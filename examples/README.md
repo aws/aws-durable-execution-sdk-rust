@@ -26,10 +26,15 @@ apply to Rust) is tracked in [`docs/porting-map.md`](../docs/porting-map.md).
 # Build a family (default: all families). Produces publish/<example>/bootstrap.
 ./build_examples.sh basics
 
-# Configure AWS credentials for a test account, then deploy a family:
+# Configure AWS credentials for a test account, then deploy a family. The
+# templates do not create an IAM role: every deploy MUST pass the ARN of an
+# existing Lambda execution role (with the durable-execution permissions:
+# lambda:CheckpointDurableExecution, lambda:GetDurableExecutionState) via
+# --parameter-overrides.
 sam deploy --template-file template_basics.yaml \
     --stack-name dex-rust-examples-basics \
-    --resolve-s3 --capabilities CAPABILITY_IAM --region us-west-2
+    --resolve-s3 --region us-west-2 \
+    --parameter-overrides ExecutionRoleArn=arn:aws:iam::<account>:role/<lambda-execution-role>
 ```
 
 `build_examples.sh` mirrors `compliance/build_examples.sh` exactly: one shared
@@ -40,6 +45,10 @@ SAM's `BuildMethod: makefile`. It is a separate cargo workspace
 root `make check`.
 
 ## Smoke-test notes
+
+The CI cloud-test workflow (`.github/workflows/cloud-tests.yml`) deploys all
+three family stacks and runs `cloud/run_cloud_tests.sh`, which invokes every
+directly-invokable example and asserts the terminal states below.
 
 - **Callbacks are driven externally.** After an execution suspends on a
   callback, complete it with

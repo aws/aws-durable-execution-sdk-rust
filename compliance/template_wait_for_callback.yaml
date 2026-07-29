@@ -1,6 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Durable Execution Conformance Test Examples - Rust (WaitForCallback)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
 Globals:
   Function:
     Runtime: provided.al2023
@@ -10,32 +14,6 @@ Globals:
     MemorySize: 128
 
 Resources:
-  DurableFunctionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-        - Effect: Allow
-          Principal:
-            Service: lambda.amazonaws.com
-          Action: sts:AssumeRole
-      ManagedPolicyArns:
-      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-      - PolicyName: DurableExecutionPolicy
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Effect: Allow
-            Action:
-            - lambda:CheckpointDurableExecution
-            - lambda:GetDurableExecutionState
-            - lambda:SendDurableExecutionCallbackSuccess
-            - lambda:SendDurableExecutionCallbackFailure
-            - lambda:SendDurableExecutionCallbackHeartbeat
-            Resource: '*'
-
   WfcbBasic:
     Type: AWS::Serverless::Function
     Metadata:
@@ -45,7 +23,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_basic/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -59,7 +37,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_explicit_name/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -73,7 +51,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_anonymous/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -87,7 +65,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_external_failure/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -101,7 +79,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_timeout/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -115,7 +93,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_failure_caught/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -129,7 +107,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_submitter_retry/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -143,7 +121,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_in_child_context/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -157,7 +135,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_two_sequential/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -171,7 +149,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_mixed_ops/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -185,7 +163,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_json_result/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -199,7 +177,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_heartbeat_timeout/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -213,7 +191,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_heartbeat_success/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -227,7 +205,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_timeout_caught/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -241,7 +219,7 @@ Resources:
     Properties:
       CodeUri: publish/wfcb_null_result/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300

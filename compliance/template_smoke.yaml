@@ -1,6 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Durable Execution Conformance Test Examples - Rust (Smoke)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
 Globals:
   Function:
     Runtime: provided.al2023
@@ -8,29 +12,6 @@ Globals:
     MemorySize: 128
 
 Resources:
-  DurableFunctionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-        - Effect: Allow
-          Principal:
-            Service: lambda.amazonaws.com
-          Action: sts:AssumeRole
-      ManagedPolicyArns:
-      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-      - PolicyName: DurableExecutionPolicy
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Effect: Allow
-            Action:
-            - lambda:CheckpointDurableExecution
-            - lambda:GetDurableExecutionState
-            Resource: '*'
-
   Hello:
     Type: AWS::Serverless::Function
     Metadata:
@@ -39,10 +20,7 @@ Resources:
       CodeUri: publish/hello/
       Handler: bootstrap
       Description: Smoke test - minimal durable handler that returns immediately
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300

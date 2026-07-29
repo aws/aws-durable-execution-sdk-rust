@@ -1,6 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Durable Execution Examples - Rust (external, serdes & cross-cutting family)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
 Globals:
   Function:
     Runtime: provided.al2023
@@ -10,35 +14,6 @@ Globals:
     - x86_64
 
 Resources:
-  DurableFunctionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-        - Effect: Allow
-          Principal:
-            Service: lambda.amazonaws.com
-          Action: sts:AssumeRole
-      ManagedPolicyArns:
-      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-      - PolicyName: DurableExecutionPolicy
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Effect: Allow
-            Action:
-            - lambda:CheckpointDurableExecution
-            - lambda:GetDurableExecutionState
-            - lambda:InvokeFunction
-            - lambda:SendDurableExecutionCallbackSuccess
-            - lambda:SendDurableExecutionCallbackFailure
-            - lambda:SendDurableExecutionCallbackHeartbeat
-            Resource: '*'
-
-  # ---- chained-invoke companion targets (callees) ----
-
   InvokeTarget:
     Type: AWS::Serverless::Function
     Metadata:
@@ -47,10 +22,7 @@ Resources:
       CodeUri: publish/invoke_target/
       Handler: bootstrap
       Description: 'Companion: echo target for chained invoke'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -63,10 +35,7 @@ Resources:
       CodeUri: publish/invoke_target_tenant/
       Handler: bootstrap
       Description: 'Companion: tenant-isolated echo target for chained invoke'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       TenancyConfig:
         TenantIsolationMode: PER_TENANT
       DurableConfig:
@@ -83,10 +52,7 @@ Resources:
       CodeUri: publish/invoke_simple/
       Handler: bootstrap
       Description: 'Example: chained durable invocation of another function'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -102,10 +68,7 @@ Resources:
       CodeUri: publish/invoke_tenant_id/
       Handler: bootstrap
       Description: 'Example: chained invoke scoped to a tenant'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -123,10 +86,7 @@ Resources:
       CodeUri: publish/create_callback_simple/
       Handler: bootstrap
       Description: 'Example: create a callback and await external completion'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -139,10 +99,7 @@ Resources:
       CodeUri: publish/create_callback_heartbeat/
       Handler: bootstrap
       Description: 'Example: create a callback with heartbeat keepalive'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -155,10 +112,7 @@ Resources:
       CodeUri: publish/create_callback_timeout/
       Handler: bootstrap
       Description: 'Example: create a callback with a timeout, caught'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -173,10 +127,7 @@ Resources:
       CodeUri: publish/wait_for_callback_basic/
       Handler: bootstrap
       Description: 'Example: wait_for_callback with a no-op submitter'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -189,10 +140,7 @@ Resources:
       CodeUri: publish/wait_for_callback_submitter/
       Handler: bootstrap
       Description: 'Example: wait_for_callback with a submitter and retry'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -205,10 +153,7 @@ Resources:
       CodeUri: publish/wait_for_callback_timeout/
       Handler: bootstrap
       Description: 'Example: wait_for_callback with a timeout, caught'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -223,10 +168,7 @@ Resources:
       CodeUri: publish/wait_for_condition/
       Handler: bootstrap
       Description: 'Example: poll a condition with a bounded wait strategy'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -241,10 +183,7 @@ Resources:
       CodeUri: publish/serde_basic/
       Handler: bootstrap
       Description: 'Example: custom Serdes on an operation'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -257,10 +196,7 @@ Resources:
       CodeUri: publish/serde_configure/
       Handler: bootstrap
       Description: 'Example: a default Serdes for the whole execution via Options'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -273,10 +209,7 @@ Resources:
       CodeUri: publish/large_payload/
       Handler: bootstrap
       Description: 'Example: FileSystemSerdes overflow for large payloads'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -291,10 +224,7 @@ Resources:
       CodeUri: publish/logging_levels/
       Handler: bootstrap
       Description: 'Example: structured logging at multiple levels via tracing'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -307,10 +237,7 @@ Resources:
       CodeUri: publish/logging_after_wait/
       Handler: bootstrap
       Description: 'Example: replay-suppressed logging after a durable wait'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -325,10 +252,7 @@ Resources:
       CodeUri: publish/comprehensive/
       Handler: bootstrap
       Description: 'Example: capstone exercising every core operation'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -344,10 +268,7 @@ Resources:
       CodeUri: publish/error_determinism/
       Handler: bootstrap
       Description: 'Example: the determinism contract in practice'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -360,10 +281,7 @@ Resources:
       CodeUri: publish/no_replay_execution/
       Handler: bootstrap
       Description: 'Example: is_replaying() to guard non-durable side effects'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -376,10 +294,7 @@ Resources:
       CodeUri: publish/optional_results/
       Handler: bootstrap
       Description: 'Example: unit and Option results (JS undefined analogue)'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -392,10 +307,7 @@ Resources:
       CodeUri: publish/retry_exhaustion/
       Handler: bootstrap
       Description: 'Example: retry until the strategy stops, then recover'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -408,10 +320,7 @@ Resources:
       CodeUri: publish/handler_error/
       Handler: bootstrap
       Description: 'Example: an error returned from the handler fails the execution'
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300

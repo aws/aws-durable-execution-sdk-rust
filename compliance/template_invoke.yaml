@@ -1,6 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Durable Execution Conformance Test Examples - Rust (Invoke)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
 Globals:
   Function:
     Runtime: provided.al2023
@@ -10,32 +14,6 @@ Globals:
       - x86_64
 
 Resources:
-  DurableFunctionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-        - Effect: Allow
-          Principal:
-            Service: lambda.amazonaws.com
-          Action: sts:AssumeRole
-      ManagedPolicyArns:
-      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-      - PolicyName: DurableExecutionPolicy
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Effect: Allow
-            Action:
-            - lambda:CheckpointDurableExecution
-            - lambda:GetDurableExecutionState
-            - lambda:InvokeFunction
-            Resource: '*'
-
-  # Target functions
-
   TargetEcho:
     Type: AWS::Serverless::Function
     Metadata:
@@ -44,10 +22,7 @@ Resources:
       CodeUri: publish/target_echo/
       Handler: bootstrap
       Description: Echo target function (waits briefly, echoes input)
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -60,10 +35,7 @@ Resources:
       CodeUri: publish/target_echo_tenant/
       Handler: bootstrap
       Description: Echo target function with tenancy enabled
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       TenancyConfig:
         TenantIsolationMode: PER_TENANT
       DurableConfig:
@@ -78,10 +50,7 @@ Resources:
       CodeUri: publish/target_error/
       Handler: bootstrap
       Description: Target function that fails
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -98,10 +67,7 @@ Resources:
       CodeUri: publish/invoke_basic/
       Handler: bootstrap
       Description: Invoke basic (target function succeeds)
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -119,10 +85,7 @@ Resources:
       CodeUri: publish/invoke_with_name/
       Handler: bootstrap
       Description: Invoke with name
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -140,10 +103,7 @@ Resources:
       CodeUri: publish/invoke_complex_object/
       Handler: bootstrap
       Description: Invoke returning complex object
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -161,10 +121,7 @@ Resources:
       CodeUri: publish/invoke_null_result/
       Handler: bootstrap
       Description: Invoke returning null
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -182,10 +139,7 @@ Resources:
       CodeUri: publish/invoke_target_fails/
       Handler: bootstrap
       Description: Invoke target fails (execution fails with InvokeError)
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -203,10 +157,7 @@ Resources:
       CodeUri: publish/invoke_target_fails_caught/
       Handler: bootstrap
       Description: Invoke target fails, caught
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -224,10 +175,7 @@ Resources:
       CodeUri: publish/invoke_large_payload/
       Handler: bootstrap
       Description: Invoke large payload
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -245,10 +193,7 @@ Resources:
       CodeUri: publish/invoke_with_tenant_id/
       Handler: bootstrap
       Description: Invoke with tenantId
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -266,10 +211,7 @@ Resources:
       CodeUri: publish/invoke_replay_skips/
       Handler: bootstrap
       Description: Replay skips succeeded invoke
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -287,10 +229,7 @@ Resources:
       CodeUri: publish/invoke_replay_rethrows/
       Handler: bootstrap
       Description: Replay re-throws failed invoke
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -308,10 +247,7 @@ Resources:
       CodeUri: publish/step_then_invoke/
       Handler: bootstrap
       Description: Step then invoke
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -329,10 +265,7 @@ Resources:
       CodeUri: publish/invoke_then_step/
       Handler: bootstrap
       Description: Invoke then step
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -350,10 +283,7 @@ Resources:
       CodeUri: publish/invoke_in_child_context/
       Handler: bootstrap
       Description: Invoke inside child context
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -371,10 +301,7 @@ Resources:
       CodeUri: publish/invoke_multiple_sequential/
       Handler: bootstrap
       Description: Multiple sequential invokes
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -393,10 +320,7 @@ Resources:
       CodeUri: publish/invoke_custom_payload_serdes/
       Handler: bootstrap
       Description: Invoke with custom payload serdes
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -414,10 +338,7 @@ Resources:
       CodeUri: publish/invoke_custom_result_serdes/
       Handler: bootstrap
       Description: Invoke with custom result serdes
-      Role:
-        Fn::GetAtt:
-        - DurableFunctionRole
-        - Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300

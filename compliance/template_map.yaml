@@ -1,6 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Durable Execution Conformance Test Examples - Rust (Map)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
 Globals:
   Function:
     Runtime: provided.al2023
@@ -10,29 +14,6 @@ Globals:
     MemorySize: 128
 
 Resources:
-  DurableFunctionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-        - Effect: Allow
-          Principal:
-            Service: lambda.amazonaws.com
-          Action: sts:AssumeRole
-      ManagedPolicyArns:
-      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-      - PolicyName: DurableExecutionPolicy
-        PolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-          - Effect: Allow
-            Action:
-            - lambda:CheckpointDurableExecution
-            - lambda:GetDurableExecutionState
-            Resource: '*'
-
   MapBasic:
     Type: AWS::Serverless::Function
     Metadata:
@@ -42,7 +23,7 @@ Resources:
     Properties:
       CodeUri: publish/map_basic/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -56,7 +37,7 @@ Resources:
     Properties:
       CodeUri: publish/map_items_only/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -70,7 +51,7 @@ Resources:
     Properties:
       CodeUri: publish/map_item_index/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -84,7 +65,7 @@ Resources:
     Properties:
       CodeUri: publish/map_empty/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -98,7 +79,7 @@ Resources:
     Properties:
       CodeUri: publish/map_fail_fast/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -112,7 +93,7 @@ Resources:
     Properties:
       CodeUri: publish/map_throw_if_error/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -126,7 +107,7 @@ Resources:
     Properties:
       CodeUri: publish/map_min_successful/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -140,7 +121,7 @@ Resources:
     Properties:
       CodeUri: publish/map_tolerated_within/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -154,7 +135,7 @@ Resources:
     Properties:
       CodeUri: publish/map_tolerated_exceeded/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -168,7 +149,7 @@ Resources:
     Properties:
       CodeUri: publish/map_tolerated_pct/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -182,7 +163,7 @@ Resources:
     Properties:
       CodeUri: publish/map_concurrent/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -196,7 +177,7 @@ Resources:
     Properties:
       CodeUri: publish/map_flat/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -210,7 +191,7 @@ Resources:
     Properties:
       CodeUri: publish/map_item_namer/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -224,7 +205,7 @@ Resources:
     Properties:
       CodeUri: publish/map_custom_serde/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -238,7 +219,7 @@ Resources:
     Properties:
       CodeUri: publish/map_suspend_iteration/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -252,7 +233,7 @@ Resources:
     Properties:
       CodeUri: publish/map_large_result/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -266,7 +247,7 @@ Resources:
     Properties:
       CodeUri: publish/map_then_wait/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -280,7 +261,7 @@ Resources:
     Properties:
       CodeUri: publish/map_fail_then_wait/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -294,7 +275,7 @@ Resources:
     Properties:
       CodeUri: publish/map_op_serde/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
@@ -308,7 +289,7 @@ Resources:
     Properties:
       CodeUri: publish/map_op_serde_replay/
       Handler: bootstrap
-      Role: !GetAtt DurableFunctionRole.Arn
+      Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
