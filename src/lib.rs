@@ -1,0 +1,1121 @@
+//! AWS Durable Execution SDK for Rust.
+//!
+//! This crate provides a Rust implementation of the AWS Lambda Durable
+//! Functions SDK, enabling long-running orchestrations that survive Lambda
+//! invocation timeouts through automatic checkpointing and deterministic
+//! replay.
+//!
+//! # Overview
+//!
+//! A durable function is a Lambda function whose progress is automatically
+//! checkpointed. If the function is interrupted, it restarts and replays
+//! recorded results instead of re-executing operations. The SDK guarantees
+//! deterministic replay as long as operations are created in a consistent
+//! order across invocations.
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! use aws_durable_execution_sdk_rust as durable;
+//! use serde::{Deserialize, Serialize};
+//!
+//! #[derive(Deserialize, Serialize)]
+//! struct Order { id: String }
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), lambda_runtime::Error> {
+//!     durable::run(|event: Order, ctx: durable::DurableContext| async move {
+//!         let result = ctx.step(|_step_ctx| async move {
+//!             Ok(format!("processed {}", event.id))
+//!         }).name("process")
+//!           .await?;
+//!         Ok(result)
+//!     }).await
+//! }
+//! ```
+//!
+//! # Determinism contract
+//!
+//! 1. Operation IDs are minted at the **call site**, synchronously.
+//! 2. Never create durable operations while iterating `HashMap`/`HashSet`.
+//! 3. Use [`DurableContext::race`] or [`DurableContext::select_ok`] instead
+//!    of `tokio::select!` over durable futures.
+//! 4. On suspension, the user future is dropped — do not rely on `Drop`
+//!    ordering for correctness between durable operations.
+
+mod builders;
+pub(crate) mod callback;
+pub(crate) mod child;
+#[allow(dead_code)] // reason: some client-abstraction items are consumed only by the engine
+pub(crate) mod client;
+pub(crate) mod combinator;
+mod context;
+pub(crate) mod driver;
+mod engine;
+mod error;
+mod future;
+pub(crate) mod invoke;
+pub(crate) mod map_parallel; // public types re-exported above
+mod options;
+mod serdes;
+pub(crate) mod step;
+#[cfg(feature = "test-util")]
+pub mod test_util;
+pub(crate) mod tracing_layer;
+pub(crate) mod wait;
+pub(crate) mod wait_for_condition;
+
+pub use self::builders::{
+    ChildBuilder, CreateCallbackBuilder, InvokeBuilder, JoinAllBuilder, MapBuilder,
+    ParallelBuilder, RaceBuilder, SelectOkBuilder, StepBuilder, TryJoinAllBuilder, WaitBuilder,
+    WaitForCallbackBuilder, WaitForConditionBuilder,
+};
+pub use self::context::{DurableContext, StepContext};
+pub use self::error::{
+    CallbackError, CallbackErrorKind, ChildContextError, ChildContextErrorKind, CombinatorError,
+    CombinatorErrorKind, InvokeError, InvokeErrorKind, OperationError, OperationErrorKind,
+    StepError, StepErrorKind, WaitForConditionError, WaitForConditionErrorKind,
+};
+pub use self::future::{Branch, Callback, DurableFuture, Settled};
+pub use self::map_parallel::{
+    BatchItem, BatchItemStatus, BatchResult, CompletionReason, NestingMode,
+};
+pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
+pub use self::serdes::{
+    FileSystemPathEncoding, FileSystemSerdes, FileSystemSerdesConfig,
+    FileSystemSerdesConfigBuilder, FileSystemSerdesError, FileSystemSerdesMode, Serdes,
+    SerdesContext,
+};
+pub use self::step::StepSemantics;
+pub use self::wait_for_condition::{WaitDecision, WaitStrategyFn};
+
+// Re-export rule: every foreign type in the public surface is re-exported.
+pub use lambda_runtime::{self, Context as LambdaContext};
+
+use serde::{Deserialize, Serialize};
+use std::future::Future;
+
+/// Boxed error type matching the `lambda_runtime::Error` shape.
+///
+/// This is the canonical error type for handler and step closures. The `?`
+/// operator works on any error type that implements
+/// `std::error::Error + Send + Sync`, with zero conversion ceremony.
+///
+/// # Examples
+///
+/// ```no_run
+/// use aws_durable_execution_sdk_rust as durable;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<String, durable::BoxError> {
+///     let value = ctx.step(|_| async { Ok(42) }).await?;
+///     Ok(format!("got {value}"))
+/// }
+/// ```
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Retry decision returned by a [`RetryStrategy`] function.
+///
+/// Tells the engine whether to retry a failed step and, if so, how long
+/// to wait before the next attempt.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::RetryDecision;
+/// use std::time::Duration;
+///
+/// let retry = RetryDecision::Retry {
+///     delay: Duration::from_secs(1),
+/// };
+/// let stop = RetryDecision::Stop;
+/// # drop(retry);
+/// # drop(stop);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RetryDecision {
+    /// Retry after the specified delay.
+    Retry {
+        /// Duration to wait before retrying.
+        delay: std::time::Duration,
+    },
+    /// Do not retry; propagate the error.
+    Stop,
+}
+
+/// A retry strategy function that decides whether to retry a failed step.
+///
+/// Receives the step error and the attempt number (starting from 1), and
+/// returns a [`RetryDecision`].
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::{RetryStrategy, RetryDecision, StepError};
+/// use std::time::Duration;
+///
+/// let exponential: RetryStrategy = Box::new(|_err: &StepError, attempt: u32| {
+///     if attempt >= 3 {
+///         RetryDecision::Stop
+///     } else {
+///         RetryDecision::Retry {
+///             delay: Duration::from_millis(100 * u64::from(2_u32.pow(attempt - 1))),
+///         }
+///     }
+/// });
+/// # drop(exponential);
+/// ```
+pub type RetryStrategy = Box<dyn Fn(&StepError, u32) -> RetryDecision + Send + Sync>;
+
+/// Configuration for completion behavior in map and parallel operations.
+///
+/// Controls early-completion thresholds: how many items must succeed and
+/// how many failures are tolerated before stopping. Thresholds may be
+/// combined — when multiple are set, the first threshold to fire wins.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::CompletionConfig;
+///
+/// // Fail-fast: stop on the first failure.
+/// let fail_fast = CompletionConfig::with_tolerated_failure_count(0);
+///
+/// // Early completion: stop after 2 successes.
+/// let min_success = CompletionConfig::with_min_successful(2);
+/// # drop(fail_fast);
+/// # drop(min_success);
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct CompletionConfig {
+    /// Completes the batch early once this many items succeed.
+    /// `None` means no minimum-success threshold.
+    pub min_successful: Option<usize>,
+
+    /// Fails the batch once more than this many items fail.
+    /// `Some(0)` means fail-fast (stop on first failure).
+    /// `None` means no count-based failure tolerance.
+    pub tolerated_failure_count: Option<usize>,
+
+    /// Fails the batch once the failure percentage strictly exceeds this
+    /// threshold (integer 0-100).
+    /// `None` means no percentage-based failure tolerance.
+    pub tolerated_failure_percentage: Option<usize>,
+}
+
+impl CompletionConfig {
+    /// Creates a config with just a `min_successful` threshold.
+    #[must_use]
+    pub fn with_min_successful(min: usize) -> Self {
+        Self {
+            min_successful: Some(min),
+            ..Self::default()
+        }
+    }
+
+    /// Creates a config with just a `tolerated_failure_count` threshold.
+    ///
+    /// Use `0` for fail-fast behavior (stop on first failure).
+    #[must_use]
+    pub fn with_tolerated_failure_count(count: usize) -> Self {
+        Self {
+            tolerated_failure_count: Some(count),
+            ..Self::default()
+        }
+    }
+
+    /// Creates a config with just a `tolerated_failure_percentage` threshold.
+    #[must_use]
+    pub fn with_tolerated_failure_percentage(pct: usize) -> Self {
+        Self {
+            tolerated_failure_percentage: Some(pct),
+            ..Self::default()
+        }
+    }
+
+    /// Validates the completion config, returning an error message when the
+    /// config is invalid (crate-internal; callers convert the message into a
+    /// typed batch error).
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if let Some(pct) = self.tolerated_failure_percentage
+            && pct > 100
+        {
+            return Err(format!(
+                "tolerated_failure_percentage must be 0-100, got {pct}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Configuration for the wait strategy used by
+/// [`DurableContext::wait_for_condition`].
+///
+/// Controls the polling interval and backoff behavior for condition checks.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::WaitStrategy;
+/// use std::time::Duration;
+///
+/// let strategy = WaitStrategy::default();
+/// # drop(strategy);
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct WaitStrategy {
+    /// Initial delay between condition checks.
+    pub initial_delay: std::time::Duration,
+    /// Maximum delay between condition checks.
+    pub max_delay: std::time::Duration,
+    /// Backoff multiplier applied after each check.
+    pub backoff_factor: f64,
+}
+
+impl Default for WaitStrategy {
+    fn default() -> Self {
+        Self {
+            initial_delay: std::time::Duration::from_secs(1),
+            max_delay: std::time::Duration::from_mins(1),
+            backoff_factor: 2.0,
+        }
+    }
+}
+
+/// Starts the durable function runtime with the given handler.
+///
+/// This is the primary entry point. It configures the Lambda runtime with
+/// durable execution support using default [`Options`], then runs the
+/// handler for each invocation.
+///
+/// The handler closure is called once per invocation. It receives the
+/// deserialized event and a [`DurableContext`] for performing durable
+/// operations.
+///
+/// # Errors
+///
+/// Returns an error if the Lambda runtime fails to start or if
+/// configuration is invalid.
+///
+/// # Examples
+///
+/// ```no_run
+/// use aws_durable_execution_sdk_rust as durable;
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Deserialize)]
+/// struct MyEvent { name: String }
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), lambda_runtime::Error> {
+///     durable::run(|event: MyEvent, ctx: durable::DurableContext| async move {
+///         Ok(format!("Hello, {}!", event.name))
+///     }).await
+/// }
+/// ```
+/// Starts the Lambda runtime with durable execution support.
+///
+/// It registers the handler with the Lambda runtime and, per invocation,
+/// parses the durable envelope into a checkpoint log, constructs a
+/// [`DurableContext`] seeded with that log, and drives the handler closure
+/// so that completed operations replay from the log instead of re-executing.
+///
+/// # Errors
+///
+/// Returns an error if the Lambda runtime fails to start or encounters an
+/// unrecoverable error during execution.
+pub async fn run<F, E, Fut, O>(handler: F) -> Result<(), lambda_runtime::Error>
+where
+    F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+    E: for<'de> Deserialize<'de> + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send,
+    O: Serialize + Send + 'static,
+{
+    use std::sync::Arc as StdArc;
+
+    let handler = StdArc::new(handler);
+
+    // Create the Lambda client once (cold-start best practice — reused
+    // across invocations).
+    let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
+    let lambda_client = StdArc::new(lambda_client);
+
+    lambda_runtime::run(lambda_runtime::service_fn(
+        move |event: lambda_runtime::LambdaEvent<serde_json::Value>| {
+            let handler = StdArc::clone(&handler);
+            let lambda_client = StdArc::clone(&lambda_client);
+            async move {
+                let (raw_payload, lambda_ctx) = event.into_parts();
+
+                // Parse the durable invocation envelope. The service delivers:
+                // { "DurableExecutionArn": "...", "CheckpointToken": "...",
+                //   "InitialExecutionState": { "Operations": [...] } }
+                let execution_arn = raw_payload
+                    .get("DurableExecutionArn")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+
+                let checkpoint_token = raw_payload
+                    .get("CheckpointToken")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+
+                let customer_input: E = extract_customer_input(&raw_payload)?;
+
+                // Parse the initial execution state into a checkpoint log.
+                let checkpoint_log = parse_inline_operations(&raw_payload);
+                let checkpoint_log = StdArc::new(checkpoint_log);
+
+                // Create the production execution client.
+                let exec_client: StdArc<dyn client::ExecutionClient> =
+                    StdArc::new(client::LambdaExecutionClient::new((*lambda_client).clone()));
+
+                let ctx = DurableContext::new_root_with_client(
+                    execution_arn,
+                    lambda_ctx,
+                    checkpoint_log,
+                    exec_client,
+                    checkpoint_token,
+                );
+
+                let suspension_signal = ctx.suspension_signal().clone();
+
+                // Run the handler through the driver which handles suspension.
+                let outcome = driver::drive_invocation(
+                    async {
+                        match (handler)(customer_input, ctx).await {
+                            Ok(result) => serde_json::to_string(&result)
+                                .map_err(|e| ("HandlerError".to_owned(), e.to_string())),
+                            Err(e) => Err(wire_error_from_box_error(e)),
+                        }
+                    },
+                    suspension_signal,
+                )
+                .await;
+
+                // Convert outcome to the durable response envelope.
+                let response = match outcome {
+                    driver::InvocationOutcome::Complete(serialized) => {
+                        serde_json::json!({
+                            "Status": "SUCCEEDED",
+                            "Result": serialized
+                        })
+                    }
+                    driver::InvocationOutcome::Pending => {
+                        serde_json::json!({
+                            "Status": "PENDING"
+                        })
+                    }
+                    driver::InvocationOutcome::Failed {
+                        error_type,
+                        error_message,
+                    } => {
+                        serde_json::json!({
+                            "Status": "FAILED",
+                            "Error": {
+                                "ErrorType": error_type,
+                                "ErrorMessage": error_message
+                            }
+                        })
+                    }
+                };
+
+                Ok::<serde_json::Value, lambda_runtime::Error>(response)
+            }
+        },
+    ))
+    .await
+}
+
+/// Extracts the customer's original event from the durable invocation
+/// envelope.
+///
+/// The service embeds the customer payload in
+/// `InitialExecutionState.Operations[0].ExecutionDetails.InputPayload`
+/// as a JSON string.
+fn extract_customer_input<E>(payload: &serde_json::Value) -> Result<E, lambda_runtime::Error>
+where
+    E: for<'de> Deserialize<'de>,
+{
+    // Try the durable envelope path first.
+    let input_str = payload
+        .get("InitialExecutionState")
+        .and_then(|s| s.get("Operations"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|ops| ops.first())
+        .and_then(|op| op.get("ExecutionDetails"))
+        .and_then(|d| d.get("InputPayload"))
+        .and_then(serde_json::Value::as_str);
+
+    if let Some(input_json) = input_str {
+        // InputPayload is a JSON string — parse the customer's event from it.
+        serde_json::from_str(input_json)
+            .map_err(|e| lambda_runtime::Error::from(format!("deserialize customer input: {e}")))
+    } else {
+        // Fallback: treat the raw payload as the customer event directly.
+        // This handles direct invocations (testing) where there is no
+        // durable envelope.
+        serde_json::from_value(payload.clone())
+            .map_err(|e| lambda_runtime::Error::from(format!("deserialize event: {e}")))
+    }
+}
+
+/// Extracts the wire error type and raw error message from a `BoxError`.
+///
+/// Attempts to downcast to `OperationError` for structured extraction;
+/// falls back to `HandlerError` with the Display string for unknown types.
+fn wire_error_from_box_error(err: BoxError) -> (String, String) {
+    match err.downcast::<OperationError>() {
+        Ok(op_err) => wire_error_from_operation_error(&op_err),
+        Err(other) => ("HandlerError".to_owned(), other.to_string()),
+    }
+}
+
+/// Extracts the wire error type and raw error message from an `OperationError`.
+///
+/// For callback external failures, the wire message is the raw external
+/// error message (not the full Display chain). For other errors, the full
+/// Display string is used.
+fn wire_error_from_operation_error(err: &OperationError) -> (String, String) {
+    match err.kind() {
+        OperationErrorKind::Step(_) => ("StepError".to_owned(), err.to_string()),
+        OperationErrorKind::Invoke(_) => ("InvokeError".to_owned(), err.to_string()),
+        OperationErrorKind::Callback(cb_err) => {
+            let message = match cb_err.kind() {
+                CallbackErrorKind::ExternalFailure { message, .. } => message.clone(),
+                _ => err.to_string(),
+            };
+            ("CallbackError".to_owned(), message)
+        }
+        OperationErrorKind::ChildContext(child_err) => {
+            let message = match child_err.kind() {
+                ChildContextErrorKind::ChildFailed { message } => message.clone(),
+                _ => err.to_string(),
+            };
+            ("ChildContextError".to_owned(), message)
+        }
+        OperationErrorKind::WaitForCondition(_) => {
+            ("WaitForConditionError".to_owned(), err.to_string())
+        }
+        OperationErrorKind::Combinator(_) => ("PromiseCombinatorError".to_owned(), err.to_string()),
+    }
+}
+
+/// Parses inline operations from the durable invocation envelope into a
+/// checkpoint log.
+///
+/// The service embeds the execution state in
+/// `InitialExecutionState.Operations` as a JSON array of operation objects.
+/// Each has `Id`, `Type`, `Status`, and type-specific details (e.g.,
+/// `StepDetails`). On first invocation the array is empty or contains only
+/// the execution-start operation; on re-invocation it contains all prior
+/// checkpointed operations.
+fn parse_inline_operations(payload: &serde_json::Value) -> engine::CheckpointLog {
+    let Some(ops_json) = payload
+        .get("InitialExecutionState")
+        .and_then(|s| s.get("Operations"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return engine::CheckpointLog::empty();
+    };
+
+    // Skip the first operation (Execution type — the invocation context)
+    // and parse remaining step/wait/etc. operations into records.
+    let records: Vec<(String, engine::CheckpointRecord)> =
+        ops_json.iter().filter_map(parse_single_operation).collect();
+
+    engine::CheckpointLog::from_records(records)
+}
+
+/// Parses a single operation JSON object into a checkpoint record.
+#[allow(clippy::too_many_lines)] // reason: sequential detail extraction reads better as one flow
+fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::CheckpointRecord)> {
+    let id = op.get("Id").and_then(serde_json::Value::as_str)?;
+    let op_type = op.get("Type").and_then(serde_json::Value::as_str)?;
+    // Skip the Execution context operation (wire format: "EXECUTION").
+    if op_type.eq_ignore_ascii_case("Execution") {
+        return None;
+    }
+    let status_str = op
+        .get("Status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("STARTED");
+    // The backend sends status in UPPER_CASE (wire format).
+    let status = match status_str.to_ascii_uppercase().as_str() {
+        "SUCCEEDED" => engine::CheckpointStatus::Succeeded,
+        "FAILED" => engine::CheckpointStatus::Failed,
+        "PENDING" => engine::CheckpointStatus::Pending,
+        "READY" => engine::CheckpointStatus::Ready,
+        "CANCELLED" => engine::CheckpointStatus::Cancelled,
+        "TIMEDOUT" | "TIMED_OUT" => engine::CheckpointStatus::TimedOut,
+        "STOPPED" => engine::CheckpointStatus::Stopped,
+        _ => engine::CheckpointStatus::Started,
+    };
+
+    // Extract step details.
+    let step_details = op.get("StepDetails");
+    let result = step_details
+        .and_then(|d| d.get("Result"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    let error = step_details.and_then(|d| d.get("Error"));
+    let error_type = error
+        .and_then(|e| e.get("ErrorType"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    let error_message = error
+        .and_then(|e| e.get("ErrorMessage"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    #[allow(clippy::cast_possible_truncation)] // reason: attempt ≤ MAX_ATTEMPTS (small)
+    #[allow(clippy::cast_sign_loss)] // reason: clamped to non-negative
+    let attempt = step_details
+        .and_then(|d| d.get("Attempt"))
+        .and_then(serde_json::Value::as_i64)
+        .map_or(0, |a| a.clamp(0, i64::from(u32::MAX)) as u32);
+
+    // Parse ChainedInvokeDetails (for invoke operations).
+    let invoke_details = op.get("ChainedInvokeDetails");
+    let invoke_result = invoke_details
+        .and_then(|d| d.get("Result"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    let invoke_error = invoke_details.and_then(|d| d.get("Error"));
+    let invoke_error_type = invoke_error
+        .and_then(|e| e.get("ErrorType"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    let invoke_error_message = invoke_error
+        .and_then(|e| e.get("ErrorMessage"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+
+    // Parse ContextDetails for child context operations.
+    let context_details = op.get("ContextDetails");
+    let replay_children = context_details
+        .and_then(|d| d.get("ReplayChildren"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    // Parse CallbackDetails for callback operations.
+    let callback_details = op.get("CallbackDetails");
+    let callback_id = callback_details
+        .and_then(|d| d.get("CallbackId"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+
+    // Also check for result in ContextDetails (child context success payload).
+    let result = result.or_else(|| {
+        context_details
+            .and_then(|d| d.get("Result"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+    });
+
+    // Also check for errors in ContextDetails (child context failure).
+    let context_error = context_details.and_then(|d| d.get("Error"));
+    let error_type = error_type.or_else(|| {
+        context_error
+            .and_then(|e| e.get("ErrorType"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+    });
+    let error_message = error_message.or_else(|| {
+        context_error
+            .and_then(|e| e.get("ErrorMessage"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+    });
+
+    // Also check for result in CallbackDetails (callback success payload).
+    let result = result.or_else(|| {
+        callback_details
+            .and_then(|d| d.get("Result"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+    });
+
+    // Also check for errors in CallbackDetails (callback failure).
+    let callback_error = callback_details.and_then(|d| d.get("Error"));
+    let error_type = error_type.or_else(|| {
+        callback_error
+            .and_then(|e| e.get("ErrorType"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+    });
+    let error_message = error_message.or_else(|| {
+        callback_error
+            .and_then(|e| e.get("ErrorMessage"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+    });
+
+    Some((
+        id.to_owned(),
+        engine::CheckpointRecord {
+            id: id.to_owned(),
+            status,
+            result,
+            error_type,
+            error_message,
+            attempt,
+            invoke_result,
+            invoke_error_type,
+            invoke_error_message,
+            replay_children,
+            callback_id,
+        },
+    ))
+}
+
+/// Creates a Lambda service function with durable execution support.
+///
+/// Unlike [`run`], this does not start the runtime — it returns a service
+/// function suitable for passing to `lambda_runtime::run`. Use this for
+/// composable setups where you need additional middleware or custom
+/// runtime configuration.
+///
+/// # Errors
+///
+/// Returns an error if configuration is invalid.
+///
+/// # Examples
+///
+/// ```no_run
+/// use aws_durable_execution_sdk_rust as durable;
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Deserialize)]
+/// struct MyEvent { name: String }
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), lambda_runtime::Error> {
+///     let service = durable::wrap(
+///         |event: MyEvent, ctx: durable::DurableContext| async move {
+///             Ok(format!("Hello, {}!", event.name))
+///         },
+///         durable::Options::default(),
+///     );
+///     lambda_runtime::run(lambda_runtime::service_fn(service)).await
+/// }
+/// ```
+#[allow(clippy::type_complexity)] // reason: Lambda service function signature is inherently complex
+pub fn wrap<F, E, Fut, O>(
+    handler: F,
+    options: Options,
+) -> impl Fn(
+    lambda_runtime::LambdaEvent<serde_json::Value>,
+) -> std::pin::Pin<
+    Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
+> + Send
++ Sync
+where
+    F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+    E: for<'de> Deserialize<'de> + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send,
+    O: Serialize + Send + 'static,
+{
+    use std::sync::Arc as StdArc;
+
+    let handler = StdArc::new(handler);
+
+    // Consume Options once, at wrap time. The execution client is resolved a
+    // single time here and reused across every invocation (cold-start best
+    // practice); the execution-wide default serdes is threaded into each root
+    // context so operations that set no serdes of their own fall back to it.
+    let Options {
+        serdes,
+        sdk_config,
+        lambda_client,
+    } = options;
+    let default_serdes: Option<StdArc<dyn Serdes>> = serdes.map(StdArc::from);
+    let preset_client: Option<StdArc<dyn client::ExecutionClient>> =
+        base_lambda_client_from_options(sdk_config, lambda_client).map(|c| {
+            StdArc::new(client::LambdaExecutionClient::new(c))
+                as StdArc<dyn client::ExecutionClient>
+        });
+    let provider = StdArc::new(ClientProvider::new(preset_client));
+    let default_serdes = StdArc::new(default_serdes);
+
+    move |event: lambda_runtime::LambdaEvent<serde_json::Value>| -> std::pin::Pin<
+        Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
+    > {
+        let handler = StdArc::clone(&handler);
+        let provider = StdArc::clone(&provider);
+        let default_serdes = StdArc::clone(&default_serdes);
+        Box::pin(async move {
+            let (raw_payload, lambda_ctx) = event.into_parts();
+
+            // Parse the durable invocation envelope.
+            let execution_arn = raw_payload
+                .get("DurableExecutionArn")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+
+            let checkpoint_token = raw_payload
+                .get("CheckpointToken")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+
+            let customer_input: E = extract_customer_input(&raw_payload)?;
+
+            // Parse the initial execution state into a checkpoint log.
+            let checkpoint_log = parse_inline_operations(&raw_payload);
+            let checkpoint_log = StdArc::new(checkpoint_log);
+
+            // Reuse the execution client resolved once at wrap time (built
+            // from the ambient default at most once when no client was
+            // supplied via Options).
+            let exec_client = provider.get().await;
+
+            let ctx = DurableContext::new_root_with_client_and_defaults(
+                execution_arn,
+                lambda_ctx,
+                checkpoint_log,
+                exec_client,
+                checkpoint_token,
+                (*default_serdes).clone(),
+            );
+
+            let suspension_signal = ctx.suspension_signal().clone();
+
+            // Run the handler through the driver which handles suspension.
+            let outcome = driver::drive_invocation(
+                async {
+                    match (handler)(customer_input, ctx).await {
+                        Ok(result) => serde_json::to_string(&result)
+                            .map_err(|e| ("HandlerError".to_owned(), e.to_string())),
+                        Err(e) => Err(wire_error_from_box_error(e)),
+                    }
+                },
+                suspension_signal,
+            )
+            .await;
+
+            // Convert outcome to the durable response envelope.
+            let response = match outcome {
+                driver::InvocationOutcome::Complete(serialized) => {
+                    serde_json::json!({
+                        "Status": "SUCCEEDED",
+                        "Result": serialized
+                    })
+                }
+                driver::InvocationOutcome::Pending => {
+                    serde_json::json!({
+                        "Status": "PENDING"
+                    })
+                }
+                driver::InvocationOutcome::Failed {
+                    error_type,
+                    error_message,
+                } => {
+                    serde_json::json!({
+                        "Status": "FAILED",
+                        "Error": {
+                            "ErrorType": error_type,
+                            "ErrorMessage": error_message
+                        }
+                    })
+                }
+            };
+
+            Ok(response)
+        })
+    }
+}
+
+/// Resolves the base Lambda client from the caller's [`Options`].
+///
+/// Precedence: a supplied `lambda_client` is used directly; otherwise a
+/// supplied `sdk_config` builds one; otherwise `None`, which defers to the
+/// ambient default resolved once at first use by [`ClientProvider`].
+pub(crate) fn base_lambda_client_from_options(
+    sdk_config: Option<aws_config::SdkConfig>,
+    lambda_client: Option<aws_sdk_lambda::Client>,
+) -> Option<aws_sdk_lambda::Client> {
+    match (lambda_client, sdk_config) {
+        (Some(client), _) => Some(client),
+        (None, Some(config)) => Some(aws_sdk_lambda::Client::new(&config)),
+        (None, None) => None,
+    }
+}
+
+/// Supplies the execution client for every invocation of a [`wrap`]-ed
+/// handler, building it at most once and reusing it thereafter.
+///
+/// When [`Options`] supplied a client (or an SDK config), it is captured as
+/// `preset` and returned on every call. Otherwise the ambient default config
+/// is loaded lazily on the first invocation and the resulting client is
+/// cached, so no per-invocation client construction or config load occurs.
+pub(crate) struct ClientProvider {
+    preset: Option<std::sync::Arc<dyn client::ExecutionClient>>,
+    default_cell: tokio::sync::OnceCell<std::sync::Arc<dyn client::ExecutionClient>>,
+}
+
+impl ClientProvider {
+    /// Creates a provider. `preset` is the client resolved from `Options`, or
+    /// `None` to defer to the ambient default on first use.
+    pub(crate) fn new(preset: Option<std::sync::Arc<dyn client::ExecutionClient>>) -> Self {
+        Self {
+            preset,
+            default_cell: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Returns the shared execution client, building the ambient-default one
+    /// exactly once when no client was preset.
+    pub(crate) async fn get(&self) -> std::sync::Arc<dyn client::ExecutionClient> {
+        use std::sync::Arc as StdArc;
+        if let Some(preset) = &self.preset {
+            return StdArc::clone(preset);
+        }
+        let client = self
+            .default_cell
+            .get_or_init(|| async {
+                let aws_config =
+                    aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
+                StdArc::new(client::LambdaExecutionClient::new(lambda_client))
+                    as StdArc<dyn client::ExecutionClient>
+            })
+            .await;
+        StdArc::clone(client)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::IntoFuture;
+
+    use super::*;
+
+    /// Verifies that `tokio::join!` accepts `IntoFuture` operands directly.
+    ///
+    /// Since tokio 1.23+, `tokio::join!` desugars through `.await` which
+    /// uses `IntoFuture`. This means operation builders can be passed
+    /// directly to `tokio::join!` without calling `.future()` first.
+    #[allow(clippy::unwrap_used)] // reason: test code
+    #[tokio::test]
+    async fn tokio_join_accepts_into_future() {
+        // Verify compilation: IntoFuture is accepted by tokio::join!
+        fn check_into_future<T: IntoFuture>(_t: T) {}
+        let ctx = DurableContext::__test_context();
+        check_into_future(ctx.step(|_| async { Ok(1i32) }));
+        // NOTE: cannot actually tokio::join! the builders because they
+        // todo!() at runtime — but the type-level verification above
+        // plus the external rustc test confirms IntoFuture acceptance.
+    }
+
+    /// Verifies that `wrap()` produces a service function compatible with
+    /// `lambda_runtime::service_fn`. This is a compile-time + type-level
+    /// test: the returned closure has the correct signature.
+    #[test]
+    fn wrap_returns_callable_service_function() {
+        fn assert_send_sync<T: Send + Sync>(_t: &T) {}
+
+        // Verify that wrap() compiles and returns something Send + Sync.
+        let service = wrap(
+            |_event: serde_json::Value, _ctx: DurableContext| async move {
+                Ok::<String, BoxError>("hello".to_owned())
+            },
+            Options::default(),
+        );
+
+        // The service must be Send + Sync (required by lambda_runtime::run).
+        assert_send_sync(&service);
+
+        // Verify the closure can be called (type-level check; we cannot
+        // actually invoke without a real Lambda event envelope but the
+        // fact that `service` is accepted by `service_fn` is proven by
+        // the Send + Sync + correct return type checks above).
+        drop(service);
+    }
+
+    // ── CallbackDetails parsing tests ───────────────────────────────────
+
+    #[test]
+    fn parse_callback_details_extracts_result() {
+        let op = serde_json::json!({
+            "Id": "abc123",
+            "Type": "Callback",
+            "Status": "SUCCEEDED",
+            "CallbackDetails": {
+                "CallbackId": "cb-42",
+                "Result": "\"hello from callback\""
+            }
+        });
+
+        let parsed = parse_single_operation(&op);
+        assert!(parsed.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
+        let (id, record) = parsed.unwrap();
+        assert_eq!(id, "abc123");
+        assert_eq!(record.status, engine::CheckpointStatus::Succeeded);
+        assert_eq!(record.callback_id.as_deref(), Some("cb-42"));
+        assert_eq!(record.result.as_deref(), Some("\"hello from callback\""));
+    }
+
+    #[test]
+    fn parse_callback_details_extracts_error() {
+        let op = serde_json::json!({
+            "Id": "abc456",
+            "Type": "Callback",
+            "Status": "FAILED",
+            "CallbackDetails": {
+                "CallbackId": "cb-99",
+                "Error": {
+                    "ErrorType": "NotApproved",
+                    "ErrorMessage": "request was denied"
+                }
+            }
+        });
+
+        let parsed = parse_single_operation(&op);
+        assert!(parsed.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
+        let (id, record) = parsed.unwrap();
+        assert_eq!(id, "abc456");
+        assert_eq!(record.status, engine::CheckpointStatus::Failed);
+        assert_eq!(record.callback_id.as_deref(), Some("cb-99"));
+        assert_eq!(record.error_type.as_deref(), Some("NotApproved"));
+        assert_eq!(record.error_message.as_deref(), Some("request was denied"));
+    }
+
+    #[test]
+    fn parse_callback_details_result_does_not_override_step_result() {
+        // StepDetails.Result takes priority; CallbackDetails.Result is
+        // only a fallback for callback-type operations without step data.
+        let op = serde_json::json!({
+            "Id": "abc789",
+            "Type": "Callback",
+            "Status": "SUCCEEDED",
+            "StepDetails": {
+                "Result": "\"from step\""
+            },
+            "CallbackDetails": {
+                "CallbackId": "cb-1",
+                "Result": "\"from callback\""
+            }
+        });
+
+        let parsed = parse_single_operation(&op);
+        assert!(parsed.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
+        let (_, record) = parsed.unwrap();
+        assert_eq!(record.result.as_deref(), Some("\"from step\""));
+    }
+
+    #[test]
+    fn parse_inline_operations_handles_callback_success() {
+        let payload = serde_json::json!({
+            "InitialExecutionState": {
+                "Operations": [
+                    {
+                        "Id": "exec-0",
+                        "Type": "Execution",
+                        "Status": "STARTED"
+                    },
+                    {
+                        "Id": "wire-id-1",
+                        "Type": "Callback",
+                        "Status": "SUCCEEDED",
+                        "CallbackDetails": {
+                            "CallbackId": "cb-id-123",
+                            "Result": "\"payload\""
+                        }
+                    }
+                ]
+            }
+        });
+
+        let log = parse_inline_operations(&payload);
+        let record = log.get("wire-id-1");
+        assert!(record.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
+        let record = record.unwrap();
+        assert_eq!(record.callback_id.as_deref(), Some("cb-id-123"));
+        assert_eq!(record.result.as_deref(), Some("\"payload\""));
+    }
+
+    // ── Options consumption: client resolution + reuse ──────────────────
+
+    /// A supplied `sdk_config` measurably alters client construction: the
+    /// resolved Lambda client carries the region from that config. Without
+    /// wrap consuming `sdk_config` (the pre-fix behavior) the config was
+    /// dropped and this region would not appear.
+    #[test]
+    #[allow(clippy::expect_used)] // reason: test assertion
+    fn sdk_config_measurably_alters_client_construction() {
+        let sdk_config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_sdk_lambda::config::Region::new("eu-west-1"))
+            .build();
+        let client = base_lambda_client_from_options(Some(sdk_config), None)
+            .expect("sdk_config must yield a client");
+        assert_eq!(
+            client.config().region().map(ToString::to_string),
+            Some("eu-west-1".to_owned()),
+            "the supplied sdk_config's region must flow into the built client"
+        );
+    }
+
+    /// A supplied `lambda_client` is the one used (not a default-constructed
+    /// one): the resolved client preserves the supplied client's region.
+    #[test]
+    #[allow(clippy::expect_used)] // reason: test assertion
+    fn supplied_lambda_client_is_the_one_used() {
+        let conf = aws_sdk_lambda::config::Config::builder()
+            .behavior_version(aws_sdk_lambda::config::BehaviorVersion::latest())
+            .region(aws_sdk_lambda::config::Region::new("ap-south-1"))
+            .build();
+        let supplied = aws_sdk_lambda::Client::from_conf(conf);
+        let resolved = base_lambda_client_from_options(None, Some(supplied))
+            .expect("lambda_client must be returned");
+        assert_eq!(
+            resolved.config().region().map(ToString::to_string),
+            Some("ap-south-1".to_owned()),
+            "the supplied lambda_client must be used verbatim, not replaced"
+        );
+    }
+
+    /// With neither `sdk_config` nor `lambda_client`, resolution defers to the
+    /// ambient default (returns `None` so `ClientProvider` builds it lazily).
+    #[test]
+    fn no_options_defers_client_to_ambient_default() {
+        assert!(base_lambda_client_from_options(None, None).is_none());
+    }
+
+    /// `ClientProvider` reuses a preset execution client across calls rather
+    /// than rebuilding one per invocation: two `get()` calls return the same
+    /// `Arc` allocation.
+    #[tokio::test]
+    async fn client_provider_reuses_preset_across_invocations() {
+        use crate::client::InMemoryExecutionClient;
+        use std::sync::Arc as StdArc;
+
+        let preset: StdArc<dyn client::ExecutionClient> =
+            StdArc::new(InMemoryExecutionClient::new(Vec::new()));
+        let provider = ClientProvider::new(Some(StdArc::clone(&preset)));
+
+        let first = provider.get().await;
+        let second = provider.get().await;
+        assert!(
+            StdArc::ptr_eq(&first, &second),
+            "the client must be reused, not rebuilt, across invocations"
+        );
+        assert!(
+            StdArc::ptr_eq(&first, &preset),
+            "the reused client must be exactly the one supplied via Options"
+        );
+    }
+}

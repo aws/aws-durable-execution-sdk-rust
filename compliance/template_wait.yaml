@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (Wait)
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  DurableFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: DurableExecutionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:CheckpointDurableExecution
+            - lambda:GetDurableExecutionState
+            Resource: '*'
+
+  WaitBasic:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["2-1"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_basic/
+      Handler: bootstrap
+      Description: 'Conformance 2-1: wait basic'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitWithName:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["2-2"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_with_name/
+      Handler: bootstrap
+      Description: 'Conformance 2-2: wait with name'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitMultipleSequential:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["2-3"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_multiple_sequential/
+      Handler: bootstrap
+      Description: 'Conformance 2-3: multiple sequential waits'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitDurationUnits:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["2-4"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_duration_units/
+      Handler: bootstrap
+      Description: 'Conformance 2-4: wait with different duration units'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitLongDuration:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["2-5"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_long_duration/
+      Handler: bootstrap
+      Description: 'Conformance 2-5: wait with long duration (1 hour)'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

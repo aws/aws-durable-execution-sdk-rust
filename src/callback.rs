@@ -1,0 +1,1472 @@
+//! Callback operation execution engine.
+//!
+//! Implements `create_callback` (deferred external completion) and
+//! `wait_for_callback` (child-context wrapper around callback + submitter
+//! step).
+//!
+//! Wire shape:
+//! - `create_callback`: `OperationType::Callback`, `SubType` `"Callback"`
+//! - `wait_for_callback`: `OperationType::Context`, `SubType` `"WaitForCallback"`
+//! - Actions: Start → (Succeed | Fail)
+//! - `CallbackOptions { timeout_seconds, heartbeat_timeout_seconds }`
+//! - `CallbackDetails { callback_id, result }`
+
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+
+use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::BoxError;
+use crate::context::{DurableContext, StepContext};
+use crate::engine::{CheckpointStatus, OperationId};
+use crate::error::{
+    CallbackError, CallbackErrorKind, ChildContextError, ChildContextErrorKind, OperationError,
+    OperationErrorKind,
+};
+use crate::future::Callback;
+use crate::serdes::{Serdes, SerdesContext};
+
+/// Wire sub-type for callback operations.
+const CALLBACK_SUB_TYPE: &str = "Callback";
+
+/// Wire sub-type for wait-for-callback context operations.
+const WFCB_SUB_TYPE: &str = "WaitForCallback";
+
+/// Boxed submitter closure type used by `WaitForCallbackExecution` and
+/// `run_wfcb_body`. Receives a step context and the callback ID string,
+/// and returns a future that delivers the callback ID to an external system.
+pub(crate) type BoxedSubmitter = Box<
+    dyn FnOnce(StepContext, &str) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>
+        + Send,
+>;
+
+// ────────────────────────────────────────────────────────────────────────────
+// CreateCallbackExecution
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Internal state for `create_callback` execution passed from the builder.
+pub(crate) struct CreateCallbackExecution<O> {
+    pub(crate) ctx: DurableContext,
+    pub(crate) op_id: OperationId,
+    pub(crate) name: Option<String>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) heartbeat: Option<Duration>,
+    pub(crate) serdes: Option<Box<dyn Serdes>>,
+    pub(crate) _marker: std::marker::PhantomData<O>,
+}
+
+impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
+    /// Executes the create-callback operation: replay or live path.
+    pub(crate) async fn execute(self) -> Result<Callback<O>, OperationError> {
+        // 1. Task-ownership check.
+        self.ctx.enforce_task_ownership()?;
+
+        let positional_id = self.op_id.positional().to_owned();
+        let wire_id = self.op_id.wire().to_owned();
+
+        // 2. Check checkpoint log for replay.
+        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            match &record.status {
+                CheckpointStatus::Succeeded => {
+                    // Callback completed successfully during a previous
+                    // invocation — return settled Callback with the result.
+                    // The payload was written by an external caller, so only
+                    // the deserialize side of the serdes acts on it. Per-op
+                    // serdes wins; otherwise the execution-wide serdes decodes
+                    // it (default JSON).
+                    let callback_id = record.callback_id.clone().unwrap_or_default();
+                    let result_str = record.result.as_deref().unwrap_or("null");
+                    let serdes_ctx =
+                        SerdesContext::new(self.op_id.wire(), self.ctx.execution_arn());
+                    let value: O = deserialize_callback_result(
+                        self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                        result_str,
+                        &serdes_ctx,
+                    )?;
+                    return Ok(Callback::new_settled(callback_id, Ok(value)));
+                }
+                CheckpointStatus::Failed => {
+                    // Callback failed externally.
+                    let callback_id = record.callback_id.clone().unwrap_or_default();
+                    let error_type = record.error_type.as_deref().unwrap_or("Error").to_owned();
+                    let error_message = record
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("callback failed")
+                        .to_owned();
+                    let kind = classify_callback_error(&error_type, &error_message);
+                    let err = OperationError::from_kind(OperationErrorKind::Callback(
+                        CallbackError::from_kind(kind),
+                    ));
+                    return Ok(Callback::new_settled(callback_id, Err(err)));
+                }
+                CheckpointStatus::TimedOut => {
+                    // Callback timed out.
+                    let callback_id = record.callback_id.clone().unwrap_or_default();
+                    let kind = CallbackErrorKind::TimedOut;
+                    let err = OperationError::from_kind(OperationErrorKind::Callback(
+                        CallbackError::from_kind(kind),
+                    ));
+                    return Ok(Callback::new_settled(callback_id, Err(err)));
+                }
+                CheckpointStatus::Started | CheckpointStatus::Pending => {
+                    // Callback is in flight — return pending (will suspend on
+                    // .result()).
+                    let callback_id = record.callback_id.clone().unwrap_or_default();
+                    return Ok(Callback::new_pending(callback_id, self.ctx.clone()));
+                }
+                _ => {
+                    // Unexpected status — treat as internal error.
+                    return Err(callback_internal_error(&format!(
+                        "unexpected checkpointed status: {:?}",
+                        record.status
+                    )));
+                }
+            }
+        }
+
+        // 3. First invocation — checkpoint START with callback options.
+        let mut builder = OperationUpdate::builder()
+            .id(wire_id.clone())
+            .r#type(OperationType::Callback)
+            .sub_type(CALLBACK_SUB_TYPE.to_owned())
+            .action(OperationAction::Start);
+
+        if let Some(n) = &self.name {
+            builder = builder.name(n.clone());
+        }
+        if let Some(parent_wire) = self.ctx.parent_wire_id_computed() {
+            builder = builder.parent_id(parent_wire);
+        }
+
+        // Build callback options if timeout or heartbeat is set.
+        let cb_opts = build_callback_options(self.timeout, self.heartbeat);
+        if let Some(opts) = cb_opts {
+            builder = builder.callback_options(opts);
+        }
+
+        #[allow(clippy::expect_used)] // reason: all required fields set above
+        let update = builder
+            .build()
+            .expect("all required OperationUpdate fields set");
+
+        self.ctx
+            .checkpoint_updates(vec![update])
+            .await
+            .map_err(|e| callback_internal_error(&format!("checkpoint start: {e}")))?;
+
+        // After checkpointing START, the backend assigns a callback_id.
+        // Read it from the (now-updated) checkpoint log.
+        let callback_id = self
+            .ctx
+            .checkpoint_record(&positional_id)
+            .and_then(|r| r.callback_id.clone())
+            .unwrap_or_default();
+
+        // Return pending — Result() will fire suspend.
+        Ok(Callback::new_pending(callback_id, self.ctx.clone()))
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// WaitForCallbackExecution
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Internal state for `wait_for_callback` execution passed from the builder.
+pub(crate) struct WaitForCallbackExecution<O> {
+    pub(crate) ctx: DurableContext,
+    pub(crate) op_id: OperationId,
+    pub(crate) name: Option<String>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) heartbeat: Option<Duration>,
+    pub(crate) submitter: BoxedSubmitter,
+    pub(crate) submitter_retry: Option<crate::RetryStrategy>,
+    pub(crate) serdes: Option<Box<dyn Serdes>>,
+    pub(crate) _marker: std::marker::PhantomData<O>,
+}
+
+impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<O> {
+    /// Executes the wait-for-callback operation: replay or live path.
+    #[allow(clippy::too_many_lines)] // reason: child context execution has distinct replay/live paths that read better as one flow
+    pub(crate) async fn execute(self) -> Result<O, OperationError> {
+        // 1. Task-ownership check.
+        self.ctx.enforce_task_ownership()?;
+
+        let positional_id = self.op_id.positional().to_owned();
+        let wire_id = self.op_id.wire().to_owned();
+
+        // Clone ctx/op_id/name BEFORE consuming self.
+        let ctx = self.ctx.clone();
+        let name = self.name.clone();
+
+        // 2. Check checkpoint log for replay (context-level terminal).
+        if let Some(record) = ctx.checkpoint_record(&positional_id) {
+            match &record.status {
+                CheckpointStatus::Succeeded => {
+                    // WaitForCallback context completed — deserialize result.
+                    let result_str = record.result.as_deref().unwrap_or("null");
+                    let value: O = serde_json::from_str(result_str)
+                        .map_err(|e| wfcb_internal_error(&format!("deserialize result: {e}")))?;
+                    return Ok(value);
+                }
+                CheckpointStatus::Failed => {
+                    // Context failed — classify the error.
+                    return Err(wfcb_failed_error(
+                        record.error_type.as_deref(),
+                        record.error_message.as_deref(),
+                    ));
+                }
+                // Started/Pending/Ready: fall through to execute/resume.
+                _ => {}
+            }
+        } else {
+            // 3. First invocation — checkpoint ContextStarted.
+            let update = build_wfcb_update(&wire_id, name.as_deref(), OperationAction::Start, &ctx);
+            ctx.checkpoint_updates(vec![update])
+                .await
+                .map_err(|e| wfcb_internal_error(&format!("checkpoint start: {e}")))?;
+        }
+
+        // 4. Create child context with chained prefix.
+        let child_ctx = ctx.new_child(&positional_id);
+
+        // 5. Run inner body: create_callback + submitter step + await result.
+        let body_result = run_wfcb_body::<O>(
+            child_ctx,
+            self.timeout,
+            self.heartbeat,
+            self.submitter,
+            self.submitter_retry,
+            self.serdes,
+        )
+        .await;
+
+        match body_result {
+            Ok(value) => {
+                // 6a. Success — serialize and checkpoint ContextSucceeded.
+                let serialized = serde_json::to_string(&value)
+                    .map_err(|e| wfcb_internal_error(&format!("serialize result: {e}")))?;
+                let mut builder = OperationUpdate::builder()
+                    .id(wire_id.clone())
+                    .r#type(OperationType::Context)
+                    .sub_type(WFCB_SUB_TYPE.to_owned())
+                    .action(OperationAction::Succeed)
+                    .payload(serialized.clone());
+                if let Some(n) = &name {
+                    builder = builder.name(n.clone());
+                }
+                if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+                    builder = builder.parent_id(parent_wire);
+                }
+                #[allow(clippy::expect_used)] // reason: all required fields set above
+                let update = builder
+                    .build()
+                    .expect("all required OperationUpdate fields set");
+
+                ctx.checkpoint_updates(vec![update])
+                    .await
+                    .map_err(|e| wfcb_internal_error(&format!("checkpoint succeed: {e}")))?;
+
+                // Round-trip deserialize for consistency.
+                let out: O = serde_json::from_str(&serialized)
+                    .map_err(|e| wfcb_internal_error(&format!("deserialize result: {e}")))?;
+                Ok(out)
+            }
+            Err(err) => {
+                // 6b. Failure — checkpoint ContextFailed.
+                let (err_type, err_msg) = extract_error_info(&err);
+                let mut builder = OperationUpdate::builder()
+                    .id(wire_id.clone())
+                    .r#type(OperationType::Context)
+                    .sub_type(WFCB_SUB_TYPE.to_owned())
+                    .action(OperationAction::Fail);
+                if let Some(n) = &name {
+                    builder = builder.name(n.clone());
+                }
+                if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+                    builder = builder.parent_id(parent_wire);
+                }
+                builder = builder.error(
+                    aws_sdk_lambda::types::ErrorObject::builder()
+                        .error_type(err_type)
+                        .error_message(err_msg)
+                        .build(),
+                );
+                #[allow(clippy::expect_used)] // reason: all required fields set above
+                let update = builder
+                    .build()
+                    .expect("all required OperationUpdate fields set");
+
+                // Best-effort checkpoint — if it fails, return original error.
+                let _ = ctx.checkpoint_updates(vec![update]).await;
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Inner body of `wait_for_callback`: create callback, run submitter step,
+/// await result.
+///
+/// The submitter is executed as a proper step operation (producing
+/// `StepStarted`/`StepSucceeded`/`StepFailed` checkpoint events).
+async fn run_wfcb_body<O: DeserializeOwned + Send + 'static>(
+    child_ctx: DurableContext,
+    timeout: Option<Duration>,
+    heartbeat: Option<Duration>,
+    submitter: BoxedSubmitter,
+    submitter_retry: Option<crate::RetryStrategy>,
+    serdes: Option<Box<dyn Serdes>>,
+) -> Result<O, OperationError> {
+    // Step 1: create the inner callback (no name, per wire spec). The per-op
+    // serdes flows through to the inner callback's decode so a serdes set on
+    // wait_for_callback actually reaches the delivered payload.
+    let cb_exec: CreateCallbackExecution<O> = CreateCallbackExecution {
+        ctx: child_ctx.clone(),
+        op_id: child_ctx.mint_id(),
+        name: None,
+        timeout,
+        heartbeat,
+        serdes,
+        _marker: std::marker::PhantomData,
+    };
+    let cb = cb_exec.execute().await?;
+
+    // Step 2: run the submitter as a proper step operation.
+    // This produces StepStarted/StepSucceeded (or StepFailed) events in the
+    // checkpoint log, matching the wire protocol expectation. The step is
+    // unnamed (empty-string equivalent).
+    let callback_id = cb.id().to_owned();
+    let step_exec: crate::step::StepExecution<()> = crate::step::StepExecution {
+        ctx: child_ctx.clone(),
+        op_id: child_ctx.mint_id(),
+        name: None,
+        retry_strategy: submitter_retry,
+        serdes: None,
+        semantics: crate::step::StepSemantics::default(),
+        closure: Box::new(move |step_ctx| {
+            Box::pin(async move {
+                (submitter)(step_ctx, &callback_id)
+                    .await
+                    .map_err(|e| -> BoxError { e })?;
+                Ok(())
+            })
+        }),
+    };
+    let step_result = step_exec.execute().await;
+    if let Err(e) = step_result {
+        // Map step errors to child-context errors for consistent error
+        // propagation through the WaitForCallback context boundary.
+        return Err(OperationError::from_kind(OperationErrorKind::ChildContext(
+            ChildContextError::from_kind(ChildContextErrorKind::ChildFailed {
+                message: e.to_string(),
+            }),
+        )));
+    }
+
+    // Step 3: await callback result.
+    cb.result().await
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Builds the wire `CallbackOptions` from timeout/heartbeat durations.
+/// Returns `None` when neither is set.
+fn build_callback_options(
+    timeout: Option<Duration>,
+    heartbeat: Option<Duration>,
+) -> Option<aws_sdk_lambda::types::CallbackOptions> {
+    #[allow(clippy::cast_possible_truncation)] // reason: duration ≤ i32::MAX for practical timers
+    #[allow(clippy::cast_sign_loss)] // reason: ceil is non-negative
+    let timeout_secs = timeout.map_or(0, |d| {
+        (d.as_secs_f64().ceil() as i64).min(i64::from(i32::MAX)) as i32
+    });
+    #[allow(clippy::cast_possible_truncation)] // reason: duration ≤ i32::MAX for practical timers
+    #[allow(clippy::cast_sign_loss)] // reason: ceil is non-negative
+    let heartbeat_secs = heartbeat.map_or(0, |d| {
+        (d.as_secs_f64().ceil() as i64).min(i64::from(i32::MAX)) as i32
+    });
+
+    if timeout_secs == 0 && heartbeat_secs == 0 {
+        return None;
+    }
+
+    Some(
+        aws_sdk_lambda::types::CallbackOptions::builder()
+            .timeout_seconds(timeout_secs)
+            .heartbeat_timeout_seconds(heartbeat_secs)
+            .build(),
+    )
+}
+
+/// Builds a `WaitForCallback` context operation update.
+fn build_wfcb_update(
+    wire_id: &str,
+    name: Option<&str>,
+    action: OperationAction,
+    ctx: &DurableContext,
+) -> OperationUpdate {
+    let mut builder = OperationUpdate::builder()
+        .id(wire_id.to_owned())
+        .r#type(OperationType::Context)
+        .sub_type(WFCB_SUB_TYPE.to_owned())
+        .action(action);
+    if let Some(n) = name {
+        builder = builder.name(n.to_owned());
+    }
+    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+        builder = builder.parent_id(parent_wire);
+    }
+    #[allow(clippy::expect_used)] // reason: all required fields set above
+    builder
+        .build()
+        .expect("all required OperationUpdate fields set")
+}
+
+/// Classifies a callback error from the wire error type/message.
+fn classify_callback_error(error_type: &str, error_message: &str) -> CallbackErrorKind {
+    match error_type {
+        "Callback.Timeout" => CallbackErrorKind::TimedOut,
+        "Callback.Heartbeat" => CallbackErrorKind::HeartbeatTimedOut,
+        _ => CallbackErrorKind::ExternalFailure {
+            error_type: error_type.to_owned(),
+            message: error_message.to_owned(),
+        },
+    }
+}
+
+/// Constructs the appropriate error for a failed `WaitForCallback` context.
+fn wfcb_failed_error(error_type: Option<&str>, error_message: Option<&str>) -> OperationError {
+    let err_type = error_type.unwrap_or("Error");
+    let err_msg = error_message.unwrap_or("wait-for-callback failed");
+
+    // Propagate callback errors directly (they bubble through the
+    // child-context wrapping on the wire).
+    if err_type == "Callback.Timeout"
+        || err_type == "Callback.Heartbeat"
+        || err_type == "CallbackError"
+    {
+        let kind = classify_callback_error(err_type, err_msg);
+        return OperationError::from_kind(OperationErrorKind::Callback(CallbackError::from_kind(
+            kind,
+        )));
+    }
+
+    OperationError::from_kind(OperationErrorKind::ChildContext(
+        ChildContextError::from_kind(ChildContextErrorKind::ChildFailed {
+            message: err_msg.to_owned(),
+        }),
+    ))
+}
+
+/// Extracts error type and message from an `OperationError`.
+fn extract_error_info(err: &OperationError) -> (String, String) {
+    match err.kind() {
+        OperationErrorKind::Callback(cb_err) => match cb_err.kind() {
+            CallbackErrorKind::TimedOut => (
+                "Callback.Timeout".to_owned(),
+                "callback timed out".to_owned(),
+            ),
+            CallbackErrorKind::HeartbeatTimedOut => (
+                "Callback.Heartbeat".to_owned(),
+                "heartbeat timed out".to_owned(),
+            ),
+            CallbackErrorKind::ExternalFailure {
+                error_type,
+                message,
+            } => (error_type.clone(), message.clone()),
+            CallbackErrorKind::DeserializationFailed { message } => {
+                ("DeserializationError".to_owned(), message.clone())
+            }
+            CallbackErrorKind::Internal { message } => {
+                ("InternalError".to_owned(), message.clone())
+            }
+        },
+        _ => ("Error".to_owned(), err.to_string()),
+    }
+}
+
+/// Creates a callback deserialization error.
+fn callback_deser_error(e: &serde_json::Error) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Callback(CallbackError::from_kind(
+        CallbackErrorKind::DeserializationFailed {
+            message: e.to_string(),
+        },
+    )))
+}
+
+/// Creates a callback deserialization error from a message.
+fn callback_deser_error_msg(message: String) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Callback(CallbackError::from_kind(
+        CallbackErrorKind::DeserializationFailed { message },
+    )))
+}
+
+/// Decodes an externally-delivered callback payload into the target type.
+///
+/// The payload is produced by an external caller, so only the deserialize
+/// side of the serdes is meaningful: `serdes` (when present) transforms the
+/// wire payload back to a JSON string, which is then parsed into `O`. With no
+/// serdes the payload is parsed as JSON directly.
+fn deserialize_callback_result<O: DeserializeOwned>(
+    serdes: Option<&dyn Serdes>,
+    payload: &str,
+    serdes_ctx: &SerdesContext,
+) -> Result<O, OperationError> {
+    let json_str = if let Some(s) = serdes {
+        s.deserialize_from_string_with_context(payload, serdes_ctx)
+            .map_err(|e| callback_deser_error_msg(format!("callback serdes: {e}")))?
+    } else {
+        payload.to_owned()
+    };
+
+    serde_json::from_str(&json_str).map_err(|e| callback_deser_error(&e))
+}
+
+/// Creates a callback internal error.
+fn callback_internal_error(msg: &str) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Callback(CallbackError::from_kind(
+        CallbackErrorKind::Internal {
+            message: msg.to_owned(),
+        },
+    )))
+}
+
+/// Creates a wait-for-callback internal error.
+fn wfcb_internal_error(msg: &str) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::ChildContext(
+        ChildContextError::from_kind(ChildContextErrorKind::Internal {
+            message: msg.to_owned(),
+        }),
+    ))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tests
+// ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // reason: test assertions
+#[allow(clippy::expect_used)] // reason: test assertions
+#[allow(clippy::panic)] // reason: test assertions with descriptive messages
+mod tests {
+    use super::*;
+    use crate::client::InMemoryExecutionClient;
+    use crate::engine::{CheckpointLog, CheckpointRecord};
+    use std::sync::Arc;
+
+    /// Helper: create a context with a preloaded checkpoint log.
+    fn ctx_with_log(records: Vec<(String, CheckpointRecord)>) -> DurableContext {
+        let log = CheckpointLog::from_records(records);
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:123:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+            client,
+            "token-1".to_owned(),
+        )
+    }
+
+    /// Helper: build a checkpoint record for callback operations.
+    fn callback_record(
+        wire_id: &str,
+        status: CheckpointStatus,
+        result: Option<&str>,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        callback_id: Option<&str>,
+    ) -> (String, CheckpointRecord) {
+        (
+            wire_id.to_owned(),
+            CheckpointRecord {
+                id: wire_id.to_owned(),
+                status,
+                result: result.map(String::from),
+                error_type: error_type.map(String::from),
+                error_message: error_message.map(String::from),
+                attempt: 0,
+                invoke_result: None,
+                invoke_error_type: None,
+                invoke_error_message: None,
+                replay_children: false,
+                callback_id: callback_id.map(String::from),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn replay_succeeded() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            Some(r#""hello""#),
+            None,
+            None,
+            Some("cb-123"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("test".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should succeed");
+        assert_eq!(cb.id(), "cb-123");
+        let value = cb.result().await.expect("should have value");
+        assert_eq!(value, "hello");
+    }
+
+    /// A callback result is a [`DurableFuture`], so it participates in the
+    /// durable combinators like any other durable operation. Here a settled
+    /// callback wins a `race` against a slow future.
+    #[tokio::test]
+    async fn result_participates_in_race_combinator() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            Some(r#""callback-wins""#),
+            None,
+            None,
+            Some("cb-race"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("racer".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should succeed");
+
+        let slow = crate::future::DurableFuture::from_async(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok("slow".to_owned())
+        });
+
+        let winner = ctx
+            .race([cb.result(), slow])
+            .await
+            .expect("race should resolve with the callback value");
+        assert_eq!(winner, "callback-wins");
+    }
+
+    /// A settled callback result composes with `try_join_all` alongside
+    /// other durable futures.
+    #[tokio::test]
+    async fn result_participates_in_try_join_all_combinator() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            Some(r#""from-callback""#),
+            None,
+            None,
+            Some("cb-join"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("joiner".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should succeed");
+
+        let other = crate::future::DurableFuture::from_async(async { Ok("plain".to_owned()) });
+
+        let values = ctx
+            .try_join_all([cb.result(), other])
+            .await
+            .expect("try_join_all should resolve");
+        assert_eq!(values, vec!["from-callback".to_owned(), "plain".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn replay_timed_out() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::TimedOut,
+            None,
+            None,
+            None,
+            Some("cb-456"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: Some(Duration::from_secs(5)),
+            heartbeat: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should return callback");
+        let err = cb.result().await.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::Callback(e)
+                if matches!(e.kind(), CallbackErrorKind::TimedOut)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_heartbeat_timed_out() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Failed,
+            None,
+            Some("Callback.Heartbeat"),
+            Some("heartbeat timed out"),
+            Some("cb-789"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: Some(Duration::from_secs(10)),
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should return callback");
+        let err = cb.result().await.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::Callback(e)
+                if matches!(e.kind(), CallbackErrorKind::HeartbeatTimedOut)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_external_failure() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Failed,
+            None,
+            Some("ValidationError"),
+            Some("invalid input"),
+            Some("cb-fail"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should return callback");
+        let err = cb.result().await.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::Callback(e)
+                if matches!(e.kind(), CallbackErrorKind::ExternalFailure { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn live_returns_assigned_id() {
+        // Empty checkpoint log — first invocation.
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client,
+            "token-1".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("my-cb".to_owned()),
+            timeout: Some(Duration::from_mins(1)),
+            heartbeat: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should succeed");
+        // The InMemoryClient doesn't assign callback IDs, so it's empty.
+        assert_eq!(cb.id(), "");
+    }
+
+    #[tokio::test]
+    async fn id_stable_across_replay() {
+        // Verify the operation ID is stable.
+        let wire1 = crate::engine::compute_wire_id_public("1");
+        let wire2 = crate::engine::compute_wire_id_public("1");
+        assert_eq!(wire1, wire2);
+    }
+
+    #[tokio::test]
+    async fn wfcb_replay_succeeded() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            Some(r#""done""#),
+            None,
+            None,
+            None,
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("wfcb-test".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            submitter: Box::new(|_sc, _id| Box::pin(async { Ok(()) })),
+            submitter_retry: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let result = exec.execute().await.expect("should succeed");
+        assert_eq!(result, "done");
+    }
+
+    #[tokio::test]
+    async fn wfcb_replay_timed_out() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Failed,
+            None,
+            Some("Callback.Timeout"),
+            Some("callback timed out"),
+            None,
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            submitter: Box::new(|_sc, _id| Box::pin(async { Ok(()) })),
+            submitter_retry: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let err = exec.execute().await.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::Callback(e)
+                if matches!(e.kind(), CallbackErrorKind::TimedOut)
+        ));
+    }
+
+    #[tokio::test]
+    async fn wfcb_replay_heartbeat_timed_out() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Failed,
+            None,
+            Some("Callback.Heartbeat"),
+            Some("heartbeat timed out"),
+            None,
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            submitter: Box::new(|_sc, _id| Box::pin(async { Ok(()) })),
+            submitter_retry: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let err = exec.execute().await.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::Callback(e)
+                if matches!(e.kind(), CallbackErrorKind::HeartbeatTimedOut)
+        ));
+    }
+
+    #[tokio::test]
+    async fn wfcb_submitter_failure_propagates() {
+        // When the submitter closure returns an error, the step execution
+        // path uses the default retry strategy. On first failure, it
+        // schedules a retry (checkpoint + suspend), and the error propagates
+        // as a ChildContext/ChildFailed wrapping the step error.
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client,
+            "token-1".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("sub-fail-test".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            submitter: Box::new(|_sc, _id| Box::pin(async { Err("submitter exploded".into()) })),
+            submitter_retry: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        // The submitter step fails; the default retry strategy schedules a
+        // retry (backend-owned timer), which suspends the invocation instead
+        // of surfacing a fabricated error to the caller.
+        let signal = Arc::clone(ctx.suspension_signal());
+        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+    }
+
+    #[tokio::test]
+    async fn create_callback_spawn_executes() {
+        // Verify that spawning a CreateCallbackBuilder returns a future
+        // that resolves (live path — will checkpoint then return pending).
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client,
+            "token-1".to_owned(),
+        );
+        // Use the builder's spawn path.
+        let future = ctx.create_callback::<String>().name("spawn-test").spawn();
+        let cb = future.await.expect("spawn should produce callback");
+        // Live path returns empty callback_id from InMemoryClient.
+        assert_eq!(cb.id(), "");
+    }
+
+    #[tokio::test]
+    async fn create_callback_ownership_rejects_foreign_task() {
+        // Verify that calling from an unblessed task triggers an ownership
+        // error (same pattern as invoke/step ownership tests).
+        let result = tokio::spawn(async {
+            let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+            let log = Arc::new(CheckpointLog::empty());
+            let ctx = DurableContext::new_root_with_client(
+                "arn:test".to_owned(),
+                lambda_runtime::Context::default(),
+                log,
+                client,
+                "token-1".to_owned(),
+            );
+
+            // Spawn a DIFFERENT (non-blessed) task.
+            let ctx_clone = ctx.clone();
+            let handle = tokio::spawn(async move {
+                let op_id = ctx_clone.mint_id();
+                let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+                    ctx: ctx_clone,
+                    op_id,
+                    name: None,
+                    timeout: None,
+                    heartbeat: None,
+                    serdes: None,
+                    _marker: std::marker::PhantomData,
+                };
+                exec.execute().await
+            });
+
+            handle.await.unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("task") || err_msg.contains("owner"),
+            "expected ownership error, got: {err_msg}"
+        );
+    }
+
+    // ── Submitter-as-step tests (verifies the fix for missing StepStarted/
+    //    StepSucceeded events in the WaitForCallback child context) ──────
+
+    #[tokio::test]
+    async fn wfcb_submitter_executes_as_step_with_checkpoints() {
+        // The submitter must go through StepExecution, producing checkpoint
+        // calls for StepStarted and StepSucceeded. With the child context's
+        // callback START checkpoint, we expect at least 4 checkpoint calls:
+        //   1. ContextStarted (from WaitForCallbackExecution)
+        //   2. CallbackStarted (from CreateCallbackExecution)
+        //   3. StepStarted (from StepExecution wrapping submitter)
+        //   4. StepSucceeded (from StepExecution wrapping submitter)
+        // Plus ContextSucceeded for the outer context.
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token-1".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+
+        let submitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let submitted_clone = Arc::clone(&submitted);
+
+        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("step-check".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            submitter: Box::new(move |_sc, _id| {
+                submitted_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }),
+            submitter_retry: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+
+        // The callback result will suspend (pending), so the execution
+        // will error at cb.result(). We just need to verify that the
+        // submitter ran and checkpoints were produced.
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.suspension_signal()),
+            exec.execute(),
+        )
+        .await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+
+        // Verify submitter was called.
+        assert!(
+            submitted.load(std::sync::atomic::Ordering::SeqCst),
+            "submitter should have been invoked"
+        );
+
+        // Verify checkpoint calls were made (at minimum: ContextStart,
+        // CallbackStart, StepStart, StepSucceed).
+        let call_count = *client
+            .checkpoint_call_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            call_count >= 4,
+            "expected at least 4 checkpoint calls (ContextStart + CallbackStart + \
+             StepStart + StepSucceed), got {call_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wfcb_submitter_replay_skips_re_execution() {
+        // When the submitter step is already checkpointed as Succeeded,
+        // replay should NOT re-invoke the submitter closure.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build a checkpoint log that has:
+        //   pos "1" → ContextStarted (WaitForCallback context) [Status: Started]
+        //   child prefix = "1", so child ops are:
+        //   pos "1-1" → CallbackStarted [Status: Started, callback_id set]
+        //   pos "1-2" → StepSucceeded  [the submitter step]
+        //   Then the callback is still pending (no terminal status) so the
+        //   execution suspends — but the submitter must NOT re-run.
+        let wfcb_wire = crate::engine::compute_wire_id_public("1");
+        let cb_wire = crate::engine::compute_wire_id_public("1-1");
+        let step_wire = crate::engine::compute_wire_id_public("1-2");
+
+        let ctx = ctx_with_log(vec![
+            // WaitForCallback context: Started (non-terminal, fall through).
+            (
+                wfcb_wire.clone(),
+                CheckpointRecord {
+                    id: wfcb_wire,
+                    status: CheckpointStatus::Started,
+                    result: None,
+                    error_type: None,
+                    error_message: None,
+                    attempt: 0,
+                    invoke_result: None,
+                    invoke_error_type: None,
+                    invoke_error_message: None,
+                    replay_children: false,
+                    callback_id: None,
+                },
+            ),
+            // Callback: Started (pending — will suspend on .result()).
+            (
+                cb_wire.clone(),
+                CheckpointRecord {
+                    id: cb_wire,
+                    status: CheckpointStatus::Started,
+                    result: None,
+                    error_type: None,
+                    error_message: None,
+                    attempt: 0,
+                    invoke_result: None,
+                    invoke_error_type: None,
+                    invoke_error_message: None,
+                    replay_children: false,
+                    callback_id: Some("cb-replay-test".to_owned()),
+                },
+            ),
+            // Submitter step: Succeeded (replay — should not re-invoke).
+            (
+                step_wire.clone(),
+                CheckpointRecord {
+                    id: step_wire,
+                    status: CheckpointStatus::Succeeded,
+                    result: Some("null".to_owned()),
+                    error_type: None,
+                    error_message: None,
+                    attempt: 0,
+                    invoke_result: None,
+                    invoke_error_type: None,
+                    invoke_error_message: None,
+                    replay_children: false,
+                    callback_id: None,
+                },
+            ),
+        ]);
+
+        let submitter_called = Arc::new(AtomicBool::new(false));
+        let submitter_called_clone = Arc::clone(&submitter_called);
+
+        let op_id = ctx.mint_id();
+        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("replay-test".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            submitter: Box::new(move |_sc, _id| {
+                submitter_called_clone.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }),
+            submitter_retry: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+
+        // Execution should suspend at callback.result() since the callback
+        // is pending. But the submitter must NOT have been re-invoked.
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.suspension_signal()),
+            exec.execute(),
+        )
+        .await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+
+        assert!(
+            !submitter_called.load(Ordering::SeqCst),
+            "submitter should NOT be re-invoked during replay of a succeeded step"
+        );
+    }
+
+    #[tokio::test]
+    async fn wfcb_submitter_failure_checkpoints_step_and_propagates() {
+        // When the submitter fails, the step should checkpoint failure and
+        // the error should propagate as ChildFailed through the context.
+        // Verify that checkpoints are produced (StepStart + StepFail/Retry).
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token-1".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+
+        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("fail-check".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            submitter: Box::new(|_sc, _id| Box::pin(async { Err("submission failed".into()) })),
+            submitter_retry: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+
+        // The submitter step fails; the default retry strategy schedules a
+        // retry (backend-owned timer), which suspends the invocation instead
+        // of surfacing a fabricated error to the caller.
+        let signal = Arc::clone(ctx.suspension_signal());
+        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+
+        // Verify checkpoint calls were made for the step execution path:
+        //   1. ContextStarted
+        //   2. CallbackStarted
+        //   3. StepStarted
+        //   4. StepRetry or StepFail (depends on default retry strategy)
+        //   5+. Possible ContextFailed
+        let call_count = *client
+            .checkpoint_call_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            call_count >= 4,
+            "expected at least 4 checkpoint calls for failed submitter path, got {call_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wfcb_submitter_receives_step_context_with_attempt() {
+        // Verify the submitter closure receives a StepContext with
+        // the correct attempt number (from the step execution path).
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token-1".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+
+        let received_attempt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let received_attempt_clone = Arc::clone(&received_attempt);
+
+        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("attempt-check".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            submitter: Box::new(move |sc, _id| {
+                received_attempt_clone.store(sc.attempt(), std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }),
+            submitter_retry: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+
+        // Execute — will suspend at callback result, but submitter runs.
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.suspension_signal()),
+            exec.execute(),
+        )
+        .await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+
+        // First invocation: attempt should be 1 (1-based from StepExecution).
+        let attempt = received_attempt.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            attempt, 1,
+            "submitter should receive attempt=1 on first invocation, got {attempt}"
+        );
+    }
+
+    // ── Callback payload serdes tests ───────────────────────────────────
+
+    /// Test serdes that expects a non-JSON `MARK:` prefix on the wire payload
+    /// and strips it on the deserialize side. Plain `serde_json` cannot decode
+    /// a `MARK:`-prefixed payload, so a successful decode proves this serdes
+    /// was actually consulted on the callback path.
+    #[derive(Debug)]
+    struct MarkerSerdes;
+
+    impl Serdes for MarkerSerdes {
+        fn serialize(&self, _value: &dyn std::any::Any) -> Result<Vec<u8>, BoxError> {
+            Ok(Vec::new())
+        }
+
+        fn deserialize_bytes(
+            &self,
+            _bytes: &[u8],
+            _type_name: &str,
+        ) -> Result<Box<dyn std::any::Any + Send>, BoxError> {
+            Ok(Box::new(()))
+        }
+
+        fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
+            payload
+                .strip_prefix("MARK:")
+                .map(str::to_owned)
+                .ok_or_else(|| "missing MARK: prefix".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_per_op_serdes_decodes_non_json_payload() {
+        // A per-op serdes decodes a payload that plain JSON cannot parse.
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            Some(r#"MARK:"hello""#),
+            None,
+            None,
+            Some("cb-marker"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            serdes: Some(Box::new(MarkerSerdes)),
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should settle");
+        let value = cb.result().await.expect("per-op serdes should decode");
+        assert_eq!(value, "hello");
+    }
+
+    #[tokio::test]
+    async fn callback_marker_payload_fails_without_serdes() {
+        // Control: the same MARK:-prefixed payload is NOT valid JSON, so with
+        // no serdes (and no execution-wide serdes) the decode must fail. This
+        // proves the serdes is what makes the override/fallback tests pass.
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            Some(r#"MARK:"hello""#),
+            None,
+            None,
+            Some("cb-marker"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let err = exec.execute().await.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::Callback(e)
+                if matches!(e.kind(), CallbackErrorKind::DeserializationFailed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn callback_falls_back_to_execution_wide_serdes() {
+        // With no per-op serdes, the decode falls back to the execution-wide
+        // serdes threaded in from Options (Java+Go model).
+        let wire = crate::engine::compute_wire_id_public("1");
+        let log = CheckpointLog::from_records(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            Some(r#"MARK:"world""#),
+            None,
+            None,
+            Some("cb-fallback"),
+        )]);
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:123:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+            client,
+            "token-1".to_owned(),
+            Some(Arc::new(MarkerSerdes)),
+        );
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            serdes: None,
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should settle via fallback");
+        let value = cb
+            .result()
+            .await
+            .expect("execution-wide serdes should decode");
+        assert_eq!(value, "world");
+    }
+
+    #[tokio::test]
+    async fn wfcb_per_op_serdes_threads_to_inner_decode() {
+        // A serdes set on wait_for_callback must reach the inner callback's
+        // decode of the delivered payload. The MARK:-prefixed payload is not
+        // valid JSON, so a correct result proves the per-op serdes was
+        // threaded through to the inner decode (the Go non-wiring quirk is
+        // deliberately not replicated).
+        let wfcb_wire = crate::engine::compute_wire_id_public("1");
+        let cb_wire = crate::engine::compute_wire_id_public("1-1");
+        let step_wire = crate::engine::compute_wire_id_public("1-2");
+
+        let ctx = ctx_with_log(vec![
+            // WaitForCallback context: Started (non-terminal, fall through).
+            callback_record(
+                &wfcb_wire,
+                CheckpointStatus::Started,
+                None,
+                None,
+                None,
+                None,
+            ),
+            // Inner callback: Succeeded with a non-JSON marker payload.
+            callback_record(
+                &cb_wire,
+                CheckpointStatus::Succeeded,
+                Some(r#"MARK:"wfcb""#),
+                None,
+                None,
+                Some("cb-wfcb"),
+            ),
+            // Submitter step: Succeeded (replay — not re-invoked).
+            callback_record(
+                &step_wire,
+                CheckpointStatus::Succeeded,
+                Some("null"),
+                None,
+                None,
+                None,
+            ),
+        ]);
+        let op_id = ctx.mint_id();
+        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("wfcb-serdes".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            submitter: Box::new(|_sc, _id| Box::pin(async { Ok(()) })),
+            submitter_retry: None,
+            serdes: Some(Box::new(MarkerSerdes)),
+            _marker: std::marker::PhantomData,
+        };
+        let result = exec
+            .execute()
+            .await
+            .expect("wfcb should decode via threaded serdes");
+        assert_eq!(result, "wfcb");
+    }
+}

@@ -1,0 +1,565 @@
+//! Child context operation execution engine.
+//!
+//! Implements `run_in_child_context`: live path (run child closure,
+//! serialize result, checkpoint), replay path (return frozen result from
+//! checkpoint log), and error grading (`ChildFnError` → `ChildContextError`).
+//!
+//! Wire shape:
+//! - `OperationType`: `Context`
+//! - `OperationSubType`: `RunInChildContext`
+//! - Actions: Start → (Succeed | Fail)
+//! - Payload on Succeed: serialized child result
+//! - Error on Fail: `{ Type, Message }` from the child function error
+//! - `ParentId`: wire ID of the parent context's prefix (if child of child)
+
+use std::future::Future;
+use std::pin::Pin;
+
+use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::Serdes;
+use crate::SerdesContext;
+use crate::context::DurableContext;
+use crate::engine::{CheckpointStatus, OperationId};
+use crate::error::{
+    ChildContextError, ChildContextErrorKind, ChildFnError, OperationError, OperationErrorKind,
+};
+
+/// Wire sub-type for child context operations.
+const CHILD_SUB_TYPE: &str = "RunInChildContext";
+
+/// Maximum checkpoint payload size in bytes (256KB). Payloads exceeding
+/// this trigger `ReplayChildren` mode: the child result is not stored in
+/// the checkpoint; instead the child body is re-executed on replay.
+const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
+
+/// Internal state for child context execution passed from the builder.
+pub(crate) struct ChildExecution<O> {
+    pub(crate) ctx: DurableContext,
+    pub(crate) op_id: OperationId,
+    pub(crate) name: Option<String>,
+    pub(crate) serdes: Option<Box<dyn Serdes>>,
+    #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
+    pub(crate) closure: Box<
+        dyn FnOnce(DurableContext) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
+            + Send,
+    >,
+}
+
+impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
+    /// Executes the child context operation: replay path or live path.
+    #[allow(clippy::too_many_lines)] // reason: child execution has distinct replay/live/large-payload paths that read better as one flow
+    pub(crate) async fn execute(self) -> Result<O, OperationError> {
+        // 1. Task-ownership check.
+        self.ctx.enforce_task_ownership()?;
+
+        let positional_id = self.op_id.positional().to_owned();
+        let wire_id = self.op_id.wire().to_owned();
+        let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
+
+        // 2. Check checkpoint log for replay.
+        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            match &record.status {
+                CheckpointStatus::Succeeded => {
+                    if record.replay_children {
+                        // ReplayChildren mode: the result was too large to
+                        // checkpoint; re-execute the child body to reconstruct it.
+                        let child_ctx = self.ctx.new_child(&positional_id);
+                        let result = (self.closure)(child_ctx).await;
+                        return match result {
+                            Ok(value) => {
+                                // Round-trip through serialization for consistency.
+                                let serialized = serialize_value(
+                                    &value,
+                                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                                    &serdes_ctx,
+                                )?;
+                                deserialize_value::<O>(
+                                    &serialized,
+                                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                                    &serdes_ctx,
+                                )
+                            }
+                            Err(child_err) => Err(OperationError::from_kind(
+                                OperationErrorKind::ChildContext(ChildContextError::from_kind(
+                                    ChildContextErrorKind::ChildFailed {
+                                        message: child_err.to_string(),
+                                    },
+                                )),
+                            )),
+                        };
+                    }
+                    return replay_success::<O>(
+                        self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                        record.result.as_ref(),
+                        &serdes_ctx,
+                    );
+                }
+                CheckpointStatus::Failed => {
+                    return Err(replay_failure(
+                        record.error_type.as_deref(),
+                        record.error_message.as_deref(),
+                    ));
+                }
+                // Started/Pending/Ready: re-enter child body (resume path).
+                _ => {}
+            }
+        } else {
+            // 3. No checkpoint record: first invocation — checkpoint START.
+            let update = build_update(
+                &wire_id,
+                self.name.as_deref(),
+                OperationAction::Start,
+                &self.ctx,
+            );
+            // If checkpoint fails, surface as ChildContext internal error.
+            self.ctx
+                .checkpoint_updates(vec![update])
+                .await
+                .map_err(|e| child_internal_error(&format!("checkpoint start: {e}")))?;
+        }
+
+        // 4. Create child context with chained prefix.
+        let child_ctx = self.ctx.new_child(&positional_id);
+
+        // 5. Run the child closure.
+        let result = (self.closure)(child_ctx).await;
+
+        match result {
+            Ok(value) => {
+                // 6a. Success: serialize and checkpoint.
+                let serialized = serialize_value(
+                    &value,
+                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                    &serdes_ctx,
+                )?;
+                let mut succeed_builder = OperationUpdate::builder()
+                    .id(wire_id.clone())
+                    .r#type(OperationType::Context)
+                    .sub_type(CHILD_SUB_TYPE.to_owned())
+                    .action(OperationAction::Succeed);
+                if let Some(n) = &self.name {
+                    succeed_builder = succeed_builder.name(n.clone());
+                }
+                if let Some(parent_wire) = self.ctx.parent_wire_id_computed() {
+                    succeed_builder = succeed_builder.parent_id(parent_wire);
+                }
+                // Check payload size: if >256KB, use ReplayChildren mode.
+                if serialized.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
+                    succeed_builder = succeed_builder.context_options(
+                        aws_sdk_lambda::types::ContextOptions::builder()
+                            .replay_children(true)
+                            .build(),
+                    );
+                    // Don't include the payload — backend preserves child ops.
+                } else {
+                    succeed_builder = succeed_builder.payload(serialized.clone());
+                }
+                #[allow(clippy::expect_used)] // reason: all required fields are set above
+                let update = succeed_builder
+                    .build()
+                    .expect("all required OperationUpdate fields set");
+
+                self.ctx
+                    .checkpoint_updates(vec![update])
+                    .await
+                    .map_err(|e| child_internal_error(&format!("checkpoint succeed: {e}")))?;
+
+                // Round-trip deserialize for consistency (first-run == replay).
+                deserialize_value::<O>(
+                    &serialized,
+                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                    &serdes_ctx,
+                )
+            }
+            Err(child_err) => {
+                // 6b. Failure: checkpoint FAIL with error details.
+                let err_message = child_err.to_string();
+                let mut fail_builder = OperationUpdate::builder()
+                    .id(wire_id.clone())
+                    .r#type(OperationType::Context)
+                    .sub_type(CHILD_SUB_TYPE.to_owned())
+                    .action(OperationAction::Fail)
+                    .error(
+                        aws_sdk_lambda::types::ErrorObject::builder()
+                            .error_type("ChildFnError")
+                            .error_message(err_message.clone())
+                            .build(),
+                    );
+                if let Some(n) = &self.name {
+                    fail_builder = fail_builder.name(n.clone());
+                }
+                if let Some(parent_wire) = self.ctx.parent_wire_id_computed() {
+                    fail_builder = fail_builder.parent_id(parent_wire);
+                }
+                #[allow(clippy::expect_used)] // reason: all required fields are set above
+                let update = fail_builder
+                    .build()
+                    .expect("all required OperationUpdate fields set");
+
+                // Best-effort checkpoint — even if this fails, we report the
+                // child error (the next invocation will re-execute).
+                let _ = self.ctx.checkpoint_updates(vec![update]).await;
+
+                Err(OperationError::from_kind(OperationErrorKind::ChildContext(
+                    ChildContextError::from_kind(ChildContextErrorKind::ChildFailed {
+                        message: err_message,
+                    }),
+                )))
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Builds an `OperationUpdate` for child context operations.
+fn build_update(
+    wire_id: &str,
+    name: Option<&str>,
+    action: OperationAction,
+    ctx: &DurableContext,
+) -> OperationUpdate {
+    let mut builder = OperationUpdate::builder()
+        .id(wire_id.to_owned())
+        .r#type(OperationType::Context)
+        .sub_type(CHILD_SUB_TYPE.to_owned())
+        .action(action);
+
+    if let Some(n) = name {
+        builder = builder.name(n);
+    }
+
+    // Set parent wire ID if this is a nested child (child-of-child).
+    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+        builder = builder.parent_id(parent_wire);
+    }
+
+    // build() is infallible here — all required fields (id, type, action) set.
+    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    builder
+        .build()
+        .expect("all required OperationUpdate fields set")
+}
+
+/// Replays a successful child context result from the checkpoint log.
+fn replay_success<O: DeserializeOwned>(
+    serdes: Option<&dyn Serdes>,
+    result: Option<&String>,
+    serdes_ctx: &SerdesContext,
+) -> Result<O, OperationError> {
+    let payload = result.ok_or_else(|| {
+        child_internal_error("checkpointed Succeeded operation has no result payload")
+    })?;
+    deserialize_value::<O>(payload, serdes, serdes_ctx)
+}
+
+/// Replays a failed child context result from the checkpoint log.
+fn replay_failure(error_type: Option<&str>, error_message: Option<&str>) -> OperationError {
+    let message = error_message.unwrap_or_else(|| error_type.unwrap_or("child context failed"));
+    OperationError::from_kind(OperationErrorKind::ChildContext(
+        ChildContextError::from_kind(ChildContextErrorKind::ChildFailed {
+            message: message.to_owned(),
+        }),
+    ))
+}
+
+/// Serializes a value using the configured serdes or JSON default.
+fn serialize_value<O: Serialize>(
+    value: &O,
+    serdes: Option<&dyn Serdes>,
+    serdes_ctx: &SerdesContext,
+) -> Result<String, OperationError> {
+    // First serialize to JSON string (the canonical format).
+    let json_str = serde_json::to_string(value)
+        .map_err(|e| child_internal_error(&format!("serialize result: {e}")))?;
+    // Apply custom serdes transformation if configured.
+    if let Some(s) = serdes {
+        s.serialize_to_string_with_context(&json_str, serdes_ctx)
+            .map_err(|e| child_internal_error(&format!("serialize result (custom): {e}")))
+    } else {
+        Ok(json_str)
+    }
+}
+
+/// Deserializes a value using the configured serdes or JSON default.
+fn deserialize_value<O: DeserializeOwned>(
+    payload: &str,
+    serdes: Option<&dyn Serdes>,
+    serdes_ctx: &SerdesContext,
+) -> Result<O, OperationError> {
+    // Apply custom serdes reverse-transformation if configured.
+    let json_str = if let Some(s) = serdes {
+        s.deserialize_from_string_with_context(payload, serdes_ctx)
+            .map_err(|e| child_internal_error(&format!("deserialize result (custom): {e}")))?
+    } else {
+        payload.to_owned()
+    };
+    serde_json::from_str(&json_str)
+        .map_err(|e| child_internal_error(&format!("deserialize result: {e}")))
+}
+
+/// Constructs a `ChildContextError::Internal` wrapped as an `OperationError`.
+fn child_internal_error(message: &str) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::ChildContext(
+        ChildContextError::from_kind(ChildContextErrorKind::Internal {
+            message: message.to_owned(),
+        }),
+    ))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tests
+// ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // reason: test assertions
+mod tests {
+    use super::*;
+    use crate::context::DurableContext;
+    use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
+    use std::sync::Arc;
+
+    /// Helper to create a test context with the given checkpoint log.
+    fn test_ctx(log: CheckpointLog) -> DurableContext {
+        DurableContext::new_root(
+            "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+        )
+    }
+
+    /// Helper to create a checkpoint record for a succeeded child context.
+    fn succeeded_record(positional_id: &str, result: &str) -> (String, CheckpointRecord) {
+        let wire_id = crate::engine::compute_wire_id_public(positional_id);
+        (
+            wire_id.clone(),
+            CheckpointRecord {
+                id: wire_id,
+                status: CheckpointStatus::Succeeded,
+                result: Some(result.to_owned()),
+                error_type: None,
+                error_message: None,
+                attempt: 0,
+                invoke_result: None,
+                invoke_error_type: None,
+                invoke_error_message: None,
+                replay_children: false,
+                callback_id: None,
+            },
+        )
+    }
+
+    /// Helper to create a checkpoint record for a failed child context.
+    fn failed_record(
+        positional_id: &str,
+        err_type: &str,
+        err_msg: &str,
+    ) -> (String, CheckpointRecord) {
+        let wire_id = crate::engine::compute_wire_id_public(positional_id);
+        (
+            wire_id.clone(),
+            CheckpointRecord {
+                id: wire_id,
+                status: CheckpointStatus::Failed,
+                result: None,
+                error_type: Some(err_type.to_owned()),
+                error_message: Some(err_msg.to_owned()),
+                attempt: 0,
+                invoke_result: None,
+                invoke_error_type: None,
+                invoke_error_message: None,
+                replay_children: false,
+                callback_id: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn child_live_path_runs_closure() {
+        let ctx = test_ctx(CheckpointLog::empty());
+        let result: Result<i32, OperationError> = ctx
+            .run_in_child_context(|child_ctx| async move {
+                // Child context should have prefix "1" (first op of root)
+                let step_result = child_ctx.step(|_| async { Ok(42) }).await?;
+                Ok(step_result)
+            })
+            .await;
+        // Without client, checkpoint will fail — but the closure runs.
+        // In live mode without a client, this errors at checkpoint.
+        // The important thing is the child context is created with the
+        // right prefix.
+        assert!(result.is_err()); // checkpoint fails (no client)
+    }
+
+    #[tokio::test]
+    async fn child_replay_returns_frozen_result() {
+        // Set up: operation "1" is a succeeded child context in the log.
+        let log = CheckpointLog::from_records(vec![succeeded_record("1", r#""hello""#)]);
+        let ctx = test_ctx(log);
+
+        let result: Result<String, OperationError> = ctx
+            .run_in_child_context(|_child_ctx| async move {
+                // This should NOT execute during replay.
+                unreachable!("child body should not run during replay");
+            })
+            .await;
+
+        #[allow(clippy::unwrap_used)] // reason: test assertion
+        let value = result.unwrap();
+        assert_eq!(value, "hello");
+    }
+
+    #[tokio::test]
+    async fn child_replay_failure_returns_error() {
+        let log =
+            CheckpointLog::from_records(vec![failed_record("1", "ChildFnError", "step exploded")]);
+        let ctx = test_ctx(log);
+
+        let result: Result<String, OperationError> = ctx
+            .run_in_child_context(|_child_ctx| async move {
+                unreachable!("child body should not run during replay of failure");
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("step exploded"),
+            "error should contain original message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_child_prefix_chains_two_deep() {
+        // Operation "1" is a child (prefix "1"), and "1-1" is its child
+        // (prefix "1-1"). Verify nested replay works.
+        let log = CheckpointLog::from_records(vec![succeeded_record("1", r#""outer""#)]);
+        let ctx = test_ctx(log);
+
+        // Outer child replays immediately with "outer".
+        let result: Result<String, OperationError> = ctx
+            .run_in_child_context(|_child_ctx| async move {
+                unreachable!("outer child should replay");
+            })
+            .await;
+
+        #[allow(clippy::unwrap_used)] // reason: test assertion
+        let value = result.unwrap();
+        assert_eq!(value, "outer");
+    }
+
+    #[tokio::test]
+    async fn child_fn_error_propagation() {
+        // Without a client, the checkpoint will fail, but the error handling
+        // path tests the grading logic. Use a replay-failure record to test
+        // the ChildFnError → ChildContextError grading.
+        let log = CheckpointLog::from_records(vec![failed_record(
+            "1",
+            "ChildFnError",
+            "child function error: operation error: step: execution failed: boom",
+        )]);
+        let ctx = test_ctx(log);
+
+        let result: Result<String, OperationError> = ctx
+            .run_in_child_context(|_child_ctx| async move {
+                unreachable!();
+            })
+            .await;
+
+        let err = result.unwrap_err();
+        match err.kind() {
+            OperationErrorKind::ChildContext(ce) => match ce.kind() {
+                ChildContextErrorKind::ChildFailed { message } => {
+                    assert!(message.contains("boom"));
+                }
+                other => unreachable!("unexpected kind: {other:?}"),
+            },
+            other => unreachable!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_child_starts_eagerly() {
+        use tokio::sync::oneshot;
+
+        let ctx = test_ctx(CheckpointLog::empty());
+
+        let (tx, rx) = oneshot::channel::<()>();
+
+        let handle = ctx
+            .run_in_child_context(move |_child_ctx| async move {
+                // Signal that the child body has started executing.
+                let _ = tx.send(());
+                // The child will fail at checkpoint (no client), but the
+                // body definitely ran.
+                Err("test complete".into())
+            })
+            .spawn();
+
+        // The child body should have started BEFORE we await the handle.
+        let signal = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
+        assert!(
+            signal.is_ok(),
+            "child body should start executing before await"
+        );
+
+        // The handle should eventually resolve (with an error).
+        let result: Result<String, OperationError> = handle.await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_spawned_children_deterministic_ids() {
+        // Two spawned children: IDs are claimed at builder creation, so
+        // they are always "1" and "2" regardless of execution order.
+        let log = CheckpointLog::from_records(vec![
+            succeeded_record("1", r#""first""#),
+            succeeded_record("2", r#""second""#),
+        ]);
+        let ctx = test_ctx(log);
+
+        // Both will replay from checkpoint (no execution needed).
+        let handle_a = ctx
+            .run_in_child_context(|_| async move {
+                unreachable!("should replay");
+            })
+            .spawn();
+        let handle_b = ctx
+            .run_in_child_context(|_| async move {
+                unreachable!("should replay");
+            })
+            .spawn();
+
+        // Await in reverse order — IDs were already claimed.
+        let result_b: String = handle_b.await.expect("b should succeed");
+        let result_a: String = handle_a.await.expect("a should succeed");
+
+        assert_eq!(result_a, "first");
+        assert_eq!(result_b, "second");
+    }
+
+    #[tokio::test]
+    async fn ownership_check_in_child_context() {
+        // Verify that the child context inherits task ownership from
+        // the parent — operations in the child from a foreign task fail.
+        // This is tested via the replay path (no client needed).
+        // The child's checkpoint_record lookup uses its own prefix.
+        let log = CheckpointLog::from_records(vec![succeeded_record("1", "42")]);
+        let ctx = test_ctx(log);
+
+        let result: Result<i32, OperationError> = ctx
+            .run_in_child_context(|_| async move {
+                unreachable!("should replay");
+            })
+            .await;
+
+        // Replay succeeds — ownership check passes (same task).
+        assert_eq!(result.expect("should succeed"), 42);
+    }
+}

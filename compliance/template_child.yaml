@@ -1,0 +1,394 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (Child Context)
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  DurableFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: DurableExecutionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:CheckpointDurableExecution
+            - lambda:GetDurableExecutionState
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            Resource:
+              Fn::GetAtt:
+              - AttemptsTable
+              - Arn
+
+  AttemptsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: executionId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: executionId
+        KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ChildBasic:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-1"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_basic/
+      Handler: bootstrap
+      Description: 'Conformance 3-1: child context basic'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildWithName:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-2"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_with_name/
+      Handler: bootstrap
+      Description: 'Conformance 3-2: named child context'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildMultipleSteps:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-3"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_multiple_steps/
+      Handler: bootstrap
+      Description: 'Conformance 3-3: child with multiple steps'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildError:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-4"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_error/
+      Handler: bootstrap
+      Description: 'Conformance 3-4: child step failure (no retry)'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildErrorCaught:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-5"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_error_caught/
+      Handler: bootstrap
+      Description: 'Conformance 3-5: child error caught, execution continues'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildNested:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-6"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_nested/
+      Handler: bootstrap
+      Description: 'Conformance 3-6: nested child contexts'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildRetry:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-7"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_retry/
+      Handler: bootstrap
+      Description: 'Conformance 3-7: child with step retry'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildRetryExhaustion:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-8"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_retry_exhaustion/
+      Handler: bootstrap
+      Description: 'Conformance 3-8: child retry exhaustion'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildReplay:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-9"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_replay/
+      Handler: bootstrap
+      Description: 'Conformance 3-9: child replay (cached result)'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildStepAndWait:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-10"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_step_and_wait/
+      Handler: bootstrap
+      Description: 'Conformance 3-10: child with step and wait'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildLargePayload:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-11"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_large_payload/
+      Handler: bootstrap
+      Description: 'Conformance 3-11: child large payload'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildLargePayloadLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: '/aws/lambda/${ChildLargePayload}'
+      RetentionInDays: 7
+
+  ChildInterrupted:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-12"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_interrupted/
+      Handler: bootstrap
+      Description: 'Conformance 3-12: child interrupted and re-executed'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+      Environment:
+        Variables:
+          ATTEMPTS_TABLE_NAME:
+            Ref: AttemptsTable
+
+  ChildWaitReplay:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-13"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_wait_replay/
+      Handler: bootstrap
+      Description: 'Conformance 3-13: child with wait inside'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildCustomSerdes:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-14"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_custom_serdes/
+      Handler: bootstrap
+      Description: 'Conformance 3-14: child with custom serdes'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildErrorNoStep:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-15"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_error_no_step/
+      Handler: bootstrap
+      Description: 'Conformance 3-15: child error without step'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildNullResult:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-16"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_null_result/
+      Handler: bootstrap
+      Description: 'Conformance 3-16: child returns null'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildPrintOnly:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-17"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_print_only/
+      Handler: bootstrap
+      Description: 'Conformance 3-17: child print only'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  ChildPrintOnlyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: '/aws/lambda/${ChildPrintOnly}'
+      RetentionInDays: 7
+
+  ChildStepWaitAfter:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["3-18"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_step_wait_after/
+      Handler: bootstrap
+      Description: 'Conformance 3-18: child with step+wait, then step+wait after'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

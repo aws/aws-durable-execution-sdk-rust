@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (WaitForCallback)
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures:
+      - x86_64
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  DurableFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: DurableExecutionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:CheckpointDurableExecution
+            - lambda:GetDurableExecutionState
+            - lambda:SendDurableExecutionCallbackSuccess
+            - lambda:SendDurableExecutionCallbackFailure
+            - lambda:SendDurableExecutionCallbackHeartbeat
+            Resource: '*'
+
+  WfcbBasic:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-1"]
+    Properties:
+      CodeUri: publish/wfcb_basic/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbExplicitName:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-2"]
+    Properties:
+      CodeUri: publish/wfcb_explicit_name/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbAnonymous:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-3"]
+    Properties:
+      CodeUri: publish/wfcb_anonymous/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbExternalFailure:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-4"]
+    Properties:
+      CodeUri: publish/wfcb_external_failure/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbTimeout:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-5"]
+    Properties:
+      CodeUri: publish/wfcb_timeout/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbFailureCaught:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-6"]
+    Properties:
+      CodeUri: publish/wfcb_failure_caught/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbSubmitterRetry:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-7"]
+    Properties:
+      CodeUri: publish/wfcb_submitter_retry/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbInChildContext:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-8"]
+    Properties:
+      CodeUri: publish/wfcb_in_child_context/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbTwoSequential:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-9"]
+    Properties:
+      CodeUri: publish/wfcb_two_sequential/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbMixedOps:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-10"]
+    Properties:
+      CodeUri: publish/wfcb_mixed_ops/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbJsonResult:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-11"]
+    Properties:
+      CodeUri: publish/wfcb_json_result/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbHeartbeatTimeout:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-12"]
+    Properties:
+      CodeUri: publish/wfcb_heartbeat_timeout/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbHeartbeatSuccess:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-13"]
+    Properties:
+      CodeUri: publish/wfcb_heartbeat_success/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbTimeoutCaught:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-14"]
+    Properties:
+      CodeUri: publish/wfcb_timeout_caught/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WfcbNullResult:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["7-15"]
+    Properties:
+      CodeUri: publish/wfcb_null_result/
+      Handler: bootstrap
+      Role: !GetAtt DurableFunctionRole.Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

@@ -1,0 +1,35 @@
+[package]
+name = "step_default_retry"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+publish = false
+description = "Conformance handler: step_default_retry"
+
+
+[[bin]]
+name = "step_default_retry"
+path = "src/main.rs"
+
+[lints.clippy]
+all = "deny"
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[dependencies]
+aws-durable-execution-sdk-rust = { path = "../../.." }
+compliance = { path = "../.." }
+lambda_runtime = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros"] }
+tracing = "0.1"
+aws-config = "1"
+aws-sdk-dynamodb = "1"

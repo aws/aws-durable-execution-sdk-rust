@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (WaitForCondition)
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  DurableFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: DurableExecutionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:CheckpointDurableExecution
+            - lambda:GetDurableExecutionState
+            Resource: '*'
+
+  WaitForConditionBasic:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-1"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_basic/
+      Handler: bootstrap
+      Description: 'Conformance 6-1: wait_for_condition basic'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionImmediate:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-2"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_immediate/
+      Handler: bootstrap
+      Description: 'Conformance 6-2: wait_for_condition immediate'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionWithName:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-3"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_with_name/
+      Handler: bootstrap
+      Description: 'Conformance 6-3: wait_for_condition with name'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionCustomInitialState:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-4"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_custom_initial_state/
+      Handler: bootstrap
+      Description: 'Conformance 6-4: wait_for_condition custom initial state'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionFixedDelay:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-5"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_fixed_delay/
+      Handler: bootstrap
+      Description: 'Conformance 6-5: wait_for_condition fixed delay'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionMaxAttempts:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-6"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_max_attempts/
+      Handler: bootstrap
+      Description: 'Conformance 6-6: wait_for_condition max attempts exceeded'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionCheckThrows:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-7"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_check_throws/
+      Handler: bootstrap
+      Description: 'Conformance 6-7: wait_for_condition check throws'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionCheckThrowsCaught:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-8"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_check_throws_caught/
+      Handler: bootstrap
+      Description: 'Conformance 6-8: wait_for_condition check throws caught'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionComplexObject:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-9"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_complex_object/
+      Handler: bootstrap
+      Description: 'Conformance 6-9: wait_for_condition complex object state'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionNullResult:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-10"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_null_result/
+      Handler: bootstrap
+      Description: 'Conformance 6-10: wait_for_condition null result'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionCustomSerdes:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-11"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_custom_serdes/
+      Handler: bootstrap
+      Description: 'Conformance 6-11: wait_for_condition custom serdes'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionThenStep:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-12"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_then_step/
+      Handler: bootstrap
+      Description: 'Conformance 6-12: wait_for_condition then step'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitForConditionMultipleSequential:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["6-13"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_for_condition_multiple_sequential/
+      Handler: bootstrap
+      Description: 'Conformance 6-13: multiple sequential wait_for_condition'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

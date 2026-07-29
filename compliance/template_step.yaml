@@ -1,0 +1,458 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (Step)
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  DurableFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: DurableExecutionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:CheckpointDurableExecution
+            - lambda:GetDurableExecutionState
+            Resource: '*'
+      - PolicyName: AttemptsTablePolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - dynamodb:UpdateItem
+            - dynamodb:GetItem
+            Resource:
+              Fn::GetAtt:
+              - AttemptsTable
+              - Arn
+
+  AttemptsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: '${AWS::StackName}-Attempts'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: executionId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: executionId
+        KeyType: HASH
+
+  StepBasic:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-1"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_basic/
+      Handler: bootstrap
+      Description: 'Conformance 1-1: step basic'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepWithName:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-2"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_with_name/
+      Handler: bootstrap
+      Description: 'Conformance 1-2: step with name'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepNested:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-3"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_nested/
+      Handler: bootstrap
+      Description: 'Conformance 1-3: sequential steps'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepComplexObject:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-4"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_complex_object/
+      Handler: bootstrap
+      Description: 'Conformance 1-4: complex object'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepNullResult:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-5"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_null_result/
+      Handler: bootstrap
+      Description: 'Conformance 1-5: null result'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepCustomSerdes:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-6"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_custom_serdes/
+      Handler: bootstrap
+      Description: 'Conformance 1-6: custom serdes'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepLogging:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-7"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_logging/
+      Handler: bootstrap
+      Description: 'Conformance 1-7: logging'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepLoggingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: '/aws/lambda/${StepLogging}'
+      RetentionInDays: 7
+
+  StepAndWaitReplay:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-8"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_and_wait_replay/
+      Handler: bootstrap
+      Description: 'Conformance 1-8: step and wait replay'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepReplaySkipsSucceeded:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-9"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_replay_skips_succeeded/
+      Handler: bootstrap
+      Description: 'Conformance 1-9: replay skips succeeded'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepReplayRethrowsFailed:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-10"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_replay_rethrows_failed/
+      Handler: bootstrap
+      Description: 'Conformance 1-10: replay rethrows failed'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepWithRetry:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-11"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_with_retry/
+      Handler: bootstrap
+      Description: 'Conformance 1-11: step with retry'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      Environment:
+        Variables:
+          ATTEMPTS_TABLE_NAME:
+            Fn::Sub: '${AWS::StackName}-Attempts'
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepRetryExhaustion:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-12"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_retry_exhaustion/
+      Handler: bootstrap
+      Description: 'Conformance 1-12: retry exhaustion'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepDefaultRetry:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-13"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_default_retry/
+      Handler: bootstrap
+      Description: 'Conformance 1-13: default retry'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      Environment:
+        Variables:
+          ATTEMPTS_TABLE_NAME:
+            Fn::Sub: '${AWS::StackName}-Attempts'
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepRetryCustomConfig:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-14"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_retry_custom_config/
+      Handler: bootstrap
+      Description: 'Conformance 1-14: custom retry config'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      Environment:
+        Variables:
+          ATTEMPTS_TABLE_NAME:
+            Fn::Sub: '${AWS::StackName}-Attempts'
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepRetrySpecificException:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-15"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_retry_specific_exception/
+      Handler: bootstrap
+      Description: 'Conformance 1-15: retry specific exception'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      Environment:
+        Variables:
+          ATTEMPTS_TABLE_NAME:
+            Fn::Sub: '${AWS::StackName}-Attempts'
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepRetryNonRetryable:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-16"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_retry_non_retryable/
+      Handler: bootstrap
+      Description: 'Conformance 1-16: non-retryable exception'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepAtMostOnceNoRetry:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-17"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_at_most_once_no_retry/
+      Handler: bootstrap
+      Description: 'Conformance 1-17: at-most-once no retry'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepAtMostOnceNoRetryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: '/aws/lambda/${StepAtMostOnceNoRetry}'
+      RetentionInDays: 7
+
+  StepAtMostOnceWithRetry:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-18"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_at_most_once_with_retry/
+      Handler: bootstrap
+      Description: 'Conformance 1-18: at-most-once with retry'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      Environment:
+        Variables:
+          ATTEMPTS_TABLE_NAME:
+            Fn::Sub: '${AWS::StackName}-Attempts'
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepAtMostOnceWithRetryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: '/aws/lambda/${StepAtMostOnceWithRetry}'
+      RetentionInDays: 7
+
+  StepWithError:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-19"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_with_error/
+      Handler: bootstrap
+      Description: 'Conformance 1-19: step with error'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  StepErrorCaught:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["1-20"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/step_error_caught/
+      Handler: bootstrap
+      Description: 'Conformance 1-20: error caught'
+      Role:
+        Fn::GetAtt:
+        - DurableFunctionRole
+        - Arn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

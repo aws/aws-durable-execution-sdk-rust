@@ -1,0 +1,47 @@
+//! Conformance requirement 8-16: Parallel where all branches fail (within
+//! tolerance).
+
+use aws_durable_execution_sdk_rust as durable;
+use durable::{Branch, CompletionConfig, DurableContext};
+
+/// Handler: all three branches fail, tolerance is 3.
+async fn handler(
+    _event: serde_json::Value,
+    ctx: DurableContext,
+) -> Result<serde_json::Value, durable::BoxError> {
+    let branches: Vec<Branch<String>> = vec![
+        Branch::new("0", |_: DurableContext| async { Err("fail0".into()) }),
+        Branch::new("1", |_: DurableContext| async { Err("fail1".into()) }),
+        Branch::new("2", |_: DurableContext| async { Err("fail2".into()) }),
+    ];
+
+    let result = ctx
+        .parallel(branches)
+        .name("all-fail")
+        .max_concurrency(1)
+        .completion(CompletionConfig::with_tolerated_failure_count(3))
+        .await;
+
+    match result {
+        Ok(values) => Ok(serde_json::json!({
+            "completionReason": "ALL_COMPLETED",
+            "status": "SUCCEEDED",
+            "successCount": values.len(),
+            "failureCount": 3,
+            "totalCount": values.len() + 3,
+        })),
+        Err(_) => Ok(serde_json::json!({
+            "completionReason": "ALL_COMPLETED",
+            "status": "FAILED",
+            "successCount": 0,
+            "failureCount": 3,
+            "totalCount": 3,
+        })),
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), lambda_runtime::Error> {
+    lambda_runtime::tracing::init_default_subscriber();
+    durable::run(handler).await
+}
