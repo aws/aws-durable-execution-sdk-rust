@@ -32,10 +32,21 @@
 //!
 //! This design keeps suspension signaling entirely internal — no public
 //! type or error surfaces to user code.
+//!
+//! ## Scope quiescence
+//!
+//! The flag is per-SCOPE, and a scope suspends only when it is QUIESCENT:
+//! every operation eagerly spawned into it has settled (completed, durably
+//! parked, or aborted) and at least one of them — or its owner — needs to
+//! suspend. [`ScopeQuiescence`] holds that accounting, so a `.spawn()`ed wait
+//! that parks cannot end the invocation while a spawned sibling step is still
+//! runnable. It is the same rule the batch coordinator applies to branches
+//! (suspend once `any_suspended && running == 0`), lifted onto the scope
+//! because a scope with spawned children has no coordinator loop to hold it.
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 // Imports used by tests — suppress dead-code warnings for the engine types
@@ -71,33 +82,80 @@ pub(crate) enum InvocationOutcome {
 // Suspension Signal (shared state between operations and the driver)
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Tracks the settle state of the operations spawned INTO this scope, so the
+/// scope's owner parks only once every runnable sibling has settled.
+///
+/// This is the same accounting the batch coordinator performs for branches
+/// (`running`/`any_suspended` in [`crate::map_parallel`]): a scope suspends
+/// only when it is quiescent — nothing runnable is left — and at least one
+/// child parked. The coordinator can keep that state in local variables
+/// because it owns the loop that joins its branches; a scope with `.spawn()`ed
+/// children has no such loop (the owner is user code), so the same counters
+/// live on the scope itself and every transition is published by whoever
+/// observes it.
+///
+/// A "spawn" is registered on the OWNER's scope (the scope the `.spawn()` call
+/// was made from) and settles exactly once: completed, durably parked, or
+/// aborted.
+#[derive(Debug, Default)]
+struct ScopeQuiescence {
+    /// Spawned operations registered on this scope that have not settled.
+    /// Incremented on the owner's task BEFORE `tokio::spawn`; decremented on
+    /// the spawned task once its scope driver returns (or by its RAII guard if
+    /// the task is aborted first).
+    spawns_outstanding: AtomicUsize,
+    /// Set once a spawned operation settled as durably parked. Never cleared
+    /// within an invocation: the recorded suspension outlives the handle.
+    any_spawn_parked: AtomicBool,
+    /// Set when this scope's owner tried to park while spawns were still
+    /// outstanding, so the last spawn to settle knows it must complete the
+    /// deferred suspension request.
+    owner_parked: AtomicBool,
+}
+
+/// How a spawned operation left its scope driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnSettlement {
+    /// The operation future resolved (successfully or with an error).
+    Completed,
+    /// The operation's own scope suspended: durable state is recorded and the
+    /// operation resumes on a later invocation.
+    Parked,
+    /// The task was cancelled before it could settle (abort-on-drop or runtime
+    /// shutdown). No durable resumption is implied.
+    Aborted,
+}
+
 /// A per-scope suspension signal — one node in the invocation's scope tree.
 ///
 /// Suspension is SCOPED: a `wait` (or any parking operation) requests only
 /// the scope of the context it runs on. The root handler runs in the root
 /// scope; each map/parallel branch runs in its own child scope (created via
 /// [`DurableContext::new_scoped_child`](crate::context::DurableContext) or
-/// `new_scoped_flat_child`). A sequential child context shares its parent's
-/// scope, so its suspension propagates directly to whoever drives the parent.
+/// `new_scoped_flat_child`), and each `.spawn()`ed operation runs in its own
+/// child scope (created via
+/// [`DurableContext::spawn_scope`](crate::context::DurableContext)). A
+/// sequential child context shares its parent's scope, so its suspension
+/// propagates directly to whoever drives the parent.
 ///
 /// Each scope is observed by exactly one driver:
 /// - the root scope by the invocation driver ([`drive_invocation`]);
-/// - a branch scope by a coordinator's branch driver ([`drive_scope`]).
+/// - a branch or spawn scope by a scope driver ([`drive_scope`]).
 ///
 /// When a scope is suspended while its driver's future returns `Pending`,
 /// that driver reports suspension for its subtree: the invocation reports
-/// PENDING; a branch reports [`ScopeOutcome::Suspended`]. A branch suspension
-/// is scoped to that branch and does not request root suspension, so sibling
-/// branches keep running. A coordinator that becomes quiescent
-/// with parked work suspends its OWN scope, which the level above observes.
+/// PENDING; a branch or spawn reports [`ScopeOutcome::Suspended`]. A branch or
+/// spawn suspension is scoped to it and does not request root suspension, so
+/// siblings keep running. A scope owner that becomes quiescent with parked
+/// work suspends its OWN scope, which the level above observes.
 ///
 /// This is an internal engine concern — it is never exposed publicly.
 #[derive(Debug)]
 pub(crate) struct SuspensionSignal {
     /// Set to `true` by an operation in this scope that must suspend.
     requested: AtomicBool,
-    /// Waker of the branch driver ([`drive_scope`]) polling THIS scope, if
-    /// any. The root scope has no branch driver — its driver is the
+    /// Waker of the scope driver ([`drive_scope`]) polling THIS scope, if
+    /// any. The root scope has no scope driver — its driver is the
     /// invocation driver, which registers through `invocation_waker`.
     scope_waker: std::sync::Mutex<Option<Waker>>,
     /// Shared invocation (root) poll-loop waker. Every scope in the tree
@@ -107,6 +165,8 @@ pub(crate) struct SuspensionSignal {
     /// is harmless: the invocation driver returns PENDING only when the ROOT
     /// scope's own flag is set, which a mere branch suspension never sets.
     invocation_waker: Arc<std::sync::Mutex<Option<Waker>>>,
+    /// Settle accounting for the operations spawned into this scope.
+    quiescence: ScopeQuiescence,
 }
 
 impl SuspensionSignal {
@@ -116,24 +176,27 @@ impl SuspensionSignal {
             requested: AtomicBool::new(false),
             scope_waker: std::sync::Mutex::new(None),
             invocation_waker: Arc::new(std::sync::Mutex::new(None)),
+            quiescence: ScopeQuiescence::default(),
         }
     }
 
     /// Creates a fresh CHILD scope beneath this one. The child shares the
     /// invocation waker (so a park anywhere still re-polls the root) but owns
-    /// its own suspension flag and branch-driver waker, so a suspension in
-    /// the child is caught by the child's branch driver rather than the root.
+    /// its own suspension flag, scope-driver waker and quiescence accounting,
+    /// so a suspension in the child is caught by the child's scope driver
+    /// rather than the root.
     pub(crate) fn new_child_scope(&self) -> Self {
         Self {
             requested: AtomicBool::new(false),
             scope_waker: std::sync::Mutex::new(None),
             invocation_waker: Arc::clone(&self.invocation_waker),
+            quiescence: ScopeQuiescence::default(),
         }
     }
 
     /// Called by operations to request suspension of THIS scope.
     ///
-    /// Sets this scope's flag and wakes both this scope's branch driver (if
+    /// Sets this scope's flag and wakes both this scope's scope driver (if
     /// registered) and the invocation driver (fallback), so the responsible
     /// driver re-polls and observes the flag — even when the request comes
     /// from a task other than the one that driver is polling.
@@ -148,13 +211,85 @@ impl SuspensionSignal {
         self.requested.load(Ordering::Acquire)
     }
 
+    /// Registers a spawned operation on this scope. Called on the OWNER's
+    /// task, synchronously, BEFORE `tokio::spawn`, so the count is already
+    /// correct if the task settles before the owner is polled again.
+    pub(crate) fn register_spawn(&self) {
+        self.quiescence
+            .spawns_outstanding
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Settles a spawned operation registered on this scope, and completes a
+    /// deferred owner park when this was the last outstanding spawn.
+    ///
+    /// Called on the SPAWNED task (never on the handle: nothing guarantees a
+    /// handle is ever polled, but the runtime always polls a live task, and
+    /// the task's RAII guard reports `Aborted` if it is cancelled first).
+    pub(crate) fn settle_spawn(&self, settlement: SpawnSettlement) {
+        if settlement == SpawnSettlement::Parked {
+            // Publish the parked flag BEFORE the decrement so any observer
+            // that sees quiescence also sees why the scope must suspend.
+            self.quiescence
+                .any_spawn_parked
+                .store(true, Ordering::SeqCst);
+        }
+        let remaining = self
+            .quiescence
+            .spawns_outstanding
+            .fetch_sub(1, Ordering::SeqCst)
+            .saturating_sub(1);
+        // The owner set `owner_parked` BEFORE re-reading the count, and we
+        // decrement BEFORE reading `owner_parked`, so at least one of the two
+        // sides always observes the other: the park request cannot be lost.
+        //
+        // An `Aborted` settle also completes a deferred park: the task is gone,
+        // so nothing else will ever fire it, and hanging is worse than
+        // suspending a scope whose owner has already parked.
+        if remaining == 0 && self.quiescence.owner_parked.load(Ordering::SeqCst) {
+            self.request_suspend();
+        }
+    }
+
+    /// Parks this scope's owner: the single entry point for "this scope cannot
+    /// make progress".
+    ///
+    /// Requests suspension immediately when the scope is already quiescent.
+    /// Otherwise the request is DEFERRED: runnable spawned siblings keep going
+    /// and the last one to settle fires the suspension
+    /// ([`Self::settle_spawn`]). Every parking path funnels through here — see
+    /// [`DurableContext::request_suspend`](crate::context::DurableContext) —
+    /// so no suspension can bypass the accounting.
+    pub(crate) fn park_owner(&self) {
+        self.quiescence.owner_parked.store(true, Ordering::SeqCst);
+        if self.quiescence.spawns_outstanding.load(Ordering::SeqCst) == 0 {
+            self.request_suspend();
+        }
+    }
+
+    /// Whether a spawned operation on this scope settled as durably parked.
+    ///
+    /// A driver whose future COMPLETED must still report suspension in that
+    /// case: the parked operation recorded durable state that only a later
+    /// invocation can resume.
+    pub(crate) fn any_spawn_parked(&self) -> bool {
+        self.quiescence.any_spawn_parked.load(Ordering::SeqCst)
+    }
+
+    /// Number of spawned operations on this scope that have not yet settled.
+    #[cfg(test)]
+    #[allow(dead_code)] // reason: available for test assertions on scope state
+    pub(crate) fn outstanding_spawns(&self) -> usize {
+        self.quiescence.spawns_outstanding.load(Ordering::SeqCst)
+    }
+
     /// Registers (or refreshes) the invocation (root) poll loop's waker.
     /// Called by [`drive_invocation`].
     pub(crate) fn register_driver_waker(&self, waker: &Waker) {
         set_slot(&self.invocation_waker, waker);
     }
 
-    /// Registers (or refreshes) this scope's branch-driver waker.
+    /// Registers (or refreshes) this scope's scope-driver waker.
     /// Called by [`drive_scope`].
     pub(crate) fn register_scope_waker(&self, waker: &Waker) {
         set_slot(&self.scope_waker, waker);
@@ -330,6 +465,11 @@ impl Drop for AbortOnDrop {
 /// signaled. On suspension, the future is dropped at its current await
 /// point (unswallowable cancellation) and `InvocationOutcome::Pending`
 /// is returned.
+///
+/// A handler that RESOLVES while a `.spawn()`ed operation is durably parked
+/// also yields `Pending`: the parked operation recorded state that only a
+/// later invocation can resume, so its result must not be discarded by
+/// completing the invocation.
 #[allow(dead_code)] // reason: wired by the handler wrapper
 pub(crate) async fn drive_invocation<F>(
     handler_future: F,
@@ -362,7 +502,8 @@ where
                 // An operation may have requested suspension AND the
                 // handler still completed (e.g. error propagated via `?`
                 // without yielding). Suspension takes precedence.
-                if suspension_signal.is_suspend_requested() {
+                if suspension_signal.is_suspend_requested() || suspension_signal.any_spawn_parked()
+                {
                     Poll::Ready(InvocationOutcome::Pending)
                 } else {
                     Poll::Ready(InvocationOutcome::Complete(result))
@@ -372,7 +513,8 @@ where
                 // Same precedence rule: if an operation requested
                 // suspension before the error propagated, the invocation
                 // outcome is Pending, not Failed.
-                if suspension_signal.is_suspend_requested() {
+                if suspension_signal.is_suspend_requested() || suspension_signal.any_spawn_parked()
+                {
                     Poll::Ready(InvocationOutcome::Pending)
                 } else {
                     Poll::Ready(InvocationOutcome::Failed {
@@ -427,7 +569,9 @@ pub(crate) enum ScopeOutcome<T> {
 /// dropped and [`ScopeOutcome::Suspended`] is returned so the coordinator can
 /// keep sibling branches running. Otherwise the future's own output is
 /// returned as [`ScopeOutcome::Completed`]. Suspension takes precedence over
-/// a same-poll `Ready`, mirroring the invocation driver's precedence rule.
+/// a same-poll `Ready`, mirroring the invocation driver's precedence rule —
+/// including the case where the future resolved but an operation `.spawn()`ed
+/// into this scope is durably parked.
 pub(crate) async fn drive_scope<F>(
     inner: F,
     scope: Arc<SuspensionSignal>,
@@ -447,7 +591,7 @@ where
 
         match pinned.as_mut().poll(cx) {
             Poll::Ready(value) => {
-                if scope.is_suspend_requested() {
+                if scope.is_suspend_requested() || scope.any_spawn_parked() {
                     Poll::Ready(ScopeOutcome::Suspended)
                 } else {
                     Poll::Ready(ScopeOutcome::Completed(value))
@@ -1168,11 +1312,15 @@ mod suspension_containment_and_task_ownership {
         );
     }
 
-    // ── 4 + 6. Suspending branch drops an active sibling spawned task and
-    // no further checkpoint (e.g. SUCCEED) is made after cleanup begins. ──
+    // ── 4 + 6. A spawned straggler (non-durable `pending()` body) holds the
+    // invocation until the Lambda timeout fires. The timeout DROPS the handler
+    // future, which drops the AbortOnDrop guard, aborting the straggler. No
+    // SUCCEED checkpoint is made for the aborted straggler. This is Case G
+    // from the S2a diagnosis — the bounded timeout simulates the Lambda
+    // platform's execution timeout backstop. ──
 
     #[tokio::test]
-    async fn suspend_drops_active_sibling_and_makes_no_further_checkpoint() {
+    async fn straggler_is_aborted_by_timeout_no_succeed_checkpoint() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let ctx = live_ctx(Arc::clone(&client));
         let signal = Arc::clone(ctx.suspension_signal());
@@ -1186,69 +1334,90 @@ mod suspension_containment_and_task_ownership {
         let c = Arc::clone(&sib_completed);
         let d = Arc::clone(&sib_dropped);
 
-        let outcome = drive_invocation(
-            async move {
-                // Sibling task: checkpoints START, runs its body, then parks
-                // forever. It must be aborted when the invocation suspends,
-                // before it can checkpoint SUCCEED.
-                let sib = ctx_h
-                    .step(move |_| {
-                        let s = Arc::clone(&s);
-                        let c = Arc::clone(&c);
-                        let d = Arc::clone(&d);
-                        async move {
-                            struct G(Arc<AtomicBool>);
-                            impl Drop for G {
-                                fn drop(&mut self) {
-                                    self.0.store(true, Ordering::SeqCst);
+        // Wrap in a timeout to simulate the Lambda execution timeout. Under
+        // the new scope-quiescence semantics, the straggler (non-durable
+        // pending body) keeps `spawns_outstanding > 0`, so `park_owner()`
+        // defers and the invocation does NOT report Pending on its own. The
+        // Lambda timeout is the backstop that aborts the straggler.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            drive_invocation(
+                async move {
+                    // Sibling task: starts, then blocks on non-durable
+                    // pending(). Under the new semantics, drive_scope for this
+                    // task never returns (no durable suspension, no
+                    // completion), so it's a "straggler".
+                    let sib = ctx_h
+                        .step(move |_| {
+                            let s = Arc::clone(&s);
+                            let c = Arc::clone(&c);
+                            let d = Arc::clone(&d);
+                            async move {
+                                struct G(Arc<AtomicBool>);
+                                impl Drop for G {
+                                    fn drop(&mut self) {
+                                        self.0.store(true, Ordering::SeqCst);
+                                    }
                                 }
+                                let _g = G(d);
+                                s.store(true, Ordering::SeqCst);
+                                std::future::pending::<()>().await;
+                                c.store(true, Ordering::SeqCst);
+                                Ok(1i32)
                             }
-                            let _g = G(d);
-                            s.store(true, Ordering::SeqCst);
-                            std::future::pending::<()>().await;
-                            c.store(true, Ordering::SeqCst);
-                            Ok(1i32)
-                        }
-                    })
-                    .name("sibling")
-                    .spawn();
-                // Let the sibling run to its park point.
-                for _ in 0..3 {
-                    tokio::task::yield_now().await;
-                }
-                // A wait suspends the whole invocation.
-                let _ = ctx_h.wait(Duration::from_secs(30)).await;
-                let _ = sib.await; // unreachable — the wait parks first
-                Ok::<_, (String, String)>("done".to_owned())
-            },
-            signal,
+                        })
+                        .name("sibling")
+                        .spawn();
+                    // Let the sibling run to its park point.
+                    for _ in 0..3 {
+                        tokio::task::yield_now().await;
+                    }
+                    // The owner parks. Under quiescence, this defers (straggler
+                    // is still outstanding), so the handler stays at this await
+                    // point until the timeout fires and drops us.
+                    let _ = ctx_h.wait(Duration::from_secs(30)).await;
+                    let _ = sib.await;
+                    Ok::<_, (String, String)>("done".to_owned())
+                },
+                signal,
+            ),
         )
         .await;
 
+        // The timeout fired — the invocation never completed on its own
+        // because the straggler prevented quiescence.
+        assert!(
+            result.is_err(),
+            "drive_invocation must NOT terminate on its own when a non-durable \
+             straggler prevents quiescence; the Lambda timeout is the backstop"
+        );
+
         // Let the runtime process the abort of the sibling task.
-        for _ in 0..5 {
+        for _ in 0..10 {
             tokio::task::yield_now().await;
         }
+        // Give tokio a moment to run the drop paths.
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert_eq!(outcome, InvocationOutcome::Pending);
         assert!(
             sib_started.load(Ordering::SeqCst),
             "sibling should have started"
         );
         assert!(
             !sib_completed.load(Ordering::SeqCst),
-            "sibling must not complete"
+            "sibling must not complete (its body is non-durable pending)"
         );
         assert!(
             sib_dropped.load(Ordering::SeqCst),
-            "sibling task must be aborted on suspend"
+            "sibling task must be aborted when the timeout drops the handler"
         );
         let recorded = client.recorded_updates();
         assert!(
             recorded
                 .iter()
                 .all(|u| u.action() != &OperationAction::Succeed),
-            "no operation should have checkpointed SUCCEED after cleanup began"
+            "no operation should have checkpointed SUCCEED — the straggler \
+             was aborted before reaching its terminal"
         );
     }
 }
@@ -1610,21 +1779,17 @@ mod scoped_suspension {
 // Regression tests (S2a): `.spawn()` must not park the ROOT scope
 // ────────────────────────────────────────────────────────────────────────────
 //
-// `.spawn()` hands the operation future to `DurableFuture::spawn_blessed`
-// (src/future.rs:67) WITHOUT creating a child suspension scope, so a parking
-// operation inside a top-level `.spawn()` sets the ROOT flag. `drive_invocation`
-// then returns `Poll::Ready(Pending)` on its next poll and drops the handler
-// future, which fires `AbortOnDrop` on every sibling spawned task — including
-// one that is mid-flight and has already checkpointed STARTED. The documented
-// `spawn` + `join!` pattern therefore does not hold, and an aborted step that
-// checkpointed STARTED re-executes on resume (duplicate side effects).
+// `.spawn()` used to hand the operation future to `DurableFuture::spawn_blessed`
+// WITHOUT creating a child suspension scope, so a parking operation inside a
+// top-level `.spawn()` set the ROOT flag. `drive_invocation` then returned
+// `Poll::Ready(Pending)` on its next poll and dropped the handler future, which
+// fired `AbortOnDrop` on every sibling spawned task — including one mid-flight
+// that had already checkpointed STARTED. This was fixed by scope-quiescence
+// accounting: each `.spawn()` now runs in its own child scope, and the owner
+// parks only at quiescence.
 //
-// Both tests below encode the INTENDED behaviour: a spawned step must reach its
-// terminal (Succeed) checkpoint before the invocation reports Pending. They fail
-// against current behaviour, so they are `#[ignore]`d to keep `make check`
-// green; the fix slice removes the attribute. See
-// .agents/scratchpad/s2a-diagnosis.md for the observed failures and the
-// intended mechanism.
+// These tests encode the CORRECT behaviour and run as part of `make check`.
+// See .agents/scratchpad/s2a-diagnosis.md for the root-cause analysis.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // reason: test assertions
 mod spawn_scope_regressions {
@@ -1664,7 +1829,6 @@ mod spawn_scope_regressions {
     /// spawned step is still runnable, so the invocation must stay alive until
     /// the step reaches its terminal checkpoint and only then report Pending.
     #[tokio::test]
-    #[ignore = "encodes the S2a defect: .spawn() parks the ROOT scope (src/future.rs:67), so the spawned wait ends the invocation and aborts the still-running spawned step; un-ignore with the fix"]
     async fn spawned_step_reaches_terminal_checkpoint_before_pending() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let ctx = live_ctx(Arc::clone(&client));
@@ -1719,7 +1883,6 @@ mod spawn_scope_regressions {
     /// The documented composition: `tokio::join!` over a spawned wait and a
     /// spawned step. Same guarantee as above, reached through `join!`.
     #[tokio::test]
-    #[ignore = "encodes the S2a defect: tokio::join!(wait.spawn(), step.spawn()) is aborted by the wait's ROOT-scope park (src/future.rs:67, src/driver.rs:334); un-ignore with the fix"]
     async fn joined_spawned_wait_and_step_lets_the_step_finish() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let ctx = live_ctx(Arc::clone(&client));
@@ -1771,7 +1934,6 @@ mod spawn_scope_regressions {
     /// flagging: if the spawned wait's park flags ROOT unconditionally, the
     /// driver drops the handler while the sequential step is still in flight.
     #[tokio::test]
-    #[ignore = "encodes the S2a defect: a parked spawned wait must not pre-empt the owner's sequential work (src/future.rs:67 flags ROOT, driver.rs:334 drops handler); un-ignore with the fix"]
     async fn spawned_wait_parks_then_owner_does_sequential_step() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let ctx = live_ctx(Arc::clone(&client));

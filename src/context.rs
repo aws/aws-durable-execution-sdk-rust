@@ -32,7 +32,12 @@ use tokio::sync::Mutex;
 struct Inner {
     execution_arn: String,
     lambda_context: lambda_runtime::Context,
-    engine: EngineState,
+    /// Engine state (ID counter + checkpoint log) for this context's
+    /// namespace. Shared behind an `Arc` so a context can be rebound onto a
+    /// different suspension scope (see
+    /// [`DurableContext::spawn_scope`]) without duplicating the ID counter —
+    /// two contexts minting from separate counters would diverge on replay.
+    engine: Arc<EngineState>,
     /// Suspension signal shared with the driver.
     suspension_signal: Arc<SuspensionSignal>,
     /// Task-ownership detector — catches user `tokio::spawn` misuse.
@@ -97,7 +102,7 @@ impl DurableContext {
             inner: Arc::new(Inner {
                 execution_arn: String::from("arn:aws:lambda:us-east-1:123456789012:function:test"),
                 lambda_context: lambda_runtime::Context::default(),
-                engine: EngineState::new_root(Arc::new(CheckpointLog::empty())),
+                engine: Arc::new(EngineState::new_root(Arc::new(CheckpointLog::empty()))),
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
@@ -119,7 +124,7 @@ impl DurableContext {
             inner: Arc::new(Inner {
                 execution_arn,
                 lambda_context,
-                engine: EngineState::new_root(checkpoint_log),
+                engine: Arc::new(EngineState::new_root(checkpoint_log)),
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
@@ -143,7 +148,7 @@ impl DurableContext {
             inner: Arc::new(Inner {
                 execution_arn,
                 lambda_context,
-                engine: EngineState::new_root(checkpoint_log),
+                engine: Arc::new(EngineState::new_root(checkpoint_log)),
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
@@ -168,7 +173,7 @@ impl DurableContext {
             inner: Arc::new(Inner {
                 execution_arn,
                 lambda_context,
-                engine: EngineState::new_root(checkpoint_log),
+                engine: Arc::new(EngineState::new_root(checkpoint_log)),
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
@@ -191,10 +196,10 @@ impl DurableContext {
             inner: Arc::new(Inner {
                 execution_arn: self.inner.execution_arn.clone(),
                 lambda_context: self.inner.lambda_context.clone(),
-                engine: EngineState::new_child(
+                engine: Arc::new(EngineState::new_child(
                     parent_positional_id,
                     Arc::clone(&self.inner.engine.checkpoint_log),
-                ),
+                )),
                 suspension_signal: Arc::clone(&self.inner.suspension_signal),
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
@@ -224,10 +229,10 @@ impl DurableContext {
             inner: Arc::new(Inner {
                 execution_arn: self.inner.execution_arn.clone(),
                 lambda_context: self.inner.lambda_context.clone(),
-                engine: EngineState::new_child(
+                engine: Arc::new(EngineState::new_child(
                     parent_positional_id,
                     Arc::clone(&self.inner.engine.checkpoint_log),
-                ),
+                )),
                 suspension_signal: Arc::new(self.inner.suspension_signal.new_child_scope()),
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
@@ -250,10 +255,10 @@ impl DurableContext {
             inner: Arc::new(Inner {
                 execution_arn: self.inner.execution_arn.clone(),
                 lambda_context: self.inner.lambda_context.clone(),
-                engine: EngineState::new_child(
+                engine: Arc::new(EngineState::new_child(
                     child_positional_id,
                     Arc::clone(&self.inner.engine.checkpoint_log),
-                ),
+                )),
                 suspension_signal: Arc::new(self.inner.suspension_signal.new_child_scope()),
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
@@ -262,6 +267,34 @@ impl DurableContext {
                 default_serdes: self.inner.default_serdes.clone(),
             }),
         }
+    }
+
+    /// Creates a clone of this context bound to a FRESH child suspension
+    /// scope, for an eagerly spawned (`.spawn()`ed) operation.
+    ///
+    /// Returns the rebound context and the new scope. Everything else —
+    /// engine state (so the ID counter and checkpoint log stay shared, and
+    /// replay identity is unaffected), client, token, ownership, ARN — is the
+    /// same as this context: only the suspension scope differs. A parking
+    /// operation inside the spawned task therefore suspends ITS OWN scope
+    /// (observed by the spawned task's [`drive_scope`](crate::driver::drive_scope))
+    /// instead of the owner's, exactly like a map/parallel branch.
+    pub(crate) fn spawn_scope(&self) -> (Self, Arc<SuspensionSignal>) {
+        let scope = Arc::new(self.inner.suspension_signal.new_child_scope());
+        let rebound = Self {
+            inner: Arc::new(Inner {
+                execution_arn: self.inner.execution_arn.clone(),
+                lambda_context: self.inner.lambda_context.clone(),
+                engine: Arc::clone(&self.inner.engine),
+                suspension_signal: Arc::clone(&scope),
+                task_ownership: Arc::clone(&self.inner.task_ownership),
+                execution_client: self.inner.execution_client.clone(),
+                checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
+                parent_wire_id: self.inner.parent_wire_id.clone(),
+                default_serdes: self.inner.default_serdes.clone(),
+            }),
+        };
+        (rebound, scope)
     }
 
     /// Advances the ID counter by `n` positions without minting.
@@ -320,22 +353,34 @@ impl DurableContext {
         self.inner.engine.checkpoint_log.get(&wire_id)
     }
 
-    /// Requests suspension from the driver (used by operations that cannot
-    /// proceed — e.g., pending retry timer).
+    /// Requests suspension of THIS context's scope (used by operations that
+    /// cannot proceed — e.g. a pending retry timer).
+    ///
+    /// Routes through the scope's quiescence gate: if operations were
+    /// `.spawn()`ed into this scope and have not settled yet, the request is
+    /// deferred until the last of them settles, so a park never aborts a
+    /// runnable sibling. Every parking path in the SDK funnels through here
+    /// (directly or via [`Self::suspend_now`]), so none can bypass the
+    /// accounting.
     pub(crate) fn request_suspend(&self) {
-        self.inner.suspension_signal.request_suspend();
+        self.inner.suspension_signal.park_owner();
     }
 
     /// Suspends the invocation and never returns control to the caller.
     ///
-    /// Sets the suspension signal, then awaits a future that never resolves
-    /// and never registers a waker. The driver observes the signal on the
-    /// next `Poll::Pending` from the handler and drops the handler future at
-    /// this await point, completing the invocation as `PENDING`. Because the
-    /// future is dropped rather than resumed, an operation's suspension can
-    /// never surface to user code and can never be caught or ignored. The
-    /// `-> T` return type is inhabited only vacuously: the awaited future
-    /// never completes, so no value is ever produced.
+    /// Requests suspension of this context's scope (through the scope's
+    /// quiescence gate — see [`Self::request_suspend`]), then awaits a future
+    /// that never resolves and never registers a waker. The driver observes
+    /// the signal on the next `Poll::Pending` from the handler and drops the
+    /// handler future at this await point, completing the invocation as
+    /// `PENDING`. Because the future is dropped rather than resumed, an
+    /// operation's suspension can never surface to user code and can never be
+    /// caught or ignored. The `-> T` return type is inhabited only vacuously:
+    /// the awaited future never completes, so no value is ever produced.
+    ///
+    /// When runnable `.spawn()`ed siblings are still outstanding in this
+    /// scope, the suspension request is deferred until they settle; this call
+    /// still never returns.
     pub(crate) async fn suspend_now<T>(&self) -> T {
         self.request_suspend();
         std::future::pending::<T>().await

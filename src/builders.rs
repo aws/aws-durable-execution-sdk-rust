@@ -15,6 +15,38 @@ use crate::error::OperationError;
 use crate::future::DurableFuture;
 use crate::{CompletionConfig, RetryStrategy, Serdes, Settled, WaitStrategy};
 
+/// The body shared by every builder's `.spawn()` terminal.
+///
+/// Rebinds the builder's context onto a FRESH child suspension scope, then
+/// hands the operation future to
+/// [`DurableFuture::spawn_blessed`](crate::future::DurableFuture) together with
+/// the owner's scope (for quiescence accounting) and the new scope (which the
+/// spawned task drives).
+///
+/// This is one helper rather than thirteen copies so that no `.spawn()`
+/// terminal can drift out of the accounting: an eagerly spawned operation that
+/// kept the owner's scope would park the owner — ending the invocation — the
+/// moment it hit a durable suspension point, aborting runnable siblings.
+///
+/// The builder must have a `ctx: DurableContext` field and implement
+/// [`IntoFuture`] with `IntoFuture = DurableFuture<_>`.
+macro_rules! spawn_terminal {
+    ($builder:expr) => {{
+        let mut builder = $builder;
+        let owner_scope = ::std::sync::Arc::clone(builder.ctx.suspension_signal());
+        let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
+        let (spawn_ctx, spawn_scope) = builder.ctx.spawn_scope();
+        builder.ctx = spawn_ctx;
+        let future = ::std::future::IntoFuture::into_future(builder);
+        $crate::future::DurableFuture::spawn_blessed(
+            future,
+            task_ownership,
+            owner_scope,
+            spawn_scope,
+        )
+    }};
+}
+
 // ============================================================
 // StepBuilder
 // ============================================================
@@ -194,10 +226,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> StepBui
     where
         O: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = <Self as IntoFuture>::into_future(self);
-        // Spawn on a tokio task with blessed-task registration.
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -312,9 +341,7 @@ impl WaitBuilder {
     /// }
     /// ```
     pub fn spawn(self) -> DurableFuture<()> {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = <Self as IntoFuture>::into_future(self);
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -495,9 +522,7 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
     /// }
     /// ```
     pub fn spawn(self) -> DurableFuture<O> {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = <Self as IntoFuture>::into_future(self);
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -662,9 +687,7 @@ impl<O: Send + 'static> ChildBuilder<O> {
     where
         O: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = <Self as IntoFuture>::into_future(self);
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -857,9 +880,7 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
 
     /// Eagerly spawns the operation on a tokio task.
     pub fn spawn(self) -> DurableFuture<S> {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = <Self as IntoFuture>::into_future(self);
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -997,9 +1018,7 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> CreateCallbackBuilder<O> {
 
     /// Eagerly spawns the callback creation on a tokio task.
     pub fn spawn(self) -> DurableFuture<crate::Callback<O>> {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = self.into_future();
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -1177,9 +1196,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> WaitFor
 
     /// Eagerly spawns the operation on a tokio task.
     pub fn spawn(self) -> DurableFuture<O> {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = <Self as IntoFuture>::into_future(self);
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -1453,9 +1470,7 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
         I: serde::Serialize + serde::de::DeserializeOwned + Sync,
         O: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = <Self as IntoFuture>::into_future(self);
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -1658,9 +1673,7 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     where
         O: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = <Self as IntoFuture>::into_future(self);
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -1772,9 +1785,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<Vec<O>> {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = self.into_future();
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -1878,9 +1889,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<Vec<Settled<O>>> {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = self.into_future();
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -1981,9 +1990,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<O> {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = self.into_future();
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 
@@ -2084,9 +2091,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<O> {
-        let task_ownership = self.ctx.task_ownership().clone();
-        let future = self.into_future();
-        DurableFuture::spawn_blessed(future, task_ownership)
+        spawn_terminal!(self)
     }
 }
 

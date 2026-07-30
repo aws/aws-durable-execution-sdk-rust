@@ -63,19 +63,73 @@ impl<O: Send + 'static> DurableFuture<O> {
         }
     }
 
-    /// Spawns the future on a tokio task and registers it as blessed.
+    /// Spawns the future on a tokio task with its OWN suspension scope, and
+    /// registers it as blessed.
+    ///
+    /// `owner_scope` is the scope the `.spawn()` call was made from;
+    /// `spawn_scope` is the fresh child scope the operation runs in (the
+    /// builder's context was rebound onto it by
+    /// [`DurableContext::spawn_scope`](crate::context::DurableContext)).
+    ///
+    /// Scope isolation means a parking operation inside the spawned task
+    /// suspends only `spawn_scope`, which this task's
+    /// [`drive_scope`](crate::driver::drive_scope) observes — the owner's scope
+    /// is untouched, so runnable siblings keep running. The task then reports
+    /// how it settled to the owner's scope-quiescence accounting, which is what
+    /// lets the owner suspend exactly once everything runnable has finished or
+    /// parked.
+    ///
+    /// The accounting transitions happen ON THIS TASK, never in the returned
+    /// handle: the runtime always polls a live task, but nothing guarantees the
+    /// handle is ever polled. A task cancelled before it settles reports
+    /// `Aborted` from its RAII guard.
     pub(crate) fn spawn_blessed(
         future: Self,
         task_ownership: std::sync::Arc<crate::driver::TaskOwnership>,
+        owner_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
+        spawn_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
     ) -> Self
     where
         O: Send + 'static,
     {
+        use crate::driver::{ScopeOutcome, SpawnSettlement, drive_scope};
         use tokio::sync::oneshot;
+
+        /// Reports `Aborted` if the task is dropped before it settles, so a
+        /// cancelled spawn can never leave the owner's counter stuck above
+        /// zero (which would park the owner forever).
+        struct SpawnAccounting {
+            scope: std::sync::Arc<crate::driver::SuspensionSignal>,
+            settled: bool,
+        }
+
+        impl SpawnAccounting {
+            fn settle(&mut self, settlement: SpawnSettlement) {
+                if !self.settled {
+                    self.settled = true;
+                    self.scope.settle_spawn(settlement);
+                }
+            }
+        }
+
+        impl Drop for SpawnAccounting {
+            fn drop(&mut self) {
+                self.settle(SpawnSettlement::Aborted);
+            }
+        }
 
         let (tx, rx) = oneshot::channel();
 
+        // Register BEFORE spawning so the count is already correct even if the
+        // task settles before the owner is polled again.
+        owner_scope.register_spawn();
+        let task_scope = std::sync::Arc::clone(&owner_scope);
+
         let handle = tokio::spawn(async move {
+            let mut accounting = SpawnAccounting {
+                scope: task_scope,
+                settled: false,
+            };
             // Register this task as blessed AFTER spawn (we need the task ID).
             if let Some(task_id) = tokio::task::try_id() {
                 task_ownership.bless_task(task_id);
@@ -85,7 +139,7 @@ impl<O: Send + 'static> DurableFuture<O> {
             // lost to a `JoinError` nobody observes (the JoinHandle is held
             // only for abort-on-drop, never awaited).
             let mut future = future;
-            let result = std::future::poll_fn(move |cx| {
+            let body = std::future::poll_fn(move |cx| {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     Pin::new(&mut future).poll(cx)
                 })) {
@@ -93,10 +147,21 @@ impl<O: Send + 'static> DurableFuture<O> {
                     Ok(Poll::Pending) => Poll::Pending,
                     Err(payload) => Poll::Ready(Err(payload)),
                 }
-            })
-            .await;
+            });
+            // Drive the operation in its OWN scope: a park inside it suspends
+            // that scope only, and surfaces here as `Suspended`.
+            let settled = match drive_scope(body, spawn_scope).await {
+                ScopeOutcome::Completed(result) => {
+                    accounting.settle(SpawnSettlement::Completed);
+                    SpawnMessage::Settled(result)
+                }
+                ScopeOutcome::Suspended => {
+                    accounting.settle(SpawnSettlement::Parked);
+                    SpawnMessage::Parked
+                }
+            };
             // Ignore send error — receiver was dropped.
-            let _ = tx.send(result);
+            let _ = tx.send(settled);
         });
 
         // Own the spawned task: hold its abort-on-drop guard inside the
@@ -108,12 +173,22 @@ impl<O: Send + 'static> DurableFuture<O> {
         Self::from_async(async move {
             let _guard = guard;
             match rx.await {
-                Ok(Ok(result)) => result,
+                Ok(SpawnMessage::Settled(Ok(result))) => result,
                 // The operation body panicked: re-raise the ORIGINAL panic
                 // payload on the awaiting task, exactly as the lazy
                 // (non-spawned) path would have, instead of masking it as a
                 // fabricated step error.
-                Ok(Err(panic_payload)) => std::panic::resume_unwind(panic_payload),
+                Ok(SpawnMessage::Settled(Err(panic_payload))) => {
+                    std::panic::resume_unwind(panic_payload)
+                }
+                // The operation parked durably: it resumes on a later
+                // invocation, so this handle can never resolve now. Park the
+                // owner — through the quiescence gate, so any still-runnable
+                // spawned sibling finishes first — and never return.
+                Ok(SpawnMessage::Parked) => {
+                    owner_scope.park_owner();
+                    std::future::pending().await
+                }
                 // The sender was dropped without a value: the task was
                 // cancelled (aborted) before completing.
                 Err(_) => Err(OperationError::from_kind(
@@ -126,6 +201,14 @@ impl<O: Send + 'static> DurableFuture<O> {
             }
         })
     }
+}
+
+/// What a spawned task reports to its handle.
+enum SpawnMessage<O> {
+    /// The operation resolved (`Ok`) or its body panicked (`Err(payload)`).
+    Settled(Result<Result<O, OperationError>, Box<dyn std::any::Any + Send>>),
+    /// The operation suspended durably; it resumes on a later invocation.
+    Parked,
 }
 
 impl<O: Send + 'static> Future for DurableFuture<O> {
