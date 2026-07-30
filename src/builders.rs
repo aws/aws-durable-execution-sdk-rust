@@ -47,6 +47,40 @@ macro_rules! spawn_terminal {
     }};
 }
 
+/// Like [`spawn_terminal!`] but also redirects park signals from the
+/// builder's constituent `futures` onto the combinator's spawn scope.
+///
+/// Without this, a constituent that was itself `.spawn()`ed would park the
+/// OUTER owner scope — the same scope that counts the combinator as
+/// outstanding — creating a deadlock cycle: the owner waits for the
+/// combinator to settle, while the combinator waits for the constituent to
+/// complete, which it never will (it parked).
+///
+/// By redirecting, the constituent's park hits the combinator's spawn scope
+/// instead. [`drive_scope`](crate::driver::drive_scope) detects the
+/// suspension and the combinator settles as parked on the owner scope,
+/// breaking the cycle.
+macro_rules! spawn_combinator_terminal {
+    ($builder:expr) => {{
+        let mut builder = $builder;
+        let owner_scope = ::std::sync::Arc::clone(builder.ctx.suspension_signal());
+        let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
+        let (spawn_ctx, spawn_scope) = builder.ctx.spawn_scope();
+        // Redirect each constituent future's park to the combinator's scope.
+        for future in &builder.futures {
+            future.set_park_scope(::std::sync::Arc::clone(&spawn_scope));
+        }
+        builder.ctx = spawn_ctx;
+        let future = ::std::future::IntoFuture::into_future(builder);
+        $crate::future::DurableFuture::spawn_blessed(
+            future,
+            task_ownership,
+            owner_scope,
+            spawn_scope,
+        )
+    }};
+}
+
 // ============================================================
 // StepBuilder
 // ============================================================
@@ -1873,7 +1907,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<Vec<O>> {
-        spawn_terminal!(self)
+        spawn_combinator_terminal!(self)
     }
 }
 
@@ -1977,7 +2011,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<Vec<Settled<O>>> {
-        spawn_terminal!(self)
+        spawn_combinator_terminal!(self)
     }
 }
 
@@ -2078,7 +2112,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<O> {
-        spawn_terminal!(self)
+        spawn_combinator_terminal!(self)
     }
 }
 
@@ -2179,7 +2213,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<O> {
-        spawn_terminal!(self)
+        spawn_combinator_terminal!(self)
     }
 }
 

@@ -1987,4 +1987,77 @@ mod spawn_scope_regressions {
              before the invocation reports Pending"
         );
     }
+
+    /// A spawned `try_join_all` containing a parking wait input beside a
+    /// runnable step sibling. The combinator is itself spawned onto the root
+    /// scope. Without park-redirect, the parking input calls `park_owner` on
+    /// root — the same scope that counts the combinator as outstanding —
+    /// creating a deadlock: root waits for the combinator to settle, but the
+    /// combinator's `JoinSet` hangs on the parked constituent.
+    ///
+    /// With the fix, the constituent's park is redirected to the combinator's
+    /// spawn scope, so `drive_scope` detects suspension and the combinator
+    /// settles as Parked on root, breaking the cycle. The runnable sibling
+    /// spawned alongside must still complete before the invocation suspends.
+    #[tokio::test]
+    async fn spawned_combinator_with_parking_input_does_not_deadlock() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = live_ctx(Arc::clone(&client));
+        let signal = Arc::clone(ctx.suspension_signal());
+        let sibling_done = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&sibling_done);
+        let ctx_h = ctx.clone();
+
+        let outcome = tokio::time::timeout(
+            BOUND,
+            drive_invocation(
+                async move {
+                    // Parking input: a spawned wait (will park on first
+                    // invocation since no timer has elapsed).
+                    let parking_wait = ctx_h.wait(Duration::from_mins(1)).spawn();
+                    // The combinator contains the parking input alongside a
+                    // step that resolves immediately.
+                    let instant_step = ctx_h.step(|_| async { Ok(()) }).name("inner").future();
+                    // Spawn the combinator: this registers the combinator on
+                    // root scope. The defect made the parking input also park
+                    // root, causing a deadlock.
+                    let combo = ctx_h.try_join_all([parking_wait, instant_step]).spawn();
+
+                    // Runnable sibling spawned on root beside the combinator.
+                    let sibling = ctx_h
+                        .step(move |_| {
+                            let d = Arc::clone(&done);
+                            async move {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                d.store(true, Ordering::SeqCst);
+                                Ok(42_i32)
+                            }
+                        })
+                        .name("sibling")
+                        .spawn();
+
+                    let _ = tokio::join!(combo, sibling);
+                    Ok::<_, (String, String)>("done".to_owned())
+                },
+                signal,
+            ),
+        )
+        .await
+        .expect(
+            "drive_invocation must terminate within the bound; \
+             a deadlock from the spawned combinator defect would hang here",
+        );
+
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert!(
+            sibling_done.load(Ordering::SeqCst),
+            "the runnable sibling must complete before the invocation \
+             suspends; the combinator's suspension must not abort it"
+        );
+        assert!(
+            succeeded(&client, "sibling"),
+            "the sibling must reach its terminal Succeed checkpoint \
+             before the invocation reports Pending"
+        );
+    }
 }

@@ -44,6 +44,42 @@ use crate::error::{ChildFnError, OperationError};
 #[must_use = "futures do nothing unless polled or spawned"]
 pub struct DurableFuture<O> {
     inner: Pin<Box<dyn Future<Output = Result<O, OperationError>> + Send>>,
+    /// Optional shared cell that a spawned handle reads at park-time.
+    /// When set to `Some(scope)`, the handle parks that scope instead of the
+    /// one captured at `.spawn()` time. Enables spawned combinators to
+    /// redirect constituent parking onto the combinator's spawn scope,
+    /// preventing deadlock when a constituent parks and the combinator is
+    /// outstanding on the same owner scope.
+    park_redirect: Option<std::sync::Arc<ParkRedirect>>,
+}
+
+/// Shared mutable cell read by a spawned handle at park-time to determine
+/// which scope to park. Default is `None` (use the originally captured scope).
+#[derive(Debug)]
+pub(crate) struct ParkRedirect {
+    target: std::sync::Mutex<Option<std::sync::Arc<crate::driver::SuspensionSignal>>>,
+}
+
+impl ParkRedirect {
+    fn new() -> Self {
+        Self {
+            target: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn set(&self, scope: std::sync::Arc<crate::driver::SuspensionSignal>) {
+        // A poisoned Mutex means a panic occurred while the lock was held.
+        // Since ParkRedirect access is trivial (clone-in / clone-out with no
+        // user code under the lock), poisoning is an irrecoverable internal
+        // state; silently falling back to the default park target is safe.
+        if let Ok(mut guard) = self.target.lock() {
+            *guard = Some(scope);
+        }
+    }
+
+    fn get(&self) -> Option<std::sync::Arc<crate::driver::SuspensionSignal>> {
+        self.target.lock().ok().and_then(|guard| guard.clone())
+    }
 }
 
 impl<O> std::fmt::Debug for DurableFuture<O> {
@@ -60,6 +96,19 @@ impl<O: Send + 'static> DurableFuture<O> {
     {
         Self {
             inner: Box::pin(fut),
+            park_redirect: None,
+        }
+    }
+
+    /// Redirects this future's park behaviour to `scope`.
+    ///
+    /// Only meaningful for spawned futures (produced by `.spawn()`): when
+    /// the inner spawned task parks, the handle will park `scope` instead
+    /// of the scope captured at `.spawn()` time. No-op on non-spawned
+    /// futures.
+    pub(crate) fn set_park_scope(&self, scope: std::sync::Arc<crate::driver::SuspensionSignal>) {
+        if let Some(redirect) = &self.park_redirect {
+            redirect.set(scope);
         }
     }
 
@@ -120,6 +169,13 @@ impl<O: Send + 'static> DurableFuture<O> {
 
         let (tx, rx) = oneshot::channel();
 
+        // Park-redirect cell: the handle reads this at park-time. A
+        // combinator's `.spawn()` may set it to the combinator's spawn scope
+        // before polling the handle, redirecting parking away from the
+        // captured `owner_scope`.
+        let redirect = std::sync::Arc::new(ParkRedirect::new());
+        let redirect_handle = std::sync::Arc::clone(&redirect);
+
         // Register BEFORE spawning so the count is already correct even if the
         // task settles before the owner is polled again.
         owner_scope.register_spawn();
@@ -170,36 +226,43 @@ impl<O: Send + 'static> DurableFuture<O> {
         // the invocation.
         let guard = crate::driver::AbortOnDrop::new(handle);
 
-        Self::from_async(async move {
-            let _guard = guard;
-            match rx.await {
-                Ok(SpawnMessage::Settled(Ok(result))) => result,
-                // The operation body panicked: re-raise the ORIGINAL panic
-                // payload on the awaiting task, exactly as the lazy
-                // (non-spawned) path would have, instead of masking it as a
-                // fabricated step error.
-                Ok(SpawnMessage::Settled(Err(panic_payload))) => {
-                    std::panic::resume_unwind(panic_payload)
-                }
-                // The operation parked durably: it resumes on a later
-                // invocation, so this handle can never resolve now. Park the
-                // owner — through the quiescence gate, so any still-runnable
-                // spawned sibling finishes first — and never return.
-                Ok(SpawnMessage::Parked) => {
-                    owner_scope.park_owner();
-                    std::future::pending().await
-                }
-                // The sender was dropped without a value: the task was
-                // cancelled (aborted) before completing.
-                Err(_) => Err(OperationError::from_kind(
-                    crate::error::OperationErrorKind::Step(crate::error::StepError::from_kind(
-                        crate::error::StepErrorKind::ExecutionFailed {
-                            message: "spawned task was cancelled".to_owned(),
-                        },
+        Self {
+            inner: Box::pin(async move {
+                let _guard = guard;
+                match rx.await {
+                    Ok(SpawnMessage::Settled(Ok(result))) => result,
+                    // The operation body panicked: re-raise the ORIGINAL panic
+                    // payload on the awaiting task, exactly as the lazy
+                    // (non-spawned) path would have, instead of masking it as a
+                    // fabricated step error.
+                    Ok(SpawnMessage::Settled(Err(panic_payload))) => {
+                        std::panic::resume_unwind(panic_payload)
+                    }
+                    // The operation parked durably: it resumes on a later
+                    // invocation, so this handle can never resolve now. Park
+                    // the effective scope — either the redirect target (when
+                    // this future is a constituent of a spawned combinator) or
+                    // the original owner scope — then never return.
+                    Ok(SpawnMessage::Parked) => {
+                        let park_target = redirect_handle
+                            .get()
+                            .unwrap_or_else(|| std::sync::Arc::clone(&owner_scope));
+                        park_target.park_owner();
+                        std::future::pending().await
+                    }
+                    // The sender was dropped without a value: the task was
+                    // cancelled (aborted) before completing.
+                    Err(_) => Err(OperationError::from_kind(
+                        crate::error::OperationErrorKind::Step(crate::error::StepError::from_kind(
+                            crate::error::StepErrorKind::ExecutionFailed {
+                                message: "spawned task was cancelled".to_owned(),
+                            },
+                        )),
                     )),
-                )),
-            }
-        })
+                }
+            }),
+            park_redirect: Some(redirect),
+        }
     }
 }
 
