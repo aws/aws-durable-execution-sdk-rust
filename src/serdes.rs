@@ -29,6 +29,42 @@ use std::fmt::Debug;
 /// and individual map/parallel item results. A type that implements this
 /// trait therefore behaves identically wherever it is attached.
 ///
+/// The string handed over is the JSON *encoding* of the value, not the value's
+/// own text: a `String` result of `X` arrives as `"X"`, quotes included. A
+/// serdes that wants to transform the underlying text — and to emit a wire
+/// payload that is not itself JSON — must decode and re-encode around its own
+/// transform:
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::Serdes;
+///
+/// #[derive(Debug)]
+/// struct WrapSerdes;
+///
+/// impl Serdes for WrapSerdes {
+///     fn serialize_to_string(
+///         &self,
+///         json_str: &str,
+///     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+///         let raw: String = serde_json::from_str(json_str)?;
+///         Ok(format!("wrapped:{raw}"))
+///     }
+///
+///     fn deserialize_from_string(
+///         &self,
+///         payload: &str,
+///     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+///         let raw = payload.strip_prefix("wrapped:").unwrap_or(payload);
+///         Ok(serde_json::to_string(raw)?)
+///     }
+/// }
+///
+/// let wire = WrapSerdes.serialize_to_string(r#""X""#)?;
+/// assert_eq!(wire, "wrapped:X");
+/// assert_eq!(WrapSerdes.deserialize_from_string(&wire)?, r#""X""#);
+/// # Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+/// ```
+///
 /// # Object safety
 ///
 /// This trait is deliberately object-safe so it can be stored as
@@ -768,6 +804,7 @@ fn json_escape_string(input: &str) -> String {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::Serdes;
+    use std::sync::{Arc, Mutex};
 
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -818,6 +855,52 @@ pub(crate) mod test_support {
             let _ = write!(out, "{byte:02x}");
         }
         out
+    }
+
+    /// An identity serdes that records every string the engine hands it.
+    ///
+    /// Where `HexEnvelopeSerdes` pins the wire form a path *produces*, this
+    /// pins the shape a path *provides*: the exact `&str` passed to
+    /// `serialize_to_string`. Cloning shares the recording buffer, so a clone
+    /// can be attached to an operation while the original is inspected.
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct RecordingSerdes {
+        serialize_inputs: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingSerdes {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        /// Every string handed to `serialize_to_string`, in call order.
+        pub(crate) fn serialize_inputs(&self) -> Vec<String> {
+            self.serialize_inputs
+                .lock()
+                .map(|seen| seen.clone())
+                .unwrap_or_default()
+        }
+
+        /// The distinct strings handed to `serialize_to_string`, sorted.
+        pub(crate) fn distinct_serialize_inputs(&self) -> Vec<String> {
+            let mut seen = self.serialize_inputs();
+            seen.sort();
+            seen.dedup();
+            seen
+        }
+    }
+
+    impl Serdes for RecordingSerdes {
+        fn serialize_to_string(&self, json_str: &str) -> Result<String, BoxError> {
+            if let Ok(mut seen) = self.serialize_inputs.lock() {
+                seen.push(json_str.to_owned());
+            }
+            Ok(json_str.to_owned())
+        }
+
+        fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
+            Ok(payload.to_owned())
+        }
     }
 }
 

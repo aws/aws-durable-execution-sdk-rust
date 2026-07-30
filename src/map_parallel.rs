@@ -2764,6 +2764,93 @@ mod tests {
         );
     }
 
+    /// The engine must hand a custom serdes the SAME string on every path.
+    ///
+    /// The probe value is a `String`, the one case where an extra encoding
+    /// step is visible: `serde_json` gives `"X"` (quotes included) while the
+    /// raw value is `X`. A serdes written against one shape and run on the
+    /// other silently produces a different wire payload — which is exactly
+    /// how conformance requirement 9-14 broke — so the shape is pinned here
+    /// for the step, map-item and parallel-branch paths at once.
+    #[tokio::test]
+    async fn custom_serdes_receives_the_same_string_on_step_map_and_parallel_paths() {
+        use crate::future::Branch;
+        use crate::serdes::test_support::RecordingSerdes;
+
+        let value = "X".to_owned();
+        let expected_input = serde_json::to_string(&value).expect("a string is JSON-able");
+        assert_eq!(
+            expected_input, "\"X\"",
+            "the JSON encoding of a string carries quotes; that is the shape \
+             a serdes is handed"
+        );
+
+        // ── step ──
+        let step_recorder = RecordingSerdes::new();
+        let (step_ctx, _step_client) = test_ctx_with_client(CheckpointLog::empty());
+        let step_value = value.clone();
+        let step_out: String = step_ctx
+            .step(move |_| {
+                let v = step_value.clone();
+                async move { Ok(v) }
+            })
+            .serdes(step_recorder.clone())
+            .await
+            .expect("step with a recording serdes must succeed");
+        assert_eq!(step_out, value, "step must round-trip the value");
+        assert_eq!(
+            step_recorder.distinct_serialize_inputs(),
+            vec![expected_input.clone()],
+            "a step serdes must be handed the JSON encoding of the result"
+        );
+
+        // ── map item ──
+        let map_recorder = RecordingSerdes::new();
+        let (map_ctx, _map_client) = test_ctx_with_client(CheckpointLog::empty());
+        let map_value = value.clone();
+        let map_out: Vec<String> = map_ctx
+            .map(vec![0_usize], move |_child, _item, _idx| {
+                let v = map_value.clone();
+                async move { Ok(v) }
+            })
+            .serdes(map_recorder.clone())
+            .await
+            .expect("map with a recording item serdes must succeed");
+        assert_eq!(
+            map_out,
+            vec![value.clone()],
+            "map must round-trip the value"
+        );
+        assert_eq!(
+            map_recorder.distinct_serialize_inputs(),
+            step_recorder.distinct_serialize_inputs(),
+            "a map item serdes must be handed exactly what a step serdes is \
+             handed, got {:?}",
+            map_recorder.serialize_inputs()
+        );
+
+        // ── parallel branch ──
+        let par_recorder = RecordingSerdes::new();
+        let (par_ctx, _par_client) = test_ctx_with_client(CheckpointLog::empty());
+        let par_value = value.clone();
+        let par_out: Vec<String> = par_ctx
+            .parallel(vec![Branch::new("only", move |_c| {
+                let v = par_value.clone();
+                async move { Ok(v) }
+            })])
+            .serdes(par_recorder.clone())
+            .await
+            .expect("parallel with a recording item serdes must succeed");
+        assert_eq!(par_out, vec![value], "parallel must round-trip the value");
+        assert_eq!(
+            par_recorder.distinct_serialize_inputs(),
+            step_recorder.distinct_serialize_inputs(),
+            "a parallel branch serdes must be handed exactly what a step \
+             serdes is handed, got {:?}",
+            par_recorder.serialize_inputs()
+        );
+    }
+
     /// Replay must reverse the same transform: a terminal map child whose
     /// stored payload is the custom (non-JSON) wire form is decoded back to
     /// the typed value, with no downcast involved.
