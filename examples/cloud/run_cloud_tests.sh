@@ -43,6 +43,10 @@ EXECUTION_TIMEOUT=900
 # 10 seconds after creation.
 CALLBACK_POLL_INTERVAL=2
 CALLBACK_DISCOVERY_TIMEOUT=120
+# Upper bound on a backgrounded invoke for a callback example. The function's
+# own timeout ends the invocation well before this; this only guarantees the
+# harness cannot block forever.
+CALLBACK_INVOKE_TIMEOUT=180
 
 DEFAULT_PAYLOAD='"cloud-test"'
 CALLBACK_RESULT='"approved by cloud test"'
@@ -232,7 +236,12 @@ echo "$EXPECTATIONS" | grep -v '^[[:space:]]*$' | while IFS='|' read -r family e
     meta="$WORK_DIR/invoke-$example.json"
     if [ "$drive" = "callback" ]; then
         started_after=$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)
-        aws lambda invoke --function-name "$fn" --qualifier '$LATEST' \
+        # Bounded by `timeout` rather than killed later: closing the client
+        # connection early can cancel the in-flight invocation, and the parked
+        # handler must stay alive long enough to observe the completed
+        # callback. The function's own timeout ends the invocation first.
+        timeout "$CALLBACK_INVOKE_TIMEOUT" \
+            aws lambda invoke --function-name "$fn" --qualifier '$LATEST' \
             --payload "${payload:-$DEFAULT_PAYLOAD}" \
             --cli-binary-format raw-in-base64-out \
             --cli-read-timeout 0 \
@@ -240,8 +249,7 @@ echo "$EXPECTATIONS" | grep -v '^[[:space:]]*$' | while IFS='|' read -r family e
         invoke_pid=$!
 
         if ! arn=$(discover_execution_arn "$fn" "$started_after"); then
-            kill "$invoke_pid" 2> /dev/null
-            wait "$invoke_pid" 2> /dev/null
+            wait "$invoke_pid" 2> /dev/null || true
             echo "FAIL $example: execution did not appear within ${CALLBACK_DISCOVERY_TIMEOUT}s" >> "$WORK_DIR/failures"
             continue
         fi
@@ -252,11 +260,7 @@ echo "$EXPECTATIONS" | grep -v '^[[:space:]]*$' | while IFS='|' read -r family e
         if ! drive_callback "$example" "$arn"; then
             echo "FAIL $example: callback drive failed" >> "$WORK_DIR/failures"
         fi
-        # The invoke client has served its purpose: the execution is running
-        # and phase 2 polls it to a terminal state through its ARN. Release the
-        # client rather than waiting on it, because an invoke whose callback
-        # was never completed would never return.
-        kill "$invoke_pid" 2> /dev/null
+        # Let the invocation finish on its own; `timeout` bounds the wait.
         wait "$invoke_pid" 2> /dev/null || true
         continue
     fi
