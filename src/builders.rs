@@ -469,8 +469,6 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
     /// # #[derive(Debug)]
     /// # struct UpperSerdes;
     /// # impl durable::Serdes for UpperSerdes {
-    /// #     fn serialize(&self, _: &dyn std::any::Any) -> Result<Vec<u8>, durable::BoxError> { Ok(vec![]) }
-    /// #     fn deserialize_bytes(&self, _: &[u8], _: &str) -> Result<Box<dyn std::any::Any + Send>, durable::BoxError> { Ok(Box::new(())) }
     /// #     fn serialize_to_string(&self, s: &str) -> Result<String, durable::BoxError> { Ok(s.to_uppercase()) }
     /// #     fn deserialize_from_string(&self, s: &str) -> Result<String, durable::BoxError> { Ok(s.to_owned()) }
     /// # }
@@ -1370,6 +1368,10 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     }
 
     /// Sets a custom serializer/deserializer for item results.
+    ///
+    /// Item results go through the same JSON-string transform model as every
+    /// other operation, so a [`Serdes`] attached here behaves exactly as it
+    /// does on a step, invoke, callback, or `result_serdes`.
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
         self.serdes = Some(Box::new(serdes));
         self
@@ -1637,6 +1639,10 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     }
 
     /// Sets a custom serializer/deserializer for branch results.
+    ///
+    /// Branch results go through the same JSON-string transform model as every
+    /// other operation, so a [`Serdes`] attached here behaves exactly as it
+    /// does on a step, invoke, callback, or `result_serdes`.
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
         self.serdes = Some(Box::new(serdes));
         self

@@ -694,7 +694,7 @@ where
             reason: CompletionReason::AllCompleted,
         };
         let serdes_ref: Option<&dyn Serdes> = serdes.as_ref().map(Box::as_ref);
-        let payload = from_batch_result(&result, serdes_ref)?;
+        let payload = from_batch_result(&result, serdes_ref, &parent_wire, ctx.execution_arn())?;
         let json_str = serde_json::to_string(&payload)
             .map_err(|e| batch_error(&format!("serialize batch result: {e}")))?;
         let serialized_payload = if let Some(ref rs) = result_serdes {
@@ -1046,7 +1046,7 @@ where
     // Otherwise, use the default batch payload format unchanged.
     let serdes_opt: &Option<Box<dyn Serdes>> = &serdes;
     let serdes_ref: Option<&dyn Serdes> = serdes_opt.as_ref().map(Box::as_ref);
-    let payload = from_batch_result(&batch_result, serdes_ref)?;
+    let payload = from_batch_result(&batch_result, serdes_ref, &parent_wire, ctx.execution_arn())?;
     let json_str = serde_json::to_string(&payload)
         .map_err(|e| batch_error(&format!("serialize batch result: {e}")))?;
     let serialized_payload = if let Some(ref rs) = result_serdes {
@@ -1099,10 +1099,13 @@ where
 {
     let child_positional = child_op_id.positional().to_owned();
     let child_wire = child_op_id.wire().to_owned();
+    // Per-item serdes context: the child's wire ID is stable across replays,
+    // so a context-sensitive serdes resolves the same location every time.
+    let serdes_ctx = SerdesContext::new(child_wire.clone(), ctx.execution_arn());
 
     // Replay path: child already terminal.
     if is_terminal {
-        match replay_terminal_child::<O>(ctx, &child_positional, index, serdes) {
+        match replay_terminal_child::<O>(ctx, &child_positional, index, serdes, &serdes_ctx) {
             Ok(item) => return Ok(ItemOutcome::Terminal(item)),
             Err(e) => {
                 // ReplayChildren sentinel: fall through to re-execution.
@@ -1125,8 +1128,8 @@ where
         return match outcome {
             ScopeOutcome::Suspended => Ok(ItemOutcome::Suspended),
             ScopeOutcome::Completed(Ok(value)) => {
-                let serialized = serialize_value(&value, serdes)?;
-                let deserialized: O = deserialize_value(&serialized, serdes)?;
+                let serialized = serialize_value(&value, serdes, &serdes_ctx)?;
+                let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx)?;
                 Ok(ItemOutcome::Terminal(BatchItem {
                     index,
                     name: item_name.to_owned(),
@@ -1181,7 +1184,7 @@ where
         }
         ScopeOutcome::Completed(Ok(value)) => {
             // Serialize and checkpoint success.
-            let serialized = serialize_value(&value, serdes)?;
+            let serialized = serialize_value(&value, serdes, &serdes_ctx)?;
             let mut builder = OperationUpdate::builder()
                 .id(child_wire)
                 .r#type(OperationType::Context)
@@ -1209,7 +1212,7 @@ where
                 .map_err(|e| batch_error(&format!("checkpoint child succeed: {e}")))?;
 
             // Round-trip deserialize for live == replay consistency.
-            let deserialized: O = deserialize_value(&serialized, serdes)?;
+            let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx)?;
 
             Ok(ItemOutcome::Terminal(BatchItem {
                 index,
@@ -1266,7 +1269,7 @@ where
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Replays a terminal batch (parent already succeeded/failed in the log).
-fn replay_terminal_batch<O: DeserializeOwned + 'static>(
+fn replay_terminal_batch<O: DeserializeOwned>(
     _ctx: &DurableContext,
     record: &crate::engine::CheckpointRecord,
     _parent_positional: &str,
@@ -1300,7 +1303,15 @@ fn replay_terminal_batch<O: DeserializeOwned + 'static>(
             };
             let payload: BatchCheckpointPayload = serde_json::from_str(&json_str)
                 .map_err(|e| batch_error(&format!("deserialize batch payload: {e}")))?;
-            to_batch_result(&payload, serdes)
+            // The batch parent's serdes context carries the parent wire ID and
+            // the execution ARN, which is exactly what the per-item contexts
+            // are derived from.
+            to_batch_result(
+                &payload,
+                serdes,
+                serdes_ctx.operation_id(),
+                serdes_ctx.durable_execution_arn(),
+            )
         }
         CheckpointStatus::Failed => {
             let msg = record.error_message.as_deref().unwrap_or("batch failed");
@@ -1314,11 +1325,12 @@ fn replay_terminal_batch<O: DeserializeOwned + 'static>(
 }
 
 /// Replays a terminal child item from the checkpoint log.
-fn replay_terminal_child<O: DeserializeOwned + 'static>(
+fn replay_terminal_child<O: DeserializeOwned>(
     ctx: &DurableContext,
     child_positional: &str,
     index: usize,
     serdes: Option<&dyn Serdes>,
+    serdes_ctx: &SerdesContext,
 ) -> Result<BatchItem<O>, OperationError> {
     let record = ctx
         .checkpoint_record(child_positional)
@@ -1334,7 +1346,7 @@ fn replay_terminal_child<O: DeserializeOwned + 'static>(
                 .result
                 .as_deref()
                 .ok_or_else(|| batch_error("succeeded child has no result"))?;
-            let value: O = deserialize_value(payload, serdes)?;
+            let value: O = deserialize_value(payload, serdes, serdes_ctx)?;
             Ok(BatchItem {
                 index,
                 name: String::new(),
@@ -1505,46 +1517,54 @@ fn should_stop_failure(
 
 /// Serializes a value using the configured serdes or JSON default.
 ///
-/// When a custom serdes is provided, uses `Serdes::serialize(&dyn Any)` to
-/// serialize the raw value directly. The result bytes are converted to UTF-8
-/// for the checkpoint payload string.
-fn serialize_value<O: Serialize + 'static>(
+/// Uses the single normalized serialization model: `serde_json` produces the
+/// JSON string, then the custom serdes transforms it for the wire via
+/// [`Serdes::serialize_to_string_with_context`]. This is the same path every
+/// other operation (step, invoke, callback, child, batch result) takes.
+fn serialize_value<O: Serialize>(
     value: &O,
     serdes: Option<&dyn Serdes>,
+    serdes_ctx: &SerdesContext,
 ) -> Result<String, OperationError> {
+    let json_str =
+        serde_json::to_string(value).map_err(|e| batch_error(&format!("serialize result: {e}")))?;
     if let Some(s) = serdes {
-        let bytes = s
-            .serialize(value as &dyn std::any::Any)
-            .map_err(|e| batch_error(&format!("serialize result (custom): {e}")))?;
-        String::from_utf8(bytes)
-            .map_err(|e| batch_error(&format!("serialize result (custom): non-UTF8: {e}")))
+        s.serialize_to_string_with_context(&json_str, serdes_ctx)
+            .map_err(|e| batch_error(&format!("serialize result (custom): {e}")))
     } else {
-        serde_json::to_string(value).map_err(|e| batch_error(&format!("serialize result: {e}")))
+        Ok(json_str)
     }
 }
 
 /// Deserializes a value using the configured serdes or JSON default.
 ///
-/// When a custom serdes is provided, uses `Serdes::deserialize_bytes()` to
-/// deserialize raw bytes. The result is downcast from `Box<dyn Any>` to the
-/// target type.
-fn deserialize_value<O: DeserializeOwned + 'static>(
+/// Reverses [`serialize_value`]: the custom serdes undoes its wire transform
+/// via [`Serdes::deserialize_from_string_with_context`], then `serde_json`
+/// deserializes the JSON string into `O`. No runtime downcast is involved, so
+/// the target type is checked at compile time.
+fn deserialize_value<O: DeserializeOwned>(
     payload: &str,
     serdes: Option<&dyn Serdes>,
+    serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
-    if let Some(s) = serdes {
-        let boxed = s
-            .deserialize_bytes(payload.as_bytes(), std::any::type_name::<O>())
-            .map_err(|e| batch_error(&format!("deserialize result (custom): {e}")))?;
-        let any_send: Box<dyn std::any::Any + Send> = boxed;
-        // Attempt downcast to the target type.
-        any_send
-            .downcast::<O>()
-            .map(|b| *b)
-            .map_err(|_| batch_error("deserialize result (custom): type mismatch on downcast"))
+    let json_str = if let Some(s) = serdes {
+        s.deserialize_from_string_with_context(payload, serdes_ctx)
+            .map_err(|e| batch_error(&format!("deserialize result (custom): {e}")))?
     } else {
-        serde_json::from_str(payload).map_err(|e| batch_error(&format!("deserialize result: {e}")))
-    }
+        payload.to_owned()
+    };
+    serde_json::from_str(&json_str).map_err(|e| batch_error(&format!("deserialize result: {e}")))
+}
+
+/// Builds the serdes context for an individual batch item result stored
+/// inside the batch summary payload.
+///
+/// The identity is derived from the batch parent's wire ID plus the item
+/// index, so it is deterministic across replays and distinct per item (a
+/// context-sensitive serdes such as `FileSystemSerdes` must not collapse all
+/// item results onto one path).
+fn item_summary_serdes_ctx(parent_wire: &str, execution_arn: &str, index: usize) -> SerdesContext {
+    SerdesContext::new(format!("{parent_wire}/item-{index}"), execution_arn)
 }
 
 /// Batch checkpoint payload.
@@ -1574,9 +1594,11 @@ struct BatchCheckpointItem {
 }
 
 /// Converts a live `BatchResult` into the checkpoint payload format.
-fn from_batch_result<O: Serialize + 'static>(
+fn from_batch_result<O: Serialize>(
     result: &BatchResult<O>,
     serdes: Option<&dyn Serdes>,
+    parent_wire: &str,
+    execution_arn: &str,
 ) -> Result<BatchCheckpointPayload, OperationError> {
     let mut items = Vec::with_capacity(result.items.len());
     for item in &result.items {
@@ -1586,7 +1608,8 @@ fn from_batch_result<O: Serialize + 'static>(
         };
         let result_str = if item.status == BatchItemStatus::Succeeded {
             if let Some(ref value) = item.result {
-                serialize_value(value, serdes)?
+                let item_ctx = item_summary_serdes_ctx(parent_wire, execution_arn, item.index);
+                serialize_value(value, serdes, &item_ctx)?
             } else {
                 String::new()
             }
@@ -1613,9 +1636,11 @@ fn from_batch_result<O: Serialize + 'static>(
 }
 
 /// Converts a deserialized checkpoint payload back into a `BatchResult`.
-fn to_batch_result<O: DeserializeOwned + 'static>(
+fn to_batch_result<O: DeserializeOwned>(
     payload: &BatchCheckpointPayload,
     serdes: Option<&dyn Serdes>,
+    parent_wire: &str,
+    execution_arn: &str,
 ) -> Result<BatchResult<O>, OperationError> {
     let mut items = Vec::with_capacity(payload.results.len());
     for cp in &payload.results {
@@ -1625,7 +1650,8 @@ fn to_batch_result<O: DeserializeOwned + 'static>(
             other => return Err(batch_error(&format!("unknown item status: {other}"))),
         };
         let result = if status == BatchItemStatus::Succeeded && !cp.result.is_empty() {
-            Some(deserialize_value::<O>(&cp.result, serdes)?)
+            let item_ctx = item_summary_serdes_ctx(parent_wire, execution_arn, cp.index);
+            Some(deserialize_value::<O>(&cp.result, serdes, &item_ctx)?)
         } else {
             None
         };
@@ -2633,5 +2659,267 @@ mod tests {
             err.to_string().contains("boom in parallel branch"),
             "batch failure should carry the branch panic message, got: {err}"
         );
+    }
+
+    // ── Serialization-model equivalence tests ───────────────────────────
+    //
+    // These prove the point of the normalization: ONE `Serdes`
+    // implementation — one that implements only the JSON-string transform
+    // methods — behaves identically as a map item serdes, a parallel item
+    // serdes, and a step serdes. Before the normalization, map/parallel item
+    // results went through a separate mandatory byte API plus a runtime
+    // downcast, so a serdes like this one could not even be written.
+
+    /// A payload whose stored wire form plain `serde_json` cannot parse, and
+    /// whose JSON needs real escaping (quotes, backslash, newline, non-ASCII).
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Doc {
+        label: String,
+        nested: Vec<Vec<i64>>,
+    }
+
+    fn probe_doc() -> Doc {
+        Doc {
+            label: "quote:\" backslash:\\ newline:\n tab:\t ünïcodé ☃".to_owned(),
+            nested: vec![vec![1, -2, i64::MIN], Vec::new()],
+        }
+    }
+
+    /// Payloads recorded on SUCCEED updates that carry a `ParentId` (i.e. the
+    /// map children / parallel branches, not the batch parent).
+    fn child_success_payloads(client: &crate::client::InMemoryExecutionClient) -> Vec<String> {
+        client
+            .recorded_updates()
+            .iter()
+            .filter(|u| matches!(u.action(), OperationAction::Succeed) && u.parent_id().is_some())
+            .filter_map(|u| u.payload().map(str::to_owned))
+            .collect()
+    }
+
+    /// The wire form a step, a map item and a parallel branch produce for the
+    /// same value through the same custom serdes must be byte-identical, and
+    /// each must round-trip back to the original value.
+    #[tokio::test]
+    async fn custom_serdes_is_equivalent_on_step_map_and_parallel_paths() {
+        use crate::future::Branch;
+        use crate::serdes::test_support::{HexEnvelopeSerdes, hex_envelope};
+
+        let doc = probe_doc();
+        let expected_wire = hex_envelope(&serde_json::to_string(&doc).expect("doc is JSON-able"));
+
+        // Control: the wire form is NOT valid JSON, so any path that skipped
+        // the serdes transform would fail rather than silently pass.
+        assert!(
+            serde_json::from_str::<Doc>(&expected_wire).is_err(),
+            "the probe wire form must be unparseable by plain serde_json"
+        );
+
+        // ── step ──
+        let (step_ctx, step_client) = test_ctx_with_client(CheckpointLog::empty());
+        let step_doc = doc.clone();
+        let step_out: Doc = step_ctx
+            .step(move |_| {
+                let d = step_doc.clone();
+                async move { Ok(d) }
+            })
+            .serdes(HexEnvelopeSerdes)
+            .await
+            .expect("step with a string-transform serdes must succeed");
+        assert_eq!(step_out, doc, "step must round-trip the value");
+        let step_wire: Vec<String> = step_client
+            .recorded_updates()
+            .iter()
+            .filter(|u| matches!(u.action(), OperationAction::Succeed))
+            .filter_map(|u| u.payload().map(str::to_owned))
+            .collect();
+        assert_eq!(step_wire, vec![expected_wire.clone()]);
+
+        // ── map items ──
+        let (map_ctx, map_client) = test_ctx_with_client(CheckpointLog::empty());
+        let map_doc = doc.clone();
+        let map_out: Vec<Doc> = map_ctx
+            .map(vec![0_usize], move |_child, _item, _idx| {
+                let d = map_doc.clone();
+                async move { Ok(d) }
+            })
+            .serdes(HexEnvelopeSerdes)
+            .await
+            .expect("map with a string-transform item serdes must succeed");
+        assert_eq!(map_out, vec![doc.clone()], "map must round-trip the value");
+        assert_eq!(
+            child_success_payloads(&map_client),
+            vec![expected_wire.clone()],
+            "a map item must produce the same wire form as a step"
+        );
+
+        // ── parallel branches ──
+        let (par_ctx, par_client) = test_ctx_with_client(CheckpointLog::empty());
+        let par_doc = doc.clone();
+        let par_out: Vec<Doc> = par_ctx
+            .parallel(vec![Branch::new("only", move |_c| {
+                let d = par_doc.clone();
+                async move { Ok(d) }
+            })])
+            .serdes(HexEnvelopeSerdes)
+            .await
+            .expect("parallel with a string-transform item serdes must succeed");
+        assert_eq!(par_out, vec![doc], "parallel must round-trip the value");
+        assert_eq!(
+            child_success_payloads(&par_client),
+            vec![expected_wire],
+            "a parallel branch must produce the same wire form as a step"
+        );
+    }
+
+    /// Replay must reverse the same transform: a terminal map child whose
+    /// stored payload is the custom (non-JSON) wire form is decoded back to
+    /// the typed value, with no downcast involved.
+    #[tokio::test]
+    async fn custom_serdes_item_replay_reverses_the_transform() {
+        use crate::serdes::test_support::{HexEnvelopeSerdes, hex_envelope};
+
+        let doc = probe_doc();
+        let wire = hex_envelope(&serde_json::to_string(&doc).expect("doc is JSON-able"));
+
+        // Batch parent "1" started; its single child "1.1" already succeeded
+        // with the custom wire form in the log.
+        let parent_wire_id = crate::engine::compute_wire_id_public("1");
+        let child_wire_id = crate::engine::compute_wire_id_public("2");
+        let log = CheckpointLog::from_records(vec![
+            (
+                parent_wire_id.clone(),
+                CheckpointRecord {
+                    id: parent_wire_id,
+                    status: CheckpointStatus::Started,
+                    result: None,
+                    error_type: None,
+                    error_message: None,
+                    attempt: 0,
+                    invoke_result: None,
+                    invoke_error_type: None,
+                    invoke_error_message: None,
+                    replay_children: false,
+                    callback_id: None,
+                },
+            ),
+            (
+                child_wire_id.clone(),
+                CheckpointRecord {
+                    id: child_wire_id,
+                    status: CheckpointStatus::Succeeded,
+                    result: Some(wire),
+                    error_type: None,
+                    error_message: None,
+                    attempt: 0,
+                    invoke_result: None,
+                    invoke_error_type: None,
+                    invoke_error_message: None,
+                    replay_children: false,
+                    callback_id: None,
+                },
+            ),
+        ]);
+        let (ctx, _client) = test_ctx_with_client(log);
+
+        let out: Vec<Doc> = ctx
+            .map(vec![0_usize], |_child, _item, _idx| async move {
+                unreachable!("a terminal child must be replayed, not re-executed")
+            })
+            .serdes(HexEnvelopeSerdes)
+            .await
+            .expect("replay of a custom-serdes item must succeed");
+        assert_eq!(out, vec![probe_doc()]);
+    }
+
+    /// The batch summary embeds each item result as its own transformed
+    /// payload, so replaying a terminal batch must reverse the item transform
+    /// per item.
+    #[tokio::test]
+    async fn custom_serdes_batch_summary_replay_reverses_item_transforms() {
+        use crate::serdes::test_support::{HexEnvelopeSerdes, hex_envelope};
+
+        let first = hex_envelope(r#""hello""#);
+        let second = hex_envelope(r#""world""#);
+        let payload = serde_json::json!({
+            "results": [
+                {"index": 0, "status": "SUCCEEDED", "result": first},
+                {"index": 1, "status": "SUCCEEDED", "result": second}
+            ],
+            "reason": "ALL_COMPLETED"
+        });
+        let wire_id = crate::engine::compute_wire_id_public("1");
+        let log = CheckpointLog::from_records(vec![(
+            wire_id.clone(),
+            CheckpointRecord {
+                id: wire_id,
+                status: CheckpointStatus::Succeeded,
+                result: Some(payload.to_string()),
+                error_type: None,
+                error_message: None,
+                attempt: 0,
+                invoke_result: None,
+                invoke_error_type: None,
+                invoke_error_message: None,
+                replay_children: false,
+                callback_id: None,
+            },
+        )]);
+        let ctx = test_ctx(log);
+
+        let values: Vec<String> = ctx
+            .map(
+                vec!["a".to_owned(), "b".to_owned()],
+                |_child, _item, _idx| async move {
+                    unreachable!("terminal batch must replay, not re-execute")
+                },
+            )
+            .serdes(HexEnvelopeSerdes)
+            .await
+            .expect("batch summary replay with an item serdes must succeed");
+        assert_eq!(values, vec!["hello", "world"]);
+    }
+
+    /// `FileSystemSerdes` used as a map ITEM serdes. This is the exact case    /// that failed at runtime before the normalization: the byte methods it
+    /// was forced to implement returned an error, so the item path errored
+    /// even though the same serdes worked on steps and batch results.
+    ///
+    /// It also pins per-item context identity: each item must resolve to its
+    /// own file, otherwise every item would read back the last one written.
+    #[tokio::test]
+    async fn filesystem_serdes_works_as_a_map_item_serdes() {
+        let tmp = std::env::temp_dir().join("map_item_fs_serdes");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let out: Vec<String> = ctx
+            .map(vec![1_i32, 2, 3], |_child, item, _idx| async move {
+                Ok(format!("item-{item}"))
+            })
+            .serdes(crate::FileSystemSerdes::new(
+                tmp.to_string_lossy().to_string(),
+            ))
+            .await
+            .expect("FileSystemSerdes must work as a map item serdes");
+        assert_eq!(out, vec!["item-1", "item-2", "item-3"]);
+
+        // Every item envelope must be a DISTINCT file pointer.
+        let payloads = child_success_payloads(&client);
+        assert_eq!(payloads.len(), 3, "payloads: {payloads:?}");
+        let mut files: Vec<String> = payloads
+            .iter()
+            .map(|p| {
+                let v: serde_json::Value =
+                    serde_json::from_str(p).expect("envelope must be valid JSON");
+                v.get("file")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("envelope must be a file pointer")
+                    .to_owned()
+            })
+            .collect();
+        files.sort();
+        files.dedup();
+        assert_eq!(files.len(), 3, "each item needs its own file: {files:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

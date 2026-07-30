@@ -3,7 +3,6 @@
 
 use aws_durable_execution_sdk_rust as durable;
 use durable::{BoxError, Serdes, WaitDecision};
-use std::any::Any;
 use std::time::Duration;
 
 /// Custom serdes that adds/strips an "ENC:" prefix for string state.
@@ -11,18 +10,6 @@ use std::time::Duration;
 struct PrefixSerdes;
 
 impl Serdes for PrefixSerdes {
-    fn serialize(&self, _value: &dyn Any) -> Result<Vec<u8>, BoxError> {
-        Ok(Vec::new())
-    }
-
-    fn deserialize_bytes(
-        &self,
-        _data: &[u8],
-        _type_name: &str,
-    ) -> Result<Box<dyn Any + Send>, BoxError> {
-        Ok(Box::new(()))
-    }
-
     fn serialize_to_string(&self, json_str: &str) -> Result<String, BoxError> {
         // json_str is a JSON-quoted string like "\"hello\"".
         // Parse it, add prefix, re-serialize.

@@ -3,7 +3,6 @@
 //! The custom result serdes uppercases the invoke result on deserialization.
 
 use aws_durable_execution_sdk_rust as durable;
-use std::any::Any;
 
 /// Custom serdes that uppercases the result on deserialization.
 ///
@@ -16,18 +15,6 @@ use std::any::Any;
 struct UppercaseResultSerdes;
 
 impl durable::Serdes for UppercaseResultSerdes {
-    fn serialize(&self, _value: &dyn Any) -> Result<Vec<u8>, durable::BoxError> {
-        Ok(Vec::new())
-    }
-
-    fn deserialize_bytes(
-        &self,
-        _bytes: &[u8],
-        _type_name: &str,
-    ) -> Result<Box<dyn Any + Send>, durable::BoxError> {
-        Ok(Box::new(()))
-    }
-
     fn serialize_to_string(&self, json_str: &str) -> Result<String, durable::BoxError> {
         Ok(json_str.to_owned())
     }

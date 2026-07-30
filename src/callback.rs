@@ -1292,18 +1292,6 @@ mod tests {
     struct MarkerSerdes;
 
     impl Serdes for MarkerSerdes {
-        fn serialize(&self, _value: &dyn std::any::Any) -> Result<Vec<u8>, BoxError> {
-            Ok(Vec::new())
-        }
-
-        fn deserialize_bytes(
-            &self,
-            _bytes: &[u8],
-            _type_name: &str,
-        ) -> Result<Box<dyn std::any::Any + Send>, BoxError> {
-            Ok(Box::new(()))
-        }
-
         fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
             payload
                 .strip_prefix("MARK:")
@@ -1337,6 +1325,53 @@ mod tests {
         let cb = exec.execute().await.expect("should settle");
         let value = cb.result().await.expect("per-op serdes should decode");
         assert_eq!(value, "hello");
+    }
+
+    /// The shared probe serdes — the same type the map/parallel item-serdes
+    /// equivalence test uses — must decode a callback payload too. One
+    /// implementation, every operation path: that is the point of the
+    /// normalized serialization model.
+    #[tokio::test]
+    async fn shared_probe_serdes_decodes_callback_payload() {
+        use crate::serdes::test_support::{HexEnvelopeSerdes, hex_envelope};
+
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Doc {
+            label: String,
+            nested: Vec<Vec<i64>>,
+        }
+
+        let doc = Doc {
+            label: "quote:\" backslash:\\ newline:\n tab:\t ünïcodé ☃".to_owned(),
+            nested: vec![vec![1, -2, i64::MIN], Vec::new()],
+        };
+        let wire = hex_envelope(&serde_json::to_string(&doc).expect("doc is JSON-able"));
+        // Control: the stored payload is not JSON, so a decode can only
+        // succeed if the serdes transform was reversed.
+        assert!(serde_json::from_str::<Doc>(&wire).is_err());
+
+        let op_wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &op_wire,
+            CheckpointStatus::Succeeded,
+            Some(&wire),
+            None,
+            None,
+            Some("cb-probe"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<Doc> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            serdes: Some(Box::new(HexEnvelopeSerdes)),
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should settle");
+        let value = cb.result().await.expect("probe serdes should decode");
+        assert_eq!(value, doc);
     }
 
     #[tokio::test]

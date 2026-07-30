@@ -13,8 +13,6 @@
 //!
 //! [`Serdes`]: aws_durable_execution_sdk_rust::Serdes
 
-use std::any::Any;
-
 use aws_durable_execution_sdk_rust as durable;
 use durable::Serdes;
 
@@ -24,18 +22,6 @@ use durable::Serdes;
 struct UppercaseSerdes;
 
 impl Serdes for UppercaseSerdes {
-    fn serialize(&self, _value: &dyn Any) -> Result<Vec<u8>, durable::BoxError> {
-        Ok(Vec::new())
-    }
-
-    fn deserialize_bytes(
-        &self,
-        _bytes: &[u8],
-        _type_name: &str,
-    ) -> Result<Box<dyn Any + Send>, durable::BoxError> {
-        Ok(Box::new(()))
-    }
-
     fn serialize_to_string(&self, json_str: &str) -> Result<String, durable::BoxError> {
         Ok(json_str.to_uppercase())
     }

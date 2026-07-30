@@ -3,8 +3,6 @@
 //! externally-delivered payload into Unix epoch seconds, so the value decodes
 //! directly into the output type.
 
-use std::any::Any;
-
 use aws_durable_execution_sdk_rust as durable;
 use durable::{BoxError, Serdes};
 use serde::{Deserialize, Serialize};
@@ -39,18 +37,6 @@ struct ReceivedData {
 struct TimestampSerdes;
 
 impl Serdes for TimestampSerdes {
-    fn serialize(&self, _value: &dyn Any) -> Result<Vec<u8>, BoxError> {
-        Ok(Vec::new())
-    }
-
-    fn deserialize_bytes(
-        &self,
-        _bytes: &[u8],
-        _type_name: &str,
-    ) -> Result<Box<dyn Any + Send>, BoxError> {
-        Ok(Box::new(()))
-    }
-
     fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
         let raw: CallbackPayload = serde_json::from_str(payload)?;
         let timestamp = parse_iso_timestamp(&raw.timestamp)?;

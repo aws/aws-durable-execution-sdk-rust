@@ -6,30 +6,12 @@
 
 use aws_durable_execution_sdk_rust as durable;
 use durable::{DurableContext, Serdes};
-use std::any::Any;
 
 /// Custom operation-level serializer that emits `OPSERDE:<comma-joined results>`.
 #[derive(Debug)]
 struct OpSerdes;
 
 impl Serdes for OpSerdes {
-    fn serialize(
-        &self,
-        _value: &dyn Any,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        // Not used for op-level — serialize_to_string is the entry point.
-        Ok(Vec::new())
-    }
-
-    fn deserialize_bytes(
-        &self,
-        _bytes: &[u8],
-        _type_name: &str,
-    ) -> Result<Box<dyn Any + Send>, Box<dyn std::error::Error + Send + Sync>> {
-        // Not used for op-level — deserialize_from_string is the entry point.
-        Err("OpSerdes::deserialize_bytes not used".into())
-    }
-
     fn serialize_to_string(
         &self,
         json_str: &str,

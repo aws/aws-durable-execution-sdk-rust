@@ -8,13 +8,26 @@
 //! Files mounted to Lambda), keeping checkpoint payloads small regardless
 //! of value size.
 
-use std::any::Any;
 use std::fmt::Debug;
 
 /// Object-safe serialization/deserialization trait.
 ///
 /// Implement this trait to provide custom serialization formats for
 /// operation results. The default implementation uses `serde_json`.
+///
+/// # Serialization model
+///
+/// A `Serdes` is a **transformation around JSON**, not a replacement for it.
+/// The engine always serializes values with `serde_json` first, hands the
+/// resulting JSON string to [`serialize_to_string_with_context`](Serdes::serialize_to_string_with_context)
+/// for the wire, and reverses the transform with
+/// [`deserialize_from_string_with_context`](Serdes::deserialize_from_string_with_context)
+/// before deserializing back with `serde_json`.
+///
+/// Every operation path uses this one model — steps, invokes, callbacks,
+/// child contexts, `wait_for_condition`, whole map/parallel batch results,
+/// and individual map/parallel item results. A type that implements this
+/// trait therefore behaves identically wherever it is attached.
 ///
 /// # Object safety
 ///
@@ -25,7 +38,6 @@ use std::fmt::Debug;
 ///
 /// ```
 /// use aws_durable_execution_sdk_rust::Serdes;
-/// use std::any::Any;
 ///
 /// struct UppercaseSerdes;
 ///
@@ -36,21 +48,6 @@ use std::fmt::Debug;
 /// }
 ///
 /// impl Serdes for UppercaseSerdes {
-///     fn serialize(
-///         &self,
-///         _value: &dyn Any,
-///     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-///         Ok(b"{}".to_vec())
-///     }
-///
-///     fn deserialize_bytes(
-///         &self,
-///         _bytes: &[u8],
-///         _type_name: &str,
-///     ) -> Result<Box<dyn Any + Send>, Box<dyn std::error::Error + Send + Sync>> {
-///         Ok(Box::new(()))
-///     }
-///
 ///     fn serialize_to_string(
 ///         &self,
 ///         json_str: &str,
@@ -70,30 +67,6 @@ use std::fmt::Debug;
 /// # drop(serdes);
 /// ```
 pub trait Serdes: Debug + Send + Sync {
-    /// Serializes a value to bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if serialization fails.
-    fn serialize(
-        &self,
-        value: &dyn Any,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Deserializes bytes into a boxed value.
-    ///
-    /// The `type_name` parameter is provided for error messages and
-    /// debugging — it is the name of the expected output type.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if deserialization fails.
-    fn deserialize_bytes(
-        &self,
-        bytes: &[u8],
-        type_name: &str,
-    ) -> Result<Box<dyn Any + Send>, Box<dyn std::error::Error + Send + Sync>>;
-
     /// Transforms a JSON-serialized string for wire transport.
     ///
     /// The default implementation returns the input unchanged (standard
@@ -606,30 +579,6 @@ impl FileSystemSerdes {
 /// `_with_context` methods entirely — the default trait implementations delegate
 /// to the context-free versions.
 impl Serdes for FileSystemSerdes {
-    fn serialize(
-        &self,
-        _value: &dyn Any,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        // FileSystemSerdes works at the string level via serialize_to_string.
-        // This byte-level method is not the primary interface.
-        Err(Box::new(FileSystemSerdesError::new(
-            "FileSystemSerdes operates at the string level; use serialize_to_string instead"
-                .to_owned(),
-        )))
-    }
-
-    fn deserialize_bytes(
-        &self,
-        _bytes: &[u8],
-        _type_name: &str,
-    ) -> Result<Box<dyn Any + Send>, Box<dyn std::error::Error + Send + Sync>> {
-        // FileSystemSerdes works at the string level via deserialize_from_string.
-        Err(Box::new(FileSystemSerdesError::new(
-            "FileSystemSerdes operates at the string level; use deserialize_from_string instead"
-                .to_owned(),
-        )))
-    }
-
     fn serialize_to_string(
         &self,
         json_str: &str,
@@ -803,6 +752,73 @@ fn json_escape_string(input: &str) -> String {
         }
     }
     escaped
+}
+
+// ============================================================
+// Shared test support
+// ============================================================
+
+/// Test-only serdes shared by the operation-path equivalence tests in
+/// `step`, `callback`, and `map_parallel`.
+///
+/// The point of the shared type is that ONE `Serdes` implementation must
+/// behave identically on every operation path — step results, callback
+/// payloads, and map/parallel item results — now that all of them go through
+/// the same JSON-string transformation model.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::Serdes;
+
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+    /// A serdes whose wire form is deliberately NOT JSON: the JSON string is
+    /// hex-encoded behind a `HEX1:` marker.
+    ///
+    /// Two properties make this useful as a probe:
+    ///
+    /// 1. It implements ONLY the string transform methods. Before the
+    ///    serialization model was normalized, `Serdes` also demanded
+    ///    `serialize(&dyn Any)` / `deserialize_bytes`, so this type would not
+    ///    have compiled.
+    /// 2. Plain `serde_json` cannot parse a `HEX1:`-prefixed payload, so a
+    ///    successful round-trip proves the transform was actually applied and
+    ///    reversed rather than incidentally bypassed by a JSON-only path.
+    #[derive(Debug)]
+    pub(crate) struct HexEnvelopeSerdes;
+
+    impl Serdes for HexEnvelopeSerdes {
+        fn serialize_to_string(&self, json_str: &str) -> Result<String, BoxError> {
+            Ok(hex_envelope(json_str))
+        }
+
+        fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
+            let hex = payload
+                .strip_prefix("HEX1:")
+                .ok_or_else(|| -> BoxError { "missing HEX1: marker".into() })?;
+            if hex.len() % 2 != 0 {
+                return Err("odd-length hex body".into());
+            }
+            let mut bytes = Vec::with_capacity(hex.len() / 2);
+            let raw = hex.as_bytes();
+            for pair in raw.chunks(2) {
+                let s = std::str::from_utf8(pair)?;
+                bytes.push(u8::from_str_radix(s, 16)?);
+            }
+            Ok(String::from_utf8(bytes)?)
+        }
+    }
+
+    /// Returns the exact wire form `HexEnvelopeSerdes` produces for a JSON
+    /// string, so tests can assert on the stored payload.
+    pub(crate) fn hex_envelope(json_str: &str) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(5 + json_str.len() * 2);
+        out.push_str("HEX1:");
+        for byte in json_str.as_bytes() {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1228,6 +1244,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The shared probe serdes must be a valid `Serdes` while implementing
+    /// ONLY the string transform methods, and its transform must be exactly
+    /// reversible. It is the fixture the operation-path equivalence tests
+    /// depend on, so it gets its own round-trip check.
+    #[test]
+    fn hex_envelope_probe_serdes_round_trips() {
+        use super::test_support::{HexEnvelopeSerdes, hex_envelope};
+
+        let serdes: Box<dyn Serdes> = Box::new(HexEnvelopeSerdes);
+        let ctx = SerdesContext::new("op-1", "arn:test");
+
+        let json = r#"{"label":"a\"b\\c\nd ☃","nested":[[1,-2],[]]}"#;
+        let wire = serdes
+            .serialize_to_string_with_context(json, &ctx)
+            .expect("serialize");
+        assert_eq!(wire, hex_envelope(json));
+        // The wire form must not be parseable as JSON — that is what makes it
+        // a useful probe for "was the transform actually applied?".
+        assert!(serde_json::from_str::<serde_json::Value>(&wire).is_err());
+
+        let back = serdes
+            .deserialize_from_string_with_context(&wire, &ctx)
+            .expect("deserialize");
+        assert_eq!(back, json);
+
+        // A payload that never went through the transform must be rejected
+        // rather than silently passed through.
+        assert!(serdes.deserialize_from_string(json).is_err());
+    }
+
     #[test]
     fn plain_serdes_passthrough_still_works_with_context() {
         // Proves that a plain custom Serdes (not FileSystemSerdes) still
@@ -1240,19 +1286,6 @@ mod tests {
             }
         }
         impl Serdes for UpperSerdes {
-            fn serialize(
-                &self,
-                _: &dyn Any,
-            ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(Vec::new())
-            }
-            fn deserialize_bytes(
-                &self,
-                _: &[u8],
-                _: &str,
-            ) -> Result<Box<dyn Any + Send>, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(Box::new(()))
-            }
             fn serialize_to_string(
                 &self,
                 json_str: &str,

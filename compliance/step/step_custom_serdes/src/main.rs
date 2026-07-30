@@ -2,25 +2,12 @@
 
 use aws_durable_execution_sdk_rust as durable;
 use durable::Serdes;
-use std::any::Any;
 
 /// Custom serdes that uppercases the serialized form.
 #[derive(Debug)]
 struct UppercaseSerdes;
 
 impl Serdes for UppercaseSerdes {
-    fn serialize(&self, _value: &dyn Any) -> Result<Vec<u8>, durable::BoxError> {
-        Ok(Vec::new())
-    }
-
-    fn deserialize_bytes(
-        &self,
-        _data: &[u8],
-        _type_name: &str,
-    ) -> Result<Box<dyn Any + Send>, durable::BoxError> {
-        Ok(Box::new(()))
-    }
-
     fn serialize_to_string(&self, json_str: &str) -> Result<String, durable::BoxError> {
         Ok(json_str.to_uppercase())
     }

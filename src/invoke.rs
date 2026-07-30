@@ -442,16 +442,6 @@ mod tests {
             }
         }
         impl Serdes for Upper {
-            fn serialize(&self, _: &dyn std::any::Any) -> Result<Vec<u8>, crate::BoxError> {
-                Ok(Vec::new())
-            }
-            fn deserialize_bytes(
-                &self,
-                _: &[u8],
-                _: &str,
-            ) -> Result<Box<dyn std::any::Any + Send>, crate::BoxError> {
-                Ok(Box::new(()))
-            }
             fn serialize_to_string(&self, json_str: &str) -> Result<String, crate::BoxError> {
                 Ok(json_str.to_uppercase())
             }
@@ -631,16 +621,6 @@ mod tests {
             }
         }
         impl Serdes for UpperPayload {
-            fn serialize(&self, _: &dyn std::any::Any) -> Result<Vec<u8>, crate::BoxError> {
-                Ok(Vec::new())
-            }
-            fn deserialize_bytes(
-                &self,
-                _: &[u8],
-                _: &str,
-            ) -> Result<Box<dyn std::any::Any + Send>, crate::BoxError> {
-                Ok(Box::new(()))
-            }
             fn serialize_to_string(&self, json_str: &str) -> Result<String, crate::BoxError> {
                 Ok(json_str.to_uppercase())
             }
@@ -700,16 +680,6 @@ mod tests {
             }
         }
         impl Serdes for LowerResult {
-            fn serialize(&self, _: &dyn std::any::Any) -> Result<Vec<u8>, crate::BoxError> {
-                Ok(Vec::new())
-            }
-            fn deserialize_bytes(
-                &self,
-                _: &[u8],
-                _: &str,
-            ) -> Result<Box<dyn std::any::Any + Send>, crate::BoxError> {
-                Ok(Box::new(()))
-            }
             fn serialize_to_string(&self, json_str: &str) -> Result<String, crate::BoxError> {
                 Ok(json_str.to_owned())
             }

@@ -3,7 +3,6 @@
 
 use aws_durable_execution_sdk_rust as durable;
 use durable::{DurableContext, Serdes};
-use std::any::Any;
 
 /// Custom serdes that wraps with "wrapped:" prefix.
 ///
@@ -12,23 +11,6 @@ use std::any::Any;
 struct WrapSerdes;
 
 impl Serdes for WrapSerdes {
-    fn serialize(&self, value: &dyn Any) -> Result<Vec<u8>, durable::BoxError> {
-        let s = value
-            .downcast_ref::<String>()
-            .ok_or("WrapSerdes: expected String")?;
-        Ok(format!("wrapped:{s}").into_bytes())
-    }
-
-    fn deserialize_bytes(
-        &self,
-        bytes: &[u8],
-        _type_name: &str,
-    ) -> Result<Box<dyn Any + Send>, durable::BoxError> {
-        let s = std::str::from_utf8(bytes)?;
-        let unwrapped = s.strip_prefix("wrapped:").unwrap_or(s).to_owned();
-        Ok(Box::new(unwrapped))
-    }
-
     fn serialize_to_string(&self, s: &str) -> Result<String, durable::BoxError> {
         Ok(format!("wrapped:{s}"))
     }

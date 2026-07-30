@@ -1,28 +1,12 @@
 //! Conformance requirement 3-14: child with custom serdes.
 
 use aws_durable_execution_sdk_rust as durable;
-use std::any::Any;
 
 /// Uppercases the serialized result.
 #[derive(Debug)]
 struct UppercaseSerdes;
 
 impl durable::Serdes for UppercaseSerdes {
-    fn serialize(
-        &self,
-        _value: &dyn Any,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Vec::new())
-    }
-
-    fn deserialize_bytes(
-        &self,
-        _bytes: &[u8],
-        _type_name: &str,
-    ) -> Result<Box<dyn Any + Send>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Box::new(()))
-    }
-
     fn serialize_to_string(
         &self,
         json_str: &str,

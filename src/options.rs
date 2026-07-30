@@ -145,8 +145,8 @@ impl OptionsBuilder {
     /// #     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }
     /// # }
     /// # impl Serdes for MySerdes {
-    /// #     fn serialize(&self, _: &dyn std::any::Any) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { todo!() }
-    /// #     fn deserialize_bytes(&self, _: &[u8], _: &str) -> Result<Box<dyn std::any::Any + Send>, Box<dyn std::error::Error + Send + Sync>> { todo!() }
+    /// #     fn serialize_to_string(&self, s: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { Ok(s.to_uppercase()) }
+    /// #     fn deserialize_from_string(&self, s: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { Ok(s.to_owned()) }
     /// # }
     /// let opts = Options::builder()
     ///     .serdes(MySerdes)
