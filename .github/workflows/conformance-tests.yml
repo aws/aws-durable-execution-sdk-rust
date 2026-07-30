@@ -58,9 +58,14 @@ jobs:
         id: discover
         working-directory: compliance
         run: |
+          # template_smoke.yaml is a single hello handler used to verify that
+          # a build deploys and runs; it is not one of the conformance
+          # validator's suites, so it is excluded here.
           suites=$(for t in template_*.yaml; do
             s=${t#template_}
-            printf '%s\n' "${s%.yaml}"
+            s=${s%.yaml}
+            [ "$s" = "smoke" ] && continue
+            printf '%s\n' "$s"
           done | jq -R . | jq -s -c .)
           echo "Discovered suites: $suites"
           echo "suites=$suites" >> "$GITHUB_OUTPUT"
