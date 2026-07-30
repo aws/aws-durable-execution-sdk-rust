@@ -23,7 +23,7 @@ async fn handler(
     ctx: durable::DurableContext,
 ) -> Result<serde_json::Value, durable::BoxError> {
     // Strategy only retries "ValidationError", not TransientError.
-    let retry: durable::RetryStrategy = Box::new(|err, _attempt| {
+    let retry = |err: &durable::StepError, _attempt: u32| {
         let msg = err.to_string();
         if msg.contains("ValidationError") {
             durable::RetryDecision::Retry {
@@ -32,7 +32,7 @@ async fn handler(
         } else {
             durable::RetryDecision::Stop
         }
-    });
+    };
 
     let result: String = ctx
         .step(|_| async {

@@ -7,7 +7,7 @@ async fn handler(
     _event: serde_json::Value,
     ctx: durable::DurableContext,
 ) -> Result<serde_json::Value, durable::BoxError> {
-    let no_retry: durable::RetryStrategy = Box::new(|_err, _attempt| durable::RetryDecision::Stop);
+    let no_retry = |_err: &durable::StepError, _attempt: u32| durable::RetryDecision::Stop;
 
     let result: String = ctx
         .step(|_| async { Err("Something went wrong".into()) })

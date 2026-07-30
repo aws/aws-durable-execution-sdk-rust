@@ -61,13 +61,13 @@ async fn handler(
     // 6. A bounded condition poll.
     let counted = ctx
         .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)
-        .wait_strategy_fn(Box::new(|state: i32, _attempt| {
+        .wait_strategy_fn(|state: i32, _attempt| {
             if state >= 2 {
                 WaitDecision::complete()
             } else {
                 WaitDecision::continue_with(Duration::from_secs(1))
             }
-        }))
+        })
         .name("gate")
         .await?;
 

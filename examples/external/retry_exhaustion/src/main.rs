@@ -24,7 +24,7 @@ async fn handler(
             |step_ctx| async move { Err(format!("attempt {} failed", step_ctx.attempt()).into()) },
         )
         .name("always-fails")
-        .retry_strategy(Box::new(|_err, attempt| {
+        .retry_strategy(|_err, attempt| {
             if attempt >= 3 {
                 RetryDecision::Stop
             } else {
@@ -32,7 +32,7 @@ async fn handler(
                     delay: Duration::from_secs(1),
                 }
             }
-        }))
+        })
         .await;
 
     match outcome {

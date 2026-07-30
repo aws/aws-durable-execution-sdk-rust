@@ -14,7 +14,7 @@ async fn handler(
     let input = event.as_str().unwrap_or("").to_owned();
     let arn = ctx.execution_arn().to_owned();
 
-    let no_retry: durable::RetryStrategy = Box::new(|_err, _attempt| durable::RetryDecision::Stop);
+    let no_retry = |_err: &durable::StepError, _attempt: u32| durable::RetryDecision::Stop;
 
     let result: String = ctx
         .step(move |_| async move {

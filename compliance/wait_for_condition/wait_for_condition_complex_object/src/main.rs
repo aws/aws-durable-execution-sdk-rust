@@ -29,13 +29,13 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                         attempts: 0,
                     },
                 )
-                .wait_strategy_fn(Box::new(|state: PollState, _attempt| {
+                .wait_strategy_fn(|state: PollState, _attempt| {
                     if state.status == "DONE" {
                         WaitDecision::complete()
                     } else {
                         WaitDecision::continue_with(Duration::from_secs(1))
                     }
-                }))
+                })
                 .await?;
             Ok(result)
         },

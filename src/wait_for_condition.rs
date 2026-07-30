@@ -92,29 +92,15 @@ impl WaitDecision {
     }
 }
 
-/// Type alias for a wait strategy function.
+/// Type alias for a boxed wait strategy function.
 ///
 /// Receives the current (deserialized) state and the 1-based attempt number,
 /// and returns a [`WaitDecision`].
 ///
-/// # Examples
-///
-/// ```
-/// use aws_durable_execution_sdk_rust::{WaitStrategyFn, WaitDecision};
-/// use std::time::Duration;
-///
-/// let strategy: WaitStrategyFn<i32> = Box::new(|state, attempt| {
-///     if state >= 10 {
-///         WaitDecision::complete()
-///     } else if attempt >= 5 {
-///         WaitDecision::exhausted("max attempts exceeded")
-///     } else {
-///         WaitDecision::continue_with(Duration::from_secs(1))
-///     }
-/// });
-/// # drop(strategy);
-/// ```
-pub type WaitStrategyFn<S> = Box<dyn Fn(S, u32) -> WaitDecision + Send + Sync>;
+/// Crate-internal: the boxing is an implementation detail. The public setter
+/// [`WaitForConditionBuilder::wait_strategy_fn`](crate::WaitForConditionBuilder::wait_strategy_fn)
+/// takes a generic closure and boxes it here.
+pub(crate) type WaitStrategyFn<S> = Box<dyn Fn(S, u32) -> WaitDecision + Send + Sync>;
 
 /// Internal state for wait-for-condition execution.
 pub(crate) struct WaitForConditionExecution<S> {
@@ -917,7 +903,7 @@ mod tests {
 
         let handle = ctx
             .wait_for_condition(|_ctx, state: i32| async move { Ok(state) }, 5)
-            .wait_strategy_fn(Box::new(|_state: i32, _attempt| WaitDecision::complete()))
+            .wait_strategy_fn(|_state: i32, _attempt| WaitDecision::complete())
             .spawn();
 
         let result = handle.await;

@@ -1,11 +1,13 @@
 //! Map completion policy: tolerate failures across items.
 //!
-//! Map accepts the same [`CompletionConfig`] as parallel. Its fields let a
+//! Map accepts the same [`CompletionConfig`] as parallel. Its thresholds let a
 //! bounded number of item failures pass (`tolerated_failure_count` /
 //! `tolerated_failure_percentage`) or complete the batch early once enough
-//! items succeed (`min_successful`). Each item's error — including its type —
-//! is preserved for inspection and survives replay, so a later invocation sees
-//! the same failure it saw the first time.
+//! items succeed (`min_successful`). Build one with
+//! [`CompletionConfig::builder`](aws_durable_execution_sdk_rust::CompletionConfig::builder),
+//! which combines thresholds in a single chain. Each item's error — including
+//! its type — is preserved for inspection and survives replay, so a later
+//! invocation sees the same failure it saw the first time.
 //!
 //! This example maps four items, one of which deliberately fails, tolerating a
 //! single failure. The batch completes with the three successful results.
@@ -30,7 +32,7 @@ async fn handler(
                 return child
                     .step(|_| async { Err::<u32, durable::BoxError>("item 0 failed".into()) })
                     .name("work")
-                    .retry_strategy(Box::new(|_err, _attempt| durable::RetryDecision::Stop))
+                    .retry_strategy(|_err, _attempt| durable::RetryDecision::Stop)
                     .await
                     .map_err(Into::into);
             }
@@ -41,7 +43,11 @@ async fn handler(
                 .map_err(Into::into)
         })
         .name("tolerant-map")
-        .completion(CompletionConfig::with_tolerated_failure_count(1))
+        .completion(
+            CompletionConfig::builder()
+                .tolerated_failure_count(1)
+                .build(),
+        )
         .await?;
     Ok(results.len())
 }

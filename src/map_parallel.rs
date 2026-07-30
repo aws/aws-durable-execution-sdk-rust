@@ -2003,10 +2003,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_config_min_successful() {
-        let cfg = crate::CompletionConfig {
-            min_successful: Some(2),
-            ..Default::default()
-        };
+        let cfg = crate::CompletionConfig::builder().min_successful(2).build();
         assert!(should_stop_min(&cfg, 2));
         assert!(should_stop_min(&cfg, 3));
         assert!(!should_stop_min(&cfg, 1));
@@ -2014,10 +2011,9 @@ mod tests {
 
     #[tokio::test]
     async fn completion_config_tolerated_failure_count() {
-        let cfg = crate::CompletionConfig {
-            tolerated_failure_count: Some(0),
-            ..Default::default()
-        };
+        let cfg = crate::CompletionConfig::builder()
+            .tolerated_failure_count(0)
+            .build();
         // 0 tolerated means fail-fast: first failure exceeds.
         assert!(should_stop_failure(&cfg, 1, 10));
         assert!(!should_stop_failure(&cfg, 0, 10));
@@ -2025,10 +2021,9 @@ mod tests {
 
     #[tokio::test]
     async fn completion_config_tolerated_failure_percentage() {
-        let cfg = crate::CompletionConfig {
-            tolerated_failure_percentage: Some(20),
-            ..Default::default()
-        };
+        let cfg = crate::CompletionConfig::builder()
+            .tolerated_failure_percentage(20)
+            .build();
         // 3/10 = 30% > 20%: should stop.
         assert!(should_stop_failure(&cfg, 3, 10));
         // 2/10 = 20% == 20%: should NOT stop (strictly exceeds).
@@ -2100,10 +2095,7 @@ mod tests {
     async fn never_started_branches_omitted_from_results() {
         // A batch with min_successful=1 should omit branches that never started.
         // We test the completion logic directly.
-        let cfg = crate::CompletionConfig {
-            min_successful: Some(1),
-            ..Default::default()
-        };
+        let cfg = crate::CompletionConfig::builder().min_successful(1).build();
         // After 1 success, should stop.
         assert!(should_stop_min(&cfg, 1));
     }
@@ -2112,11 +2104,10 @@ mod tests {
     async fn completion_config_validate_mutual_exclusivity() {
         // Having both min_successful and tolerated_failure_count is valid
         // (Go/JS allow it — first threshold fires). No error.
-        let cfg = crate::CompletionConfig {
-            min_successful: Some(2),
-            tolerated_failure_count: Some(1),
-            ..Default::default()
-        };
+        let cfg = crate::CompletionConfig::builder()
+            .min_successful(2)
+            .tolerated_failure_count(1)
+            .build();
         assert!(cfg.validate().is_ok());
     }
 
@@ -2554,10 +2545,11 @@ mod tests {
                 crate::future::Branch::new("ok-1", |_ctx| Box::pin(async { Ok(1) })),
                 crate::future::Branch::new("ok-2", |_ctx| Box::pin(async { Ok(2) })),
             ])
-            .completion(crate::CompletionConfig {
-                tolerated_failure_count: Some(0),
-                ..Default::default()
-            })
+            .completion(
+                crate::CompletionConfig::builder()
+                    .tolerated_failure_count(0)
+                    .build(),
+            )
             .await;
 
         // The public API propagates failures as errors — that's correct
@@ -2608,10 +2600,11 @@ mod tests {
             ctx.map(vec![0_i32], |_child, _item: i32, _idx| async move {
                 panic!("boom in map branch")
             })
-            .completion(crate::CompletionConfig {
-                tolerated_failure_count: Some(0),
-                ..Default::default()
-            })
+            .completion(
+                crate::CompletionConfig::builder()
+                    .tolerated_failure_count(0)
+                    .build(),
+            )
             .await
         };
 

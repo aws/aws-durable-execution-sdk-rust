@@ -14,9 +14,9 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     },
                     serde_json::Value::Null,
                 )
-                .wait_strategy_fn(Box::new(
+                .wait_strategy_fn(
                     |_state: serde_json::Value, _attempt| WaitDecision::complete(),
-                ))
+                )
                 .await;
 
             match result {

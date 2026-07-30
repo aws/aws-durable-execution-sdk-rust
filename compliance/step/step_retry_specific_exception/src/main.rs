@@ -26,7 +26,7 @@ async fn handler(
 ) -> Result<serde_json::Value, durable::BoxError> {
     let execution_id = ctx.execution_arn().to_owned();
 
-    let retry: durable::RetryStrategy = Box::new(|err, attempt| {
+    let retry = |err: &durable::StepError, attempt: u32| {
         // Only retry if the error message indicates it's a TransientError.
         if attempt >= 3 {
             return durable::RetryDecision::Stop;
@@ -39,7 +39,7 @@ async fn handler(
         } else {
             durable::RetryDecision::Stop
         }
-    });
+    };
 
     let result: String = ctx
         .step(move |_sc| async move {

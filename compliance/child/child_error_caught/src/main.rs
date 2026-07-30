@@ -11,7 +11,7 @@ async fn handler(
         .run_in_child_context(|child_ctx| async move {
             let v: String = child_ctx
                 .step(|_| async move { Err("Child step failed".into()) })
-                .retry_strategy(Box::new(|_, _| durable::RetryDecision::Stop))
+                .retry_strategy(|_, _| durable::RetryDecision::Stop)
                 .await?;
             Ok(v)
         })

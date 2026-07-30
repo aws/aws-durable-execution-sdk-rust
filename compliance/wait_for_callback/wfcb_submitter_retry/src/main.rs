@@ -13,7 +13,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                 Err("submitter failure".into())
             })
             .name(&name)
-            .submitter_retry(Box::new(|_err, attempt| {
+            .submitter_retry(|_err, attempt| {
                 if attempt >= 2 {
                     durable::RetryDecision::Stop
                 } else {
@@ -21,7 +21,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                         delay: Duration::from_secs(1),
                     }
                 }
-            }))
+            })
             .await?;
         Ok(result)
     })

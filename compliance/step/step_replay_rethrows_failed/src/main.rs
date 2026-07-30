@@ -11,7 +11,7 @@ async fn handler(
     ctx: durable::DurableContext,
 ) -> Result<serde_json::Value, durable::BoxError> {
     // No-retry strategy: stop on first attempt.
-    let no_retry: durable::RetryStrategy = Box::new(|_err, _attempt| durable::RetryDecision::Stop);
+    let no_retry = |_err: &durable::StepError, _attempt: u32| durable::RetryDecision::Stop;
 
     let step_result: Result<String, OperationError> = ctx
         .step(|_step_ctx| async {

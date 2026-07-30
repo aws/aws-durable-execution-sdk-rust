@@ -11,7 +11,7 @@ async fn handler(
 ) -> Result<serde_json::Value, durable::BoxError> {
     let execution_id = ctx.execution_arn().to_owned();
 
-    let retry: durable::RetryStrategy = Box::new(|_err, attempt| {
+    let retry = |_err: &durable::StepError, attempt: u32| {
         const MAX_ATTEMPTS: u32 = 5;
         const INITIAL_DELAY_SECS: u64 = 2;
         const BACKOFF_RATE: u64 = 3;
@@ -25,7 +25,7 @@ async fn handler(
         durable::RetryDecision::Retry {
             delay: Duration::from_secs(delay_secs),
         }
-    });
+    };
 
     let result: String = ctx
         .step(move |_sc| async move {

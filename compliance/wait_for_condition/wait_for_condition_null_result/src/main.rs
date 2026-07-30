@@ -13,9 +13,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     |_ctx, _state: serde_json::Value| async move { Ok(serde_json::Value::Null) },
                     serde_json::Value::Null,
                 )
-                .wait_strategy_fn(Box::new(|_state: serde_json::Value, _attempt| {
-                    WaitDecision::complete()
-                }))
+                .wait_strategy_fn(|_state: serde_json::Value, _attempt| WaitDecision::complete())
                 .await?;
             Ok(result)
         },

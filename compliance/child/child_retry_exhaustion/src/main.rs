@@ -12,7 +12,7 @@ async fn handler(
         .run_in_child_context(|child_ctx| async move {
             let v: String = child_ctx
                 .step(|_| async move { Err("Always fails".into()) })
-                .retry_strategy(Box::new(|_, attempt| {
+                .retry_strategy(|_, attempt| {
                     if attempt >= 2 {
                         durable::RetryDecision::Stop
                     } else {
@@ -20,7 +20,7 @@ async fn handler(
                             delay: Duration::from_secs(1),
                         }
                     }
-                }))
+                })
                 .await?;
             Ok(v)
         })

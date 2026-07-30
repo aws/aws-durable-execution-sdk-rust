@@ -37,13 +37,13 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     String::new(),
                 )
                 .serdes(PrefixSerdes)
-                .wait_strategy_fn(Box::new(|state: String, _attempt| {
+                .wait_strategy_fn(|state: String, _attempt| {
                     if state.len() >= 2 {
                         WaitDecision::complete()
                     } else {
                         WaitDecision::continue_with(Duration::from_secs(1))
                     }
-                }))
+                })
                 .await?;
             Ok(result)
         },

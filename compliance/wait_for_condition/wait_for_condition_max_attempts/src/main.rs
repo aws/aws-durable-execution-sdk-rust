@@ -11,13 +11,13 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         |_input: serde_json::Value, ctx: durable::DurableContext| async move {
             let result = ctx
                 .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)
-                .wait_strategy_fn(Box::new(|_state: i32, attempt| {
+                .wait_strategy_fn(|_state: i32, attempt| {
                     if attempt >= 3 {
                         WaitDecision::exhausted("max attempts exceeded")
                     } else {
                         WaitDecision::continue_with(Duration::from_secs(1))
                     }
-                }))
+                })
                 .await?;
             Ok(result)
         },

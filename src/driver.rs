@@ -1114,9 +1114,9 @@ mod suspension_containment_and_task_ownership {
             async move {
                 let _ = ctx_h
                     .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)
-                    .wait_strategy_fn(Box::new(|_state: i32, _attempt| {
+                    .wait_strategy_fn(|_state: i32, _attempt| {
                         crate::WaitDecision::continue_with(Duration::from_secs(1))
-                    }))
+                    })
                     .await;
                 ran_c.store(true, Ordering::SeqCst);
                 Ok::<_, (String, String)>("done".to_owned())
@@ -1706,10 +1706,7 @@ mod scoped_suspension {
                 ];
                 let r = ctx_h
                     .parallel(branches)
-                    .completion(crate::CompletionConfig {
-                        min_successful: Some(1),
-                        ..Default::default()
-                    })
+                    .completion(crate::CompletionConfig::builder().min_successful(1).build())
                     .await;
                 Ok::<_, (String, String)>(format!("ok={}", r.is_ok()))
             },

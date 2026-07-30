@@ -1705,7 +1705,7 @@ fn operation_status_str(s: &OperationStatus) -> &'static str {
 #[allow(clippy::indexing_slicing)] // reason: test assertions index known-length op vectors
 mod tests {
     use super::*;
-    use crate::{CompletionConfig, RetryDecision, RetryStrategy, StepError};
+    use crate::{CompletionConfig, RetryDecision, StepError};
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1742,8 +1742,7 @@ mod tests {
         let result = LocalRunner::new()
             .run(
                 |(), ctx: DurableContext| async move {
-                    let strategy: RetryStrategy =
-                        Box::new(|_e: &StepError, _a: u32| RetryDecision::Stop);
+                    let strategy = |_e: &StepError, _a: u32| RetryDecision::Stop;
                     let v: i32 = ctx
                         .step(|_| async { Err("boom".into()) })
                         .retry_strategy(strategy)
@@ -1774,7 +1773,7 @@ mod tests {
                     let attempts_seen = Arc::clone(&attempts_seen);
                     async move {
                         let attempts_seen = Arc::clone(&attempts_seen);
-                        let strategy: RetryStrategy = Box::new(|_e: &StepError, attempt: u32| {
+                        let strategy = |_e: &StepError, attempt: u32| {
                             if attempt >= 3 {
                                 RetryDecision::Stop
                             } else {
@@ -1782,7 +1781,7 @@ mod tests {
                                     delay: std::time::Duration::from_secs(1),
                                 }
                             }
-                        });
+                        };
                         let v: i32 = ctx
                             .step(move |sc| {
                                 let attempts_seen = Arc::clone(&attempts_seen);
@@ -1872,16 +1871,13 @@ mod tests {
         let result = LocalRunner::new()
             .run(
                 |(), ctx: DurableContext| async move {
-                    let strategy: crate::WaitStrategyFn<Counter> =
-                        Box::new(|state: Counter, _attempt: u32| {
-                            if state.count >= 3 {
-                                crate::WaitDecision::complete()
-                            } else {
-                                crate::WaitDecision::continue_with(std::time::Duration::from_secs(
-                                    1,
-                                ))
-                            }
-                        });
+                    let strategy = |state: Counter, _attempt: u32| {
+                        if state.count >= 3 {
+                            crate::WaitDecision::complete()
+                        } else {
+                            crate::WaitDecision::continue_with(std::time::Duration::from_secs(1))
+                        }
+                    };
                     let final_state = ctx
                         .wait_for_condition(
                             |_sc, state: Counter| async move {

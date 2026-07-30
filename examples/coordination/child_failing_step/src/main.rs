@@ -27,7 +27,7 @@ async fn handler(
                 .name("charge")
                 // A deliberately-failing demo step fails on the first attempt
                 // instead of retrying, so the error surfaces immediately.
-                .retry_strategy(Box::new(|_err, _attempt| durable::RetryDecision::Stop))
+                .retry_strategy(|_err, _attempt| durable::RetryDecision::Stop)
                 .await?;
             Ok(charged)
         })

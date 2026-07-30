@@ -5,14 +5,14 @@ use aws_durable_execution_sdk_rust as durable;
 use durable::WaitDecision;
 use std::time::Duration;
 
-fn make_strategy(threshold: i32) -> Box<dyn Fn(i32, u32) -> WaitDecision + Send + Sync> {
-    Box::new(move |state: i32, _attempt| {
+fn make_strategy(threshold: i32) -> impl Fn(i32, u32) -> WaitDecision + Send + Sync {
+    move |state: i32, _attempt| {
         if state >= threshold {
             WaitDecision::complete()
         } else {
             WaitDecision::continue_with(Duration::from_secs(1))
         }
-    })
+    }
 }
 
 #[tokio::main]

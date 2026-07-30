@@ -43,7 +43,7 @@ async fn handler(
             Ok(format!("succeeded on attempt {attempt}"))
         })
         .name("flaky-call")
-        .retry_strategy(Box::new(|_err, attempt| {
+        .retry_strategy(|_err, attempt| {
             if attempt >= 3 {
                 RetryDecision::Stop
             } else {
@@ -52,7 +52,7 @@ async fn handler(
                     delay: Duration::from_secs(u64::from(attempt)),
                 }
             }
-        }))
+        })
         .semantics(StepSemantics::AtMostOncePerRetry)
         .await?;
     Ok(result)

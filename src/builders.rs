@@ -60,24 +60,22 @@ macro_rules! spawn_terminal {
 ///
 /// ```no_run
 /// use aws_durable_execution_sdk_rust as durable;
-/// use aws_durable_execution_sdk_rust::{RetryStrategy, RetryDecision, StepError};
+/// use aws_durable_execution_sdk_rust::RetryDecision;
 /// use std::time::Duration;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,
 ///     ctx: durable::DurableContext,
 /// ) -> Result<i32, durable::BoxError> {
-///     let strategy: RetryStrategy = Box::new(|_err: &StepError, attempt: u32| {
-///         if attempt >= 3 {
-///             RetryDecision::Stop
-///         } else {
-///             RetryDecision::Retry { delay: Duration::from_secs(1) }
-///         }
-///     });
-///
 ///     let result = ctx.step(|_| async { Ok(42) })
 ///         .name("compute")
-///         .retry_strategy(strategy)
+///         .retry_strategy(|_err, attempt| {
+///             if attempt >= 3 {
+///                 RetryDecision::Stop
+///             } else {
+///                 RetryDecision::Retry { delay: Duration::from_secs(1) }
+///             }
+///         })
 ///         .await?;
 ///     Ok(result)
 /// }
@@ -150,10 +148,40 @@ impl<O: Send + 'static> StepBuilder<O> {
 
     /// Sets the retry strategy for this step.
     ///
-    /// The strategy function is called on each failure with the error and
-    /// attempt number to decide whether to retry.
-    pub fn retry_strategy(mut self, strategy: RetryStrategy) -> Self {
-        self.retry_strategy = Some(strategy);
+    /// The strategy closure is called on each failure with the error and
+    /// attempt number to decide whether to retry. The SDK boxes the closure
+    /// internally — no `Box::new` at the call site.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk_rust::RetryDecision;
+    /// use std::time::Duration;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<i32, durable::BoxError> {
+    ///     let result = ctx.step(|_| async { Ok(42) })
+    ///         .retry_strategy(|_err, attempt| {
+    ///             if attempt >= 3 {
+    ///                 RetryDecision::Stop
+    ///             } else {
+    ///                 RetryDecision::Retry {
+    ///                     delay: Duration::from_millis(100 * u64::from(2_u32.pow(attempt - 1))),
+    ///                 }
+    ///             }
+    ///         })
+    ///         .await?;
+    ///     Ok(result)
+    /// }
+    /// ```
+    pub fn retry_strategy<F>(mut self, strategy: F) -> Self
+    where
+        F: Fn(&crate::StepError, u32) -> crate::RetryDecision + Send + Sync + 'static,
+    {
+        self.retry_strategy = Some(Box::new(strategy));
         self
     }
 
@@ -744,13 +772,13 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 ///         |_, state: State| async move { Ok(State { ready: true }) },
 ///         State { ready: false },
 ///     ).name("wait-ready")
-///      .wait_strategy_fn(Box::new(|state: State, _attempt| {
+///      .wait_strategy_fn(|state: State, _attempt| {
 ///          if state.ready {
 ///              WaitDecision::complete()
 ///          } else {
 ///              WaitDecision::continue_with(Duration::from_secs(5))
 ///          }
-///      }))
+///      })
 ///      .await?;
 ///     Ok(())
 /// }
@@ -829,13 +857,37 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
     ///
     /// This converts the [`WaitStrategy`] config struct into a functional
     /// strategy internally.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk_rust::WaitStrategy;
+    /// use std::time::Duration;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<i32, durable::BoxError> {
+    ///     let done = ctx
+    ///         .wait_for_condition(|_step_ctx, state: i32| async move { Ok(state + 1) }, 0_i32)
+    ///         .wait_strategy(
+    ///             WaitStrategy::builder()
+    ///                 .initial_delay(Duration::from_secs(2))
+    ///                 .max_delay(Duration::from_secs(30))
+    ///                 .build(),
+    ///         )
+    ///         .await?;
+    ///     Ok(done)
+    /// }
+    /// ```
     #[allow(clippy::needless_pass_by_value)] // reason: API consistency with other builder chain methods
     pub fn wait_strategy(mut self, strategy: WaitStrategy) -> Self {
         // Convert the config struct into a functional strategy with
         // exponential backoff.
-        let initial = strategy.initial_delay;
-        let max = strategy.max_delay;
-        let factor = strategy.backoff_factor;
+        let initial = strategy.initial_delay();
+        let max = strategy.max_delay();
+        let factor = strategy.backoff_factor();
         self.wait_strategy = Some(Box::new(move |_state: S, attempt: u32| {
             // Default behavior: always continue with backoff.
             #[allow(clippy::cast_possible_truncation)] // reason: attempt is small
@@ -853,15 +905,41 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
         self
     }
 
-    /// Sets a custom wait strategy function.
+    /// Sets a custom wait strategy closure.
     ///
     /// The strategy receives the current (deserialized) state and the
     /// 1-based attempt number, and returns a [`WaitDecision`](crate::WaitDecision).
-    pub fn wait_strategy_fn(
-        mut self,
-        strategy: crate::wait_for_condition::WaitStrategyFn<S>,
-    ) -> Self {
-        self.wait_strategy = Some(strategy);
+    /// The SDK boxes the closure internally — no `Box::new` at the call site.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk_rust::WaitDecision;
+    /// use std::time::Duration;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<i32, durable::BoxError> {
+    ///     let done = ctx
+    ///         .wait_for_condition(|_step_ctx, state: i32| async move { Ok(state + 1) }, 0_i32)
+    ///         .wait_strategy_fn(|state: i32, _attempt| {
+    ///             if state >= 3 {
+    ///                 WaitDecision::complete()
+    ///             } else {
+    ///                 WaitDecision::continue_with(Duration::from_secs(1))
+    ///             }
+    ///         })
+    ///         .await?;
+    ///     Ok(done)
+    /// }
+    /// ```
+    pub fn wait_strategy_fn<F>(mut self, strategy: F) -> Self
+    where
+        F: Fn(S, u32) -> crate::WaitDecision + Send + Sync + 'static,
+    {
+        self.wait_strategy = Some(Box::new(strategy));
         self
     }
 
@@ -1126,7 +1204,8 @@ impl<O: Send + 'static> WaitForCallbackBuilder<O> {
     ///
     /// Controls how many times the submitter is retried on failure before
     /// the operation is abandoned. If not set, the SDK default retry
-    /// strategy is used (exponential backoff, 6 attempts).
+    /// strategy is used (exponential backoff, 6 attempts). The SDK boxes the
+    /// closure internally — no `Box::new` at the call site.
     ///
     /// # Examples
     ///
@@ -1141,19 +1220,22 @@ impl<O: Send + 'static> WaitForCallbackBuilder<O> {
     ///     let result = ctx.wait_for_callback::<String, _, _>(
     ///         |_step_ctx, _cb_id| async { Ok(()) }
     ///     ).name("with-retry")
-    ///      .submitter_retry(Box::new(|_err, attempt| {
+    ///      .submitter_retry(|_err, attempt| {
     ///          if attempt >= 2 {
     ///              durable::RetryDecision::Stop
     ///          } else {
     ///              durable::RetryDecision::Retry { delay: Duration::from_secs(1) }
     ///          }
-    ///      }))
+    ///      })
     ///      .await?;
     ///     Ok(result)
     /// }
     /// ```
-    pub fn submitter_retry(mut self, strategy: RetryStrategy) -> Self {
-        self.submitter_retry = Some(strategy);
+    pub fn submitter_retry<F>(mut self, strategy: F) -> Self
+    where
+        F: Fn(&crate::StepError, u32) -> crate::RetryDecision + Send + Sync + 'static,
+    {
+        self.submitter_retry = Some(Box::new(strategy));
         self
     }
 
@@ -2118,5 +2200,130 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
         };
 
         DurableFuture::from_async(async move { execution.execute().await })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // reason: test assertions
+#[allow(clippy::expect_used)] // reason: test assertions
+#[allow(clippy::panic)] // reason: test assertions on unexpected variants
+mod tests {
+    use super::*;
+
+    /// A [`WaitStrategy`] built through its builder drives the derived polling
+    /// schedule: the first delay is `initial_delay`, each subsequent delay
+    /// grows by `backoff_factor`, and the sequence is capped at `max_delay`.
+    #[test]
+    fn wait_strategy_builder_drives_polling_schedule() {
+        let ctx = DurableContext::__test_context();
+
+        let builder = ctx
+            .wait_for_condition(|_sc, state: i32| async move { Ok(state) }, 0_i32)
+            .wait_strategy(
+                WaitStrategy::builder()
+                    .initial_delay(Duration::from_secs(2))
+                    .max_delay(Duration::from_secs(10))
+                    .backoff_factor(3.0)
+                    .build(),
+            );
+
+        let strategy = builder
+            .wait_strategy
+            .as_ref()
+            .expect("wait_strategy must install a strategy");
+
+        let delay_of = |attempt: u32| match strategy(0_i32, attempt) {
+            crate::WaitDecision::Continue { delay } => delay,
+            other => panic!("config-derived strategy must always continue, got {other:?}"),
+        };
+
+        // attempt 1 → initial (2s); attempt 2 → 2s * 3 = 6s;
+        // attempt 3 → 18s, capped at max_delay (10s).
+        assert_eq!(delay_of(1), Duration::from_secs(2));
+        assert_eq!(delay_of(2), Duration::from_secs(6));
+        assert_eq!(delay_of(3), Duration::from_secs(10));
+        assert_eq!(delay_of(9), Duration::from_secs(10));
+    }
+
+    /// The default [`WaitStrategy`] keeps its pre-builder behavior: a 1 second
+    /// first delay doubling up to the 1 minute cap.
+    #[test]
+    fn default_wait_strategy_schedule_unchanged() {
+        let ctx = DurableContext::__test_context();
+
+        let builder = ctx
+            .wait_for_condition(|_sc, state: i32| async move { Ok(state) }, 0_i32)
+            .wait_strategy(WaitStrategy::default());
+
+        let strategy = builder
+            .wait_strategy
+            .as_ref()
+            .expect("wait_strategy must install a strategy");
+
+        let delay_of = |attempt: u32| match strategy(0_i32, attempt) {
+            crate::WaitDecision::Continue { delay } => delay,
+            other => panic!("config-derived strategy must always continue, got {other:?}"),
+        };
+
+        assert_eq!(delay_of(1), Duration::from_secs(1));
+        assert_eq!(delay_of(2), Duration::from_secs(2));
+        assert_eq!(delay_of(3), Duration::from_secs(4));
+        assert_eq!(delay_of(20), Duration::from_mins(1));
+    }
+
+    /// The closure setters accept a bare (unboxed) closure and box it
+    /// internally: a plain `|err, attempt| ...` compiles and the installed
+    /// strategy returns that closure's decisions.
+    #[test]
+    fn retry_strategy_setter_accepts_bare_closure() {
+        let ctx = DurableContext::__test_context();
+
+        let builder = ctx
+            .step(|_| async { Ok(1_i32) })
+            .retry_strategy(|_err, attempt| {
+                if attempt >= 2 {
+                    crate::RetryDecision::Stop
+                } else {
+                    crate::RetryDecision::Retry {
+                        delay: Duration::from_secs(7),
+                    }
+                }
+            });
+
+        let strategy = builder
+            .retry_strategy
+            .as_ref()
+            .expect("retry_strategy must install a strategy");
+        let err = crate::StepError::from_kind(crate::StepErrorKind::ExecutionFailed {
+            message: "boom".to_owned(),
+        });
+
+        assert_eq!(
+            strategy(&err, 1),
+            crate::RetryDecision::Retry {
+                delay: Duration::from_secs(7)
+            }
+        );
+        assert_eq!(strategy(&err, 2), crate::RetryDecision::Stop);
+    }
+
+    /// The callback submitter retry setter likewise takes a bare closure.
+    #[test]
+    fn submitter_retry_setter_accepts_bare_closure() {
+        let ctx = DurableContext::__test_context();
+
+        let builder = ctx
+            .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })
+            .submitter_retry(|_err, _attempt| crate::RetryDecision::Stop);
+
+        let strategy = builder
+            .submitter_retry
+            .as_ref()
+            .expect("submitter_retry must install a strategy");
+        let err = crate::StepError::from_kind(crate::StepErrorKind::ExecutionFailed {
+            message: "boom".to_owned(),
+        });
+
+        assert_eq!(strategy(&err, 1), crate::RetryDecision::Stop);
     }
 }

@@ -11,13 +11,13 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let result = ctx
             .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)
             .name("poll-status")
-            .wait_strategy_fn(Box::new(move |state: i32, _attempt| {
+            .wait_strategy_fn(move |state: i32, _attempt| {
                 if state >= threshold {
                     WaitDecision::complete()
                 } else {
                     WaitDecision::continue_with(Duration::from_secs(1))
                 }
-            }))
+            })
             .await?;
         Ok(result)
     })

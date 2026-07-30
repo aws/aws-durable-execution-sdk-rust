@@ -87,7 +87,7 @@ pub use self::serdes::{
     SerdesContext,
 };
 pub use self::step::StepSemantics;
-pub use self::wait_for_condition::{WaitDecision, WaitStrategyFn};
+pub use self::wait_for_condition::WaitDecision;
 
 // Re-export rule: every foreign type in the public surface is re-exported.
 pub use lambda_runtime::{self, Context as LambdaContext};
@@ -116,10 +116,12 @@ use std::future::Future;
 /// ```
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Retry decision returned by a [`RetryStrategy`] function.
+/// Retry decision returned by a retry-strategy closure.
 ///
 /// Tells the engine whether to retry a failed step and, if so, how long
-/// to wait before the next attempt.
+/// to wait before the next attempt. Retry strategies are installed with
+/// [`StepBuilder::retry_strategy`] and
+/// [`WaitForCallbackBuilder::submitter_retry`].
 ///
 /// # Examples
 ///
@@ -146,35 +148,25 @@ pub enum RetryDecision {
     Stop,
 }
 
-/// A retry strategy function that decides whether to retry a failed step.
+/// A boxed retry strategy that decides whether to retry a failed step.
 ///
 /// Receives the step error and the attempt number (starting from 1), and
 /// returns a [`RetryDecision`].
 ///
-/// # Examples
-///
-/// ```
-/// use aws_durable_execution_sdk_rust::{RetryStrategy, RetryDecision, StepError};
-/// use std::time::Duration;
-///
-/// let exponential: RetryStrategy = Box::new(|_err: &StepError, attempt: u32| {
-///     if attempt >= 3 {
-///         RetryDecision::Stop
-///     } else {
-///         RetryDecision::Retry {
-///             delay: Duration::from_millis(100 * u64::from(2_u32.pow(attempt - 1))),
-///         }
-///     }
-/// });
-/// # drop(exponential);
-/// ```
-pub type RetryStrategy = Box<dyn Fn(&StepError, u32) -> RetryDecision + Send + Sync>;
+/// Crate-internal: the boxing is an implementation detail. Public setters
+/// ([`StepBuilder::retry_strategy`], [`WaitForCallbackBuilder::submitter_retry`])
+/// take a generic closure and box it here.
+pub(crate) type RetryStrategy = Box<dyn Fn(&StepError, u32) -> RetryDecision + Send + Sync>;
 
 /// Configuration for completion behavior in map and parallel operations.
 ///
 /// Controls early-completion thresholds: how many items must succeed and
 /// how many failures are tolerated before stopping. Thresholds may be
 /// combined — when multiple are set, the first threshold to fire wins.
+///
+/// Construct with [`CompletionConfig::builder`] (which combines thresholds)
+/// or with one of the single-threshold constructors. Fields are private per
+/// C-STRUCT-PRIVATE; read values back through the accessors.
 ///
 /// # Examples
 ///
@@ -183,31 +175,52 @@ pub type RetryStrategy = Box<dyn Fn(&StepError, u32) -> RetryDecision + Send + S
 ///
 /// // Fail-fast: stop on the first failure.
 /// let fail_fast = CompletionConfig::with_tolerated_failure_count(0);
+/// assert_eq!(fail_fast.tolerated_failure_count(), Some(0));
 ///
 /// // Early completion: stop after 2 successes.
 /// let min_success = CompletionConfig::with_min_successful(2);
-/// # drop(fail_fast);
-/// # drop(min_success);
+/// assert_eq!(min_success.min_successful(), Some(2));
+///
+/// // Combined thresholds — first to fire wins.
+/// let combined = CompletionConfig::builder()
+///     .min_successful(2)
+///     .tolerated_failure_count(1)
+///     .build();
+/// assert_eq!(combined.min_successful(), Some(2));
+/// assert_eq!(combined.tolerated_failure_count(), Some(1));
 /// ```
 #[derive(Debug, Clone, Default)]
-#[non_exhaustive]
 pub struct CompletionConfig {
     /// Completes the batch early once this many items succeed.
     /// `None` means no minimum-success threshold.
-    pub min_successful: Option<usize>,
+    min_successful: Option<usize>,
 
     /// Fails the batch once more than this many items fail.
     /// `Some(0)` means fail-fast (stop on first failure).
     /// `None` means no count-based failure tolerance.
-    pub tolerated_failure_count: Option<usize>,
+    tolerated_failure_count: Option<usize>,
 
     /// Fails the batch once the failure percentage strictly exceeds this
     /// threshold (integer 0-100).
     /// `None` means no percentage-based failure tolerance.
-    pub tolerated_failure_percentage: Option<usize>,
+    tolerated_failure_percentage: Option<usize>,
 }
 
 impl CompletionConfig {
+    /// Creates a new [`CompletionConfigBuilder`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::CompletionConfig;
+    ///
+    /// let config = CompletionConfig::builder().min_successful(3).build();
+    /// assert_eq!(config.min_successful(), Some(3));
+    /// ```
+    pub fn builder() -> CompletionConfigBuilder {
+        CompletionConfigBuilder::default()
+    }
+
     /// Creates a config with just a `min_successful` threshold.
     #[must_use]
     pub fn with_min_successful(min: usize) -> Self {
@@ -237,6 +250,24 @@ impl CompletionConfig {
         }
     }
 
+    /// Returns the minimum-success threshold, if set.
+    #[must_use]
+    pub fn min_successful(&self) -> Option<usize> {
+        self.min_successful
+    }
+
+    /// Returns the count-based failure tolerance, if set.
+    #[must_use]
+    pub fn tolerated_failure_count(&self) -> Option<usize> {
+        self.tolerated_failure_count
+    }
+
+    /// Returns the percentage-based failure tolerance, if set.
+    #[must_use]
+    pub fn tolerated_failure_percentage(&self) -> Option<usize> {
+        self.tolerated_failure_percentage
+    }
+
     /// Validates the completion config, returning an error message when the
     /// config is invalid (crate-internal; callers convert the message into a
     /// typed batch error).
@@ -252,10 +283,72 @@ impl CompletionConfig {
     }
 }
 
+/// Builder for [`CompletionConfig`].
+///
+/// Follows the Rust API Guidelines C-BUILDER pattern. All methods consume
+/// and return `self` for chaining, so multiple thresholds combine in one
+/// expression instead of requiring post-construction mutation.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::CompletionConfig;
+///
+/// let config = CompletionConfig::builder()
+///     .min_successful(2)
+///     .tolerated_failure_percentage(25)
+///     .build();
+/// assert_eq!(config.tolerated_failure_percentage(), Some(25));
+/// ```
+#[derive(Debug, Clone, Default)]
+#[must_use = "builders do nothing unless .build() is called"]
+#[non_exhaustive]
+pub struct CompletionConfigBuilder {
+    min_successful: Option<usize>,
+    tolerated_failure_count: Option<usize>,
+    tolerated_failure_percentage: Option<usize>,
+}
+
+impl CompletionConfigBuilder {
+    /// Completes the batch early once this many items succeed.
+    pub fn min_successful(mut self, min: usize) -> Self {
+        self.min_successful = Some(min);
+        self
+    }
+
+    /// Fails the batch once more than this many items fail.
+    ///
+    /// Use `0` for fail-fast behavior (stop on first failure).
+    pub fn tolerated_failure_count(mut self, count: usize) -> Self {
+        self.tolerated_failure_count = Some(count);
+        self
+    }
+
+    /// Fails the batch once the failure percentage strictly exceeds this
+    /// threshold (integer 0-100).
+    pub fn tolerated_failure_percentage(mut self, pct: usize) -> Self {
+        self.tolerated_failure_percentage = Some(pct);
+        self
+    }
+
+    /// Builds the [`CompletionConfig`] from the configured thresholds.
+    #[must_use]
+    pub fn build(self) -> CompletionConfig {
+        CompletionConfig {
+            min_successful: self.min_successful,
+            tolerated_failure_count: self.tolerated_failure_count,
+            tolerated_failure_percentage: self.tolerated_failure_percentage,
+        }
+    }
+}
+
 /// Configuration for the wait strategy used by
 /// [`DurableContext::wait_for_condition`].
 ///
 /// Controls the polling interval and backoff behavior for condition checks.
+/// Construct with [`WaitStrategy::builder`] — unset values keep their
+/// [`Default`] value. Fields are private per C-STRUCT-PRIVATE; read values
+/// back through the accessors.
 ///
 /// # Examples
 ///
@@ -263,18 +356,23 @@ impl CompletionConfig {
 /// use aws_durable_execution_sdk_rust::WaitStrategy;
 /// use std::time::Duration;
 ///
-/// let strategy = WaitStrategy::default();
-/// # drop(strategy);
+/// let strategy = WaitStrategy::builder()
+///     .initial_delay(Duration::from_secs(2))
+///     .max_delay(Duration::from_secs(30))
+///     .build();
+/// assert_eq!(strategy.initial_delay(), Duration::from_secs(2));
+/// // Unset values keep the default.
+/// let default_factor = WaitStrategy::default().backoff_factor();
+/// assert!((strategy.backoff_factor() - default_factor).abs() < f64::EPSILON);
 /// ```
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct WaitStrategy {
     /// Initial delay between condition checks.
-    pub initial_delay: std::time::Duration,
+    initial_delay: std::time::Duration,
     /// Maximum delay between condition checks.
-    pub max_delay: std::time::Duration,
+    max_delay: std::time::Duration,
     /// Backoff multiplier applied after each check.
-    pub backoff_factor: f64,
+    backoff_factor: f64,
 }
 
 impl Default for WaitStrategy {
@@ -283,6 +381,103 @@ impl Default for WaitStrategy {
             initial_delay: std::time::Duration::from_secs(1),
             max_delay: std::time::Duration::from_mins(1),
             backoff_factor: 2.0,
+        }
+    }
+}
+
+impl WaitStrategy {
+    /// Creates a new [`WaitStrategyBuilder`] seeded with the default values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::WaitStrategy;
+    /// use std::time::Duration;
+    ///
+    /// let strategy = WaitStrategy::builder()
+    ///     .backoff_factor(1.5)
+    ///     .build();
+    /// assert!((strategy.backoff_factor() - 1.5).abs() < f64::EPSILON);
+    /// ```
+    pub fn builder() -> WaitStrategyBuilder {
+        WaitStrategyBuilder::default()
+    }
+
+    /// Returns the initial delay between condition checks.
+    #[must_use]
+    pub fn initial_delay(&self) -> std::time::Duration {
+        self.initial_delay
+    }
+
+    /// Returns the maximum delay between condition checks.
+    #[must_use]
+    pub fn max_delay(&self) -> std::time::Duration {
+        self.max_delay
+    }
+
+    /// Returns the backoff multiplier applied after each check.
+    #[must_use]
+    pub fn backoff_factor(&self) -> f64 {
+        self.backoff_factor
+    }
+}
+
+/// Builder for [`WaitStrategy`].
+///
+/// Follows the Rust API Guidelines C-BUILDER pattern. All methods consume
+/// and return `self` for chaining. Values left unset keep the
+/// [`WaitStrategy::default`] value.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::WaitStrategy;
+/// use std::time::Duration;
+///
+/// let strategy = WaitStrategy::builder()
+///     .initial_delay(Duration::from_millis(500))
+///     .max_delay(Duration::from_secs(10))
+///     .backoff_factor(3.0)
+///     .build();
+/// assert_eq!(strategy.max_delay(), Duration::from_secs(10));
+/// ```
+#[derive(Debug, Clone, Default)]
+#[must_use = "builders do nothing unless .build() is called"]
+#[non_exhaustive]
+pub struct WaitStrategyBuilder {
+    initial_delay: Option<std::time::Duration>,
+    max_delay: Option<std::time::Duration>,
+    backoff_factor: Option<f64>,
+}
+
+impl WaitStrategyBuilder {
+    /// Sets the initial delay between condition checks.
+    pub fn initial_delay(mut self, delay: std::time::Duration) -> Self {
+        self.initial_delay = Some(delay);
+        self
+    }
+
+    /// Sets the maximum delay between condition checks.
+    pub fn max_delay(mut self, delay: std::time::Duration) -> Self {
+        self.max_delay = Some(delay);
+        self
+    }
+
+    /// Sets the backoff multiplier applied after each check.
+    pub fn backoff_factor(mut self, factor: f64) -> Self {
+        self.backoff_factor = Some(factor);
+        self
+    }
+
+    /// Builds the [`WaitStrategy`], filling unset values from
+    /// [`WaitStrategy::default`].
+    #[must_use]
+    pub fn build(self) -> WaitStrategy {
+        let defaults = WaitStrategy::default();
+        WaitStrategy {
+            initial_delay: self.initial_delay.unwrap_or(defaults.initial_delay),
+            max_delay: self.max_delay.unwrap_or(defaults.max_delay),
+            backoff_factor: self.backoff_factor.unwrap_or(defaults.backoff_factor),
         }
     }
 }
@@ -898,6 +1093,89 @@ mod tests {
     use std::future::IntoFuture;
 
     use super::*;
+
+    /// The `CompletionConfig` builder combines thresholds in one expression —
+    /// no `Default`-then-mutate — and the built config drives the same
+    /// completion decisions the single-threshold constructors do.
+    #[test]
+    fn completion_config_builder_combines_thresholds() {
+        let combined = CompletionConfig::builder()
+            .min_successful(2)
+            .tolerated_failure_count(1)
+            .tolerated_failure_percentage(25)
+            .build();
+
+        assert_eq!(combined.min_successful(), Some(2));
+        assert_eq!(combined.tolerated_failure_count(), Some(1));
+        assert_eq!(combined.tolerated_failure_percentage(), Some(25));
+        assert!(combined.validate().is_ok());
+
+        // An unset threshold stays `None`.
+        let only_min = CompletionConfig::builder().min_successful(3).build();
+        assert_eq!(only_min.min_successful(), Some(3));
+        assert_eq!(only_min.tolerated_failure_count(), None);
+        assert_eq!(only_min.tolerated_failure_percentage(), None);
+
+        // Builder output matches the equivalent single-threshold constructor.
+        assert_eq!(
+            CompletionConfig::builder()
+                .tolerated_failure_count(0)
+                .build()
+                .tolerated_failure_count(),
+            CompletionConfig::with_tolerated_failure_count(0).tolerated_failure_count(),
+        );
+
+        // Default is still "no thresholds".
+        let default = CompletionConfig::default();
+        assert_eq!(default.min_successful(), None);
+        assert_eq!(default.tolerated_failure_count(), None);
+        assert_eq!(default.tolerated_failure_percentage(), None);
+    }
+
+    /// An out-of-range percentage set through the builder is still rejected by
+    /// the same construction-time validation the batch engine applies.
+    #[test]
+    #[allow(clippy::expect_used)] // reason: test assertion — extracting expected error
+    fn completion_config_builder_percentage_is_validated() {
+        let cfg = CompletionConfig::builder()
+            .tolerated_failure_percentage(101)
+            .build();
+        let err = cfg
+            .validate()
+            .expect_err("a percentage above 100 must be rejected");
+        assert!(
+            err.contains("tolerated_failure_percentage"),
+            "error should name the offending field, got: {err}"
+        );
+    }
+
+    /// The `WaitStrategy` builder sets each knob independently and leaves
+    /// unset knobs at their `Default` value.
+    #[test]
+    fn wait_strategy_builder_overrides_only_what_is_set() {
+        let defaults = WaitStrategy::default();
+
+        let strategy = WaitStrategy::builder()
+            .initial_delay(std::time::Duration::from_secs(5))
+            .build();
+        assert_eq!(strategy.initial_delay(), std::time::Duration::from_secs(5));
+        assert_eq!(strategy.max_delay(), defaults.max_delay());
+        assert!((strategy.backoff_factor() - defaults.backoff_factor()).abs() < f64::EPSILON);
+
+        let full = WaitStrategy::builder()
+            .initial_delay(std::time::Duration::from_millis(500))
+            .max_delay(std::time::Duration::from_secs(10))
+            .backoff_factor(3.0)
+            .build();
+        assert_eq!(full.initial_delay(), std::time::Duration::from_millis(500));
+        assert_eq!(full.max_delay(), std::time::Duration::from_secs(10));
+        assert!((full.backoff_factor() - 3.0).abs() < f64::EPSILON);
+
+        // Default behavior is unchanged by the builder rework.
+        assert_eq!(defaults.initial_delay(), std::time::Duration::from_secs(1));
+        assert_eq!(defaults.max_delay(), std::time::Duration::from_mins(1));
+        assert!((defaults.backoff_factor() - 2.0).abs() < f64::EPSILON);
+    }
 
     /// Verifies that `tokio::join!` accepts `IntoFuture` operands directly.
     ///

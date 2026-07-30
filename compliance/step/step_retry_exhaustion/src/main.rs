@@ -8,7 +8,7 @@ async fn handler(
     _event: serde_json::Value,
     ctx: durable::DurableContext,
 ) -> Result<serde_json::Value, durable::BoxError> {
-    let retry: durable::RetryStrategy = Box::new(|_err, attempt| {
+    let retry = |_err: &durable::StepError, attempt: u32| {
         if attempt >= 4 {
             durable::RetryDecision::Stop
         } else {
@@ -16,7 +16,7 @@ async fn handler(
                 delay: Duration::from_secs(1),
             }
         }
-    });
+    };
 
     let result: String = ctx
         .step(|_| async { Err("Always fails".into()) })

@@ -1,11 +1,13 @@
 //! Parallel completion policy: complete early once enough branches succeed.
 //!
 //! A [`CompletionConfig`] controls when a parallel (or map) batch is considered
-//! done. Its `min_successful` field completes the batch as soon as that many
+//! done. Its `min_successful` threshold completes the batch as soon as that many
 //! branches succeed, without waiting for the rest — useful for quorum or
-//! first-N-of-M patterns. The same struct also carries failure-tolerance knobs
+//! first-N-of-M patterns. The same config also carries failure-tolerance knobs
 //! (`tolerated_failure_count`, `tolerated_failure_percentage`) for bounding how
-//! many branch failures may pass before the batch aborts.
+//! many branch failures may pass before the batch aborts. A single threshold
+//! has a named constructor; combine several with
+//! [`CompletionConfig::builder`](aws_durable_execution_sdk_rust::CompletionConfig::builder).
 //!
 //! This example runs three branches under a policy that completes once two
 //! succeed, returning the results gathered by that point.

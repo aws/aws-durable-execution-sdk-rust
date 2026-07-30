@@ -26,7 +26,7 @@ async fn handler(
                         Ok(e)
                     }
                 })
-                .retry_strategy(Box::new(|_, _| durable::RetryDecision::Stop))
+                .retry_strategy(|_, _| durable::RetryDecision::Stop)
                 .await?;
             Ok(v)
         })

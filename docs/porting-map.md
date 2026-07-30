@@ -129,7 +129,7 @@ is therefore either ported or covered, none left planned. Cross-cutting notes:
 | `parallel/min-successful-with-callback` | ✅ covered | by `parallel_completion` (min_successful; callback is Family 3) |
 | `parallel/min-successful-with-passing-threshold` | ✅ covered | by `parallel_completion` (same completion surface) |
 | `parallel/should-complete` | ✅ covered | by `parallel_completion` (`CompletionConfig`) |
-| `parallel/failure-threshold-exceeded-count` | ✅ covered | by `parallel_completion` (`CompletionConfig` tolerated-failure fields) |
+| `parallel/failure-threshold-exceeded-count` | ✅ covered | by `parallel_completion` (`CompletionConfig` tolerated-failure thresholds) |
 | `parallel/failure-threshold-exceeded-percentage` | ✅ covered | by `parallel_completion` (`tolerated_failure_percentage` field) |
 | `parallel/tolerated-failure-count` | ✅ covered | by `parallel_completion` (`CompletionConfig`); tolerated-failure return semantics shown in `map_completion` |
 | `parallel/tolerated-failure-percentage` | ✅ covered | by `parallel_completion` (`CompletionConfig`) |

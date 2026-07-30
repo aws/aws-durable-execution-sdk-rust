@@ -21,7 +21,7 @@ async fn handler(
                         }
                     }
                 })
-                .retry_strategy(Box::new(|_, attempt| {
+                .retry_strategy(|_, attempt| {
                     if attempt >= 3 {
                         durable::RetryDecision::Stop
                     } else {
@@ -29,7 +29,7 @@ async fn handler(
                             delay: Duration::from_secs(1),
                         }
                     }
-                }))
+                })
                 .await?;
             Ok(v)
         })

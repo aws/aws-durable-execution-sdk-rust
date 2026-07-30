@@ -9,8 +9,10 @@ async fn handler(
     _event: serde_json::Value,
     ctx: DurableContext,
 ) -> Result<serde_json::Value, durable::BoxError> {
-    let mut cfg = CompletionConfig::with_tolerated_failure_count(1);
-    cfg.min_successful = Some(3);
+    let cfg = CompletionConfig::builder()
+        .tolerated_failure_count(1)
+        .min_successful(3)
+        .build();
 
     let branches: Vec<Branch<String>> = vec![
         Branch::new("0", |_: DurableContext| async { Err("fail0".into()) }),

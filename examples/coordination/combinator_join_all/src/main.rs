@@ -27,7 +27,7 @@ async fn handler(
     let bad = ctx
         .step(|_| async { Err::<u32, durable::BoxError>("boom".into()) })
         .name("bad")
-        .retry_strategy(Box::new(|_err, _attempt| durable::RetryDecision::Stop))
+        .retry_strategy(|_err, _attempt| durable::RetryDecision::Stop)
         .future();
 
     let settled = ctx.join_all([good, bad]).name("collect").await?;

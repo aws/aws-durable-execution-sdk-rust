@@ -15,7 +15,7 @@ async fn handler(
     let input = event.as_str().unwrap_or("").to_owned();
     let execution_id = ctx.execution_arn().to_owned();
 
-    let retry: durable::RetryStrategy = Box::new(|_err, attempt| {
+    let retry = |_err: &durable::StepError, attempt: u32| {
         if attempt >= 3 {
             durable::RetryDecision::Stop
         } else {
@@ -23,7 +23,7 @@ async fn handler(
                 delay: Duration::from_secs(1),
             }
         }
-    });
+    };
 
     let result: String = ctx
         .step(move |_sc| async move {

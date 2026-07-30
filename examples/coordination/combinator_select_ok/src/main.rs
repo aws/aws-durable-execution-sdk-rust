@@ -22,7 +22,7 @@ async fn handler(
     let failing = ctx
         .step(|_| async { Err::<u32, durable::BoxError>("unavailable".into()) })
         .name("primary")
-        .retry_strategy(Box::new(|_err, _attempt| durable::RetryDecision::Stop))
+        .retry_strategy(|_err, _attempt| durable::RetryDecision::Stop)
         .future();
     let succeeding = ctx.step(|_| async { Ok(42u32) }).name("fallback").future();
 
