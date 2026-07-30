@@ -1374,7 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn callback_falls_back_to_execution_wide_serdes() {
         // With no per-op serdes, the decode falls back to the execution-wide
-        // serdes threaded in from Options (Java+Go model).
+        // serdes from Options.
         let wire = crate::engine::compute_wire_id_public("1");
         let log = CheckpointLog::from_records(vec![callback_record(
             &wire,

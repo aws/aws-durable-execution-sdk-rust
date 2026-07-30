@@ -1519,8 +1519,8 @@ impl<
 ///     ctx: durable::DurableContext,
 /// ) -> Result<(), durable::BoxError> {
 ///     let branches = vec![
-///         durable::Branch::new("a", |_| Box::pin(async { Ok(1) })),
-///         durable::Branch::new("b", |_| Box::pin(async { Ok(2) })),
+///         durable::Branch::new("a", |_| async { Ok(1) }),
+///         durable::Branch::new("b", |_| async { Ok(2) }),
 ///     ];
 ///     let _results: Vec<i32> = ctx.parallel(branches)
 ///         .name("fan-out")

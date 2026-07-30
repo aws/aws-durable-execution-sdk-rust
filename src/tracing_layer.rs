@@ -1,6 +1,6 @@
 //! Tracing integration: replay-aware filter layer and operation span helpers.
 //!
-//! The SDK creates a [`tracing::Span`] per operation carrying the cross-SDK
+//! The SDK creates a [`tracing::Span`] per operation carrying the
 //! structured-log field contract. When these spans are rendered by a JSON
 //! subscriber (e.g., `lambda_runtime`'s `init_default_subscriber()` with
 //! `AWS_LAMBDA_LOG_FORMAT=JSON`), the fields appear as top-level JSON keys —
@@ -10,7 +10,7 @@
 //! filter coalesce(durableExecutionArn, executionArn) like "<arn>"
 //! ```
 //!
-//! # Cross-SDK field contract
+//! # Structured-log field contract
 //!
 //! | Field | Description |
 //! |-------|-------------|
@@ -22,57 +22,32 @@
 //!
 //! # Replay filter
 //!
-//! The [`ReplayFilter`] layer suppresses user-emitted events inside spans
-//! marked `isReplay = true`, matching the other SDKs' replay-suppressed
-//! default behavior. Install it via [`replay_filter()`].
+//! The `isReplay` span field enables an application-installed subscriber or
+//! per-layer filter to suppress user-emitted events inside replay spans,
+//! avoiding duplicate `CloudWatch` log lines. The application must install its
+//! own subscriber that checks `isReplay`; the SDK does not install one
+//! automatically. See [`ReplayFilterLayer`] for a ready-made filter
+//! implementation usable via [`replay_filter()`].
 //!
-//! ## Packaging decision
+//! ## Architecture
 //!
-//! **Decision: Layer shipped in the SDK as a public function returning an
-//! opaque `impl Layer` — NOT feature-gated.**
-//!
-//! **Justification:**
-//! 1. The `tracing-subscriber` dependency is needed ONLY at the TYPE level
-//!    in the return type. However, `impl Layer<S>` requires the `Layer`
-//!    trait bound, which lives in `tracing-subscriber`. Therefore
-//!    `tracing-subscriber` must be a normal dependency for the public API
-//!    to compile... OR we use a feature gate.
-//! 2. After analysis: the replay filter can be implemented using ONLY the
-//!    `tracing` facade's `tracing::Subscriber` trait (via a
-//!    `tracing::subscriber::Filter` approach). But the idiomatic Rust
-//!    tracing ecosystem uses `tracing_subscriber::Layer` for composability.
-//! 3. **Chosen approach:** The replay filter is implemented as a
-//!    per-layer filter using `tracing_subscriber::layer::Filter` trait.
-//!    Since `tracing-subscriber` is already a dev-dependency, we ship the
-//!    filter as a **documented recipe** — the SDK provides the filter TYPE
-//!    but gated behind an optional feature `"replay-filter"` so that
-//!    production binaries that don't need it pay zero cost.
-//!
-//! **REVISED after deeper analysis:** Since conformance handlers (binaries)
-//! already depend on `tracing-subscriber` and the Layer is trivial (~30
-//! lines), the simplest viable path is:
-//! - Keep `tracing-subscriber` as dev-dep only.
-//! - The SDK provides the filter logic as an internal helper.
-//! - Conformance handlers and examples construct the subscriber themselves
-//!   using the SDK's public `is_replay_span()` predicate function.
-//! - No production dependency on `tracing-subscriber` is needed.
-//!
-//! This satisfies the spec's constraint: production dependency = `tracing`
-//! facade ONLY.
+//! The replay filter is an internal `#[cfg(test)]` helper. Production binaries
+//! depend only on the `tracing` facade; `tracing-subscriber` is a dev-dependency.
+//! Applications construct their own subscriber using the SDK's public
+//! `is_replay_span()` predicate or the `isReplay` span field directly.
 
 #[cfg(test)]
 use tracing::Id;
 #[cfg(test)]
 use tracing::span::Attributes;
 
-/// Field name constants matching the cross-SDK structured-log contract.
+/// Field name constants for the structured-log contract.
 ///
 /// These field names appear as top-level JSON keys in `CloudWatch` structured
 /// logs. The validator queries them via:
 /// `filter coalesce(durableExecutionArn, executionArn) like "<arn>"`
 pub(crate) mod fields {
-    /// Durable execution ARN — matches Go `executionArn`
-    /// and JS `DefaultLogger` shape.
+    /// Durable execution ARN — identifies the orchestration instance.
     pub(crate) const EXECUTION_ARN: &str = "executionArn";
 
     /// Lambda invocation request ID.
@@ -88,7 +63,7 @@ pub(crate) mod fields {
     pub(crate) const IS_REPLAY: &str = "isReplay";
 }
 
-/// Creates a `tracing::Span` for a durable operation with the cross-SDK
+/// Creates a `tracing::Span` for a durable operation with the structured-log
 /// field contract.
 ///
 /// The span carries:
@@ -220,9 +195,8 @@ impl ReplayTracker {
 /// A per-layer filter that suppresses user-emitted events inside spans
 /// marked `isReplay = true`.
 ///
-/// Matches the other SDKs' replay-suppressed default behavior: during
-/// replay, user logging inside operations is silenced to avoid duplicate
-/// `CloudWatch` log lines.
+/// During replay, user logging inside operations is silenced to avoid
+/// duplicate `CloudWatch` log lines.
 ///
 /// This is the documented recipe for handlers:
 ///
@@ -351,7 +325,7 @@ mod tests {
 
     #[test]
     fn field_constants_match_cross_sdk_contract() {
-        // Verify field name constants match the cross-SDK logger contract
+        // Verify field name constants match the structured-log contract
         // and the CloudWatch Logs Insights query.
         assert_eq!(fields::EXECUTION_ARN, "executionArn");
         assert_eq!(fields::REQUEST_ID, "requestId");
@@ -361,7 +335,7 @@ mod tests {
     }
 
     /// Verifies that a JSON subscriber produces log lines containing the
-    /// cross-SDK field contract fields when events fire inside an operation
+    /// structured-log field contract fields when events fire inside an operation
     /// span.
     #[test]
     fn json_output_contains_cross_sdk_fields() {

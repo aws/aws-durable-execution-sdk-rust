@@ -1,13 +1,11 @@
 //! Step operation execution engine.
 //!
 //! Implements the live path (run closure, serialize, checkpoint), replay path
-//! (return frozen result), and retry strategy (checkpoint-suspend for delays,
-//! per the reference SDK behavior).
+//! (return frozen result), and retry strategy (checkpoint-suspend for delays).
 //!
-//! Retry delay design decision: checkpoint-suspend (NOT in-process sleep).
-//! Checkpoint a RETRY action with `NextAttemptDelaySeconds` then fire
-//! suspension; the backend owns the timer. This matches the cross-SDK
-//! retry-timer contract.
+//! Retry delays use checkpoint-suspend rather than in-process sleep:
+//! a RETRY action with `NextAttemptDelaySeconds` is checkpointed, then the
+//! function suspends; the backend owns the timer.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,7 +26,7 @@ use crate::{BoxError, RetryDecision, RetryStrategy, Serdes, SerdesContext};
 /// The default retry strategy: 6 total attempts, 5s initial delay, 60s max
 /// delay, 2x backoff rate, FULL jitter.
 ///
-/// Matches the standard cross-SDK `ExponentialBackoff` defaults.
+/// Matches the standard `ExponentialBackoff` defaults.
 pub(crate) fn default_retry_strategy() -> RetryStrategy {
     Box::new(|_err: &StepError, attempt: u32| {
         const MAX_ATTEMPTS: u32 = 6;
@@ -233,7 +231,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
         }
 
         // Execute the step body inside a tracing span carrying the
-        // cross-SDK structured-log field contract.
+        // structured-log field contract.
         let is_replay = false; // Live execution is never replay.
         let span = tracing_layer::operation_span(
             ctx.execution_arn(),

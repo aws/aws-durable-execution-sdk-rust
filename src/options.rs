@@ -52,9 +52,10 @@ impl std::error::Error for OptionsValidationError {}
 #[non_exhaustive]
 pub struct Options {
     /// Execution-wide default serializer/deserializer, applied by a `step`,
-    /// `run_in_child_context`, `invoke`, or `wait_for_condition` operation that
-    /// sets no serdes of its own. Threaded into the root [`DurableContext`] by
-    /// [`wrap`](crate::wrap).
+    /// `run_in_child_context`, `invoke`, `callback`, or `wait_for_condition`
+    /// operation that sets no serdes of its own. Per-operation `.serdes(...)`
+    /// takes precedence, falling back to this default. Threaded into the root
+    /// [`DurableContext`] by [`wrap`](crate::wrap).
     pub(crate) serdes: Option<Box<dyn Serdes>>,
     /// A user-built AWS SDK config used to construct the Lambda client.
     pub(crate) sdk_config: Option<aws_config::SdkConfig>,
@@ -127,10 +128,12 @@ pub struct OptionsBuilder {
 impl OptionsBuilder {
     /// Sets the execution-wide default serializer/deserializer.
     ///
-    /// Applied by any `step`, `run_in_child_context`, `invoke`, or
-    /// `wait_for_condition` operation that sets no serdes of its own. If not
-    /// set, `serde_json` is used. `map`/`parallel` use their own per-operation
-    /// item serdes and are not affected by this default.
+    /// Applied by any `step`, `run_in_child_context`, `invoke`, `callback`,
+    /// or `wait_for_condition` operation that sets no per-operation serdes of
+    /// its own. Per-operation `.serdes(...)` on any builder takes precedence,
+    /// falling back to this default. If not set, `serde_json` is used.
+    /// `map`/`parallel` use their own per-operation item serdes and are not
+    /// affected by this default.
     ///
     /// # Examples
     ///

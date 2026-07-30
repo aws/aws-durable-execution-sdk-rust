@@ -5,16 +5,13 @@
 //! (frozen terminal state; LOUD error on state deserialization failure — never
 //! silent reset to initial state).
 //!
-//! ## Cross-SDK bug avoidance
+//! ## Key invariants
 //!
-//! Python issue #574 / JS issue #754: `wait_for_condition` silently resets to
-//! `initial_state` when checkpointed state fails to deserialize. The fix
-//! (Python PR #575) surfaces the deserialization error. Our implementation
-//! MUST error loudly on checkpointed-state deserialization failure.
-//!
-//! Python issue #530: `WaitDecision` type mismatch made `create_wait_strategy`
-//! unusable, and exhaustion must raise `WaitForConditionError` (Python PR #541).
-//! Our `WaitDecision` type is designed to avoid this class of bug.
+//! - The SDK surfaces a `WaitForConditionError::SerializationFailed` error
+//!   when checkpointed state fails to deserialize. It never silently resets
+//!   to `initial_state`.
+//! - [`WaitDecision`] is the type returned by the wait strategy.
+//! - Wait strategy exhaustion raises `WaitForConditionError::MaxChecksExceeded`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -32,7 +29,7 @@ use crate::error::{
 };
 use crate::{BoxError, Serdes, SerdesContext};
 
-/// Wire sub-type for wait-for-condition operations (matches Go/JS/Python).
+/// Wire sub-type for wait-for-condition operations.
 const WFC_SUB_TYPE: &str = "WaitForCondition";
 
 /// Decision returned by a wait strategy function.
@@ -179,10 +176,8 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                 | CheckpointStatus::Cancelled
                 | CheckpointStatus::TimedOut
                 | CheckpointStatus::Stopped => {
-                    // Re-invoked after timer fired (Ready) or terminal
-                    // status that the backend lets us retry.  We need a
-                    // fresh StepStarted to match the per-attempt protocol.
-                    // (Go parity: only statusStarted skips START.)
+                    // Only statusStarted skips START — other statuses
+                    // need a fresh StepStarted for the per-attempt protocol.
                 }
             }
         }
@@ -243,7 +238,7 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                     &serdes_ctx,
                 )?;
 
-                // Round-trip through serdes for consistency (Go parity).
+                // Round-trip through serdes for consistency.
                 let deserialized: S = deserialize_state_str(
                     self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
                     &serialized,
@@ -321,7 +316,7 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
             }
             Err(check_err) => {
                 // Check function error: checkpoint FAIL immediately (no retry
-                // for check errors — Go/Python parity).
+                // for check errors).
                 let update = build_wfc_fail_update(
                     &wire_id,
                     self.name.as_deref(),
@@ -410,18 +405,19 @@ fn deserialize_state_str<S: DeserializeOwned>(
     serdes_ctx: &SerdesContext,
 ) -> Result<S, OperationError> {
     let json_str = if let Some(s) = serdes {
-        s.deserialize_from_string_with_context(payload, serdes_ctx).map_err(|e| {
-            wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-                message: format!("state deserialization failed (cross-SDK bug guard: this error is intentionally loud — the SDK never silently resets to initial_state): {e}"),
-            })
-        })?
+        s.deserialize_from_string_with_context(payload, serdes_ctx)
+            .map_err(|e| {
+                wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
+                    message: format!("state deserialization failed: {e}"),
+                })
+            })?
     } else {
         payload.to_owned()
     };
 
     serde_json::from_str(&json_str).map_err(|e| {
         wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-            message: format!("state deserialization failed (cross-SDK bug guard: this error is intentionally loud — the SDK never silently resets to initial_state): {e}"),
+            message: format!("state deserialization failed: {e}"),
         })
     })
 }
@@ -761,12 +757,9 @@ mod tests {
 
     /// REGRESSION TEST: corrupt checkpointed state → loud `WaitForConditionError`.
     ///
-    /// This is the cross-SDK bug guard for Python issue #574 / JS issue #754:
-    /// when checkpointed state fails to deserialize, the SDK MUST surface the
-    /// error loudly (`WaitForConditionError::SerializationFailed`), NOT silently
-    /// reset to `initial_state`.
-    ///
-    /// Named explicitly to match the cross-SDK bug.
+    /// When checkpointed state fails to deserialize, the SDK surfaces
+    /// `WaitForConditionError::SerializationFailed`. It never silently
+    /// resets to `initial_state`.
     #[tokio::test]
     async fn regression_python574_corrupt_state_loud_error_not_silent_reset() {
         // Simulate a checkpoint with corrupt/incompatible state data.
@@ -811,12 +804,8 @@ mod tests {
             OperationErrorKind::WaitForCondition(wfc_err) => match wfc_err.kind() {
                 WaitForConditionErrorKind::SerializationFailed { message } => {
                     assert!(
-                        message.contains("deserialization failed"),
-                        "error message should mention deserialization: {message}"
-                    );
-                    assert!(
-                        message.contains("never silently resets"),
-                        "error message should mention the bug guard: {message}"
+                        message.contains("state deserialization failed"),
+                        "error message should indicate state deserialization failure: {message}"
                     );
                 }
                 other => panic!("expected SerializationFailed, got: {other:?}"),

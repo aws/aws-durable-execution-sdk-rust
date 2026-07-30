@@ -7,9 +7,7 @@ use std::any::Any;
 
 /// Custom serdes that wraps with "wrapped:" prefix.
 ///
-/// Matches Go handler's `wrapSerdes` which does:
-///   Marshal(v) → []byte("wrapped:" + v.(string))
-///   Unmarshal(data, v) → *v = TrimPrefix(string(data), "wrapped:")
+/// Serialization prepends `"wrapped:"` to the value; deserialization strips it.
 #[derive(Debug)]
 struct WrapSerdes;
 

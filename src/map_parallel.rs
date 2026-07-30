@@ -11,7 +11,7 @@
 //! - Actions: Start → (Succeed | Fail)
 //! - `ParentId` on children points to the parent's wire ID
 //!
-//! Cross-SDK invariants (verified from JS/Python/Go):
+//! Invariants:
 //! - Suspended branches RETAIN concurrency slots (only terminal events
 //!   decrement in-flight)
 //! - Never-started branches are OMITTED from results
@@ -367,8 +367,7 @@ impl<
 
         // Extract successful results in order; errors are embedded in the
         // batch result structure. For the simple Vec<O> return, we only
-        // include successful items (never-started are omitted — cross-SDK
-        // invariant).
+        // include successful items (never-started are omitted — invariant).
         let mut results = Vec::with_capacity(batch_result.items.len());
         for item in batch_result.items {
             match item.status {
@@ -585,7 +584,7 @@ fn panic_message(payload: &dyn std::any::Any) -> String {
 ///
 /// A `Terminal` branch (succeeded or failed) frees its concurrency slot; a
 /// `Suspended` branch parked on a durable operation and KEEPS its slot until
-/// it terminally completes on a later invocation (the cross-SDK slot-holding
+/// it terminally completes on a later invocation (the slot-holding
 /// invariant). Never-started branches are simply never dispatched.
 enum ItemOutcome<O> {
     /// The branch reached a terminal state this invocation.
@@ -784,7 +783,7 @@ where
 
     // Coordinator loop. In-flight = running + suspended, bounded by
     // `concurrency`: a SUSPENDED branch KEEPS its slot (only terminal
-    // completion frees one — the cross-SDK slot-holding invariant), so
+    // completion frees one — the slot-holding invariant), so
     // `suspended_count` counts against the cap and new branches only start
     // when capacity remains after terminal completions. Each branch runs
     // through `execute_single_item`, which drives the branch body under its
@@ -819,7 +818,7 @@ where
     loop {
         // Dispatch while capacity remains and not-started eligible work exists.
         // A threshold hit (`stopped`) halts new dispatch; already-running
-        // branches are still drained below (Go parity — in-flight completes).
+        // branches are still drained below (in-flight branches always complete).
         while !stopped && next_index < total_items && running + suspended_count < concurrency {
             let i = next_index;
             next_index += 1;
@@ -958,9 +957,8 @@ where
                 // normal branch would have produced so accounting and the
                 // completion threshold treat it identically, and checkpoint the
                 // child FAIL so a retry does not repeat already-started work.
-                // A panicking branch surfaces as a failed batch item, matching
-                // the reference SDKs, rather than failing or hanging the whole
-                // batch.
+                // A panicking branch surfaces as a failed batch item rather
+                // than failing or hanging the whole batch.
                 let Some(meta) = branch_meta.remove(&join_err.id()) else {
                     return Err(batch_error(
                         "branch task terminated with an unrecognized task id",
@@ -1024,7 +1022,7 @@ where
     }
 
     // 9. Assemble results in input order (only terminal items; suspended and
-    // never-started branches are omitted — cross-SDK invariant).
+    // never-started branches are omitted).
     let final_items: Vec<BatchItem<O>> = results.into_iter().flatten().collect();
 
     // 10. Determine completion reason.

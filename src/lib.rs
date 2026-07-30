@@ -1050,9 +1050,7 @@ mod tests {
     // ── Options consumption: client resolution + reuse ──────────────────
 
     /// A supplied `sdk_config` measurably alters client construction: the
-    /// resolved Lambda client carries the region from that config. Without
-    /// wrap consuming `sdk_config` (the pre-fix behavior) the config was
-    /// dropped and this region would not appear.
+    /// resolved Lambda client carries the region from that config.
     #[test]
     #[allow(clippy::expect_used)] // reason: test assertion
     fn sdk_config_measurably_alters_client_construction() {

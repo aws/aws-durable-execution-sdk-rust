@@ -41,8 +41,7 @@ impl OperationId {
 
 /// Computes the SHA-256 hex digest of the given positional ID string.
 ///
-/// The hash input is the raw UTF-8 bytes of the formatted positional string
-/// (matching the JS/Go model where `hashId(input)` hashes the string as-is).
+/// The hash input is the raw UTF-8 bytes of the formatted positional string.
 fn compute_wire_id(positional: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(positional.as_bytes());
