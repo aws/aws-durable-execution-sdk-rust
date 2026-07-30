@@ -153,10 +153,18 @@ logical_id() {
 function_name() {
     map="$WORK_DIR/resources-$1.tsv"
     if [ ! -f "$map" ]; then
-        aws cloudformation describe-stack-resources \
+        # Write the cache only after a successful call: a partial write from a
+        # failed describe would be reused by every later lookup as if it were
+        # the complete resource list.
+        if ! aws cloudformation describe-stack-resources \
             --stack-name "$(stack_for "$1")" \
             --query "StackResources[?ResourceType=='AWS::Lambda::Function'].[LogicalResourceId,PhysicalResourceId]" \
-            --output text > "$map"
+            --output text > "$map.partial" 2> "$WORK_DIR/describe-error.txt"; then
+            rm -f "$map.partial"
+            log "FAIL - describe-stack-resources failed for stack $(stack_for "$1"): $(tr '\n' ' ' < "$WORK_DIR/describe-error.txt")" >&2
+            return 1
+        fi
+        mv "$map.partial" "$map"
     fi
     awk -v id="$(logical_id "$2")" '$1 == id { print $2 }' "$map"
 }
@@ -172,21 +180,46 @@ result_matches() {
 
 # drive_callback EXAMPLE ARN: find the suspended execution's callback id in
 # its history and complete it with a success result.
+#
+# Every AWS CLI exit status here is checked. This function is called as
+# `if ! drive_callback ...`, which disables `set -e` for its whole body, so an
+# unchecked command would report a completion that never happened: the
+# execution would stay parked until its DurableConfig.ExecutionTimeout and the
+# harness would blame the SDK for a harness failure.
 drive_callback() {
     deadline=$(( $(date +%s) + CALLBACK_DISCOVERY_TIMEOUT ))
+    err="$WORK_DIR/callback-error-$1.txt"
+    : > "$err"
     while :; do
-        cb_id=$(aws lambda get-durable-execution-history \
+        # A history query that fails may be transient, so it is retried until
+        # the discovery deadline; the last error is reported if we give up.
+        if cb_id=$(aws lambda get-durable-execution-history \
             --durable-execution-arn "$2" --no-include-execution-data \
             --query "Events[?EventType=='CallbackStarted'].CallbackStartedDetails.CallbackId | [0]" \
-            --output text)
-        if [ -n "$cb_id" ] && [ "$cb_id" != "None" ]; then
-            aws lambda send-durable-execution-callback-success \
-                --callback-id "$cb_id" --result "$CALLBACK_RESULT" > /dev/null
-            log "$1: completed callback"
-            return 0
+            --output text 2> "$err") &&
+            [ -n "$cb_id" ] && [ "$cb_id" != "None" ]; then
+            # `--result` is a blob parameter and AWS CLI v2 defaults
+            # cli_binary_format to base64, so without
+            # `--cli-binary-format raw-in-base64-out` the CLI tries to
+            # base64-DECODE the result, rejects it client-side, and never
+            # calls the API (`aws lambda invoke --payload` below passes the
+            # same flag for the same reason).
+            if aws lambda send-durable-execution-callback-success \
+                --callback-id "$cb_id" --result "$CALLBACK_RESULT" \
+                --cli-binary-format raw-in-base64-out \
+                > /dev/null 2> "$err"; then
+                log "$1: completed callback"
+                return 0
+            fi
+            log "$1: FAIL - send-durable-execution-callback-success rejected the completion, so the callback was never delivered: $(tr '\n' ' ' < "$err")"
+            return 1
         fi
         if [ "$(date +%s)" -ge "$deadline" ]; then
-            log "$1: FAIL - no callback appeared within ${CALLBACK_DISCOVERY_TIMEOUT}s"
+            detail=""
+            if [ -s "$err" ]; then
+                detail=" (last error: $(tr '\n' ' ' < "$err"))"
+            fi
+            log "$1: FAIL - no callback appeared within ${CALLBACK_DISCOVERY_TIMEOUT}s$detail"
             return 1
         fi
         sleep "$CALLBACK_POLL_INTERVAL"
@@ -200,17 +233,25 @@ drive_callback() {
 # complete it.
 discover_execution_arn() {
     deadline=$(( $(date +%s) + CALLBACK_DISCOVERY_TIMEOUT ))
+    err="$WORK_DIR/discover-error.txt"
+    : > "$err"
     while :; do
-        arn=$(aws lambda list-durable-executions-by-function \
+        # The execution may not be listable yet, so a failed list is retried
+        # until the deadline rather than aborting; the last error is reported
+        # if we give up, so a rejected call is not mistaken for a slow start.
+        if arn=$(aws lambda list-durable-executions-by-function \
             --function-name "$1" --statuses RUNNING \
             --started-after "$2" --reverse-order --max-items 1 \
             --query 'DurableExecutions[0].DurableExecutionArn' \
-            --output text 2> /dev/null)
-        if [ -n "$arn" ] && [ "$arn" != "None" ]; then
+            --output text 2> "$err") &&
+            [ -n "$arn" ] && [ "$arn" != "None" ]; then
             printf '%s\n' "$arn"
             return 0
         fi
         if [ "$(date +%s)" -ge "$deadline" ]; then
+            if [ -s "$err" ]; then
+                log "$1: list-durable-executions-by-function failed: $(tr '\n' ' ' < "$err")" >&2
+            fi
             return 1
         fi
         sleep "$CALLBACK_POLL_INTERVAL"
@@ -254,13 +295,19 @@ echo "$EXPECTATIONS" | grep -v '^[[:space:]]*$' | while IFS='|' read -r family e
             continue
         fi
 
-        printf '%s|%s|%s|%s\n' "$example" "$expected" "$arn" "$allowed_results" >> "$WORK_DIR/pending"
         log "$example: started ($arn)"
 
-        if ! drive_callback "$example" "$arn"; then
-            echo "FAIL $example: callback drive failed" >> "$WORK_DIR/failures"
+        if drive_callback "$example" "$arn"; then
+            printf '%s|%s|%s|%s\n' "$example" "$expected" "$arn" "$allowed_results" >> "$WORK_DIR/pending"
+        else
+            # Not polled for a terminal state: with no callback delivered the
+            # execution can only run to its ExecutionTimeout, and the send
+            # failure logged by drive_callback is the actionable cause.
+            echo "FAIL $example: callback drive failed (see log above)" >> "$WORK_DIR/failures"
         fi
-        # Let the invocation finish on its own; `timeout` bounds the wait.
+        # Let the invocation finish on its own; `timeout` bounds the wait. Its
+        # status is deliberately ignored: `timeout` ending a still-parked
+        # invoke is expected, and phase 2 asserts the terminal state.
         wait "$invoke_pid" 2> /dev/null || true
         continue
     fi
