@@ -1605,3 +1605,227 @@ mod scoped_suspension {
         assert!(matches!(parked, ScopeOutcome::Suspended));
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Regression tests (S2a): `.spawn()` must not park the ROOT scope
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `.spawn()` hands the operation future to `DurableFuture::spawn_blessed`
+// (src/future.rs:67) WITHOUT creating a child suspension scope, so a parking
+// operation inside a top-level `.spawn()` sets the ROOT flag. `drive_invocation`
+// then returns `Poll::Ready(Pending)` on its next poll and drops the handler
+// future, which fires `AbortOnDrop` on every sibling spawned task — including
+// one that is mid-flight and has already checkpointed STARTED. The documented
+// `spawn` + `join!` pattern therefore does not hold, and an aborted step that
+// checkpointed STARTED re-executes on resume (duplicate side effects).
+//
+// Both tests below encode the INTENDED behaviour: a spawned step must reach its
+// terminal (Succeed) checkpoint before the invocation reports Pending. They fail
+// against current behaviour, so they are `#[ignore]`d to keep `make check`
+// green; the fix slice removes the attribute. See
+// .agents/scratchpad/s2a-diagnosis.md for the observed failures and the
+// intended mechanism.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // reason: test assertions
+mod spawn_scope_regressions {
+    use super::{InvocationOutcome, drive_invocation};
+    use crate::client::{ExecutionClient, InMemoryExecutionClient};
+    use crate::context::DurableContext;
+    use crate::engine::CheckpointLog;
+    use aws_sdk_lambda::types::OperationAction;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Upper bound on either test: a suspension-scoping defect must show up as
+    /// a FAILED assertion, never as a hung test run.
+    const BOUND: Duration = Duration::from_secs(5);
+
+    fn live_ctx(client: Arc<InMemoryExecutionClient>) -> DurableContext {
+        DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client as Arc<dyn ExecutionClient>,
+            "token0".to_owned(),
+        )
+    }
+
+    /// True if the client recorded a terminal (Succeed) checkpoint for the
+    /// operation named `name`.
+    fn succeeded(client: &InMemoryExecutionClient, name: &str) -> bool {
+        client
+            .recorded_updates()
+            .iter()
+            .any(|u| matches!(u.action(), OperationAction::Succeed) && u.name() == Some(name))
+    }
+
+    /// `wait.spawn()` beside `step.spawn()`: the spawned wait parks, but the
+    /// spawned step is still runnable, so the invocation must stay alive until
+    /// the step reaches its terminal checkpoint and only then report Pending.
+    #[tokio::test]
+    #[ignore = "encodes the S2a defect: .spawn() parks the ROOT scope (src/future.rs:67), so the spawned wait ends the invocation and aborts the still-running spawned step; un-ignore with the fix"]
+    async fn spawned_step_reaches_terminal_checkpoint_before_pending() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = live_ctx(Arc::clone(&client));
+        let signal = Arc::clone(ctx.suspension_signal());
+        let body_done = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&body_done);
+        let ctx_h = ctx.clone();
+
+        let outcome = tokio::time::timeout(
+            BOUND,
+            drive_invocation(
+                async move {
+                    // Parks: no timer result is available on a first invocation.
+                    let wait = ctx_h.wait(Duration::from_secs(10)).spawn();
+                    // Runnable, and slower than the wait's park so the ordering
+                    // under test is deterministic.
+                    let work = ctx_h
+                        .step(move |_| {
+                            let done = Arc::clone(&done);
+                            async move {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                done.store(true, Ordering::SeqCst);
+                                Ok(7_i32)
+                            }
+                        })
+                        .name("work")
+                        .spawn();
+                    let _ = work.await;
+                    let _ = wait.await;
+                    Ok::<_, (String, String)>("done".to_owned())
+                },
+                signal,
+            ),
+        )
+        .await
+        .expect("drive_invocation must terminate within the bound, not hang");
+
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert!(
+            body_done.load(Ordering::SeqCst),
+            "the spawned step body must run to completion before the invocation \
+             suspends; a parked spawned sibling must not abort it"
+        );
+        assert!(
+            succeeded(&client, "work"),
+            "the spawned step must reach its terminal Succeed checkpoint before \
+             the invocation reports Pending; otherwise its STARTED checkpoint \
+             re-executes the body on resume and duplicates side effects"
+        );
+    }
+
+    /// The documented composition: `tokio::join!` over a spawned wait and a
+    /// spawned step. Same guarantee as above, reached through `join!`.
+    #[tokio::test]
+    #[ignore = "encodes the S2a defect: tokio::join!(wait.spawn(), step.spawn()) is aborted by the wait's ROOT-scope park (src/future.rs:67, src/driver.rs:334); un-ignore with the fix"]
+    async fn joined_spawned_wait_and_step_lets_the_step_finish() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = live_ctx(Arc::clone(&client));
+        let signal = Arc::clone(ctx.suspension_signal());
+        let body_done = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&body_done);
+        let ctx_h = ctx.clone();
+
+        let outcome = tokio::time::timeout(
+            BOUND,
+            drive_invocation(
+                async move {
+                    let wait = ctx_h.wait(Duration::from_secs(10)).spawn();
+                    let work = ctx_h
+                        .step(move |_| {
+                            let done = Arc::clone(&done);
+                            async move {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                done.store(true, Ordering::SeqCst);
+                                Ok(7_i32)
+                            }
+                        })
+                        .name("work")
+                        .spawn();
+                    let (_timer, _result) = tokio::join!(wait, work);
+                    Ok::<_, (String, String)>("done".to_owned())
+                },
+                signal,
+            ),
+        )
+        .await
+        .expect("drive_invocation must terminate within the bound, not hang");
+
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert!(
+            body_done.load(Ordering::SeqCst),
+            "join! over a spawned wait and a spawned step must not abort the step"
+        );
+        assert!(
+            succeeded(&client, "work"),
+            "the joined spawned step must reach its terminal Succeed checkpoint \
+             before the invocation reports Pending"
+        );
+    }
+
+    /// A spawned wait parks, then the owner performs a non-spawned sequential
+    /// step. The sequential step must complete and checkpoint Succeed BEFORE
+    /// the invocation reports Pending. This catches premature ROOT-scope
+    /// flagging: if the spawned wait's park flags ROOT unconditionally, the
+    /// driver drops the handler while the sequential step is still in flight.
+    #[tokio::test]
+    #[ignore = "encodes the S2a defect: a parked spawned wait must not pre-empt the owner's sequential work (src/future.rs:67 flags ROOT, driver.rs:334 drops handler); un-ignore with the fix"]
+    async fn spawned_wait_parks_then_owner_does_sequential_step() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = live_ctx(Arc::clone(&client));
+        let signal = Arc::clone(ctx.suspension_signal());
+        let step_done = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&step_done);
+        let ctx_h = ctx.clone();
+
+        let outcome = tokio::time::timeout(
+            BOUND,
+            drive_invocation(
+                async move {
+                    // Spawn a wait — it parks immediately (no timer result on
+                    // first invocation). Hold the handle so its AbortOnDrop
+                    // doesn't fire, but never await it.
+                    let _wait = ctx_h.wait(Duration::from_secs(10)).spawn();
+
+                    // Yield once so the spawned wait task has a chance to run
+                    // and park. Without scope isolation, this parks ROOT.
+                    tokio::task::yield_now().await;
+
+                    // Now do a NON-SPAWNED sequential step. If the spawned
+                    // wait already flagged ROOT, the driver will drop us here.
+                    let _result = ctx_h
+                        .step(move |_| {
+                            let done = Arc::clone(&done);
+                            async move {
+                                done.store(true, Ordering::SeqCst);
+                                Ok(42_i32)
+                            }
+                        })
+                        .name("sequential_work")
+                        .await;
+
+                    // Handler completes normally. The driver should see the
+                    // parked spawn and report Pending instead of Complete.
+                    Ok::<_, (String, String)>("done".to_owned())
+                },
+                signal,
+            ),
+        )
+        .await
+        .expect("drive_invocation must terminate within the bound, not hang");
+
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert!(
+            step_done.load(Ordering::SeqCst),
+            "the non-spawned step must complete before Pending; a parked spawn \
+             must not pre-empt the owner's sequential work"
+        );
+        assert!(
+            succeeded(&client, "sequential_work"),
+            "the sequential step must reach its terminal Succeed checkpoint \
+             before the invocation reports Pending"
+        );
+    }
+}
