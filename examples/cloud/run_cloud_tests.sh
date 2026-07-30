@@ -189,11 +189,38 @@ drive_callback() {
     done
 }
 
+# discover_execution_arn FUNCTION STARTED_AFTER: find the durable execution a
+# background invoke just started. Needed because an invoke of a function that
+# parks on a callback with no timeout does not return until the callback is
+# completed, so its response cannot supply the ARN we need in order to
+# complete it.
+discover_execution_arn() {
+    deadline=$(( $(date +%s) + CALLBACK_DISCOVERY_TIMEOUT ))
+    while :; do
+        arn=$(aws lambda list-durable-executions-by-function \
+            --function-name "$1" --statuses RUNNING \
+            --started-after "$2" --reverse-order --max-items 1 \
+            --query 'DurableExecutions[0].DurableExecutionArn' \
+            --output text 2> /dev/null)
+        if [ -n "$arn" ] && [ "$arn" != "None" ]; then
+            printf '%s\n' "$arn"
+            return 0
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            return 1
+        fi
+        sleep "$CALLBACK_POLL_INTERVAL"
+    done
+}
+
 # ---- phase 1: invoke every example (and drive its callback if needed) ----
 #
-# Invoking a durable function returns as soon as the execution starts or
-# first suspends, so all executions run concurrently while this loop moves
-# on; only the four callback examples add a short synchronous drive step.
+# An invoke returns once the execution reaches a terminal state or parks on a
+# timer, so most examples are started here and polled to their terminal state
+# in phase 2. The exception is an example that parks on a callback with no
+# timeout: its invoke stays open until the callback is completed, so it is
+# started in the background, its execution is discovered through the list API,
+# its callback is completed, and only then is the invoke reaped.
 
 echo "$EXPECTATIONS" | grep -v '^[[:space:]]*$' | while IFS='|' read -r family example expected payload drive allowed_results; do
     fn=$(function_name "$family" "$example")
@@ -203,6 +230,32 @@ echo "$EXPECTATIONS" | grep -v '^[[:space:]]*$' | while IFS='|' read -r family e
     fi
 
     meta="$WORK_DIR/invoke-$example.json"
+    if [ "$drive" = "callback" ]; then
+        started_after=$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)
+        aws lambda invoke --function-name "$fn" --qualifier '$LATEST' \
+            --payload "${payload:-$DEFAULT_PAYLOAD}" \
+            --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 0 \
+            --output json "$WORK_DIR/response-$example.json" > "$meta" &
+        invoke_pid=$!
+
+        if ! arn=$(discover_execution_arn "$fn" "$started_after"); then
+            kill "$invoke_pid" 2> /dev/null
+            wait "$invoke_pid" 2> /dev/null
+            echo "FAIL $example: execution did not appear within ${CALLBACK_DISCOVERY_TIMEOUT}s" >> "$WORK_DIR/failures"
+            continue
+        fi
+
+        printf '%s|%s|%s|%s\n' "$example" "$expected" "$arn" "$allowed_results" >> "$WORK_DIR/pending"
+        log "$example: started ($arn)"
+
+        if ! drive_callback "$example" "$arn"; then
+            echo "FAIL $example: callback drive failed" >> "$WORK_DIR/failures"
+        fi
+        wait "$invoke_pid" 2> /dev/null || true
+        continue
+    fi
+
     if ! aws lambda invoke --function-name "$fn" --qualifier '$LATEST' \
         --payload "${payload:-$DEFAULT_PAYLOAD}" \
         --cli-binary-format raw-in-base64-out \
@@ -227,11 +280,6 @@ echo "$EXPECTATIONS" | grep -v '^[[:space:]]*$' | while IFS='|' read -r family e
 
     printf '%s|%s|%s|%s\n' "$example" "$expected" "$arn" "$allowed_results" >> "$WORK_DIR/pending"
     log "$example: started ($arn)"
-
-    if [ "$drive" = "callback" ]; then
-        drive_callback "$example" "$arn" \
-            || echo "FAIL $example: callback drive failed" >> "$WORK_DIR/failures"
-    fi
 done
 
 # ---- phase 2: poll every execution to its terminal state -----------------
