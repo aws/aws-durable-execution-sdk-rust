@@ -3,15 +3,28 @@
 #
 # examples/ is a single cargo WORKSPACE (examples/Cargo.toml): every example is
 # a member, so the whole set shares ONE target dir (examples/target) and ONE
-# resolve of the SDK graph. This script runs a single `cargo build` over the
-# requested families and stages each example's binary into
+# resolve of the SDK graph. This script runs a single `cargo lambda build` over
+# the requested families and stages each example's binary into
 # publish/<example>/bootstrap for SAM deployment on the provided.al2023
 # runtime. It mirrors compliance/build_examples.sh (same layout, same
 # skip-guard, same Makefile-per-bootstrap contract); the SDK's own release
 # profile is untouched — fast-build tuning lives in examples/Cargo.toml.
 #
+# Why cargo-lambda and not a plain `cargo build`: a natively linked binary
+# requires the glibc symbol versions of the machine that built it. The
+# provided.al2023 runtime ships glibc 2.34, so a binary built on a newer host
+# (for example the GitHub ubuntu-latest runner, glibc 2.39) dies at startup
+# with `/lib64/libc.so.6: version 'GLIBC_2.39' not found` and the execution
+# fails with `Runtime exited with error: exit status 1`. cargo-lambda builds
+# through cargo-zigbuild, which pins the glibc version the binary links
+# against, so the SAME command produces a runtime-compatible artifact on every
+# host — a local pass and a CI pass mean the same thing. cargo-lambda is the
+# route documented in the Lambda Developer Guide:
+# https://docs.aws.amazon.com/lambda/latest/dg/rust-package.html
+#
 # Requires:
-#   - Rust toolchain with the x86_64-unknown-linux-gnu target (native on AL2023)
+#   - Rust toolchain
+#   - cargo-lambda (pip3 install cargo-lambda, or cargo install cargo-lambda)
 #
 # Usage:
 #   ./build_examples.sh [family...]
@@ -32,11 +45,25 @@ set -eu
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PUBLISH_DIR="$SCRIPT_DIR/publish"
-TARGET="x86_64-unknown-linux-gnu"
-RELEASE_DIR="$SCRIPT_DIR/target/$TARGET/release"
+LAMBDA_DIR="$SCRIPT_DIR/target/lambda"
 STAMP="$PUBLISH_DIR/.built-at"
 
 cd "$SCRIPT_DIR"
+
+if ! command -v cargo-lambda > /dev/null 2>&1; then
+    cat >&2 << 'EOF'
+Error: cargo-lambda is not installed.
+
+It is the single build path for this workspace, locally and in CI: it pins the
+glibc version the example binaries link against so they start on the
+provided.al2023 runtime regardless of which host built them.
+
+Install it with one of:
+    pip3 install cargo-lambda
+    cargo install cargo-lambda
+EOF
+    exit 1
+fi
 
 # ---- resolve the requested families ----
 if [ $# -gt 0 ]; then
@@ -94,8 +121,15 @@ fi
 
 # ---- single shared-workspace build over just the requested members ----
 echo "Building families: $families"
+# cargo-lambda stages every binary it finds in the target dir into
+# target/lambda/<bin>/bootstrap, so a leftover binary from an earlier build of
+# other members would look like fresh output. Clear the staging dir first: only
+# what this invocation builds may be staged.
+rm -rf "$LAMBDA_DIR"
+# --x86-64 is explicit rather than host-derived so an aarch64 workstation does
+# not silently produce arm64 binaries for the x86_64 SAM functions.
 # shellcheck disable=SC2086
-cargo build --release --target "$TARGET" $pkgs
+cargo lambda build --release --x86-64 $pkgs
 
 # ---- stage each example binary into publish/<example>/bootstrap ----
 for dir in $example_dirs; do
@@ -105,7 +139,7 @@ for dir in $example_dirs; do
 
     # The binary name is the crate name with '-' normalized to '_'.
     bin_name=$(grep '^name' "$dir/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/' | tr '-' '_')
-    src_bin="$RELEASE_DIR/$bin_name"
+    src_bin="$LAMBDA_DIR/$bin_name/bootstrap"
     if [ ! -f "$src_bin" ]; then
         echo "Error: built binary not found for $example at $src_bin" >&2
         exit 1

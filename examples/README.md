@@ -22,6 +22,19 @@ apply to Rust) is tracked in [`docs/porting-map.md`](../docs/porting-map.md).
 
 ## Build and deploy
 
+Prerequisite: [cargo-lambda](https://www.cargo-lambda.info/), the build tool
+the Lambda Developer Guide documents for
+[packaging Rust functions](https://docs.aws.amazon.com/lambda/latest/dg/rust-package.html).
+It is the single build path for this workspace and for `compliance/`, used
+identically on a workstation and in CI, so a local pass and a CI pass mean the
+same thing. A plain `cargo build` is not a substitute: it links against the
+build host's glibc, and a binary built on a host newer than the
+`provided.al2023` runtime (glibc 2.34) fails to start there at all.
+
+```sh
+pip3 install cargo-lambda     # or: cargo install cargo-lambda
+```
+
 ```sh
 # Build a family (default: all families). Produces publish/<example>/bootstrap.
 ./build_examples.sh basics
@@ -38,9 +51,9 @@ sam deploy --template-file template_basics.yaml \
 ```
 
 `build_examples.sh` mirrors `compliance/build_examples.sh` exactly: one shared
-`cargo build` over the requested families, a skip-if-unchanged guard keyed on
-git HEAD + clean tree + a per-family stamp, and a `Makefile`-per-bootstrap for
-SAM's `BuildMethod: makefile`. It is a separate cargo workspace
+`cargo lambda build` over the requested families, a skip-if-unchanged guard
+keyed on git HEAD + clean tree + a per-family stamp, and a `Makefile`-per-bootstrap
+for SAM's `BuildMethod: makefile`. It is a separate cargo workspace
 (`examples/Cargo.toml`) so its heavier dependency graph never enters the SDK's
 root `make check`.
 
