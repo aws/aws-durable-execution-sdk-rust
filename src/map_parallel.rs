@@ -1128,8 +1128,8 @@ where
         return match outcome {
             ScopeOutcome::Suspended => Ok(ItemOutcome::Suspended),
             ScopeOutcome::Completed(Ok(value)) => {
-                let serialized = serialize_value(&value, serdes, &serdes_ctx)?;
-                let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx)?;
+                let serialized = serialize_item_value(&value, serdes, &serdes_ctx)?;
+                let deserialized: O = deserialize_item_value(&serialized, serdes, &serdes_ctx)?;
                 Ok(ItemOutcome::Terminal(BatchItem {
                     index,
                     name: item_name.to_owned(),
@@ -1184,7 +1184,7 @@ where
         }
         ScopeOutcome::Completed(Ok(value)) => {
             // Serialize and checkpoint success.
-            let serialized = serialize_value(&value, serdes, &serdes_ctx)?;
+            let serialized = serialize_item_value(&value, serdes, &serdes_ctx)?;
             let mut builder = OperationUpdate::builder()
                 .id(child_wire)
                 .r#type(OperationType::Context)
@@ -1212,7 +1212,7 @@ where
                 .map_err(|e| batch_error(&format!("checkpoint child succeed: {e}")))?;
 
             // Round-trip deserialize for live == replay consistency.
-            let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx)?;
+            let deserialized: O = deserialize_item_value(&serialized, serdes, &serdes_ctx)?;
 
             Ok(ItemOutcome::Terminal(BatchItem {
                 index,
@@ -1346,7 +1346,7 @@ fn replay_terminal_child<O: DeserializeOwned>(
                 .result
                 .as_deref()
                 .ok_or_else(|| batch_error("succeeded child has no result"))?;
-            let value: O = deserialize_value(payload, serdes, serdes_ctx)?;
+            let value: O = deserialize_item_value(payload, serdes, serdes_ctx)?;
             Ok(BatchItem {
                 index,
                 name: String::new(),
@@ -1554,6 +1554,70 @@ fn deserialize_value<O: DeserializeOwned>(
         payload.to_owned()
     };
     serde_json::from_str(&json_str).map_err(|e| batch_error(&format!("deserialize result: {e}")))
+}
+
+/// Serializes a map/parallel item result for the custom serdes boundary.
+///
+/// Unlike [`serialize_value`] (used by step, invoke, callback, and whole-batch
+/// paths), this extracts the *raw* item payload before handing it to the
+/// serdes. For a `String` value `"X"`, the serdes receives `X` (no JSON
+/// quoting); for non-string JSON values (numbers, objects, arrays) the serdes
+/// receives the standard JSON representation. This matches the JS/Python
+/// reference implementations where the custom serializer receives the native
+/// value stringified, not its JSON encoding.
+///
+/// When no custom serdes is configured, the value is JSON-encoded as usual
+/// (identical to [`serialize_value`]).
+fn serialize_item_value<O: Serialize>(
+    value: &O,
+    serdes: Option<&dyn Serdes>,
+    serdes_ctx: &SerdesContext,
+) -> Result<String, OperationError> {
+    let Some(s) = serdes else {
+        // No custom serdes: JSON-encode directly (same as serialize_value).
+        return serde_json::to_string(value)
+            .map_err(|e| batch_error(&format!("serialize item: {e}")));
+    };
+    // Extract raw representation: strip JSON string quoting for String values.
+    let json_value = serde_json::to_value(value)
+        .map_err(|e| batch_error(&format!("serialize item to value: {e}")))?;
+    let raw = match json_value {
+        serde_json::Value::String(inner) => inner,
+        other => other.to_string(),
+    };
+    s.serialize_to_string_with_context(&raw, serdes_ctx)
+        .map_err(|e| batch_error(&format!("serialize item (custom): {e}")))
+}
+
+/// Deserializes a map/parallel item result from the custom serdes boundary.
+///
+/// Reverses [`serialize_item_value`]: the custom serdes undoes its wire
+/// transform, producing the raw item payload. This function then reconstructs
+/// the typed value: it first tries direct JSON parsing (works for numbers,
+/// objects, arrays); if that fails it treats the raw payload as a string value
+/// (wrapping via `serde_json::Value::String`). No runtime downcast is
+/// involved.
+///
+/// When no custom serdes is configured, falls back to standard JSON
+/// deserialization (identical to [`deserialize_value`]).
+fn deserialize_item_value<O: DeserializeOwned>(
+    payload: &str,
+    serdes: Option<&dyn Serdes>,
+    serdes_ctx: &SerdesContext,
+) -> Result<O, OperationError> {
+    let Some(s) = serdes else {
+        return serde_json::from_str(payload)
+            .map_err(|e| batch_error(&format!("deserialize item: {e}")));
+    };
+    let raw = s
+        .deserialize_from_string_with_context(payload, serdes_ctx)
+        .map_err(|e| batch_error(&format!("deserialize item (custom): {e}")))?;
+    // Try JSON parse first (handles numbers, objects, arrays, and JSON strings).
+    serde_json::from_str::<O>(&raw).or_else(|_| {
+        // Raw string: wrap as a JSON string value and deserialize.
+        serde_json::from_value::<O>(serde_json::Value::String(raw.clone()))
+            .map_err(|e| batch_error(&format!("deserialize item from raw: {e}")))
+    })
 }
 
 /// Builds the serdes context for an individual batch item result stored
@@ -2764,28 +2828,29 @@ mod tests {
         );
     }
 
-    /// The engine must hand a custom serdes the SAME string on every path.
+    /// The engine must hand item serdes the RAW value, not the JSON encoding.
     ///
-    /// The probe value is a `String`, the one case where an extra encoding
-    /// step is visible: `serde_json` gives `"X"` (quotes included) while the
-    /// raw value is `X`. A serdes written against one shape and run on the
-    /// other silently produces a different wire payload — which is exactly
-    /// how conformance requirement 9-14 broke — so the shape is pinned here
-    /// for the step, map-item and parallel-branch paths at once.
+    /// The probe value is a `String` `"X"`, the one case where the difference
+    /// is visible: `serde_json` gives `"X"` (quotes included) while the raw
+    /// value is just `X`. Steps pass the JSON encoding to the serdes (they
+    /// are not items), but map/parallel items extract the raw payload first —
+    /// matching the JS/Python reference implementations where the custom
+    /// serializer receives the native value stringified.
     #[tokio::test]
-    async fn custom_serdes_receives_the_same_string_on_step_map_and_parallel_paths() {
+    async fn custom_serdes_item_receives_raw_value_not_json_encoding() {
         use crate::future::Branch;
         use crate::serdes::test_support::RecordingSerdes;
 
         let value = "X".to_owned();
-        let expected_input = serde_json::to_string(&value).expect("a string is JSON-able");
+        let json_encoding = serde_json::to_string(&value).expect("a string is JSON-able");
         assert_eq!(
-            expected_input, "\"X\"",
-            "the JSON encoding of a string carries quotes; that is the shape \
-             a serdes is handed"
+            json_encoding, "\"X\"",
+            "the JSON encoding of a string carries quotes"
         );
+        // The raw extraction strips the JSON string quoting.
+        let raw_value = "X";
 
-        // ── step ──
+        // ── step (receives JSON encoding — unchanged) ──
         let step_recorder = RecordingSerdes::new();
         let (step_ctx, _step_client) = test_ctx_with_client(CheckpointLog::empty());
         let step_value = value.clone();
@@ -2800,11 +2865,11 @@ mod tests {
         assert_eq!(step_out, value, "step must round-trip the value");
         assert_eq!(
             step_recorder.distinct_serialize_inputs(),
-            vec![expected_input.clone()],
+            vec![json_encoding.clone()],
             "a step serdes must be handed the JSON encoding of the result"
         );
 
-        // ── map item ──
+        // ── map item (receives raw value) ──
         let map_recorder = RecordingSerdes::new();
         let (map_ctx, _map_client) = test_ctx_with_client(CheckpointLog::empty());
         let map_value = value.clone();
@@ -2821,15 +2886,18 @@ mod tests {
             vec![value.clone()],
             "map must round-trip the value"
         );
+        // The serdes is called twice: once for the item result (raw) and
+        // once for the batch summary embedding (JSON-encoded). The FIRST
+        // call is the item-level one that matters for the serdes contract.
+        let map_inputs = map_recorder.serialize_inputs();
         assert_eq!(
-            map_recorder.distinct_serialize_inputs(),
-            step_recorder.distinct_serialize_inputs(),
-            "a map item serdes must be handed exactly what a step serdes is \
-             handed, got {:?}",
-            map_recorder.serialize_inputs()
+            map_inputs.first().map(String::as_str),
+            Some(raw_value),
+            "a map item serdes must be handed the raw value (no JSON quoting) \
+             as its first call, got {map_inputs:?}",
         );
 
-        // ── parallel branch ──
+        // ── parallel branch (receives raw value) ──
         let par_recorder = RecordingSerdes::new();
         let (par_ctx, _par_client) = test_ctx_with_client(CheckpointLog::empty());
         let par_value = value.clone();
@@ -2842,12 +2910,12 @@ mod tests {
             .await
             .expect("parallel with a recording item serdes must succeed");
         assert_eq!(par_out, vec![value], "parallel must round-trip the value");
+        let par_inputs = par_recorder.serialize_inputs();
         assert_eq!(
-            par_recorder.distinct_serialize_inputs(),
-            step_recorder.distinct_serialize_inputs(),
-            "a parallel branch serdes must be handed exactly what a step \
-             serdes is handed, got {:?}",
-            par_recorder.serialize_inputs()
+            par_inputs.first().map(String::as_str),
+            Some(raw_value),
+            "a parallel branch serdes must be handed the raw value (no JSON \
+             quoting) as its first call, got {par_inputs:?}",
         );
     }
 

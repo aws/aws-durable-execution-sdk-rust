@@ -29,11 +29,12 @@ use std::fmt::Debug;
 /// and individual map/parallel item results. A type that implements this
 /// trait therefore behaves identically wherever it is attached.
 ///
-/// The string handed over is the JSON *encoding* of the value, not the value's
-/// own text: a `String` result of `X` arrives as `"X"`, quotes included. A
-/// serdes that wants to transform the underlying text — and to emit a wire
-/// payload that is not itself JSON — must decode and re-encode around its own
-/// transform:
+/// # Input shape by operation path
+///
+/// **Step, invoke, callback, and batch-level paths** hand the serdes the JSON
+/// *encoding* of the value: a `String` result of `X` arrives as `"X"`, quotes
+/// included. A serdes on these paths that wants the raw text must decode
+/// before transforming:
 ///
 /// ```
 /// use aws_durable_execution_sdk_rust::Serdes;
@@ -64,6 +65,11 @@ use std::fmt::Debug;
 /// assert_eq!(WrapSerdes.deserialize_from_string(&wire)?, r#""X""#);
 /// # Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
 /// ```
+///
+/// **Map/parallel item paths** hand the serdes the *raw* item payload: a
+/// `String` result of `X` arrives as `X` (no JSON quoting). This matches
+/// the JS/Python reference implementations. A serdes for items can work
+/// directly with the raw value without JSON decoding.
 ///
 /// # Object safety
 ///
@@ -479,8 +485,18 @@ impl FileSystemSerdes {
                 Ok(format!(r#"{{"file":"{escaped_path}"}}"#))
             }
             FileSystemSerdesMode::Overflow => {
-                // Inline envelope: {"data":"<json>"}
-                let inline_envelope = format!(r#"{{"data":{json_str}}}"#);
+                // Build the inline envelope. The input may be valid JSON
+                // (step/batch path) or a raw string (map/parallel item path
+                // with custom serdes). Only valid JSON can be embedded directly
+                // in the {"data":...} envelope; raw strings are JSON-encoded
+                // first and stored under {"raw":"..."}.
+                let inline_envelope = if serde_json::from_str::<serde_json::Value>(json_str).is_ok()
+                {
+                    format!(r#"{{"data":{json_str}}}"#)
+                } else {
+                    let encoded = serde_json::Value::String(json_str.to_owned());
+                    format!(r#"{{"raw":{encoded}}}"#)
+                };
                 if inline_envelope.len() > self.config.overflow_threshold_bytes {
                     let file_path = self.write_to_file(json_str, context)?;
                     let escaped_path = json_escape_string(&file_path);
@@ -526,6 +542,9 @@ impl FileSystemSerdes {
                 },
             )?;
             Ok(contents)
+        } else if let Some(raw) = parsed.get("raw").and_then(serde_json::Value::as_str) {
+            // Raw string inline data (item path with custom serdes).
+            Ok(raw.to_owned())
         } else if let Some(data) = parsed.get("data") {
             // Inline data: extract the JSON value as a string.
             // The "data" field contains the raw JSON value (not double-encoded).

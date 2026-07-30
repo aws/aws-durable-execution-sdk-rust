@@ -6,27 +6,20 @@ use durable::{DurableContext, Serdes};
 
 /// Custom serdes that wraps with "wrapped:" prefix.
 ///
-/// A `Serdes` is a transformation *around* JSON: the SDK hands
-/// `serialize_to_string` the `serde_json` encoding of the value (for a
-/// `String` item that is `"X"`, quotes included) and feeds whatever
-/// `deserialize_from_string` returns back to `serde_json`. The requirement
-/// asserts the checkpointed iteration payload is exactly `wrapped:X`, so this
-/// serdes decodes the JSON string before wrapping and re-encodes it after
-/// unwrapping. Every operation path — step, child, invoke, map/parallel item
-/// — hands the serdes the same shape, so this is the one rule, not a
-/// map-specific accommodation.
+/// The SDK hands map/parallel item serdes the raw item payload: for a
+/// `String` value `"X"`, the serdes receives `X` (no JSON quoting). This
+/// matches the JS/Python reference implementations where the handler applies
+/// `wrapped:${value}` / `f"wrapped:{value}"` directly to the native value.
 #[derive(Debug)]
 struct WrapSerdes;
 
 impl Serdes for WrapSerdes {
-    fn serialize_to_string(&self, json_str: &str) -> Result<String, durable::BoxError> {
-        let raw: String = serde_json::from_str(json_str)?;
-        Ok(format!("wrapped:{raw}"))
+    fn serialize_to_string(&self, s: &str) -> Result<String, durable::BoxError> {
+        Ok(format!("wrapped:{s}"))
     }
 
-    fn deserialize_from_string(&self, payload: &str) -> Result<String, durable::BoxError> {
-        let raw = payload.strip_prefix("wrapped:").unwrap_or(payload);
-        Ok(serde_json::to_string(raw)?)
+    fn deserialize_from_string(&self, s: &str) -> Result<String, durable::BoxError> {
+        Ok(s.strip_prefix("wrapped:").unwrap_or(s).to_owned())
     }
 }
 
@@ -61,23 +54,24 @@ mod tests {
     use super::WrapSerdes;
     use aws_durable_execution_sdk_rust::Serdes;
 
-    /// The payload the requirement asserts (`wrapped:X`, no JSON quotes) must
-    /// come out of the serdes when it is handed what the SDK actually hands
-    /// it: the `serde_json` encoding of the item result.
+    /// The SDK hands item serdes the raw payload (no JSON quoting for
+    /// strings). For `String` item `"X"`, the serdes receives `X` directly
+    /// and produces `wrapped:X` — the wire form requirement 9-14 asserts.
     #[test]
-    fn wraps_the_decoded_item_and_round_trips() {
+    fn wraps_the_raw_item_and_round_trips() {
         let serdes = WrapSerdes;
-        let json_str = serde_json::to_string("X").expect("a string is JSON-able");
-        assert_eq!(json_str, "\"X\"", "the SDK hands over the JSON encoding");
+        // The SDK extracts the raw value before passing to serdes:
+        // for String "X", the serdes receives "X" (the raw content, no quotes).
+        let raw = "X";
 
         let payload = serdes
-            .serialize_to_string(&json_str)
+            .serialize_to_string(raw)
             .expect("serialize must succeed");
         assert_eq!(payload, "wrapped:X", "requirement 9-14 asserts this exactly");
 
         let back = serdes
             .deserialize_from_string(&payload)
             .expect("deserialize must succeed");
-        assert_eq!(back, json_str, "the transform must be reversible");
+        assert_eq!(back, raw, "the transform must be reversible");
     }
 }
