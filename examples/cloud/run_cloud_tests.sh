@@ -220,7 +220,7 @@ discover_execution_arn() {
 # in phase 2. The exception is an example that parks on a callback with no
 # timeout: its invoke stays open until the callback is completed, so it is
 # started in the background, its execution is discovered through the list API,
-# its callback is completed, and only then is the invoke reaped.
+# and its callback is completed while that invoke is still open.
 
 echo "$EXPECTATIONS" | grep -v '^[[:space:]]*$' | while IFS='|' read -r family example expected payload drive allowed_results; do
     fn=$(function_name "$family" "$example")
@@ -252,6 +252,11 @@ echo "$EXPECTATIONS" | grep -v '^[[:space:]]*$' | while IFS='|' read -r family e
         if ! drive_callback "$example" "$arn"; then
             echo "FAIL $example: callback drive failed" >> "$WORK_DIR/failures"
         fi
+        # The invoke client has served its purpose: the execution is running
+        # and phase 2 polls it to a terminal state through its ARN. Release the
+        # client rather than waiting on it, because an invoke whose callback
+        # was never completed would never return.
+        kill "$invoke_pid" 2> /dev/null
         wait "$invoke_pid" 2> /dev/null || true
         continue
     fi
