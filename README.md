@@ -6,7 +6,8 @@ timer, an external signal, or the function timeout. The service then invokes
 the function again, and this SDK replays the recorded results instead of
 re-running the work that already completed. An orchestration that spans
 minutes or a month therefore fits in one ordinary async Rust function, and
-every unit of work inside a completed step happens exactly once.
+once the service records a step's result, replay returns that result
+without re-running the body.
 
 ## Status
 
@@ -319,8 +320,13 @@ let count = ctx
     .await?;
 ```
 
-Pass a `WaitStrategy` to `.wait_strategy(...)` instead when fixed exponential
-backoff is enough. Build one with `WaitStrategy::builder()`, setting
+Pass a `WaitStrategy` to `.wait_strategy(...)` instead when you want
+configurable exponential backoff between polls. `WaitStrategy` controls
+only the delay timing; it always returns `WaitDecision::continue_with(...)`
+and never completes the operation on its own. The condition check itself
+must drive the state toward a value that your `wait_strategy_fn` recognizes
+as done, or use a `wait_strategy_fn` that stops after a maximum attempt
+count. Build a `WaitStrategy` with `WaitStrategy::builder()`, setting
 `initial_delay`, `max_delay`, and `backoff_factor`.
 
 ### callbacks
@@ -417,8 +423,9 @@ Both accept `.max_concurrency(...)` and `.completion(...)`. A
 `CompletionConfig` ends the batch early: `with_min_successful(n)` stops once
 `n` items succeed, `with_tolerated_failure_count(0)` fails fast on the first
 error, and `CompletionConfig::builder()` combines thresholds so the first one
-to fire wins. Await `.await_batch()` instead of the builder to get a
-`BatchResult<O>` that reports each item's status and why the batch ended.
+to fire wins. `MapBuilder` also exposes `.await_batch()`: await it instead of
+the builder to get a `BatchResult<O>` that reports each item's status and why
+the batch ended.
 
 ### combinators
 
@@ -493,16 +500,25 @@ operation can produce.
 
 ```rust
 #[derive(Debug)]
-struct WrapSerdes;
+struct Base64JsonSerdes;
 
-impl Serdes for WrapSerdes {
+impl Serdes for Base64JsonSerdes {
     fn serialize(
         &self,
         value: &serde_json::Value,
         _context: &SerdesContext,
     ) -> Result<String, durable::BoxError> {
-        let raw = value.as_str().unwrap_or_default();
-        Ok(format!("wrapped:{raw}"))
+        use std::io::Write;
+        let json = serde_json::to_vec(value)?;
+        let mut buf = Vec::new();
+        let engine = base64::engine::general_purpose::STANDARD;
+        {
+            let mut encoder =
+                base64::write::EncoderWriter::new(&mut buf, &engine);
+            encoder.write_all(&json)?;
+            encoder.finish()?;
+        }
+        Ok(String::from_utf8(buf)?)
     }
 
     fn deserialize(
@@ -510,17 +526,29 @@ impl Serdes for WrapSerdes {
         data: &str,
         _context: &SerdesContext,
     ) -> Result<serde_json::Value, durable::BoxError> {
-        let raw = data.strip_prefix("wrapped:").unwrap_or(data);
-        Ok(serde_json::Value::String(raw.to_owned()))
+        use std::io::Read;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let mut decoder =
+            base64::read::DecoderReader::new(data.as_bytes(), &engine);
+        let mut json = Vec::new();
+        decoder.read_to_end(&mut json)?;
+        Ok(serde_json::from_slice(&json)?)
     }
 }
 ```
 
-Set one per operation with `.serdes(...)` on any builder, or execution wide
-through `Options`, which `durable::wrap` consumes.
+Set one per operation with `.serdes(...)` on `StepBuilder`, `InvokeBuilder`,
+`ChildBuilder`, `WaitForConditionBuilder`, `CreateCallbackBuilder`,
+`WaitForCallbackBuilder`, `MapBuilder`, or `ParallelBuilder`. `WaitBuilder`
+and the combinator builders carry no serdes method because their payloads
+are structural, not user-typed. Set an execution-wide default through
+`Options`, which `durable::wrap` consumes; it applies to step, invoke,
+child context, callback, and `wait_for_condition` operations that set no
+per-operation serdes of their own. `map` and `parallel` use their own
+per-operation item serdes and ignore the `Options` default.
 
 ```rust
-let options = durable::Options::builder().serdes(WrapSerdes).build()?;
+let options = durable::Options::builder().serdes(Base64JsonSerdes).build()?;
 let service = durable::wrap(handler, options);
 lambda_runtime::run(lambda_runtime::service_fn(service)).await
 ```
@@ -573,8 +601,8 @@ awaits, and `.callback_timeout()` times one out.
 waits, and retries, `coordination/` for child contexts, map, parallel, and the
 combinators, and `external/` for invoke, callbacks, `wait_for_condition`,
 serdes, and large payloads. Each one is a Lambda function on
-`provided.al2023`, built with cargo-lambda the same way as the quick start
-above, and reads as a single workload rather than a demo harness.
+`provided.al2023`, and cargo-lambda builds each example the same way as the
+quick start above. Each reads as a single workload rather than a demo harness.
 
 ## Contributing
 

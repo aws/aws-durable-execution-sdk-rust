@@ -54,7 +54,7 @@ rather than an index.
 `missing_docs = "deny"` and `unreachable_pub = "deny"` mean every public item
 carries a `///` comment and nothing leaks into the public surface by accident.
 
-The production dependency allowlist is closed, and a script enforces it. The
+The script closes and enforces the production dependency allowlist. The
 dependency policy section below explains what adding to it involves.
 
 ## The quality gate
@@ -148,10 +148,10 @@ several operations or needs to observe replay.
 
 `compliance/` holds Lambda handlers in ten suites that a language-agnostic
 runner drives against the live service. The runner starts each handler's
-execution, then compares the recorded history against the behavior every Durable
-Execution SDK must produce, which is how we know the Rust implementation agrees
-with its peers rather than merely passing its own tests. Each suite has a SAM
-template at `compliance/template_<suite>.yaml`.
+execution, then compares the recorded history against the language-independent
+durable execution contract, which is how we know the Rust implementation
+satisfies the service specification rather than merely passing its own tests.
+Each suite has a SAM template at `compliance/template_<suite>.yaml`.
 
 Running the suite costs real time and real resources. A cold build of all
 handlers produces roughly two gigabytes of artifacts, and each suite deploys a
