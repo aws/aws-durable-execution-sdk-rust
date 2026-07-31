@@ -1,0 +1,44 @@
+[workspace]
+# The examples/ tree is its OWN cargo workspace, deliberately NOT a member of
+# the SDK root workspace — exactly like compliance/. Rationale is identical:
+# examples are user-facing deployable Lambda functions that pull a heavier
+# dependency graph (lambda_runtime, the AWS SDK) which has no business in the
+# SDK's `make check`, and keeping them out preserves a fast, focused root gate.
+# Every example is a workspace member, so the whole family set builds into ONE
+# shared target dir (examples/target) with a single resolve of the shared SDK
+# graph. Families are grouped by directory; see examples/README.md for the
+# JS-parity mapping table and the family plan.
+members = [
+    "basics/*",
+    "coordination/*",
+    "external/*",
+]
+resolver = "2"
+
+# Workspace lints: the same panic/doc policy the SDK and compliance enforce.
+# Example code is documentation — it must hold to the same discipline it
+# teaches. A `.unwrap()` in an example teaches `.unwrap()`.
+[workspace.lints.clippy]
+all = "deny"
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+# Fast-build profile — SCOPED TO THIS WORKSPACE ONLY (mirrors compliance/).
+# The SDK's own root Cargo.toml has no [profile] tables and is untouched.
+# Handlers are thin glue that never runs hot, so their own code compiles at
+# opt-level 1; dependencies build at opt-level 3 via the package."*" override.
+[profile.release]
+opt-level = 1
+debug = false
+lto = false
+codegen-units = 256
+
+[profile.release.package."*"]
+opt-level = 3

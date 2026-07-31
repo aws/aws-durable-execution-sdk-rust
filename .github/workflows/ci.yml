@@ -1,0 +1,93 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [alpha]
+  pull_request:
+    branches: [alpha]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The six gates of `make check`, split so a failure names itself.
+  check:
+    name: check (sdk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Test with test-util feature
+        run: cargo test --features test-util
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
+
+  # Dependency policy: advisories, bans, licenses, sources, plus the
+  # direct-dependency allowlist that keeps the production graph closed.
+  dependencies:
+    name: dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979 # v2.0.15
+        with:
+          command: check
+
+      - name: Direct dependency allowlist
+        run: sh scripts/check-direct-deps.sh
+
+  # The conformance handlers and examples are separate cargo workspaces with
+  # heavier dependency graphs, deliberately outside the SDK's `make check`.
+  # CI still compiles both so a public API change cannot silently break them.
+  workspaces:
+    name: build (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: [compliance, examples]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          workspaces: ${{ matrix.workspace }}
+
+      - name: Build
+        working-directory: ${{ matrix.workspace }}
+        run: cargo build --all-targets
+
+      - name: Clippy
+        working-directory: ${{ matrix.workspace }}
+        run: cargo clippy --all-targets -- -D warnings

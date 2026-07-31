@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (Wait)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  WaitBasic:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["2-1"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_basic/
+      Handler: bootstrap
+      Description: 'Conformance 2-1: wait basic'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitWithName:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["2-2"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_with_name/
+      Handler: bootstrap
+      Description: 'Conformance 2-2: wait with name'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitMultipleSequential:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["2-3"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_multiple_sequential/
+      Handler: bootstrap
+      Description: 'Conformance 2-3: multiple sequential waits'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitDurationUnits:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["2-4"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_duration_units/
+      Handler: bootstrap
+      Description: 'Conformance 2-4: wait with different duration units'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  WaitLongDuration:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["2-5"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/wait_long_duration/
+      Handler: bootstrap
+      Description: 'Conformance 2-5: wait with long duration (1 hour)'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

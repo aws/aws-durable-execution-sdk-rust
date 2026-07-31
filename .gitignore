@@ -1,0 +1,26 @@
+# Build artifacts
+/target
+
+# Cargo.lock is checked in for reproducible builds of the compliance
+# binary crate. For library crates the convention is to gitignore it,
+# but this workspace contains a binary-like member (compliance handlers)
+# whose exact dependency resolution matters for conformance runs.
+# Decision: CHECK IN Cargo.lock (do not ignore it).
+# Ref: https://doc.rust-lang.org/cargo/faq.html#why-have-cargolock-in-version-control
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+tokio_join_test
+
+# Agent scratch space. Kept on disk so a later step can read an earlier
+# step's notes, never committed.
+.agents/
+.kiro/

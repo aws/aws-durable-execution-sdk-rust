@@ -1,0 +1,20 @@
+[package]
+name = "serde_configure"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+publish = false
+description = "Example: a default Serdes for the whole execution via Options"
+
+[[bin]]
+name = "serde_configure"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-durable-execution-sdk-rust = { path = "../../.." }
+lambda_runtime = "0.13"
+serde_json = "1"
+tokio = { version = "1", features = ["macros"] }

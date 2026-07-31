@@ -1,0 +1,221 @@
+name: Conformance Tests
+
+# Full-integration conformance run: discovers suites from
+# compliance/template_<suite>.yaml, builds the Rust handlers against the
+# local SDK (compliance/ is its own cargo workspace with a path dependency
+# on ../), and runs each suite as its own parallel matrix job with the
+# pinned language-agnostic runner.
+#
+# The handlers are built EXACTLY ONCE, in build_handlers, and shipped to the
+# suite jobs as an artifact. The suite jobs deploy and test only — they carry
+# no Rust toolchain and never invoke cargo.
+
+on:
+  push:
+    branches: [alpha]
+    paths:
+      - "src/**"
+      - "compliance/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/conformance-tests.yml"
+  pull_request:
+    branches: [alpha]
+    paths:
+      - "src/**"
+      - "compliance/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/conformance-tests.yml"
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "AWS Region for deploying and running conformance tests"
+        required: false
+        default: us-west-2
+        type: string
+
+env:
+  AWS_REGION: ${{ github.event.inputs.region || 'us-west-2' }}
+
+concurrency:
+  group: ${{ github.head_ref || github.ref_name || github.run_id }}-conformance
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  discover_suites:
+    name: discover conformance suites
+    runs-on: ubuntu-latest
+    outputs:
+      suites: ${{ steps.discover.outputs.suites }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Discover suites from templates
+        id: discover
+        working-directory: compliance
+        run: |
+          # template_smoke.yaml is a single hello handler used to verify that
+          # a build deploys and runs; it is not one of the conformance
+          # validator's suites, so it is excluded here.
+          suites=$(for t in template_*.yaml; do
+            s=${t#template_}
+            s=${s%.yaml}
+            [ "$s" = "smoke" ] && continue
+            printf '%s\n' "$s"
+          done | jq -R . | jq -s -c .)
+          echo "Discovered suites: $suites"
+          echo "suites=$suites" >> "$GITHUB_OUTPUT"
+
+  build_handlers:
+    name: build conformance handlers
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: compliance
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          workspaces: compliance
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      # The single build path, identical to the one a maintainer runs locally.
+      # cargo-lambda pins the glibc version the handlers link against so they
+      # start on the provided.al2023 runtime (glibc 2.34); a plain `cargo
+      # build` on this runner produces binaries that require GLIBC_2.39 and
+      # die at startup. See compliance/build_examples.sh for the full note.
+      - name: Install cargo-lambda
+        run: pip install "cargo-lambda==1.8.6"
+
+      - name: Build conformance handlers
+        run: ./build_examples.sh
+
+      # tar, not a bare artifact upload: actions/upload-artifact does not
+      # preserve the executable bit, and a non-executable bootstrap cannot be
+      # started by the runtime. The 152 handlers are ~2.1 GiB raw / ~800 MiB
+      # gzipped; one upload plus one download per suite is still far cheaper
+      # than rebuilding the whole workspace in each of the 10 suite jobs.
+      - name: Package handlers
+        run: tar -czf handlers.tar.gz publish
+
+      - name: Upload handlers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-handlers
+          path: compliance/handlers.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  conformance:
+    name: conformance (${{ matrix.suite }})
+    needs: [discover_suites, build_handlers]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Required for AWS OIDC credentials
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.discover_suites.outputs.suites) }}
+    defaults:
+      run:
+        working-directory: compliance
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download handlers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: conformance-handlers
+          path: compliance
+
+      - name: Unpack handlers
+        run: |
+          tar -xzf handlers.tar.gz
+          rm handlers.tar.gz
+          # The bootstraps must be executable for the runtime to start them;
+          # tar restores the bit, so assert rather than blindly chmod.
+          count=0
+          for b in publish/*/bootstrap; do
+            [ -x "$b" ] || { echo "Not executable after unpack: $b" >&2; exit 1; }
+            count=$((count + 1))
+          done
+          echo "Unpacked $count executable handler bootstraps."
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        with:
+          role-to-assume: "${{ secrets.TEST_ROLE_ARN }}"
+          role-session-name: rustConformanceTest
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS test account
+        env:
+          TEST_ACCOUNT_ID: ${{ secrets.TEST_ACCOUNT_ID }}
+        run: |
+          ACTUAL_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$ACTUAL_ACCOUNT_ID" != "$TEST_ACCOUNT_ID" ]; then
+            echo "Expected AWS account $TEST_ACCOUNT_ID but assumed into $ACTUAL_ACCOUNT_ID"
+            exit 1
+          fi
+          echo "Using AWS test account $ACTUAL_ACCOUNT_ID"
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+
+      # Installed from main, matching the peer SDK repos: the released
+      # versions do not accept --parameter-overrides.
+      - name: Install conformance runner
+        run: |
+          pip install "git+https://github.com/aws/aws-durable-execution-conformance-tests.git@main#subdirectory=packages/aws-durable-execution-conformance-tests"
+
+      - name: Compute stack-safe suite slug
+        run: |
+          # CloudFormation stack names allow only [a-zA-Z][-a-zA-Z0-9]*;
+          # suite names like wait_for_condition contain underscores.
+          echo "SUITE_SLUG=$(echo '${{ matrix.suite }}' | tr '_' '-')" >> "$GITHUB_ENV"
+
+      - name: Run conformance suite
+        env:
+          EXECUTION_ROLE_ARN: ${{ secrets.TEST_LAMBDA_EXECUTION_ROLE_ARN }}
+        run: |
+          python -m aws_durable_execution_conformance_tests.app \
+            --template template_${{ matrix.suite }}.yaml \
+            --language rust \
+            --suite ${{ matrix.suite }} \
+            --name conf-rust-${SUITE_SLUG}-${{ github.run_id }} \
+            --region ${{ env.AWS_REGION }} \
+            --parameter-overrides ExecutionRoleArn="$EXECUTION_ROLE_ARN" \
+            --history-dir history-${{ matrix.suite }} \
+            --report junit \
+            --report-file report-${{ matrix.suite }}
+
+      - name: Upload conformance report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-report-${{ matrix.suite }}
+          path: |
+            compliance/report-${{ matrix.suite }}.xml
+            compliance/history-${{ matrix.suite }}/
+          if-no-files-found: warn

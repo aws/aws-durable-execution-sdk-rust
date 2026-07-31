@@ -1,0 +1,21 @@
+[package]
+name = "create_callback_simple"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+publish = false
+description = "Example: create a callback and await external completion"
+
+[[bin]]
+name = "create_callback_simple"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-durable-execution-sdk-rust = { path = "../../.." }
+lambda_runtime = "0.13"
+serde_json = "1"
+tokio = { version = "1", features = ["macros"] }
+tracing = "0.1"

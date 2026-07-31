@@ -1,0 +1,61 @@
+//! Conformance requirement 8-15: Parallel with a custom per-branch serde.
+
+use aws_durable_execution_sdk_rust as durable;
+use durable::{Branch, DurableContext, Serdes, SerdesContext};
+
+/// Custom serdes that wraps strings as `{"wrapped": "value"}`.
+#[derive(Debug)]
+struct WrappedSerdes;
+
+impl Serdes for WrappedSerdes {
+    fn serialize(
+        &self,
+        value: &serde_json::Value,
+        _context: &SerdesContext,
+    ) -> Result<String, durable::BoxError> {
+        let inner = value.as_str().unwrap_or_default();
+        Ok(serde_json::to_string(
+            &serde_json::json!({"wrapped": inner}),
+        )?)
+    }
+
+    fn deserialize(
+        &self,
+        data: &str,
+        _context: &SerdesContext,
+    ) -> Result<serde_json::Value, durable::BoxError> {
+        let v: serde_json::Value = serde_json::from_str(data)?;
+        let inner = v
+            .get("wrapped")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("WrappedSerdes: missing 'wrapped' field")?
+            .to_owned();
+        Ok(serde_json::Value::String(inner))
+    }
+}
+
+/// Handler: parallel with custom serdes wrapping branch results.
+async fn handler(
+    _event: serde_json::Value,
+    ctx: DurableContext,
+) -> Result<serde_json::Value, durable::BoxError> {
+    let branches = vec![
+        Branch::new("0", |_: DurableContext| async { Ok("x".to_owned()) }),
+        Branch::new("1", |_: DurableContext| async { Ok("y".to_owned()) }),
+    ];
+
+    let results: Vec<String> = ctx
+        .parallel(branches)
+        .name("serde")
+        .max_concurrency(1)
+        .serdes(WrappedSerdes)
+        .await?;
+
+    Ok(serde_json::to_value(results)?)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), lambda_runtime::Error> {
+    lambda_runtime::tracing::init_default_subscriber();
+    durable::run(handler).await
+}

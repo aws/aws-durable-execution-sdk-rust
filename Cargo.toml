@@ -1,0 +1,69 @@
+[workspace]
+# The compliance/ conformance handlers form their OWN cargo workspace
+# (compliance/Cargo.toml) so they build into a single shared target dir and
+# carry their own fast-build [profile.release] tuning without touching the
+# SDK's release profile. They are deliberately NOT members of this workspace:
+# they pull a heavier dependency graph (aws-sdk-dynamodb) that has no business
+# in the SDK's `make check`, so they build as separate workspaces.
+members = ["."]
+
+[package]
+name = "aws-durable-execution-sdk-rust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "Apache-2.0"
+description = "Rust SDK for AWS Lambda Durable Functions"
+publish = false
+
+[lib]
+name = "aws_durable_execution_sdk_rust"
+
+# Non-default feature gating the in-process local testing runner
+# (`test_util::LocalRunner`). Off by default so the always-on public API and
+# dependency graph are unchanged; enable with `--features test-util`.
+[features]
+test-util = []
+
+# Workspace-level lints inherited by all members.
+# Style precedence: rustfmt (definitional) > Rust API Guidelines > clippy judgment.
+[workspace.lints.clippy]
+all = "deny"
+# Groups at lower priority so individual lint overrides take precedence.
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Allow multiple versions of transitive dependencies — the AWS SDK
+# ecosystem has not yet converged on single versions for all crates.
+multiple_crate_versions = { level = "allow", priority = 1 }
+# Panic-policy restriction lints (not covered by all/pedantic; added explicitly).
+# A panic in the SDK kills the customer's Lambda invocation.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "deny"
+unused_qualifications = "warn"
+unsafe_code = "forbid"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+lambda_runtime = "0.13"
+aws-config = "1"
+aws-sdk-lambda = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+aws-smithy-runtime-api = { version = "1", features = ["http-1x"] }
+aws-smithy-types = "1"
+tokio = { version = "1", features = ["test-util"] }

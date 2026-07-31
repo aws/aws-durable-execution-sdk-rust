@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (Callback)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures:
+      - x86_64
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  CallbackBasic:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-1"]
+    Properties:
+      CodeUri: publish/callback_basic/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackWithName:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-2"]
+    Properties:
+      CodeUri: publish/callback_with_name/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackTimeout:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-3"]
+    Properties:
+      CodeUri: publish/callback_timeout/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackHeartbeatTimeout:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-4"]
+    Properties:
+      CodeUri: publish/callback_heartbeat_timeout/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackHeartbeatSuccess:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-5"]
+    Properties:
+      CodeUri: publish/callback_heartbeat_success/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackFailure:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-6"]
+    Properties:
+      CodeUri: publish/callback_failure/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackStepFailure:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-7"]
+    Properties:
+      CodeUri: publish/callback_step_failure/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackStepTimeout:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-8"]
+    Properties:
+      CodeUri: publish/callback_step_timeout/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackWaitSuccess:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-9"]
+    Properties:
+      CodeUri: publish/callback_wait_success/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackWaitFailure:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-10"]
+    Properties:
+      CodeUri: publish/callback_wait_failure/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackWaitTimeout:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-11"]
+    Properties:
+      CodeUri: publish/callback_wait_timeout/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackReplayWithWait:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-12"]
+    Properties:
+      CodeUri: publish/callback_replay_with_wait/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackReplayFailure:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-13"]
+    Properties:
+      CodeUri: publish/callback_replay_failure/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackReplayTimeout:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-14"]
+    Properties:
+      CodeUri: publish/callback_replay_timeout/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackSerdesHappy:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-15"]
+    Properties:
+      CodeUri: publish/callback_serdes_happy/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackSerdesNumeric:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-16"]
+    Properties:
+      CodeUri: publish/callback_serdes_numeric/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackTwoSequential:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-17"]
+    Properties:
+      CodeUri: publish/callback_two_sequential/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackTwoParallel:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-18"]
+    Properties:
+      CodeUri: publish/callback_two_parallel/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  CallbackTwoParallelReverse:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    TestingMetadata:
+      TestDescription: ["4-19"]
+    Properties:
+      CodeUri: publish/callback_two_parallel_reverse/
+      Handler: bootstrap
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

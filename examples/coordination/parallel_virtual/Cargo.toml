@@ -1,0 +1,21 @@
+[package]
+name = "parallel_virtual"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+publish = false
+description = "Example: parallel branches in flat (virtual) contexts"
+
+[[bin]]
+name = "parallel_virtual"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-durable-execution-sdk-rust = { path = "../../.." }
+lambda_runtime = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros"] }
