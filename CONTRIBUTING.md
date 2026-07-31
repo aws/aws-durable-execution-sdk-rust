@@ -146,17 +146,19 @@ several operations or needs to observe replay.
 
 ## The conformance suite
 
-`compliance/` holds Lambda handlers in ten suites that a language-agnostic
+`compliance/` holds Lambda handlers in nine suites that a language-agnostic
 runner drives against the live service. The runner starts each handler's
 execution, then compares the recorded history against the language-independent
 durable execution contract, which is how we know the Rust implementation
 satisfies the service specification rather than merely passing its own tests.
 Each suite has a SAM template at `compliance/template_<suite>.yaml`.
+`compliance/template_smoke.yaml` is a single hello handler that checks a
+deployment works at all, so the runner does not validate it and CI skips it.
 
 Running the suite costs real time and real resources. A cold build of all
 handlers produces roughly two gigabytes of artifacts, and each suite deploys a
 CloudFormation stack of Lambda functions and runs executions that include
-timers. CI splits the ten suites across parallel jobs; on a workstation, build
+timers. CI splits the nine suites across parallel jobs; on a workstation, build
 and run one suite at a time.
 
 You need a Rust toolchain,
@@ -185,7 +187,7 @@ pip3 install cargo-lambda
 pip install "git+https://github.com/aws/aws-durable-execution-conformance-tests.git@main#subdirectory=packages/aws-durable-execution-conformance-tests"
 
 cd compliance
-./build_examples.sh step          # build one suite; omit the argument for all ten
+./build_examples.sh step          # build one suite; omit the argument to build every template
 
 python -m aws_durable_execution_conformance_tests.app \
     --template template_step.yaml \
