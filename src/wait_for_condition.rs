@@ -355,22 +355,26 @@ fn serialize_state<S: Serialize>(
     value: &S,
     serdes_ctx: &SerdesContext,
 ) -> Result<String, OperationError> {
-    let json_str = serde_json::to_string(value).map_err(|e| {
+    let Some(s) = serdes else {
+        // No custom serdes: plain `serde_json` straight to the wire.
+        return serde_json::to_string(value).map_err(|e| {
+            wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
+                message: e.to_string(),
+            })
+        });
+    };
+    // A custom serdes is handed the state erased to `serde_json::Value` — the
+    // same shape every other operation path provides.
+    let json_value = serde_json::to_value(value).map_err(|e| {
         wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
             message: e.to_string(),
         })
     })?;
-
-    if let Some(s) = serdes {
-        s.serialize_to_string_with_context(&json_str, serdes_ctx)
-            .map_err(|e| {
-                wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-                    message: e.to_string(),
-                })
-            })
-    } else {
-        Ok(json_str)
-    }
+    s.serialize(&json_value, serdes_ctx).map_err(|e| {
+        wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
+            message: e.to_string(),
+        })
+    })
 }
 
 /// Deserializes state from checkpoint result (Option<&String>).
@@ -390,18 +394,19 @@ fn deserialize_state_str<S: DeserializeOwned>(
     payload: &str,
     serdes_ctx: &SerdesContext,
 ) -> Result<S, OperationError> {
-    let json_str = if let Some(s) = serdes {
-        s.deserialize_from_string_with_context(payload, serdes_ctx)
-            .map_err(|e| {
-                wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-                    message: format!("state deserialization failed: {e}"),
-                })
-            })?
-    } else {
-        payload.to_owned()
+    let Some(s) = serdes else {
+        return serde_json::from_str(payload).map_err(|e| {
+            wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
+                message: format!("state deserialization failed: {e}"),
+            })
+        });
     };
-
-    serde_json::from_str(&json_str).map_err(|e| {
+    let json_value = s.deserialize(payload, serdes_ctx).map_err(|e| {
+        wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
+            message: format!("state deserialization failed: {e}"),
+        })
+    })?;
+    serde_json::from_value(json_value).map_err(|e| {
         wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
             message: format!("state deserialization failed: {e}"),
         })

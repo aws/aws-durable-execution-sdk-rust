@@ -28,7 +28,7 @@ pub(crate) struct InvokeExecution<O> {
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) function_id: String,
-    pub(crate) serialized_input: Result<String, String>,
+    pub(crate) erased_input: Result<serde_json::Value, String>,
     pub(crate) payload_serdes: Option<Box<dyn Serdes>>,
     pub(crate) result_serdes: Option<Box<dyn Serdes>>,
     pub(crate) tenant_id: Option<String>,
@@ -45,7 +45,7 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
         // lookup, checkpoint, or execution-client call — so a failing
         // `Serialize` never invokes the target with a `null` payload and
         // never records an operation the caller did not request.
-        let serialized_input = match self.serialized_input {
+        let erased_input = match self.erased_input {
             Ok(input) => input,
             Err(msg) => {
                 return Err(OperationError::from_kind(OperationErrorKind::Invoke(
@@ -104,16 +104,20 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
             .as_deref()
             .or_else(|| self.ctx.default_serdes());
         let wire_payload = if let Some(ps) = effective_payload_serdes {
-            ps.serialize_to_string_with_context(&serialized_input, &serdes_ctx)
-                .map_err(|e| {
-                    OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::from_kind(
-                        InvokeErrorKind::SerializationFailed {
-                            message: format!("payload serdes: {e}"),
-                        },
-                    )))
-                })?
+            // The Value was erased at the call site (context.rs). The serdes
+            // receives the same shape every other path provides — no re-parsing
+            // needed.
+            ps.serialize(&erased_input, &serdes_ctx)
+                .map_err(|e| invoke_serialization_error(&format!("payload serdes: {e}")))?
         } else {
-            serialized_input
+            // No custom serdes: render the Value to compact JSON for the wire.
+            // Note: this is `to_string(&Value)`, not `to_string(&I)`. The two
+            // can differ for edge cases (struct field order without
+            // `preserve_order`, 128-bit integers outside i64/u64 range,
+            // duplicate keys). Those cases fail at the `to_value` call site
+            // rather than silently producing different wire bytes.
+            serde_json::to_string(&erased_input)
+                .map_err(|e| invoke_serialization_error(&format!("serialize invoke input: {e}")))?
         };
 
         // Checkpoint ChainedInvokeStarted then suspend.
@@ -144,26 +148,17 @@ pub(crate) fn serialize_invoke_input<I: Serialize>(
     input: &I,
     serdes_ctx: &SerdesContext,
 ) -> Result<String, OperationError> {
-    let json_str = serde_json::to_string(input).map_err(|e| {
-        OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::from_kind(
-            InvokeErrorKind::SerializationFailed {
-                message: format!("serialize invoke input: {e}"),
-            },
-        )))
-    })?;
-
-    if let Some(s) = payload_serdes {
-        s.serialize_to_string_with_context(&json_str, serdes_ctx)
-            .map_err(|e| {
-                OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::from_kind(
-                    InvokeErrorKind::SerializationFailed {
-                        message: format!("payload serdes: {e}"),
-                    },
-                )))
-            })
-    } else {
-        Ok(json_str)
-    }
+    let Some(s) = payload_serdes else {
+        // No custom serdes: plain `serde_json` straight to the wire.
+        return serde_json::to_string(input)
+            .map_err(|e| invoke_serialization_error(&format!("serialize invoke input: {e}")));
+    };
+    // A custom serdes is handed the input erased to `serde_json::Value` — the
+    // same shape every other operation path provides.
+    let json_value = serde_json::to_value(input)
+        .map_err(|e| invoke_serialization_error(&format!("serialize invoke input: {e}")))?;
+    s.serialize(&json_value, serdes_ctx)
+        .map_err(|e| invoke_serialization_error(&format!("payload serdes: {e}")))
 }
 
 /// Deserializes the invoke result payload using the configured serdes.
@@ -172,26 +167,24 @@ fn deserialize_invoke_result<O: DeserializeOwned>(
     payload: &str,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
-    let json_str = if let Some(s) = result_serdes {
-        s.deserialize_from_string_with_context(payload, serdes_ctx)
-            .map_err(|e| {
-                OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::from_kind(
-                    InvokeErrorKind::SerializationFailed {
-                        message: format!("result serdes: {e}"),
-                    },
-                )))
-            })?
-    } else {
-        payload.to_owned()
+    let Some(s) = result_serdes else {
+        return serde_json::from_str(payload)
+            .map_err(|e| invoke_serialization_error(&format!("deserialize invoke result: {e}")));
     };
+    let json_value = s
+        .deserialize(payload, serdes_ctx)
+        .map_err(|e| invoke_serialization_error(&format!("result serdes: {e}")))?;
+    serde_json::from_value(json_value)
+        .map_err(|e| invoke_serialization_error(&format!("deserialize invoke result: {e}")))
+}
 
-    serde_json::from_str(&json_str).map_err(|e| {
-        OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::from_kind(
-            InvokeErrorKind::SerializationFailed {
-                message: format!("deserialize invoke result: {e}"),
-            },
-        )))
-    })
+/// Wraps a message as an invoke `SerializationFailed` operation error.
+fn invoke_serialization_error(message: &str) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::from_kind(
+        InvokeErrorKind::SerializationFailed {
+            message: message.to_owned(),
+        },
+    )))
 }
 
 /// Reconstructs an `InvokeError` from a failed checkpoint record.
@@ -302,7 +295,7 @@ mod tests {
             op_id,
             name: None,
             function_id: "target-fn".to_owned(),
-            serialized_input: Ok("\"input\"".to_owned()),
+            erased_input: Ok(serde_json::json!("input")),
             payload_serdes: None,
             result_serdes: None,
             tenant_id: None,
@@ -342,7 +335,7 @@ mod tests {
             op_id,
             name: None,
             function_id: "target-fn".to_owned(),
-            serialized_input: Ok("\"input\"".to_owned()),
+            erased_input: Ok(serde_json::json!("input")),
             payload_serdes: None,
             result_serdes: None,
             tenant_id: None,
@@ -388,7 +381,7 @@ mod tests {
             op_id,
             name: None,
             function_id: "target-fn".to_owned(),
-            serialized_input: Ok("\"input\"".to_owned()),
+            erased_input: Ok(serde_json::json!("input")),
             payload_serdes: None,
             result_serdes: None,
             tenant_id: None,
@@ -420,7 +413,7 @@ mod tests {
             op_id,
             name: Some("charge".to_owned()),
             function_id: "payment-fn".to_owned(),
-            serialized_input: Ok(r#"{"amount":100}"#.to_owned()),
+            erased_input: Ok(serde_json::json!({"amount": 100})),
             payload_serdes: None,
             result_serdes: None,
             tenant_id: None,
@@ -442,11 +435,19 @@ mod tests {
             }
         }
         impl Serdes for Upper {
-            fn serialize_to_string(&self, json_str: &str) -> Result<String, crate::BoxError> {
-                Ok(json_str.to_uppercase())
+            fn serialize(
+                &self,
+                value: &serde_json::Value,
+                _context: &SerdesContext,
+            ) -> Result<String, crate::BoxError> {
+                Ok(value.to_string().to_uppercase())
             }
-            fn deserialize_from_string(&self, payload: &str) -> Result<String, crate::BoxError> {
-                Ok(payload.to_lowercase())
+            fn deserialize(
+                &self,
+                data: &str,
+                _context: &SerdesContext,
+            ) -> Result<serde_json::Value, crate::BoxError> {
+                Ok(serde_json::from_str(&data.to_lowercase())?)
             }
         }
 
@@ -456,9 +457,9 @@ mod tests {
         assert_eq!(serialized, "\"HELLO\"");
 
         // Test result deserialization.
-        // Upper.deserialize_from_string lowercases the whole payload string
-        // (including JSON quotes), and then serde_json::from_str parses it.
-        // Input: "\"WORLD\"" -> lowercase: "\"world\"" -> serde parses: "world".
+        // Upper::deserialize lowercases the whole payload string (including
+        // JSON quotes) and parses it into a Value, which is then deserialized
+        // into `String`: "\"WORLD\"" -> "\"world\"" -> "world".
         let result: String = deserialize_invoke_result(Some(&Upper), "\"WORLD\"", &ctx).unwrap();
         assert_eq!(result, "world");
     }
@@ -483,7 +484,7 @@ mod tests {
             op_id,
             name: Some("my-invoke".to_owned()),
             function_id: "fn-arn".to_owned(),
-            serialized_input: Ok("null".to_owned()),
+            erased_input: Ok(serde_json::Value::Null),
             payload_serdes: None,
             result_serdes: None,
             tenant_id: None,
@@ -547,7 +548,7 @@ mod tests {
                     op_id,
                     name: None,
                     function_id: "fn".to_owned(),
-                    serialized_input: Ok("\"x\"".to_owned()),
+                    erased_input: Ok(serde_json::json!("x")),
                     payload_serdes: None,
                     result_serdes: None,
                     tenant_id: None,
@@ -598,7 +599,7 @@ mod tests {
             op_id,
             name: None,
             function_id: "fn".to_owned(),
-            serialized_input: Ok("null".to_owned()),
+            erased_input: Ok(serde_json::Value::Null),
             payload_serdes: None,
             result_serdes: None,
             tenant_id: None,
@@ -621,11 +622,19 @@ mod tests {
             }
         }
         impl Serdes for UpperPayload {
-            fn serialize_to_string(&self, json_str: &str) -> Result<String, crate::BoxError> {
-                Ok(json_str.to_uppercase())
+            fn serialize(
+                &self,
+                value: &serde_json::Value,
+                _context: &SerdesContext,
+            ) -> Result<String, crate::BoxError> {
+                Ok(value.to_string().to_uppercase())
             }
-            fn deserialize_from_string(&self, payload: &str) -> Result<String, crate::BoxError> {
-                Ok(payload.to_owned())
+            fn deserialize(
+                &self,
+                data: &str,
+                _context: &SerdesContext,
+            ) -> Result<serde_json::Value, crate::BoxError> {
+                Ok(serde_json::from_str(data)?)
             }
         }
 
@@ -645,7 +654,7 @@ mod tests {
             op_id,
             name: None,
             function_id: "target-fn".to_owned(),
-            serialized_input: Ok("\"hello\"".to_owned()),
+            erased_input: Ok(serde_json::json!("hello")),
             payload_serdes: Some(Box::new(UpperPayload)),
             result_serdes: None,
             tenant_id: None,
@@ -680,11 +689,19 @@ mod tests {
             }
         }
         impl Serdes for LowerResult {
-            fn serialize_to_string(&self, json_str: &str) -> Result<String, crate::BoxError> {
-                Ok(json_str.to_owned())
+            fn serialize(
+                &self,
+                value: &serde_json::Value,
+                _context: &SerdesContext,
+            ) -> Result<String, crate::BoxError> {
+                Ok(value.to_string())
             }
-            fn deserialize_from_string(&self, payload: &str) -> Result<String, crate::BoxError> {
-                Ok(payload.to_lowercase())
+            fn deserialize(
+                &self,
+                data: &str,
+                _context: &SerdesContext,
+            ) -> Result<serde_json::Value, crate::BoxError> {
+                Ok(serde_json::from_str(&data.to_lowercase())?)
             }
         }
 
@@ -715,7 +732,7 @@ mod tests {
             op_id,
             name: None,
             function_id: "fn".to_owned(),
-            serialized_input: Ok("null".to_owned()),
+            erased_input: Ok(serde_json::Value::Null),
             payload_serdes: None,
             result_serdes: Some(Box::new(LowerResult)),
             tenant_id: None,

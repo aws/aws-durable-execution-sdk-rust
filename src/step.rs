@@ -480,26 +480,15 @@ fn serialize_value<O: Serialize>(
     value: &O,
     serdes_ctx: &SerdesContext,
 ) -> Result<String, OperationError> {
-    let json_str = serde_json::to_string(value).map_err(|e| {
-        OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
-            StepErrorKind::SerializationFailed {
-                message: e.to_string(),
-            },
-        )))
-    })?;
-
-    if let Some(s) = serdes {
-        s.serialize_to_string_with_context(&json_str, serdes_ctx)
-            .map_err(|e| {
-                OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
-                    StepErrorKind::SerializationFailed {
-                        message: e.to_string(),
-                    },
-                )))
-            })
-    } else {
-        Ok(json_str)
-    }
+    let Some(s) = serdes else {
+        // No custom serdes: plain `serde_json` straight to the wire.
+        return serde_json::to_string(value).map_err(|e| step_serialization_error(&e));
+    };
+    // A custom serdes is handed the value erased to `serde_json::Value` — the
+    // same shape every other operation path provides.
+    let json_value = serde_json::to_value(value).map_err(|e| step_serialization_error(&e))?;
+    s.serialize(&json_value, serdes_ctx)
+        .map_err(|e| step_serialization_error(&*e))
 }
 
 fn deserialize_result<O: DeserializeOwned>(
@@ -507,26 +496,22 @@ fn deserialize_result<O: DeserializeOwned>(
     serialized: &str,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
-    let json_str = if let Some(s) = serdes {
-        s.deserialize_from_string_with_context(serialized, serdes_ctx)
-            .map_err(|e| {
-                OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
-                    StepErrorKind::SerializationFailed {
-                        message: e.to_string(),
-                    },
-                )))
-            })?
-    } else {
-        serialized.to_owned()
+    let Some(s) = serdes else {
+        return serde_json::from_str(serialized).map_err(|e| step_serialization_error(&e));
     };
+    let json_value = s
+        .deserialize(serialized, serdes_ctx)
+        .map_err(|e| step_serialization_error(&*e))?;
+    serde_json::from_value(json_value).map_err(|e| step_serialization_error(&e))
+}
 
-    serde_json::from_str(&json_str).map_err(|e| {
-        OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
-            StepErrorKind::SerializationFailed {
-                message: e.to_string(),
-            },
-        )))
-    })
+/// Wraps any error as a step `SerializationFailed` operation error.
+fn step_serialization_error<E: std::fmt::Display + ?Sized>(e: &E) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
+        StepErrorKind::SerializationFailed {
+            message: e.to_string(),
+        },
+    )))
 }
 
 fn replay_success<O: DeserializeOwned>(
@@ -642,11 +627,19 @@ mod tests {
             }
         }
         impl Serdes for Upper {
-            fn serialize_to_string(&self, json_str: &str) -> Result<String, BoxError> {
-                Ok(json_str.to_uppercase())
+            fn serialize(
+                &self,
+                value: &serde_json::Value,
+                _context: &SerdesContext,
+            ) -> Result<String, BoxError> {
+                Ok(value.to_string().to_uppercase())
             }
-            fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
-                Ok(payload.to_owned())
+            fn deserialize(
+                &self,
+                data: &str,
+                _context: &SerdesContext,
+            ) -> Result<serde_json::Value, BoxError> {
+                Ok(serde_json::from_str(data)?)
             }
         }
         let serdes: Box<dyn Serdes> = Box::new(Upper);
@@ -776,11 +769,19 @@ mod tests {
             }
         }
         impl Serdes for Upper {
-            fn serialize_to_string(&self, json_str: &str) -> Result<String, BoxError> {
-                Ok(json_str.to_uppercase())
+            fn serialize(
+                &self,
+                value: &serde_json::Value,
+                _context: &SerdesContext,
+            ) -> Result<String, BoxError> {
+                Ok(value.to_string().to_uppercase())
             }
-            fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
-                Ok(payload.to_lowercase())
+            fn deserialize(
+                &self,
+                data: &str,
+                _context: &SerdesContext,
+            ) -> Result<serde_json::Value, BoxError> {
+                Ok(serde_json::from_str(&data.to_lowercase())?)
             }
         }
 

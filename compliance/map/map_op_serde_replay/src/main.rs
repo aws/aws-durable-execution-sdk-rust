@@ -8,23 +8,23 @@
 use std::time::Duration;
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{DurableContext, Serdes};
+use durable::{DurableContext, Serdes, SerdesContext};
 
 /// Custom operation-level serializer (same as 9-19).
 ///
-/// Serializes the entire batch result JSON into "OPSERDE:X,Y" format.
-/// On deserialization, reconstructs the batch JSON from that compact form.
+/// Serializes the entire batch result into "OPSERDE:X,Y" format. On
+/// deserialization, reconstructs the batch value from that compact form.
 #[derive(Debug)]
 struct OpSerdes;
 
 impl Serdes for OpSerdes {
-    fn serialize_to_string(
+    fn serialize(
         &self,
-        json_str: &str,
+        value: &serde_json::Value,
+        _context: &SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Parse the batch result JSON and extract item results.
-        let payload: serde_json::Value = serde_json::from_str(json_str)?;
-        let results = payload
+        // The batch payload arrives as a structured value — no parse step.
+        let results = value
             .get("results")
             .and_then(serde_json::Value::as_array)
             .map(|arr| {
@@ -33,7 +33,8 @@ impl Serdes for OpSerdes {
                         item.get("result")
                             .and_then(serde_json::Value::as_str)
                             .map(|s| {
-                                // The result is a JSON-encoded string — strip outer quotes.
+                                // Each item carries its own wire string — a
+                                // JSON-encoded string here, so strip the quotes.
                                 s.trim_matches('"').to_owned()
                             })
                     })
@@ -43,19 +44,20 @@ impl Serdes for OpSerdes {
         Ok(format!("OPSERDE:{}", results.join(",")))
     }
 
-    fn deserialize_from_string(
+    fn deserialize(
         &self,
-        payload: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let data = payload
+        data: &str,
+        _context: &SerdesContext,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let body = data
             .strip_prefix("OPSERDE:")
             .ok_or("missing OPSERDE: prefix")?;
-        let items: Vec<&str> = if data.is_empty() {
+        let items: Vec<&str> = if body.is_empty() {
             Vec::new()
         } else {
-            data.split(',').collect()
+            body.split(',').collect()
         };
-        // Reconstruct the batch checkpoint JSON with string status/reason
+        // Reconstruct the batch checkpoint value with the string status/reason
         // matching the SDK's BatchCheckpointPayload format.
         let results: Vec<serde_json::Value> = items
             .into_iter()
@@ -68,11 +70,10 @@ impl Serdes for OpSerdes {
                 })
             })
             .collect();
-        let payload = serde_json::json!({
+        Ok(serde_json::json!({
             "results": results,
             "reason": "ALL_COMPLETED"
-        });
-        Ok(serde_json::to_string(&payload)?)
+        }))
     }
 }
 

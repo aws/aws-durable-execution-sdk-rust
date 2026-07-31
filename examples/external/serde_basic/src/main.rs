@@ -9,7 +9,7 @@
 //! [`Serdes`]: aws_durable_execution_sdk_rust::Serdes
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::Serdes;
+use durable::{Serdes, SerdesContext};
 
 /// A serdes that uppercases the JSON wire form. Illustrative of the transform
 /// seam; production code would compress or encrypt here.
@@ -17,12 +17,22 @@ use durable::Serdes;
 struct UppercaseSerdes;
 
 impl Serdes for UppercaseSerdes {
-    fn serialize_to_string(&self, json_str: &str) -> Result<String, durable::BoxError> {
-        Ok(json_str.to_uppercase())
+    fn serialize(
+        &self,
+        value: &serde_json::Value,
+        _context: &SerdesContext,
+    ) -> Result<String, durable::BoxError> {
+        // The serdes receives the operation's value erased to
+        // `serde_json::Value`, not pre-rendered JSON text.
+        Ok(value.to_string().to_uppercase())
     }
 
-    fn deserialize_from_string(&self, payload: &str) -> Result<String, durable::BoxError> {
-        Ok(payload.to_owned())
+    fn deserialize(
+        &self,
+        data: &str,
+        _context: &SerdesContext,
+    ) -> Result<serde_json::Value, durable::BoxError> {
+        Ok(serde_json::from_str(data)?)
     }
 }
 

@@ -5,20 +5,20 @@
 //! `"OPSERDE:X,Y"` for the whole map result payload.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{DurableContext, Serdes};
+use durable::{DurableContext, Serdes, SerdesContext};
 
 /// Custom operation-level serializer that emits `OPSERDE:<comma-joined results>`.
 #[derive(Debug)]
 struct OpSerdes;
 
 impl Serdes for OpSerdes {
-    fn serialize_to_string(
+    fn serialize(
         &self,
-        json_str: &str,
+        value: &serde_json::Value,
+        _context: &SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Parse the default batch payload JSON to extract results.
-        let payload: serde_json::Value = serde_json::from_str(json_str)?;
-        let results = payload
+        // The batch payload arrives as a structured value — no parse step.
+        let results = value
             .get("results")
             .and_then(serde_json::Value::as_array)
             .map(|arr| {
@@ -34,18 +34,19 @@ impl Serdes for OpSerdes {
         Ok(format!("OPSERDE:{}", results.join(",")))
     }
 
-    fn deserialize_from_string(
+    fn deserialize(
         &self,
-        payload: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Reverse: "OPSERDE:X,Y" → reconstruct the batch payload JSON.
-        let data = payload
+        data: &str,
+        _context: &SerdesContext,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        // Reverse: "OPSERDE:X,Y" → reconstruct the batch payload value.
+        let body = data
             .strip_prefix("OPSERDE:")
             .ok_or("missing OPSERDE: prefix")?;
-        let items: Vec<&str> = if data.is_empty() {
+        let items: Vec<&str> = if body.is_empty() {
             Vec::new()
         } else {
-            data.split(',').collect()
+            body.split(',').collect()
         };
         let results: Vec<serde_json::Value> = items
             .into_iter()
@@ -58,11 +59,10 @@ impl Serdes for OpSerdes {
                 })
             })
             .collect();
-        let payload = serde_json::json!({
+        Ok(serde_json::json!({
             "results": results,
             "reason": 1
-        });
-        Ok(serde_json::to_string(&payload)?)
+        }))
     }
 }
 

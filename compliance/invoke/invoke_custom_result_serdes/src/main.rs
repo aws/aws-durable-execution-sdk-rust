@@ -6,26 +6,21 @@ use aws_durable_execution_sdk_rust as durable;
 
 /// Custom serdes that uppercases the result on deserialization.
 ///
-/// The Go SDK equivalent does `*s = strings.ToUpper(string(data))` which
-/// directly assigns the uppercased raw bytes (including JSON quotes) as the
-/// final string value. Our SDK applies an additional `serde_json::from_str`
-/// after `deserialize_from_string`, so we must JSON-encode the uppercased
-/// raw payload to preserve it through that extra parse step.
+/// The Go SDK equivalent does `*s = strings.ToUpper(string(data))`, which
+/// assigns the uppercased raw bytes (JSON quotes included) as the final string
+/// value. Returning `Value::String(data.to_uppercase())` reproduces that
+/// exactly: the SDK deserializes the returned value into `String`, so no
+/// re-encoding step is needed to survive an extra parse.
 #[derive(Debug)]
 struct UppercaseResultSerdes;
 
 impl durable::Serdes for UppercaseResultSerdes {
-    fn serialize_to_string(&self, json_str: &str) -> Result<String, durable::BoxError> {
-        Ok(json_str.to_owned())
-    }
-
-    fn deserialize_from_string(&self, payload: &str) -> Result<String, durable::BoxError> {
-        // Uppercase the raw payload (including JSON quotes), matching the Go
-        // SDK's `strings.ToUpper(string(data))` semantics. Then re-encode as
-        // JSON so the SDK's subsequent `serde_json::from_str` produces the
-        // uppercased value as the final typed result.
-        let uppercased = payload.to_uppercase();
-        Ok(serde_json::to_string(&uppercased)?)
+    fn deserialize(
+        &self,
+        data: &str,
+        _context: &durable::SerdesContext,
+    ) -> Result<serde_json::Value, durable::BoxError> {
+        Ok(serde_json::Value::String(data.to_uppercase()))
     }
 }
 

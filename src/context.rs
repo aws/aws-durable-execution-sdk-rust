@@ -631,17 +631,12 @@ impl DurableContext {
         O: DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        // Serialize input at call site (synchronous, before the future body):
-        // the input type is erased past this point. The outcome is carried as
-        // a `Result` so a serialization failure surfaces as an error at await
-        // time rather than being replaced by a `null` payload.
-        let serialized_input = serde_json::to_string(&input).map_err(|e| e.to_string());
-        InvokeBuilder::new(
-            self.clone(),
-            op_id,
-            function_id.to_owned(),
-            serialized_input,
-        )
+        // Erase input to `Value` at the call site (synchronous, before the
+        // future body): the input type is erased past this point. Carrying a
+        // `Value` rather than pre-rendered text means the custom serdes and the
+        // default path share one conversion — no re-parsing needed.
+        let erased_input = serde_json::to_value(&input).map_err(|e| e.to_string());
+        InvokeBuilder::new(self.clone(), op_id, function_id.to_owned(), erased_input)
     }
 
     /// Creates a child context for fan-out / sub-orchestration.

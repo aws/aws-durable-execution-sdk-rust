@@ -37,15 +37,19 @@ struct ReceivedData {
 struct TimestampSerdes;
 
 impl Serdes for TimestampSerdes {
-    fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
-        let raw: CallbackPayload = serde_json::from_str(payload)?;
+    fn deserialize(
+        &self,
+        data: &str,
+        _context: &durable::SerdesContext,
+    ) -> Result<serde_json::Value, BoxError> {
+        let raw: CallbackPayload = serde_json::from_str(data)?;
         let timestamp = parse_iso_timestamp(&raw.timestamp)?;
         let received = ReceivedData {
             id: raw.id,
             message: raw.message,
             timestamp,
         };
-        Ok(serde_json::to_string(&received)?)
+        Ok(serde_json::to_value(&received)?)
     }
 }
 

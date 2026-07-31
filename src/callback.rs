@@ -510,22 +510,21 @@ fn callback_deser_error_msg(message: String) -> OperationError {
 /// Decodes an externally-delivered callback payload into the target type.
 ///
 /// The payload is produced by an external caller, so only the deserialize
-/// side of the serdes is meaningful: `serdes` (when present) transforms the
-/// wire payload back to a JSON string, which is then parsed into `O`. With no
-/// serdes the payload is parsed as JSON directly.
-fn deserialize_callback_result<O: DeserializeOwned>(
+/// side of the serdes is meaningful: `serdes` (when present) turns the wire
+/// payload back into a `serde_json::Value`, which is then deserialized into
+/// `O`. With no serdes the payload is parsed as JSON directly.
+pub(crate) fn deserialize_callback_result<O: DeserializeOwned>(
     serdes: Option<&dyn Serdes>,
     payload: &str,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
-    let json_str = if let Some(s) = serdes {
-        s.deserialize_from_string_with_context(payload, serdes_ctx)
-            .map_err(|e| callback_deser_error_msg(format!("callback serdes: {e}")))?
-    } else {
-        payload.to_owned()
+    let Some(s) = serdes else {
+        return serde_json::from_str(payload).map_err(|e| callback_deser_error(&e));
     };
-
-    serde_json::from_str(&json_str).map_err(|e| callback_deser_error(&e))
+    let json_value = s
+        .deserialize(payload, serdes_ctx)
+        .map_err(|e| callback_deser_error_msg(format!("callback serdes: {e}")))?;
+    serde_json::from_value(json_value).map_err(|e| callback_deser_error(&e))
 }
 
 /// Creates a callback internal error.
@@ -1292,11 +1291,15 @@ mod tests {
     struct MarkerSerdes;
 
     impl Serdes for MarkerSerdes {
-        fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
-            payload
+        fn deserialize(
+            &self,
+            data: &str,
+            _context: &SerdesContext,
+        ) -> Result<serde_json::Value, BoxError> {
+            let body = data
                 .strip_prefix("MARK:")
-                .map(str::to_owned)
-                .ok_or_else(|| "missing MARK: prefix".into())
+                .ok_or_else(|| -> BoxError { "missing MARK: prefix".into() })?;
+            Ok(serde_json::from_str(body)?)
         }
     }
 

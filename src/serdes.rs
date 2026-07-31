@@ -17,59 +17,63 @@ use std::fmt::Debug;
 ///
 /// # Serialization model
 ///
-/// A `Serdes` is a **transformation around JSON**, not a replacement for it.
-/// The engine always serializes values with `serde_json` first, hands the
-/// resulting JSON string to [`serialize_to_string_with_context`](Serdes::serialize_to_string_with_context)
-/// for the wire, and reverses the transform with
-/// [`deserialize_from_string_with_context`](Serdes::deserialize_from_string_with_context)
-/// before deserializing back with `serde_json`.
+/// A `Serdes` sits between the SDK's typed values and the checkpoint wire
+/// format. On the way out it receives the operation's value **erased to
+/// [`serde_json::Value`]** and returns the string to store on the wire; on
+/// the way back it receives that string and returns a [`serde_json::Value`],
+/// which the SDK deserializes into the target type.
 ///
-/// Every operation path uses this one model — steps, invokes, callbacks,
-/// child contexts, `wait_for_condition`, whole map/parallel batch results,
-/// and individual map/parallel item results. A type that implements this
-/// trait therefore behaves identically wherever it is attached.
+/// This mirrors the Go, JavaScript, and Java SDKs, whose custom serdes also
+/// receive the value rather than pre-rendered JSON text.
 ///
-/// # Input shape by operation path
+/// # One rule on every path
 ///
-/// **Step, invoke, callback, and batch-level paths** hand the serdes the JSON
-/// *encoding* of the value: a `String` result of `X` arrives as `"X"`, quotes
-/// included. A serdes on these paths that wants the raw text must decode
-/// before transforming:
+/// Steps, invoke payloads, invoke results, callback payloads, child-context
+/// results, `wait_for_condition` state, individual map/parallel item results,
+/// and whole map/parallel batch results all hand the serdes the *same* shape:
+/// the [`serde_json::Value`] of the value being serialized. A `String` result
+/// of `X` arrives as `Value::String("X")` on every path — there is no
+/// per-path quoting rule to compensate for, so a type that implements this
+/// trait behaves identically wherever it is attached.
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::Serdes;
+/// use aws_durable_execution_sdk_rust::{Serdes, SerdesContext};
+/// use serde_json::Value;
 ///
 /// #[derive(Debug)]
 /// struct WrapSerdes;
 ///
 /// impl Serdes for WrapSerdes {
-///     fn serialize_to_string(
+///     fn serialize(
 ///         &self,
-///         json_str: &str,
+///         value: &Value,
+///         _context: &SerdesContext,
 ///     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-///         let raw: String = serde_json::from_str(json_str)?;
+///         // The value arrives typed — a string result is a `Value::String`,
+///         // so there is no JSON quoting to strip first.
+///         let raw = value.as_str().unwrap_or_default();
 ///         Ok(format!("wrapped:{raw}"))
 ///     }
 ///
-///     fn deserialize_from_string(
+///     fn deserialize(
 ///         &self,
-///         payload: &str,
-///     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-///         let raw = payload.strip_prefix("wrapped:").unwrap_or(payload);
-///         Ok(serde_json::to_string(raw)?)
+///         data: &str,
+///         _context: &SerdesContext,
+///     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+///         let raw = data.strip_prefix("wrapped:").unwrap_or(data);
+///         Ok(Value::String(raw.to_owned()))
 ///     }
 /// }
 ///
-/// let wire = WrapSerdes.serialize_to_string(r#""X""#)?;
+/// let context = SerdesContext::new("step-1", "arn:test");
+/// let wire = WrapSerdes.serialize(&Value::String("X".to_owned()), &context)?;
 /// assert_eq!(wire, "wrapped:X");
-/// assert_eq!(WrapSerdes.deserialize_from_string(&wire)?, r#""X""#);
+/// assert_eq!(
+///     WrapSerdes.deserialize(&wire, &context)?,
+///     Value::String("X".to_owned()),
+/// );
 /// # Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
 /// ```
-///
-/// **Map/parallel item paths** hand the serdes the *raw* item payload: a
-/// `String` result of `X` arrives as `X` (no JSON quoting). This matches
-/// the JS/Python reference implementations. A serdes for items can work
-/// directly with the raw value without JSON decoding.
 ///
 /// # Object safety
 ///
@@ -79,7 +83,7 @@ use std::fmt::Debug;
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::Serdes;
+/// use aws_durable_execution_sdk_rust::{Serdes, SerdesContext};
 ///
 /// struct UppercaseSerdes;
 ///
@@ -90,18 +94,20 @@ use std::fmt::Debug;
 /// }
 ///
 /// impl Serdes for UppercaseSerdes {
-///     fn serialize_to_string(
+///     fn serialize(
 ///         &self,
-///         json_str: &str,
+///         value: &serde_json::Value,
+///         _context: &SerdesContext,
 ///     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-///         Ok(json_str.to_uppercase())
+///         Ok(value.to_string().to_uppercase())
 ///     }
 ///
-///     fn deserialize_from_string(
+///     fn deserialize(
 ///         &self,
-///         payload: &str,
-///     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-///         Ok(payload.to_owned())
+///         data: &str,
+///         _context: &SerdesContext,
+///     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+///         Ok(serde_json::from_str(&data.to_lowercase())?)
 ///     }
 /// }
 ///
@@ -109,73 +115,49 @@ use std::fmt::Debug;
 /// # drop(serdes);
 /// ```
 pub trait Serdes: Debug + Send + Sync {
-    /// Transforms a JSON-serialized string for wire transport.
+    /// Serializes a structured value to the string stored on the wire.
     ///
-    /// The default implementation returns the input unchanged (standard
-    /// JSON). Override to apply custom transformations (e.g., uppercase).
+    /// `value` is the operation's value erased to [`serde_json::Value`]. The
+    /// default implementation renders compact JSON via `value.to_string()`.
+    /// Note that this may differ from what `serde_json::to_string` would
+    /// produce on the original typed value — struct field order may change
+    /// (without `preserve_order`), 128-bit integers outside i64/u64 range
+    /// cannot be represented in `Value`, and duplicate keys collapse.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the transformation fails.
-    fn serialize_to_string(
-        &self,
-        json_str: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(json_str.to_owned())
-    }
-
-    /// Transforms a wire payload string back for JSON deserialization.
-    ///
-    /// The default implementation returns the input unchanged (standard
-    /// JSON). Override to reverse custom transformations.
+    /// `context` carries the operation's wire ID and the execution ARN.
+    /// Implementations that store data externally (e.g.
+    /// [`FileSystemSerdes`]) use it for deterministic path resolution;
+    /// implementations that do not need it can ignore it.
     ///
     /// # Errors
     ///
     /// Returns an error if the transformation fails.
-    fn deserialize_from_string(
+    fn serialize(
         &self,
-        payload: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(payload.to_owned())
-    }
-
-    /// Context-aware string serialization for wire transport.
-    ///
-    /// The default implementation delegates to [`serialize_to_string`](Serdes::serialize_to_string),
-    /// ignoring the context. Implementations that require operation identity for
-    /// path resolution (e.g., [`FileSystemSerdes`]) override this to use the
-    /// context for deterministic file placement.
-    ///
-    /// The engine calls this method at every serialization point, passing the
-    /// operation's wire ID and execution ARN.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the transformation fails.
-    fn serialize_to_string_with_context(
-        &self,
-        json_str: &str,
+        value: &serde_json::Value,
         _context: &SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.serialize_to_string(json_str)
+        Ok(value.to_string())
     }
 
-    /// Context-aware string deserialization from wire transport.
+    /// Deserializes a wire string back into a structured value.
     ///
-    /// The default implementation delegates to [`deserialize_from_string`](Serdes::deserialize_from_string),
-    /// ignoring the context. Implementations that store data externally
-    /// (e.g., [`FileSystemSerdes`]) may use the context for path resolution
-    /// on deserialization if needed.
+    /// `data` is the string a previous [`serialize`](Serdes::serialize) call
+    /// returned (or, for callbacks, the payload an external caller delivered).
+    /// The returned [`serde_json::Value`] is deserialized into the target type
+    /// by the SDK, so no runtime downcast is involved.
+    ///
+    /// The default implementation parses `data` as JSON.
     ///
     /// # Errors
     ///
     /// Returns an error if the transformation fails.
-    fn deserialize_from_string_with_context(
+    fn deserialize(
         &self,
-        payload: &str,
+        data: &str,
         _context: &SerdesContext,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.deserialize_from_string(payload)
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(serde_json::from_str(data)?)
     }
 }
 
@@ -396,7 +378,7 @@ impl FileSystemSerdesConfigBuilder {
 /// # Envelope format
 ///
 /// The checkpoint stores one of:
-/// - `{"data":"<inline JSON>"}` — value stored inline (OVERFLOW mode, under threshold)
+/// - `{"data":<inline JSON value>}` — value stored inline (OVERFLOW mode, under threshold)
 /// - `{"file":"<path>"}` — value stored in a file
 ///
 /// # Examples
@@ -465,7 +447,7 @@ impl FileSystemSerdes {
         }
     }
 
-    /// Serializes a JSON string to the filesystem envelope format.
+    /// Serializes a value to the filesystem envelope format.
     ///
     /// Returns the envelope JSON string to be stored in the checkpoint.
     /// The `context` provides the operation identity for path resolution.
@@ -475,30 +457,29 @@ impl FileSystemSerdes {
     /// Returns an error if directory creation or file writing fails.
     pub fn serialize_with_context(
         &self,
-        json_str: &str,
+        value: &serde_json::Value,
         context: &SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let json_str = serde_json::to_string(value).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(FileSystemSerdesError::new(format!(
+                    "failed to render value as JSON: {e}"
+                )))
+            },
+        )?;
         match self.config.storage_mode {
             FileSystemSerdesMode::Always => {
-                let file_path = self.write_to_file(json_str, context)?;
+                let file_path = self.write_to_file(&json_str, context)?;
                 let escaped_path = json_escape_string(&file_path);
                 Ok(format!(r#"{{"file":"{escaped_path}"}}"#))
             }
             FileSystemSerdesMode::Overflow => {
-                // Build the inline envelope. The input may be valid JSON
-                // (step/batch path) or a raw string (map/parallel item path
-                // with custom serdes). Only valid JSON can be embedded directly
-                // in the {"data":...} envelope; raw strings are JSON-encoded
-                // first and stored under {"raw":"..."}.
-                let inline_envelope = if serde_json::from_str::<serde_json::Value>(json_str).is_ok()
-                {
-                    format!(r#"{{"data":{json_str}}}"#)
-                } else {
-                    let encoded = serde_json::Value::String(json_str.to_owned());
-                    format!(r#"{{"raw":{encoded}}}"#)
-                };
+                // The value is always valid JSON (it came from a `Value`), so
+                // it can be embedded directly in the `{"data":...}` envelope.
+                // No sniffing, and no `{"raw":...}` variant to fall back to.
+                let inline_envelope = format!(r#"{{"data":{json_str}}}"#);
                 if inline_envelope.len() > self.config.overflow_threshold_bytes {
-                    let file_path = self.write_to_file(json_str, context)?;
+                    let file_path = self.write_to_file(&json_str, context)?;
                     let escaped_path = json_escape_string(&file_path);
                     Ok(format!(r#"{{"file":"{escaped_path}"}}"#))
                 } else {
@@ -521,9 +502,9 @@ impl FileSystemSerdes {
         &self,
         envelope: &str,
         _context: &SerdesContext,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         // Parse the envelope to determine storage location.
-        // Envelope is: {"file":"<path>"} or {"data":"<json>"}
+        // Envelope is: {"file":"<path>"} or {"data":<json>}
         let parsed: serde_json::Value = serde_json::from_str(envelope).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(FileSystemSerdesError::new(format!(
@@ -541,14 +522,22 @@ impl FileSystemSerdes {
                     )))
                 },
             )?;
-            Ok(contents)
+            serde_json::from_str(&contents).map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(FileSystemSerdesError::new(format!(
+                        "invalid JSON in file '{file_path}': {e}"
+                    )))
+                },
+            )
         } else if let Some(raw) = parsed.get("raw").and_then(serde_json::Value::as_str) {
-            // Raw string inline data (item path with custom serdes).
-            Ok(raw.to_owned())
+            // Legacy inline envelope. The writer no longer produces `{"raw":..}`
+            // (a `Value` is always embeddable under `"data"`), but executions
+            // checkpointed by an earlier version may still contain one, so the
+            // read path keeps handling it.
+            Ok(serde_json::Value::String(raw.to_owned()))
         } else if let Some(data) = parsed.get("data") {
-            // Inline data: extract the JSON value as a string.
-            // The "data" field contains the raw JSON value (not double-encoded).
-            Ok(data.to_string())
+            // Inline data: the "data" field holds the value verbatim.
+            Ok(data.clone())
         } else {
             Err(Box::new(FileSystemSerdesError::new(
                 "envelope contains neither 'file' nor 'data' field".to_owned(),
@@ -616,68 +605,30 @@ impl FileSystemSerdes {
 
 /// # Context-Aware Engine Wiring
 ///
-/// The engine calls [`serialize_to_string_with_context`](Serdes::serialize_to_string_with_context)
-/// and [`deserialize_from_string_with_context`](Serdes::deserialize_from_string_with_context)
-/// at every serialization point, passing a [`SerdesContext`] with the operation's
-/// wire ID and execution ARN. `FileSystemSerdes` overrides these to delegate to
+/// The engine calls [`Serdes::serialize`] and [`Serdes::deserialize`] at every
+/// serialization point, passing a [`SerdesContext`] with the operation's wire
+/// ID and execution ARN. `FileSystemSerdes` implements them by delegating to
 /// [`serialize_with_context`](FileSystemSerdes::serialize_with_context) and
 /// [`deserialize_with_context`](FileSystemSerdes::deserialize_with_context),
 /// enabling deterministic file-path resolution.
 ///
-/// The context-free trait methods (`serialize_to_string`, `deserialize_from_string`)
-/// remain as fallbacks: `serialize_to_string` passes through unchanged (no file
-/// write without context), and `deserialize_from_string` detects envelope payloads
-/// and reads from files when possible (read path needs no context since the path
-/// is in the envelope).
-///
-/// Custom `Serdes` implementations that do not need context can ignore the
-/// `_with_context` methods entirely — the default trait implementations delegate
-/// to the context-free versions.
+/// There is no context-free fallback: both trait methods carry the context, so
+/// there is no path on which `FileSystemSerdes` silently declines to persist.
 impl Serdes for FileSystemSerdes {
-    fn serialize_to_string(
+    fn serialize(
         &self,
-        json_str: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // When used through the Serdes trait (without explicit context),
-        // we cannot resolve file paths. Return the JSON as-is.
-        // The context-aware path is serialize_with_context().
-        Ok(json_str.to_owned())
-    }
-
-    fn deserialize_from_string(
-        &self,
-        payload: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Attempt to parse as an envelope. If it looks like one, process it.
-        // Otherwise return as-is (passthrough for non-filesystem payloads).
-        if payload.starts_with('{')
-            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload)
-            && (parsed.get("file").is_some() || parsed.get("data").is_some())
-        {
-            // This is a filesystem serdes envelope.
-            let dummy_ctx = SerdesContext {
-                operation_id: String::new(),
-                durable_execution_arn: String::new(),
-            };
-            return self.deserialize_with_context(payload, &dummy_ctx);
-        }
-        Ok(payload.to_owned())
-    }
-
-    fn serialize_to_string_with_context(
-        &self,
-        json_str: &str,
+        value: &serde_json::Value,
         context: &SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.serialize_with_context(json_str, context)
+        self.serialize_with_context(value, context)
     }
 
-    fn deserialize_from_string_with_context(
+    fn deserialize(
         &self,
-        payload: &str,
+        data: &str,
         context: &SerdesContext,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.deserialize_with_context(payload, context)
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.deserialize_with_context(data, context)
     }
 }
 
@@ -816,26 +767,24 @@ fn json_escape_string(input: &str) -> String {
 /// Test-only serdes shared by the operation-path equivalence tests in
 /// `step`, `callback`, and `map_parallel`.
 ///
-/// The point of the shared type is that ONE `Serdes` implementation must
-/// behave identically on every operation path — step results, callback
-/// payloads, and map/parallel item results — now that all of them go through
-/// the same JSON-string transformation model.
+/// The point of the shared types is that ONE `Serdes` implementation must
+/// behave identically on every operation path — step results, invoke payloads,
+/// callback payloads, child results, and map/parallel item and batch results —
+/// now that all of them hand the serdes the same [`serde_json::Value`].
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::Serdes;
+    use super::{Serdes, SerdesContext};
     use std::sync::{Arc, Mutex};
 
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-    /// A serdes whose wire form is deliberately NOT JSON: the JSON string is
-    /// hex-encoded behind a `HEX1:` marker.
+    /// A serdes whose wire form is deliberately NOT JSON: the compact JSON
+    /// rendering of the value is hex-encoded behind a `HEX1:` marker.
     ///
     /// Two properties make this useful as a probe:
     ///
-    /// 1. It implements ONLY the string transform methods. Before the
-    ///    serialization model was normalized, `Serdes` also demanded
-    ///    `serialize(&dyn Any)` / `deserialize_bytes`, so this type would not
-    ///    have compiled.
+    /// 1. It receives the typed value as a [`serde_json::Value`], so it needs
+    ///    no per-path decoding to find the payload.
     /// 2. Plain `serde_json` cannot parse a `HEX1:`-prefixed payload, so a
     ///    successful round-trip proves the transform was actually applied and
     ///    reversed rather than incidentally bypassed by a JSON-only path.
@@ -843,24 +792,20 @@ pub(crate) mod test_support {
     pub(crate) struct HexEnvelopeSerdes;
 
     impl Serdes for HexEnvelopeSerdes {
-        fn serialize_to_string(&self, json_str: &str) -> Result<String, BoxError> {
-            Ok(hex_envelope(json_str))
+        fn serialize(
+            &self,
+            value: &serde_json::Value,
+            _context: &SerdesContext,
+        ) -> Result<String, BoxError> {
+            Ok(hex_envelope(&value.to_string()))
         }
 
-        fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
-            let hex = payload
-                .strip_prefix("HEX1:")
-                .ok_or_else(|| -> BoxError { "missing HEX1: marker".into() })?;
-            if hex.len() % 2 != 0 {
-                return Err("odd-length hex body".into());
-            }
-            let mut bytes = Vec::with_capacity(hex.len() / 2);
-            let raw = hex.as_bytes();
-            for pair in raw.chunks(2) {
-                let s = std::str::from_utf8(pair)?;
-                bytes.push(u8::from_str_radix(s, 16)?);
-            }
-            Ok(String::from_utf8(bytes)?)
+        fn deserialize(
+            &self,
+            data: &str,
+            _context: &SerdesContext,
+        ) -> Result<serde_json::Value, BoxError> {
+            Ok(serde_json::from_str(&hex_decode(data)?)?)
         }
     }
 
@@ -876,15 +821,43 @@ pub(crate) mod test_support {
         out
     }
 
-    /// An identity serdes that records every string the engine hands it.
+    /// Returns the wire form `HexEnvelopeSerdes` produces for a value, i.e.
+    /// the hex envelope of the value's compact JSON rendering.
+    pub(crate) fn hex_envelope_of(value: &serde_json::Value) -> String {
+        hex_envelope(&value.to_string())
+    }
+
+    /// Reverses [`hex_envelope`], erroring on anything that did not go
+    /// through the transform.
+    fn hex_decode(payload: &str) -> Result<String, BoxError> {
+        let hex = payload
+            .strip_prefix("HEX1:")
+            .ok_or_else(|| -> BoxError { "missing HEX1: marker".into() })?;
+        if hex.len() % 2 != 0 {
+            return Err("odd-length hex body".into());
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().chunks(2) {
+            let s = std::str::from_utf8(pair)?;
+            bytes.push(u8::from_str_radix(s, 16)?);
+        }
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    /// A `HexEnvelopeSerdes` that also records every value the engine hands it.
     ///
     /// Where `HexEnvelopeSerdes` pins the wire form a path *produces*, this
-    /// pins the shape a path *provides*: the exact `&str` passed to
-    /// `serialize_to_string`. Cloning shares the recording buffer, so a clone
-    /// can be attached to an operation while the original is inspected.
+    /// pins the shape a path *provides*: the exact [`serde_json::Value`] passed
+    /// to [`Serdes::serialize`] and the exact `Value` returned from
+    /// [`Serdes::deserialize`]. It keeps the non-JSON hex wire form, so a path
+    /// that bypassed the transform would fail rather than quietly pass.
+    ///
+    /// Cloning shares the recording buffers, so a clone can be attached to an
+    /// operation while the original is inspected.
     #[derive(Debug, Clone, Default)]
     pub(crate) struct RecordingSerdes {
-        serialize_inputs: Arc<Mutex<Vec<String>>>,
+        serialize_inputs: Arc<Mutex<Vec<serde_json::Value>>>,
+        deserialize_outputs: Arc<Mutex<Vec<serde_json::Value>>>,
     }
 
     impl RecordingSerdes {
@@ -892,33 +865,58 @@ pub(crate) mod test_support {
             Self::default()
         }
 
-        /// Every string handed to `serialize_to_string`, in call order.
-        pub(crate) fn serialize_inputs(&self) -> Vec<String> {
+        /// Every value handed to [`Serdes::serialize`], in call order.
+        pub(crate) fn serialize_inputs(&self) -> Vec<serde_json::Value> {
             self.serialize_inputs
                 .lock()
                 .map(|seen| seen.clone())
                 .unwrap_or_default()
         }
 
-        /// The distinct strings handed to `serialize_to_string`, sorted.
-        pub(crate) fn distinct_serialize_inputs(&self) -> Vec<String> {
-            let mut seen = self.serialize_inputs();
-            seen.sort();
-            seen.dedup();
-            seen
+        /// The distinct values handed to [`Serdes::serialize`], first-seen
+        /// order preserved (`serde_json::Value` is not `Ord`, so this cannot
+        /// sort-then-dedup).
+        pub(crate) fn distinct_serialize_inputs(&self) -> Vec<serde_json::Value> {
+            let mut distinct: Vec<serde_json::Value> = Vec::new();
+            for value in self.serialize_inputs() {
+                if !distinct.contains(&value) {
+                    distinct.push(value);
+                }
+            }
+            distinct
+        }
+
+        /// Every value returned from [`Serdes::deserialize`], in call order.
+        pub(crate) fn deserialize_outputs(&self) -> Vec<serde_json::Value> {
+            self.deserialize_outputs
+                .lock()
+                .map(|seen| seen.clone())
+                .unwrap_or_default()
         }
     }
 
     impl Serdes for RecordingSerdes {
-        fn serialize_to_string(&self, json_str: &str) -> Result<String, BoxError> {
+        fn serialize(
+            &self,
+            value: &serde_json::Value,
+            _context: &SerdesContext,
+        ) -> Result<String, BoxError> {
             if let Ok(mut seen) = self.serialize_inputs.lock() {
-                seen.push(json_str.to_owned());
+                seen.push(value.clone());
             }
-            Ok(json_str.to_owned())
+            Ok(hex_envelope(&value.to_string()))
         }
 
-        fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
-            Ok(payload.to_owned())
+        fn deserialize(
+            &self,
+            data: &str,
+            _context: &SerdesContext,
+        ) -> Result<serde_json::Value, BoxError> {
+            let value: serde_json::Value = serde_json::from_str(&hex_decode(data)?)?;
+            if let Ok(mut seen) = self.deserialize_outputs.lock() {
+                seen.push(value.clone());
+            }
+            Ok(value)
         }
     }
 }
@@ -975,20 +973,20 @@ mod tests {
                     .to_owned(),
         };
 
-        let input_json = r#"{"value":42,"name":"test"}"#;
+        let input = serde_json::json!({"value": 42, "name": "test"});
         let envelope = serdes
-            .serialize_with_context(input_json, &ctx)
+            .serialize_with_context(&input, &ctx)
             .expect("serialize should succeed");
 
         // Envelope should be a file pointer
         assert!(envelope.contains(r#""file""#), "envelope: {envelope}");
         assert!(!envelope.contains(r#""data""#), "envelope: {envelope}");
 
-        // Deserialize should return the original JSON
+        // Deserialize should return the original value
         let output = serdes
             .deserialize_with_context(&envelope, &ctx)
             .expect("deserialize should succeed");
-        assert_eq!(output, input_json);
+        assert_eq!(output, input);
 
         // Clean up
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1010,9 +1008,9 @@ mod tests {
                 "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e/i".to_owned(),
         };
 
-        let small_json = r#"{"x":1}"#;
+        let small = serde_json::json!({"x": 1});
         let envelope = serdes
-            .serialize_with_context(small_json, &ctx)
+            .serialize_with_context(&small, &ctx)
             .expect("serialize should succeed");
 
         // Small value should be inline
@@ -1023,7 +1021,7 @@ mod tests {
         let output = serdes
             .deserialize_with_context(&envelope, &ctx)
             .expect("deserialize should succeed");
-        assert_eq!(output, small_json);
+        assert_eq!(output, small);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1045,9 +1043,10 @@ mod tests {
         };
 
         // This will exceed the 50-byte threshold once wrapped in {"data":...}
-        let large_json = r#"{"big":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#;
+        let large =
+            serde_json::json!({"big": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"});
         let envelope = serdes
-            .serialize_with_context(large_json, &ctx)
+            .serialize_with_context(&large, &ctx)
             .expect("serialize should succeed");
 
         // Large value should overflow to file
@@ -1057,7 +1056,7 @@ mod tests {
         let output = serdes
             .deserialize_with_context(&envelope, &ctx)
             .expect("deserialize should succeed");
-        assert_eq!(output, large_json);
+        assert_eq!(output, large);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1076,9 +1075,9 @@ mod tests {
             durable_execution_arn: "some-weird-arn/with/slashes".to_owned(),
         };
 
-        let json = r#""hello""#;
+        let value = serde_json::json!("hello");
         let envelope = serdes
-            .serialize_with_context(json, &ctx)
+            .serialize_with_context(&value, &ctx)
             .expect("serialize should succeed");
 
         // File path should use SHA-256 hashes (64 hex chars)
@@ -1093,7 +1092,7 @@ mod tests {
         let output = serdes
             .deserialize_with_context(&envelope, &ctx)
             .expect("deserialize should succeed");
-        assert_eq!(output, json);
+        assert_eq!(output, value);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1127,7 +1126,7 @@ mod tests {
         };
 
         let envelope = serdes
-            .serialize_with_context("42", &ctx)
+            .serialize_with_context(&serde_json::json!(42), &ctx)
             .expect("serialize");
 
         // Parse the envelope and verify its structure
@@ -1159,7 +1158,7 @@ mod tests {
         };
 
         let envelope = serdes
-            .serialize_with_context(r#""data""#, &ctx)
+            .serialize_with_context(&serde_json::json!("data"), &ctx)
             .expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
         let path = parsed.get("file").and_then(|v| v.as_str()).unwrap();
@@ -1177,23 +1176,76 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_from_string_handles_envelope() {
+    fn deserialize_reads_inline_data_envelope() {
         let tmp = std::env::temp_dir().join("fs_serdes_test_trait");
         let _ = std::fs::remove_dir_all(&tmp);
 
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let ctx = SerdesContext::new("op", "arn:test");
 
-        // Inline envelope
+        // Inline envelope: the value is returned verbatim, not re-rendered.
         let result = serdes
-            .deserialize_from_string(r#"{"data":"hello"}"#)
+            .deserialize_with_context(r#"{"data":"hello"}"#, &ctx)
             .expect("should parse inline");
-        assert_eq!(result, r#""hello""#);
+        assert_eq!(result, serde_json::json!("hello"));
 
-        // Non-envelope JSON passes through
         let result = serdes
-            .deserialize_from_string(r#"{"value":42}"#)
-            .expect("should pass through");
-        assert_eq!(result, r#"{"value":42}"#);
+            .deserialize_with_context(r#"{"data":{"value":42}}"#, &ctx)
+            .expect("should parse inline object");
+        assert_eq!(result, serde_json::json!({"value": 42}));
+
+        // Neither 'file' nor 'data': a loud error, never a silent passthrough.
+        assert!(
+            serdes
+                .deserialize_with_context(r#"{"value":42}"#, &ctx)
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The writer no longer emits `{"raw":...}` — a `Value` is always
+    /// embeddable under `"data"` — but executions checkpointed before the
+    /// value-based boundary may still contain one, so the READ path must keep
+    /// handling it. Deleting the reader alongside the writer would strand
+    /// in-flight executions.
+    #[test]
+    fn deserialize_still_reads_legacy_raw_envelope() {
+        let serdes = FileSystemSerdes::new("/unused");
+        let ctx = SerdesContext::new("op", "arn:test");
+
+        let result = serdes
+            .deserialize_with_context(r#"{"raw":"not json at all"}"#, &ctx)
+            .expect("legacy raw envelope must still be readable");
+        assert_eq!(result, serde_json::Value::String("not json at all".into()));
+    }
+
+    /// Overflow mode must never write a `{"raw":...}` envelope now that the
+    /// input is always a `Value`.
+    #[test]
+    fn overflow_mode_never_writes_raw_envelope() {
+        let tmp = std::env::temp_dir().join("fs_serdes_test_no_raw");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let config = FileSystemSerdesConfig::builder()
+            .storage_mode(FileSystemSerdesMode::Overflow)
+            .overflow_threshold_bytes(4096)
+            .build();
+        let serdes = FileSystemSerdes::with_config(tmp.to_string_lossy().to_string(), config);
+        let ctx = SerdesContext::new("op", "arn:test");
+
+        // A bare string is the case that previously took the {"raw":...} arm.
+        let value = serde_json::json!("plain text");
+        let envelope = serdes
+            .serialize_with_context(&value, &ctx)
+            .expect("serialize");
+        assert_eq!(envelope, r#"{"data":"plain text"}"#);
+        assert_eq!(
+            serdes
+                .deserialize_with_context(&envelope, &ctx)
+                .expect("deserialize"),
+            value
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1214,9 +1266,9 @@ mod tests {
 
         // First invocation: serialize
         let serdes1 = FileSystemSerdes::new(base.clone());
-        let input = r#"{"items":[1,2,3]}"#;
+        let input = serde_json::json!({"items": [1, 2, 3]});
         let envelope = serdes1
-            .serialize_with_context(input, &ctx)
+            .serialize_with_context(&input, &ctx)
             .expect("serialize");
 
         // Second invocation (replay): deserialize from a fresh instance
@@ -1256,9 +1308,9 @@ mod tests {
                 "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/exec/inv".to_owned(),
         };
 
-        let input_json = r#"{"value":"test"}"#;
+        let input = serde_json::json!({"value": "test"});
         let envelope = serdes
-            .serialize_with_context(input_json, &ctx)
+            .serialize_with_context(&input, &ctx)
             .expect("serialize should succeed");
 
         // The envelope must be valid JSON
@@ -1270,7 +1322,7 @@ mod tests {
         let output = serdes
             .deserialize_with_context(&envelope, &ctx)
             .expect("deserialize should succeed");
-        assert_eq!(output, input_json);
+        assert_eq!(output, input);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1278,9 +1330,9 @@ mod tests {
     // ── Engine-wiring tests: context-aware path activates via trait methods ──
 
     #[test]
-    fn serialize_with_context_via_trait_writes_file() {
-        // Proves that calling the trait method `serialize_to_string_with_context`
-        // on a `Box<dyn Serdes>` holding a FileSystemSerdes activates the
+    fn serialize_via_trait_writes_file() {
+        // Proves that calling the trait method `Serdes::serialize` on a
+        // `Box<dyn Serdes>` holding a FileSystemSerdes activates the
         // context-aware file-writing path (the engine code path).
         let tmp = std::env::temp_dir().join("fs_serdes_trait_ctx_ser");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1292,10 +1344,10 @@ mod tests {
             "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/exec-1/inv-1",
         );
 
-        let input_json = r#"{"total":42}"#;
+        let input = serde_json::json!({"total": 42});
         let envelope = serdes
-            .serialize_to_string_with_context(input_json, &ctx)
-            .expect("serialize_to_string_with_context should succeed");
+            .serialize(&input, &ctx)
+            .expect("Serdes::serialize should succeed");
 
         // The envelope must be a file pointer.
         assert!(
@@ -1318,9 +1370,9 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_with_context_via_trait_reads_file() {
-        // Proves that calling the trait method `deserialize_from_string_with_context`
-        // on a `Box<dyn Serdes>` holding a FileSystemSerdes reads from the file.
+    fn deserialize_via_trait_reads_file() {
+        // Proves that calling the trait method `Serdes::deserialize` on a
+        // `Box<dyn Serdes>` holding a FileSystemSerdes reads from the file.
         let tmp = std::env::temp_dir().join("fs_serdes_trait_ctx_deser");
         let _ = std::fs::remove_dir_all(&tmp);
         let base = tmp.to_string_lossy().to_string();
@@ -1331,56 +1383,66 @@ mod tests {
             "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/exec-1/inv-1",
         );
 
-        // Write via context-aware path.
-        let input = r#"{"key":"value"}"#;
-        let envelope = serdes
-            .serialize_to_string_with_context(input, &ctx)
-            .expect("serialize");
+        // Write via the trait.
+        let input = serde_json::json!({"key": "value"});
+        let envelope = serdes.serialize(&input, &ctx).expect("serialize");
 
-        // Read back via context-aware path (same Box<dyn Serdes>).
+        // Read back via the trait (same Box<dyn Serdes>).
         let output = serdes
-            .deserialize_from_string_with_context(&envelope, &ctx)
-            .expect("deserialize_from_string_with_context should succeed");
+            .deserialize(&envelope, &ctx)
+            .expect("Serdes::deserialize should succeed");
         assert_eq!(output, input);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The shared probe serdes must be a valid `Serdes` while implementing
-    /// ONLY the string transform methods, and its transform must be exactly
+    /// only the two value methods, and its transform must be exactly
     /// reversible. It is the fixture the operation-path equivalence tests
     /// depend on, so it gets its own round-trip check.
     #[test]
     fn hex_envelope_probe_serdes_round_trips() {
-        use super::test_support::{HexEnvelopeSerdes, hex_envelope};
+        use super::test_support::{HexEnvelopeSerdes, hex_envelope_of};
 
         let serdes: Box<dyn Serdes> = Box::new(HexEnvelopeSerdes);
         let ctx = SerdesContext::new("op-1", "arn:test");
 
-        let json = r#"{"label":"a\"b\\c\nd ☃","nested":[[1,-2],[]]}"#;
-        let wire = serdes
-            .serialize_to_string_with_context(json, &ctx)
-            .expect("serialize");
-        assert_eq!(wire, hex_envelope(json));
+        let value = serde_json::json!({"label": "a\"b\\c\nd ☃", "nested": [[1, -2], []]});
+        let wire = serdes.serialize(&value, &ctx).expect("serialize");
+        assert_eq!(wire, hex_envelope_of(&value));
         // The wire form must not be parseable as JSON — that is what makes it
         // a useful probe for "was the transform actually applied?".
         assert!(serde_json::from_str::<serde_json::Value>(&wire).is_err());
 
-        let back = serdes
-            .deserialize_from_string_with_context(&wire, &ctx)
-            .expect("deserialize");
-        assert_eq!(back, json);
+        let back = serdes.deserialize(&wire, &ctx).expect("deserialize");
+        assert_eq!(back, value);
 
         // A payload that never went through the transform must be rejected
         // rather than silently passed through.
-        assert!(serdes.deserialize_from_string(json).is_err());
+        assert!(serdes.deserialize(&value.to_string(), &ctx).is_err());
     }
 
     #[test]
-    fn plain_serdes_passthrough_still_works_with_context() {
-        // Proves that a plain custom Serdes (not FileSystemSerdes) still
-        // works when the engine calls the _with_context methods — the
-        // default trait impl delegates to the context-free methods.
+    fn default_trait_methods_are_plain_json() {
+        // A serdes that overrides nothing must behave exactly like plain
+        // `serde_json`: compact rendering out, JSON parse in.
+        #[derive(Debug)]
+        struct Passthrough;
+        impl Serdes for Passthrough {}
+
+        let serdes: Box<dyn Serdes> = Box::new(Passthrough);
+        let ctx = SerdesContext::new("op-1", "arn:test");
+
+        let value = serde_json::json!({"a": [1, "two"], "b": null});
+        let wire = serdes.serialize(&value, &ctx).expect("serialize");
+        assert_eq!(wire, value.to_string());
+        assert_eq!(serdes.deserialize(&wire, &ctx).expect("deserialize"), value);
+    }
+
+    #[test]
+    fn plain_custom_serdes_receives_the_value() {
+        // Proves that a plain custom Serdes (not FileSystemSerdes) is handed
+        // the typed value, so a string payload needs no quote-stripping.
         struct UpperSerdes;
         impl Debug for UpperSerdes {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1388,32 +1450,32 @@ mod tests {
             }
         }
         impl Serdes for UpperSerdes {
-            fn serialize_to_string(
+            fn serialize(
                 &self,
-                json_str: &str,
+                value: &serde_json::Value,
+                _context: &SerdesContext,
             ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(json_str.to_uppercase())
+                let raw = value.as_str().unwrap_or_default();
+                Ok(raw.to_uppercase())
             }
-            fn deserialize_from_string(
+            fn deserialize(
                 &self,
-                payload: &str,
-            ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(payload.to_lowercase())
+                data: &str,
+                _context: &SerdesContext,
+            ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(serde_json::Value::String(data.to_lowercase()))
             }
         }
 
         let serdes: Box<dyn Serdes> = Box::new(UpperSerdes);
         let ctx = SerdesContext::new("op-1", "arn:test");
 
-        // Context-aware calls should delegate to the context-free methods.
         let result = serdes
-            .serialize_to_string_with_context("hello", &ctx)
+            .serialize(&serde_json::json!("hello"), &ctx)
             .expect("serialize");
         assert_eq!(result, "HELLO");
 
-        let result = serdes
-            .deserialize_from_string_with_context("WORLD", &ctx)
-            .expect("deserialize");
-        assert_eq!(result, "world");
+        let result = serdes.deserialize("WORLD", &ctx).expect("deserialize");
+        assert_eq!(result, serde_json::json!("world"));
     }
 }

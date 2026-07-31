@@ -1,25 +1,36 @@
 //! Conformance requirement 8-15: Parallel with a custom per-branch serde.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{Branch, DurableContext, Serdes};
+use durable::{Branch, DurableContext, Serdes, SerdesContext};
 
 /// Custom serdes that wraps strings as `{"wrapped": "value"}`.
 #[derive(Debug)]
 struct WrappedSerdes;
 
 impl Serdes for WrappedSerdes {
-    fn serialize_to_string(&self, s: &str) -> Result<String, durable::BoxError> {
-        Ok(serde_json::to_string(&serde_json::json!({"wrapped": s}))?)
+    fn serialize(
+        &self,
+        value: &serde_json::Value,
+        _context: &SerdesContext,
+    ) -> Result<String, durable::BoxError> {
+        let inner = value.as_str().unwrap_or_default();
+        Ok(serde_json::to_string(
+            &serde_json::json!({"wrapped": inner}),
+        )?)
     }
 
-    fn deserialize_from_string(&self, s: &str) -> Result<String, durable::BoxError> {
-        let v: serde_json::Value = serde_json::from_str(s)?;
+    fn deserialize(
+        &self,
+        data: &str,
+        _context: &SerdesContext,
+    ) -> Result<serde_json::Value, durable::BoxError> {
+        let v: serde_json::Value = serde_json::from_str(data)?;
         let inner = v
             .get("wrapped")
             .and_then(serde_json::Value::as_str)
             .ok_or("WrappedSerdes: missing 'wrapped' field")?
             .to_owned();
-        Ok(inner)
+        Ok(serde_json::Value::String(inner))
     }
 }
 

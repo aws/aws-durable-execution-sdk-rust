@@ -2,7 +2,7 @@
 //! Custom serializer adds "ENC:" prefix; custom deserializer strips it.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{BoxError, Serdes, WaitDecision};
+use durable::{BoxError, Serdes, SerdesContext, WaitDecision};
 use std::time::Duration;
 
 /// Custom serdes that adds/strips an "ENC:" prefix for string state.
@@ -10,20 +10,25 @@ use std::time::Duration;
 struct PrefixSerdes;
 
 impl Serdes for PrefixSerdes {
-    fn serialize_to_string(&self, json_str: &str) -> Result<String, BoxError> {
-        // json_str is a JSON-quoted string like "\"hello\"".
-        // Parse it, add prefix, re-serialize.
-        let raw: String = serde_json::from_str(json_str)?;
-        let prefixed = format!("ENC:{raw}");
-        Ok(serde_json::to_string(&prefixed)?)
+    fn serialize(
+        &self,
+        value: &serde_json::Value,
+        _context: &SerdesContext,
+    ) -> Result<String, BoxError> {
+        // The state arrives typed, so the raw string needs no JSON decode.
+        let raw = value.as_str().unwrap_or_default();
+        Ok(serde_json::to_string(&format!("ENC:{raw}"))?)
     }
 
-    fn deserialize_from_string(&self, payload: &str) -> Result<String, BoxError> {
-        // payload is a JSON-quoted string like "\"ENC:hello\"".
-        // Parse it, strip prefix, re-serialize.
-        let raw: String = serde_json::from_str(payload)?;
+    fn deserialize(
+        &self,
+        data: &str,
+        _context: &SerdesContext,
+    ) -> Result<serde_json::Value, BoxError> {
+        // `data` is a JSON-quoted string like "\"ENC:hello\"".
+        let raw: String = serde_json::from_str(data)?;
         let stripped = raw.strip_prefix("ENC:").unwrap_or(&raw).to_owned();
-        Ok(serde_json::to_string(&stripped)?)
+        Ok(serde_json::Value::String(stripped))
     }
 }
 

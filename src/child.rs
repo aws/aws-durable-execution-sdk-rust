@@ -274,16 +274,17 @@ fn serialize_value<O: Serialize>(
     serdes: Option<&dyn Serdes>,
     serdes_ctx: &SerdesContext,
 ) -> Result<String, OperationError> {
-    // First serialize to JSON string (the canonical format).
-    let json_str = serde_json::to_string(value)
+    let Some(s) = serdes else {
+        // No custom serdes: plain `serde_json` straight to the wire.
+        return serde_json::to_string(value)
+            .map_err(|e| child_internal_error(&format!("serialize result: {e}")));
+    };
+    // A custom serdes is handed the value erased to `serde_json::Value` — the
+    // same shape every other operation path provides.
+    let json_value = serde_json::to_value(value)
         .map_err(|e| child_internal_error(&format!("serialize result: {e}")))?;
-    // Apply custom serdes transformation if configured.
-    if let Some(s) = serdes {
-        s.serialize_to_string_with_context(&json_str, serdes_ctx)
-            .map_err(|e| child_internal_error(&format!("serialize result (custom): {e}")))
-    } else {
-        Ok(json_str)
-    }
+    s.serialize(&json_value, serdes_ctx)
+        .map_err(|e| child_internal_error(&format!("serialize result (custom): {e}")))
 }
 
 /// Deserializes a value using the configured serdes or JSON default.
@@ -292,14 +293,14 @@ fn deserialize_value<O: DeserializeOwned>(
     serdes: Option<&dyn Serdes>,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
-    // Apply custom serdes reverse-transformation if configured.
-    let json_str = if let Some(s) = serdes {
-        s.deserialize_from_string_with_context(payload, serdes_ctx)
-            .map_err(|e| child_internal_error(&format!("deserialize result (custom): {e}")))?
-    } else {
-        payload.to_owned()
+    let Some(s) = serdes else {
+        return serde_json::from_str(payload)
+            .map_err(|e| child_internal_error(&format!("deserialize result: {e}")));
     };
-    serde_json::from_str(&json_str)
+    let json_value = s
+        .deserialize(payload, serdes_ctx)
+        .map_err(|e| child_internal_error(&format!("deserialize result (custom): {e}")))?;
+    serde_json::from_value(json_value)
         .map_err(|e| child_internal_error(&format!("deserialize result: {e}")))
 }
 

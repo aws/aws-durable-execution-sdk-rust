@@ -462,7 +462,7 @@ pub struct InvokeBuilder<O> {
     op_id: OperationId,
     name: Option<String>,
     function_id: String,
-    serialized_input: Result<String, String>,
+    erased_input: Result<serde_json::Value, String>,
     payload_serdes: Option<Box<dyn Serdes>>,
     result_serdes: Option<Box<dyn Serdes>>,
     tenant_id: Option<String>,
@@ -484,14 +484,14 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
         ctx: DurableContext,
         op_id: OperationId,
         function_id: String,
-        serialized_input: Result<String, String>,
+        erased_input: Result<serde_json::Value, String>,
     ) -> Self {
         Self {
             ctx,
             op_id,
             name: None,
             function_id,
-            serialized_input,
+            erased_input,
             payload_serdes: None,
             result_serdes: None,
             tenant_id: None,
@@ -531,8 +531,7 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
     /// # #[derive(Debug)]
     /// # struct UpperSerdes;
     /// # impl durable::Serdes for UpperSerdes {
-    /// #     fn serialize_to_string(&self, s: &str) -> Result<String, durable::BoxError> { Ok(s.to_uppercase()) }
-    /// #     fn deserialize_from_string(&self, s: &str) -> Result<String, durable::BoxError> { Ok(s.to_owned()) }
+    /// #     fn serialize(&self, v: &serde_json::Value, _c: &durable::SerdesContext) -> Result<String, durable::BoxError> { Ok(v.to_string().to_uppercase()) }
     /// # }
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -598,7 +597,7 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> IntoFuture for InvokeBuild
             op_id: self.op_id,
             name: self.name,
             function_id: self.function_id,
-            serialized_input: self.serialized_input,
+            erased_input: self.erased_input,
             payload_serdes: self.payload_serdes,
             result_serdes: self.result_serdes,
             tenant_id: self.tenant_id,
