@@ -19,3 +19,8 @@
 .DS_Store
 Thumbs.db
 tokio_join_test
+
+# Agent scratch space. Kept on disk so a later step can read an earlier
+# step's notes, never committed.
+.agents/
+.kiro/
