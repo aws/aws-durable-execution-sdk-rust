@@ -31,7 +31,6 @@ use aws_sdk_lambda::types::OperationUpdate;
 use tokio::sync::Mutex;
 
 /// Shared inner state for a durable execution context.
-#[derive(Debug)]
 struct Inner {
     execution_arn: String,
     lambda_context: lambda_runtime::Context,
@@ -72,6 +71,20 @@ struct Inner {
     replay_span: tracing::Span,
 }
 
+impl std::fmt::Debug for Inner {
+    /// Hand-written to keep `checkpoint_token` — a credential-like value —
+    /// out of log output, and to skip the engine/client/signal internals
+    /// that make a derived impl unreadable. See issue #30.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("execution_arn", &self.execution_arn)
+            .field("parent_wire_id", &self.parent_wire_id)
+            .field("is_replaying", &self.engine.is_replaying())
+            .field("checkpoint_token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
 /// The durable execution context — a cheap-to-clone handle providing access
 /// to all durable operations.
 ///
@@ -100,9 +113,23 @@ struct Inner {
 ///     Ok(result)
 /// }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DurableContext {
     inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for DurableContext {
+    /// Hand-written so `tracing::debug!(?ctx)` in a handler cannot leak the
+    /// checkpoint token into `CloudWatch` Logs: the token prints as
+    /// `"<redacted>"` and engine/client internals are skipped. See issue #30.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableContext")
+            .field("execution_arn", &self.inner.execution_arn)
+            .field("parent_wire_id", &self.inner.parent_wire_id)
+            .field("is_replaying", &self.inner.engine.is_replaying())
+            .field("checkpoint_token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl DurableContext {
@@ -2229,6 +2256,42 @@ mod tests {
         assert!(
             ctx.suspension_signal().fatal_error().is_none(),
             "a passing validation must not record a fatal error"
+        );
+    }
+
+    // ── Debug redaction tests ───────────────────────────────────────────
+
+    #[test]
+    fn debug_output_redacts_checkpoint_token() {
+        let secret_token = "super-secret-credential-value-12345";
+        let log = Arc::new(CheckpointLog::empty());
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:123456789012:function:my-fn".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+            client,
+            secret_token.to_owned(),
+        );
+
+        let debug_output = format!("{ctx:?}");
+
+        // The actual token value MUST NOT appear in debug output.
+        assert!(
+            !debug_output.contains(secret_token),
+            "checkpoint_token value leaked in Debug output: {debug_output}"
+        );
+
+        // The redacted placeholder MUST appear.
+        assert!(
+            debug_output.contains("<redacted>"),
+            "expected '<redacted>' in Debug output: {debug_output}"
+        );
+
+        // Useful fields MUST be present.
+        assert!(
+            debug_output.contains("arn:aws:lambda:us-east-1:123456789012:function:my-fn"),
+            "expected execution_arn in Debug output: {debug_output}"
         );
     }
 }
