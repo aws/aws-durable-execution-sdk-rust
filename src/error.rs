@@ -107,6 +107,9 @@ pub enum OperationErrorKind {
     ChildContext(ChildContextError),
     /// A combinator operation failed.
     Combinator(CombinatorError),
+    /// The handler produced operations in a different order than the
+    /// checkpointed history — the execution is non-deterministic.
+    NonDeterministicExecution(NonDeterministicExecutionError),
 }
 
 impl fmt::Display for OperationErrorKind {
@@ -118,6 +121,7 @@ impl fmt::Display for OperationErrorKind {
             Self::WaitForCondition(e) => write!(f, "wait_for_condition: {e}"),
             Self::ChildContext(e) => write!(f, "child_context: {e}"),
             Self::Combinator(e) => write!(f, "combinator: {e}"),
+            Self::NonDeterministicExecution(e) => write!(f, "non_deterministic_execution: {e}"),
         }
     }
 }
@@ -131,6 +135,7 @@ impl std::error::Error for OperationErrorKind {
             Self::WaitForCondition(e) => Some(e),
             Self::ChildContext(e) => Some(e),
             Self::Combinator(e) => Some(e),
+            Self::NonDeterministicExecution(e) => Some(e),
         }
     }
 }
@@ -713,6 +718,104 @@ impl fmt::Display for CombinatorErrorKind {
 
 impl std::error::Error for CombinatorErrorKind {}
 
+// --- NonDeterministicExecutionError ---
+
+/// Error raised when a replay operation does not match the checkpointed
+/// history — the handler produced operations in a different order between
+/// invocations.
+///
+/// This is a fatal, non-recoverable error: the execution must be failed and
+/// cannot be retried without resetting the checkpoint log.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::{
+///     NonDeterministicExecutionError, NonDeterministicExecutionErrorKind,
+/// };
+///
+/// fn check_nondeterminism(err: &NonDeterministicExecutionError) {
+///     match err.kind() {
+///         NonDeterministicExecutionErrorKind::OperationMismatch { wire_id, .. } => {
+///             tracing::error!(%wire_id, "non-deterministic replay detected");
+///         }
+///         _ => {}
+///     }
+/// }
+/// ```
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct NonDeterministicExecutionError {
+    kind: NonDeterministicExecutionErrorKind,
+}
+
+impl NonDeterministicExecutionError {
+    /// Returns the specific kind of non-determinism error.
+    #[must_use]
+    pub fn kind(&self) -> &NonDeterministicExecutionErrorKind {
+        &self.kind
+    }
+
+    /// Creates a `NonDeterministicExecutionError` from its kind (internal).
+    #[allow(dead_code)] // reason: used by validate_replay_identity
+    pub(crate) fn from_kind(kind: NonDeterministicExecutionErrorKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl fmt::Display for NonDeterministicExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.kind)
+    }
+}
+
+impl std::error::Error for NonDeterministicExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.kind)
+    }
+}
+
+/// Specific kinds of non-deterministic execution failures.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::NonDeterministicExecutionErrorKind;
+/// ```
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum NonDeterministicExecutionErrorKind {
+    /// The claimed operation's identity (type, sub-type, or name) does not
+    /// match the checkpointed record at the same positional slot.
+    OperationMismatch {
+        /// The wire ID (SHA-256 hex) of the positional slot.
+        wire_id: String,
+        /// Human-readable description of what was expected (from the
+        /// checkpoint log).
+        expected: String,
+        /// Human-readable description of what the handler claimed.
+        actual: String,
+    },
+}
+
+impl fmt::Display for NonDeterministicExecutionErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OperationMismatch {
+                wire_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "operation at wire id {wire_id} does not match checkpoint: \
+                 expected {expected}, got {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NonDeterministicExecutionErrorKind {}
+
 // --- ChildFnError ---
 
 /// Crate-internal error carrier for `run_in_child_context`, `parallel`, and
@@ -774,6 +877,8 @@ const _: () = {
         assert_send_sync_static::<ChildContextErrorKind>();
         assert_send_sync_static::<CombinatorError>();
         assert_send_sync_static::<CombinatorErrorKind>();
+        assert_send_sync_static::<NonDeterministicExecutionError>();
+        assert_send_sync_static::<NonDeterministicExecutionErrorKind>();
         assert_send_sync_static::<ChildFnError>();
         assert_send_sync_static::<crate::FileSystemSerdesError>();
     }
@@ -870,6 +975,15 @@ mod tests {
                     message: "x".to_owned(),
                 },
             ))),
+            OperationError::from_kind(OperationErrorKind::NonDeterministicExecution(
+                NonDeterministicExecutionError::from_kind(
+                    NonDeterministicExecutionErrorKind::OperationMismatch {
+                        wire_id: "abc123".to_owned(),
+                        expected: "Step/Step".to_owned(),
+                        actual: "Wait/Wait".to_owned(),
+                    },
+                ),
+            )),
         ];
         for err in &cases {
             let chain = causal_chain(err);

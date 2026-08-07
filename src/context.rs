@@ -21,7 +21,10 @@ use crate::builders::{
 use crate::client::{CheckpointOutput, ClientError, ExecutionClient};
 use crate::driver::{SuspensionSignal, TaskOwnership};
 use crate::engine::{CheckpointLog, CheckpointRecord, EngineState, OperationId};
-use crate::error::{ChildFnError, OperationError, OperationErrorKind, StepError, StepErrorKind};
+use crate::error::{
+    ChildFnError, NonDeterministicExecutionError, NonDeterministicExecutionErrorKind,
+    OperationError, OperationErrorKind, StepError, StepErrorKind,
+};
 use crate::future::{Branch, DurableFuture};
 
 use aws_sdk_lambda::types::OperationUpdate;
@@ -351,6 +354,143 @@ impl DurableContext {
         // because parse_inline_operations uses the Id field from the backend.
         let wire_id = crate::engine::compute_wire_id_public(positional_id);
         self.inner.engine.checkpoint_log.get(&wire_id)
+    }
+
+    /// Eagerly validates a claimed operation's replay identity against the
+    /// checkpoint log, BEFORE the operation future first runs.
+    ///
+    /// Builders call this when they are finalized into a
+    /// [`crate::DurableFuture`] (`.future()`, `.spawn()`, or `.await` via
+    /// `IntoFuture`). Validating at finalization instead of first poll makes
+    /// fatal propagation scheduler-independent: a short-circuiting combinator
+    /// (`select_ok`, `race`, `try_join_all`) aborts losers as soon as a
+    /// winner settles, so a mismatching constituent might otherwise never be
+    /// polled and the mismatch never recorded. The fatal slot is written
+    /// synchronously here (inside [`Self::validate_replay_identity`]), so the
+    /// invocation driver fails the execution with the dedicated error no
+    /// matter which sibling settles first.
+    ///
+    /// A position with no checkpoint record is live (nothing to validate),
+    /// and a matching identity is a no-op — an unchanged handler behaves
+    /// identically.
+    pub(crate) fn preflight_replay_identity(
+        &self,
+        op_id: &OperationId,
+        claimed_type: &str,
+        claimed_sub_type: Option<&str>,
+        claimed_name: Option<&str>,
+    ) -> Result<(), OperationError> {
+        if let Some(record) = self.checkpoint_record(op_id.positional()) {
+            self.validate_replay_identity(
+                &record,
+                op_id.wire(),
+                claimed_type,
+                claimed_sub_type,
+                claimed_name,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Validates that the claimed operation's identity matches the
+    /// checkpoint record. On mismatch, returns a
+    /// `NonDeterministicExecution` error.
+    ///
+    /// `claimed_type` is the operation type string the SDK sends to the
+    /// backend (e.g. `Step`, `Wait`, `Context`, `ChainedInvoke`,
+    /// `Callback`).
+    ///
+    /// `claimed_sub_type` is the sub-type (e.g. `Step`, `Wait`, `Map`,
+    /// `RunInChildContext`) or `None` for operations without a sub-type.
+    ///
+    /// `claimed_name` is the user-supplied `.name("...")` or `None`.
+    pub(crate) fn validate_replay_identity(
+        &self,
+        record: &CheckpointRecord,
+        wire_id: &str,
+        claimed_type: &str,
+        claimed_sub_type: Option<&str>,
+        claimed_name: Option<&str>,
+    ) -> Result<(), OperationError> {
+        // A record without a stored operation type predates identity
+        // recording (legacy checkpoint) — there is genuinely nothing to
+        // validate against, so skip. This is the ONLY lenient path; once a
+        // record carries identity, every field is compared in full.
+        let Some(expected_type) = record.op_type.as_deref() else {
+            return Ok(());
+        };
+
+        let mismatch = || {
+            let err = OperationError::from_kind(OperationErrorKind::NonDeterministicExecution(
+                NonDeterministicExecutionError::from_kind(
+                    NonDeterministicExecutionErrorKind::OperationMismatch {
+                        wire_id: wire_id.to_owned(),
+                        expected: format_op_identity(
+                            expected_type,
+                            record.sub_type.as_deref(),
+                            record.op_name.as_deref(),
+                        ),
+                        actual: format_op_identity(claimed_type, claimed_sub_type, claimed_name),
+                    },
+                ),
+            ));
+            // A replay identity mismatch is execution-fatal: record it on the
+            // shared slot so the invocation driver fails the execution with
+            // the dedicated error even if this `Err` is swallowed on its way
+            // up — stored as a rejected outcome by `join_all`, out-raced by a
+            // sibling's success in `select_ok`, stringified through a
+            // child-context boundary, or tolerated by a map/parallel
+            // completion config.
+            self.inner
+                .suspension_signal
+                .record_fatal("NonDeterministicExecutionError".to_owned(), err.to_string());
+            err
+        };
+
+        // Compare canonicalized types: the checkpoint log stores PascalCase
+        // on the typed SDK path but the raw wire form (e.g.
+        // `CHAINED_INVOKE`) on the inline JSON envelope path, so both sides
+        // canonicalize through `OperationType` before comparison.
+        if canonical_op_type(expected_type) != canonical_op_type(claimed_type) {
+            return Err(mismatch());
+        }
+
+        // Sub-type is compared as a complete Option in both directions: a
+        // stored sub-type with no claimed sub-type (or the reverse) is a
+        // mismatch, not a skip. Otherwise a reordered same-type operation
+        // could consume the wrong checkpoint silently.
+        let sub_type_matches = match (record.sub_type.as_deref(), claimed_sub_type) {
+            (Some(expected), Some(claimed)) => expected.eq_ignore_ascii_case(claimed),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if !sub_type_matches {
+            return Err(mismatch());
+        }
+
+        // Name is likewise compared as a complete Option in both directions.
+        // Adding or removing `.name(...)` between runs changes the operation's
+        // replay identity and must be flagged, for the same reason as above.
+        //
+        // Empty names are normalized to `None` on BOTH sides before the
+        // comparison: the checkpoint builders deliberately omit the `Name`
+        // field when the string is empty (see `build_child_update` in
+        // `map_parallel`), so the record stores `None` where the claim
+        // computes `Some("")` — e.g. a map `item_namer` or a parallel
+        // `Branch` whose name is the empty string. Without normalization an
+        // UNCHANGED handler would be rejected on resume.
+        let claimed_name = claimed_name.filter(|n| !n.is_empty());
+        let expected_name = record.op_name.as_deref().filter(|n| !n.is_empty());
+        let name_matches = match (expected_name, claimed_name) {
+            (Some(expected), Some(claimed)) => expected == claimed,
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if !name_matches {
+            return Err(mismatch());
+        }
+
+        Ok(())
     }
 
     /// Requests suspension of THIS context's scope (used by operations that
@@ -1103,11 +1243,60 @@ impl StepContext {
     }
 }
 
+/// Canonicalizes an operation type string to the service wire format via
+/// [`aws_sdk_lambda::types::OperationType`].
+///
+/// Operation types reach the SDK in two spellings: the typed SDK path
+/// stores `PascalCase` (`ChainedInvoke`, from `operation_type_to_string`),
+/// while the inline JSON envelope path stores the raw wire value
+/// (`CHAINED_INVOKE`, the `OperationType::as_str()` form). A plain
+/// case-insensitive comparison misses the underscore, so both spellings
+/// are converted to `SCREAMING_SNAKE` and round-tripped through
+/// `OperationType` before comparison. Unknown types canonicalize to their
+/// `SCREAMING_SNAKE` form, which keeps genuine mismatches detectable.
+fn canonical_op_type(raw: &str) -> String {
+    // PascalCase → SCREAMING_SNAKE: insert `_` at lower→upper boundaries,
+    // then uppercase. Already-wire values (all caps + underscores) pass
+    // through unchanged because they contain no lower→upper boundary.
+    let mut screaming = String::with_capacity(raw.len() + 4);
+    let mut prev_is_lower = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_uppercase() && prev_is_lower {
+            screaming.push('_');
+        }
+        prev_is_lower = ch.is_ascii_lowercase();
+        screaming.push(ch.to_ascii_uppercase());
+    }
+    // Round-trip through the SDK enum so every known type lands on the
+    // exact canonical wire constant (`OperationType::as_str()`).
+    aws_sdk_lambda::types::OperationType::from(screaming.as_str())
+        .as_str()
+        .to_owned()
+}
+/// Formats an operation's identity as a human-readable string for error
+/// messages (e.g. `"Step/Step named \"fetch-name\""` or `"Wait/Wait"`).
+fn format_op_identity(op_type: &str, sub_type: Option<&str>, name: Option<&str>) -> String {
+    let mut s = String::with_capacity(64);
+    s.push_str(op_type);
+    if let Some(sub) = sub_type {
+        s.push('/');
+        s.push_str(sub);
+    }
+    if let Some(n) = name {
+        s.push_str(" named \"");
+        s.push_str(n);
+        s.push('"');
+    }
+    s
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used)] // reason: test assertions — panics are acceptable
+#[allow(clippy::unwrap_used)] // reason: test assertions
 mod tests {
     use super::*;
     use crate::client::{InMemoryExecutionClient, TestResponse, operations_to_checkpoint_log};
-    use crate::engine::CheckpointLog;
+    use crate::engine::{CheckpointLog, CheckpointStatus};
     use aws_sdk_lambda::types::Operation;
     use std::sync::Arc;
 
@@ -1394,6 +1583,540 @@ mod tests {
         #[allow(clippy::unwrap_used)]
         let r2 = log.get("step-2").unwrap();
         assert_eq!(r2.result.as_deref(), Some("\"result-2\""));
-        assert_eq!(r2.status, crate::engine::CheckpointStatus::Succeeded);
+        assert_eq!(r2.status, CheckpointStatus::Succeeded);
+    }
+
+    // ── Non-determinism detection tests ─────────────────────────────────
+
+    #[test]
+    fn validate_replay_identity_passes_when_types_match() {
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+        let record = CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: Some("42".to_owned()),
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            op_name: Some("my-step".to_owned()),
+        };
+
+        let result =
+            ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), Some("my-step"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_replay_identity_fails_on_type_mismatch() {
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+        let record = CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            op_name: None,
+        };
+
+        // Claimed as Wait but checkpointed as Step → error
+        let result = ctx.validate_replay_identity(&record, "wire-1", "Wait", Some("Wait"), None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::NonDeterministicExecution(_)
+        ));
+        let display = err.to_string();
+        assert!(
+            display.contains("Step"),
+            "expected Step in error: {display}"
+        );
+        assert!(
+            display.contains("Wait"),
+            "expected Wait in error: {display}"
+        );
+    }
+
+    #[test]
+    fn validate_replay_identity_fails_on_subtype_mismatch() {
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+        let record = CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            op_name: None,
+        };
+
+        // Same op_type but different sub_type → error
+        let result =
+            ctx.validate_replay_identity(&record, "wire-1", "Step", Some("WaitForCondition"), None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::NonDeterministicExecution(_)
+        ));
+    }
+
+    #[test]
+    fn validate_replay_identity_fails_on_name_mismatch() {
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+        let record = CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            op_name: Some("fetch-user".to_owned()),
+        };
+
+        // Same type but different name → error
+        let result = ctx.validate_replay_identity(
+            &record,
+            "wire-1",
+            "Step",
+            Some("Step"),
+            Some("fetch-order"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let display = err.to_string();
+        assert!(
+            display.contains("fetch-user"),
+            "expected name in error: {display}"
+        );
+        assert!(
+            display.contains("fetch-order"),
+            "expected claimed name in error: {display}"
+        );
+    }
+
+    #[test]
+    fn validate_replay_identity_skips_when_no_identity_stored() {
+        // Backwards compatibility: old checkpoint data has no identity fields.
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+        let record = CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: Some("1".to_owned()),
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        };
+
+        // Even though claimed type differs, validation passes because the
+        // record has no identity to compare against.
+        let result = ctx.validate_replay_identity(&record, "wire-1", "Wait", Some("Wait"), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_replay_identity_case_insensitive_type_match() {
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+        let record = CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("STEP".to_owned()),
+            sub_type: Some("STEP".to_owned()),
+            op_name: None,
+        };
+
+        // Wire format uses UPPER_CASE — validation is case-insensitive.
+        let result = ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), None);
+        assert!(result.is_ok());
+    }
+
+    /// Regression test (issue #6): the inline JSON envelope path stores the
+    /// raw wire value `CHAINED_INVOKE` (with underscore) while the SDK
+    /// claims `ChainedInvoke` (`PascalCase`). A case-insensitive comparison
+    /// alone rejects every non-paginated replayed invoke as
+    /// non-deterministic; canonicalization must accept it.
+    #[test]
+    fn validate_replay_identity_inline_chained_invoke_replay_matches() {
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+        let record = CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: Some("\"ok\"".to_owned()),
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            // Exactly what parse_single_operation stores from the inline
+            // envelope: the raw wire `Type` value.
+            op_type: Some("CHAINED_INVOKE".to_owned()),
+            sub_type: Some("ChainedInvoke".to_owned()),
+            op_name: None,
+        };
+
+        let result = ctx.validate_replay_identity(
+            &record,
+            "wire-1",
+            "ChainedInvoke",
+            Some("ChainedInvoke"),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "inline CHAINED_INVOKE record must match claimed ChainedInvoke: {result:?}"
+        );
+    }
+
+    /// Canonicalization must not weaken detection: a genuinely different
+    /// type still mismatches after canonicalization.
+    #[test]
+    fn validate_replay_identity_canonicalized_types_still_mismatch() {
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+        let record = CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("CHAINED_INVOKE".to_owned()),
+            sub_type: Some("ChainedInvoke".to_owned()),
+            op_name: None,
+        };
+
+        let result =
+            ctx.validate_replay_identity(&record, "wire-1", "Step", Some("ChainedInvoke"), None);
+        assert!(
+            result.is_err(),
+            "Step claimed against CHAINED_INVOKE record must mismatch"
+        );
+    }
+
+    /// Both spellings of every known operation type canonicalize to the
+    /// same wire constant, and unknown types stay distinguishable.
+    #[test]
+    fn canonical_op_type_bridges_wire_and_pascal_spellings() {
+        for (pascal, wire) in [
+            ("Callback", "CALLBACK"),
+            ("ChainedInvoke", "CHAINED_INVOKE"),
+            ("Context", "CONTEXT"),
+            ("Execution", "EXECUTION"),
+            ("Step", "STEP"),
+            ("Wait", "WAIT"),
+        ] {
+            assert_eq!(
+                canonical_op_type(pascal),
+                canonical_op_type(wire),
+                "{pascal} and {wire} must canonicalize identically"
+            );
+        }
+        assert_ne!(
+            canonical_op_type("Step"),
+            canonical_op_type("ChainedInvoke"),
+            "distinct types must stay distinct"
+        );
+    }
+
+    /// Builds a checkpoint record carrying full identity fields for the
+    /// Some↔None conformance tests below.
+    fn record_with_identity(
+        op_type: Option<&str>,
+        sub_type: Option<&str>,
+        op_name: Option<&str>,
+    ) -> CheckpointRecord {
+        CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: op_type.map(ToOwned::to_owned),
+            sub_type: sub_type.map(ToOwned::to_owned),
+            op_name: op_name.map(ToOwned::to_owned),
+        }
+    }
+
+    fn test_ctx() -> DurableContext {
+        DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+        )
+    }
+
+    #[test]
+    fn validate_replay_identity_fails_when_stored_name_removed() {
+        // Record was checkpointed with a name; the claim carries none.
+        // Removing `.name(...)` changes replay identity and must be flagged,
+        // otherwise a reordered unnamed same-type operation could consume
+        // this checkpoint silently.
+        let ctx = test_ctx();
+        let record = record_with_identity(Some("Step"), Some("Step"), Some("my-step"));
+
+        let result = ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), None);
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::NonDeterministicExecution(_)
+        ));
+        let display = err.to_string();
+        assert!(
+            display.contains("my-step"),
+            "expected stored name in error: {display}"
+        );
+    }
+
+    #[test]
+    fn validate_replay_identity_fails_when_name_added() {
+        // Record was checkpointed without a name (but with identity); the
+        // claim now carries one. The None↔Some direction is a mismatch too.
+        let ctx = test_ctx();
+        let record = record_with_identity(Some("Step"), Some("Step"), None);
+
+        let result =
+            ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), Some("new-name"));
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::NonDeterministicExecution(_)
+        ));
+        let display = err.to_string();
+        assert!(
+            display.contains("new-name"),
+            "expected claimed name in error: {display}"
+        );
+    }
+
+    #[test]
+    fn validate_replay_identity_fails_when_subtype_dropped() {
+        // Sub-type is compared as a complete Option in both directions.
+        let ctx = test_ctx();
+        let record = record_with_identity(Some("Context"), Some("Map"), None);
+
+        let result = ctx.validate_replay_identity(&record, "wire-1", "Context", None, None);
+        assert!(
+            result.is_err(),
+            "expected mismatch when stored sub-type is dropped from the claim"
+        );
+
+        // And the reverse direction: record without a sub-type, claim with one.
+        let record = record_with_identity(Some("Context"), None, None);
+        let result = ctx.validate_replay_identity(&record, "wire-1", "Context", Some("Map"), None);
+        assert!(
+            result.is_err(),
+            "expected mismatch when a sub-type is added to the claim"
+        );
+    }
+
+    #[test]
+    fn validate_replay_identity_legacy_record_skips_name_and_subtype() {
+        // A record genuinely lacking identity (no op_type) is the ONLY
+        // lenient path: nothing is compared, whatever the claim carries.
+        let ctx = test_ctx();
+        let record = record_with_identity(None, None, None);
+
+        let result =
+            ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), Some("any-name"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_replay_identity_empty_claimed_name_matches_stored_none() {
+        // The checkpoint builders omit `Name` when the string is empty, so
+        // the record stores `None` where the claim computes `Some("")` — a
+        // map `item_namer` or parallel `Branch` with an empty name. An
+        // unchanged handler must NOT be rejected on resume.
+        let ctx = test_ctx();
+        let record = record_with_identity(Some("Context"), Some("MapIteration"), None);
+
+        let result = ctx.validate_replay_identity(
+            &record,
+            "wire-1",
+            "Context",
+            Some("MapIteration"),
+            Some(""),
+        );
+        assert!(
+            result.is_ok(),
+            "claimed empty name must match a stored None: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_replay_identity_empty_stored_name_matches_claimed_none() {
+        // The reverse direction: a backend that stored an empty name string
+        // must match a claim carrying no name.
+        let ctx = test_ctx();
+        let record = record_with_identity(Some("Step"), Some("Step"), Some(""));
+
+        let result = ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), None);
+        assert!(
+            result.is_ok(),
+            "stored empty name must match a claimed None: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_replay_identity_empty_name_still_mismatches_real_name() {
+        // Normalization must not weaken detection: an empty claim against a
+        // real stored name (and the reverse) is still a mismatch.
+        let ctx = test_ctx();
+        let record = record_with_identity(Some("Step"), Some("Step"), Some("real"));
+        let result =
+            ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), Some(""));
+        assert!(
+            result.is_err(),
+            "empty claim vs stored 'real' must mismatch"
+        );
+
+        let record = record_with_identity(Some("Step"), Some("Step"), None);
+        let result =
+            ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), Some("real"));
+        assert!(
+            result.is_err(),
+            "claimed 'real' vs stored None must mismatch"
+        );
+    }
+
+    #[test]
+    fn validate_replay_identity_mismatch_records_fatal_error() {
+        // A mismatch must record the execution-fatal error on the shared
+        // suspension-signal slot so the invocation driver fails the execution
+        // even when the returned `Err` is swallowed downstream.
+        let ctx = test_ctx();
+        let record = record_with_identity(Some("Step"), Some("Step"), Some("alpha"));
+
+        assert!(
+            ctx.suspension_signal().fatal_error().is_none(),
+            "no fatal recorded before validation"
+        );
+        let result =
+            ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), Some("beta"));
+        assert!(result.is_err());
+
+        let fatal = ctx
+            .suspension_signal()
+            .fatal_error()
+            .expect("mismatch must record a fatal error");
+        assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
+        assert!(
+            fatal.error_message.contains("alpha") && fatal.error_message.contains("beta"),
+            "fatal message must name both identities: {}",
+            fatal.error_message
+        );
+    }
+
+    #[test]
+    fn validate_replay_identity_pass_records_no_fatal() {
+        let ctx = test_ctx();
+        let record = record_with_identity(Some("Step"), Some("Step"), Some("same"));
+
+        let result =
+            ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), Some("same"));
+        assert!(result.is_ok());
+        assert!(
+            ctx.suspension_signal().fatal_error().is_none(),
+            "a passing validation must not record a fatal error"
+        );
     }
 }

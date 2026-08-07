@@ -15,6 +15,34 @@ use crate::error::OperationError;
 use crate::future::DurableFuture;
 use crate::{CompletionConfig, RetryStrategy, Serdes, Settled, WaitStrategy};
 
+/// Eagerly validates the builder's claimed replay identity when the builder
+/// is finalized into a [`DurableFuture`].
+///
+/// Every `into_future` runs this FIRST — and `.future()`, `.spawn()`, and
+/// `.await` all funnel through `into_future` — so a replay identity mismatch
+/// is recorded on the execution-fatal slot synchronously at finalization,
+/// before the operation future is ever polled. This is what makes fatal
+/// propagation scheduler-independent: a short-circuiting combinator
+/// (`select_ok`, `race`, `try_join_all`) aborts losers the moment a winner
+/// settles, so a mismatching constituent might never be polled — but by then
+/// its identity was already validated here.
+///
+/// On mismatch the returned future resolves immediately with the dedicated
+/// error and never runs the operation (no START is checkpointed for an
+/// operation the recorded history contradicts).
+macro_rules! preflight_identity {
+    ($builder:expr, $claimed_type:expr, $sub_type:expr) => {
+        if let Err(err) = $builder.ctx.preflight_replay_identity(
+            &$builder.op_id,
+            $claimed_type,
+            Some($sub_type),
+            $builder.name.as_deref(),
+        ) {
+            return DurableFuture::from_async(async move { Err(err) });
+        }
+    };
+}
+
 /// The body shared by every builder's `.spawn()` terminal.
 ///
 /// Rebinds the builder's context onto a FRESH child suspension scope, then
@@ -301,6 +329,8 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     fn into_future(self) -> Self::IntoFuture {
         use crate::step::StepExecution;
 
+        preflight_identity!(self, "Step", crate::step::STEP_SUB_TYPE);
+
         let closure = self.closure.unwrap_or_else(|| {
             // If no closure was provided (shouldn't happen in normal use),
             // produce an immediate error.
@@ -413,6 +443,8 @@ impl IntoFuture for WaitBuilder {
 
     fn into_future(self) -> Self::IntoFuture {
         use crate::wait::WaitExecution;
+
+        preflight_identity!(self, "Wait", crate::wait::WAIT_SUB_TYPE);
 
         let execution = WaitExecution {
             ctx: self.ctx,
@@ -592,6 +624,12 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> IntoFuture for InvokeBuild
     fn into_future(self) -> Self::IntoFuture {
         use crate::invoke::InvokeExecution;
 
+        preflight_identity!(
+            self,
+            "ChainedInvoke",
+            crate::invoke::CHAINED_INVOKE_SUB_TYPE
+        );
+
         let execution = InvokeExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -758,6 +796,8 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
     fn into_future(self) -> Self::IntoFuture {
         use crate::child::ChildExecution;
+
+        preflight_identity!(self, "Context", crate::child::CHILD_SUB_TYPE);
 
         let closure = self.closure.unwrap_or_else(|| {
             Box::new(|_| {
@@ -1002,6 +1042,8 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
     fn into_future(self) -> Self::IntoFuture {
         use crate::wait_for_condition::WaitForConditionExecution;
 
+        preflight_identity!(self, "Step", crate::wait_for_condition::WFC_SUB_TYPE);
+
         let check = self
             .check
             .unwrap_or_else(|| Box::new(|_ctx, state| Box::pin(async move { Ok(state) })));
@@ -1137,6 +1179,8 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> IntoFuture for CreateCallb
 
     fn into_future(self) -> Self::IntoFuture {
         use crate::callback::CreateCallbackExecution;
+
+        preflight_identity!(self, "Callback", crate::callback::CALLBACK_SUB_TYPE);
 
         let execution = CreateCallbackExecution {
             ctx: self.ctx,
@@ -1321,6 +1365,8 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
     fn into_future(self) -> Self::IntoFuture {
         use crate::callback::WaitForCallbackExecution;
+
+        preflight_identity!(self, "Context", crate::callback::WFCB_SUB_TYPE);
 
         // The submitter is required — if somehow missing (shouldn't happen
         // since context.rs always provides it), use a no-op.
@@ -1602,6 +1648,8 @@ impl<
     fn into_future(self) -> Self::IntoFuture {
         use crate::map_parallel::MapExecution;
 
+        preflight_identity!(self, "Context", crate::map_parallel::MAP_SUB_TYPE);
+
         let closure = self.closure.unwrap_or_else(|| {
             std::sync::Arc::new(|_ctx, _item, _idx| {
                 Box::pin(async { Err(crate::error::ChildFnError::new("map has no closure")) })
@@ -1807,6 +1855,8 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     fn into_future(self) -> Self::IntoFuture {
         use crate::map_parallel::ParallelExecution;
 
+        preflight_identity!(self, "Context", crate::map_parallel::PARALLEL_SUB_TYPE);
+
         let execution = ParallelExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -1919,6 +1969,8 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::TryJoinAllExecution;
 
+        preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+
         let execution = TryJoinAllExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -2023,6 +2075,8 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::JoinAllExecution;
 
+        preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+
         let execution = JoinAllExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -2124,6 +2178,8 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::SelectOkExecution;
 
+        preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+
         let execution = SelectOkExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -2224,6 +2280,8 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
     fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::RaceExecution;
+
+        preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
 
         let execution = RaceExecution {
             ctx: self.ctx,

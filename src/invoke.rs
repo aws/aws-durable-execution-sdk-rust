@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 /// Wire sub-type for chained invoke operations.
-const CHAINED_INVOKE_SUB_TYPE: &str = "ChainedInvoke";
+pub(crate) const CHAINED_INVOKE_SUB_TYPE: &str = "ChainedInvoke";
 
 /// Internal state for invoke execution passed from the builder.
 pub(crate) struct InvokeExecution<O> {
@@ -62,6 +62,14 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
 
         // 2. Check checkpoint log for replay.
         if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            // Non-determinism detection: verify the record's identity matches.
+            self.ctx.validate_replay_identity(
+                &record,
+                &wire_id,
+                "ChainedInvoke",
+                Some(CHAINED_INVOKE_SUB_TYPE),
+                self.name.as_deref(),
+            )?;
             match &record.status {
                 CheckpointStatus::Succeeded => {
                     // Invoke succeeded — deserialize the result from invoke details.
@@ -281,6 +289,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
         let ctx = DurableContext::new_root(
@@ -321,6 +332,9 @@ mod tests {
             invoke_error_message: Some("target function error".to_owned()),
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
         let ctx = DurableContext::new_root(
@@ -367,6 +381,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
         let ctx = DurableContext::new_root(
@@ -585,6 +602,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
         let ctx = DurableContext::new_root(
@@ -718,6 +738,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
         let ctx = DurableContext::new_root(

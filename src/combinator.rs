@@ -30,7 +30,7 @@ use crate::future::{DurableFuture, Settled};
 
 /// Wire sub-type for combinator operations (shared with child context
 /// since combinators ARE child-context ops with a combinator-flavored closure).
-const COMBINATOR_SUB_TYPE: &str = "RunInChildContext";
+pub(crate) const COMBINATOR_SUB_TYPE: &str = "RunInChildContext";
 
 // ────────────────────────────────────────────────────────────────────────────
 // TryJoinAll (fail-fast concurrent join)
@@ -50,6 +50,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
     /// Live path: awaits all futures concurrently, fails fast on first error,
     /// checkpoints the combined `Vec<O>` result.
     /// Replay path: returns the frozen result from the checkpoint log.
+    #[allow(clippy::too_many_lines)] // reason: validation adds lines but the flow reads better flat
     pub(crate) async fn execute(self) -> Result<Vec<O>, OperationError> {
         // Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -59,6 +60,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
 
         // Replay path: check checkpoint log.
         if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            // Non-determinism detection: verify the record's identity matches.
+            self.ctx.validate_replay_identity(
+                &record,
+                &wire_id,
+                "Context",
+                Some(COMBINATOR_SUB_TYPE),
+                self.name.as_deref(),
+            )?;
             match &record.status {
                 CheckpointStatus::Succeeded => {
                     return replay_vec_success::<O>(record.result.as_ref());
@@ -213,6 +222,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
 
         // Replay path.
         if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            // Non-determinism detection.
+            self.ctx.validate_replay_identity(
+                &record,
+                &wire_id,
+                "Context",
+                Some(COMBINATOR_SUB_TYPE),
+                self.name.as_deref(),
+            )?;
             match &record.status {
                 CheckpointStatus::Succeeded => {
                     return replay_settled_success::<O>(record.result.as_ref());
@@ -335,6 +352,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
 
         // Replay path.
         if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            // Non-determinism detection.
+            self.ctx.validate_replay_identity(
+                &record,
+                &wire_id,
+                "Context",
+                Some(COMBINATOR_SUB_TYPE),
+                self.name.as_deref(),
+            )?;
             match &record.status {
                 CheckpointStatus::Succeeded => {
                     return replay_single_success::<O>(record.result.as_ref());
@@ -447,6 +472,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
 
         // Replay path.
         if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            // Non-determinism detection.
+            self.ctx.validate_replay_identity(
+                &record,
+                &wire_id,
+                "Context",
+                Some(COMBINATOR_SUB_TYPE),
+                self.name.as_deref(),
+            )?;
             match &record.status {
                 CheckpointStatus::Succeeded => {
                     return replay_single_success::<O>(record.result.as_ref());
@@ -552,6 +585,27 @@ pub(crate) fn bless_current_task(task_ownership: &TaskOwnership) {
     }
 }
 
+/// Refuses a combinator's terminal checkpoint once an execution-fatal error
+/// has been recorded.
+///
+/// Called at the top of [`checkpoint_succeed`] and [`checkpoint_fail`], which
+/// every combinator's live path funnels through. A replay identity mismatch
+/// is recorded on the shared fatal slot eagerly — when the mismatching
+/// constituent [`DurableFuture`] was finalized (see `preflight_identity!` in
+/// `builders`) — so by the time a short-circuiting combinator (`select_ok`,
+/// `race`, `try_join_all`) is ready to record a winner, the slot already
+/// says the recorded history contradicts the handler. Writing a SUCCEED (or
+/// an unrelated FAIL) checkpoint at that point would store an outcome the
+/// execution can never legitimately replay; instead the combinator returns
+/// the fatal as its own error and the invocation driver fails the execution
+/// with the dedicated `NonDeterministicExecutionError`.
+fn fatal_gate(ctx: &DurableContext) -> Result<(), OperationError> {
+    if let Some(fatal) = ctx.suspension_signal().fatal_error() {
+        return Err(combinator_internal_error(&fatal.error_message));
+    }
+    Ok(())
+}
+
 /// Checkpoints a START action for a combinator operation.
 async fn checkpoint_start(
     ctx: &DurableContext,
@@ -585,6 +639,8 @@ async fn checkpoint_start(
 }
 
 /// Checkpoints a SUCCEED action for a combinator operation.
+///
+/// Refuses (via [`fatal_gate`]) once an execution-fatal error is recorded.
 async fn checkpoint_succeed(
     ctx: &DurableContext,
     wire_id: &str,
@@ -592,6 +648,8 @@ async fn checkpoint_succeed(
     payload: &str,
 ) -> Result<(), OperationError> {
     use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
+
+    fatal_gate(ctx)?;
 
     let mut builder = OperationUpdate::builder()
         .id(wire_id.to_owned())
@@ -619,6 +677,10 @@ async fn checkpoint_succeed(
 }
 
 /// Checkpoints a FAIL action for a combinator operation.
+///
+/// Refuses (via [`fatal_gate`]) once an execution-fatal error is recorded:
+/// the dedicated non-determinism error must reach the driver rather than a
+/// stringified combinator failure.
 async fn checkpoint_fail(
     ctx: &DurableContext,
     wire_id: &str,
@@ -627,6 +689,8 @@ async fn checkpoint_fail(
     error_message: &str,
 ) -> Result<(), OperationError> {
     use aws_sdk_lambda::types::{ErrorObject, OperationAction, OperationType, OperationUpdate};
+
+    fatal_gate(ctx)?;
 
     let mut builder = OperationUpdate::builder()
         .id(wire_id.to_owned())
@@ -814,6 +878,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )
     }
@@ -839,6 +906,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )
     }

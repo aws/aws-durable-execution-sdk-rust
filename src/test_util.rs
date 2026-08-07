@@ -757,6 +757,7 @@ fn operation_error_type(err: &OperationError) -> String {
         OperationErrorKind::ChildContext(_) => "ChildContextError",
         OperationErrorKind::WaitForCondition(_) => "WaitForConditionError",
         OperationErrorKind::Combinator(_) => "PromiseCombinatorError",
+        OperationErrorKind::NonDeterministicExecution(_) => "NonDeterministicExecutionError",
     }
     .to_owned()
 }
@@ -1756,6 +1757,13 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
         .r#type(stored.op_type.clone())
         .status(stored.status.clone())
         .start_timestamp(DateTime::from_secs(0));
+
+    if let Some(ref st) = stored.sub_type {
+        builder = builder.sub_type(st);
+    }
+    if let Some(ref n) = stored.name {
+        builder = builder.name(n);
+    }
 
     match stored.op_type {
         OperationType::Step => {

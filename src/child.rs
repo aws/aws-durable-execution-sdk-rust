@@ -28,7 +28,7 @@ use crate::error::{
 };
 
 /// Wire sub-type for child context operations.
-const CHILD_SUB_TYPE: &str = "RunInChildContext";
+pub(crate) const CHILD_SUB_TYPE: &str = "RunInChildContext";
 
 /// Maximum checkpoint payload size in bytes (256KB). Payloads exceeding
 /// this trigger `ReplayChildren` mode: the child result is not stored in
@@ -61,6 +61,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
 
         // 2. Check checkpoint log for replay.
         if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            // Non-determinism detection: verify the record's identity matches.
+            self.ctx.validate_replay_identity(
+                &record,
+                &wire_id,
+                "Context",
+                Some(CHILD_SUB_TYPE),
+                self.name.as_deref(),
+            )?;
             match &record.status {
                 CheckpointStatus::Succeeded => {
                     if record.replay_children {
@@ -351,6 +359,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )
     }
@@ -376,6 +387,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )
     }

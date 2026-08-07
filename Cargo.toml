@@ -67,3 +67,7 @@ tracing-subscriber = "0.3"
 aws-smithy-runtime-api = { version = "1", features = ["http-1x"] }
 aws-smithy-types = "1"
 tokio = { version = "1", features = ["test-util"] }
+
+[[test]]
+name = "nondeterminism"
+required-features = ["test-util"]

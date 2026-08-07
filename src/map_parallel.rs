@@ -39,11 +39,11 @@ use crate::error::{
 };
 
 /// Wire sub-type for map operations.
-const MAP_SUB_TYPE: &str = "Map";
+pub(crate) const MAP_SUB_TYPE: &str = "Map";
 /// Wire sub-type for map iteration children.
 const MAP_ITERATION_SUB_TYPE: &str = "MapIteration";
 /// Wire sub-type for parallel operations.
-const PARALLEL_SUB_TYPE: &str = "Parallel";
+pub(crate) const PARALLEL_SUB_TYPE: &str = "Parallel";
 /// Wire sub-type for parallel branch children.
 const PARALLEL_BRANCH_SUB_TYPE: &str = "ParallelBranch";
 
@@ -634,6 +634,14 @@ where
 
     // 2. Check if the parent batch is already terminal in the checkpoint log.
     if let Some(record) = ctx.checkpoint_record(&parent_positional) {
+        // Non-determinism detection: verify the record's identity matches.
+        ctx.validate_replay_identity(
+            &record,
+            &parent_wire,
+            "Context",
+            Some(parent_sub_type),
+            parent_name.as_deref(),
+        )?;
         if record.status.is_terminal() {
             let serdes_ctx = SerdesContext::new(&parent_wire, ctx.execution_arn());
             match replay_terminal_batch::<O>(
@@ -733,9 +741,21 @@ where
         for i in 0..total_items {
             let child_op_id = ctx.mint_id();
             let child_positional = child_op_id.positional().to_owned();
-            let is_terminal = ctx
-                .checkpoint_record(&child_positional)
-                .is_some_and(|r| r.status.is_terminal());
+            let child_wire = child_op_id.wire().to_owned();
+            let child_name = item_namer.as_ref().map(|namer| namer(i));
+            let is_terminal = if let Some(record) = ctx.checkpoint_record(&child_positional) {
+                // Non-determinism detection on child items.
+                ctx.validate_replay_identity(
+                    &record,
+                    &child_wire,
+                    "Context",
+                    Some(child_sub_type),
+                    child_name.as_deref(),
+                )?;
+                record.status.is_terminal()
+            } else {
+                false
+            };
             pre_claimed.push(PreClaimed {
                 index: i,
                 op_id: child_op_id,
@@ -834,9 +854,21 @@ where
             } else {
                 let child_op_id = ctx.mint_id();
                 let child_positional = child_op_id.positional().to_owned();
-                let is_terminal = ctx
-                    .checkpoint_record(&child_positional)
-                    .is_some_and(|r| r.status.is_terminal());
+                let child_wire = child_op_id.wire().to_owned();
+                let child_name = item_namer.as_ref().map(|namer| namer(i));
+                let is_terminal = if let Some(record) = ctx.checkpoint_record(&child_positional) {
+                    // Non-determinism detection on child items.
+                    ctx.validate_replay_identity(
+                        &record,
+                        &child_wire,
+                        "Context",
+                        Some(child_sub_type),
+                        child_name.as_deref(),
+                    )?;
+                    record.status.is_terminal()
+                } else {
+                    false
+                };
                 PreClaimed {
                     index: i,
                     op_id: child_op_id,
@@ -1845,6 +1877,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )
     }
@@ -1866,6 +1901,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )
     }
@@ -1970,6 +2008,9 @@ mod tests {
                     invoke_error_message: None,
                     replay_children: false,
                     callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
                 },
             )
         }]);
@@ -3014,6 +3055,9 @@ mod tests {
                     invoke_error_message: None,
                     replay_children: false,
                     callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
                 },
             ),
             (
@@ -3030,6 +3074,9 @@ mod tests {
                     invoke_error_message: None,
                     replay_children: false,
                     callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
                 },
             ),
         ]);
@@ -3076,6 +3123,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )]);
         let ctx = test_ctx(log);

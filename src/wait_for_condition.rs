@@ -30,7 +30,7 @@ use crate::error::{
 use crate::{BoxError, Serdes, SerdesContext};
 
 /// Wire sub-type for wait-for-condition operations.
-const WFC_SUB_TYPE: &str = "WaitForCondition";
+pub(crate) const WFC_SUB_TYPE: &str = "WaitForCondition";
 
 /// Decision returned by a wait strategy function.
 ///
@@ -132,6 +132,14 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
         // 2. Check checkpoint log for replay / resume status.
         let mut already_started = false;
         if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            // Non-determinism detection: verify the record's identity matches.
+            self.ctx.validate_replay_identity(
+                &record,
+                &wire_id,
+                "Step",
+                Some(WFC_SUB_TYPE),
+                self.name.as_deref(),
+            )?;
             match &record.status {
                 CheckpointStatus::Succeeded => {
                     // Terminal success: deserialize the final state.
@@ -565,6 +573,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
 
         // The START checkpoint response echoes the operation as a fresh
@@ -681,6 +692,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id(); // mints "1"
@@ -768,6 +782,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
@@ -843,6 +860,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
@@ -879,6 +899,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();

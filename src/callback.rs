@@ -30,10 +30,10 @@ use crate::future::Callback;
 use crate::serdes::{Serdes, SerdesContext};
 
 /// Wire sub-type for callback operations.
-const CALLBACK_SUB_TYPE: &str = "Callback";
+pub(crate) const CALLBACK_SUB_TYPE: &str = "Callback";
 
 /// Wire sub-type for wait-for-callback context operations.
-const WFCB_SUB_TYPE: &str = "WaitForCallback";
+pub(crate) const WFCB_SUB_TYPE: &str = "WaitForCallback";
 
 /// Boxed submitter closure type used by `WaitForCallbackExecution` and
 /// `run_wfcb_body`. Receives a step context and the callback ID string,
@@ -69,6 +69,14 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
 
         // 2. Check checkpoint log for replay.
         if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            // Non-determinism detection: verify the record's identity matches.
+            self.ctx.validate_replay_identity(
+                &record,
+                &wire_id,
+                "Callback",
+                Some(CALLBACK_SUB_TYPE),
+                self.name.as_deref(),
+            )?;
             match &record.status {
                 CheckpointStatus::Succeeded => {
                     // Callback completed successfully during a previous
@@ -204,6 +212,14 @@ impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<
 
         // 2. Check checkpoint log for replay (context-level terminal).
         if let Some(record) = ctx.checkpoint_record(&positional_id) {
+            // Non-determinism detection: verify the record's identity matches.
+            ctx.validate_replay_identity(
+                &record,
+                &wire_id,
+                "Context",
+                Some(WFCB_SUB_TYPE),
+                name.as_deref(),
+            )?;
             match &record.status {
                 CheckpointStatus::Succeeded => {
                     // WaitForCallback context completed — deserialize result.
@@ -595,6 +611,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: callback_id.map(String::from),
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )
     }
@@ -1111,6 +1130,9 @@ mod tests {
                     invoke_error_message: None,
                     replay_children: false,
                     callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
                 },
             ),
             // Callback: Started (pending — will suspend on .result()).
@@ -1128,6 +1150,9 @@ mod tests {
                     invoke_error_message: None,
                     replay_children: false,
                     callback_id: Some("cb-replay-test".to_owned()),
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
                 },
             ),
             // Submitter step: Succeeded (replay — should not re-invoke).
@@ -1145,6 +1170,9 @@ mod tests {
                     invoke_error_message: None,
                     replay_children: false,
                     callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
                 },
             ),
         ]);

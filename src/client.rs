@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError;
 use aws_sdk_lambda::operation::get_durable_execution_state::GetDurableExecutionStateError;
-use aws_sdk_lambda::types::{Operation, OperationUpdate};
+use aws_sdk_lambda::types::{Operation, OperationType, OperationUpdate};
 
 use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
 
@@ -574,8 +574,25 @@ fn operation_to_record(op: &Operation) -> (String, CheckpointRecord) {
             .callback_details
             .as_ref()
             .and_then(|cb| cb.callback_id.clone()),
+        op_type: Some(operation_type_to_string(&op.r#type)),
+        sub_type: op.sub_type.clone(),
+        op_name: op.name.clone(),
     };
     (op.id().to_owned(), record)
+}
+
+/// Converts an `OperationType` enum to a string for identity comparison.
+fn operation_type_to_string(op_type: &OperationType) -> String {
+    match op_type {
+        OperationType::Callback => "Callback".to_owned(),
+        OperationType::ChainedInvoke => "ChainedInvoke".to_owned(),
+        OperationType::Context => "Context".to_owned(),
+        OperationType::Execution => "Execution".to_owned(),
+        OperationType::Step => "Step".to_owned(),
+        OperationType::Wait => "Wait".to_owned(),
+        // Future-proof: unknown variants use a placeholder.
+        _ => "Unknown".to_owned(),
+    }
 }
 
 /// Converts SDK `Operation` records into a `CheckpointLog`.
@@ -586,7 +603,7 @@ pub(crate) fn operations_to_checkpoint_log(operations: &[Operation]) -> Checkpoi
         .iter()
         // Skip Execution-type operations for consistency with
         // parse_inline_operations, which filters them in the JSON path.
-        .filter(|op| op.r#type != aws_sdk_lambda::types::OperationType::Execution)
+        .filter(|op| op.r#type != OperationType::Execution)
         .map(operation_to_record)
         .collect();
     CheckpointLog::from_records(records)
@@ -933,7 +950,7 @@ mod tests {
         let ops = vec![
             Operation::builder()
                 .id("op-1")
-                .r#type(aws_sdk_lambda::types::OperationType::Step)
+                .r#type(OperationType::Step)
                 .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
                 .step_details(
@@ -946,7 +963,7 @@ mod tests {
                 .unwrap(),
             Operation::builder()
                 .id("op-2")
-                .r#type(aws_sdk_lambda::types::OperationType::Step)
+                .r#type(OperationType::Step)
                 .status(aws_sdk_lambda::types::OperationStatus::Failed)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(1))
                 .step_details(
@@ -995,7 +1012,7 @@ mod tests {
         let ops = vec![
             Operation::builder()
                 .id("invoke-ok")
-                .r#type(aws_sdk_lambda::types::OperationType::ChainedInvoke)
+                .r#type(OperationType::ChainedInvoke)
                 .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
                 .chained_invoke_details(
@@ -1007,7 +1024,7 @@ mod tests {
                 .unwrap(),
             Operation::builder()
                 .id("invoke-err")
-                .r#type(aws_sdk_lambda::types::OperationType::ChainedInvoke)
+                .r#type(OperationType::ChainedInvoke)
                 .status(aws_sdk_lambda::types::OperationStatus::Failed)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(1))
                 .chained_invoke_details(
@@ -1061,7 +1078,7 @@ mod tests {
         let ops = vec![
             Operation::builder()
                 .id("child-replay")
-                .r#type(aws_sdk_lambda::types::OperationType::Context)
+                .r#type(OperationType::Context)
                 .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
                 .context_details(
@@ -1073,7 +1090,7 @@ mod tests {
                 .unwrap(),
             Operation::builder()
                 .id("child-inline")
-                .r#type(aws_sdk_lambda::types::OperationType::Context)
+                .r#type(OperationType::Context)
                 .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(1))
                 .context_details(
@@ -1112,14 +1129,14 @@ mod tests {
         let ops = vec![
             Operation::builder()
                 .id("exec-0")
-                .r#type(aws_sdk_lambda::types::OperationType::Execution)
+                .r#type(OperationType::Execution)
                 .status(aws_sdk_lambda::types::OperationStatus::Started)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
                 .build()
                 .unwrap(),
             Operation::builder()
                 .id("step-1")
-                .r#type(aws_sdk_lambda::types::OperationType::Step)
+                .r#type(OperationType::Step)
                 .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(1))
                 .build()
@@ -1143,7 +1160,7 @@ mod tests {
         let ops = vec![
             Operation::builder()
                 .id("op-1")
-                .r#type(aws_sdk_lambda::types::OperationType::Step)
+                .r#type(OperationType::Step)
                 .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
                 .build()
@@ -1179,6 +1196,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )]);
 
@@ -1187,7 +1207,7 @@ mod tests {
         let updated_ops = vec![
             Operation::builder()
                 .id("op-cb")
-                .r#type(aws_sdk_lambda::types::OperationType::Callback)
+                .r#type(OperationType::Callback)
                 .status(aws_sdk_lambda::types::OperationStatus::Pending)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
                 .callback_details(
@@ -1218,7 +1238,7 @@ mod tests {
         let updated_ops = vec![
             Operation::builder()
                 .id("new-op")
-                .r#type(aws_sdk_lambda::types::OperationType::Step)
+                .r#type(OperationType::Step)
                 .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
                 .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
                 .step_details(
@@ -1247,7 +1267,7 @@ mod tests {
     fn make_step_op(id: &str, result: &str) -> Operation {
         Operation::builder()
             .id(id)
-            .r#type(aws_sdk_lambda::types::OperationType::Step)
+            .r#type(OperationType::Step)
             .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
             .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
             .step_details(

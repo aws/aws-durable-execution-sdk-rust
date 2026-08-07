@@ -231,6 +231,15 @@ pub(crate) struct CheckpointRecord {
     pub(crate) replay_children: bool,
     /// The callback ID assigned by the backend (for callback operations).
     pub(crate) callback_id: Option<String>,
+    /// The operation type from the backend (e.g. `Step`, `Wait`, `Context`,
+    /// `ChainedInvoke`, `Callback`). Used for non-determinism detection.
+    pub(crate) op_type: Option<String>,
+    /// The operation sub-type from the backend (e.g. `Step`, `Wait`, `Map`,
+    /// `Parallel`). Used for non-determinism detection.
+    pub(crate) sub_type: Option<String>,
+    /// The operation name assigned by the user (if any). Used for
+    /// non-determinism detection.
+    pub(crate) op_name: Option<String>,
 }
 
 /// The checkpoint log: maps positional operation IDs to stored records.
@@ -580,6 +589,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )]);
 
@@ -607,6 +619,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )]);
 
@@ -643,6 +658,9 @@ mod tests {
                     invoke_error_message: None,
                     replay_children: false,
                     callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
                 },
             ),
             (
@@ -659,6 +677,9 @@ mod tests {
                     invoke_error_message: None,
                     replay_children: false,
                     callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
                 },
             ),
         ]));
@@ -713,6 +734,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )]));
 
@@ -741,6 +765,9 @@ mod tests {
                     invoke_error_message: None,
                     replay_children: false,
                     callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
                 },
             ),
             (
@@ -757,6 +784,9 @@ mod tests {
                     invoke_error_message: None,
                     replay_children: false,
                     callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
                 },
             ),
         ]));

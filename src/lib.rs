@@ -73,8 +73,9 @@ pub use self::builders::{
 pub use self::context::{DurableContext, StepContext};
 pub use self::error::{
     CallbackError, CallbackErrorKind, ChildContextError, ChildContextErrorKind, CombinatorError,
-    CombinatorErrorKind, InvokeError, InvokeErrorKind, OperationError, OperationErrorKind,
-    StepError, StepErrorKind, WaitForConditionError, WaitForConditionErrorKind,
+    CombinatorErrorKind, InvokeError, InvokeErrorKind, NonDeterministicExecutionError,
+    NonDeterministicExecutionErrorKind, OperationError, OperationErrorKind, StepError,
+    StepErrorKind, WaitForConditionError, WaitForConditionErrorKind,
 };
 pub use self::future::{Branch, Callback, DurableFuture, Settled};
 pub use self::map_parallel::{
@@ -728,6 +729,9 @@ fn wire_error_from_operation_error(err: &OperationError) -> (String, String) {
             ("WaitForConditionError".to_owned(), err.to_string())
         }
         OperationErrorKind::Combinator(_) => ("PromiseCombinatorError".to_owned(), err.to_string()),
+        OperationErrorKind::NonDeterministicExecution(_) => {
+            ("NonDeterministicExecutionError".to_owned(), err.to_string())
+        }
     }
 }
 
@@ -903,6 +907,15 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
             invoke_error_message,
             replay_children,
             callback_id,
+            op_type: Some(op_type.to_owned()),
+            sub_type: op
+                .get("SubType")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from),
+            op_name: op
+                .get("Name")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from),
         },
     ))
 }
@@ -1449,6 +1462,112 @@ mod tests {
         assert!(!log.has_records());
         // But the marker must survive so bootstrap pagination runs.
         assert_eq!(marker, Some("page-token-1".to_owned()));
+    }
+
+    /// Helper to build a Step operation for `resolve_bootstrap_log` tests.
+    #[allow(clippy::unwrap_used)]
+    fn make_test_step_op(id: &str, result: &str) -> aws_sdk_lambda::types::Operation {
+        aws_sdk_lambda::types::Operation::builder()
+            .id(id)
+            .r#type(aws_sdk_lambda::types::OperationType::Step)
+            .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
+            .start_timestamp(aws_sdk_lambda::primitives::DateTime::from_secs(0))
+            .step_details(
+                aws_sdk_lambda::types::StepDetails::builder()
+                    .result(result)
+                    .build(),
+            )
+            .build()
+            .unwrap()
+    }
+
+    /// When `initial_marker` is `Some`, `resolve_bootstrap_log` calls
+    /// `get_state` (count == 1) and returns a log built from the full
+    /// paginated state.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)] // reason: test assertions
+    async fn resolve_bootstrap_log_paginates_when_marker_present() {
+        let all_ops = vec![
+            make_test_step_op("step-1", "\"r1\""),
+            make_test_step_op("step-2", "\"r2\""),
+        ];
+        let client = client::InMemoryExecutionClient::new(all_ops);
+
+        // Inline log is empty (first page only had the Execution op).
+        let inline_log = engine::CheckpointLog::empty();
+
+        let result = client::resolve_bootstrap_log(
+            &client,
+            "arn:test",
+            "token",
+            inline_log,
+            Some("page-2-marker"),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let log = result.unwrap();
+        // Full state from get_state is used.
+        assert!(log.get("step-1").is_some(), "step-1 must be in the log");
+        assert!(
+            log.get("step-2").is_some(),
+            "step-2 must be in the log (from page 2)"
+        );
+
+        // get_state was called exactly once.
+        let count = *client.get_state_call_count.lock().unwrap();
+        assert_eq!(
+            count, 1,
+            "get_state must be called exactly once when marker is present"
+        );
+    }
+
+    /// When `initial_marker` is `None`, `resolve_bootstrap_log` does NOT
+    /// call `get_state` (count == 0) and returns the inline log as-is.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)] // reason: test assertions
+    async fn resolve_bootstrap_log_skips_pagination_when_no_marker() {
+        let client = client::InMemoryExecutionClient::new(Vec::new());
+
+        let inline_log = engine::CheckpointLog::empty();
+        // Insert a record to prove the inline log is returned unchanged.
+        inline_log.insert(
+            "existing-op".to_owned(),
+            engine::CheckpointRecord {
+                id: "existing-op".to_owned(),
+                status: engine::CheckpointStatus::Succeeded,
+                result: Some("\"inline\"".to_owned()),
+                error_type: None,
+                error_message: None,
+                attempt: 1,
+                invoke_result: None,
+                invoke_error_type: None,
+                invoke_error_message: None,
+                replay_children: false,
+                callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
+            },
+        );
+
+        let result =
+            client::resolve_bootstrap_log(&client, "arn:test", "token", inline_log, None).await;
+
+        assert!(result.is_ok());
+        let log = result.unwrap();
+        // The inline log is returned as-is.
+        assert!(
+            log.get("existing-op").is_some(),
+            "inline op must be preserved"
+        );
+
+        // get_state was NOT called.
+        let count = *client.get_state_call_count.lock().unwrap();
+        assert_eq!(
+            count, 0,
+            "get_state must not be called when no marker is present"
+        );
     }
 
     // ── Options consumption: client resolution + reuse ──────────────────

@@ -165,8 +165,32 @@ pub(crate) struct SuspensionSignal {
     /// is harmless: the invocation driver returns PENDING only when the ROOT
     /// scope's own flag is set, which a mere branch suspension never sets.
     invocation_waker: Arc<std::sync::Mutex<Option<Waker>>>,
+    /// Execution-wide fatal-error slot, shared by every scope in the tree
+    /// exactly like `invocation_waker`. A replay identity mismatch
+    /// (non-determinism detection) records here so the invocation driver
+    /// fails the execution with the dedicated error even when user code, a
+    /// combinator (`join_all` storing it as a rejected outcome, `select_ok`
+    /// preferring another branch's success), or a failure-tolerant map or
+    /// parallel batch swallows the per-operation error. First record wins.
+    fatal: Arc<std::sync::Mutex<Option<FatalError>>>,
     /// Settle accounting for the operations spawned into this scope.
     quiescence: ScopeQuiescence,
+}
+
+/// An execution-fatal error recorded by an operation.
+///
+/// Currently the only producer is non-determinism detection
+/// ([`crate::context::DurableContext::validate_replay_identity`]): a replay
+/// identity mismatch means the execution's recorded history no longer
+/// corresponds to the handler's operations, so no amount of re-invocation can
+/// make progress. The invocation driver checks this slot with priority over
+/// both completion and suspension.
+#[derive(Debug, Clone)]
+pub(crate) struct FatalError {
+    /// The wire error type (e.g. `NonDeterministicExecutionError`).
+    pub(crate) error_type: String,
+    /// The full error message.
+    pub(crate) error_message: String,
 }
 
 impl SuspensionSignal {
@@ -176,22 +200,54 @@ impl SuspensionSignal {
             requested: AtomicBool::new(false),
             scope_waker: std::sync::Mutex::new(None),
             invocation_waker: Arc::new(std::sync::Mutex::new(None)),
+            fatal: Arc::new(std::sync::Mutex::new(None)),
             quiescence: ScopeQuiescence::default(),
         }
     }
 
     /// Creates a fresh CHILD scope beneath this one. The child shares the
-    /// invocation waker (so a park anywhere still re-polls the root) but owns
-    /// its own suspension flag, scope-driver waker and quiescence accounting,
-    /// so a suspension in the child is caught by the child's scope driver
-    /// rather than the root.
+    /// invocation waker (so a park anywhere still re-polls the root) and the
+    /// fatal-error slot (so a fatal recorded in any scope fails the whole
+    /// execution), but owns its own suspension flag, scope-driver waker and
+    /// quiescence accounting, so a suspension in the child is caught by the
+    /// child's scope driver rather than the root.
     pub(crate) fn new_child_scope(&self) -> Self {
         Self {
             requested: AtomicBool::new(false),
             scope_waker: std::sync::Mutex::new(None),
             invocation_waker: Arc::clone(&self.invocation_waker),
+            fatal: Arc::clone(&self.fatal),
             quiescence: ScopeQuiescence::default(),
         }
+    }
+
+    /// Records an execution-fatal error into the shared slot (first record
+    /// wins) and wakes both this scope's driver and the invocation driver so
+    /// the failure is observed on the next poll rather than after an
+    /// unrelated wakeup.
+    pub(crate) fn record_fatal(&self, error_type: String, error_message: String) {
+        {
+            let mut guard = self
+                .fatal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_none() {
+                *guard = Some(FatalError {
+                    error_type,
+                    error_message,
+                });
+            }
+        }
+        wake_slot(&self.scope_waker);
+        wake_slot(&self.invocation_waker);
+    }
+
+    /// Returns the recorded execution-fatal error, if any.
+    pub(crate) fn fatal_error(&self) -> Option<FatalError> {
+        self.fatal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Called by operations to request suspension of THIS scope.
@@ -518,6 +574,19 @@ where
         // a spawned task can wake the driver to observe the signal.
         suspension_signal.register_driver_waker(cx.waker());
 
+        // A recorded fatal error (non-determinism mismatch) takes precedence
+        // over EVERYTHING, including suspension: the execution's recorded
+        // history no longer matches the handler's operations, so suspending
+        // and re-invoking cannot make progress and completing successfully
+        // would mask the defect. The handler future is dropped exactly as it
+        // would be for suspension.
+        if let Some(fatal) = suspension_signal.fatal_error() {
+            return Poll::Ready(InvocationOutcome::Failed {
+                error_type: fatal.error_type,
+                error_message: fatal.error_message,
+            });
+        }
+
         // Check if suspension was already requested (from a previous poll
         // cycle where an operation set the flag).
         if suspension_signal.is_suspend_requested() {
@@ -530,6 +599,16 @@ where
         // Poll the handler future once.
         match pinned.as_mut().poll(cx) {
             Poll::Ready(Ok(result)) => {
+                // A fatal error recorded DURING this poll (e.g. a replay
+                // identity mismatch swallowed by a combinator or a tolerant
+                // batch before the handler resolved) must fail the
+                // execution — a successful completion would erase it.
+                if let Some(fatal) = suspension_signal.fatal_error() {
+                    return Poll::Ready(InvocationOutcome::Failed {
+                        error_type: fatal.error_type,
+                        error_message: fatal.error_message,
+                    });
+                }
                 // An operation may have requested suspension AND the
                 // handler still completed (e.g. error propagated via `?`
                 // without yielding). Suspension takes precedence.
@@ -541,6 +620,15 @@ where
                 }
             }
             Poll::Ready(Err(err)) => {
+                // Fatal precedence: report the dedicated error rather than
+                // whatever shape the handler's own error took (the mismatch
+                // may have been stringified through child/batch boundaries).
+                if let Some(fatal) = suspension_signal.fatal_error() {
+                    return Poll::Ready(InvocationOutcome::Failed {
+                        error_type: fatal.error_type,
+                        error_message: fatal.error_message,
+                    });
+                }
                 // Same precedence rule: if an operation requested
                 // suspension before the error propagated, the invocation
                 // outcome is Pending, not Failed.
@@ -555,6 +643,13 @@ where
                 }
             }
             Poll::Pending => {
+                // Fatal precedence over suspension: see above.
+                if let Some(fatal) = suspension_signal.fatal_error() {
+                    return Poll::Ready(InvocationOutcome::Failed {
+                        error_type: fatal.error_type,
+                        error_message: fatal.error_message,
+                    });
+                }
                 // The future yielded — check if an operation requested
                 // suspension during this poll cycle.
                 if suspension_signal.is_suspend_requested() {
@@ -848,6 +943,9 @@ mod tests {
                 invoke_error_message: None,
                 replay_children: false,
                 callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
             },
         )]));
 
@@ -1128,6 +1226,9 @@ mod suspension_containment_and_task_ownership {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         }
     }
 

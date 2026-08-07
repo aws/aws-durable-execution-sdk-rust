@@ -13,7 +13,7 @@ use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
 
 /// Wire sub-type for wait operations.
-const WAIT_SUB_TYPE: &str = "Wait";
+pub(crate) const WAIT_SUB_TYPE: &str = "Wait";
 
 /// Internal state for wait execution passed from the builder.
 pub(crate) struct WaitExecution {
@@ -34,6 +34,14 @@ impl WaitExecution {
 
         // 2. Check checkpoint log for replay.
         if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
+            // Non-determinism detection: verify the record's identity matches.
+            self.ctx.validate_replay_identity(
+                &record,
+                &wire_id,
+                "Wait",
+                Some(WAIT_SUB_TYPE),
+                self.name.as_deref(),
+            )?;
             match &record.status {
                 CheckpointStatus::Succeeded => {
                     // Timer completed — return immediately.
@@ -141,6 +149,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
         let ctx = DurableContext::new_root(
@@ -176,6 +187,9 @@ mod tests {
             invoke_error_message: None,
             replay_children: false,
             callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
         let ctx = DurableContext::new_root(
