@@ -257,9 +257,10 @@ impl DurableContext {
 
     /// Returns the execution-wide default serdes, if one was configured via
     /// [`Options`](crate::Options). Operations fall back to this when they set
-    /// no serdes of their own.
-    pub(crate) fn default_serdes(&self) -> Option<&dyn Serdes> {
-        self.inner.default_serdes.as_deref()
+    /// no serdes of their own. Returned as the shared `Arc` handle so async
+    /// call sites can clone it into `spawn_blocking`.
+    pub(crate) fn default_serdes(&self) -> Option<&Arc<dyn Serdes>> {
+        self.inner.default_serdes.as_ref()
     }
     #[allow(dead_code)] // reason: used by run_in_child_context
     pub(crate) fn new_child(&self, parent_positional_id: &str) -> Self {

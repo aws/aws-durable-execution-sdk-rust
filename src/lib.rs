@@ -1077,7 +1077,7 @@ where
         sdk_config,
         lambda_client,
     } = options;
-    let default_serdes: Option<StdArc<dyn Serdes>> = serdes.map(StdArc::from);
+    let default_serdes: Option<StdArc<dyn Serdes>> = serdes;
     let preset_client: Option<StdArc<dyn client::ExecutionClient>> =
         base_lambda_client_from_options(sdk_config, lambda_client).map(|c| {
             StdArc::new(client::LambdaExecutionClient::new(c))

@@ -162,6 +162,100 @@ pub trait Serdes: Debug + Send + Sync {
 }
 
 // ============================================================
+// Off-runtime invocation helpers
+// ============================================================
+
+/// Runs a custom serdes `serialize` on the blocking thread pool.
+///
+/// The `Serdes` trait is sync, but implementations like [`FileSystemSerdes`]
+/// perform filesystem I/O that can stall for arbitrarily long on network
+/// mounts (EFS, S3 Files). Every async call site in the SDK routes custom
+/// serdes invocations through `tokio::task::spawn_blocking` so that a slow
+/// serialize never blocks an executor thread.
+///
+/// A `JoinError` (the blocking task panicked or was cancelled at runtime
+/// shutdown) is mapped to an ordinary error — it never panics the caller.
+pub(crate) async fn serialize_off_runtime(
+    serdes: &std::sync::Arc<dyn Serdes>,
+    value: serde_json::Value,
+    serdes_ctx: &SerdesContext,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let serdes = std::sync::Arc::clone(serdes);
+    let serdes_ctx = serdes_ctx.clone();
+    tokio::task::spawn_blocking(move || serdes.serialize(&value, &serdes_ctx))
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("serdes serialize task did not complete: {e}").into()
+        })?
+}
+
+/// Runs a custom serdes `deserialize` on the blocking thread pool.
+///
+/// See [`serialize_off_runtime`] for why: sync serdes implementations may
+/// block on filesystem I/O, which must not run on the async executor.
+///
+/// A `JoinError` (the blocking task panicked or was cancelled at runtime
+/// shutdown) is mapped to an ordinary error — it never panics the caller.
+pub(crate) async fn deserialize_off_runtime(
+    serdes: &std::sync::Arc<dyn Serdes>,
+    data: String,
+    serdes_ctx: &SerdesContext,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let serdes = std::sync::Arc::clone(serdes);
+    let serdes_ctx = serdes_ctx.clone();
+    tokio::task::spawn_blocking(move || serdes.deserialize(&data, &serdes_ctx))
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("serdes deserialize task did not complete: {e}").into()
+        })?
+}
+
+/// A value prepared for the wire: either already-rendered JSON (no custom
+/// serdes) or the erased [`serde_json::Value`] awaiting a custom serdes.
+///
+/// The two-phase split exists for `Send` reasons: preparation borrows the
+/// typed `&O` value and runs synchronously, so the borrow ends before any
+/// `.await`. The async completion phase ([`PreparedValue::into_wire`]) then
+/// owns everything it touches — otherwise every operation future would
+/// require `O: Sync` just to hold `&O` across the `spawn_blocking` await.
+pub(crate) enum PreparedValue<'a> {
+    /// Default path: the wire string is already rendered by `serde_json`.
+    Wire(String),
+    /// Custom path: the erased value plus the serdes that will render it.
+    Erased(serde_json::Value, &'a std::sync::Arc<dyn Serdes>),
+}
+
+/// Prepares a typed value for the wire, consuming the `&O` borrow now.
+///
+/// With no serdes this renders compact JSON directly from the typed value
+/// (`serde_json::to_string`), preserving the historical default-path bytes.
+/// With a custom serdes it erases to [`serde_json::Value`], to be completed
+/// off-runtime by [`PreparedValue::into_wire`].
+pub(crate) fn prepare_value<'a, O: serde::Serialize>(
+    serdes: Option<&'a std::sync::Arc<dyn Serdes>>,
+    value: &O,
+) -> Result<PreparedValue<'a>, serde_json::Error> {
+    match serdes {
+        None => serde_json::to_string(value).map(PreparedValue::Wire),
+        Some(s) => serde_json::to_value(value).map(|v| PreparedValue::Erased(v, s)),
+    }
+}
+
+impl PreparedValue<'_> {
+    /// Completes preparation: returns the wire string, invoking a custom
+    /// serdes on the blocking thread pool when one is attached.
+    pub(crate) async fn into_wire(
+        self,
+        serdes_ctx: &SerdesContext,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Self::Wire(wire) => Ok(wire),
+            Self::Erased(value, serdes) => serialize_off_runtime(serdes, value, serdes_ctx).await,
+        }
+    }
+}
+
+// ============================================================
 // SerdesContext
 // ============================================================
 
@@ -374,6 +468,16 @@ impl FileSystemSerdesConfigBuilder {
 /// a single execution environment and is not shared across invocations.
 /// On replay, a different environment may be used and the file will not
 /// be found. Use only with a durable, shared filesystem (EFS or S3 Files).
+///
+/// # Blocking I/O
+///
+/// [`serialize`](Serdes::serialize) and [`deserialize`](Serdes::deserialize)
+/// perform synchronous `std::fs` I/O, which can stall for arbitrarily long
+/// on a network mount. When the SDK invokes a serdes from its async
+/// operation paths it routes the call through
+/// `tokio::task::spawn_blocking`, so the executor is never blocked. If you
+/// call these methods directly from your own async code, apply the same
+/// treatment rather than calling them inline on the runtime.
 ///
 /// # Envelope format
 ///

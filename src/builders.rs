@@ -7,6 +7,7 @@
 
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::context::DurableContext;
@@ -148,7 +149,7 @@ pub struct StepBuilder<O> {
     op_id: OperationId,
     name: Option<String>,
     retry_strategy: Option<RetryStrategy>,
-    serdes: Option<Box<dyn Serdes>>,
+    serdes: Option<Arc<dyn Serdes>>,
     semantics: crate::step::StepSemantics,
     #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
     closure: Option<
@@ -249,7 +250,7 @@ impl<O: Send + 'static> StepBuilder<O> {
 
     /// Sets a custom serializer/deserializer for this step's result.
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Box::new(serdes));
+        self.serdes = Some(Arc::new(serdes));
         self
     }
 
@@ -495,8 +496,8 @@ pub struct InvokeBuilder<O> {
     name: Option<String>,
     function_id: String,
     erased_input: Result<serde_json::Value, String>,
-    payload_serdes: Option<Box<dyn Serdes>>,
-    result_serdes: Option<Box<dyn Serdes>>,
+    payload_serdes: Option<Arc<dyn Serdes>>,
+    result_serdes: Option<Arc<dyn Serdes>>,
     tenant_id: Option<String>,
     _marker: PhantomData<O>,
 }
@@ -544,7 +545,7 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
     /// returned by the target function. Use this to apply custom
     /// transformations on the result (e.g., uppercasing).
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.result_serdes = Some(Box::new(serdes));
+        self.result_serdes = Some(Arc::new(serdes));
         self
     }
 
@@ -576,7 +577,7 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
     /// }
     /// ```
     pub fn payload_serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.payload_serdes = Some(Box::new(serdes));
+        self.payload_serdes = Some(Arc::new(serdes));
         self
     }
 
@@ -676,7 +677,7 @@ pub struct ChildBuilder<O> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
-    serdes: Option<Box<dyn Serdes>>,
+    serdes: Option<Arc<dyn Serdes>>,
     #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
     closure: Option<
         Box<
@@ -742,7 +743,7 @@ impl<O: Send + 'static> ChildBuilder<O> {
 
     /// Overrides the serialization strategy for the child result.
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Box::new(serdes));
+        self.serdes = Some(Arc::new(serdes));
         self
     }
 
@@ -863,7 +864,7 @@ pub struct WaitForConditionBuilder<S> {
     name: Option<String>,
     initial_state: S,
     wait_strategy: Option<crate::wait_for_condition::WaitStrategyFn<S>>,
-    serdes: Option<Box<dyn Serdes>>,
+    serdes: Option<Arc<dyn Serdes>>,
     #[allow(clippy::type_complexity)] // reason: boxed Fn closure is inherently complex
     check: Option<
         Box<
@@ -1018,7 +1019,7 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
 
     /// Sets a custom serializer/deserializer for the state.
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Box::new(serdes));
+        self.serdes = Some(Arc::new(serdes));
         self
     }
 
@@ -1105,7 +1106,7 @@ pub struct CreateCallbackBuilder<O> {
     timeout: Option<Duration>,
     #[allow(dead_code)] // reason: not yet read by the builder body
     heartbeat: Option<Duration>,
-    serdes: Option<Box<dyn Serdes>>,
+    serdes: Option<Arc<dyn Serdes>>,
     _marker: PhantomData<O>,
 }
 
@@ -1158,7 +1159,7 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> CreateCallbackBuilder<O> {
     /// the callback decode falls back to the execution-wide serdes configured
     /// on [`Options`](crate::Options), whose own default is JSON.
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Box::new(serdes));
+        self.serdes = Some(Arc::new(serdes));
         self
     }
 
@@ -1237,7 +1238,7 @@ pub struct WaitForCallbackBuilder<O> {
     heartbeat: Option<Duration>,
     submitter: Option<crate::callback::BoxedSubmitter>,
     submitter_retry: Option<RetryStrategy>,
-    serdes: Option<Box<dyn Serdes>>,
+    serdes: Option<Arc<dyn Serdes>>,
     _marker: PhantomData<O>,
 }
 
@@ -1340,7 +1341,7 @@ impl<O: Send + 'static> WaitForCallbackBuilder<O> {
     /// falls back to the execution-wide serdes configured on
     /// [`Options`](crate::Options), whose own default is JSON.
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Box::new(serdes));
+        self.serdes = Some(Arc::new(serdes));
         self
     }
 }
@@ -1434,14 +1435,14 @@ pub struct MapBuilder<I, O> {
     name: Option<String>,
     max_concurrency: Option<usize>,
     completion: Option<CompletionConfig>,
-    serdes: Option<Box<dyn Serdes>>,
-    result_serdes: Option<Box<dyn Serdes>>,
+    serdes: Option<Arc<dyn Serdes>>,
+    result_serdes: Option<Arc<dyn Serdes>>,
     nesting: crate::map_parallel::NestingMode,
-    item_namer: Option<std::sync::Arc<dyn Fn(usize) -> String + Send + Sync>>,
+    item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
     items: Vec<I>,
     #[allow(clippy::type_complexity)] // reason: boxed async closure factory
     closure: Option<
-        std::sync::Arc<
+        Arc<
             dyn Fn(
                     DurableContext,
                     I,
@@ -1491,7 +1492,7 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     pub(crate) fn with_items_and_closure(
         mut self,
         items: Vec<I>,
-        closure: std::sync::Arc<
+        closure: Arc<
             dyn Fn(
                     DurableContext,
                     I,
@@ -1534,7 +1535,7 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     /// other operation, so a [`Serdes`] attached here behaves exactly as it
     /// does on a step, invoke, callback, or `result_serdes`.
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Box::new(serdes));
+        self.serdes = Some(Arc::new(serdes));
         self
     }
 
@@ -1543,7 +1544,7 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     /// This is the operation-level serdes: it serializes and deserializes
     /// the entire [`crate::BatchResult`] rather than individual items.
     pub fn result_serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.result_serdes = Some(Box::new(serdes));
+        self.result_serdes = Some(Arc::new(serdes));
         self
     }
 
@@ -1561,7 +1562,7 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     /// The namer function receives the zero-based item index and returns
     /// a display name for that iteration.
     pub fn item_namer(mut self, namer: impl Fn(usize) -> String + Send + Sync + 'static) -> Self {
-        self.item_namer = Some(std::sync::Arc::new(namer));
+        self.item_namer = Some(Arc::new(namer));
         self
     }
 
@@ -1590,7 +1591,7 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
         use crate::map_parallel::MapExecution;
 
         let closure = self.closure.unwrap_or_else(|| {
-            std::sync::Arc::new(|_ctx, _item, _idx| {
+            Arc::new(|_ctx, _item, _idx| {
                 Box::pin(async { Err(crate::error::ChildFnError::new("map has no closure")) })
                     as std::pin::Pin<
                         Box<
@@ -1651,7 +1652,7 @@ impl<
         preflight_identity!(self, "Context", crate::map_parallel::MAP_SUB_TYPE);
 
         let closure = self.closure.unwrap_or_else(|| {
-            std::sync::Arc::new(|_ctx, _item, _idx| {
+            Arc::new(|_ctx, _item, _idx| {
                 Box::pin(async { Err(crate::error::ChildFnError::new("map has no closure")) })
                     as std::pin::Pin<
                         Box<
@@ -1716,8 +1717,8 @@ pub struct ParallelBuilder<O> {
     name: Option<String>,
     max_concurrency: Option<usize>,
     completion: Option<CompletionConfig>,
-    serdes: Option<Box<dyn Serdes>>,
-    result_serdes: Option<Box<dyn Serdes>>,
+    serdes: Option<Arc<dyn Serdes>>,
+    result_serdes: Option<Arc<dyn Serdes>>,
     nesting: crate::map_parallel::NestingMode,
     #[allow(clippy::type_complexity)] // reason: boxed future factory per branch
     branches: Vec<(
@@ -1807,7 +1808,7 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     /// other operation, so a [`Serdes`] attached here behaves exactly as it
     /// does on a step, invoke, callback, or `result_serdes`.
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Box::new(serdes));
+        self.serdes = Some(Arc::new(serdes));
         self
     }
 
@@ -1816,7 +1817,7 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     /// This is the operation-level serdes: it serializes and deserializes
     /// the entire [`crate::BatchResult`] rather than individual items.
     pub fn result_serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.result_serdes = Some(Box::new(serdes));
+        self.result_serdes = Some(Arc::new(serdes));
         self
     }
 

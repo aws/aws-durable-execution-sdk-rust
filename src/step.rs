@@ -9,6 +9,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
@@ -138,7 +139,7 @@ pub(crate) struct StepExecution<O> {
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) retry_strategy: Option<RetryStrategy>,
-    pub(crate) serdes: Option<Box<dyn Serdes>>,
+    pub(crate) serdes: Option<Arc<dyn Serdes>>,
     pub(crate) semantics: StepSemantics,
     #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
     pub(crate) closure: Box<
@@ -171,10 +172,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
                 CheckpointStatus::Succeeded => {
                     let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
                     return replay_success(
-                        self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                        self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                         record.result.as_ref(),
                         &serdes_ctx,
-                    );
+                    )
+                    .await;
                 }
                 CheckpointStatus::Failed => {
                     return Err(replay_failure(
@@ -258,7 +260,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
                     &ctx,
                     &wire_id,
                     name.as_deref(),
-                    serdes.as_deref().or_else(|| ctx.default_serdes()),
+                    serdes.as_ref().or_else(|| ctx.default_serdes()),
                     value,
                 )
                 .await
@@ -285,13 +287,13 @@ async fn handle_success<O: Serialize + DeserializeOwned>(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
-    serdes: Option<&dyn Serdes>,
+    serdes: Option<&Arc<dyn Serdes>>,
     value: O,
 ) -> Result<O, OperationError> {
     let serdes_ctx = SerdesContext::new(wire_id, ctx.execution_arn());
 
     // Serialize the result.
-    let serialized = serialize_value(serdes, &value, &serdes_ctx)?;
+    let serialized = serialize_value(serdes, &value, &serdes_ctx).await?;
 
     // Checkpoint SUCCEED with payload.
     let update = build_succeed_update(wire_id, name, ctx.parent_wire_id(), &serialized);
@@ -300,7 +302,7 @@ async fn handle_success<O: Serialize + DeserializeOwned>(
         .map_err(|e| client_error_to_op_error(&e))?;
 
     // Return deserialized from the serialized form (round-trip parity).
-    deserialize_result(serdes, &serialized, &serdes_ctx)
+    deserialize_result(serdes, &serialized, &serdes_ctx).await
 }
 
 /// Handles a failed step: consult retry strategy, checkpoint accordingly.
@@ -484,32 +486,39 @@ fn build_fail_update(
 
 // ── Serialization helpers ───────────────────────────────────────────────
 
-fn serialize_value<O: Serialize>(
-    serdes: Option<&dyn Serdes>,
+fn serialize_value<'a, O: Serialize>(
+    serdes: Option<&'a Arc<dyn Serdes>>,
     value: &O,
-    serdes_ctx: &SerdesContext,
-) -> Result<String, OperationError> {
-    let Some(s) = serdes else {
-        // No custom serdes: plain `serde_json` straight to the wire.
-        return serde_json::to_string(value).map_err(|e| step_serialization_error(&e));
-    };
-    // A custom serdes is handed the value erased to `serde_json::Value` — the
+    serdes_ctx: &'a SerdesContext,
+) -> impl Future<Output = Result<String, OperationError>> + Send + 'a {
+    // Phase 1 (sync): consume the `&O` borrow now, so the returned future
+    // holds no `&O` across its await (which would force `O: Sync` on every
+    // operation future). No custom serdes renders straight to the wire; a
+    // custom serdes receives the value erased to `serde_json::Value` — the
     // same shape every other operation path provides.
-    let json_value = serde_json::to_value(value).map_err(|e| step_serialization_error(&e))?;
-    s.serialize(&json_value, serdes_ctx)
-        .map_err(|e| step_serialization_error(&*e))
+    let prepared = crate::serdes::prepare_value(serdes, value);
+    // Phase 2 (async): a custom serdes may block (e.g. filesystem I/O), so
+    // the call runs off the async runtime.
+    async move {
+        prepared
+            .map_err(|e| step_serialization_error(&e))?
+            .into_wire(serdes_ctx)
+            .await
+            .map_err(|e| step_serialization_error(&*e))
+    }
 }
 
-fn deserialize_result<O: DeserializeOwned>(
-    serdes: Option<&dyn Serdes>,
+async fn deserialize_result<O: DeserializeOwned>(
+    serdes: Option<&Arc<dyn Serdes>>,
     serialized: &str,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
     let Some(s) = serdes else {
         return serde_json::from_str(serialized).map_err(|e| step_serialization_error(&e));
     };
-    let json_value = s
-        .deserialize(serialized, serdes_ctx)
+    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
+    let json_value = crate::serdes::deserialize_off_runtime(s, serialized.to_owned(), serdes_ctx)
+        .await
         .map_err(|e| step_serialization_error(&*e))?;
     serde_json::from_value(json_value).map_err(|e| step_serialization_error(&e))
 }
@@ -523,13 +532,13 @@ fn step_serialization_error<E: std::fmt::Display + ?Sized>(e: &E) -> OperationEr
     )))
 }
 
-fn replay_success<O: DeserializeOwned>(
-    serdes: Option<&dyn Serdes>,
+async fn replay_success<O: DeserializeOwned>(
+    serdes: Option<&Arc<dyn Serdes>>,
     result: Option<&String>,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
     let payload = result.map_or("null", String::as_str);
-    deserialize_result(serdes, payload, serdes_ctx)
+    deserialize_result(serdes, payload, serdes_ctx).await
 }
 
 fn replay_failure(error_type: Option<&str>, error_message: Option<&str>) -> OperationError {
@@ -580,18 +589,18 @@ mod tests {
 
     // ── Replay tests ────────────────────────────────────────────────────
 
-    #[test]
-    fn replay_success_deserializes_json() {
+    #[tokio::test]
+    async fn replay_success_deserializes_json() {
         let payload = "42".to_owned();
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let result: Result<i32, OperationError> = replay_success(None, Some(&payload), &ctx);
+        let result: Result<i32, OperationError> = replay_success(None, Some(&payload), &ctx).await;
         assert_eq!(result.unwrap(), 42);
     }
 
-    #[test]
-    fn replay_success_null_returns_unit() {
+    #[tokio::test]
+    async fn replay_success_null_returns_unit() {
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let result: Result<(), OperationError> = replay_success(None, None, &ctx);
+        let result: Result<(), OperationError> = replay_success(None, None, &ctx).await;
         assert!(result.is_ok());
     }
 
@@ -619,16 +628,18 @@ mod tests {
 
     // ── Serialization tests ─────────────────────────────────────────────
 
-    #[test]
-    fn serialize_deserialize_round_trip() {
+    #[tokio::test]
+    async fn serialize_deserialize_round_trip() {
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let serialized = serialize_value::<String>(None, &"hello".to_owned(), &ctx).unwrap();
-        let deserialized: String = deserialize_result(None, &serialized, &ctx).unwrap();
+        let serialized = serialize_value::<String>(None, &"hello".to_owned(), &ctx)
+            .await
+            .unwrap();
+        let deserialized: String = deserialize_result(None, &serialized, &ctx).await.unwrap();
         assert_eq!(deserialized, "hello");
     }
 
-    #[test]
-    fn serialize_with_custom_serdes_uppercases() {
+    #[tokio::test]
+    async fn serialize_with_custom_serdes_uppercases() {
         struct Upper;
         impl std::fmt::Debug for Upper {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -651,9 +662,11 @@ mod tests {
                 Ok(serde_json::from_str(data)?)
             }
         }
-        let serdes: Box<dyn Serdes> = Box::new(Upper);
+        let serdes: Arc<dyn Serdes> = Arc::new(Upper);
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let result = serialize_value(Some(serdes.as_ref()), &"hello".to_owned(), &ctx).unwrap();
+        let result = serialize_value(Some(&serdes), &"hello".to_owned(), &ctx)
+            .await
+            .unwrap();
         assert_eq!(result, "\"HELLO\"");
     }
 

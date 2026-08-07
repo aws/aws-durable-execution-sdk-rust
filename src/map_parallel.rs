@@ -312,8 +312,8 @@ pub(crate) struct MapExecution<I, O> {
     pub(crate) name: Option<String>,
     pub(crate) max_concurrency: Option<usize>,
     pub(crate) completion: Option<crate::CompletionConfig>,
-    pub(crate) serdes: Option<Box<dyn Serdes>>,
-    pub(crate) result_serdes: Option<Box<dyn Serdes>>,
+    pub(crate) serdes: Option<Arc<dyn Serdes>>,
+    pub(crate) result_serdes: Option<Arc<dyn Serdes>>,
     pub(crate) nesting: NestingMode,
     pub(crate) item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
     pub(crate) items: Vec<I>,
@@ -448,8 +448,8 @@ pub(crate) struct ParallelExecution<O> {
     pub(crate) name: Option<String>,
     pub(crate) max_concurrency: Option<usize>,
     pub(crate) completion: Option<crate::CompletionConfig>,
-    pub(crate) serdes: Option<Box<dyn Serdes>>,
-    pub(crate) result_serdes: Option<Box<dyn Serdes>>,
+    pub(crate) serdes: Option<Arc<dyn Serdes>>,
+    pub(crate) result_serdes: Option<Arc<dyn Serdes>>,
     pub(crate) nesting: NestingMode,
     #[allow(clippy::type_complexity)] // reason: boxed future factory per branch
     pub(crate) branches: Vec<(
@@ -605,8 +605,8 @@ async fn execute_batch<O, F, Fut>(
     parent_name: Option<String>,
     max_concurrency: Option<usize>,
     completion: Option<crate::CompletionConfig>,
-    serdes: Option<Box<dyn Serdes>>,
-    result_serdes: Option<Box<dyn Serdes>>,
+    serdes: Option<Arc<dyn Serdes>>,
+    result_serdes: Option<Arc<dyn Serdes>>,
     nesting: NestingMode,
     item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
     total_items: usize,
@@ -650,10 +650,12 @@ where
                 &record,
                 &parent_positional,
                 total_items,
-                serdes.as_deref(),
-                result_serdes.as_deref(),
+                serdes.as_ref(),
+                result_serdes.as_ref(),
                 &serdes_ctx,
-            ) {
+            )
+            .await
+            {
                 Ok(result) => {
                     // Advance the parent counter past the iteration IDs that
                     // were consumed during the original execution. Sequential
@@ -702,13 +704,14 @@ where
             items: Vec::new(),
             reason: CompletionReason::AllCompleted,
         };
-        let serdes_ref: Option<&dyn Serdes> = serdes.as_ref().map(Box::as_ref);
-        let payload = from_batch_result(&result, serdes_ref, &parent_wire, ctx.execution_arn())?;
+        let payload =
+            from_batch_result(&result, serdes.as_ref(), &parent_wire, ctx.execution_arn()).await?;
         let serialized_payload = serialize_value(
             &payload,
-            result_serdes.as_deref(),
+            result_serdes.as_ref(),
             &SerdesContext::new(&parent_wire, ctx.execution_arn()),
-        )?;
+        )
+        .await?;
         checkpoint_batch_success_serialized(
             &ctx,
             &parent_wire,
@@ -768,7 +771,6 @@ where
     // 7. Execute items with bounded concurrency, branch-local suspension, and
     // slot-holding accounting.
     let run_item = Arc::new(run_item);
-    let serdes: Arc<Option<Box<dyn Serdes>>> = Arc::new(serdes);
 
     // 7a. For concurrent mode: checkpoint ALL child STARTs synchronously
     // BEFORE dispatching any tasks. This prevents token rotation races
@@ -884,7 +886,7 @@ where
             let parent_wire_task = parent_wire.clone();
             let child_sub_type_task = child_sub_type_owned.clone();
             let run_item_task = Arc::clone(&run_item);
-            let serdes_task = Arc::clone(&serdes);
+            let serdes_task = serdes.clone();
             let item_nesting = nesting;
             let task_ownership = ctx.task_ownership().clone();
 
@@ -913,7 +915,7 @@ where
                     &item_name_task,
                     item_nesting,
                     &*run_item_task,
-                    serdes_task.as_ref().as_deref(),
+                    serdes_task.as_ref(),
                 )
                 .await;
 
@@ -1071,14 +1073,19 @@ where
     // The whole-batch summary goes through the SAME `serialize_value` helper
     // as every other path, so `result_serdes` receives the summary erased to
     // `serde_json::Value` exactly as an item serdes receives an item value.
-    let serdes_opt: &Option<Box<dyn Serdes>> = &serdes;
-    let serdes_ref: Option<&dyn Serdes> = serdes_opt.as_ref().map(Box::as_ref);
-    let payload = from_batch_result(&batch_result, serdes_ref, &parent_wire, ctx.execution_arn())?;
+    let payload = from_batch_result(
+        &batch_result,
+        serdes.as_ref(),
+        &parent_wire,
+        ctx.execution_arn(),
+    )
+    .await?;
     let serialized_payload = serialize_value(
         &payload,
-        result_serdes.as_deref(),
+        result_serdes.as_ref(),
         &SerdesContext::new(&parent_wire, ctx.execution_arn()),
-    )?;
+    )
+    .await?;
 
     // 12. Checkpoint the parent SUCCEED.
     checkpoint_batch_success_serialized(
@@ -1113,7 +1120,7 @@ async fn execute_single_item<O, F, Fut>(
     item_name: &str,
     nesting: NestingMode,
     run_item: &F,
-    serdes: Option<&dyn Serdes>,
+    serdes: Option<&Arc<dyn Serdes>>,
 ) -> Result<ItemOutcome<O>, OperationError>
 where
     O: Serialize + DeserializeOwned + Send + 'static,
@@ -1128,7 +1135,7 @@ where
 
     // Replay path: child already terminal.
     if is_terminal {
-        match replay_terminal_child::<O>(ctx, &child_positional, index, serdes, &serdes_ctx) {
+        match replay_terminal_child::<O>(ctx, &child_positional, index, serdes, &serdes_ctx).await {
             Ok(item) => return Ok(ItemOutcome::Terminal(item)),
             Err(e) => {
                 // ReplayChildren sentinel: fall through to re-execution.
@@ -1156,8 +1163,8 @@ where
         return match outcome {
             ScopeOutcome::Suspended => Ok(ItemOutcome::Suspended),
             ScopeOutcome::Completed(Ok(value)) => {
-                let serialized = serialize_value(&value, serdes, &serdes_ctx)?;
-                let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx)?;
+                let serialized = serialize_value(&value, serdes, &serdes_ctx).await?;
+                let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx).await?;
                 Ok(ItemOutcome::Terminal(BatchItem {
                     index,
                     name: item_name.to_owned(),
@@ -1221,7 +1228,7 @@ where
         }
         ScopeOutcome::Completed(Ok(value)) => {
             // Serialize and checkpoint success.
-            let serialized = serialize_value(&value, serdes, &serdes_ctx)?;
+            let serialized = serialize_value(&value, serdes, &serdes_ctx).await?;
             let mut builder = OperationUpdate::builder()
                 .id(child_wire)
                 .r#type(OperationType::Context)
@@ -1249,7 +1256,7 @@ where
                 .map_err(|e| batch_error(&format!("checkpoint child succeed: {e}")))?;
 
             // Round-trip deserialize for live == replay consistency.
-            let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx)?;
+            let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx).await?;
 
             Ok(ItemOutcome::Terminal(BatchItem {
                 index,
@@ -1306,13 +1313,13 @@ where
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Replays a terminal batch (parent already succeeded/failed in the log).
-fn replay_terminal_batch<O: DeserializeOwned>(
+async fn replay_terminal_batch<O: DeserializeOwned>(
     _ctx: &DurableContext,
     record: &crate::engine::CheckpointRecord,
     _parent_positional: &str,
     _total_items: usize,
-    serdes: Option<&dyn Serdes>,
-    result_serdes: Option<&dyn Serdes>,
+    serdes: Option<&Arc<dyn Serdes>>,
+    result_serdes: Option<&Arc<dyn Serdes>>,
     serdes_ctx: &SerdesContext,
 ) -> Result<BatchResult<O>, OperationError> {
     match &record.status {
@@ -1332,7 +1339,7 @@ fn replay_terminal_batch<O: DeserializeOwned>(
             // If result_serdes is set, reverse its transform first — through
             // the same helper every other path uses.
             let payload: BatchCheckpointPayload =
-                deserialize_value(payload_str, result_serdes, serdes_ctx)?;
+                deserialize_value(payload_str, result_serdes, serdes_ctx).await?;
             // The batch parent's serdes context carries the parent wire ID and
             // the execution ARN, which is exactly what the per-item contexts
             // are derived from.
@@ -1342,6 +1349,7 @@ fn replay_terminal_batch<O: DeserializeOwned>(
                 serdes_ctx.operation_id(),
                 serdes_ctx.durable_execution_arn(),
             )
+            .await
         }
         CheckpointStatus::Failed => {
             let msg = record.error_message.as_deref().unwrap_or("batch failed");
@@ -1355,11 +1363,11 @@ fn replay_terminal_batch<O: DeserializeOwned>(
 }
 
 /// Replays a terminal child item from the checkpoint log.
-fn replay_terminal_child<O: DeserializeOwned>(
+async fn replay_terminal_child<O: DeserializeOwned>(
     ctx: &DurableContext,
     child_positional: &str,
     index: usize,
-    serdes: Option<&dyn Serdes>,
+    serdes: Option<&Arc<dyn Serdes>>,
     serdes_ctx: &SerdesContext,
 ) -> Result<BatchItem<O>, OperationError> {
     let record = ctx
@@ -1376,7 +1384,7 @@ fn replay_terminal_child<O: DeserializeOwned>(
                 .result
                 .as_deref()
                 .ok_or_else(|| batch_error("succeeded child has no result"))?;
-            let value: O = deserialize_value(payload, serdes, serdes_ctx)?;
+            let value: O = deserialize_value(payload, serdes, serdes_ctx).await?;
             Ok(BatchItem {
                 index,
                 name: String::new(),
@@ -1553,20 +1561,25 @@ fn should_stop_failure(
 /// (step, invoke, callback, child, batch result) uses, and — since the item
 /// paths now call this helper too — the same one map/parallel ITEM results
 /// use. There is no separate item rule.
-fn serialize_value<O: Serialize>(
+fn serialize_value<'a, O: Serialize>(
     value: &O,
-    serdes: Option<&dyn Serdes>,
-    serdes_ctx: &SerdesContext,
-) -> Result<String, OperationError> {
-    let Some(s) = serdes else {
-        // No custom serdes: plain `serde_json` straight to the wire.
-        return serde_json::to_string(value)
-            .map_err(|e| batch_error(&format!("serialize result: {e}")));
-    };
-    let json_value =
-        serde_json::to_value(value).map_err(|e| batch_error(&format!("serialize result: {e}")))?;
-    s.serialize(&json_value, serdes_ctx)
-        .map_err(|e| batch_error(&format!("serialize result (custom): {e}")))
+    serdes: Option<&'a Arc<dyn Serdes>>,
+    serdes_ctx: &'a SerdesContext,
+) -> impl Future<Output = Result<String, OperationError>> + Send + 'a {
+    // Phase 1 (sync): consume the `&O` borrow now, so the returned future
+    // holds no `&O` across its await (which would force `O: Sync` on every
+    // batch future). No custom serdes renders straight to the wire; a
+    // custom serdes receives the value erased to `serde_json::Value`.
+    let prepared = crate::serdes::prepare_value(serdes, value);
+    // Phase 2 (async): a custom serdes may block (e.g. filesystem I/O), so
+    // the call runs off the async runtime.
+    async move {
+        prepared
+            .map_err(|e| batch_error(&format!("serialize result: {e}")))?
+            .into_wire(serdes_ctx)
+            .await
+            .map_err(|e| batch_error(&format!("serialize result (custom): {e}")))
+    }
 }
 
 /// Deserializes a value using the configured serdes or JSON default.
@@ -1575,17 +1588,18 @@ fn serialize_value<O: Serialize>(
 /// `serde_json::Value` via [`Serdes::deserialize`], which `serde_json`
 /// deserializes into `O`. The conversion is exact — there is no guessing
 /// between a raw string and a JSON encoding, and no runtime downcast.
-fn deserialize_value<O: DeserializeOwned>(
+async fn deserialize_value<O: DeserializeOwned>(
     payload: &str,
-    serdes: Option<&dyn Serdes>,
+    serdes: Option<&Arc<dyn Serdes>>,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
     let Some(s) = serdes else {
         return serde_json::from_str(payload)
             .map_err(|e| batch_error(&format!("deserialize result: {e}")));
     };
-    let json_value = s
-        .deserialize(payload, serdes_ctx)
+    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
+    let json_value = crate::serdes::deserialize_off_runtime(s, payload.to_owned(), serdes_ctx)
+        .await
         .map_err(|e| batch_error(&format!("deserialize result (custom): {e}")))?;
     serde_json::from_value(json_value).map_err(|e| batch_error(&format!("deserialize result: {e}")))
 }
@@ -1628,51 +1642,87 @@ struct BatchCheckpointItem {
 }
 
 /// Converts a live `BatchResult` into the checkpoint payload format.
-fn from_batch_result<O: Serialize>(
+fn from_batch_result<'a, O: Serialize>(
     result: &BatchResult<O>,
-    serdes: Option<&dyn Serdes>,
-    parent_wire: &str,
-    execution_arn: &str,
-) -> Result<BatchCheckpointPayload, OperationError> {
-    let mut items = Vec::with_capacity(result.items.len());
-    for item in &result.items {
-        let status_str = match item.status {
-            BatchItemStatus::Succeeded => "SUCCEEDED",
-            BatchItemStatus::Failed => "FAILED",
-        };
-        let result_str = if item.status == BatchItemStatus::Succeeded {
-            if let Some(ref value) = item.result {
-                let item_ctx = item_summary_serdes_ctx(parent_wire, execution_arn, item.index);
-                serialize_value(value, serdes, &item_ctx)?
+    serdes: Option<&'a Arc<dyn Serdes>>,
+    parent_wire: &'a str,
+    execution_arn: &'a str,
+) -> impl Future<Output = Result<BatchCheckpointPayload, OperationError>> + Send + 'a {
+    // Phase 1 (sync): consume every `&O` borrow before the returned future
+    // is created — holding `&BatchResult<O>` across an await would force
+    // `O: Sync` on every batch future. Each successful item's value is
+    // prepared for the wire (rendered directly, or erased for its custom
+    // serdes), and the plain fields are copied out so the async phase never
+    // touches `&BatchItem<O>`.
+    let prepared_items: Result<Vec<_>, OperationError> = result
+        .items
+        .iter()
+        .map(|item| {
+            let prepared = if item.status == BatchItemStatus::Succeeded {
+                match item.result {
+                    Some(ref value) => Some(
+                        crate::serdes::prepare_value(serdes, value)
+                            .map_err(|e| batch_error(&format!("serialize result: {e}")))?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            Ok((
+                item.index,
+                item.name.clone(),
+                item.status,
+                item.error_message.clone().unwrap_or_default(),
+                prepared,
+            ))
+        })
+        .collect();
+    let reason = result.reason.as_str().to_owned();
+
+    // Phase 2 (async): complete each prepared value; a custom serdes may
+    // block (e.g. filesystem I/O), so it runs off the async runtime.
+    async move {
+        let prepared_items = prepared_items?;
+        let mut items = Vec::with_capacity(prepared_items.len());
+        for (index, name, status, err_message, prepared) in prepared_items {
+            let status_str = match status {
+                BatchItemStatus::Succeeded => "SUCCEEDED",
+                BatchItemStatus::Failed => "FAILED",
+            };
+            let result_str = if let Some(prepared) = prepared {
+                let item_ctx = item_summary_serdes_ctx(parent_wire, execution_arn, index);
+                prepared
+                    .into_wire(&item_ctx)
+                    .await
+                    .map_err(|e| batch_error(&format!("serialize result (custom): {e}")))?
             } else {
                 String::new()
-            }
-        } else {
-            String::new()
-        };
-        items.push(BatchCheckpointItem {
-            index: item.index,
-            name: item.name.clone(),
-            status: status_str.to_owned(),
-            result: result_str,
-            err_type: if item.status == BatchItemStatus::Failed {
-                "ChildFnError".to_owned()
-            } else {
-                String::new()
-            },
-            err_message: item.error_message.clone().unwrap_or_default(),
-        });
+            };
+            items.push(BatchCheckpointItem {
+                index,
+                name,
+                status: status_str.to_owned(),
+                result: result_str,
+                err_type: if status == BatchItemStatus::Failed {
+                    "ChildFnError".to_owned()
+                } else {
+                    String::new()
+                },
+                err_message,
+            });
+        }
+        Ok(BatchCheckpointPayload {
+            results: items,
+            reason,
+        })
     }
-    Ok(BatchCheckpointPayload {
-        results: items,
-        reason: result.reason.as_str().to_owned(),
-    })
 }
 
 /// Converts a deserialized checkpoint payload back into a `BatchResult`.
-fn to_batch_result<O: DeserializeOwned>(
+async fn to_batch_result<O: DeserializeOwned>(
     payload: &BatchCheckpointPayload,
-    serdes: Option<&dyn Serdes>,
+    serdes: Option<&Arc<dyn Serdes>>,
     parent_wire: &str,
     execution_arn: &str,
 ) -> Result<BatchResult<O>, OperationError> {
@@ -1685,7 +1735,7 @@ fn to_batch_result<O: DeserializeOwned>(
         };
         let result = if status == BatchItemStatus::Succeeded && !cp.result.is_empty() {
             let item_ctx = item_summary_serdes_ctx(parent_wire, execution_arn, cp.index);
-            Some(deserialize_value::<O>(&cp.result, serdes, &item_ctx)?)
+            Some(deserialize_value::<O>(&cp.result, serdes, &item_ctx).await?)
         } else {
             None
         };
@@ -2937,10 +2987,15 @@ mod tests {
         // is fed the EXACT wire form the step path wrote above, so this asserts
         // the two paths agree on the reconstructed shape.
         let callback_rec = RecordingSerdes::new();
+        let callback_rec_arc: Arc<dyn Serdes> = Arc::new(callback_rec.clone());
         let callback_ctx = SerdesContext::new("cb-1", "arn:test");
-        let callback_out: String =
-            crate::callback::deserialize_callback_result(Some(&callback_rec), &wire, &callback_ctx)
-                .expect("the callback path must decode the wire form the step path wrote");
+        let callback_out: String = crate::callback::deserialize_callback_result(
+            Some(&callback_rec_arc),
+            &wire,
+            &callback_ctx,
+        )
+        .await
+        .expect("the callback path must decode the wire form the step path wrote");
         assert_eq!(callback_out, value, "callback must round-trip the value");
         assert_eq!(
             callback_rec.deserialize_outputs(),

@@ -14,6 +14,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use serde::Serialize;
@@ -41,7 +42,7 @@ pub(crate) struct ChildExecution<O> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
-    pub(crate) serdes: Option<Box<dyn Serdes>>,
+    pub(crate) serdes: Option<Arc<dyn Serdes>>,
     #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
     pub(crate) closure: Box<
         dyn FnOnce(DurableContext) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
@@ -83,14 +84,16 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
                                 // Round-trip through serialization for consistency.
                                 let serialized = serialize_value(
                                     &value,
-                                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
-                                    &serdes_ctx,
-                                )?;
-                                deserialize_value::<O>(
-                                    &serialized,
-                                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                                     &serdes_ctx,
                                 )
+                                .await?;
+                                deserialize_value::<O>(
+                                    &serialized,
+                                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
+                                    &serdes_ctx,
+                                )
+                                .await
                             }
                             Err(child_err) => Err(OperationError::from_kind(
                                 OperationErrorKind::ChildContext(ChildContextError::from_kind(
@@ -102,10 +105,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
                         };
                     }
                     return replay_success::<O>(
-                        self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                        self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                         record.result.as_ref(),
                         &serdes_ctx,
-                    );
+                    )
+                    .await;
                 }
                 CheckpointStatus::Failed => {
                     return Err(replay_failure(
@@ -147,9 +151,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
                 // 6a. Success: serialize and checkpoint.
                 let serialized = serialize_value(
                     &value,
-                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                     &serdes_ctx,
-                )?;
+                )
+                .await?;
                 let mut succeed_builder = OperationUpdate::builder()
                     .id(wire_id.clone())
                     .r#type(OperationType::Context)
@@ -185,9 +190,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
                 // Round-trip deserialize for consistency (first-run == replay).
                 deserialize_value::<O>(
                     &serialized,
-                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                     &serdes_ctx,
                 )
+                .await
             }
             Err(child_err) => {
                 // 6b. Failure: checkpoint FAIL with error details.
@@ -262,15 +268,15 @@ fn build_update(
 }
 
 /// Replays a successful child context result from the checkpoint log.
-fn replay_success<O: DeserializeOwned>(
-    serdes: Option<&dyn Serdes>,
+async fn replay_success<O: DeserializeOwned>(
+    serdes: Option<&Arc<dyn Serdes>>,
     result: Option<&String>,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
     let payload = result.ok_or_else(|| {
         child_internal_error("checkpointed Succeeded operation has no result payload")
     })?;
-    deserialize_value::<O>(payload, serdes, serdes_ctx)
+    deserialize_value::<O>(payload, serdes, serdes_ctx).await
 }
 
 /// Replays a failed child context result from the checkpoint log.
@@ -284,36 +290,41 @@ fn replay_failure(error_type: Option<&str>, error_message: Option<&str>) -> Oper
 }
 
 /// Serializes a value using the configured serdes or JSON default.
-fn serialize_value<O: Serialize>(
+fn serialize_value<'a, O: Serialize>(
     value: &O,
-    serdes: Option<&dyn Serdes>,
-    serdes_ctx: &SerdesContext,
-) -> Result<String, OperationError> {
-    let Some(s) = serdes else {
-        // No custom serdes: plain `serde_json` straight to the wire.
-        return serde_json::to_string(value)
-            .map_err(|e| child_internal_error(&format!("serialize result: {e}")));
-    };
-    // A custom serdes is handed the value erased to `serde_json::Value` — the
+    serdes: Option<&'a Arc<dyn Serdes>>,
+    serdes_ctx: &'a SerdesContext,
+) -> impl Future<Output = Result<String, OperationError>> + Send + 'a {
+    // Phase 1 (sync): consume the `&O` borrow now, so the returned future
+    // holds no `&O` across its await (which would force `O: Sync` on every
+    // operation future). No custom serdes renders straight to the wire; a
+    // custom serdes receives the value erased to `serde_json::Value` — the
     // same shape every other operation path provides.
-    let json_value = serde_json::to_value(value)
-        .map_err(|e| child_internal_error(&format!("serialize result: {e}")))?;
-    s.serialize(&json_value, serdes_ctx)
-        .map_err(|e| child_internal_error(&format!("serialize result (custom): {e}")))
+    let prepared = crate::serdes::prepare_value(serdes, value);
+    // Phase 2 (async): a custom serdes may block (e.g. filesystem I/O), so
+    // the call runs off the async runtime.
+    async move {
+        prepared
+            .map_err(|e| child_internal_error(&format!("serialize result: {e}")))?
+            .into_wire(serdes_ctx)
+            .await
+            .map_err(|e| child_internal_error(&format!("serialize result (custom): {e}")))
+    }
 }
 
 /// Deserializes a value using the configured serdes or JSON default.
-fn deserialize_value<O: DeserializeOwned>(
+async fn deserialize_value<O: DeserializeOwned>(
     payload: &str,
-    serdes: Option<&dyn Serdes>,
+    serdes: Option<&Arc<dyn Serdes>>,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
     let Some(s) = serdes else {
         return serde_json::from_str(payload)
             .map_err(|e| child_internal_error(&format!("deserialize result: {e}")));
     };
-    let json_value = s
-        .deserialize(payload, serdes_ctx)
+    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
+    let json_value = crate::serdes::deserialize_off_runtime(s, payload.to_owned(), serdes_ctx)
+        .await
         .map_err(|e| child_internal_error(&format!("deserialize result (custom): {e}")))?;
     serde_json::from_value(json_value)
         .map_err(|e| child_internal_error(&format!("deserialize result: {e}")))

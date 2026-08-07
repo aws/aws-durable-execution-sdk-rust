@@ -13,6 +13,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
@@ -55,7 +56,7 @@ pub(crate) struct CreateCallbackExecution<O> {
     pub(crate) name: Option<String>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) heartbeat: Option<Duration>,
-    pub(crate) serdes: Option<Box<dyn Serdes>>,
+    pub(crate) serdes: Option<Arc<dyn Serdes>>,
     pub(crate) _marker: std::marker::PhantomData<O>,
 }
 
@@ -91,10 +92,11 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
                     let serdes_ctx =
                         SerdesContext::new(self.op_id.wire(), self.ctx.execution_arn());
                     let value: O = deserialize_callback_result(
-                        self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                        self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                         result_str,
                         &serdes_ctx,
-                    )?;
+                    )
+                    .await?;
                     return Ok(Callback::new_settled(callback_id, Ok(value)));
                 }
                 CheckpointStatus::Failed => {
@@ -193,7 +195,7 @@ pub(crate) struct WaitForCallbackExecution<O> {
     pub(crate) heartbeat: Option<Duration>,
     pub(crate) submitter: BoxedSubmitter,
     pub(crate) submitter_retry: Option<crate::RetryStrategy>,
-    pub(crate) serdes: Option<Box<dyn Serdes>>,
+    pub(crate) serdes: Option<Arc<dyn Serdes>>,
     pub(crate) _marker: std::marker::PhantomData<O>,
 }
 
@@ -341,7 +343,7 @@ async fn run_wfcb_body<O: DeserializeOwned + Send + 'static>(
     heartbeat: Option<Duration>,
     submitter: BoxedSubmitter,
     submitter_retry: Option<crate::RetryStrategy>,
-    serdes: Option<Box<dyn Serdes>>,
+    serdes: Option<Arc<dyn Serdes>>,
 ) -> Result<O, OperationError> {
     // Step 1: create the inner callback (no name, per wire spec). The per-op
     // serdes flows through to the inner callback's decode so a serdes set on
@@ -535,16 +537,17 @@ fn callback_deser_error_msg(message: String) -> OperationError {
 /// side of the serdes is meaningful: `serdes` (when present) turns the wire
 /// payload back into a `serde_json::Value`, which is then deserialized into
 /// `O`. With no serdes the payload is parsed as JSON directly.
-pub(crate) fn deserialize_callback_result<O: DeserializeOwned>(
-    serdes: Option<&dyn Serdes>,
+pub(crate) async fn deserialize_callback_result<O: DeserializeOwned>(
+    serdes: Option<&Arc<dyn Serdes>>,
     payload: &str,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
     let Some(s) = serdes else {
         return serde_json::from_str(payload).map_err(|e| callback_deser_error(&e));
     };
-    let json_value = s
-        .deserialize(payload, serdes_ctx)
+    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
+    let json_value = crate::serdes::deserialize_off_runtime(s, payload.to_owned(), serdes_ctx)
+        .await
         .map_err(|e| callback_deser_error_msg(format!("callback serdes: {e}")))?;
     serde_json::from_value(json_value).map_err(|e| callback_deser_error(&e))
 }
@@ -1356,7 +1359,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: None,
-            serdes: Some(Box::new(MarkerSerdes)),
+            serdes: Some(Arc::new(MarkerSerdes)),
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should settle");
@@ -1403,7 +1406,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: None,
-            serdes: Some(Box::new(HexEnvelopeSerdes)),
+            serdes: Some(Arc::new(HexEnvelopeSerdes)),
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should settle");
@@ -1532,7 +1535,7 @@ mod tests {
             heartbeat: None,
             submitter: Box::new(|_sc, _id| Box::pin(async { Ok(()) })),
             submitter_retry: None,
-            serdes: Some(Box::new(MarkerSerdes)),
+            serdes: Some(Arc::new(MarkerSerdes)),
             _marker: std::marker::PhantomData,
         };
         let result = exec

@@ -9,6 +9,8 @@ use aws_sdk_lambda::types::{
     ChainedInvokeOptions, OperationAction, OperationType, OperationUpdate,
 };
 
+use std::sync::Arc;
+
 use crate::Serdes;
 use crate::SerdesContext;
 use crate::client::ClientError;
@@ -29,8 +31,8 @@ pub(crate) struct InvokeExecution<O> {
     pub(crate) name: Option<String>,
     pub(crate) function_id: String,
     pub(crate) erased_input: Result<serde_json::Value, String>,
-    pub(crate) payload_serdes: Option<Box<dyn Serdes>>,
-    pub(crate) result_serdes: Option<Box<dyn Serdes>>,
+    pub(crate) payload_serdes: Option<Arc<dyn Serdes>>,
+    pub(crate) result_serdes: Option<Arc<dyn Serdes>>,
     pub(crate) tenant_id: Option<String>,
     pub(crate) _marker: std::marker::PhantomData<O>,
 }
@@ -76,11 +78,12 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
                     let payload = record.invoke_result.as_deref().unwrap_or("null");
                     return deserialize_invoke_result(
                         self.result_serdes
-                            .as_deref()
+                            .as_ref()
                             .or_else(|| self.ctx.default_serdes()),
                         payload,
                         &serdes_ctx,
-                    );
+                    )
+                    .await;
                 }
                 CheckpointStatus::Failed
                 | CheckpointStatus::TimedOut
@@ -109,13 +112,15 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
         // 3. Live path: apply payload serdes then checkpoint.
         let effective_payload_serdes = self
             .payload_serdes
-            .as_deref()
+            .as_ref()
             .or_else(|| self.ctx.default_serdes());
         let wire_payload = if let Some(ps) = effective_payload_serdes {
             // The Value was erased at the call site (context.rs). The serdes
             // receives the same shape every other path provides — no re-parsing
-            // needed.
-            ps.serialize(&erased_input, &serdes_ctx)
+            // needed. Custom serdes may block (e.g. filesystem I/O), so the
+            // call runs off the async runtime.
+            crate::serdes::serialize_off_runtime(ps, erased_input, &serdes_ctx)
+                .await
                 .map_err(|e| invoke_serialization_error(&format!("payload serdes: {e}")))?
         } else {
             // No custom serdes: render the Value to compact JSON for the wire.
@@ -151,27 +156,28 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
 
 /// Serializes the invoke input payload using the configured serdes.
 #[allow(dead_code)] // reason: used in unit tests, may be needed by future callers
-pub(crate) fn serialize_invoke_input<I: Serialize>(
-    payload_serdes: Option<&dyn Serdes>,
+pub(crate) async fn serialize_invoke_input<I: Serialize>(
+    payload_serdes: Option<&Arc<dyn Serdes>>,
     input: &I,
     serdes_ctx: &SerdesContext,
 ) -> Result<String, OperationError> {
-    let Some(s) = payload_serdes else {
-        // No custom serdes: plain `serde_json` straight to the wire.
-        return serde_json::to_string(input)
-            .map_err(|e| invoke_serialization_error(&format!("serialize invoke input: {e}")));
-    };
-    // A custom serdes is handed the input erased to `serde_json::Value` — the
-    // same shape every other operation path provides.
-    let json_value = serde_json::to_value(input)
+    // Phase 1 (sync): consume the `&I` borrow before awaiting. No custom
+    // serdes renders straight to the wire; a custom serdes receives the
+    // input erased to `serde_json::Value` — the same shape every other
+    // operation path provides.
+    let prepared = crate::serdes::prepare_value(payload_serdes, input)
         .map_err(|e| invoke_serialization_error(&format!("serialize invoke input: {e}")))?;
-    s.serialize(&json_value, serdes_ctx)
+    // Phase 2 (async): a custom serdes may block (e.g. filesystem I/O), so
+    // the call runs off the async runtime.
+    prepared
+        .into_wire(serdes_ctx)
+        .await
         .map_err(|e| invoke_serialization_error(&format!("payload serdes: {e}")))
 }
 
 /// Deserializes the invoke result payload using the configured serdes.
-fn deserialize_invoke_result<O: DeserializeOwned>(
-    result_serdes: Option<&dyn Serdes>,
+async fn deserialize_invoke_result<O: DeserializeOwned>(
+    result_serdes: Option<&Arc<dyn Serdes>>,
     payload: &str,
     serdes_ctx: &SerdesContext,
 ) -> Result<O, OperationError> {
@@ -179,8 +185,9 @@ fn deserialize_invoke_result<O: DeserializeOwned>(
         return serde_json::from_str(payload)
             .map_err(|e| invoke_serialization_error(&format!("deserialize invoke result: {e}")));
     };
-    let json_value = s
-        .deserialize(payload, serdes_ctx)
+    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
+    let json_value = crate::serdes::deserialize_off_runtime(s, payload.to_owned(), serdes_ctx)
+        .await
         .map_err(|e| invoke_serialization_error(&format!("result serdes: {e}")))?;
     serde_json::from_value(json_value)
         .map_err(|e| invoke_serialization_error(&format!("deserialize invoke result: {e}")))
@@ -470,14 +477,19 @@ mod tests {
 
         // Test payload serialization.
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let serialized = serialize_invoke_input(Some(&Upper), &"hello", &ctx).unwrap();
+        let upper: Arc<dyn Serdes> = Arc::new(Upper);
+        let serialized = serialize_invoke_input(Some(&upper), &"hello", &ctx)
+            .await
+            .unwrap();
         assert_eq!(serialized, "\"HELLO\"");
 
         // Test result deserialization.
         // Upper::deserialize lowercases the whole payload string (including
         // JSON quotes) and parses it into a Value, which is then deserialized
         // into `String`: "\"WORLD\"" -> "\"world\"" -> "world".
-        let result: String = deserialize_invoke_result(Some(&Upper), "\"WORLD\"", &ctx).unwrap();
+        let result: String = deserialize_invoke_result(Some(&upper), "\"WORLD\"", &ctx)
+            .await
+            .unwrap();
         assert_eq!(result, "world");
     }
 
@@ -675,7 +687,7 @@ mod tests {
             name: None,
             function_id: "target-fn".to_owned(),
             erased_input: Ok(serde_json::json!("hello")),
-            payload_serdes: Some(Box::new(UpperPayload)),
+            payload_serdes: Some(Arc::new(UpperPayload)),
             result_serdes: None,
             tenant_id: None,
             _marker: PhantomData,
@@ -757,7 +769,7 @@ mod tests {
             function_id: "fn".to_owned(),
             erased_input: Ok(serde_json::Value::Null),
             payload_serdes: None,
-            result_serdes: Some(Box::new(LowerResult)),
+            result_serdes: Some(Arc::new(LowerResult)),
             tenant_id: None,
             _marker: PhantomData,
         };

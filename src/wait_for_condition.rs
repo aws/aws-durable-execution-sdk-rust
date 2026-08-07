@@ -15,6 +15,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
@@ -109,7 +110,7 @@ pub(crate) struct WaitForConditionExecution<S> {
     pub(crate) name: Option<String>,
     pub(crate) initial_state: S,
     pub(crate) wait_strategy: Option<WaitStrategyFn<S>>,
-    pub(crate) serdes: Option<Box<dyn Serdes>>,
+    pub(crate) serdes: Option<Arc<dyn Serdes>>,
     #[allow(clippy::type_complexity)] // reason: boxed Fn closure is inherently complex
     pub(crate) check: Box<
         dyn Fn(StepContext, S) -> Pin<Box<dyn Future<Output = Result<S, BoxError>> + Send>>
@@ -146,10 +147,11 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                     // CRITICAL: LOUD error on deserialization failure.
                     // Never fall back to initial_state (Python #574 / JS #754).
                     return replay_terminal_success(
-                        self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                        self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                         record.result.as_ref(),
                         &serdes_ctx,
-                    );
+                    )
+                    .await;
                 }
                 CheckpointStatus::Failed => {
                     // Terminal failure: reconstruct error from checkpoint.
@@ -192,10 +194,11 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                 // On deserialization failure, surface the error loudly and
                 // never silently fall back to initial_state.
                 deserialize_state(
-                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                     record.result.as_ref(),
                     &serdes_ctx,
-                )?
+                )
+                .await?
             } else {
                 self.initial_state.clone()
             }
@@ -227,17 +230,19 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
             Ok(new_state) => {
                 // Serialize the new state.
                 let serialized = serialize_state(
-                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                     &new_state,
                     &serdes_ctx,
-                )?;
+                )
+                .await?;
 
                 // Round-trip through serdes for consistency.
                 let deserialized: S = deserialize_state_str(
-                    self.serdes.as_deref().or_else(|| self.ctx.default_serdes()),
+                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                     &serialized,
                     &serdes_ctx,
-                )?;
+                )
+                .await?;
 
                 // Consult the wait strategy.
                 let decision = if let Some(strategy) = &self.wait_strategy {
@@ -334,13 +339,13 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
 
 /// Replays a terminal success from the checkpoint log.
 /// CRITICAL: NEVER falls back to `initial_state` (Python #574 / JS #754 fix).
-fn replay_terminal_success<S: DeserializeOwned>(
-    serdes: Option<&dyn Serdes>,
+async fn replay_terminal_success<S: DeserializeOwned>(
+    serdes: Option<&Arc<dyn Serdes>>,
     result: Option<&String>,
     serdes_ctx: &SerdesContext,
 ) -> Result<S, OperationError> {
     let payload = result.map_or("null", String::as_str);
-    deserialize_state_str(serdes, payload, serdes_ctx)
+    deserialize_state_str(serdes, payload, serdes_ctx).await
 }
 
 /// Replays a terminal failure from the checkpoint log.
@@ -358,47 +363,50 @@ fn replay_terminal_failure(
 }
 
 /// Serializes state using the configured serdes or default JSON.
-fn serialize_state<S: Serialize>(
-    serdes: Option<&dyn Serdes>,
+fn serialize_state<'a, S: Serialize>(
+    serdes: Option<&'a Arc<dyn Serdes>>,
     value: &S,
-    serdes_ctx: &SerdesContext,
-) -> Result<String, OperationError> {
-    let Some(s) = serdes else {
-        // No custom serdes: plain `serde_json` straight to the wire.
-        return serde_json::to_string(value).map_err(|e| {
-            wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-                message: e.to_string(),
+    serdes_ctx: &'a SerdesContext,
+) -> impl Future<Output = Result<String, OperationError>> + Send + 'a {
+    // Phase 1 (sync): consume the `&S` borrow now, so the returned future
+    // holds no `&S` across its await (which would force `S: Sync`). No
+    // custom serdes renders straight to the wire; a custom serdes receives
+    // the state erased to `serde_json::Value` — the same shape every other
+    // operation path provides.
+    let prepared = crate::serdes::prepare_value(serdes, value);
+    // Phase 2 (async): a custom serdes may block (e.g. filesystem I/O), so
+    // the call runs off the async runtime.
+    async move {
+        prepared
+            .map_err(|e| {
+                wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
+                    message: e.to_string(),
+                })
+            })?
+            .into_wire(serdes_ctx)
+            .await
+            .map_err(|e| {
+                wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
+                    message: e.to_string(),
+                })
             })
-        });
-    };
-    // A custom serdes is handed the state erased to `serde_json::Value` — the
-    // same shape every other operation path provides.
-    let json_value = serde_json::to_value(value).map_err(|e| {
-        wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-            message: e.to_string(),
-        })
-    })?;
-    s.serialize(&json_value, serdes_ctx).map_err(|e| {
-        wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-            message: e.to_string(),
-        })
-    })
+    }
 }
 
 /// Deserializes state from checkpoint result (Option<&String>).
 /// LOUD error on failure — never silently resets (Python #574 fix).
-fn deserialize_state<S: DeserializeOwned>(
-    serdes: Option<&dyn Serdes>,
+async fn deserialize_state<S: DeserializeOwned>(
+    serdes: Option<&Arc<dyn Serdes>>,
     result: Option<&String>,
     serdes_ctx: &SerdesContext,
 ) -> Result<S, OperationError> {
     let payload = result.map_or("null", String::as_str);
-    deserialize_state_str(serdes, payload, serdes_ctx)
+    deserialize_state_str(serdes, payload, serdes_ctx).await
 }
 
 /// Deserializes state from a string payload.
-fn deserialize_state_str<S: DeserializeOwned>(
-    serdes: Option<&dyn Serdes>,
+async fn deserialize_state_str<S: DeserializeOwned>(
+    serdes: Option<&Arc<dyn Serdes>>,
     payload: &str,
     serdes_ctx: &SerdesContext,
 ) -> Result<S, OperationError> {
@@ -409,11 +417,14 @@ fn deserialize_state_str<S: DeserializeOwned>(
             })
         });
     };
-    let json_value = s.deserialize(payload, serdes_ctx).map_err(|e| {
-        wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-            message: format!("state deserialization failed: {e}"),
-        })
-    })?;
+    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
+    let json_value = crate::serdes::deserialize_off_runtime(s, payload.to_owned(), serdes_ctx)
+        .await
+        .map_err(|e| {
+            wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
+                message: format!("state deserialization failed: {e}"),
+            })
+        })?;
     serde_json::from_value(json_value).map_err(|e| {
         wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
             message: format!("state deserialization failed: {e}"),

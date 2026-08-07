@@ -1,5 +1,7 @@
 //! Configuration types for the durable execution runtime.
 
+use std::sync::Arc;
+
 use crate::Serdes;
 
 /// Error returned when [`OptionsBuilder::build()`] detects an invalid
@@ -56,7 +58,7 @@ pub struct Options {
     /// operation that sets no serdes of its own. Per-operation `.serdes(...)`
     /// takes precedence, falling back to this default. Threaded into the root
     /// [`DurableContext`] by [`wrap`](crate::wrap).
-    pub(crate) serdes: Option<Box<dyn Serdes>>,
+    pub(crate) serdes: Option<Arc<dyn Serdes>>,
     /// A user-built AWS SDK config used to construct the Lambda client.
     pub(crate) sdk_config: Option<aws_config::SdkConfig>,
     /// A pre-built Lambda client. When set, it is used directly instead of
@@ -120,7 +122,7 @@ impl Options {
 #[must_use = "builders do nothing unless .build() is called"]
 #[non_exhaustive]
 pub struct OptionsBuilder {
-    serdes: Option<Box<dyn Serdes>>,
+    serdes: Option<Arc<dyn Serdes>>,
     sdk_config: Option<aws_config::SdkConfig>,
     lambda_client: Option<aws_sdk_lambda::Client>,
 }
@@ -153,7 +155,7 @@ impl OptionsBuilder {
     ///     .expect("valid config");
     /// ```
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Box::new(serdes));
+        self.serdes = Some(Arc::new(serdes));
         self
     }
 
