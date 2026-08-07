@@ -570,20 +570,17 @@ where
             async move {
                 let (raw_payload, lambda_ctx) = event.into_parts();
 
-                // Parse the durable invocation envelope. The service delivers:
-                // { "DurableExecutionArn": "...", "CheckpointToken": "...",
-                //   "InitialExecutionState": { "Operations": [...] } }
-                let execution_arn = raw_payload
-                    .get("DurableExecutionArn")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-
-                let checkpoint_token = raw_payload
-                    .get("CheckpointToken")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
+                // Parse and validate the durable invocation envelope.
+                let envelope = parse_envelope(&raw_payload)?.ok_or_else(|| {
+                    lambda_runtime::Error::from(
+                        "invocation payload is not a durable execution envelope \
+                             (missing DurableExecutionArn, CheckpointToken, and \
+                             InitialExecutionState)"
+                            .to_owned(),
+                    )
+                })?;
+                let execution_arn = envelope.execution_arn;
+                let checkpoint_token = envelope.checkpoint_token;
 
                 let customer_input: E = extract_customer_input(&raw_payload)?;
 
@@ -674,17 +671,101 @@ where
     .await
 }
 
+/// Parsed and validated durable invocation envelope fields.
+#[derive(Debug)]
+struct InvocationEnvelope {
+    execution_arn: String,
+    checkpoint_token: String,
+}
+
+/// Returns `true` when the payload looks like a durable invocation envelope
+/// (contains at least one of the expected top-level keys). Used to distinguish
+/// "the service sent an envelope but something is wrong" (an error naming the
+/// bad field) from "this payload has no envelope shape at all" (rejected at
+/// the entry points with a message describing the expected envelope).
+fn has_envelope_shape(payload: &serde_json::Value) -> bool {
+    payload.get("DurableExecutionArn").is_some()
+        || payload.get("CheckpointToken").is_some()
+        || payload.get("InitialExecutionState").is_some()
+}
+
+/// Parses and validates the durable invocation envelope.
+///
+/// When the envelope shape is present (any of the expected top-level keys
+/// exist), this function requires `DurableExecutionArn` and
+/// `CheckpointToken` to be present and to be strings. A missing or
+/// mistyped field is an immediate error naming the field, rather than
+/// silently defaulting to an empty string.
+///
+/// When the envelope shape is absent (none of the expected keys), returns
+/// `None` — callers decide whether that's acceptable.
+fn parse_envelope(
+    payload: &serde_json::Value,
+) -> Result<Option<InvocationEnvelope>, lambda_runtime::Error> {
+    if !has_envelope_shape(payload) {
+        return Ok(None);
+    }
+
+    let execution_arn = match payload.get("DurableExecutionArn") {
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| {
+                lambda_runtime::Error::from(
+                    "malformed invocation envelope: \"DurableExecutionArn\" is present but is not \
+                     a string"
+                        .to_owned(),
+                )
+            })?
+            .to_owned(),
+        None => {
+            return Err(lambda_runtime::Error::from(
+                "malformed invocation envelope: required field \"DurableExecutionArn\" is missing"
+                    .to_owned(),
+            ));
+        }
+    };
+
+    let checkpoint_token = match payload.get("CheckpointToken") {
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| {
+                lambda_runtime::Error::from(
+                    "malformed invocation envelope: \"CheckpointToken\" is present but is not a \
+                     string"
+                        .to_owned(),
+                )
+            })?
+            .to_owned(),
+        None => {
+            return Err(lambda_runtime::Error::from(
+                "malformed invocation envelope: required field \"CheckpointToken\" is missing"
+                    .to_owned(),
+            ));
+        }
+    };
+
+    Ok(Some(InvocationEnvelope {
+        execution_arn,
+        checkpoint_token,
+    }))
+}
+
 /// Extracts the customer's original event from the durable invocation
 /// envelope.
 ///
 /// The service embeds the customer payload in
 /// `InitialExecutionState.Operations[0].ExecutionDetails.InputPayload`
 /// as a JSON string.
+///
+/// The envelope is always required: [`run`] and [`wrap`] reject an
+/// envelope-free payload before reaching this function, and there is no
+/// raw-payload fallback. Local testing goes through
+/// [`LocalRunner`](test_util::LocalRunner), which drives the handler
+/// directly and never routes through the service entry points.
 fn extract_customer_input<E>(payload: &serde_json::Value) -> Result<E, lambda_runtime::Error>
 where
     E: for<'de> Deserialize<'de>,
 {
-    // Try the durable envelope path first.
     let input_str = payload
         .get("InitialExecutionState")
         .and_then(|s| s.get("Operations"))
@@ -699,11 +780,11 @@ where
         serde_json::from_str(input_json)
             .map_err(|e| lambda_runtime::Error::from(format!("deserialize customer input: {e}")))
     } else {
-        // Fallback: treat the raw payload as the customer event directly.
-        // This handles direct invocations (testing) where there is no
-        // durable envelope.
-        serde_json::from_value(payload.clone())
-            .map_err(|e| lambda_runtime::Error::from(format!("deserialize event: {e}")))
+        Err(lambda_runtime::Error::from(
+            "malformed invocation envelope: could not extract customer input from \
+             InitialExecutionState.Operations[0].ExecutionDetails.InputPayload"
+                .to_owned(),
+        ))
     }
 }
 
@@ -1014,18 +1095,17 @@ where
         Box::pin(async move {
             let (raw_payload, lambda_ctx) = event.into_parts();
 
-            // Parse the durable invocation envelope.
-            let execution_arn = raw_payload
-                .get("DurableExecutionArn")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-
-            let checkpoint_token = raw_payload
-                .get("CheckpointToken")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_owned();
+            // Parse and validate the durable invocation envelope.
+            let envelope = parse_envelope(&raw_payload)?.ok_or_else(|| {
+                lambda_runtime::Error::from(
+                    "invocation payload is not a durable execution envelope \
+                         (missing DurableExecutionArn, CheckpointToken, and \
+                         InitialExecutionState)"
+                        .to_owned(),
+                )
+            })?;
+            let execution_arn = envelope.execution_arn;
+            let checkpoint_token = envelope.checkpoint_token;
 
             let customer_input: E = extract_customer_input(&raw_payload)?;
 
@@ -1174,6 +1254,8 @@ impl ClientProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // reason: test assertions
+#[allow(clippy::expect_used)] // reason: test assertions
 mod tests {
     use std::future::IntoFuture;
 
@@ -1302,6 +1384,109 @@ mod tests {
         // fact that `service` is accepted by `service_fn` is proven by
         // the Send + Sync + correct return type checks above).
         drop(service);
+    }
+
+    // ── Service-level entry-point envelope tests ────────────────────────
+    //
+    // These invoke the `wrap`-produced service end to end, covering the
+    // entry-point envelope handling that the `parse_envelope` unit tests
+    // alone cannot reach.
+
+    /// Offline `Options`: a Lambda client built from a static config so the
+    /// service never loads ambient AWS configuration. The client is only
+    /// exercised by the happy-path test, which makes no AWS calls (single
+    /// inline state page, no checkpointed operations).
+    fn offline_options() -> Options {
+        let conf = aws_sdk_lambda::config::Config::builder()
+            .behavior_version(aws_sdk_lambda::config::BehaviorVersion::latest())
+            .region(aws_sdk_lambda::config::Region::new("us-east-1"))
+            .build();
+        Options::builder()
+            .lambda_client(aws_sdk_lambda::Client::from_conf(conf))
+            .build()
+            .expect("offline options build")
+    }
+
+    /// Invokes the `wrap`-produced echo service with the given payload.
+    async fn invoke_wrap_service(
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, lambda_runtime::Error> {
+        let service = wrap(
+            |event: serde_json::Value, _ctx: DurableContext| async move {
+                Ok::<serde_json::Value, BoxError>(event)
+            },
+            offline_options(),
+        );
+        let event = lambda_runtime::LambdaEvent::new(payload, lambda_runtime::Context::default());
+        service(event).await
+    }
+
+    #[tokio::test]
+    async fn wrap_service_missing_arn_fails() {
+        let payload = serde_json::json!({
+            "CheckpointToken": "token-abc",
+            "InitialExecutionState": { "Operations": [] }
+        });
+        let err = invoke_wrap_service(payload).await.expect_err("must fail");
+        assert!(
+            err.to_string().contains("DurableExecutionArn"),
+            "error should name the missing field, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_service_missing_token_fails() {
+        let payload = serde_json::json!({
+            "DurableExecutionArn": "arn:aws:lambda:us-east-1:123456789012:function:test",
+            "InitialExecutionState": { "Operations": [] }
+        });
+        let err = invoke_wrap_service(payload).await.expect_err("must fail");
+        assert!(
+            err.to_string().contains("CheckpointToken"),
+            "error should name the missing field, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrap_service_envelope_free_payload_fails() {
+        // An envelope-free payload fails fast at the entry point. There is
+        // no raw-payload fallback on the service paths, with or without
+        // `test-util`; local testing goes through `LocalRunner` instead.
+        let payload = serde_json::json!({ "count": 42 });
+        let err = invoke_wrap_service(payload).await.expect_err("must fail");
+        assert!(
+            err.to_string().contains("not a durable execution envelope"),
+            "error should describe the missing envelope, got: {err}"
+        );
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // reason: test assertions
+    #[tokio::test]
+    async fn wrap_service_valid_envelope_succeeds() {
+        let payload = serde_json::json!({
+            "DurableExecutionArn": "arn:aws:lambda:us-east-1:123456789012:function:test",
+            "CheckpointToken": "token-abc",
+            "InitialExecutionState": {
+                "Operations": [{
+                    "Id": "root",
+                    "Type": "Execution",
+                    "Status": "STARTED",
+                    "ExecutionDetails": { "InputPayload": "{\"count\":42}" }
+                }]
+            }
+        });
+        let response = invoke_wrap_service(payload).await.expect("must succeed");
+        assert_eq!(
+            response.get("Status").and_then(serde_json::Value::as_str),
+            Some("SUCCEEDED"),
+            "unexpected response: {response}"
+        );
+        let result_json = response
+            .get("Result")
+            .and_then(serde_json::Value::as_str)
+            .expect("Result should be a serialized JSON string");
+        let echoed: serde_json::Value = serde_json::from_str(result_json).unwrap();
+        assert_eq!(echoed, serde_json::json!({ "count": 42 }));
     }
 
     // ── CallbackDetails parsing tests ───────────────────────────────────
@@ -1658,6 +1843,144 @@ mod tests {
         assert!(
             StdArc::ptr_eq(&first, &preset),
             "the reused client must be exactly the one supplied via Options"
+        );
+    }
+
+    // ── Envelope validation tests ────────────────────────────────────────
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // reason: test assertions
+    #[test]
+    fn parse_envelope_valid_payload() {
+        let payload = serde_json::json!({
+            "DurableExecutionArn": "arn:aws:lambda:us-west-2:123456789012:function:test",
+            "CheckpointToken": "tok-abc",
+            "InitialExecutionState": { "Operations": [] }
+        });
+        let result = parse_envelope(&payload);
+        assert!(result.is_ok());
+        let envelope = result.unwrap().expect("envelope should be Some");
+        assert_eq!(
+            envelope.execution_arn,
+            "arn:aws:lambda:us-west-2:123456789012:function:test"
+        );
+        assert_eq!(envelope.checkpoint_token, "tok-abc");
+    }
+
+    #[test]
+    fn parse_envelope_missing_arn_errors() {
+        let payload = serde_json::json!({
+            "CheckpointToken": "tok-abc",
+            "InitialExecutionState": { "Operations": [] }
+        });
+        let err = parse_envelope(&payload).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DurableExecutionArn") && msg.contains("missing"),
+            "error should name the missing field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_envelope_missing_token_errors() {
+        let payload = serde_json::json!({
+            "DurableExecutionArn": "arn:test",
+            "InitialExecutionState": { "Operations": [] }
+        });
+        let err = parse_envelope(&payload).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CheckpointToken") && msg.contains("missing"),
+            "error should name the missing field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_envelope_arn_wrong_type_errors() {
+        let payload = serde_json::json!({
+            "DurableExecutionArn": 12345,
+            "CheckpointToken": "tok-abc",
+            "InitialExecutionState": { "Operations": [] }
+        });
+        let err = parse_envelope(&payload).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DurableExecutionArn") && msg.contains("not a string"),
+            "error should note the type mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_envelope_token_wrong_type_errors() {
+        let payload = serde_json::json!({
+            "DurableExecutionArn": "arn:test",
+            "CheckpointToken": ["not", "a", "string"],
+            "InitialExecutionState": { "Operations": [] }
+        });
+        let err = parse_envelope(&payload).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CheckpointToken") && msg.contains("not a string"),
+            "error should note the type mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_envelope_no_envelope_returns_none() {
+        // A plain customer event with no envelope fields.
+        let payload = serde_json::json!({ "order_id": "abc-123" });
+        let result = parse_envelope(&payload).unwrap();
+        assert!(result.is_none(), "non-envelope payload should return None");
+    }
+
+    #[test]
+    fn extract_customer_input_from_valid_envelope() {
+        let payload = serde_json::json!({
+            "DurableExecutionArn": "arn:test",
+            "CheckpointToken": "tok",
+            "InitialExecutionState": {
+                "Operations": [{
+                    "ExecutionDetails": {
+                        "InputPayload": "\"hello\""
+                    }
+                }]
+            }
+        });
+        let result: Result<String, _> = extract_customer_input(&payload);
+        assert_eq!(result.unwrap(), "hello");
+    }
+
+    #[test]
+    fn extract_customer_input_envelope_without_input_payload_errors() {
+        // Envelope shape is present (has DurableExecutionArn) but the
+        // InitialExecutionState path is incomplete — should error, not
+        // fall back to treating the envelope as the customer event.
+        let payload = serde_json::json!({
+            "DurableExecutionArn": "arn:test",
+            "CheckpointToken": "tok",
+            "InitialExecutionState": { "Operations": [] }
+        });
+        let result: Result<serde_json::Value, _> = extract_customer_input(&payload);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("InputPayload"),
+            "error should mention InputPayload, got: {msg}"
+        );
+    }
+
+    #[allow(clippy::unwrap_used)] // reason: test assertions
+    #[test]
+    fn extract_customer_input_no_envelope_errors() {
+        // A payload with no envelope shape at all is an error: there is no
+        // raw-payload fallback, with or without `test-util`. Local testing
+        // uses `LocalRunner`, which never routes through this function.
+        let payload = serde_json::json!({ "count": 42 });
+        let result: Result<serde_json::Value, _> = extract_customer_input(&payload);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("InputPayload"),
+            "error should mention the envelope input path, got: {msg}"
         );
     }
 }
