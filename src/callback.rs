@@ -18,6 +18,7 @@ use std::time::Duration;
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tracing::Instrument as _;
 
 use crate::BoxError;
 use crate::context::{DurableContext, StepContext};
@@ -250,6 +251,10 @@ impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<
         let child_ctx = ctx.new_child(&positional_id);
 
         // 5. Run inner body: create_callback + submitter step + await result.
+        // Instrumented with the child namespace's replay-aware span so a
+        // resumed body's log lines are suppressed while its nested
+        // operations replay.
+        let child_span = child_ctx.replay_span();
         let body_result = run_wfcb_body::<O>(
             child_ctx,
             self.timeout,
@@ -258,6 +263,7 @@ impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<
             self.submitter_retry,
             self.serdes,
         )
+        .instrument(child_span)
         .await;
 
         match body_result {

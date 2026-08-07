@@ -86,6 +86,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use tracing::Instrument as _;
+
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -669,6 +671,10 @@ impl LocalRunner {
             };
 
             let handler_ref = &handler;
+            // Mirror production: instrument the handler future with the
+            // handler-level span so replay-aware log filters behave the same
+            // under the local runner as on Lambda.
+            let replay_span = ctx.replay_span();
             let outcome = drive_invocation(
                 async move {
                     match handler_ref(event_inst, ctx).await {
@@ -677,7 +683,8 @@ impl LocalRunner {
                         Err(e) => Ok(wire_error_from_box_error(e))
                             .map_or_else(|never: (String, String)| Err(never), Err),
                     }
-                },
+                }
+                .instrument(replay_span),
                 signal,
             )
             .await;

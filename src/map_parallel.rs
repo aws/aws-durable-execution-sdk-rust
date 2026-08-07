@@ -28,6 +28,7 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinSet;
+use tracing::Instrument as _;
 
 use crate::Serdes;
 use crate::SerdesContext;
@@ -1146,7 +1147,12 @@ where
     if nesting == NestingMode::Flat {
         let child_ctx = ctx.new_scoped_flat_child(&child_positional, parent_wire);
         let scope = Arc::clone(child_ctx.suspension_signal());
-        let outcome = drive_scope(run_item(child_ctx, index), scope).await;
+        // Instrument the branch body with the branch namespace's
+        // replay-aware span: a resumed branch's pre-wait log lines are
+        // suppressed while its own operations replay, independently of the
+        // root handler span and of sibling branches.
+        let branch_span = child_ctx.replay_span();
+        let outcome = drive_scope(run_item(child_ctx, index).instrument(branch_span), scope).await;
         return match outcome {
             ScopeOutcome::Suspended => Ok(ItemOutcome::Suspended),
             ScopeOutcome::Completed(Ok(value)) => {
@@ -1191,10 +1197,19 @@ where
 
     // Create child context (with its OWN suspension scope) and run the item
     // through the branch driver so a park is caught locally as Suspended
-    // instead of tearing down the whole invocation.
+    // instead of tearing down the whole invocation. The branch body is
+    // instrumented with the branch namespace's replay-aware span so a
+    // resumed branch's pre-wait log lines are suppressed while its own
+    // operations replay, independently of the root handler span and of
+    // sibling branches.
     let child_ctx = ctx.new_scoped_child(&child_positional);
     let scope = Arc::clone(child_ctx.suspension_signal());
-    let outcome = drive_scope(run_item(child_ctx, index), Arc::clone(&scope)).await;
+    let branch_span = child_ctx.replay_span();
+    let outcome = drive_scope(
+        run_item(child_ctx, index).instrument(branch_span),
+        Arc::clone(&scope),
+    )
+    .await;
 
     match outcome {
         ScopeOutcome::Suspended => {

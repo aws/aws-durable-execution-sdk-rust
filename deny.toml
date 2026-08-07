@@ -42,8 +42,11 @@ wildcards = "allow"
 #
 # MECHANICAL ENFORCEMENT of the closed production dependency allowlist
 # is provided by scripts/check-direct-deps.sh, which is wired into
-# `make check`. That script validates that only the 8 spec-approved
-# crates appear as DIRECT [dependencies] of any workspace member.
+# `make check`. That script validates DIRECT [dependencies] of every
+# workspace member against two allowlists: the default-feature graph may
+# contain only the 8 spec-approved always-on crates, and the
+# --all-features graph may add only the approved optional feature-gated
+# crates (currently tracing-subscriber, behind `replay-filter`).
 # This gives us the red gate the spec requires without needing to
 # enumerate every transitive crate.
 allow = []

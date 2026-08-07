@@ -18,6 +18,7 @@ use std::pin::Pin;
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tracing::Instrument as _;
 
 use crate::Serdes;
 use crate::SerdesContext;
@@ -75,7 +76,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
                         // ReplayChildren mode: the result was too large to
                         // checkpoint; re-execute the child body to reconstruct it.
                         let child_ctx = self.ctx.new_child(&positional_id);
-                        let result = (self.closure)(child_ctx).await;
+                        let child_span = child_ctx.replay_span();
+                        let result = (self.closure)(child_ctx).instrument(child_span).await;
                         return match result {
                             Ok(value) => {
                                 // Round-trip through serialization for consistency.
@@ -132,8 +134,13 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
         // 4. Create child context with chained prefix.
         let child_ctx = self.ctx.new_child(&positional_id);
 
-        // 5. Run the child closure.
-        let result = (self.closure)(child_ctx).await;
+        // 5. Run the child closure, instrumented with the child namespace's
+        // replay-aware span: on a resume, nested operations can still be
+        // replaying while the parent is live, and the child span's isReplay
+        // flag (kept current by the child's own mints) is what lets a
+        // filter suppress the body's pre-wait log lines exactly once.
+        let child_span = child_ctx.replay_span();
+        let result = (self.closure)(child_ctx).instrument(child_span).await;
 
         match result {
             Ok(value) => {

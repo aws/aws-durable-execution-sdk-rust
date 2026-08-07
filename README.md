@@ -600,9 +600,10 @@ awaits, and `.callback_timeout()` times one out.
 `examples/` holds one deployable function per pattern: `basics/` for steps,
 waits, and retries, `coordination/` for child contexts, map, parallel, and the
 combinators, and `external/` for invoke, callbacks, `wait_for_condition`,
-serdes, and large payloads. Each one is a Lambda function on
-`provided.al2023`, and cargo-lambda builds each example the same way as the
-quick start above. Each reads as a single workload rather than a demo harness.
+serdes, large payloads, and replay-suppressed logging. Each one is a Lambda
+function on `provided.al2023`, and cargo-lambda builds each example the same
+way as the quick start above. Each reads as a single workload rather than a
+demo harness.
 
 ## Contributing
 

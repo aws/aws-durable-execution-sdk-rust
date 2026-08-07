@@ -379,20 +379,21 @@ impl EngineState {
     /// Returns whether the context is currently in replay mode (there are
     /// checkpointed records and we have not yet passed the high-water mark).
     ///
-    /// The context starts in replay mode if the checkpoint log has any
-    /// terminal records, and transitions to live mode when the next minted
-    /// ID has no corresponding checkpoint record.
+    /// The context is replaying as long as the NEXT operation to be claimed
+    /// in this namespace has a checkpoint record of ANY status: a record —
+    /// terminal or still `Started` — proves a prior invocation already
+    /// executed the code path leading to that claim. A `Started` composite
+    /// (child context, map, or parallel parent) counts: the resumed
+    /// invocation re-enters it to replay its nested operations, so the code
+    /// before it is a re-run. The context transitions to live mode when the
+    /// next ID to be minted has no record at all.
     pub(crate) fn is_replaying(&self) -> bool {
         if !self.checkpoint_log.has_records() {
             return false;
         }
-        // The context is replaying as long as the NEXT operation to be
-        // claimed would have a checkpoint record (keyed by wire ID).
         let next_positional = self.id_counter.peek_next();
         let next_wire = compute_wire_id(&next_positional);
-        self.checkpoint_log
-            .get(&next_wire)
-            .is_some_and(|r| r.status.is_terminal())
+        self.checkpoint_log.get(&next_wire).is_some()
     }
 }
 
@@ -717,8 +718,12 @@ mod tests {
     }
 
     #[test]
-    fn replay_mode_non_terminal_not_replaying() {
-        // A "Started" status is non-terminal — operation needs re-execution.
+    fn replay_mode_non_terminal_record_still_replaying() {
+        // A "Started" status is non-terminal — the operation re-executes.
+        // But its record proves a prior invocation already claimed it, so
+        // the code path leading to it is a re-run: the context reports
+        // replaying until the claim (a started child context, map, or
+        // parallel parent is re-entered to replay its nested operations).
         let wire1 = compute_wire_id("1");
         let log = Arc::new(CheckpointLog::from_records(vec![(
             wire1.clone(),
@@ -741,7 +746,13 @@ mod tests {
         )]));
 
         let engine = EngineState::new_root(log);
-        // Non-terminal record: not replaying.
+        // Non-terminal record: STILL replaying — a prior invocation reached
+        // this claim, so the code before it re-ran.
+        assert!(engine.is_replaying());
+        // The record is not terminal, so the operation itself re-executes.
+        assert!(!engine.is_replaying_at("1"));
+        // Past the started record: live.
+        let _ = engine.mint_id();
         assert!(!engine.is_replaying());
     }
 

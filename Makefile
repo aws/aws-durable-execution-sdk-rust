@@ -7,6 +7,7 @@ check:
 	cargo fmt --check
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo test
-	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+	cargo test --all-features
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 	cargo deny check
 	sh scripts/check-direct-deps.sh

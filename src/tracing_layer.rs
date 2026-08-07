@@ -1,8 +1,21 @@
-//! Tracing integration: replay-aware filter layer and operation span helpers.
+//! Tracing integration: replay-aware filter layer and span helpers.
 //!
-//! The SDK creates a [`tracing::Span`] per operation carrying the
-//! structured-log field contract. When these spans are rendered by a JSON
-//! subscriber (e.g., `lambda_runtime`'s `init_default_subscriber()` with
+//! The SDK creates two kinds of [`tracing::Span`]:
+//!
+//! - A `durable_execution` span per NAMESPACE. The handler-level span wraps
+//!   each invocation of the user's handler; each child namespace (a
+//!   `run_in_child_context` body, a map/parallel branch, a
+//!   `wait_for_callback` body) gets its own detached span wrapping its body.
+//!   Every one carries the execution ARN, the request ID, and an `isReplay`
+//!   flag that the SDK keeps current as that namespace crosses its own
+//!   replay high-water mark: the flag starts as the namespace's initial
+//!   replay status and is re-recorded after every operation claim minted
+//!   through it.
+//! - A per-operation `durable_operation` span wrapping each live step body,
+//!   carrying the full structured-log field contract below.
+//!
+//! When these spans are rendered by a JSON subscriber (e.g.,
+//! `lambda_runtime`'s `init_default_subscriber()` with
 //! `AWS_LAMBDA_LOG_FORMAT=JSON`), the fields appear as top-level JSON keys —
 //! matching the `CloudWatch` Logs Insights query:
 //!
@@ -18,27 +31,38 @@
 //! | `requestId` | Lambda invocation request ID |
 //! | `operationId` | Wire operation ID (SHA-256 hex) |
 //! | `attempt` | Current attempt number (1-based) |
-//! | `isReplay` | Whether this operation is being replayed |
+//! | `isReplay` | Whether the span covers replayed work |
 //!
 //! # Replay filter
 //!
-//! The `isReplay` span field enables an application-installed subscriber or
-//! per-layer filter to suppress user-emitted events inside replay spans,
-//! avoiding duplicate `CloudWatch` log lines. The application must install its
-//! own subscriber that checks `isReplay`; the SDK does not install one
-//! automatically. See [`ReplayFilterLayer`] for a ready-made filter
-//! implementation usable via [`replay_filter()`].
+//! When an execution resumes, the handler re-runs from the top and the SDK
+//! replays recorded results. Handler code between operations executes again,
+//! so its log statements would re-emit on every resume. The `isReplay` flag
+//! on the handler span lets a per-layer filter suppress those events,
+//! avoiding duplicate `CloudWatch` log lines. The SDK does not install a
+//! subscriber automatically.
 //!
-//! ## Architecture
+//! Enable the **`replay-filter`** feature to get [`ReplayFilterLayer`], a
+//! ready-made per-layer filter that implements this suppression. Install it
+//! on a `tracing-subscriber` layer like any other filter:
 //!
-//! The replay filter is an internal `#[cfg(test)]` helper. Production binaries
-//! depend only on the `tracing` facade; `tracing-subscriber` is a dev-dependency.
-//! Applications construct their own subscriber using the SDK's public
-//! `is_replay_span()` predicate or the `isReplay` span field directly.
+//! ```ignore
+//! use aws_durable_execution_sdk_rust::ReplayFilterLayer;
+//! use tracing_subscriber::Layer as _;
+//! use tracing_subscriber::layer::SubscriberExt;
+//! use tracing_subscriber::util::SubscriberInitExt;
+//!
+//! tracing_subscriber::registry()
+//!     .with(tracing_subscriber::fmt::layer().with_filter(ReplayFilterLayer))
+//!     .init();
+//! ```
+//!
+//! Without the feature, applications can build their own filter by walking
+//! the span scope and checking the `isReplay` field directly.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-filter"))]
 use tracing::Id;
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-filter"))]
 use tracing::span::Attributes;
 
 /// Field name constants for the structured-log contract.
@@ -93,45 +117,107 @@ pub(crate) fn operation_span(
     )
 }
 
-/// Returns `true` if the given span's recorded fields include
-/// `isReplay = true`.
+/// Creates the handler-level `tracing::Span` wrapping one invocation of the
+/// user's handler.
 ///
-/// This is the public predicate that replay-filter implementations
-/// (in handlers/examples) use to suppress replayed events. It inspects
-/// the span extensions for the cached replay flag set by [`ReplayFilter`].
+/// The span carries:
+/// - `executionArn`: the durable execution ARN
+/// - `requestId`: the Lambda request ID
+/// - `isReplay`: whether the execution is currently replaying
 ///
-/// # Usage in handlers
+/// Handler-level `tracing::info!` calls (user code between operations)
+/// inherit these fields automatically through span nesting, which is what
+/// lets [`ReplayFilterLayer`] suppress them during replay. The `isReplay`
+/// field is dynamic: [`DurableContext::mint_id`] re-records it after every
+/// operation claim, so it flips to `false` the moment the invocation crosses
+/// the replay high-water mark.
 ///
-/// ```ignore
-/// use tracing_subscriber::layer::Filter;
+/// [`DurableContext::mint_id`]: crate::DurableContext
+#[must_use]
+pub(crate) fn execution_span(
+    execution_arn: &str,
+    request_id: &str,
+    is_replay: bool,
+) -> tracing::Span {
+    tracing::info_span!(
+        "durable_execution",
+        { fields::EXECUTION_ARN } = execution_arn,
+        { fields::REQUEST_ID } = request_id,
+        { fields::IS_REPLAY } = is_replay,
+    )
+}
+
+/// Creates a DETACHED `durable_execution` span for a child namespace — a
+/// `run_in_child_context` body, a map/parallel branch, or a
+/// `wait_for_callback` body.
 ///
-/// // Build a per-layer filter that drops events in replay spans:
-/// struct ReplayFilter;
-/// impl<S: Subscriber> Filter<S> for ReplayFilter {
-///     fn event_enabled(&self, event: &tracing::Event<'_>, ctx: &...) -> bool {
-///         // Walk parent spans looking for isReplay=true
-///         !is_in_replay_span(ctx)
-///     }
-/// }
-/// ```
-#[allow(dead_code)] // reason: used by the replay filter; retained as a public utility
-#[cfg(test)]
-pub(crate) fn is_replay_event(attrs: &Attributes<'_>) -> bool {
-    struct ReplayVisitor {
-        is_replay: bool,
-    }
-    impl tracing::field::Visit for ReplayVisitor {
-        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-            if field.name() == fields::IS_REPLAY {
-                self.is_replay = value;
-            }
+/// Each child context owns an [`crate::engine::EngineState`] with its own ID
+/// counter and therefore its own replay high-water mark: nested operations
+/// can still be replaying while the parent namespace is already live (or
+/// vice versa). Giving each namespace its own span — whose `isReplay` flag
+/// that namespace's mints keep current — is what lets a per-layer filter
+/// suppress a branch's pre-wait log lines on resume without consulting (or
+/// clobbering) the parent's state.
+///
+/// The span is created with `parent: None` so an event inside the child
+/// scope resolves its replay status against the child namespace alone: a
+/// parent span that is still replaying must not suppress a branch that has
+/// gone live, and a live parent must not un-suppress a branch that is still
+/// replaying.
+#[must_use]
+pub(crate) fn scoped_execution_span(
+    execution_arn: &str,
+    request_id: &str,
+    is_replay: bool,
+) -> tracing::Span {
+    tracing::info_span!(
+        parent: None,
+        "durable_execution",
+        { fields::EXECUTION_ARN } = execution_arn,
+        { fields::REQUEST_ID } = request_id,
+        { fields::IS_REPLAY } = is_replay,
+    )
+}
+
+/// Visitor that extracts the `isReplay` boolean field from recorded values.
+///
+/// Shared by [`is_replay_event`] (span attributes at creation) and
+/// [`replay_flag_in_record`] (`span.record()` updates after creation).
+#[cfg(any(test, feature = "replay-filter"))]
+struct ReplayVisitor {
+    is_replay: Option<bool>,
+}
+
+#[cfg(any(test, feature = "replay-filter"))]
+impl tracing::field::Visit for ReplayVisitor {
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        if field.name() == fields::IS_REPLAY {
+            self.is_replay = Some(value);
         }
-
-        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
     }
 
-    let mut visitor = ReplayVisitor { is_replay: false };
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+/// Returns `true` if the given span attributes include `isReplay = true`.
+///
+/// Used by [`ReplayFilterLayer`] to detect replay spans at creation time and
+/// by the test-only [`ReplayTracker`] for verification.
+#[cfg(any(test, feature = "replay-filter"))]
+pub(crate) fn is_replay_event(attrs: &Attributes<'_>) -> bool {
+    let mut visitor = ReplayVisitor { is_replay: None };
     attrs.record(&mut visitor);
+    visitor.is_replay == Some(true)
+}
+
+/// Extracts the `isReplay` value from a `span.record()` update, if present.
+///
+/// Used by [`ReplayFilterLayer`] to track the handler span's dynamic replay
+/// flag, which the SDK re-records after every operation claim.
+#[cfg(any(test, feature = "replay-filter"))]
+fn replay_flag_in_record(values: &tracing::span::Record<'_>) -> Option<bool> {
+    let mut visitor = ReplayVisitor { is_replay: None };
+    values.record(&mut visitor);
     visitor.is_replay
 }
 
@@ -188,35 +274,54 @@ impl ReplayTracker {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Replay filter layer (test/example infrastructure — tracing-subscriber is
-// a dev-dependency, so this type is only available in tests/examples)
+// Replay filter layer (public under the `replay-filter` feature;
+// `tracing-subscriber` is an optional dependency)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// A per-layer filter that suppresses user-emitted events inside spans
+/// A per-layer filter that suppresses log events emitted inside spans
 /// marked `isReplay = true`.
 ///
-/// During replay, user logging inside operations is silenced to avoid
-/// duplicate `CloudWatch` log lines.
+/// When an execution resumes, the handler re-runs from the top and replays
+/// recorded results, so handler code between operations executes — and logs —
+/// again. The SDK wraps each invocation in a span whose `isReplay` flag
+/// tracks the live replay status; this filter drops events while that flag
+/// is `true`, so a log line is written once, on the invocation that first
+/// executed it, not again on every resume.
 ///
-/// This is the documented recipe for handlers:
+/// # Usage
 ///
-/// ```ignore
-/// use tracing_subscriber::layer::SubscriberExt;
-/// use tracing_subscriber::util::SubscriberInitExt;
+/// Enable the **`replay-filter`** feature:
 ///
-/// let fmt_layer = tracing_subscriber::fmt::layer()
-///     .json()
-///     .with_filter(ReplayFilterLayer);
-///
-/// tracing_subscriber::registry()
-///     .with(fmt_layer)
-///     .init();
+/// ```toml
+/// [dependencies]
+/// aws-durable-execution-sdk-rust = { git = "https://github.com/aws/aws-durable-execution-sdk-rust", branch = "alpha", features = ["replay-filter"] }
+/// tracing-subscriber = { version = "0.3", features = ["registry"] }
 /// ```
-#[cfg(test)]
+///
+/// Then install the filter on a subscriber layer:
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::ReplayFilterLayer;
+/// use tracing_subscriber::Layer as _;
+/// use tracing_subscriber::layer::SubscriberExt;
+///
+/// let subscriber = tracing_subscriber::registry().with(
+///     tracing_subscriber::fmt::layer()
+///         .json()
+///         .with_filter(ReplayFilterLayer),
+/// );
+///
+/// // In a Lambda binary, install it globally instead:
+/// // `tracing_subscriber::util::SubscriberInitExt::init(subscriber)`.
+/// tracing::subscriber::with_default(subscriber, || {
+///     tracing::info!("emitted normally — not inside a replay span");
+/// });
+/// ```
+#[cfg(any(test, feature = "replay-filter"))]
 #[derive(Debug, Clone)]
-struct ReplayFilterLayer;
+pub struct ReplayFilterLayer;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-filter"))]
 impl<S> tracing_subscriber::layer::Filter<S> for ReplayFilterLayer
 where
     S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
@@ -256,39 +361,42 @@ where
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         // Record isReplay field when a new span is created.
-        if let Some(span) = ctx.span(id) {
-            let mut visitor = ReplayFieldVisitor { is_replay: false };
-            attrs.record(&mut visitor);
-            if visitor.is_replay {
-                span.extensions_mut()
-                    .insert(ReplaySpanFields { is_replay: true });
+        if let Some(span) = ctx.span(id)
+            && is_replay_event(attrs)
+        {
+            span.extensions_mut()
+                .insert(ReplaySpanFields { is_replay: true });
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        // The SDK re-records the handler span's isReplay flag after every
+        // operation claim (see `execution_span`). Track those updates so
+        // suppression follows the live replay status, not just the value
+        // the span was created with.
+        if let Some(is_replay) = replay_flag_in_record(values)
+            && let Some(span) = ctx.span(id)
+        {
+            let mut extensions = span.extensions_mut();
+            if let Some(fields) = extensions.get_mut::<ReplaySpanFields>() {
+                fields.is_replay = is_replay;
+            } else {
+                extensions.insert(ReplaySpanFields { is_replay });
             }
         }
     }
 }
 
 /// Storage for the replay flag in span extensions.
-#[cfg(test)]
+#[cfg(any(test, feature = "replay-filter"))]
 #[derive(Debug)]
 struct ReplaySpanFields {
     is_replay: bool,
-}
-
-/// Visitor that extracts the `isReplay` boolean field from span attributes.
-#[cfg(test)]
-struct ReplayFieldVisitor {
-    is_replay: bool,
-}
-
-#[cfg(test)]
-impl tracing::field::Visit for ReplayFieldVisitor {
-    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        if field.name() == fields::IS_REPLAY {
-            self.is_replay = value;
-        }
-    }
-
-    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -605,6 +713,160 @@ mod tests {
         assert!(
             output.contains("sdk lifecycle event"),
             "SDK lifecycle events must pass through. Got: {output}"
+        );
+    }
+
+    /// A `MakeWriter` that captures output in a shared buffer, for the
+    /// dynamic-replay tests below.
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut inner) = self.0.lock() {
+                inner.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Verifies that the filter follows `span.record()` updates to
+    /// `isReplay`: events are suppressed while the flag is `true` and
+    /// emitted again once it is re-recorded as `false` — the mechanism the
+    /// SDK uses on the handler span as the invocation crosses the replay
+    /// high-water mark.
+    #[test]
+    fn replay_filter_follows_dynamic_is_replay_updates() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(Arc::clone(&buffer));
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_span_list(false)
+            .with_writer(writer)
+            .with_filter(ReplayFilterLayer);
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let span = execution_span("arn:test", "req-1", true);
+        {
+            let _entered = span.enter();
+            tracing::info!("suppressed while replaying");
+            span.record(fields::IS_REPLAY, false);
+            tracing::info!("emitted after replay ends");
+            span.record(fields::IS_REPLAY, true);
+            tracing::info!("suppressed again");
+        }
+
+        let output = buffer.lock().map_or_else(
+            |_| String::new(),
+            |b| String::from_utf8_lossy(&b).to_string(),
+        );
+
+        assert!(
+            !output.contains("suppressed while replaying"),
+            "Events while isReplay=true must be suppressed. Got: {output}"
+        );
+        assert!(
+            output.contains("emitted after replay ends"),
+            "Events after isReplay flips to false must pass. Got: {output}"
+        );
+        assert!(
+            !output.contains("suppressed again"),
+            "Events after isReplay flips back to true must be suppressed. Got: {output}"
+        );
+    }
+
+    /// Verifies the end-to-end handler-level fix: log events emitted by
+    /// handler code BETWEEN operations (not inside any operation span) are
+    /// suppressed while the execution replays recorded results, and emitted
+    /// once it passes the replay high-water mark.
+    #[tokio::test]
+    async fn replay_filter_suppresses_handler_level_replay_logs() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tracing::Instrument as _;
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(Arc::clone(&buffer));
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_span_list(false)
+            .with_writer(writer)
+            .with_filter(ReplayFilterLayer);
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Seed the checkpoint log with a completed wait at position "1":
+        // this invocation is a resume that replays the wait.
+        let wire_key = crate::engine::compute_wire_id_public("1");
+        let record = CheckpointRecord {
+            id: wire_key.clone(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        };
+        let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
+        let ctx = crate::DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+
+        // Mirror production (`run`/`wrap`): the handler future is
+        // instrumented with the handler-level span.
+        let replay_span = ctx.replay_span();
+        async move {
+            tracing::info!("handler line before the wait");
+            let _ = ctx.wait(Duration::from_secs(5)).await;
+            tracing::info!("handler line after the wait");
+        }
+        .instrument(replay_span)
+        .await;
+
+        let output = buffer.lock().map_or_else(
+            |_| String::new(),
+            |b| String::from_utf8_lossy(&b).to_string(),
+        );
+
+        assert!(
+            !output.contains("handler line before the wait"),
+            "Handler-level events during replay must be suppressed. Got: {output}"
+        );
+        assert!(
+            output.contains("handler line after the wait"),
+            "Handler-level events past the high-water mark must be emitted. Got: {output}"
         );
     }
 }

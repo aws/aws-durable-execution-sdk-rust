@@ -60,16 +60,17 @@ dependency policy section below explains what adding to it involves.
 ## The quality gate
 
 `make check` is the single entry point, and it must pass before you push. It
-runs six commands in order, and any one of them failing fails the gate:
+runs seven commands in order, and any one of them failing fails the gate:
 
 | Command | Rejects |
 | --- | --- |
 | `cargo fmt --check` | any file whose formatting differs from rustfmt's default output |
 | `cargo clippy --all-targets --all-features -- -D warnings` | every clippy warning, including the `pedantic` and `cargo` groups, across the library and its tests |
-| `cargo test` | a failing unit test or doctest |
-| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | a broken intra-doc link or malformed rustdoc markup |
+| `cargo test` | a failing unit test or doctest in the default feature set |
+| `cargo test --all-features` | a failing test behind a feature gate (`test-util`, `replay-filter`), including the integration tests those features unlock |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | a broken intra-doc link or malformed rustdoc markup anywhere in the documented surface, including feature-gated items |
 | `cargo deny check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source |
-| `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlist does not name |
+| `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlists do not name, in either the default-feature or the all-features graph |
 
 Two of those are stricter than their defaults. Clippy normally reports warnings
 and exits zero; `-D warnings` turns every one into an error, so a `pedantic`
@@ -88,18 +89,15 @@ workspaces omit those. A lint policy change that you intend to apply across the
 project must update all applicable `Cargo.toml` files, and the pull request should
 say why.
 
-`make check` deliberately leaves out two things that CI still runs. It tests the
-default feature set only, so run the `test-util` feature separately when you
-touch `LocalRunner`:
+`make check` deliberately leaves out one thing that CI still runs: it covers
+the SDK workspace only. Both feature-gated surfaces are already inside the
+gate — `cargo test --all-features` runs the `test-util` and `replay-filter`
+tests, so there is no separate feature-testing step to remember.
 
-```sh
-cargo test --features test-util
-```
-
-And it covers the SDK workspace only. `compliance/` and `examples/` are separate
-cargo workspaces whose heavier dependency graph the root gate deliberately
-excludes so it stays fast. CI compiles and lints both, which catches a public API
-change that breaks them. Do the same locally when you change the public surface:
+`compliance/` and `examples/` are separate cargo workspaces whose heavier
+dependency graph the root gate deliberately excludes so it stays fast. CI
+compiles and lints both, which catches a public API change that breaks them.
+Do the same locally when you change the public surface:
 
 ```sh
 (cd compliance && cargo build --all-targets && cargo clippy --all-targets -- -D warnings)
@@ -108,19 +106,33 @@ change that breaks them. Do the same locally when you change the public surface:
 
 ## Dependency policy
 
-Eight crates make up the entire direct production dependency set: `aws-config`,
-`aws-sdk-lambda`, `lambda_runtime`, `serde`, `serde_json`, `sha2`, `tokio`, and
-`tracing`. `scripts/check-direct-deps.sh` reads `cargo tree` and fails if any
-workspace member names a direct dependency outside that list, so the gate turns
-red the moment someone adds one.
+Eight crates make up the always-on direct production dependency set:
+`aws-config`, `aws-sdk-lambda`, `lambda_runtime`, `serde`, `serde_json`,
+`sha2`, `tokio`, and `tracing`. One more is approved as an optional,
+feature-gated production dependency: `tracing-subscriber`, which only the
+`replay-filter` feature pulls in, because [`ReplayFilterLayer`] implements
+that crate's `Filter` trait and cannot exist without it. A default build
+never compiles or ships it.
 
-Adding a crate to that list is a decision, not a routine change. The SDK ships
-inside the customer's Lambda package and every dependency enlarges it, widens
-the advisory surface, and constrains what the customer can resolve. Open a pull
-request that changes `ALLOWLIST` in the script on its own, explain what the crate
-buys that the current eight cannot, and expect the discussion to be about
-whether we take on the dependency at all. Development dependencies carry none of
+`scripts/check-direct-deps.sh` reads `cargo tree` twice and fails if either
+graph steps outside its allowlist: the default-feature graph may contain only
+the eight always-on crates, and the `--all-features` graph may add only the
+approved optional crates. The second pass is what closes the loophole where
+an unapproved crate rides in behind a feature flag, so the gate turns red the
+moment someone adds a dependency of either kind.
+
+Adding a crate to either list is a decision, not a routine change. The SDK
+ships inside the customer's Lambda package and every always-on dependency
+enlarges it, widens the advisory surface, and constrains what the customer can
+resolve. An optional dependency avoids the package-size cost for consumers who
+do not enable its feature, but it still widens the advisory surface and still
+needs the same approval. Open a pull request that changes the allowlists in
+the script on its own, explain what the crate buys that the current set
+cannot, and expect the discussion to be about whether we take on the
+dependency at all. Development dependencies carry none of
 this weight: `deny.toml` sets `exclude-dev = true` and you may add one freely.
+
+[`ReplayFilterLayer`]: https://github.com/aws/aws-durable-execution-sdk-rust/blob/alpha/src/tracing_layer.rs
 
 `cargo deny check` handles the rest of the supply chain. It enforces a permissive
 license allowlist, so a dependency arriving under an unlisted license fails, and

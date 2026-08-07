@@ -65,6 +65,16 @@ pub(crate) mod tracing_layer;
 pub(crate) mod wait;
 pub(crate) mod wait_for_condition;
 
+#[cfg(feature = "replay-filter")]
+pub use self::tracing_layer::ReplayFilterLayer;
+
+// When users run `cargo test` without `--features replay-filter`, the type is
+// still compiled (via `#[cfg(any(test, ...))]`) inside the `pub(crate)` module.
+// Without this re-export the `unreachable_pub` lint fires. The guard ensures
+// only one `pub use` is active at a time.
+#[cfg(all(test, not(feature = "replay-filter")))]
+pub use self::tracing_layer::ReplayFilterLayer;
+
 pub use self::builders::{
     ChildBuilder, CreateCallbackBuilder, InvokeBuilder, JoinAllBuilder, MapBuilder,
     ParallelBuilder, RaceBuilder, SelectOkBuilder, StepBuilder, TryJoinAllBuilder, WaitBuilder,
@@ -95,6 +105,7 @@ pub use lambda_runtime::{self, Context as LambdaContext};
 
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+use tracing::Instrument as _;
 
 /// Boxed error type matching the `lambda_runtime::Error` shape.
 ///
@@ -610,8 +621,12 @@ where
                 );
 
                 let suspension_signal = ctx.suspension_signal().clone();
+                let replay_span = ctx.replay_span();
 
-                // Run the handler through the driver which handles suspension.
+                // Run the handler through the driver which handles
+                // suspension. The handler future is instrumented with the
+                // handler-level span so user log events between operations
+                // carry the execution ARN and the live `isReplay` flag.
                 let outcome = driver::drive_invocation(
                     async {
                         match (handler)(customer_input, ctx).await {
@@ -619,7 +634,8 @@ where
                                 .map_err(|e| ("HandlerError".to_owned(), e.to_string())),
                             Err(e) => Err(wire_error_from_box_error(e)),
                         }
-                    },
+                    }
+                    .instrument(replay_span),
                     suspension_signal,
                 )
                 .await;
@@ -1047,8 +1063,12 @@ where
             );
 
             let suspension_signal = ctx.suspension_signal().clone();
+            let replay_span = ctx.replay_span();
 
             // Run the handler through the driver which handles suspension.
+            // The handler future is instrumented with the handler-level span
+            // so user log events between operations carry the execution ARN
+            // and the live `isReplay` flag.
             let outcome = driver::drive_invocation(
                 async {
                     match (handler)(customer_input, ctx).await {
@@ -1056,7 +1076,8 @@ where
                             .map_err(|e| ("HandlerError".to_owned(), e.to_string())),
                         Err(e) => Err(wire_error_from_box_error(e)),
                     }
-                },
+                }
+                .instrument(replay_span),
                 suspension_signal,
             )
             .await;

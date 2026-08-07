@@ -22,8 +22,14 @@ name = "aws_durable_execution_sdk_rust"
 # Non-default feature gating the in-process local testing runner
 # (`test_util::LocalRunner`). Off by default so the always-on public API and
 # dependency graph are unchanged; enable with `--features test-util`.
+#
+# `replay-filter` exports `ReplayFilterLayer`, a ready-made
+# `tracing-subscriber` per-layer filter that suppresses replayed log events.
+# Off by default so the production dependency graph stays at the eight
+# allowlisted crates; enabling it pulls in `tracing-subscriber`.
 [features]
 test-util = []
+replay-filter = ["dep:tracing-subscriber"]
 
 # Workspace-level lints inherited by all members.
 # Style precedence: rustfmt (definitional) > Rust API Guidelines > clippy judgment.
@@ -60,10 +66,11 @@ aws-sdk-lambda = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", optional = true, features = ["registry"] }
 sha2 = "0.10"
 
 [dev-dependencies]
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 aws-smithy-runtime-api = { version = "1", features = ["http-1x"] }
 aws-smithy-types = "1"
 tokio = { version = "1", features = ["test-util"] }
@@ -71,3 +78,7 @@ tokio = { version = "1", features = ["test-util"] }
 [[test]]
 name = "nondeterminism"
 required-features = ["test-util"]
+
+[[test]]
+name = "replay_logging"
+required-features = ["test-util", "replay-filter"]

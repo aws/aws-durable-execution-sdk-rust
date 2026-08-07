@@ -59,6 +59,17 @@ struct Inner {
     /// sets no serdes of its own. Threaded in from [`Options`](crate::Options)
     /// by [`wrap`](crate::wrap); shared with every child context.
     default_serdes: Option<Arc<dyn Serdes>>,
+    /// This namespace's `durable_execution` span. For a root context it is
+    /// the handler-level span wrapping the invocation; for a child context
+    /// (sequential child, map/parallel branch, callback body) it is a
+    /// detached span wrapping that child's body. [`DurableContext::mint_id`]
+    /// re-records its `isReplay` field after every operation claim minted
+    /// through this context, so replay-aware filters (see
+    /// `tracing_layer::ReplayFilterLayer`) can suppress log events emitted
+    /// while THIS namespace is replaying. Per-namespace spans are what keep
+    /// concurrent branches — each with its own replay high-water mark — from
+    /// clobbering each other's flag.
+    replay_span: tracing::Span,
 }
 
 /// The durable execution context — a cheap-to-clone handle providing access
@@ -101,17 +112,26 @@ impl DurableContext {
     #[doc(hidden)]
     #[must_use]
     pub fn __test_context() -> Self {
+        let execution_arn = String::from("arn:aws:lambda:us-east-1:123456789012:function:test");
+        let lambda_context = lambda_runtime::Context::default();
+        let engine = Arc::new(EngineState::new_root(Arc::new(CheckpointLog::empty())));
+        let replay_span = crate::tracing_layer::execution_span(
+            &execution_arn,
+            &lambda_context.request_id,
+            engine.is_replaying(),
+        );
         Self {
             inner: Arc::new(Inner {
-                execution_arn: String::from("arn:aws:lambda:us-east-1:123456789012:function:test"),
-                lambda_context: lambda_runtime::Context::default(),
-                engine: Arc::new(EngineState::new_root(Arc::new(CheckpointLog::empty()))),
+                execution_arn,
+                lambda_context,
+                engine,
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
                 parent_wire_id: None,
                 default_serdes: None,
+                replay_span,
             }),
         }
     }
@@ -123,17 +143,24 @@ impl DurableContext {
         lambda_context: lambda_runtime::Context,
         checkpoint_log: Arc<CheckpointLog>,
     ) -> Self {
+        let engine = Arc::new(EngineState::new_root(checkpoint_log));
+        let replay_span = crate::tracing_layer::execution_span(
+            &execution_arn,
+            &lambda_context.request_id,
+            engine.is_replaying(),
+        );
         Self {
             inner: Arc::new(Inner {
                 execution_arn,
                 lambda_context,
-                engine: Arc::new(EngineState::new_root(checkpoint_log)),
+                engine,
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
                 parent_wire_id: None,
                 default_serdes: None,
+                replay_span,
             }),
         }
     }
@@ -147,17 +174,24 @@ impl DurableContext {
         client: Arc<dyn ExecutionClient>,
         checkpoint_token: String,
     ) -> Self {
+        let engine = Arc::new(EngineState::new_root(checkpoint_log));
+        let replay_span = crate::tracing_layer::execution_span(
+            &execution_arn,
+            &lambda_context.request_id,
+            engine.is_replaying(),
+        );
         Self {
             inner: Arc::new(Inner {
                 execution_arn,
                 lambda_context,
-                engine: Arc::new(EngineState::new_root(checkpoint_log)),
+                engine,
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
                 parent_wire_id: None,
                 default_serdes: None,
+                replay_span,
             }),
         }
     }
@@ -172,17 +206,24 @@ impl DurableContext {
         checkpoint_token: String,
         default_serdes: Option<Arc<dyn Serdes>>,
     ) -> Self {
+        let engine = Arc::new(EngineState::new_root(checkpoint_log));
+        let replay_span = crate::tracing_layer::execution_span(
+            &execution_arn,
+            &lambda_context.request_id,
+            engine.is_replaying(),
+        );
         Self {
             inner: Arc::new(Inner {
                 execution_arn,
                 lambda_context,
-                engine: Arc::new(EngineState::new_root(checkpoint_log)),
+                engine,
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
                 parent_wire_id: None,
                 default_serdes,
+                replay_span,
             }),
         }
     }
@@ -195,27 +236,59 @@ impl DurableContext {
     }
     #[allow(dead_code)] // reason: used by run_in_child_context
     pub(crate) fn new_child(&self, parent_positional_id: &str) -> Self {
+        let engine = Arc::new(EngineState::new_child(
+            parent_positional_id,
+            Arc::clone(&self.inner.engine.checkpoint_log),
+        ));
+        // The child namespace has its own replay high-water mark: nested
+        // operations can still be replaying while the parent is already
+        // live. Give it its own detached span, initialized from the CHILD
+        // engine's replay status; the child's mints keep it current, and the
+        // parent span keeps the value the parent's own mints gave it.
+        let replay_span = crate::tracing_layer::scoped_execution_span(
+            &self.inner.execution_arn,
+            &self.inner.lambda_context.request_id,
+            engine.is_replaying(),
+        );
         Self {
             inner: Arc::new(Inner {
                 execution_arn: self.inner.execution_arn.clone(),
                 lambda_context: self.inner.lambda_context.clone(),
-                engine: Arc::new(EngineState::new_child(
-                    parent_positional_id,
-                    Arc::clone(&self.inner.engine.checkpoint_log),
-                )),
+                engine,
                 suspension_signal: Arc::clone(&self.inner.suspension_signal),
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 parent_wire_id: Some(crate::engine::compute_wire_id_public(parent_positional_id)),
                 default_serdes: self.inner.default_serdes.clone(),
+                replay_span,
             }),
         }
     }
 
     /// Mints the next operation ID (internal engine concern).
+    ///
+    /// Also re-records THIS namespace's span `isReplay` flag: after each
+    /// claim, the namespace is replaying iff the NEXT operation to be
+    /// claimed in it has a checkpoint record. This keeps replay-aware log
+    /// filters (see `tracing_layer::ReplayFilterLayer`) in step with the
+    /// live replay status as each namespace crosses its own replay
+    /// high-water mark.
     pub(crate) fn mint_id(&self) -> OperationId {
-        self.inner.engine.mint_id()
+        let id = self.inner.engine.mint_id();
+        self.inner.replay_span.record(
+            crate::tracing_layer::fields::IS_REPLAY,
+            self.inner.engine.is_replaying(),
+        );
+        id
+    }
+
+    /// Returns this namespace's `durable_execution` span. The handler future
+    /// (for a root context) or the child body future (for a child context)
+    /// is instrumented with it so log events inherit the execution ARN,
+    /// request ID, and the namespace's live `isReplay` flag.
+    pub(crate) fn replay_span(&self) -> tracing::Span {
+        self.inner.replay_span.clone()
     }
 
     /// Creates a child context with its OWN fresh suspension scope.
@@ -228,20 +301,31 @@ impl DurableContext {
     /// the branch scope. Everything else (checkpoint log, token, ownership,
     /// ARN) is shared with the parent, exactly like `new_child`.
     pub(crate) fn new_scoped_child(&self, parent_positional_id: &str) -> Self {
+        let engine = Arc::new(EngineState::new_child(
+            parent_positional_id,
+            Arc::clone(&self.inner.engine.checkpoint_log),
+        ));
+        // A branch runs as its own task with its own namespace and its own
+        // replay high-water mark; give it its own detached span (initialized
+        // from the BRANCH engine's replay status) so its mints track branch
+        // replay state without clobbering the root handler span's flag.
+        let replay_span = crate::tracing_layer::scoped_execution_span(
+            &self.inner.execution_arn,
+            &self.inner.lambda_context.request_id,
+            engine.is_replaying(),
+        );
         Self {
             inner: Arc::new(Inner {
                 execution_arn: self.inner.execution_arn.clone(),
                 lambda_context: self.inner.lambda_context.clone(),
-                engine: Arc::new(EngineState::new_child(
-                    parent_positional_id,
-                    Arc::clone(&self.inner.engine.checkpoint_log),
-                )),
+                engine,
                 suspension_signal: Arc::new(self.inner.suspension_signal.new_child_scope()),
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 parent_wire_id: Some(crate::engine::compute_wire_id_public(parent_positional_id)),
                 default_serdes: self.inner.default_serdes.clone(),
+                replay_span,
             }),
         }
     }
@@ -254,20 +338,29 @@ impl DurableContext {
         child_positional_id: &str,
         parent_wire_id_override: &str,
     ) -> Self {
+        let engine = Arc::new(EngineState::new_child(
+            child_positional_id,
+            Arc::clone(&self.inner.engine.checkpoint_log),
+        ));
+        // Same reasoning as `new_scoped_child`: a flat branch has its own
+        // namespace and replay high-water mark, so it gets its own span.
+        let replay_span = crate::tracing_layer::scoped_execution_span(
+            &self.inner.execution_arn,
+            &self.inner.lambda_context.request_id,
+            engine.is_replaying(),
+        );
         Self {
             inner: Arc::new(Inner {
                 execution_arn: self.inner.execution_arn.clone(),
                 lambda_context: self.inner.lambda_context.clone(),
-                engine: Arc::new(EngineState::new_child(
-                    child_positional_id,
-                    Arc::clone(&self.inner.engine.checkpoint_log),
-                )),
+                engine,
                 suspension_signal: Arc::new(self.inner.suspension_signal.new_child_scope()),
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 parent_wire_id: Some(parent_wire_id_override.to_owned()),
                 default_serdes: self.inner.default_serdes.clone(),
+                replay_span,
             }),
         }
     }
@@ -295,6 +388,9 @@ impl DurableContext {
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 parent_wire_id: self.inner.parent_wire_id.clone(),
                 default_serdes: self.inner.default_serdes.clone(),
+                // Same engine (same ID counter and namespace), so mints
+                // through the rebound context keep the shared flag current.
+                replay_span: self.inner.replay_span.clone(),
             }),
         };
         (rebound, scope)
@@ -305,8 +401,20 @@ impl DurableContext {
     /// Used after replaying a terminal batch: the child IDs consumed during
     /// the original execution must be skipped so the next operation gets
     /// the correct positional ID.
+    ///
+    /// Like [`Self::mint_id`], re-records this namespace's span `isReplay`
+    /// flag afterwards. The skipped positions are a flat batch's synthetic
+    /// child IDs, which intentionally have no checkpoint records, so
+    /// minting the terminal batch parent set the flag to `false`; only
+    /// after the skip does the next positional ID name the caller's next
+    /// logical operation, whose record (or absence) decides whether the
+    /// namespace is still replaying.
     pub(crate) fn advance_counter(&self, n: usize) {
         self.inner.engine.id_counter.advance(n);
+        self.inner.replay_span.record(
+            crate::tracing_layer::fields::IS_REPLAY,
+            self.inner.engine.is_replaying(),
+        );
     }
 
     /// Returns a reference to the suspension signal for this context.
@@ -663,8 +771,12 @@ impl DurableContext {
     /// Returns whether the current invocation is in replay mode.
     ///
     /// During replay, previously-checkpointed operation results are returned
-    /// without re-execution. User code can use this flag to suppress
-    /// duplicate side effects (e.g., logging) during replay.
+    /// without re-execution. Replay mode lasts while the next operation to
+    /// be claimed was already claimed by a prior invocation — including a
+    /// started-but-unfinished child context, map, or parallel parent that
+    /// the resumed invocation re-enters to replay its nested operations.
+    /// User code can use this flag to suppress duplicate side effects
+    /// (e.g., logging) during replay.
     ///
     /// # Examples
     ///
