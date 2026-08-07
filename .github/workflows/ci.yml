@@ -12,6 +12,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Debug info in the dev profile inflates target/ by gigabytes and has
+  # exhausted the runner's disk in the examples build; nothing in CI reads it.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   # The six gates of `make check`, split so a failure names itself.
@@ -76,6 +79,13 @@ jobs:
         workspace: [compliance, examples]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # These workspaces' dependency graphs fill the default runner disk
+      # (the examples build has died linking with "no space left"); reclaim
+      # the space taken by preinstalled toolchains we never use.
+      - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: false
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
