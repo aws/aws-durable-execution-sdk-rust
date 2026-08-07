@@ -1481,14 +1481,15 @@ fn should_stop_failure(
     }
 
     // Percentage-based tolerance.
+    // Uses cross-multiplication (failure_count * 100 > pct * total_items) to
+    // avoid integer-division truncation.  This means a true failure rate of
+    // 33.3% correctly exceeds a 33% threshold (1*100=100 > 33*3=99).
+    // When pct == 0, any failure exceeds the threshold (fail-fast).
     if let Some(pct) = cfg.tolerated_failure_percentage
-        && pct > 0
         && total_items > 0
+        && failure_count * 100 > pct * total_items
     {
-        let actual_pct = (failure_count * 100) / total_items;
-        if actual_pct > pct {
-            return true;
-        }
+        return true;
     }
 
     false
@@ -2014,6 +2015,55 @@ mod tests {
         assert!(should_stop_failure(&cfg, 3, 10));
         // 2/10 = 20% == 20%: should NOT stop (strictly exceeds).
         assert!(!should_stop_failure(&cfg, 2, 10));
+    }
+
+    #[tokio::test]
+    async fn tolerated_failure_percentage_boundary_cross_multiplication() {
+        // The original integer-division bug: 1 failure of 3 items with
+        // pct=33.  True rate is 33.3% which exceeds 33%, but old code
+        // computed (1*100)/3 == 33, and 33 > 33 is false.
+        // Cross-multiplication: 1*100=100 > 33*3=99 → true (correctly stops).
+        let cfg = crate::CompletionConfig::builder()
+            .tolerated_failure_percentage(33)
+            .build();
+        assert!(
+            should_stop_failure(&cfg, 1, 3),
+            "1/3 = 33.3% should exceed 33% threshold"
+        );
+
+        // One item below the boundary: 0 failures of 3 must NOT stop.
+        assert!(
+            !should_stop_failure(&cfg, 0, 3),
+            "0/3 = 0% should not exceed 33%"
+        );
+
+        // Exactly at threshold when the division is exact: 1/3 with pct=34
+        // means 33.3% < 34%, should NOT stop.
+        let cfg34 = crate::CompletionConfig::builder()
+            .tolerated_failure_percentage(34)
+            .build();
+        assert!(
+            !should_stop_failure(&cfg34, 1, 3),
+            "1/3 = 33.3% should not exceed 34%"
+        );
+    }
+
+    #[tokio::test]
+    async fn tolerated_failure_percentage_zero_means_fail_fast() {
+        // pct=0 means fail on first failure (fail-fast).
+        let cfg = crate::CompletionConfig::builder()
+            .tolerated_failure_percentage(0)
+            .build();
+        // First failure must stop the batch.
+        assert!(
+            should_stop_failure(&cfg, 1, 10),
+            "pct=0 should stop on first failure"
+        );
+        // Zero failures should NOT stop.
+        assert!(
+            !should_stop_failure(&cfg, 0, 10),
+            "pct=0 with no failures should not stop"
+        );
     }
 
     #[tokio::test]

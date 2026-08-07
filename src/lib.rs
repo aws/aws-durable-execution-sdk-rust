@@ -201,7 +201,9 @@ pub struct CompletionConfig {
     tolerated_failure_count: Option<usize>,
 
     /// Fails the batch once the failure percentage strictly exceeds this
-    /// threshold (integer 0-100).
+    /// threshold (integer 0-100).  Uses cross-multiplication to avoid
+    /// integer-division truncation.
+    /// `Some(0)` means fail-fast (stop on first failure).
     /// `None` means no percentage-based failure tolerance.
     tolerated_failure_percentage: Option<usize>,
 }
@@ -242,6 +244,14 @@ impl CompletionConfig {
     }
 
     /// Creates a config with just a `tolerated_failure_percentage` threshold.
+    ///
+    /// The batch stops once the true failure rate **strictly exceeds** the
+    /// given percentage.  Internally this uses cross-multiplication
+    /// (`failure_count * 100 > pct * total_items`) to avoid integer-division
+    /// truncation — so a failure rate of 33.3% (1 of 3) correctly exceeds a
+    /// 33% threshold.
+    ///
+    /// Use `0` for fail-fast behavior (stop on first failure).
     #[must_use]
     pub fn with_tolerated_failure_percentage(pct: usize) -> Self {
         Self {
