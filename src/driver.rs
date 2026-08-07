@@ -328,14 +328,23 @@ fn set_slot(slot: &std::sync::Mutex<Option<Waker>>, waker: &Waker) {
 /// created it. Durable operations check ownership before proceeding —
 /// operations from a foreign task fail fast.
 ///
+/// **Production topology**: `lambda_runtime` awaits the handler future
+/// inline under `block_on`, so `tokio::task::try_id()` returns `None` at
+/// context-creation time. The guard handles this as an explicit
+/// "root-context" marker: operations invoked from the same inline context
+/// (where `try_id()` is also `None`) pass, but operations invoked from a
+/// foreign `tokio::spawn` (where `try_id()` returns `Some`) are rejected
+/// unless the task was blessed by the SDK (`.spawn()`, combinators, etc.).
+///
 /// The `.spawn()` terminal registers the spawned task's ID as "blessed",
 /// exempting it from the ownership check. This catches user
 /// `tokio::spawn` misuse while allowing the SDK's own spawn mechanism.
 #[derive(Debug)]
 pub(crate) struct TaskOwnership {
     /// The task ID that owns this context. `None` if created outside a
-    /// spawned task (e.g. in `block_on` — the Lambda runtime always runs
-    /// handlers in spawned tasks, so this is `Some` in production).
+    /// spawned task (e.g. in `block_on` — the production path). A `None`
+    /// owner acts as a root-context marker: inline callers (also `None`)
+    /// pass, but unblessed spawned tasks are rejected.
     #[allow(dead_code)] // reason: read by check_current_task
     owner_task_id: Option<tokio::task::Id>,
     /// Task IDs blessed by `.spawn()` — these are exempt from the check.
@@ -349,9 +358,11 @@ impl TaskOwnership {
     /// Creates ownership tracking anchored to the current task.
     ///
     /// If called outside a tokio spawned task (e.g. directly in
-    /// `block_on`), the ownership check is disabled (always passes).
-    /// In production, the Lambda runtime always runs handlers in spawned
-    /// tasks, so the check is always active.
+    /// `block_on`), the owner is recorded as `None` — the "root-context"
+    /// marker. This is the production path: `lambda_runtime` awaits the
+    /// handler inline under `block_on`, so `try_id()` returns `None`.
+    /// The guard still activates: operations invoked from unblessed
+    /// spawned tasks (where `try_id()` returns `Some`) are rejected.
     pub(crate) fn new_current() -> Self {
         Self {
             owner_task_id: tokio::task::try_id(),
@@ -388,38 +399,58 @@ impl TaskOwnership {
     /// Returns `Ok(())` if the caller is the owner or a blessed task.
     /// Returns `Err` with a descriptive message if unauthorized.
     ///
-    /// If the owner task ID is not available (context created outside a
-    /// spawned task — only possible in test/`block_on` scenarios), the
-    /// check always passes.
+    /// **Root-context mode** (owner is `None` — production path): callers
+    /// with `try_id() == None` (inline under the same `block_on`) pass.
+    /// Callers with a task ID must be blessed; otherwise they are foreign
+    /// spawned tasks and the operation is rejected.
+    ///
+    /// **Task-context mode** (owner is `Some`) — callers must be the same
+    /// task or a blessed task; otherwise rejected.
     #[allow(dead_code)] // reason: called by enforce_task_ownership
     pub(crate) fn check_current_task(&self) -> Result<(), String> {
-        let Some(owner_id) = self.owner_task_id else {
-            // Owner was created outside a spawned task (e.g. block_on in
-            // tests). The check is disabled — in production the Lambda
-            // runtime always spawns the handler task.
-            return Ok(());
-        };
-
-        let Some(current_id) = tokio::task::try_id() else {
-            return Err("durable operation invoked outside a tokio task context".to_owned());
-        };
-
-        if current_id == owner_id {
-            return Ok(());
+        match self.owner_task_id {
+            None => {
+                // Root-context mode: owner was created inline under block_on
+                // (the production lambda_runtime topology).
+                let Some(current_id) = tokio::task::try_id() else {
+                    // Caller is also inline (no task ID) — same context.
+                    return Ok(());
+                };
+                // Caller has a task ID — must be blessed to proceed.
+                let blessed = self
+                    .blessed_tasks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if blessed.contains(&current_id) {
+                    return Ok(());
+                }
+                Err(format!(
+                    "durable operation invoked from task {current_id:?}, but context is owned by \
+                     the root handler (no task). Use .spawn() instead of tokio::spawn for durable \
+                     fan-out"
+                ))
+            }
+            Some(owner_id) => {
+                // Task-context mode: owner was created inside a tokio::spawn.
+                let Some(current_id) = tokio::task::try_id() else {
+                    return Err("durable operation invoked outside a tokio task context".to_owned());
+                };
+                if current_id == owner_id {
+                    return Ok(());
+                }
+                let blessed = self
+                    .blessed_tasks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if blessed.contains(&current_id) {
+                    return Ok(());
+                }
+                Err(format!(
+                    "durable operation invoked from task {current_id:?}, but context is owned by \
+                     task {owner_id:?}. Use .spawn() instead of tokio::spawn for durable fan-out"
+                ))
+            }
         }
-
-        let blessed = self
-            .blessed_tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if blessed.contains(&current_id) {
-            return Ok(());
-        }
-
-        Err(format!(
-            "durable operation invoked from task {current_id:?}, but context is owned by \
-             task {owner_id:?}. Use .spawn() instead of tokio::spawn for durable fan-out"
-        ))
     }
 }
 
@@ -919,6 +950,83 @@ mod tests {
         assert!(
             inner.is_ok(),
             "blessed task should pass ownership check: {inner:?}"
+        );
+    }
+
+    // ── Task ownership: production topology (inline under block_on) ─────
+
+    /// Reproduces the REAL production topology: handler awaited inline
+    /// under `block_on` (NOT inside `tokio::spawn`). `#[tokio::test]`
+    /// runs in `block_on`, so `try_id()` is `None` — matching production.
+    #[tokio::test]
+    async fn ownership_root_context_allows_inline_operations() {
+        // Context created inline (try_id() == None) — production path.
+        let ownership = TaskOwnership::new_current();
+        assert!(
+            ownership.owner_task_id.is_none(),
+            "sanity: #[tokio::test] root runs in block_on with no task ID"
+        );
+        // Operation invoked inline — should pass.
+        let result = ownership.check_current_task();
+        assert!(
+            result.is_ok(),
+            "inline operation in root context should pass: {result:?}"
+        );
+    }
+
+    /// Production topology: a durable operation invoked from a bare user
+    /// `tokio::spawn` (NOT blessed) MUST be rejected.
+    #[tokio::test]
+    async fn ownership_root_context_rejects_unblessed_spawn() {
+        // Context created inline (try_id() == None) — production path.
+        let ownership = Arc::new(TaskOwnership::new_current());
+        assert!(
+            ownership.owner_task_id.is_none(),
+            "sanity: root runs in block_on with no task ID"
+        );
+        let ownership_clone = Arc::clone(&ownership);
+
+        // User tokio::spawn — NOT blessed.
+        let handle = tokio::spawn(async move { ownership_clone.check_current_task() });
+
+        #[allow(clippy::unwrap_used)] // reason: test — join handle will not panic
+        let inner = handle.await.unwrap();
+        assert!(
+            inner.is_err(),
+            "unblessed spawned task must be rejected in root-context mode"
+        );
+        #[allow(clippy::unwrap_used)] // reason: test — verified Err above
+        let msg = inner.unwrap_err();
+        assert!(
+            msg.contains("Use .spawn()"),
+            "error message should guide users: {msg}"
+        );
+    }
+
+    /// Production topology: SDK-blessed spawns (`.spawn()`, combinators)
+    /// still work in root-context mode.
+    #[tokio::test]
+    async fn ownership_root_context_allows_blessed_spawn() {
+        // Context created inline (try_id() == None) — production path.
+        let ownership = Arc::new(TaskOwnership::new_current());
+        assert!(
+            ownership.owner_task_id.is_none(),
+            "sanity: root runs in block_on with no task ID"
+        );
+        let ownership_clone = Arc::clone(&ownership);
+
+        // Simulate what .spawn() / combinators do: spawn and bless.
+        let handle = tokio::spawn(async move {
+            let task_id = tokio::task::id();
+            ownership_clone.bless_task(task_id);
+            ownership_clone.check_current_task()
+        });
+
+        #[allow(clippy::unwrap_used)] // reason: test — join handle will not panic
+        let inner = handle.await.unwrap();
+        assert!(
+            inner.is_ok(),
+            "blessed task in root-context mode should pass: {inner:?}"
         );
     }
 

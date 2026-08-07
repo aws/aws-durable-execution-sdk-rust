@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::context::DurableContext;
+use crate::driver::TaskOwnership;
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     ChildContextError, ChildContextErrorKind, CombinatorError, CombinatorErrorKind, OperationError,
@@ -86,7 +87,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
             std::collections::HashMap::with_capacity(count);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            let abort = join_set.spawn(async move { (idx, future.await) });
+            let task_ownership = self.ctx.task_ownership().clone();
+            let abort = join_set.spawn(async move {
+                bless_current_task(&task_ownership);
+                (idx, future.await)
+            });
             task_index.insert(abort.id(), idx);
         }
 
@@ -234,7 +239,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             std::collections::HashMap::with_capacity(count);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            let abort = join_set.spawn(async move { (idx, future.await) });
+            let task_ownership = self.ctx.task_ownership().clone();
+            let abort = join_set.spawn(async move {
+                bless_current_task(&task_ownership);
+                (idx, future.await)
+            });
             task_index.insert(abort.id(), idx);
         }
 
@@ -351,7 +360,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
             std::collections::HashMap::with_capacity(count);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            let abort = join_set.spawn(async move { (idx, future.await) });
+            let task_ownership = self.ctx.task_ownership().clone();
+            let abort = join_set.spawn(async move {
+                bless_current_task(&task_ownership);
+                (idx, future.await)
+            });
             task_index.insert(abort.id(), idx);
         }
 
@@ -454,7 +467,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            join_set.spawn(async move { (idx, future.await) });
+            let task_ownership = self.ctx.task_ownership().clone();
+            join_set.spawn(async move {
+                bless_current_task(&task_ownership);
+                (idx, future.await)
+            });
         }
 
         // Wait for the first completed task.
@@ -521,6 +538,19 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
 // ────────────────────────────────────────────────────────────────────────────
 // Shared helpers
 // ────────────────────────────────────────────────────────────────────────────
+
+/// Blesses the current task for task-ownership checks.
+///
+/// Call this at the top of a spawned async block (in `JoinSet` tasks) to
+/// register the task with the ownership guard. This is a shared helper to
+/// ensure the obligation cannot be forgotten when adding new spawn sites.
+///
+/// Does nothing if called outside a tokio spawned task (`try_id()` returns `None`).
+pub(crate) fn bless_current_task(task_ownership: &TaskOwnership) {
+    if let Some(task_id) = tokio::task::try_id() {
+        task_ownership.bless_task(task_id);
+    }
+}
 
 /// Checkpoints a START action for a combinator operation.
 async fn checkpoint_start(
@@ -1317,5 +1347,169 @@ mod tests {
         let (r1, r2) = tokio::join!(f1, f2);
         assert_eq!(r1.unwrap(), 1);
         assert_eq!(r2.unwrap(), 2);
+    }
+
+    // === Task-ownership tests ===
+    //
+    // These verify that combinator-spawned JoinSet tasks are blessed and
+    // do NOT trigger ownership errors when the guard is active (context
+    // created inside tokio::spawn where try_id() returns Some).
+    //
+    // Each branch calls `ctx.enforce_task_ownership()` — the same check
+    // that every durable operation (step, invoke, etc.) performs at entry.
+    // Without the bless_current_task() call in the combinator spawn sites,
+    // these tests FAIL with ownership errors.
+
+    #[tokio::test]
+    async fn try_join_all_ownership_blessed() {
+        // Create context inside a spawned task so the ownership guard is active.
+        let result = tokio::spawn(async {
+            let ctx = test_ctx_with_client(CheckpointLog::empty());
+
+            // Each branch performs an ownership check (simulating a durable op).
+            let ctx_a = ctx.clone();
+            let a = DurableFuture::from_async(async move {
+                ctx_a.enforce_task_ownership()?;
+                Ok(1)
+            });
+            let ctx_b = ctx.clone();
+            let b = DurableFuture::from_async(async move {
+                ctx_b.enforce_task_ownership()?;
+                Ok(2)
+            });
+
+            let op_id = ctx.mint_id();
+            let exec = TryJoinAllExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![a, b],
+            };
+            exec.execute().await
+        })
+        .await
+        .unwrap();
+
+        // Must succeed — no ownership errors.
+        let values = result.unwrap();
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn join_all_ownership_blessed_no_rejections() {
+        // Create context inside a spawned task so the ownership guard is active.
+        let result = tokio::spawn(async {
+            let ctx = test_ctx_with_client(CheckpointLog::empty());
+
+            // Each branch calls enforce_task_ownership — without blessing,
+            // every branch would be Rejected with an ownership error.
+            let ctx_a = ctx.clone();
+            let a = DurableFuture::from_async(async move {
+                ctx_a.enforce_task_ownership()?;
+                Ok(10)
+            });
+            let ctx_b = ctx.clone();
+            let b = DurableFuture::from_async(async move {
+                ctx_b.enforce_task_ownership()?;
+                Ok(20)
+            });
+            let ctx_c = ctx.clone();
+            let c = DurableFuture::from_async(async move {
+                ctx_c.enforce_task_ownership()?;
+                Ok(30)
+            });
+
+            let op_id = ctx.mint_id();
+            let exec = JoinAllExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![a, b, c],
+            };
+            exec.execute().await
+        })
+        .await
+        .unwrap();
+
+        // Must succeed with all branches fulfilled — none rejected due to ownership.
+        let settled = result.unwrap();
+        assert_eq!(settled.len(), 3);
+        for (i, s) in settled.iter().enumerate() {
+            assert!(
+                matches!(s, Settled::Fulfilled(_)),
+                "branch {i} must be Fulfilled, not Rejected with ownership error"
+            );
+        }
+        assert!(matches!(&settled[0], Settled::Fulfilled(10)));
+        assert!(matches!(&settled[1], Settled::Fulfilled(20)));
+        assert!(matches!(&settled[2], Settled::Fulfilled(30)));
+    }
+
+    #[tokio::test]
+    async fn select_ok_ownership_blessed() {
+        let result = tokio::spawn(async {
+            let ctx = test_ctx_with_client(CheckpointLog::empty());
+
+            let ctx_a = ctx.clone();
+            let a = DurableFuture::from_async(async move {
+                ctx_a.enforce_task_ownership()?;
+                Ok("winner".to_owned())
+            });
+            let ctx_b = ctx.clone();
+            let b = DurableFuture::from_async(async move {
+                ctx_b.enforce_task_ownership()?;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok("slower".to_owned())
+            });
+
+            let op_id = ctx.mint_id();
+            let exec = SelectOkExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![a, b],
+            };
+            exec.execute().await
+        })
+        .await
+        .unwrap();
+
+        // Must succeed — no ownership errors.
+        let value = result.unwrap();
+        assert_eq!(value, "winner");
+    }
+
+    #[tokio::test]
+    async fn race_ownership_blessed() {
+        let result = tokio::spawn(async {
+            let ctx = test_ctx_with_client(CheckpointLog::empty());
+
+            let ctx_a = ctx.clone();
+            let a = DurableFuture::from_async(async move {
+                ctx_a.enforce_task_ownership()?;
+                Ok("fast".to_owned())
+            });
+            let ctx_b = ctx.clone();
+            let b = DurableFuture::from_async(async move {
+                ctx_b.enforce_task_ownership()?;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                Ok("slow".to_owned())
+            });
+
+            let op_id = ctx.mint_id();
+            let exec = RaceExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![a, b],
+            };
+            exec.execute().await
+        })
+        .await
+        .unwrap();
+
+        // Must succeed — no ownership errors.
+        let value = result.unwrap();
+        assert_eq!(value, "fast");
     }
 }

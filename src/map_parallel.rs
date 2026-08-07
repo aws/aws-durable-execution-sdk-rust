@@ -867,9 +867,7 @@ where
 
             let abort = join_set.spawn(async move {
                 // Bless this task for task-ownership checks.
-                if let Some(task_id) = tokio::task::try_id() {
-                    task_ownership.bless_task(task_id);
-                }
+                crate::combinator::bless_current_task(&task_ownership);
 
                 let outcome = execute_single_item(
                     &ctx_task,
