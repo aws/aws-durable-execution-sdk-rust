@@ -565,13 +565,30 @@ where
 
                 let customer_input: E = extract_customer_input(&raw_payload)?;
 
-                // Parse the initial execution state into a checkpoint log.
-                let checkpoint_log = parse_inline_operations(&raw_payload);
-                let checkpoint_log = StdArc::new(checkpoint_log);
+                // Parse the initial execution state into a checkpoint log,
+                // then paginate if the backend indicates more pages.
+                let (checkpoint_log, initial_marker) = parse_inline_operations(&raw_payload);
 
                 // Create the production execution client.
                 let exec_client: StdArc<dyn client::ExecutionClient> =
                     StdArc::new(client::LambdaExecutionClient::new((*lambda_client).clone()));
+
+                // If the initial state was paginated, fetch remaining pages.
+                let checkpoint_log = StdArc::new(
+                    client::resolve_bootstrap_log(
+                        exec_client.as_ref(),
+                        &execution_arn,
+                        &checkpoint_token,
+                        checkpoint_log,
+                        initial_marker.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        lambda_runtime::Error::from(format!(
+                            "failed to paginate initial state: {e}"
+                        ))
+                    })?,
+                );
 
                 let ctx = DurableContext::new_root_with_client(
                     execution_arn,
@@ -713,21 +730,30 @@ fn wire_error_from_operation_error(err: &OperationError) -> (String, String) {
 /// `StepDetails`). On first invocation the array is empty or contains only
 /// the execution-start operation; on re-invocation it contains all prior
 /// checkpointed operations.
-fn parse_inline_operations(payload: &serde_json::Value) -> engine::CheckpointLog {
-    let Some(ops_json) = payload
-        .get("InitialExecutionState")
-        .and_then(|s| s.get("Operations"))
-        .and_then(serde_json::Value::as_array)
-    else {
-        return engine::CheckpointLog::empty();
-    };
+fn parse_inline_operations(payload: &serde_json::Value) -> (engine::CheckpointLog, Option<String>) {
+    let initial_state = payload.get("InitialExecutionState");
 
+    // Check for a pagination marker indicating more pages of operations.
+    // Extracted independently of `Operations`: the service may omit the
+    // Operations array on the first page (e.g. when a large customer
+    // payload displaces it) while still supplying a marker, and the
+    // remaining pages must still be fetched.
+    let next_marker = initial_state
+        .and_then(|s| s.get("NextMarker"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|m| !m.is_empty())
+        .map(String::from);
+
+    // A missing or non-array `Operations` field is an empty first page.
     // Skip the first operation (Execution type — the invocation context)
     // and parse remaining step/wait/etc. operations into records.
-    let records: Vec<(String, engine::CheckpointRecord)> =
-        ops_json.iter().filter_map(parse_single_operation).collect();
+    let records: Vec<(String, engine::CheckpointRecord)> = initial_state
+        .and_then(|s| s.get("Operations"))
+        .and_then(serde_json::Value::as_array)
+        .map(|ops| ops.iter().filter_map(parse_single_operation).collect())
+        .unwrap_or_default();
 
-    engine::CheckpointLog::from_records(records)
+    (engine::CheckpointLog::from_records(records), next_marker)
 }
 
 /// Parses a single operation JSON object into a checkpoint record.
@@ -964,14 +990,29 @@ where
 
             let customer_input: E = extract_customer_input(&raw_payload)?;
 
-            // Parse the initial execution state into a checkpoint log.
-            let checkpoint_log = parse_inline_operations(&raw_payload);
-            let checkpoint_log = StdArc::new(checkpoint_log);
+            // Parse the initial execution state into a checkpoint log,
+            // then paginate if the backend indicates more pages.
+            let (checkpoint_log, initial_marker) = parse_inline_operations(&raw_payload);
 
             // Reuse the execution client resolved once at wrap time (built
             // from the ambient default at most once when no client was
             // supplied via Options).
             let exec_client = provider.get().await;
+
+            // If the initial state was paginated, fetch remaining pages.
+            let checkpoint_log = StdArc::new(
+                client::resolve_bootstrap_log(
+                    exec_client.as_ref(),
+                    &execution_arn,
+                    &checkpoint_token,
+                    checkpoint_log,
+                    initial_marker.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    lambda_runtime::Error::from(format!("failed to paginate initial state: {e}"))
+                })?,
+            );
 
             let ctx = DurableContext::new_root_with_client_and_defaults(
                 execution_arn,
@@ -1316,13 +1357,88 @@ mod tests {
             }
         });
 
-        let log = parse_inline_operations(&payload);
+        let (log, marker) = parse_inline_operations(&payload);
+        assert!(marker.is_none());
         let record = log.get("wire-id-1");
         assert!(record.is_some());
         #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let record = record.unwrap();
         assert_eq!(record.callback_id.as_deref(), Some("cb-id-123"));
         assert_eq!(record.result.as_deref(), Some("\"payload\""));
+    }
+
+    /// When `InitialExecutionState` includes a `NextMarker`, the parser
+    /// returns it alongside the parsed operations so the caller can
+    /// paginate.
+    #[test]
+    fn parse_inline_operations_returns_next_marker() {
+        let payload = serde_json::json!({
+            "InitialExecutionState": {
+                "Operations": [
+                    {
+                        "Id": "exec-0",
+                        "Type": "Execution",
+                        "Status": "STARTED"
+                    },
+                    {
+                        "Id": "wire-id-1",
+                        "Type": "Step",
+                        "Status": "SUCCEEDED",
+                        "StepDetails": {
+                            "Attempt": 1,
+                            "Result": "\"hello\""
+                        }
+                    }
+                ],
+                "NextMarker": "page-token-2"
+            }
+        });
+
+        let (log, marker) = parse_inline_operations(&payload);
+        // The first page's operation is still parsed.
+        let record = log.get("wire-id-1");
+        assert!(record.is_some());
+        // The marker signals that more pages are available.
+        assert_eq!(marker, Some("page-token-2".to_owned()));
+    }
+
+    /// An empty `NextMarker` is treated as no marker (no pagination needed).
+    #[test]
+    fn parse_inline_operations_ignores_empty_marker() {
+        let payload = serde_json::json!({
+            "InitialExecutionState": {
+                "Operations": [
+                    {
+                        "Id": "exec-0",
+                        "Type": "Execution",
+                        "Status": "STARTED"
+                    }
+                ],
+                "NextMarker": ""
+            }
+        });
+
+        let (_log, marker) = parse_inline_operations(&payload);
+        assert_eq!(marker, None);
+    }
+
+    /// A payload with a `NextMarker` but no `Operations` array still
+    /// reports the marker: the service may omit `Operations` on the first
+    /// page (e.g. when a large customer payload displaces it), and the
+    /// remaining pages must still be fetched rather than silently skipped.
+    #[test]
+    fn parse_inline_operations_keeps_marker_without_operations() {
+        let payload = serde_json::json!({
+            "InitialExecutionState": {
+                "NextMarker": "page-token-1"
+            }
+        });
+
+        let (log, marker) = parse_inline_operations(&payload);
+        // No operations yet — the first page is empty.
+        assert!(!log.has_records());
+        // But the marker must survive so bootstrap pagination runs.
+        assert_eq!(marker, Some("page-token-1".to_owned()));
     }
 
     // ── Options consumption: client resolution + reuse ──────────────────

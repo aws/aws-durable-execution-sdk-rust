@@ -743,6 +743,7 @@ mod tests {
                     Ok(CheckpointOutput {
                         checkpoint_token: "token-2".to_owned(),
                         updated_operations: vec![],
+                        next_marker: None,
                     })
                 })
             }

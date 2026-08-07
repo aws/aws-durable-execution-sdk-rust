@@ -390,8 +390,10 @@ impl DurableContext {
     ///
     /// Serializes all concurrent callers through a single critical section:
     /// the lock is held across the full read-token → API-call →
-    /// rotate-token sequence. This prevents concurrent branches from racing
-    /// on the checkpoint token.
+    /// rotate-token sequence, and — when the response carries a pagination
+    /// marker — through the follow-up `get_state` fetch as well, so no
+    /// concurrent branch can rotate the token out from under the paginated
+    /// state read.
     pub(crate) async fn checkpoint_updates(
         &self,
         updates: Vec<OperationUpdate>,
@@ -414,7 +416,6 @@ impl DurableContext {
 
         // Rotate the token while still holding the lock.
         token_guard.clone_from(&output.checkpoint_token);
-        drop(token_guard);
 
         // Merge updated operations into the checkpoint log so that
         // subsequent reads (e.g. reading callback_id after START) see
@@ -425,6 +426,25 @@ impl DurableContext {
                 &output.updated_operations,
             );
         }
+
+        // If the checkpoint response is paginated, fetch remaining pages
+        // via get_state and merge them into the checkpoint log. The token
+        // lock stays held through this fetch: releasing it first would let
+        // a concurrent branch checkpoint and rotate the token, leaving this
+        // get_state call with a stale token.
+        if output.next_marker.is_some() {
+            let full_state = client
+                .get_state(&self.inner.execution_arn, &token_guard)
+                .await?;
+            if !full_state.operations.is_empty() {
+                crate::client::merge_operations_into_log(
+                    &self.inner.engine.checkpoint_log,
+                    &full_state.operations,
+                );
+            }
+        }
+
+        drop(token_guard);
 
         Ok(output)
     }
@@ -1080,5 +1100,300 @@ impl StepContext {
     #[must_use]
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{InMemoryExecutionClient, TestResponse, operations_to_checkpoint_log};
+    use crate::engine::CheckpointLog;
+    use aws_sdk_lambda::types::Operation;
+    use std::sync::Arc;
+
+    /// Helper: builds a Step operation.
+    #[allow(clippy::unwrap_used)]
+    fn make_step_op(id: &str, result: &str) -> Operation {
+        Operation::builder()
+            .id(id)
+            .r#type(aws_sdk_lambda::types::OperationType::Step)
+            .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+            .step_details(
+                aws_sdk_lambda::types::StepDetails::builder()
+                    .result(result)
+                    .build(),
+            )
+            .build()
+            .unwrap()
+    }
+
+    /// Tests that `checkpoint_updates` paginates when the checkpoint response
+    /// has a `next_marker` — calling `get_state` to fetch all remaining
+    /// operations and merging them into the checkpoint log.
+    #[tokio::test]
+    async fn checkpoint_updates_paginates_on_marker() {
+        // The full state has 3 operations (what get_state returns).
+        let all_ops = vec![
+            make_step_op("step-1", "\"r1\""),
+            make_step_op("step-2", "\"r2\""),
+            make_step_op("step-3", "\"r3\""),
+        ];
+        let client = Arc::new(InMemoryExecutionClient::new(all_ops));
+
+        // Enqueue a paginated checkpoint response: returns only step-1
+        // but signals more pages via next_marker.
+        let page1_ops = vec![make_step_op("step-1", "\"r1\"")];
+        client.enqueue_checkpoint_response(TestResponse::SuccessPaginated(
+            page1_ops,
+            "page-2-token".to_owned(),
+        ));
+
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::clone(&log),
+            client.clone(),
+            "initial-token".to_owned(),
+        );
+
+        // Perform a checkpoint with no updates (we just want to exercise pagination).
+        let result = ctx.checkpoint_updates(Vec::new()).await;
+        assert!(result.is_ok());
+
+        // The checkpoint log should now contain ALL operations from get_state.
+        assert!(log.get("step-1").is_some(), "step-1 must be in the log");
+        assert!(
+            log.get("step-2").is_some(),
+            "step-2 must be in the log (paginated)"
+        );
+        assert!(
+            log.get("step-3").is_some(),
+            "step-3 must be in the log (paginated)"
+        );
+
+        // get_state should have been called once for pagination.
+        #[allow(clippy::unwrap_used)]
+        let get_state_count = *client.get_state_call_count.lock().unwrap();
+        assert_eq!(
+            get_state_count, 1,
+            "get_state must be called for pagination"
+        );
+    }
+
+    /// Mock client for the concurrent pagination/token race test: every
+    /// `checkpoint` validates and rotates the token, always returns a
+    /// pagination marker, and `get_state` records whether the token it was
+    /// handed is still the client's CURRENT token.
+    #[derive(Debug)]
+    struct PaginatedTokenValidatingClient {
+        current_token: std::sync::Mutex<String>,
+        counter: std::sync::atomic::AtomicU32,
+        stale_checkpoint_tokens: std::sync::atomic::AtomicU32,
+        stale_get_state_tokens: std::sync::atomic::AtomicU32,
+        get_state_calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl PaginatedTokenValidatingClient {
+        fn new(initial_token: &str) -> Self {
+            Self {
+                current_token: std::sync::Mutex::new(initial_token.to_owned()),
+                counter: std::sync::atomic::AtomicU32::new(0),
+                stale_checkpoint_tokens: std::sync::atomic::AtomicU32::new(0),
+                stale_get_state_tokens: std::sync::atomic::AtomicU32::new(0),
+                get_state_calls: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl ExecutionClient for PaginatedTokenValidatingClient {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            checkpoint_token: &str,
+            _updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>,
+        > {
+            let submitted = checkpoint_token.to_owned();
+            Box::pin(async move {
+                // Widen the race window like the real network call would.
+                tokio::task::yield_now().await;
+                let mut current = self
+                    .current_token
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *current != submitted {
+                    self.stale_checkpoint_tokens
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(ClientError::non_retryable(format!(
+                        "stale checkpoint token: expected {current}, got {submitted}"
+                    )));
+                }
+                let n = self
+                    .counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let next = format!("token-{}", n + 1);
+                current.clone_from(&next);
+                drop(current);
+                Ok(CheckpointOutput {
+                    checkpoint_token: next,
+                    updated_operations: Vec::new(),
+                    // Every response paginated — forces the marker-triggered
+                    // get_state on every checkpoint.
+                    next_marker: Some("more-pages".to_owned()),
+                })
+            })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            checkpoint_token: &str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<crate::client::GetStateOutput, ClientError>> + Send + '_,
+            >,
+        > {
+            let submitted = checkpoint_token.to_owned();
+            Box::pin(async move {
+                self.get_state_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Yield so a concurrent branch would have every chance to
+                // checkpoint (and rotate the token) if the caller released
+                // the token lock too early.
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
+                let current = self
+                    .current_token
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *current != submitted {
+                    self.stale_get_state_tokens
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                drop(current);
+                Ok(crate::client::GetStateOutput {
+                    operations: Vec::new(),
+                })
+            })
+        }
+    }
+
+    /// Regression test (issue #5): concurrent checkpoints whose responses
+    /// carry a pagination marker must perform the marker-triggered
+    /// `get_state` while STILL holding the checkpoint-token lock. If the
+    /// lock is dropped first, a concurrent branch checkpoints, consumes and
+    /// rotates the token, and the paginated `get_state` runs with a stale
+    /// token. The mock's `get_state` validates the token it receives
+    /// against the client's current token.
+    #[tokio::test]
+    async fn concurrent_paginated_checkpoints_get_state_uses_current_token() {
+        let client = Arc::new(PaginatedTokenValidatingClient::new("token-0"));
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+        );
+
+        // Race several concurrent checkpoint_updates calls, each of which
+        // paginates. Every one must succeed (no stale checkpoint token) and
+        // every get_state must observe the then-current token.
+        let (r1, r2, r3, r4) = tokio::join!(
+            ctx.checkpoint_updates(Vec::new()),
+            ctx.checkpoint_updates(Vec::new()),
+            ctx.checkpoint_updates(Vec::new()),
+            ctx.checkpoint_updates(Vec::new()),
+        );
+        assert!(r1.is_ok(), "checkpoint 1 failed: {r1:?}");
+        assert!(r2.is_ok(), "checkpoint 2 failed: {r2:?}");
+        assert!(r3.is_ok(), "checkpoint 3 failed: {r3:?}");
+        assert!(r4.is_ok(), "checkpoint 4 failed: {r4:?}");
+
+        assert_eq!(
+            client
+                .get_state_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "every paginated checkpoint must trigger a get_state"
+        );
+        assert_eq!(
+            client
+                .stale_checkpoint_tokens
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no checkpoint may run with a stale token"
+        );
+        assert_eq!(
+            client
+                .stale_get_state_tokens
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the marker-triggered get_state must run with the current token \
+             (token lock held through the paginated fetch)"
+        );
+    }
+
+    /// Tests that `checkpoint_updates` does NOT call `get_state` when there
+    /// is no pagination marker.
+    #[tokio::test]
+    async fn checkpoint_updates_no_pagination_when_no_marker() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        // Default response has no marker.
+
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+            client.clone(),
+            "initial-token".to_owned(),
+        );
+
+        let result = ctx.checkpoint_updates(Vec::new()).await;
+        assert!(result.is_ok());
+
+        #[allow(clippy::unwrap_used)]
+        let get_state_count = *client.get_state_call_count.lock().unwrap();
+        assert_eq!(
+            get_state_count, 0,
+            "get_state must NOT be called without a marker"
+        );
+    }
+
+    /// Tests that the bootstrap pagination path works: when the initial
+    /// state has a `NextMarker`, `get_state` is called to fetch the full
+    /// operation set, and all operations appear in the checkpoint log.
+    #[tokio::test]
+    async fn bootstrap_pagination_fetches_all_pages() {
+        // Simulate a paginated initial state: page 1 has step-1,
+        // and get_state returns the full set (step-1 + step-2 + step-3).
+        let all_ops = vec![
+            make_step_op("step-1", "\"result-1\""),
+            make_step_op("step-2", "\"result-2\""),
+            make_step_op("step-3", "\"result-3\""),
+        ];
+        let client: Arc<dyn ExecutionClient> = Arc::new(InMemoryExecutionClient::new(all_ops));
+
+        // The full log comes from get_state when the initial state is paginated.
+        let full_state = client.get_state("arn:test", "token").await;
+        assert!(full_state.is_ok());
+        #[allow(clippy::unwrap_used)]
+        let full_state = full_state.unwrap();
+
+        let log = operations_to_checkpoint_log(&full_state.operations);
+        assert!(log.get("step-1").is_some());
+        assert!(log.get("step-2").is_some());
+        assert!(log.get("step-3").is_some());
+
+        // Verify that the results are correct.
+        #[allow(clippy::unwrap_used)]
+        let r2 = log.get("step-2").unwrap();
+        assert_eq!(r2.result.as_deref(), Some("\"result-2\""));
+        assert_eq!(r2.status, crate::engine::CheckpointStatus::Succeeded);
     }
 }

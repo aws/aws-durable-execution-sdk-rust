@@ -170,6 +170,9 @@ pub(crate) struct CheckpointOutput {
     pub(crate) checkpoint_token: String,
     /// Updated operations from the backend (may be empty).
     pub(crate) updated_operations: Vec<Operation>,
+    /// Pagination marker — if present, more operations are available via
+    /// `get_state` and the caller must paginate.
+    pub(crate) next_marker: Option<String>,
 }
 
 /// The output from loading execution state.
@@ -254,13 +257,17 @@ impl ExecutionClient for LambdaExecutionClient {
                                 "backend returned no checkpoint token".to_owned(),
                             ));
                         }
-                        let updated_ops = output
-                            .new_execution_state
-                            .and_then(|s| s.operations)
-                            .unwrap_or_default();
+                        let (updated_ops, next_marker) = match output.new_execution_state {
+                            Some(state) => (
+                                state.operations.unwrap_or_default(),
+                                state.next_marker.filter(|m| !m.is_empty()),
+                            ),
+                            None => (Vec::new(), None),
+                        };
                         return Ok(CheckpointOutput {
                             checkpoint_token: new_token,
                             updated_operations: updated_ops,
+                            next_marker,
                         });
                     }
                     Err(err) => {
@@ -357,6 +364,9 @@ impl ExecutionClient for LambdaExecutionClient {
 pub(crate) enum TestResponse {
     /// Return success with the given operations.
     Success(Vec<Operation>),
+    /// Return success with given operations and a pagination marker,
+    /// indicating more operations are available via `get_state`.
+    SuccessPaginated(Vec<Operation>, String),
     /// Return a retryable failure.
     RetryableError(String),
     /// Return a non-retryable failure.
@@ -463,6 +473,19 @@ impl ExecutionClient for InMemoryExecutionClient {
                     Ok(CheckpointOutput {
                         checkpoint_token: format!("token-{counter}"),
                         updated_operations: ops,
+                        next_marker: None,
+                    })
+                }
+                Some(TestResponse::SuccessPaginated(ops, marker)) => {
+                    let mut counter = self
+                        .token_counter
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *counter += 1;
+                    Ok(CheckpointOutput {
+                        checkpoint_token: format!("token-{counter}"),
+                        updated_operations: ops,
+                        next_marker: Some(marker),
                     })
                 }
                 None => {
@@ -474,6 +497,7 @@ impl ExecutionClient for InMemoryExecutionClient {
                     Ok(CheckpointOutput {
                         checkpoint_token: format!("token-{counter}"),
                         updated_operations: Vec::new(),
+                        next_marker: None,
                     })
                 }
             }
@@ -522,10 +546,30 @@ fn operation_to_record(op: &Operation) -> (String, CheckpointRecord) {
         error_type: extract_error_type(op),
         error_message: extract_error_message(op),
         attempt,
-        invoke_result: None,
-        invoke_error_type: None,
-        invoke_error_message: None,
-        replay_children: false,
+        // ChainedInvoke payloads live in their own record fields — mirroring
+        // parse_single_operation in lib.rs, which is the JSON-path reference
+        // for this mapping. invoke.rs replays exclusively from these.
+        invoke_result: op
+            .chained_invoke_details
+            .as_ref()
+            .and_then(|i| i.result.clone()),
+        invoke_error_type: op
+            .chained_invoke_details
+            .as_ref()
+            .and_then(|i| i.error.as_ref())
+            .and_then(|e| e.error_type.clone()),
+        invoke_error_message: op
+            .chained_invoke_details
+            .as_ref()
+            .and_then(|i| i.error.as_ref())
+            .and_then(|e| e.error_message.clone()),
+        // Large child contexts require ContextDetails.ReplayChildren to
+        // signal re-execution of children; mirror the JSON path.
+        replay_children: op
+            .context_details
+            .as_ref()
+            .and_then(|c| c.replay_children)
+            .unwrap_or(false),
         callback_id: op
             .callback_details
             .as_ref()
@@ -538,8 +582,13 @@ fn operation_to_record(op: &Operation) -> (String, CheckpointRecord) {
 ///
 /// Keyed by wire ID (the operation's `id` field from the service).
 pub(crate) fn operations_to_checkpoint_log(operations: &[Operation]) -> CheckpointLog {
-    let records: Vec<(String, CheckpointRecord)> =
-        operations.iter().map(operation_to_record).collect();
+    let records: Vec<(String, CheckpointRecord)> = operations
+        .iter()
+        // Skip Execution-type operations for consistency with
+        // parse_inline_operations, which filters them in the JSON path.
+        .filter(|op| op.r#type != aws_sdk_lambda::types::OperationType::Execution)
+        .map(operation_to_record)
+        .collect();
     CheckpointLog::from_records(records)
 }
 
@@ -553,6 +602,29 @@ pub(crate) fn merge_operations_into_log(log: &CheckpointLog, operations: &[Opera
         let (wire_id, record) = operation_to_record(op);
         log.insert(wire_id, record);
     }
+}
+
+/// Resolves the bootstrap checkpoint log, following the pagination marker.
+///
+/// This is the single production decision point for bootstrap pagination:
+/// when the initial execution state carried a `NextMarker`, the inline
+/// first page is incomplete, so the complete state is fetched through
+/// [`ExecutionClient::get_state`] (which follows markers until exhausted).
+/// Without a marker the inline page already holds the full history and is
+/// used as-is. Both `run`/`wrap` and the `test-util` `LocalRunner` call
+/// this helper, so tests exercise exactly the code production runs.
+pub(crate) async fn resolve_bootstrap_log(
+    client: &dyn ExecutionClient,
+    execution_arn: &str,
+    checkpoint_token: &str,
+    first_page: CheckpointLog,
+    next_marker: Option<&str>,
+) -> Result<CheckpointLog, ClientError> {
+    if next_marker.is_none() {
+        return Ok(first_page);
+    }
+    let full_state = client.get_state(execution_arn, checkpoint_token).await?;
+    Ok(operations_to_checkpoint_log(&full_state.operations))
 }
 
 /// Maps SDK `OperationStatus` to internal `CheckpointStatus`.
@@ -573,15 +645,14 @@ fn sdk_status_to_checkpoint_status(
 }
 
 /// Extracts the result payload from an `Operation`.
+///
+/// `ChainedInvoke` results are deliberately excluded: they map to
+/// `invoke_result` (see `operation_to_record`), matching the JSON path in
+/// `parse_single_operation`.
 fn extract_result(op: &Operation) -> Option<String> {
     op.step_details
         .as_ref()
         .and_then(|s| s.result.clone())
-        .or_else(|| {
-            op.chained_invoke_details
-                .as_ref()
-                .and_then(|i| i.result.clone())
-        })
         .or_else(|| op.context_details.as_ref().and_then(|c| c.result.clone()))
         .or_else(|| {
             op.callback_details
@@ -591,17 +662,15 @@ fn extract_result(op: &Operation) -> Option<String> {
 }
 
 /// Extracts the error type from an `Operation`.
+///
+/// `ChainedInvoke` errors are deliberately excluded: they map to
+/// `invoke_error_type` (see `operation_to_record`), matching the JSON path
+/// in `parse_single_operation`.
 fn extract_error_type(op: &Operation) -> Option<String> {
     op.step_details
         .as_ref()
         .and_then(|s| s.error.as_ref())
         .and_then(|e| e.error_type.clone())
-        .or_else(|| {
-            op.chained_invoke_details
-                .as_ref()
-                .and_then(|i| i.error.as_ref())
-                .and_then(|e| e.error_type.clone())
-        })
         .or_else(|| {
             op.context_details
                 .as_ref()
@@ -617,17 +686,15 @@ fn extract_error_type(op: &Operation) -> Option<String> {
 }
 
 /// Extracts the error message from an `Operation`.
+///
+/// `ChainedInvoke` errors are deliberately excluded: they map to
+/// `invoke_error_message` (see `operation_to_record`), matching the JSON
+/// path in `parse_single_operation`.
 fn extract_error_message(op: &Operation) -> Option<String> {
     op.step_details
         .as_ref()
         .and_then(|s| s.error.as_ref())
         .and_then(|e| e.error_message.clone())
-        .or_else(|| {
-            op.chained_invoke_details
-                .as_ref()
-                .and_then(|i| i.error.as_ref())
-                .and_then(|e| e.error_message.clone())
-        })
         .or_else(|| {
             op.context_details
                 .as_ref()
@@ -917,6 +984,157 @@ mod tests {
         assert_eq!(r2.attempt, 2);
     }
 
+    /// A paginated `ChainedInvoke` operation converts into the
+    /// invoke-specific record fields (`invoke_result` /
+    /// `invoke_error_*`) that invoke replay reads — matching the inline
+    /// JSON conversion in `parse_single_operation` — and never leaks into
+    /// the generic `result` / `error_*` fields.
+    #[test]
+    fn chained_invoke_maps_to_invoke_specific_fields() {
+        #[allow(clippy::unwrap_used)] // reason: test — builder is infallible for valid input
+        let ops = vec![
+            Operation::builder()
+                .id("invoke-ok")
+                .r#type(aws_sdk_lambda::types::OperationType::ChainedInvoke)
+                .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
+                .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+                .chained_invoke_details(
+                    aws_sdk_lambda::types::ChainedInvokeDetails::builder()
+                        .result(r#""invoke-payload""#)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+            Operation::builder()
+                .id("invoke-err")
+                .r#type(aws_sdk_lambda::types::OperationType::ChainedInvoke)
+                .status(aws_sdk_lambda::types::OperationStatus::Failed)
+                .start_timestamp(aws_smithy_types::DateTime::from_secs(1))
+                .chained_invoke_details(
+                    aws_sdk_lambda::types::ChainedInvokeDetails::builder()
+                        .error(
+                            aws_sdk_lambda::types::ErrorObject::builder()
+                                .error_type("InvokeError")
+                                .error_message("downstream failed")
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        ];
+
+        let log = operations_to_checkpoint_log(&ops);
+
+        let ok = log.get("invoke-ok");
+        assert!(ok.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
+        let ok = ok.unwrap();
+        assert_eq!(ok.invoke_result.as_deref(), Some(r#""invoke-payload""#));
+        assert_eq!(
+            ok.result, None,
+            "invoke results must not leak into the generic result field"
+        );
+
+        let err = log.get("invoke-err");
+        assert!(err.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
+        let err = err.unwrap();
+        assert_eq!(err.invoke_error_type.as_deref(), Some("InvokeError"));
+        assert_eq!(
+            err.invoke_error_message.as_deref(),
+            Some("downstream failed")
+        );
+        assert_eq!(
+            err.error_type, None,
+            "invoke errors must not leak into the generic error fields"
+        );
+        assert_eq!(err.error_message, None);
+    }
+
+    /// A paginated child-context operation preserves
+    /// `ContextDetails.ReplayChildren`, which large child contexts require
+    /// for correct replay — matching the inline JSON conversion.
+    #[test]
+    fn context_replay_children_is_preserved() {
+        #[allow(clippy::unwrap_used)] // reason: test — builder is infallible for valid input
+        let ops = vec![
+            Operation::builder()
+                .id("child-replay")
+                .r#type(aws_sdk_lambda::types::OperationType::Context)
+                .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
+                .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+                .context_details(
+                    aws_sdk_lambda::types::ContextDetails::builder()
+                        .replay_children(true)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+            Operation::builder()
+                .id("child-inline")
+                .r#type(aws_sdk_lambda::types::OperationType::Context)
+                .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
+                .start_timestamp(aws_smithy_types::DateTime::from_secs(1))
+                .context_details(
+                    aws_sdk_lambda::types::ContextDetails::builder()
+                        .result(r#""child-result""#)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        ];
+
+        let log = operations_to_checkpoint_log(&ops);
+
+        let replayed = log.get("child-replay");
+        assert!(replayed.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
+        let replayed = replayed.unwrap();
+        assert!(
+            replayed.replay_children,
+            "ReplayChildren must survive the typed-state conversion"
+        );
+
+        let inline = log.get("child-inline");
+        assert!(inline.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
+        let inline = inline.unwrap();
+        assert!(!inline.replay_children);
+        assert_eq!(inline.result.as_deref(), Some(r#""child-result""#));
+    }
+
+    /// Execution-type operations are filtered from the typed-state
+    /// conversion, matching `parse_inline_operations` in the JSON path.
+    #[test]
+    fn execution_operations_are_filtered_from_log() {
+        #[allow(clippy::unwrap_used)] // reason: test — builder is infallible for valid input
+        let ops = vec![
+            Operation::builder()
+                .id("exec-0")
+                .r#type(aws_sdk_lambda::types::OperationType::Execution)
+                .status(aws_sdk_lambda::types::OperationStatus::Started)
+                .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+                .build()
+                .unwrap(),
+            Operation::builder()
+                .id("step-1")
+                .r#type(aws_sdk_lambda::types::OperationType::Step)
+                .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
+                .start_timestamp(aws_smithy_types::DateTime::from_secs(1))
+                .build()
+                .unwrap(),
+        ];
+
+        let log = operations_to_checkpoint_log(&ops);
+
+        assert!(
+            log.get("exec-0").is_none(),
+            "Execution operations must be filtered like the JSON path does"
+        );
+        assert!(log.get("step-1").is_some());
+    }
+
     // ── Get state ───────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1020,5 +1238,103 @@ mod tests {
         let record = record.unwrap();
         assert_eq!(record.status, CheckpointStatus::Succeeded);
         assert_eq!(record.result.as_deref(), Some(r#""merged result""#));
+    }
+
+    // ── Pagination tests ────────────────────────────────────────────────
+
+    /// Helper: builds a Step operation with a result for pagination tests.
+    #[allow(clippy::unwrap_used)] // reason: test helper
+    fn make_step_op(id: &str, result: &str) -> Operation {
+        Operation::builder()
+            .id(id)
+            .r#type(aws_sdk_lambda::types::OperationType::Step)
+            .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+            .step_details(
+                aws_sdk_lambda::types::StepDetails::builder()
+                    .result(result)
+                    .build(),
+            )
+            .build()
+            .unwrap()
+    }
+
+    /// Tests that `get_state` in `InMemoryExecutionClient` returns all
+    /// pre-loaded operations (simulating a paginated full fetch).
+    #[tokio::test]
+    async fn in_memory_get_state_returns_all_operations() {
+        let ops = vec![
+            make_step_op("step-1", "\"page1\""),
+            make_step_op("step-2", "\"page2\""),
+            make_step_op("step-3", "\"page3\""),
+        ];
+        let client = InMemoryExecutionClient::new(ops);
+
+        let state = client.get_state("arn:test", "token-0").await;
+        assert!(state.is_ok());
+        #[allow(clippy::unwrap_used)]
+        let state = state.unwrap();
+        assert_eq!(state.operations.len(), 3);
+    }
+
+    /// Tests that a paginated checkpoint response (with `next_marker`)
+    /// triggers the caller to call `get_state`. This test verifies the
+    /// `SuccessPaginated` variant works correctly.
+    #[tokio::test]
+    async fn checkpoint_with_marker_returns_paginated_response() {
+        let all_ops = vec![
+            make_step_op("step-1", "\"r1\""),
+            make_step_op("step-2", "\"r2\""),
+            make_step_op("step-3", "\"r3\""),
+        ];
+        let client = InMemoryExecutionClient::new(all_ops);
+
+        // Enqueue a checkpoint response that indicates pagination.
+        let page1_ops = vec![make_step_op("step-1", "\"r1\"")];
+        client.enqueue_checkpoint_response(TestResponse::SuccessPaginated(
+            page1_ops,
+            "marker-page-2".to_owned(),
+        ));
+
+        let result = client.checkpoint("arn:test", "token-0", vec![]).await;
+        assert!(result.is_ok());
+        #[allow(clippy::unwrap_used)]
+        let output = result.unwrap();
+        assert_eq!(output.updated_operations.len(), 1);
+        assert_eq!(output.next_marker, Some("marker-page-2".to_owned()));
+
+        // Caller should then call get_state to get all operations.
+        let full_state = client.get_state("arn:test", &output.checkpoint_token).await;
+        assert!(full_state.is_ok());
+        #[allow(clippy::unwrap_used)]
+        let full_state = full_state.unwrap();
+        assert_eq!(full_state.operations.len(), 3);
+    }
+
+    /// Tests that `operations_to_checkpoint_log` correctly converts a
+    /// multi-page set of operations into a complete checkpoint log.
+    #[test]
+    fn operations_to_checkpoint_log_handles_multi_page_operations() {
+        let ops = vec![
+            make_step_op("step-1", "\"result-1\""),
+            make_step_op("step-2", "\"result-2\""),
+            make_step_op("step-3", "\"result-3\""),
+        ];
+
+        let log = operations_to_checkpoint_log(&ops);
+
+        // All three operations should be in the log.
+        assert!(log.get("step-1").is_some());
+        assert!(log.get("step-2").is_some());
+        assert!(log.get("step-3").is_some());
+
+        #[allow(clippy::unwrap_used)]
+        let r1 = log.get("step-1").unwrap();
+        assert_eq!(r1.result.as_deref(), Some("\"result-1\""));
+        assert_eq!(r1.status, CheckpointStatus::Succeeded);
+
+        #[allow(clippy::unwrap_used)]
+        let r3 = log.get("step-3").unwrap();
+        assert_eq!(r3.result.as_deref(), Some("\"result-3\""));
     }
 }

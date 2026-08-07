@@ -99,6 +99,7 @@ use aws_sdk_lambda::types::{
 use crate::BoxError;
 use crate::client::{
     CheckpointOutput, ClientError, ExecutionClient, GetStateOutput, operations_to_checkpoint_log,
+    resolve_bootstrap_log,
 };
 use crate::context::DurableContext;
 use crate::driver::{InvocationOutcome, drive_invocation};
@@ -385,6 +386,16 @@ enum CallbackOutcome {
 pub struct LocalRunner {
     max_invocations: usize,
     callback_outcomes: Vec<CallbackOutcome>,
+    /// When set, simulates paginated execution state: the initial
+    /// checkpoint log is truncated to this many operations, and the backend
+    /// returns a pagination marker so the context fetches the remainder via
+    /// `get_state`. This exercises the bootstrap pagination path.
+    initial_page_size: Option<usize>,
+    /// When set, the backend's checkpoint response includes `next_marker`
+    /// once the total stored operations exceed this threshold, simulating a
+    /// paginated checkpoint response. This exercises the checkpoint
+    /// pagination path in `DurableContext::checkpoint_updates`.
+    checkpoint_page_size: Option<usize>,
 }
 
 impl Default for LocalRunner {
@@ -410,6 +421,8 @@ impl LocalRunner {
         Self {
             max_invocations: DEFAULT_MAX_INVOCATIONS,
             callback_outcomes: Vec::new(),
+            initial_page_size: None,
+            checkpoint_page_size: None,
         }
     }
 
@@ -427,6 +440,47 @@ impl LocalRunner {
     #[must_use]
     pub fn max_invocations(mut self, max: usize) -> Self {
         self.max_invocations = max.max(1);
+        self
+    }
+
+    /// Sets the initial-state page size for pagination testing.
+    ///
+    /// When set, the runner truncates the checkpoint log passed to each
+    /// invocation to at most this many operations, simulating the service
+    /// embedding only the first page in `InitialExecutionState`. The
+    /// context then calls `get_state` to fetch the rest.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().initial_page_size(1);
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn initial_page_size(mut self, size: usize) -> Self {
+        self.initial_page_size = Some(size.max(1));
+        self
+    }
+
+    /// Sets the checkpoint-response page size for pagination testing.
+    ///
+    /// When set, the backend's checkpoint response includes a pagination
+    /// marker once total stored operations exceed this threshold, forcing
+    /// the context to paginate via `get_state`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().checkpoint_page_size(1);
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn checkpoint_page_size(mut self, size: usize) -> Self {
+        self.checkpoint_page_size = Some(size.max(1));
         self
     }
 
@@ -508,7 +562,14 @@ impl LocalRunner {
         F: Fn(E, DurableContext) -> Fut + Send + Sync,
         Fut: Future<Output = Result<O, BoxError>> + Send,
     {
-        let backend = Arc::new(Backend::new(self.callback_outcomes.clone()));
+        let backend = if let Some(cp_size) = self.checkpoint_page_size {
+            Arc::new(Backend::with_checkpoint_page_size(
+                self.callback_outcomes.clone(),
+                cp_size,
+            ))
+        } else {
+            Arc::new(Backend::new(self.callback_outcomes.clone()))
+        };
         let client: Arc<dyn ExecutionClient> = Arc::clone(&backend) as Arc<dyn ExecutionClient>;
 
         // Serialize the event once; deserialize a fresh copy per invocation.
@@ -545,7 +606,42 @@ impl LocalRunner {
             }
 
             let ops = backend.build_operations();
-            let checkpoint_log = Arc::new(operations_to_checkpoint_log(&ops));
+
+            // Simulate initial-state pagination: if a page size is
+            // configured and the history exceeds it, hand the context only
+            // a truncated first page plus a pagination marker — exactly
+            // what the service embeds in InitialExecutionState — and let
+            // the shared production bootstrap helper decide whether to
+            // fetch the remainder via get_state.
+            let (first_page_ops, initial_marker) = match self.initial_page_size {
+                Some(page_size) if ops.len() > page_size => {
+                    let first_page = ops.get(..page_size).unwrap_or(&ops).to_vec();
+                    (first_page, Some(format!("initial-marker-{}", ops.len())))
+                }
+                _ => (ops, None),
+            };
+            let first_page_log = operations_to_checkpoint_log(&first_page_ops);
+            let checkpoint_log = match resolve_bootstrap_log(
+                client.as_ref(),
+                "arn:aws:lambda:us-west-2:000000000000:function:local-test",
+                &backend.current_token(),
+                first_page_log,
+                initial_marker.as_deref(),
+            )
+            .await
+            {
+                Ok(log) => Arc::new(log),
+                Err(e) => {
+                    return TestResult {
+                        disposition: Disposition::Failed,
+                        output: None,
+                        error_type: Some("BootstrapFailed".to_owned()),
+                        error_message: Some(format!("paginate initial state: {e}")),
+                        operations: backend.snapshot_operations(),
+                        invocations,
+                    };
+                }
+            };
             let token = backend.current_token();
 
             let ctx = DurableContext::new_root_with_client(
@@ -1300,6 +1396,10 @@ struct BackendState {
 #[derive(Debug)]
 struct Backend {
     state: Mutex<BackendState>,
+    /// When set, the checkpoint response will include `next_marker` when
+    /// the number of updated operations exceeds this value, simulating a
+    /// paginated checkpoint response.
+    checkpoint_page_size: Option<usize>,
 }
 
 impl Backend {
@@ -1311,6 +1411,22 @@ impl Backend {
                 callback_counter: 0,
                 callback_outcomes,
             }),
+            checkpoint_page_size: None,
+        }
+    }
+
+    fn with_checkpoint_page_size(
+        callback_outcomes: Vec<CallbackOutcome>,
+        page_size: usize,
+    ) -> Self {
+        Self {
+            state: Mutex::new(BackendState {
+                ops: Vec::new(),
+                token_counter: 0,
+                callback_counter: 0,
+                callback_outcomes,
+            }),
+            checkpoint_page_size: Some(page_size),
         }
     }
 
@@ -1572,10 +1688,34 @@ impl ExecutionClient for Backend {
             out
         };
         let token = self.current_token();
+
+        // If a checkpoint page size is configured and the total stored
+        // operations exceed it, simulate a genuinely paginated response:
+        // return only the FIRST PAGE of the full execution state (mirroring
+        // the service's NewExecutionState) and set next_marker. Operations
+        // beyond the page — including the ones this call just updated when
+        // they fall outside it — are only observable through the follow-up
+        // get_state fetch, so a caller that ignores the marker genuinely
+        // misses state.
+        let (response_ops, next_marker) = if let Some(page_size) = self.checkpoint_page_size {
+            let all_ops = self.build_operations();
+            if all_ops.len() > page_size {
+                let first_page: Vec<Operation> =
+                    all_ops.get(..page_size).unwrap_or(&all_ops).to_vec();
+                let marker = format!("page-marker-{}", all_ops.len());
+                (first_page, Some(marker))
+            } else {
+                (updated_ops, None)
+            }
+        } else {
+            (updated_ops, None)
+        };
+
         Box::pin(async move {
             Ok(CheckpointOutput {
                 checkpoint_token: token,
-                updated_operations: updated_ops,
+                updated_operations: response_ops,
+                next_marker,
             })
         })
     }
@@ -2444,5 +2584,333 @@ mod tests {
         assert!(result.is_failure());
         assert_eq!(result.error_type(), Some("CloudRunnerError"));
         assert_eq!(result.output(), None);
+    }
+
+    // ── Pagination tests ────────────────────────────────────────────────
+
+    /// A two-page initial state replays all operations: the runner calls
+    /// `get_state` when the history exceeds `initial_page_size`, and the
+    /// handler sees results from prior invocations without re-executing.
+    #[tokio::test]
+    async fn two_page_initial_state_replays_all_operations() {
+        // Use a static counter to detect re-execution of the first step.
+        static FIRST_STEP_EXECUTIONS: AtomicU32 = AtomicU32::new(0);
+        FIRST_STEP_EXECUTIONS.store(0, Ordering::SeqCst);
+
+        let result = LocalRunner::new()
+            .initial_page_size(1) // Only 1 op per "page" in initial state
+            .run(
+                |_event: (), ctx: DurableContext| async move {
+                    // First step — should only execute on the first invocation.
+                    let a = ctx
+                        .step(|_| async {
+                            FIRST_STEP_EXECUTIONS.fetch_add(1, Ordering::SeqCst);
+                            Ok(10_i32)
+                        })
+                        .name("first")
+                        .await?;
+
+                    // Wait triggers a re-invocation boundary.
+                    ctx.wait(std::time::Duration::from_secs(1))
+                        .name("pause")
+                        .await?;
+
+                    // Second step on re-invocation — initial state now has
+                    // 2+ ops, exceeding page_size=1. The runner must fetch
+                    // the full state via get_state so `a` replays correctly.
+                    let b = ctx
+                        .step(move |_| async move { Ok(a + 32) })
+                        .name("second")
+                        .await?;
+
+                    Ok::<_, BoxError>(b)
+                },
+                (),
+            )
+            .await;
+
+        assert!(
+            result.is_success(),
+            "handler failed: {:?}",
+            result.error_message()
+        );
+        assert_eq!(result.output(), Some(&42));
+        // The first step must execute exactly once (not re-executed on replay).
+        assert_eq!(
+            FIRST_STEP_EXECUTIONS.load(Ordering::SeqCst),
+            1,
+            "first step must execute exactly once; pagination must not cause re-execution"
+        );
+        // Should take 2 invocations: first runs both steps+wait, second replays
+        // the wait (now elapsed) and runs the second step.
+        assert!(
+            result.invocation_count() >= 2,
+            "expected at least 2 invocations"
+        );
+    }
+
+    /// A two-page checkpoint response is fully consumed: when the backend
+    /// returns `next_marker` in a checkpoint response, `checkpoint_updates`
+    /// calls `get_state` to merge remaining operations, ensuring subsequent
+    /// reads see all state.
+    #[tokio::test]
+    async fn two_page_checkpoint_response_is_fully_consumed() {
+        // When checkpoint_page_size is 1, the second checkpoint response
+        // (which sees 2+ stored ops) includes a marker, triggering
+        // pagination in checkpoint_updates.
+        let result = LocalRunner::new()
+            .checkpoint_page_size(1) // Trigger pagination after 1 stored op
+            .run(
+                |_event: (), ctx: DurableContext| async move {
+                    // First step: creates 1 stored op. Checkpoint response
+                    // has no marker (1 op <= page_size=1 threshold).
+                    let a = ctx.step(|_| async { Ok(10_i32) }).name("step-a").await?;
+
+                    // Second step: creates 2nd stored op. The checkpoint
+                    // response now returns next_marker (2 ops > 1), so
+                    // checkpoint_updates must call get_state to merge all
+                    // operations.
+                    let b = ctx
+                        .step(move |_| async move { Ok(a + 5) })
+                        .name("step-b")
+                        .await?;
+
+                    // Third step proves subsequent operations see the full
+                    // state, including operations merged via get_state.
+                    let c = ctx
+                        .step(move |_| async move { Ok(b + 27) })
+                        .name("step-c")
+                        .await?;
+
+                    Ok::<_, BoxError>(c)
+                },
+                (),
+            )
+            .await;
+
+        assert!(
+            result.is_success(),
+            "handler failed: {:?}",
+            result.error_message()
+        );
+        assert_eq!(result.output(), Some(&42));
+        assert_eq!(result.operations().len(), 3);
+    }
+
+    /// A truncated checkpoint page genuinely requires the second page: the
+    /// backend returns only the FIRST stored operation in the callback
+    /// Start checkpoint response (plus a marker), so the backend-assigned
+    /// `callback_id` is observable only through the follow-up `get_state`
+    /// merge in `checkpoint_updates`. If the marker were ignored, the
+    /// handler would see an empty callback id and fail.
+    #[tokio::test]
+    async fn truncated_checkpoint_page_requires_second_page() {
+        let result = LocalRunner::new()
+            .checkpoint_page_size(1)
+            .callback_success(&"approved".to_owned())
+            .run(
+                |_event: (), ctx: DurableContext| async move {
+                    // First stored operation: fills page 1.
+                    let base = ctx.step(|_| async { Ok(1_i32) }).name("filler").await?;
+
+                    // Second stored operation: the callback. Its Start
+                    // checkpoint response is truncated to page 1 (the
+                    // filler step), so the callback_id below arrives only
+                    // via the paginated get_state merge.
+                    let cb = ctx.create_callback::<String>().name("approval").await?;
+                    if cb.id().is_empty() {
+                        return Err::<String, BoxError>(
+                            "callback id missing: second checkpoint page was not consumed".into(),
+                        );
+                    }
+
+                    let approval = cb.result().await?;
+                    Ok(format!("{base}:{approval}"))
+                },
+                (),
+            )
+            .await;
+
+        assert!(
+            result.is_success(),
+            "handler failed: {:?}",
+            result.error_message()
+        );
+        assert_eq!(result.output(), Some(&"1:approved".to_owned()));
+    }
+
+    /// Combining both pagination modes: a handler with paginated initial
+    /// state AND paginated checkpoint responses still runs correctly.
+    #[tokio::test]
+    async fn combined_initial_and_checkpoint_pagination() {
+        let result = LocalRunner::new()
+            .initial_page_size(1)
+            .checkpoint_page_size(2)
+            .run(
+                |_event: (), ctx: DurableContext| async move {
+                    let a = ctx.step(|_| async { Ok(1_i32) }).name("a").await?;
+                    ctx.wait(std::time::Duration::from_secs(1))
+                        .name("timer")
+                        .await?;
+                    let b = ctx
+                        .step(move |_| async move { Ok(a + 1) })
+                        .name("b")
+                        .await?;
+                    let c = ctx
+                        .step(move |_| async move { Ok(b + 1) })
+                        .name("c")
+                        .await?;
+                    Ok::<_, BoxError>(c)
+                },
+                (),
+            )
+            .await;
+
+        assert!(
+            result.is_success(),
+            "handler failed: {:?}",
+            result.error_message()
+        );
+        assert_eq!(result.output(), Some(&3));
+    }
+
+    /// Tests that the Backend with `checkpoint_page_size` returns a
+    /// `next_marker` when operations exceed the page size, simulating
+    /// a two-page checkpoint response. The caller (`DurableContext`)
+    /// should then paginate via `get_state`.
+    #[tokio::test]
+    async fn backend_paginated_checkpoint_returns_marker() {
+        let backend = Arc::new(Backend::with_checkpoint_page_size(Vec::new(), 1));
+
+        // Checkpoint two operations so we exceed page_size=1.
+        let updates = vec![
+            OperationUpdate::builder()
+                .id("op-1")
+                .r#type(OperationType::Step)
+                .action(OperationAction::Start)
+                .build()
+                .unwrap(),
+            OperationUpdate::builder()
+                .id("op-2")
+                .r#type(OperationType::Step)
+                .action(OperationAction::Start)
+                .build()
+                .unwrap(),
+        ];
+
+        let result = backend.checkpoint("arn:test", "token-0", updates).await;
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(
+            output.next_marker.is_some(),
+            "expected a next_marker when operations exceed page_size"
+        );
+
+        // Verify that get_state returns all operations (used for pagination).
+        let full_state = backend.get_state("arn:test", "token-0").await;
+        assert!(full_state.is_ok());
+        let full_state = full_state.unwrap();
+        assert_eq!(
+            full_state.operations.len(),
+            2,
+            "get_state must return all operations for pagination"
+        );
+    }
+
+    /// Tests that the shared production bootstrap helper
+    /// (`resolve_bootstrap_log`) follows the pagination marker: given a
+    /// truncated first page plus a marker, it fetches the complete state
+    /// via `get_state`; without a marker it uses the first page as-is and
+    /// never calls `get_state`.
+    #[tokio::test]
+    async fn two_page_bootstrap_replays_all_operations() {
+        use crate::client::{
+            InMemoryExecutionClient, operations_to_checkpoint_log, resolve_bootstrap_log,
+        };
+
+        // Full backend state: two steps. Page 1 delivers only step-1.
+        let all_ops = vec![
+            Operation::builder()
+                .id("step-1")
+                .r#type(OperationType::Step)
+                .status(OperationStatus::Succeeded)
+                .start_timestamp(DateTime::from_secs(0))
+                .step_details(StepDetails::builder().result("\"page1-result\"").build())
+                .build()
+                .unwrap(),
+            Operation::builder()
+                .id("step-2")
+                .r#type(OperationType::Step)
+                .status(OperationStatus::Succeeded)
+                .start_timestamp(DateTime::from_secs(0))
+                .step_details(StepDetails::builder().result("\"page2-result\"").build())
+                .build()
+                .unwrap(),
+        ];
+
+        let first_page: Vec<Operation> = all_ops.get(..1).unwrap_or(&all_ops).to_vec();
+
+        let client = Arc::new(InMemoryExecutionClient::new(all_ops));
+
+        // Marker present: the helper must fetch the complete state.
+        let log = resolve_bootstrap_log(
+            client.as_ref(),
+            "arn:test",
+            "token",
+            operations_to_checkpoint_log(&first_page),
+            Some("marker-1"),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            log.get("step-1").is_some(),
+            "step-1 from page 1 must be in the log"
+        );
+        assert!(
+            log.get("step-2").is_some(),
+            "step-2 from page 2 must be in the log"
+        );
+
+        let r1 = log.get("step-1").unwrap();
+        assert_eq!(r1.result.as_deref(), Some("\"page1-result\""));
+
+        let r2 = log.get("step-2").unwrap();
+        assert_eq!(r2.result.as_deref(), Some("\"page2-result\""));
+
+        let calls_after_marker = *client
+            .get_state_call_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            calls_after_marker, 1,
+            "marker must trigger exactly one get_state fetch"
+        );
+
+        // No marker: the first page is complete — no get_state call, and
+        // the log holds only page-1 operations.
+        let log = resolve_bootstrap_log(
+            client.as_ref(),
+            "arn:test",
+            "token",
+            operations_to_checkpoint_log(&first_page),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(log.get("step-1").is_some());
+        assert!(
+            log.get("step-2").is_none(),
+            "without a marker the helper must not fetch further pages"
+        );
+        let calls_after_no_marker = *client
+            .get_state_call_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            calls_after_no_marker, 1,
+            "no-marker path must not call get_state again"
+        );
     }
 }

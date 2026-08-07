@@ -2423,6 +2423,7 @@ mod tests {
                 Ok(crate::client::CheckpointOutput {
                     checkpoint_token: new_token,
                     updated_operations: Vec::new(),
+                    next_marker: None,
                 })
             })
         }
