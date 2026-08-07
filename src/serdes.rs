@@ -551,7 +551,7 @@ impl FileSystemSerdes {
         json_str: &str,
         context: &SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let dir_path = self.resolve_execution_dir(context);
+        let dir_path = self.resolve_execution_dir(context)?;
         std::fs::create_dir_all(&dir_path).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(FileSystemSerdesError::new(format!(
@@ -559,6 +559,13 @@ impl FileSystemSerdes {
                 )))
             },
         )?;
+
+        // Defense-in-depth (physical): `resolve_execution_dir` checks only the
+        // lexically-cleaned path, so a pre-existing symlink beneath `base_path`
+        // can still redirect `create_dir_all` outside the base directory.
+        // Canonicalize both sides (resolving symlinks) and verify real
+        // containment before writing anything.
+        self.assert_canonical_containment(&dir_path)?;
 
         let file_name = format!(
             "{}.json",
@@ -578,28 +585,88 @@ impl FileSystemSerdes {
     }
 
     /// Resolves the per-execution directory under the base path.
-    fn resolve_execution_dir(&self, context: &SerdesContext) -> String {
-        match self.config.path_encoding {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the resolved path escapes `base_path` (defense-in-depth).
+    fn resolve_execution_dir(
+        &self,
+        context: &SerdesContext,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let dir = match self.config.path_encoding {
             FileSystemPathEncoding::Uri => {
                 // Try to parse as a durable execution ARN for human-readable paths.
                 if let Some(parts) = parse_durable_execution_arn(&context.durable_execution_arn) {
-                    return format!(
-                        "{}/{}/{}/{}",
-                        self.base_path,
-                        parts.function_name,
-                        parts.execution_name,
-                        parts.invocation_id
-                    );
+                    let enc_fn = encode_segment(&parts.function_name, self.config.path_encoding);
+                    let enc_exec = encode_segment(&parts.execution_name, self.config.path_encoding);
+                    let enc_inv = encode_segment(&parts.invocation_id, self.config.path_encoding);
+                    format!("{}/{enc_fn}/{enc_exec}/{enc_inv}", self.base_path)
+                } else {
+                    // Fallback: percent-encode the whole ARN.
+                    let encoded = percent_encode(&context.durable_execution_arn);
+                    format!("{}/{encoded}", self.base_path)
                 }
-                // Fallback: percent-encode the whole ARN.
-                let encoded = percent_encode(&context.durable_execution_arn);
-                format!("{}/{encoded}", self.base_path)
             }
             FileSystemPathEncoding::Hash => {
                 let hash = sha256_hex(&context.durable_execution_arn);
                 format!("{}/{hash}", self.base_path)
             }
+        };
+
+        // Defense-in-depth: verify the resolved path is within base_path.
+        // Compare lexically-cleaned paths using Path::starts_with (which checks
+        // component-by-component, not as a string prefix).
+        let cleaned_base = path_clean(&self.base_path);
+        let cleaned_dir = path_clean(&dir);
+        if !std::path::Path::new(&cleaned_dir).starts_with(std::path::Path::new(&cleaned_base)) {
+            return Err(Box::new(FileSystemSerdesError::new(format!(
+                "resolved path '{}' escapes base_path '{}'",
+                cleaned_dir, self.base_path
+            ))));
         }
+
+        Ok(dir)
+    }
+
+    /// Verifies that `dir_path` physically resolves to a location inside
+    /// `base_path`, following symlinks on both sides.
+    ///
+    /// The lexical check in [`resolve_execution_dir`](Self::resolve_execution_dir)
+    /// cannot see symlinks, so a pre-existing symlink under the base directory
+    /// could redirect the resolved directory elsewhere. Both paths must exist
+    /// when this is called (the caller creates `dir_path` first).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either path cannot be canonicalized or if the
+    /// canonical directory is not contained within the canonical base path.
+    fn assert_canonical_containment(
+        &self,
+        dir_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let canonical_dir = std::fs::canonicalize(dir_path).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(FileSystemSerdesError::new(format!(
+                    "failed to canonicalize directory '{dir_path}': {e}"
+                )))
+            },
+        )?;
+        let canonical_base = std::fs::canonicalize(&self.base_path).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(FileSystemSerdesError::new(format!(
+                    "failed to canonicalize base_path '{}': {e}",
+                    self.base_path
+                )))
+            },
+        )?;
+        if !canonical_dir.starts_with(&canonical_base) {
+            return Err(Box::new(FileSystemSerdesError::new(format!(
+                "canonical path '{}' escapes base_path '{}' (symlink redirection)",
+                canonical_dir.display(),
+                canonical_base.display()
+            ))));
+        }
+        Ok(())
     }
 }
 
@@ -722,10 +789,24 @@ fn percent_encode(input: &str) -> String {
 }
 
 /// Encodes a path segment using the specified encoding.
+///
+/// For [`FileSystemPathEncoding::Uri`], this additionally ensures that the
+/// result is never `.` or `..` — those survive standard percent-encoding
+/// because `.` is in the unreserved set, but they form traversal components
+/// when used as path segments.
 fn encode_segment(value: &str, encoding: FileSystemPathEncoding) -> String {
     match encoding {
         FileSystemPathEncoding::Hash => sha256_hex(value),
-        FileSystemPathEncoding::Uri => percent_encode(value),
+        FileSystemPathEncoding::Uri => {
+            let encoded = percent_encode(value);
+            // A segment that resolves to "." or ".." is unsafe as a directory
+            // component — encode the leading dot to neutralize it.
+            if encoded == "." || encoded == ".." {
+                format!("%2E{}", &encoded[1..])
+            } else {
+                encoded
+            }
+        }
     }
 }
 
@@ -758,6 +839,42 @@ fn json_escape_string(input: &str) -> String {
         }
     }
     escaped
+}
+
+/// Lexically resolves `.` and `..` in a path, collapsing traversals without
+/// touching the filesystem. This is used for the defense-in-depth check before
+/// the directory is actually created.
+fn path_clean(path: &str) -> String {
+    use std::path::{Component, Path};
+    let mut components: Vec<&std::ffi::OsStr> = Vec::new();
+    let p = Path::new(path);
+    let mut has_root = false;
+    for component in p.components() {
+        match component {
+            Component::RootDir => {
+                has_root = true;
+                components.clear();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                components.pop();
+            }
+            Component::Normal(c) => {
+                components.push(c);
+            }
+            Component::Prefix(prefix) => {
+                // Windows prefix handling — unlikely but safe.
+                components.clear();
+                components.push(prefix.as_os_str());
+            }
+        }
+    }
+    let joined: std::path::PathBuf = components.iter().collect();
+    if has_root {
+        format!("/{}", joined.to_string_lossy())
+    } else {
+        joined.to_string_lossy().to_string()
+    }
 }
 
 // ============================================================
@@ -924,6 +1041,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // reason: test assertions
 #[allow(clippy::expect_used)] // reason: test assertions with descriptive messages
+#[allow(clippy::indexing_slicing)] // reason: test code with known-good structures
 mod tests {
     use super::*;
 
@@ -1477,5 +1595,336 @@ mod tests {
 
         let result = serdes.deserialize("WORLD", &ctx).expect("deserialize");
         assert_eq!(result, serde_json::json!("world"));
+    }
+
+    // ================================================================
+    // Path traversal / containment tests (issue #9)
+    // ================================================================
+
+    /// Helper to build an ARN with custom components for traversal tests.
+    fn traversal_arn(function_name: &str, execution_name: &str, invocation_id: &str) -> String {
+        format!(
+            "arn:aws:lambda:us-east-1:123456789012:function:{function_name}:1/durable-execution/{execution_name}/{invocation_id}"
+        )
+    }
+
+    #[test]
+    fn traversal_in_function_name_is_contained() {
+        let tmp = std::env::temp_dir().join("fs_serdes_traversal_fn");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let arn = traversal_arn("../../etc", "exec-1", "inv-1");
+        let ctx = SerdesContext {
+            operation_id: "step-1".to_owned(),
+            durable_execution_arn: arn,
+        };
+
+        let input = serde_json::json!({"data": "test"});
+        let result = serdes.serialize_with_context(&input, &ctx);
+
+        // Either serialize succeeds and writes inside base_path, or it errors.
+        match result {
+            Ok(envelope) => {
+                // If it succeeded, the file MUST be inside base_path.
+                let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+                let file_path = parsed["file"].as_str().unwrap();
+                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_base = std::fs::canonicalize(&tmp).unwrap();
+                assert!(
+                    canonical_file.starts_with(&canonical_base),
+                    "file {canonical_file:?} is outside base {canonical_base:?}"
+                );
+            }
+            Err(e) => {
+                // Error is acceptable — the traversal was rejected.
+                assert!(
+                    e.to_string().contains("escapes base_path"),
+                    "unexpected error: {e}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn traversal_in_execution_name_is_contained() {
+        let tmp = std::env::temp_dir().join("fs_serdes_traversal_exec");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let arn = traversal_arn("my-fn", "../../etc", "inv-1");
+        let ctx = SerdesContext {
+            operation_id: "step-1".to_owned(),
+            durable_execution_arn: arn,
+        };
+
+        let input = serde_json::json!({"data": "test"});
+        let result = serdes.serialize_with_context(&input, &ctx);
+
+        match result {
+            Ok(envelope) => {
+                let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+                let file_path = parsed["file"].as_str().unwrap();
+                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_base = std::fs::canonicalize(&tmp).unwrap();
+                assert!(
+                    canonical_file.starts_with(&canonical_base),
+                    "file {canonical_file:?} is outside base {canonical_base:?}"
+                );
+            }
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("escapes base_path"),
+                    "unexpected error: {e}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn traversal_in_invocation_id_is_contained() {
+        let tmp = std::env::temp_dir().join("fs_serdes_traversal_inv");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let arn = traversal_arn("my-fn", "exec-1", "../../etc");
+        let ctx = SerdesContext {
+            operation_id: "step-1".to_owned(),
+            durable_execution_arn: arn,
+        };
+
+        let input = serde_json::json!({"data": "test"});
+        let result = serdes.serialize_with_context(&input, &ctx);
+
+        match result {
+            Ok(envelope) => {
+                let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+                let file_path = parsed["file"].as_str().unwrap();
+                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_base = std::fs::canonicalize(&tmp).unwrap();
+                assert!(
+                    canonical_file.starts_with(&canonical_base),
+                    "file {canonical_file:?} is outside base {canonical_base:?}"
+                );
+            }
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("escapes base_path"),
+                    "unexpected error: {e}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn encoded_components_round_trip() {
+        // Prove that after encoding, deserialize can still find what serialize
+        // wrote — the envelope carries the resolved path, not the raw ARN.
+        let tmp = std::env::temp_dir().join("fs_serdes_encoded_rt");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        // Use components with special chars that WILL be percent-encoded.
+        let arn = traversal_arn("fn/special:chars", "exec name+here", "inv/id");
+        let ctx = SerdesContext {
+            operation_id: "step-1".to_owned(),
+            durable_execution_arn: arn,
+        };
+
+        let input = serde_json::json!({"round": "trip", "value": 99});
+        let envelope = serdes
+            .serialize_with_context(&input, &ctx)
+            .expect("serialize should succeed with encoded components");
+
+        let output = serdes
+            .deserialize_with_context(&envelope, &ctx)
+            .expect("deserialize should find the file written by serialize");
+
+        assert_eq!(output, input);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn bare_dotdot_in_each_component_is_contained() {
+        // A bare ".." (without "/") survives standard percent-encoding because
+        // "." is unreserved. This test verifies that encode_segment neutralizes
+        // it, and the defense-in-depth check catches any that slip through.
+        let tmp = std::env::temp_dir().join("fs_serdes_bare_dotdot");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+
+        // Test bare ".." in function_name
+        let arn_fn = traversal_arn("..", "exec-1", "inv-1");
+        let ctx_fn = SerdesContext {
+            operation_id: "step-1".to_owned(),
+            durable_execution_arn: arn_fn,
+        };
+        let input = serde_json::json!({"test": "bare_dotdot"});
+        match serdes.serialize_with_context(&input, &ctx_fn) {
+            Ok(envelope) => {
+                let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+                let file_path = parsed["file"].as_str().unwrap();
+                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_base = std::fs::canonicalize(&tmp).unwrap();
+                assert!(
+                    canonical_file.starts_with(&canonical_base),
+                    "bare '..' in function_name: file {canonical_file:?} escapes base {canonical_base:?}"
+                );
+            }
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("escapes base_path"),
+                    "unexpected error for bare '..' in function_name: {e}"
+                );
+            }
+        }
+
+        // Test bare ".." in execution_name
+        let arn_exec = traversal_arn("my-fn", "..", "inv-1");
+        let ctx_exec = SerdesContext {
+            operation_id: "step-1".to_owned(),
+            durable_execution_arn: arn_exec,
+        };
+        match serdes.serialize_with_context(&input, &ctx_exec) {
+            Ok(envelope) => {
+                let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+                let file_path = parsed["file"].as_str().unwrap();
+                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_base = std::fs::canonicalize(&tmp).unwrap();
+                assert!(
+                    canonical_file.starts_with(&canonical_base),
+                    "bare '..' in execution_name: file {canonical_file:?} escapes base {canonical_base:?}"
+                );
+            }
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("escapes base_path"),
+                    "unexpected error for bare '..' in execution_name: {e}"
+                );
+            }
+        }
+
+        // Test bare ".." in invocation_id
+        let arn_inv = traversal_arn("my-fn", "exec-1", "..");
+        let ctx_inv = SerdesContext {
+            operation_id: "step-1".to_owned(),
+            durable_execution_arn: arn_inv,
+        };
+        match serdes.serialize_with_context(&input, &ctx_inv) {
+            Ok(envelope) => {
+                let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+                let file_path = parsed["file"].as_str().unwrap();
+                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_base = std::fs::canonicalize(&tmp).unwrap();
+                assert!(
+                    canonical_file.starts_with(&canonical_base),
+                    "bare '..' in invocation_id: file {canonical_file:?} escapes base {canonical_base:?}"
+                );
+            }
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("escapes base_path"),
+                    "unexpected error for bare '..' in invocation_id: {e}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A pre-existing symlink beneath `base_path` must not let a write escape
+    /// the base directory: lexical cleaning cannot see symlinks, so the
+    /// canonical containment assertion has to reject the redirection.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_under_base_path_rejected() {
+        let root = std::env::temp_dir().join("fs_serdes_symlink_escape");
+        let _ = std::fs::remove_dir_all(&root);
+        let base = root.join("base");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Plant a symlink where the encoded function-name segment will land:
+        // base/<fn> -> outside. "my-fn" percent-encodes to itself.
+        std::os::unix::fs::symlink(&outside, base.join("my-fn")).unwrap();
+
+        let serdes = FileSystemSerdes::new(base.to_string_lossy().to_string());
+        let ctx = SerdesContext {
+            operation_id: "step-1".to_owned(),
+            durable_execution_arn: traversal_arn("my-fn", "exec-1", "inv-1"),
+        };
+
+        let result = serdes.serialize_with_context(&serde_json::json!({"data": "test"}), &ctx);
+        let err = result.expect_err("symlink escape must be rejected");
+        assert!(
+            err.to_string().contains("escapes base_path"),
+            "unexpected error: {err}"
+        );
+
+        // The directory skeleton may exist (create_dir_all runs before the
+        // canonical check), but no payload file may be written through the
+        // symlink.
+        let redirected = outside.join("exec-1").join("inv-1");
+        if redirected.exists() {
+            let files: Vec<_> = std::fs::read_dir(&redirected)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_file())
+                .collect();
+            assert!(
+                files.is_empty(),
+                "no file may be written outside base_path: {files:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A benign symlink as the base path itself (e.g. macOS `/tmp` ->
+    /// `/private/tmp`) must still work: canonicalization applies to both
+    /// sides, so containment holds.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_base_path_itself_still_works() {
+        let root = std::env::temp_dir().join("fs_serdes_symlink_base");
+        let _ = std::fs::remove_dir_all(&root);
+        let real_base = root.join("real-base");
+        std::fs::create_dir_all(&real_base).unwrap();
+        let link_base = root.join("link-base");
+        std::os::unix::fs::symlink(&real_base, &link_base).unwrap();
+
+        let serdes = FileSystemSerdes::new(link_base.to_string_lossy().to_string());
+        let ctx = SerdesContext {
+            operation_id: "step-1".to_owned(),
+            durable_execution_arn: traversal_arn("my-fn", "exec-1", "inv-1"),
+        };
+
+        let envelope = serdes
+            .serialize_with_context(&serde_json::json!({"data": "test"}), &ctx)
+            .expect("write through a symlinked base path must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        let file_path = parsed["file"].as_str().unwrap();
+        let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+        let canonical_base = std::fs::canonicalize(&real_base).unwrap();
+        assert!(
+            canonical_file.starts_with(&canonical_base),
+            "file {canonical_file:?} must be inside base {canonical_base:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
