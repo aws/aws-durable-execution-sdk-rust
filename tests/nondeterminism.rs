@@ -237,13 +237,11 @@ async fn error_type_is_identifiable() {
         .await;
 
     assert!(result.is_failure());
-    // The error type should be identifiable as non-determinism.
+    // The error type should be the concrete non-determinism error type.
     let err_type = result.error_type().unwrap_or("");
-    assert!(
-        err_type.contains("NonDeterministic")
-            || err_type.contains("OperationError")
-            || !err_type.is_empty(),
-        "error_type should be set: '{err_type}'"
+    assert_eq!(
+        err_type, "NonDeterministicExecutionError",
+        "error_type should be NonDeterministicExecutionError, got: '{err_type}'"
     );
     let msg = result.error_message().unwrap_or("");
     assert!(
