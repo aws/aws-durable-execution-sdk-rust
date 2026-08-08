@@ -290,6 +290,11 @@ impl SuspensionSignal {
                 .any_spawn_parked
                 .store(true, Ordering::SeqCst);
         }
+        // Invariant: this decrement cannot underflow. Every settle is
+        // preceded by a matching `register_spawn`, which increments the
+        // count on the owner's task BEFORE `tokio::spawn` creates the task
+        // that settles it, and the task's RAII guard settles exactly once
+        // (on completion or on abort, never both).
         let remaining = self
             .quiescence
             .spawns_outstanding
@@ -405,7 +410,10 @@ pub(crate) struct TaskOwnership {
     owner_task_id: Option<tokio::task::Id>,
     /// Task IDs blessed by `.spawn()` — these are exempt from the check.
     /// We use a Mutex<Vec> because spawn registrations are rare relative
-    /// to ownership checks, and the set is small.
+    /// to ownership checks, and the set is small: the list grows by one
+    /// entry per `.spawn()` call per invocation and is never larger than
+    /// the number of spawns the handler makes, so the linear scan in
+    /// `check_current_task` is intentional at that size.
     #[allow(dead_code)] // reason: read by check_current_task
     blessed_tasks: std::sync::Mutex<Vec<tokio::task::Id>>,
 }
@@ -1417,7 +1425,7 @@ mod suspension_containment_and_task_ownership {
             async move {
                 // max_concurrency(0) is a validation error, returned as Err.
                 let r = ctx_h
-                    .parallel::<String>(Vec::new())
+                    .parallel(Vec::<crate::Branch<String>>::new())
                     .max_concurrency(0)
                     .await;
                 if r.is_err() {

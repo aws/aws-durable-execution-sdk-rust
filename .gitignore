@@ -1,6 +1,12 @@
 # Build artifacts
 /target
 
+# Generated conformance handler builds (Lambda bootstrap binaries and SAM
+# build metadata produced by compliance/build_examples.sh). Never commit
+# these: the binaries are ~15 MB each and the metadata embeds absolute
+# local paths.
+/compliance/build/
+
 # Cargo.lock is checked in for reproducible builds of the compliance
 # binary crate. For library crates the convention is to gitignore it,
 # but this workspace contains a binary-like member (compliance handlers)

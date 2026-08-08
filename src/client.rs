@@ -34,7 +34,11 @@ pub(crate) enum RetryClassification {
 /// 2. `ServiceException` → retryable (server-side 5xx).
 /// 3. Timeout/dispatch/network errors → retryable (transient).
 /// 4. `InvalidParameterValueException`, KMS errors → non-retryable (client fault).
-/// 5. Unknown structured errors → non-retryable (conservative for client faults).
+/// 5. Unknown structured errors → non-retryable. This default is deliberate:
+///    treating an unrecognized service error as retryable risks a retry storm
+///    against an error class we know nothing about, and a wrong non-retryable
+///    is cushioned because the durable service re-invokes the execution
+///    regardless, giving the call another chance on the next invocation.
 pub(crate) fn classify_checkpoint_error(
     err: &aws_sdk_lambda::error::SdkError<CheckpointDurableExecutionError>,
 ) -> RetryClassification {
@@ -53,6 +57,10 @@ pub(crate) fn classify_checkpoint_error(
                 | CheckpointDurableExecutionError::KmsNotFoundException(_) => {
                     RetryClassification::NonRetryable
                 }
+                // Unknown service errors default to non-retryable
+                // deliberately (see rule 5 in the doc above): no retry storm
+                // on an unrecognized error class, and the durable service's
+                // re-invocation cushions a wrong non-retryable.
                 _ => RetryClassification::NonRetryable,
             }
         }
@@ -83,6 +91,8 @@ pub(crate) fn classify_get_state_error(
             | GetDurableExecutionStateError::KmsNotFoundException(_) => {
                 RetryClassification::NonRetryable
             }
+            // Unknown service errors default to non-retryable deliberately —
+            // same rationale as [`classify_checkpoint_error`] rule 5.
             _ => RetryClassification::NonRetryable,
         },
         aws_sdk_lambda::error::SdkError::TimeoutError(_)

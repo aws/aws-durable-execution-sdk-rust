@@ -3946,8 +3946,10 @@ mod tests {
     async fn max_concurrency_zero_returns_validation_error() {
         let ctx = test_ctx(CheckpointLog::empty());
         // Attempt parallel with max_concurrency=0.
-        let result: Result<Vec<String>, _> =
-            ctx.parallel::<String>(vec![]).max_concurrency(0).await;
+        let result: Result<Vec<String>, _> = ctx
+            .parallel(Vec::<crate::Branch<String>>::new())
+            .max_concurrency(0)
+            .await;
         let err = result.expect_err("max_concurrency=0 must error");
         let msg = err.to_string();
         assert!(

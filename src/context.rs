@@ -1350,8 +1350,9 @@ impl DurableContext {
     ///     Ok(())
     /// }
     /// ```
-    pub fn parallel<O>(&self, branches: impl IntoIterator<Item = Branch<O>>) -> ParallelBuilder<O>
+    pub fn parallel<Branches, O>(&self, branches: Branches) -> ParallelBuilder<O>
     where
+        Branches: IntoIterator<Item = Branch<O>>,
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();

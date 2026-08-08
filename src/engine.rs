@@ -287,9 +287,11 @@ pub(crate) struct TerminalReplaySnapshot {
 
 /// The checkpoint log: maps positional operation IDs to stored records.
 ///
-/// The log is populated from the backend on invocation start and is
-/// immutable during execution (new checkpoint results are only visible
-/// on the next invocation).
+/// The log is populated from the backend on invocation start, then updated
+/// during execution as checkpoint responses merge backend-assigned fields
+/// (e.g. `callback_id`) into the live log via [`Self::insert`]. Results of
+/// operations completed by other invocations still only become visible when
+/// the next invocation reloads the log from the backend.
 #[derive(Debug)]
 pub(crate) struct CheckpointLog {
     /// Records keyed by wire operation ID for fast lookup during replay.

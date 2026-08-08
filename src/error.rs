@@ -3,6 +3,15 @@
 //! All error types are hand-written (no `thiserror`), `#[non_exhaustive]`,
 //! and implement [`std::error::Error`]. Use the `kind()` accessor pattern
 //! for matching error variants.
+//!
+//! # `Display` convention
+//!
+//! Each layer's `Display` output deliberately includes its source chain, so
+//! every message is self-contained and matches the flattened message the
+//! wire envelope carries. A consequence: error reporters that print an
+//! error's `Display` *and* walk its [`source()`](std::error::Error::source)
+//! chain will see the nested text repeated. That duplication is expected,
+//! not a bug.
 
 use std::fmt;
 
