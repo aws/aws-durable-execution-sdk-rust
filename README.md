@@ -225,6 +225,7 @@ order.
 | `ctx.wait(duration)` | Suspends the execution for `duration`. |
 | `ctx.invoke(function_id, input)` | Calls another durable function and waits for its result. |
 | `ctx.run_in_child_context(f)` | Runs `f` against a child context with its own operation namespace. |
+| `ctx.with_retry(f)` | Runs `f` against a child context and retries the whole block as a unit, with a fresh operation namespace per attempt. |
 | `ctx.wait_for_condition(check, state)` | Polls `check`, carrying state between attempts, until the wait strategy completes. |
 | `ctx.create_callback()` | Mints a callback ID now and resolves when an external system completes it. |
 | `ctx.wait_for_callback(submitter)` | Mints the ID, hands it to `submitter`, and waits for the payload. |
@@ -387,6 +388,47 @@ let greeting = ctx
     .name("greet")
     .await?;
 ```
+
+### with_retry
+
+`with_retry` runs a closure against a child context and applies a retry
+strategy to the closure's overall outcome, so a multi-operation block
+retries as a unit. Each attempt gets a fresh child operation namespace: a
+failed attempt's recorded operations are never replayed into the next
+attempt, so every operation in the block re-runs on retry. Delays between
+attempts suspend the execution, exactly as step retries do, and the retry
+progress is derived from checkpointed results, so it survives suspension.
+The closure is `Fn` rather than `FnOnce` because the SDK calls it once per
+attempt.
+
+```rust
+let receipt = ctx
+    .with_retry(|child| async move {
+        let quote = child
+            .step(|_| async { Ok(fetch_quote().await?) })
+            .name("fetch-quote")
+            .await?;
+        let receipt = child
+            .step(move |_| async move { Ok(book(quote).await?) })
+            .name("book")
+            .await?;
+        Ok(receipt)
+    })
+    .name("quote-and-book")
+    .retry_strategy(|_err, attempt| {
+        if attempt >= 3 {
+            RetryDecision::Stop
+        } else {
+            RetryDecision::Retry { delay: Duration::from_secs(5) }
+        }
+    })
+    .await?;
+```
+
+`.retry_strategy_config(...)` accepts a `RetryStrategyConfig` instead of a
+closure, and without either the step default applies (6 total attempts with
+exponential backoff). When retries exhaust, the operation fails with the
+attempt count and the last attempt's error.
 
 ### map and parallel
 

@@ -64,6 +64,7 @@ pub mod test_util;
 pub(crate) mod tracing_layer;
 pub(crate) mod wait;
 pub(crate) mod wait_for_condition;
+pub(crate) mod with_retry;
 
 #[cfg(feature = "replay-filter")]
 pub use self::tracing_layer::ReplayFilterLayer;
@@ -78,7 +79,7 @@ pub use self::tracing_layer::ReplayFilterLayer;
 pub use self::builders::{
     ChildBuilder, CreateCallbackBuilder, InvokeBuilder, JoinAllBuilder, MapBuilder,
     ParallelBuilder, RaceBuilder, SelectOkBuilder, StepBuilder, TryJoinAllBuilder, WaitBuilder,
-    WaitForCallbackBuilder, WaitForConditionBuilder,
+    WaitForCallbackBuilder, WaitForConditionBuilder, WithRetryBuilder,
 };
 pub use self::context::{DurableContext, StepContext};
 pub use self::error::{

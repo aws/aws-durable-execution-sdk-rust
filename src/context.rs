@@ -16,7 +16,7 @@ use crate::Serdes;
 use crate::builders::{
     ChildBuilder, CreateCallbackBuilder, InvokeBuilder, JoinAllBuilder, MapBuilder,
     ParallelBuilder, RaceBuilder, SelectOkBuilder, StepBuilder, TryJoinAllBuilder, WaitBuilder,
-    WaitForCallbackBuilder, WaitForConditionBuilder,
+    WaitForCallbackBuilder, WaitForConditionBuilder, WithRetryBuilder,
 };
 use crate::client::{CheckpointOutput, ClientError, ExecutionClient};
 use crate::driver::{SuspensionSignal, TaskOwnership};
@@ -974,6 +974,75 @@ impl DurableContext {
         ChildBuilder::new(self.clone(), op_id).with_closure(Box::new(move |ctx| {
             Box::pin(async move { f(ctx).await.map_err(|e| ChildFnError::new(e.to_string())) })
         }))
+    }
+
+    /// Runs a closure against a child context and retries the closure's
+    /// **overall** outcome as a unit.
+    ///
+    /// Where a step's retry strategy re-runs one operation, `with_retry`
+    /// re-runs a whole block: if any operation in the block fails (or the
+    /// closure returns an error), the retry strategy decides whether to run
+    /// the entire block again. Each attempt receives a **fresh child
+    /// operation namespace**, so operations recorded by a failed attempt
+    /// are never replayed into the next one — every operation in the block
+    /// re-runs on retry. The delay between attempts suspends the execution
+    /// (the backend owns the timer, exactly as step retries do), and the
+    /// retry progress is derived from checkpointed results, so it survives
+    /// suspension and replays deterministically.
+    ///
+    /// The closure is `Fn` rather than `FnOnce` because the SDK calls it
+    /// once per attempt. Configure the policy with
+    /// [`retry_strategy`](WithRetryBuilder::retry_strategy) or
+    /// [`retry_strategy_config`](WithRetryBuilder::retry_strategy_config);
+    /// without one, the step default applies (6 total attempts with
+    /// exponential backoff). When retries exhaust, the operation fails with
+    /// a [`ChildContextError`](crate::ChildContextError) carrying the
+    /// attempt count and the last attempt's error.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk_rust::RetryDecision;
+    /// use std::time::Duration;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, durable::BoxError> {
+    ///     // If either step fails, BOTH re-run on the next attempt.
+    ///     let result = ctx.with_retry(|child| async move {
+    ///         let quote = child
+    ///             .step(|_| async { Ok("quote-17".to_owned()) })
+    ///             .name("reserve-quote")
+    ///             .await?;
+    ///         let receipt = child
+    ///             .step(move |_| async move { Ok(format!("booked:{quote}")) })
+    ///             .name("book")
+    ///             .await?;
+    ///         Ok(receipt)
+    ///     })
+    ///     .name("reserve-and-book")
+    ///     .retry_strategy(|_err, attempt| {
+    ///         if attempt >= 3 {
+    ///             RetryDecision::Stop
+    ///         } else {
+    ///             RetryDecision::Retry { delay: Duration::from_secs(5) }
+    ///         }
+    ///     })
+    ///     .await?;
+    ///     Ok(result)
+    /// }
+    /// ```
+    pub fn with_retry<O, F, Fut>(&self, f: F) -> WithRetryBuilder<O>
+    where
+        F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+        O: Serialize + DeserializeOwned + Send + 'static,
+    {
+        let op_id = self.mint_id();
+        WithRetryBuilder::new(self.clone(), op_id)
+            .with_closure(Arc::new(move |ctx| Box::pin(f(ctx))))
     }
 
     /// Creates a wait-for-condition operation that polls until a predicate
