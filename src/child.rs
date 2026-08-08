@@ -37,17 +37,26 @@ pub(crate) const CHILD_SUB_TYPE: &str = "RunInChildContext";
 /// the checkpoint; instead the child body is re-executed on replay.
 const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 
+/// Boxed, pinned child-context body: a factory that receives the child
+/// [`DurableContext`] and returns the pinned future producing the child's
+/// result.
+///
+/// Crate-internal: the public API takes a generic closure and boxes it into
+/// this. Shared by [`ChildExecution`], the child/parallel builders, and
+/// [`crate::Branch`], so the nested `Box<dyn FnOnce ... Pin<Box<dyn Future
+/// ...>>>` spelling is written once.
+pub(crate) type BoxedChildBody<O> = Box<
+    dyn FnOnce(DurableContext) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
+        + Send,
+>;
+
 /// Internal state for child context execution passed from the builder.
 pub(crate) struct ChildExecution<O> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
-    #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
-    pub(crate) closure: Box<
-        dyn FnOnce(DurableContext) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
-            + Send,
-    >,
+    pub(crate) closure: BoxedChildBody<O>,
 }
 
 impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {

@@ -608,6 +608,23 @@ pub enum NestingMode {
 }
 
 /// Internal state for a map execution passed from the builder.
+/// Shared, pinned per-item map body: the user's map closure after
+/// [`crate::DurableContext::map`] erases it. `Arc` rather than `Box`
+/// because the same closure runs once per item, concurrently.
+///
+/// Crate-internal: the public API takes a generic closure and wraps it
+/// into this.
+pub(crate) type BoxedItemBody<I, O> = Arc<
+    dyn Fn(
+            DurableContext,
+            I,
+            usize,
+        ) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Internal state for a map execution passed from the builder.
 pub(crate) struct MapExecution<I, O> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
@@ -619,16 +636,7 @@ pub(crate) struct MapExecution<I, O> {
     pub(crate) nesting: NestingMode,
     pub(crate) item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
     pub(crate) items: Vec<I>,
-    #[allow(clippy::type_complexity)] // reason: boxed async closure factory
-    pub(crate) closure: Arc<
-        dyn Fn(
-                DurableContext,
-                I,
-                usize,
-            ) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
-            + Send
-            + Sync,
-    >,
+    pub(crate) closure: BoxedItemBody<I, O>,
 }
 
 impl<
@@ -754,17 +762,7 @@ pub(crate) struct ParallelExecution<O> {
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
     pub(crate) result_serdes: Option<Arc<dyn Serdes>>,
     pub(crate) nesting: NestingMode,
-    #[allow(clippy::type_complexity)] // reason: boxed future factory per branch
-    pub(crate) branches: Vec<(
-        String,
-        Box<
-            dyn FnOnce(
-                    DurableContext,
-                )
-                    -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
-                + Send,
-        >,
-    )>,
+    pub(crate) branches: Vec<(String, crate::child::BoxedChildBody<O>)>,
 }
 
 impl<O: Serialize + DeserializeOwned + Send + 'static> ParallelExecution<O> {
@@ -819,20 +817,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ParallelExecution<O> {
         // updates) and its factory (kept in a take-once slot since it's
         // FnOnce).
         let mut names: Vec<String> = Vec::with_capacity(total);
-        #[allow(clippy::type_complexity)] // reason: FnOnce branch factories require complex boxing
-        let mut slots: Vec<
-            std::sync::Mutex<
-                Option<
-                    Box<
-                        dyn FnOnce(
-                                DurableContext,
-                            )
-                                -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
-                            + Send,
-                    >,
-                >,
-            >,
-        > = Vec::with_capacity(total);
+        let mut slots: Vec<std::sync::Mutex<Option<crate::child::BoxedChildBody<O>>>> =
+            Vec::with_capacity(total);
         for (name, factory) in self.branches {
             names.push(name);
             slots.push(std::sync::Mutex::new(Some(factory)));

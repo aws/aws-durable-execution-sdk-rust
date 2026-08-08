@@ -64,7 +64,6 @@ impl OperationError {
     }
 
     /// Creates an `OperationError` from its kind (internal).
-    #[allow(dead_code)] // reason: used by enforce_task_ownership
     pub(crate) fn from_kind(kind: OperationErrorKind) -> Self {
         Self { kind }
     }
@@ -188,7 +187,6 @@ impl StepError {
     }
 
     /// Creates a `StepError` from its kind (internal).
-    #[allow(dead_code)] // reason: used by enforce_task_ownership
     pub(crate) fn from_kind(kind: StepErrorKind) -> Self {
         Self { kind }
     }
@@ -877,7 +875,6 @@ impl NonDeterministicExecutionError {
     }
 
     /// Creates a `NonDeterministicExecutionError` from its kind (internal).
-    #[allow(dead_code)] // reason: used by validate_replay_identity
     pub(crate) fn from_kind(kind: NonDeterministicExecutionErrorKind) -> Self {
         Self { kind }
     }

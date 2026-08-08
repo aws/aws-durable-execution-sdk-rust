@@ -27,13 +27,11 @@ pub(crate) struct OperationId {
 
 impl OperationId {
     /// Returns the positional string.
-    #[allow(dead_code)] // reason: used by operation execution
     pub(crate) fn positional(&self) -> &str {
         &self.positional
     }
 
     /// Returns the 64-hex-char wire ID (SHA-256 of the positional string).
-    #[allow(dead_code)] // reason: used by the checkpoint client
     pub(crate) fn wire(&self) -> &str {
         &self.wire
     }
@@ -120,15 +118,8 @@ impl IdCounter {
         OperationId { positional, wire }
     }
 
-    /// Returns the counter value (number of IDs minted so far).
-    #[allow(dead_code)] // reason: used in tests and future phases
-    pub(crate) fn count(&self) -> u64 {
-        self.counter.load(Ordering::SeqCst)
-    }
-
     /// Creates a child counter whose prefix is the given positional ID.
     /// Used when spawning child contexts.
-    #[allow(dead_code)] // reason: used by EngineState::new_child
     pub(crate) fn child(positional_id: &str) -> Self {
         Self::new(positional_id.to_owned())
     }
@@ -142,7 +133,6 @@ impl IdCounter {
     }
 
     /// Returns the prefix of this counter (empty string for root).
-    #[allow(dead_code)] // reason: used in tests and future phases
     pub(crate) fn prefix(&self) -> &str {
         &self.prefix
     }
@@ -170,7 +160,6 @@ impl IdCounter {
 
 /// The status of a checkpointed operation, as recorded by the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // reason: variants constructed by the checkpoint client
 pub(crate) enum CheckpointStatus {
     /// Operation started but not yet resolved.
     Started,
@@ -206,9 +195,14 @@ impl CheckpointStatus {
 /// Models the checkpoint API response shape. Fields are added as the engine
 /// consumes them in later slices.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // reason: fields read by operation execution
 pub(crate) struct CheckpointRecord {
     /// The wire operation ID (SHA-256 hex) used as the map key.
+    ///
+    /// The log keys records by this same ID, so no code path needs to read
+    /// it back off the record; it is kept on the record so `Debug` output
+    /// of a record identifies the operation it belongs to.
+    #[allow(dead_code)]
+    // reason: never read back — the log keys records by this ID; retained for Debug diagnostics
     pub(crate) id: String,
     /// The operation's status.
     pub(crate) status: CheckpointStatus,
@@ -313,7 +307,6 @@ impl CheckpointLog {
     /// Records are stored keyed by their wire ID. The caller must provide
     /// the wire-ID → record mapping (the inline parser uses the `Id` field
     /// from the backend directly as the key).
-    #[allow(dead_code)] // reason: used by the checkpoint client and tests
     pub(crate) fn from_records(records: Vec<(String, CheckpointRecord)>) -> Self {
         Self {
             records: RwLock::new(records.into_iter().collect()),
@@ -329,7 +322,7 @@ impl CheckpointLog {
     /// production path uses it anymore: they read through
     /// [`Self::with_record`], [`Self::status_view`], or [`Self::contains`]
     /// instead. Retained for tests, which assert on whole stored records.
-    #[allow(dead_code)] // reason: test-only whole-record accessor; production uses targeted reads
+    #[cfg(test)]
     pub(crate) fn get(&self, wire_id: &str) -> Option<CheckpointRecord> {
         self.with_record(wire_id, Clone::clone)
     }
@@ -385,17 +378,6 @@ impl CheckpointLog {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.insert(wire_id, record);
-    }
-
-    /// Returns the number of terminal records in the log (the high-water
-    /// mark for replay detection).
-    #[allow(dead_code)] // reason: used for progress reporting
-    pub(crate) fn terminal_count(&self) -> usize {
-        let guard = self
-            .records
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.values().filter(|r| r.status.is_terminal()).count()
     }
 
     /// Returns true if the log has any records at all.
@@ -456,6 +438,10 @@ impl EngineState {
     ///
     /// An operation is replaying if the checkpoint log contains a terminal
     /// record for it — meaning the result was frozen in a prior invocation.
+    /// Production operation paths make this check through
+    /// [`crate::context::DurableContext::checkpoint_view_validated`]; this
+    /// direct form is retained for engine unit tests.
+    #[cfg(test)]
     pub(crate) fn is_replaying_at(&self, positional_id: &str) -> bool {
         let wire_id = compute_wire_id(positional_id);
         self.checkpoint_log

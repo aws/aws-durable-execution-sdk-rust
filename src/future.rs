@@ -330,12 +330,7 @@ pub enum Settled<O> {
 /// ```
 pub struct Branch<O> {
     name: String,
-    #[allow(dead_code)] // reason: used when bodies land in later phases
-    #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
-    factory: Box<
-        dyn FnOnce(DurableContext) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
-            + Send,
-    >,
+    factory: crate::child::BoxedChildBody<O>,
 }
 
 impl<O> std::fmt::Debug for Branch<O> {
@@ -388,13 +383,7 @@ impl<O: Send + 'static> Branch<O> {
     }
 
     /// Consumes the branch and returns the factory closure (internal).
-    #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
-    pub(crate) fn into_factory(
-        self,
-    ) -> Box<
-        dyn FnOnce(DurableContext) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
-            + Send,
-    > {
+    pub(crate) fn into_factory(self) -> crate::child::BoxedChildBody<O> {
         self.factory
     }
 }

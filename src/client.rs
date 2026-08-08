@@ -5,6 +5,7 @@
 //! production implementation is backed by `aws-sdk-lambda`.
 
 use std::pin::Pin;
+#[cfg(test)]
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -133,6 +134,16 @@ fn backoff_delay(attempt: u32) -> Duration {
 #[derive(Debug)]
 pub(crate) struct ClientError {
     message: String,
+    /// Whether the underlying failure was classified as retryable.
+    ///
+    /// Production code classifies retryability *before* constructing the
+    /// error (see `classify_checkpoint_error` / `classify_get_state_error`)
+    /// and drives its retry loops off that classification, so nothing in the
+    /// production path reads this flag back. Unit tests read it through
+    /// [`ClientError::retryable`] to assert the constructors preserve the
+    /// classification.
+    #[allow(dead_code)]
+    // reason: read only by the cfg(test) accessor below; production classifies before construction
     retryable: bool,
 }
 
@@ -145,7 +156,9 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 impl ClientError {
-    /// Whether this error is classified as retryable.
+    /// Whether this error is classified as retryable (test-only accessor;
+    /// see the field docs for why production never reads this back).
+    #[cfg(test)]
     pub(crate) fn retryable(&self) -> bool {
         self.retryable
     }
@@ -370,6 +383,7 @@ impl ExecutionClient for LambdaExecutionClient {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Injection point for controlling test double behavior per call.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) enum TestResponse {
     /// Return success with the given operations.
@@ -387,6 +401,7 @@ pub(crate) enum TestResponse {
 ///
 /// Supports injecting failures and recording calls for assertions.
 /// Sufficient for unit tests — not the full `test-util` `LocalRunner`.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct InMemoryExecutionClient {
     /// Pre-loaded state returned by `get_state`.
@@ -403,6 +418,7 @@ pub(crate) struct InMemoryExecutionClient {
     recorded_updates: Mutex<Vec<OperationUpdate>>,
 }
 
+#[cfg(test)]
 impl InMemoryExecutionClient {
     /// Creates a new test double with the given pre-loaded state.
     pub(crate) fn new(state_operations: Vec<Operation>) -> Self {
@@ -434,6 +450,7 @@ impl InMemoryExecutionClient {
     }
 }
 
+#[cfg(test)]
 impl ExecutionClient for InMemoryExecutionClient {
     fn checkpoint(
         &self,
@@ -737,45 +754,6 @@ fn extract_error_message(op: &Operation) -> Option<String> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Retry Wrapper
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Performs a checkpoint call with internal retry-with-backoff.
-///
-/// The `InMemoryExecutionClient` returns one response per call (no
-/// internal retry), so this wrapper provides the retry loop for testing
-/// and production uniformly.
-pub(crate) async fn checkpoint_with_retry(
-    client: &dyn ExecutionClient,
-    execution_arn: &str,
-    checkpoint_token: &str,
-    updates: Vec<OperationUpdate>,
-) -> Result<CheckpointOutput, ClientError> {
-    let mut last_err: Option<ClientError> = None;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        match client
-            .checkpoint(execution_arn, checkpoint_token, updates.clone())
-            .await
-        {
-            Ok(output) => return Ok(output),
-            Err(err) => {
-                if !err.retryable() {
-                    return Err(err);
-                }
-                last_err = Some(err);
-                if attempt < MAX_ATTEMPTS - 1 {
-                    tokio::time::sleep(backoff_delay(attempt)).await;
-                }
-            }
-        }
-    }
-
-    Err(last_err
-        .unwrap_or_else(|| ClientError::from_retryable("retry attempts exhausted".to_owned())))
-}
-
-// ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -879,72 +857,39 @@ mod tests {
         assert_eq!(backoff_delay(100), MAX_DELAY);
     }
 
-    // ── Retry loop with test double ─────────────────────────────────────
+    // ── Test double behavior ────────────────────────────────────────────
 
     #[tokio::test]
-    async fn retry_succeeds_after_transient_failures() {
-        tokio::time::pause();
-
+    async fn in_memory_client_returns_queued_responses_in_order() {
         let client = InMemoryExecutionClient::new(Vec::new());
         client.enqueue_checkpoint_response(TestResponse::RetryableError("throttled".to_owned()));
-        client.enqueue_checkpoint_response(TestResponse::RetryableError("server error".to_owned()));
-        client.enqueue_checkpoint_response(TestResponse::Success(Vec::new()));
-
-        let result = checkpoint_with_retry(&client, "arn:test", "token-0", Vec::new()).await;
-
-        assert!(result.is_ok());
-        let count = *client
-            .checkpoint_call_count
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(count, 3);
-    }
-
-    #[tokio::test]
-    async fn retry_gives_up_after_max_attempts() {
-        tokio::time::pause();
-
-        let client = InMemoryExecutionClient::new(Vec::new());
-        client.enqueue_checkpoint_response(TestResponse::RetryableError("t1".to_owned()));
-        client.enqueue_checkpoint_response(TestResponse::RetryableError("t2".to_owned()));
-        client.enqueue_checkpoint_response(TestResponse::RetryableError("t3".to_owned()));
-
-        let result = checkpoint_with_retry(&client, "arn:test", "token-0", Vec::new()).await;
-
-        assert!(result.is_err());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — err verified above
-        let err = result.unwrap_err();
-        assert!(err.retryable());
-        let count = *client
-            .checkpoint_call_count
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(count, 3);
-    }
-
-    #[tokio::test]
-    async fn non_retryable_error_surfaces_immediately() {
-        let client = InMemoryExecutionClient::new(Vec::new());
         client.enqueue_checkpoint_response(TestResponse::NonRetryableError("invalid".to_owned()));
         client.enqueue_checkpoint_response(TestResponse::Success(Vec::new()));
 
-        let result = checkpoint_with_retry(&client, "arn:test", "token-0", Vec::new()).await;
-
-        assert!(result.is_err());
+        let first = client.checkpoint("arn:test", "token-0", Vec::new()).await;
         #[allow(clippy::unwrap_used)] // reason: test assertion — err verified above
-        let err = result.unwrap_err();
-        assert!(!err.retryable());
+        let first_err = first.unwrap_err();
+        assert!(first_err.retryable());
+
+        let second = client.checkpoint("arn:test", "token-0", Vec::new()).await;
+        #[allow(clippy::unwrap_used)] // reason: test assertion — err verified above
+        let second_err = second.unwrap_err();
+        assert!(!second_err.retryable());
+
+        let third = client.checkpoint("arn:test", "token-0", Vec::new()).await;
+        assert!(third.is_ok());
+
         let count = *client
             .checkpoint_call_count
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(count, 1);
+        assert_eq!(count, 3);
     }
 
     #[tokio::test]
     async fn success_returns_checkpoint_output() {
         let client = InMemoryExecutionClient::new(Vec::new());
-        let result = checkpoint_with_retry(&client, "arn:test", "token-0", Vec::new()).await;
+        let result = client.checkpoint("arn:test", "token-0", Vec::new()).await;
 
         assert!(result.is_ok());
         #[allow(clippy::unwrap_used)] // reason: test assertion — ok verified above

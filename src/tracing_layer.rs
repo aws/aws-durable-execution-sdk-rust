@@ -246,30 +246,12 @@ impl ReplayTracker {
         }
     }
 
-    /// Records a span's replay status from its attributes.
-    #[allow(dead_code)] // reason: test infrastructure for replay filter integration tests
-    pub(crate) fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id) {
-        if is_replay_event(attrs)
-            && let Ok(mut set) = self.replay_spans.write()
-        {
-            set.insert(id.into_u64());
-        }
-    }
-
     /// Returns whether the span (or any ancestor) is in replay mode.
     ///
     /// For a full implementation this would walk the span stack; for
     /// unit tests we check if the given span ID is directly marked.
     pub(crate) fn is_replay(&self, id: u64) -> bool {
         self.replay_spans.read().is_ok_and(|set| set.contains(&id))
-    }
-
-    /// Removes a closed span from tracking.
-    #[allow(dead_code)] // reason: used by replay filter tests in later integration
-    pub(crate) fn on_close(&self, id: &Id) {
-        if let Ok(mut set) = self.replay_spans.write() {
-            set.remove(&id.into_u64());
-        }
     }
 }
 

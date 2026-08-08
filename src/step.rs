@@ -179,6 +179,17 @@ pub enum StepSemantics {
 /// Wire sub-type for step operations.
 pub(crate) const STEP_SUB_TYPE: &str = "Step";
 
+/// Boxed, pinned step body: the user's step closure after
+/// [`crate::DurableContext::step`] erases it for storage on the builder.
+///
+/// Crate-internal: the public API takes a generic closure and boxes it into
+/// this. The alias exists so the builder, the execution state, and the
+/// context each name the type once instead of repeating the nested
+/// `Box<dyn FnOnce ... Pin<Box<dyn Future ...>>>` spelling.
+pub(crate) type BoxedStepBody<O> = Box<
+    dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<O, BoxError>> + Send>> + Send,
+>;
+
 /// Internal state for step execution passed from the builder.
 pub(crate) struct StepExecution<O> {
     pub(crate) ctx: DurableContext,
@@ -187,10 +198,7 @@ pub(crate) struct StepExecution<O> {
     pub(crate) retry_strategy: Option<RetryStrategy>,
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
     pub(crate) semantics: StepSemantics,
-    #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
-    pub(crate) closure: Box<
-        dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<O, BoxError>> + Send>> + Send,
-    >,
+    pub(crate) closure: BoxedStepBody<O>,
 }
 
 impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
@@ -592,6 +600,13 @@ async fn replay_success<O: DeserializeOwned>(
     deserialize_result(serdes, payload, serdes_ctx).await
 }
 
+/// Rebuilds a step error from the failure fields of a replayed record.
+///
+/// `error_type` is the wire `ErrorType` that [`error_type_name`] derived
+/// heuristically when the failure was first recorded (see its docs for the
+/// exact derivation and its limits). It is folded into the message as a
+/// `"{type}: {message}"` prefix for diagnostics only — nothing matches on
+/// it, so an imprecise type name cannot change replay behavior.
 fn replay_failure(error_type: Option<&str>, error_message: Option<&str>) -> OperationError {
     let msg = match (error_type, error_message) {
         (Some(t), Some(m)) => format!("{t}: {m}"),
@@ -612,9 +627,46 @@ fn client_error_to_op_error(err: &ClientError) -> OperationError {
     )))
 }
 
-/// Derives the wire error type name from a boxed error.
+/// Derives the wire `ErrorType` for a failed step from a boxed error.
 ///
-/// Uses the concrete type name as the error type name.
+/// # Why a heuristic
+///
+/// A step body returns `Result<O, BoxError>`, so the concrete error type is
+/// erased *by the caller* before the SDK ever sees it — `?` boxes the error
+/// at the user's call site. `std::any::type_name` cannot recover a name
+/// from a `dyn Error` trait object, so the only material available here is
+/// the error's `Debug` rendering. Capturing the real type name would
+/// require a generic error parameter on the public step API, which is not
+/// worth the surface cost for a diagnostic label.
+///
+/// # Exact behavior
+///
+/// Renders the error with `{:?}` and scans that string for the first token
+/// (split on any character that is neither alphanumeric nor `_`) that
+/// starts with an uppercase letter; that token is the wire `ErrorType`. If
+/// no such token exists, the fallback is the literal `"Error"`.
+///
+/// * A derived `Debug` on a unit/struct error yields the type's own name
+///   (`TransientError` → `"TransientError"`), which is the case this
+///   heuristic is tuned for.
+/// * A `String`/`&str` error boxed via `.into()` renders as a quoted
+///   lowercase message, so it falls back to `"Error"` (pinned by the
+///   `error_type_name_fallback_to_error` test below).
+/// * The heuristic is silently "wrong" for wrapper types: `Debug` output
+///   like `Custom { kind: InvalidData, .. }` yields `"Custom"`, and a
+///   capitalized first word of a hand-written `Debug` message is taken as
+///   the type name even when it is prose.
+///
+/// # Where the value goes
+///
+/// The name is sent to the backend in `ErrorObject.error_type` by
+/// [`build_fail_update`] and [`build_retry_update`], stored in the
+/// execution history, and read back on replay by [`replay_failure`], which
+/// folds it into the replayed error's message as a `"{type}: {message}"`
+/// prefix. It is a **diagnostic label only**: no SDK code path branches on
+/// its value, so an imprecise name degrades history readability, not
+/// correctness. Changing the derivation changes the wire history and the
+/// replayed error text — treat that as a wire-visible change.
 fn error_type_name(err: &(dyn std::error::Error + Send + Sync)) -> String {
     let debug = format!("{err:?}");
     // Heuristic: first capitalized word as type name.
@@ -630,7 +682,6 @@ fn error_type_name(err: &(dyn std::error::Error + Send + Sync)) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // reason: test assertions
 #[allow(clippy::expect_used)] // reason: test assertions
-#[allow(clippy::type_complexity)] // reason: boxed future factories in test setup
 #[allow(clippy::panic)] // reason: test assertions with descriptive messages
 mod tests {
     use super::*;
@@ -810,10 +861,7 @@ mod tests {
             "token0".to_owned(),
         );
         let op_id = ctx.mint_id();
-        let closure: Box<
-            dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
-                + Send,
-        > = Box::new(|_| Box::pin(async { Ok(42) }));
+        let closure: BoxedStepBody<i32> = Box::new(|_| Box::pin(async { Ok(42) }));
 
         let exec = StepExecution {
             ctx,
@@ -869,13 +917,8 @@ mod tests {
             Some(Arc::new(Upper)),
         );
         let op_id = ctx.mint_id();
-        let closure: Box<
-            dyn FnOnce(
-                    StepContext,
-                )
-                    -> Pin<Box<dyn Future<Output = Result<String, BoxError>> + Send>>
-                + Send,
-        > = Box::new(|_| Box::pin(async { Ok("hello".to_owned()) }));
+        let closure: BoxedStepBody<String> =
+            Box::new(|_| Box::pin(async { Ok("hello".to_owned()) }));
 
         let exec = StepExecution {
             ctx,
@@ -942,10 +985,7 @@ mod tests {
         );
         let op_id = ctx.mint_id(); // This mints "1"
 
-        let closure: Box<
-            dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
-                + Send,
-        > = Box::new(move |_| {
+        let closure: BoxedStepBody<i32> = Box::new(move |_| {
             executed_clone.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(0) })
         });
@@ -1001,13 +1041,7 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let closure: Box<
-            dyn FnOnce(
-                    StepContext,
-                )
-                    -> Pin<Box<dyn Future<Output = Result<String, BoxError>> + Send>>
-                + Send,
-        > = Box::new(move |_| {
+        let closure: BoxedStepBody<String> = Box::new(move |_| {
             executed_clone.store(true, Ordering::SeqCst);
             Box::pin(async { Ok("should not run".to_owned()) })
         });
@@ -1052,10 +1086,8 @@ mod tests {
         let no_retry: RetryStrategy =
             Box::new(|_err: &StepError, _attempt: u32| RetryDecision::Stop);
 
-        let closure: Box<
-            dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
-                + Send,
-        > = Box::new(|_| Box::pin(async { Err("always fails".into()) }));
+        let closure: BoxedStepBody<i32> =
+            Box::new(|_| Box::pin(async { Err("always fails".into()) }));
 
         let exec = StepExecution {
             ctx,
@@ -1097,10 +1129,7 @@ mod tests {
                 delay: Duration::from_secs(1),
             });
 
-        let closure: Box<
-            dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
-                + Send,
-        > = Box::new(|_| Box::pin(async { Err("transient".into()) }));
+        let closure: BoxedStepBody<i32> = Box::new(|_| Box::pin(async { Err("transient".into()) }));
 
         let exec = StepExecution {
             ctx: ctx.clone(),
@@ -1142,10 +1171,7 @@ mod tests {
                 delay: Duration::from_millis(1900),
             });
 
-        let closure: Box<
-            dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
-                + Send,
-        > = Box::new(|_| Box::pin(async { Err("transient".into()) }));
+        let closure: BoxedStepBody<i32> = Box::new(|_| Box::pin(async { Err("transient".into()) }));
 
         let exec = StepExecution {
             ctx: ctx.clone(),
@@ -1216,13 +1242,7 @@ mod tests {
             let ctx_clone = ctx.clone();
             let handle = tokio::spawn(async move {
                 let op_id = ctx_clone.mint_id();
-                let closure: Box<
-                    dyn FnOnce(
-                            StepContext,
-                        )
-                            -> Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
-                        + Send,
-                > = Box::new(|_| Box::pin(async { Ok(1) }));
+                let closure: BoxedStepBody<i32> = Box::new(|_| Box::pin(async { Ok(1) }));
 
                 let exec = StepExecution {
                     ctx: ctx_clone,
@@ -1296,10 +1316,7 @@ mod tests {
         let no_retry: RetryStrategy =
             Box::new(|_err: &StepError, _attempt: u32| RetryDecision::Stop);
 
-        let closure: Box<
-            dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
-                + Send,
-        > = Box::new(move |_| {
+        let closure: BoxedStepBody<i32> = Box::new(move |_| {
             executed_clone.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(42) })
         });
@@ -1373,10 +1390,7 @@ mod tests {
                 delay: Duration::from_secs(1),
             });
 
-        let closure: Box<
-            dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
-                + Send,
-        > = Box::new(move |_| {
+        let closure: BoxedStepBody<i32> = Box::new(move |_| {
             executed_clone.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(42) })
         });
@@ -1440,10 +1454,7 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let closure: Box<
-            dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
-                + Send,
-        > = Box::new(move |_| {
+        let closure: BoxedStepBody<i32> = Box::new(move |_| {
             executed_clone.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(77) })
         });

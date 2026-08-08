@@ -5,7 +5,7 @@
 //! site), implements [`IntoFuture`] for `.await` support, and provides
 //! a `.spawn()` eager terminal. Chain methods consume and return `self`.
 
-use std::future::{Future, IntoFuture};
+use std::future::IntoFuture;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
@@ -151,16 +151,7 @@ pub struct StepBuilder<O> {
     retry_strategy: Option<RetryStrategy>,
     serdes: Option<Arc<dyn Serdes>>,
     semantics: crate::step::StepSemantics,
-    #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
-    closure: Option<
-        Box<
-            dyn FnOnce(
-                    crate::context::StepContext,
-                )
-                    -> std::pin::Pin<Box<dyn Future<Output = Result<O, crate::BoxError>> + Send>>
-                + Send,
-        >,
-    >,
+    closure: crate::step::BoxedStepBody<O>,
     _marker: PhantomData<O>,
 }
 
@@ -173,8 +164,13 @@ impl<O> std::fmt::Debug for StepBuilder<O> {
 }
 
 impl<O: Send + 'static> StepBuilder<O> {
-    /// Creates a new step builder (internal).
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId) -> Self {
+    /// Creates a new step builder (internal). Taking the closure here keeps
+    /// the field non-optional: a builder without a body is unrepresentable.
+    pub(crate) fn new(
+        ctx: DurableContext,
+        op_id: OperationId,
+        closure: crate::step::BoxedStepBody<O>,
+    ) -> Self {
         Self {
             ctx,
             op_id,
@@ -182,25 +178,9 @@ impl<O: Send + 'static> StepBuilder<O> {
             retry_strategy: None,
             serdes: None,
             semantics: crate::step::StepSemantics::default(),
-            closure: None,
+            closure,
             _marker: PhantomData,
         }
-    }
-
-    /// Sets the closure for this step (internal, called by `context.step()`).
-    #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
-    pub(crate) fn with_closure(
-        mut self,
-        closure: Box<
-            dyn FnOnce(
-                    crate::context::StepContext,
-                )
-                    -> std::pin::Pin<Box<dyn Future<Output = Result<O, crate::BoxError>> + Send>>
-                + Send,
-        >,
-    ) -> Self {
-        self.closure = Some(closure);
-        self
     }
 
     /// Sets a human-readable name for this step.
@@ -368,12 +348,6 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
         preflight_identity!(self, "Step", crate::step::STEP_SUB_TYPE);
 
-        let closure = self.closure.unwrap_or_else(|| {
-            // If no closure was provided (shouldn't happen in normal use),
-            // produce an immediate error.
-            Box::new(|_| Box::pin(async { Err("step has no closure".into()) }))
-        });
-
         let execution = StepExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -381,7 +355,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             retry_strategy: self.retry_strategy,
             serdes: self.serdes,
             semantics: self.semantics,
-            closure,
+            closure: self.closure,
         };
 
         DurableFuture::from_async(async move { execution.execute().await })
@@ -714,19 +688,7 @@ pub struct ChildBuilder<O> {
     op_id: OperationId,
     name: Option<String>,
     serdes: Option<Arc<dyn Serdes>>,
-    #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
-    closure: Option<
-        Box<
-            dyn FnOnce(
-                    DurableContext,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = Result<O, crate::error::ChildFnError>>
-                            + Send,
-                    >,
-                > + Send,
-        >,
-    >,
+    closure: crate::child::BoxedChildBody<O>,
 }
 
 impl<O> std::fmt::Debug for ChildBuilder<O> {
@@ -738,34 +700,20 @@ impl<O> std::fmt::Debug for ChildBuilder<O> {
 }
 
 impl<O: Send + 'static> ChildBuilder<O> {
-    /// Creates a new builder (internal).
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId) -> Self {
+    /// Creates a new builder (internal). Taking the closure here keeps the
+    /// field non-optional: a builder without a body is unrepresentable.
+    pub(crate) fn new(
+        ctx: DurableContext,
+        op_id: OperationId,
+        closure: crate::child::BoxedChildBody<O>,
+    ) -> Self {
         Self {
             ctx,
             op_id,
             name: None,
             serdes: None,
-            closure: None,
+            closure,
         }
-    }
-
-    /// Sets the closure for this builder (internal).
-    #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
-    pub(crate) fn with_closure(
-        mut self,
-        closure: Box<
-            dyn FnOnce(
-                    DurableContext,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = Result<O, crate::error::ChildFnError>>
-                            + Send,
-                    >,
-                > + Send,
-        >,
-    ) -> Self {
-        self.closure = Some(closure);
-        self
     }
 
     /// Sets a human-readable name for this operation.
@@ -836,18 +784,12 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
         preflight_identity!(self, "Context", crate::child::CHILD_SUB_TYPE);
 
-        let closure = self.closure.unwrap_or_else(|| {
-            Box::new(|_| {
-                Box::pin(async { Err(crate::error::ChildFnError::new("child has no closure")) })
-            })
-        });
-
         let execution = ChildExecution {
             ctx: self.ctx,
             op_id: self.op_id,
             name: self.name,
             serdes: self.serdes,
-            closure,
+            closure: self.closure,
         };
 
         DurableFuture::from_async(async move { execution.execute().await })
@@ -915,7 +857,7 @@ pub struct WithRetryBuilder<O> {
     name: Option<String>,
     retry_strategy: Option<RetryStrategy>,
     serdes: Option<Arc<dyn Serdes>>,
-    closure: Option<crate::with_retry::WithRetryClosure<O>>,
+    closure: crate::with_retry::WithRetryClosure<O>,
 }
 
 impl<O> std::fmt::Debug for WithRetryBuilder<O> {
@@ -927,22 +869,21 @@ impl<O> std::fmt::Debug for WithRetryBuilder<O> {
 }
 
 impl<O: Send + 'static> WithRetryBuilder<O> {
-    /// Creates a new builder (internal).
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId) -> Self {
+    /// Creates a new builder (internal). Taking the closure here keeps the
+    /// field non-optional: a builder without a body is unrepresentable.
+    pub(crate) fn new(
+        ctx: DurableContext,
+        op_id: OperationId,
+        closure: crate::with_retry::WithRetryClosure<O>,
+    ) -> Self {
         Self {
             ctx,
             op_id,
             name: None,
             retry_strategy: None,
             serdes: None,
-            closure: None,
+            closure,
         }
-    }
-
-    /// Sets the closure for this builder (internal).
-    pub(crate) fn with_closure(mut self, closure: crate::with_retry::WithRetryClosure<O>) -> Self {
-        self.closure = Some(closure);
-        self
     }
 
     /// Sets a human-readable name for this operation.
@@ -1097,9 +1038,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
         // recorded identity exactly as `run_in_child_context` does.
         preflight_identity!(self, "Context", crate::child::CHILD_SUB_TYPE);
 
-        let closure = self.closure.unwrap_or_else(|| {
-            Arc::new(|_| Box::pin(async { Err("with_retry has no closure".into()) }))
-        });
+        let closure = self.closure;
         let strategy: Arc<RetryStrategy> = Arc::new(
             self.retry_strategy
                 .unwrap_or_else(crate::step::default_retry_strategy),
@@ -1166,18 +1105,7 @@ pub struct WaitForConditionBuilder<S> {
     initial_state: S,
     wait_strategy: Option<crate::wait_for_condition::WaitStrategyFn<S>>,
     serdes: Option<Arc<dyn Serdes>>,
-    #[allow(clippy::type_complexity)] // reason: boxed Fn closure is inherently complex
-    check: Option<
-        Box<
-            dyn Fn(
-                    crate::context::StepContext,
-                    S,
-                )
-                    -> std::pin::Pin<Box<dyn Future<Output = Result<S, crate::BoxError>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
+    check: crate::wait_for_condition::BoxedCheckFn<S>,
 }
 
 impl<S> std::fmt::Debug for WaitForConditionBuilder<S> {
@@ -1191,8 +1119,15 @@ impl<S> std::fmt::Debug for WaitForConditionBuilder<S> {
 impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static>
     WaitForConditionBuilder<S>
 {
-    /// Creates a new builder (internal).
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, initial_state: S) -> Self {
+    /// Creates a new builder (internal). Taking the check closure here
+    /// keeps the field non-optional: a builder without a check is
+    /// unrepresentable.
+    pub(crate) fn new(
+        ctx: DurableContext,
+        op_id: OperationId,
+        initial_state: S,
+        check: crate::wait_for_condition::BoxedCheckFn<S>,
+    ) -> Self {
         Self {
             ctx,
             op_id,
@@ -1200,26 +1135,8 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
             initial_state,
             wait_strategy: None,
             serdes: None,
-            check: None,
+            check,
         }
-    }
-
-    /// Sets the check closure (internal, called by `context.wait_for_condition()`).
-    #[allow(clippy::type_complexity)] // reason: boxed Fn closure is inherently complex
-    pub(crate) fn with_check(
-        mut self,
-        check: Box<
-            dyn Fn(
-                    crate::context::StepContext,
-                    S,
-                )
-                    -> std::pin::Pin<Box<dyn Future<Output = Result<S, crate::BoxError>> + Send>>
-                + Send
-                + Sync,
-        >,
-    ) -> Self {
-        self.check = Some(check);
-        self
     }
 
     /// Sets a human-readable name for this operation.
@@ -1346,10 +1263,6 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
 
         preflight_identity!(self, "Step", crate::wait_for_condition::WFC_SUB_TYPE);
 
-        let check = self
-            .check
-            .unwrap_or_else(|| Box::new(|_ctx, state| Box::pin(async move { Ok(state) })));
-
         let execution = WaitForConditionExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -1357,7 +1270,7 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
             initial_state: self.initial_state,
             wait_strategy: self.wait_strategy,
             serdes: self.serdes,
-            check,
+            check: self.check,
         };
 
         DurableFuture::from_async(async move { execution.execute().await })
@@ -1398,14 +1311,10 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
 pub struct CreateCallbackBuilder<O> {
-    #[allow(dead_code)] // reason: not yet read by the builder body
     ctx: DurableContext,
-    #[allow(dead_code)] // reason: not yet read by the builder body
     op_id: OperationId,
     name: Option<String>,
-    #[allow(dead_code)] // reason: not yet read by the builder body
     timeout: Option<Duration>,
-    #[allow(dead_code)] // reason: not yet read by the builder body
     heartbeat: Option<Duration>,
     serdes: Option<Arc<dyn Serdes>>,
     _marker: PhantomData<O>,
@@ -1537,7 +1446,7 @@ pub struct WaitForCallbackBuilder<O> {
     name: Option<String>,
     timeout: Option<Duration>,
     heartbeat: Option<Duration>,
-    submitter: Option<crate::callback::BoxedSubmitter>,
+    submitter: crate::callback::BoxedSubmitter,
     submitter_retry: Option<RetryStrategy>,
     serdes: Option<Arc<dyn Serdes>>,
     _marker: PhantomData<O>,
@@ -1552,25 +1461,25 @@ impl<O> std::fmt::Debug for WaitForCallbackBuilder<O> {
 }
 
 impl<O: Send + 'static> WaitForCallbackBuilder<O> {
-    /// Creates a new builder (internal).
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId) -> Self {
+    /// Creates a new builder (internal). Taking the submitter here keeps
+    /// the field non-optional: a builder without a submitter is
+    /// unrepresentable.
+    pub(crate) fn new(
+        ctx: DurableContext,
+        op_id: OperationId,
+        submitter: crate::callback::BoxedSubmitter,
+    ) -> Self {
         Self {
             ctx,
             op_id,
             name: None,
             timeout: None,
             heartbeat: None,
-            submitter: None,
+            submitter,
             submitter_retry: None,
             serdes: None,
             _marker: PhantomData,
         }
-    }
-
-    /// Sets the submitter closure (internal — called from `DurableContext`).
-    pub(crate) fn with_submitter(mut self, submitter: crate::callback::BoxedSubmitter) -> Self {
-        self.submitter = Some(submitter);
-        self
     }
 
     /// Sets a human-readable name for this operation.
@@ -1708,22 +1617,13 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
         preflight_identity!(self, "Context", crate::callback::WFCB_SUB_TYPE);
 
-        // The submitter is required — if somehow missing (shouldn't happen
-        // since context.rs always provides it), use a no-op.
-        let submitter = self.submitter.unwrap_or_else(|| {
-            Box::new(|_ctx, _id| {
-                Box::pin(async { Ok(()) })
-                    as std::pin::Pin<Box<dyn Future<Output = Result<(), crate::BoxError>> + Send>>
-            })
-        });
-
         let execution = WaitForCallbackExecution {
             ctx: self.ctx,
             op_id: self.op_id,
             name: self.name,
             timeout: self.timeout,
             heartbeat: self.heartbeat,
-            submitter,
+            submitter: self.submitter,
             submitter_retry: self.submitter_retry,
             serdes: self.serdes,
             _marker: PhantomData,
@@ -1779,22 +1679,7 @@ pub struct MapBuilder<I, O> {
     nesting: crate::map_parallel::NestingMode,
     item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
     items: Vec<I>,
-    #[allow(clippy::type_complexity)] // reason: boxed async closure factory
-    closure: Option<
-        Arc<
-            dyn Fn(
-                    DurableContext,
-                    I,
-                    usize,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = Result<O, crate::error::ChildFnError>>
-                            + Send,
-                    >,
-                > + Send
-                + Sync,
-        >,
-    >,
+    closure: crate::map_parallel::BoxedItemBody<I, O>,
     _marker: PhantomData<(I, O)>,
 }
 
@@ -1808,8 +1693,15 @@ impl<I, O> std::fmt::Debug for MapBuilder<I, O> {
 }
 
 impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
-    /// Creates a new builder (internal).
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId) -> Self {
+    /// Creates a new builder (internal). Taking the items and closure here
+    /// keeps the closure field non-optional: a builder without a body is
+    /// unrepresentable.
+    pub(crate) fn new(
+        ctx: DurableContext,
+        op_id: OperationId,
+        items: Vec<I>,
+        closure: crate::map_parallel::BoxedItemBody<I, O>,
+    ) -> Self {
         Self {
             ctx,
             op_id,
@@ -1820,34 +1712,10 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
             result_serdes: None,
             nesting: crate::map_parallel::NestingMode::Normal,
             item_namer: None,
-            items: Vec::new(),
-            closure: None,
+            items,
+            closure,
             _marker: PhantomData,
         }
-    }
-
-    /// Sets the items and closure (internal, called by `context.map()`).
-    #[allow(clippy::type_complexity)] // reason: boxed async closure factory
-    pub(crate) fn with_items_and_closure(
-        mut self,
-        items: Vec<I>,
-        closure: Arc<
-            dyn Fn(
-                    DurableContext,
-                    I,
-                    usize,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = Result<O, crate::error::ChildFnError>>
-                            + Send,
-                    >,
-                > + Send
-                + Sync,
-        >,
-    ) -> Self {
-        self.items = items;
-        self.closure = Some(closure);
-        self
     }
 
     /// Sets a human-readable name for this map operation.
@@ -1976,18 +1844,6 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     {
         use crate::map_parallel::MapExecution;
 
-        let closure = self.closure.unwrap_or_else(|| {
-            Arc::new(|_ctx, _item, _idx| {
-                Box::pin(async { Err(crate::error::ChildFnError::new("map has no closure")) })
-                    as std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<Output = Result<O, crate::error::ChildFnError>>
-                                + Send,
-                        >,
-                    >
-            })
-        });
-
         let execution = MapExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -1999,7 +1855,7 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
             nesting: self.nesting,
             item_namer: self.item_namer,
             items: self.items,
-            closure,
+            closure: self.closure,
         };
 
         execution.execute_batch_result().await
@@ -2037,18 +1893,6 @@ impl<
 
         preflight_identity!(self, "Context", crate::map_parallel::MAP_SUB_TYPE);
 
-        let closure = self.closure.unwrap_or_else(|| {
-            Arc::new(|_ctx, _item, _idx| {
-                Box::pin(async { Err(crate::error::ChildFnError::new("map has no closure")) })
-                    as std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<Output = Result<O, crate::error::ChildFnError>>
-                                + Send,
-                        >,
-                    >
-            })
-        });
-
         let execution = MapExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -2060,7 +1904,7 @@ impl<
             nesting: self.nesting,
             item_namer: self.item_namer,
             items: self.items,
-            closure,
+            closure: self.closure,
         };
 
         DurableFuture::from_async(async move { execution.execute().await })
@@ -2106,20 +1950,7 @@ pub struct ParallelBuilder<O> {
     serdes: Option<Arc<dyn Serdes>>,
     result_serdes: Option<Arc<dyn Serdes>>,
     nesting: crate::map_parallel::NestingMode,
-    #[allow(clippy::type_complexity)] // reason: boxed future factory per branch
-    branches: Vec<(
-        String,
-        Box<
-            dyn FnOnce(
-                    DurableContext,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = Result<O, crate::error::ChildFnError>>
-                            + Send,
-                    >,
-                > + Send,
-        >,
-    )>,
+    branches: Vec<(String, crate::child::BoxedChildBody<O>)>,
     _marker: PhantomData<O>,
 }
 
@@ -2132,8 +1963,14 @@ impl<O> std::fmt::Debug for ParallelBuilder<O> {
 }
 
 impl<O: Send + 'static> ParallelBuilder<O> {
-    /// Creates a new builder (internal).
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId) -> Self {
+    /// Creates a new builder (internal). Taking the branches here keeps the
+    /// builder complete from construction: `context.parallel()` always has
+    /// them in hand.
+    pub(crate) fn new(
+        ctx: DurableContext,
+        op_id: OperationId,
+        branches: Vec<(String, crate::child::BoxedChildBody<O>)>,
+    ) -> Self {
         Self {
             ctx,
             op_id,
@@ -2143,31 +1980,9 @@ impl<O: Send + 'static> ParallelBuilder<O> {
             serdes: None,
             result_serdes: None,
             nesting: crate::map_parallel::NestingMode::Normal,
-            branches: Vec::new(),
+            branches,
             _marker: PhantomData,
         }
-    }
-
-    /// Sets the branches (internal, called by `context.parallel()`).
-    #[allow(clippy::type_complexity)] // reason: boxed future factory per branch
-    pub(crate) fn with_branches(
-        mut self,
-        branches: Vec<(
-            String,
-            Box<
-                dyn FnOnce(
-                        DurableContext,
-                    ) -> std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<Output = Result<O, crate::error::ChildFnError>>
-                                + Send,
-                        >,
-                    > + Send,
-            >,
-        )>,
-    ) -> Self {
-        self.branches = branches;
-        self
     }
 
     /// Sets a human-readable name for this parallel operation.

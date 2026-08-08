@@ -166,8 +166,11 @@ impl DurableContext {
         }
     }
 
-    /// Creates a root context with the given execution state (internal).
-    #[allow(dead_code)] // reason: used by the handler wrapper
+    /// Creates a root context with the given execution state (test-only:
+    /// production roots are built by the handler wrapper with a client and
+    /// token via [`Self::new_root_with_client`]-equivalent wiring in
+    /// `lib.rs`).
+    #[cfg(test)]
     pub(crate) fn new_root(
         execution_arn: String,
         lambda_context: lambda_runtime::Context,
@@ -195,8 +198,9 @@ impl DurableContext {
         }
     }
 
-    /// Creates a root context with a client and token (for live execution).
-    #[allow(dead_code)] // reason: used by step tests and the handler wrapper
+    /// Creates a root context with a client and token (test-only harness
+    /// for exercising live-path operation execution against a test double).
+    #[cfg(test)]
     pub(crate) fn new_root_with_client(
         execution_arn: String,
         lambda_context: lambda_runtime::Context,
@@ -265,7 +269,6 @@ impl DurableContext {
     pub(crate) fn default_serdes(&self) -> Option<&Arc<dyn Serdes>> {
         self.inner.default_serdes.as_ref()
     }
-    #[allow(dead_code)] // reason: used by run_in_child_context
     pub(crate) fn new_child(&self, parent_positional_id: &str) -> Self {
         let engine = Arc::new(EngineState::new_child(
             parent_positional_id,
@@ -451,20 +454,17 @@ impl DurableContext {
     /// Returns a reference to the suspension signal for this context.
     ///
     /// Operations use this to request suspension when they cannot proceed.
-    #[allow(dead_code)] // reason: used by operation execution
     pub(crate) fn suspension_signal(&self) -> &Arc<SuspensionSignal> {
         &self.inner.suspension_signal
     }
 
     /// Returns a reference to the task-ownership tracker.
-    #[allow(dead_code)] // reason: used by .spawn()
     pub(crate) fn task_ownership(&self) -> &Arc<TaskOwnership> {
         &self.inner.task_ownership
     }
 
     /// Checks task ownership and returns an `OperationError` if the caller
     /// is not authorized. Used by every durable operation entry point.
-    #[allow(dead_code)] // reason: wired into the builders
     pub(crate) fn enforce_task_ownership(&self) -> Result<(), OperationError> {
         self.inner
             .task_ownership
@@ -474,13 +474,6 @@ impl DurableContext {
                     StepErrorKind::ExecutionFailed { message: msg },
                 )))
             })
-    }
-
-    /// Returns whether the given positional ID has a terminal checkpoint
-    /// record (internal).
-    #[allow(dead_code)] // reason: used by operation execution
-    pub(crate) fn is_replaying_at(&self, positional_id: &str) -> bool {
-        self.inner.engine.is_replaying_at(positional_id)
     }
 
     /// Reads the checkpoint record for the given positional ID in place,
@@ -665,7 +658,7 @@ impl DurableContext {
     /// (one read-guard pass, no record clone); this record-taking form is
     /// retained as the direct unit-test harness for the identity-matching
     /// rules both share.
-    #[allow(dead_code)] // reason: exercised by unit tests; production uses checkpoint_view_validated
+    #[cfg(test)]
     pub(crate) fn validate_replay_identity(
         &self,
         record: &CheckpointRecord,
@@ -947,15 +940,8 @@ impl DurableContext {
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        #[allow(clippy::type_complexity)] // reason: boxed future factory is inherently complex
-        let closure: Box<
-            dyn FnOnce(
-                    StepContext,
-                )
-                    -> std::pin::Pin<Box<dyn Future<Output = Result<O, BoxError>> + Send>>
-                + Send,
-        > = Box::new(move |ctx| Box::pin(f(ctx)));
-        StepBuilder::new(self.clone(), op_id).with_closure(closure)
+        let closure: crate::step::BoxedStepBody<O> = Box::new(move |ctx| Box::pin(f(ctx)));
+        StepBuilder::new(self.clone(), op_id, closure)
     }
 
     /// Creates a durable wait (timer) operation.
@@ -1061,9 +1047,10 @@ impl DurableContext {
         let op_id = self.mint_id();
         // The SDK pins the future and erases the BoxError into the internal
         // child-error carrier, so the caller writes a plain `async move` body.
-        ChildBuilder::new(self.clone(), op_id).with_closure(Box::new(move |ctx| {
+        let closure: crate::child::BoxedChildBody<O> = Box::new(move |ctx| {
             Box::pin(async move { f(ctx).await.map_err(|e| ChildFnError::new(e.to_string())) })
-        }))
+        });
+        ChildBuilder::new(self.clone(), op_id, closure)
     }
 
     /// Runs a closure against a child context and retries the closure's
@@ -1131,8 +1118,7 @@ impl DurableContext {
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        WithRetryBuilder::new(self.clone(), op_id)
-            .with_closure(Arc::new(move |ctx| Box::pin(f(ctx))))
+        WithRetryBuilder::new(self.clone(), op_id, Arc::new(move |ctx| Box::pin(f(ctx))))
     }
 
     /// Creates a wait-for-condition operation that polls until a predicate
@@ -1176,17 +1162,9 @@ impl DurableContext {
         S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     {
         let op_id = self.mint_id();
-        #[allow(clippy::type_complexity)] // reason: boxed Fn closure for async check function
-        let boxed_check: Box<
-            dyn Fn(
-                    StepContext,
-                    S,
-                )
-                    -> std::pin::Pin<Box<dyn Future<Output = Result<S, BoxError>> + Send>>
-                + Send
-                + Sync,
-        > = Box::new(move |ctx, state| Box::pin(check(ctx, state)));
-        WaitForConditionBuilder::new(self.clone(), op_id, initial_state).with_check(boxed_check)
+        let boxed_check: crate::wait_for_condition::BoxedCheckFn<S> =
+            Box::new(move |ctx, state| Box::pin(check(ctx, state)));
+        WaitForConditionBuilder::new(self.clone(), op_id, initial_state, boxed_check)
     }
 
     /// Creates a callback token for external completion.
@@ -1264,7 +1242,7 @@ impl DurableContext {
         // Box the submitter so the builder can store it without generics.
         let boxed_submitter: crate::callback::BoxedSubmitter =
             Box::new(move |ctx, id| Box::pin(submitter(ctx, id)));
-        WaitForCallbackBuilder::new(self.clone(), op_id).with_submitter(boxed_submitter)
+        WaitForCallbackBuilder::new(self.clone(), op_id, boxed_submitter)
     }
 
     /// Creates a map operation that applies a function to each item in a
@@ -1323,7 +1301,7 @@ impl DurableContext {
                 as std::pin::Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
         });
         let items: Vec<I> = items.into_iter().collect();
-        MapBuilder::new(self.clone(), op_id).with_items_and_closure(items, closure)
+        MapBuilder::new(self.clone(), op_id, items, closure)
     }
 
     /// Creates a parallel operation that executes named branches
@@ -1364,7 +1342,7 @@ impl DurableContext {
                 (name, factory)
             })
             .collect();
-        ParallelBuilder::new(self.clone(), op_id).with_branches(branch_tuples)
+        ParallelBuilder::new(self.clone(), op_id, branch_tuples)
     }
 
     /// Joins all futures, failing fast on the first error.

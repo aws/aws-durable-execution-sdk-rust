@@ -46,7 +46,6 @@
 mod builders;
 pub(crate) mod callback;
 pub(crate) mod child;
-#[allow(dead_code)] // reason: some client-abstraction items are consumed only by the engine
 pub(crate) mod client;
 pub(crate) mod combinator;
 mod context;
@@ -1465,6 +1464,15 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
     ))
 }
 
+/// Boxed, pinned future of one Lambda invocation of a wrapped durable
+/// handler: the return type of the service functions [`wrap`] produces.
+///
+/// Crate-internal: rustdoc renders the alias transparently, and callers
+/// only ever name the `impl Fn` the wrappers return.
+type BoxedInvocationFuture = std::pin::Pin<
+    Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
+>;
+
 /// Creates a Lambda service function with durable execution support.
 ///
 /// Unlike [`run`], this does not start the runtime — it returns a service
@@ -1505,16 +1513,10 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
 ///     lambda_runtime::run(lambda_runtime::service_fn(service)).await
 /// }
 /// ```
-#[allow(clippy::type_complexity)] // reason: Lambda service function signature is inherently complex
 pub fn wrap<F, E, Fut, O>(
     handler: F,
     options: Options,
-) -> impl Fn(
-    lambda_runtime::LambdaEvent<serde_json::Value>,
-) -> std::pin::Pin<
-    Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
-> + Send
-+ Sync
+) -> impl Fn(lambda_runtime::LambdaEvent<serde_json::Value>) -> BoxedInvocationFuture + Send + Sync
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
     E: for<'de> Deserialize<'de> + Send + 'static,
@@ -1549,17 +1551,11 @@ where
 /// The `default_serdes` plays the same role as [`Options::builder`]'s
 /// `serdes`: the execution-wide fallback for operations that set none.
 #[cfg(feature = "test-util")]
-#[allow(clippy::type_complexity)] // reason: Lambda service function signature is inherently complex
 pub(crate) fn wrap_with_execution_client<F, E, Fut, O>(
     handler: F,
     default_serdes: Option<std::sync::Arc<dyn Serdes>>,
     exec_client: std::sync::Arc<dyn client::ExecutionClient>,
-) -> impl Fn(
-    lambda_runtime::LambdaEvent<serde_json::Value>,
-) -> std::pin::Pin<
-    Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
-> + Send
-+ Sync
+) -> impl Fn(lambda_runtime::LambdaEvent<serde_json::Value>) -> BoxedInvocationFuture + Send + Sync
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
     E: for<'de> Deserialize<'de> + Send + 'static,
@@ -1578,17 +1574,11 @@ where
 /// [`ClientProvider`] and execution-wide default serdes. Keeping a single
 /// body guarantees the `test-util` runner and production execute the same
 /// envelope parsing, pagination, driver, and error-mapping code.
-#[allow(clippy::type_complexity)] // reason: Lambda service function signature is inherently complex
 fn wrap_with_provider<F, E, Fut, O>(
     handler: F,
     default_serdes: Option<std::sync::Arc<dyn Serdes>>,
     provider: ClientProvider,
-) -> impl Fn(
-    lambda_runtime::LambdaEvent<serde_json::Value>,
-) -> std::pin::Pin<
-    Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
-> + Send
-+ Sync
+) -> impl Fn(lambda_runtime::LambdaEvent<serde_json::Value>) -> BoxedInvocationFuture + Send + Sync
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
     E: for<'de> Deserialize<'de> + Send + 'static,

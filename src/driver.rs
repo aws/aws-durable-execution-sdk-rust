@@ -60,7 +60,6 @@ use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus, EngineSta
 
 /// The outcome of driving a single invocation of the user's handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // reason: consumed by the handler wrapper
 pub(crate) enum InvocationOutcome {
     /// The handler completed successfully with a serialized result.
     Complete(String),
@@ -337,13 +336,6 @@ impl SuspensionSignal {
         self.quiescence.any_spawn_parked.load(Ordering::SeqCst)
     }
 
-    /// Number of spawned operations on this scope that have not yet settled.
-    #[cfg(test)]
-    #[allow(dead_code)] // reason: available for test assertions on scope state
-    pub(crate) fn outstanding_spawns(&self) -> usize {
-        self.quiescence.spawns_outstanding.load(Ordering::SeqCst)
-    }
-
     /// Registers (or refreshes) the invocation (root) poll loop's waker.
     /// Called by [`drive_invocation`].
     pub(crate) fn register_driver_waker(&self, waker: &Waker) {
@@ -406,7 +398,6 @@ pub(crate) struct TaskOwnership {
     /// spawned task (e.g. in `block_on` — the production path). A `None`
     /// owner acts as a root-context marker: inline callers (also `None`)
     /// pass, but unblessed spawned tasks are rejected.
-    #[allow(dead_code)] // reason: read by check_current_task
     owner_task_id: Option<tokio::task::Id>,
     /// Task IDs blessed by `.spawn()` — these are exempt from the check.
     /// We use a Mutex<Vec> because spawn registrations are rare relative
@@ -414,7 +405,6 @@ pub(crate) struct TaskOwnership {
     /// entry per `.spawn()` call per invocation and is never larger than
     /// the number of spawns the handler makes, so the linear scan in
     /// `check_current_task` is intentional at that size.
-    #[allow(dead_code)] // reason: read by check_current_task
     blessed_tasks: std::sync::Mutex<Vec<tokio::task::Id>>,
 }
 
@@ -434,21 +424,10 @@ impl TaskOwnership {
         }
     }
 
-    /// Creates ownership tracking with a specific owner task ID (for testing).
-    #[cfg(test)]
-    #[allow(dead_code)] // reason: available for future test scenarios
-    pub(crate) fn with_owner(owner_task_id: tokio::task::Id) -> Self {
-        Self {
-            owner_task_id: Some(owner_task_id),
-            blessed_tasks: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
     /// Registers a task ID as blessed (engine-spawned).
     ///
     /// Blessed tasks pass the ownership check even though they are not the
     /// original owner.
-    #[allow(dead_code)] // reason: called by .spawn()
     pub(crate) fn bless_task(&self, task_id: tokio::task::Id) {
         let mut blessed = self
             .blessed_tasks
@@ -470,7 +449,6 @@ impl TaskOwnership {
     ///
     /// **Task-context mode** (owner is `Some`) — callers must be the same
     /// task or a blessed task; otherwise rejected.
-    #[allow(dead_code)] // reason: called by enforce_task_ownership
     pub(crate) fn check_current_task(&self) -> Result<(), String> {
         match self.owner_task_id {
             None => {
@@ -565,7 +543,6 @@ impl Drop for AbortOnDrop {
 /// also yields `Pending`: the parked operation recorded state that only a
 /// later invocation can resume, so its result must not be discarded by
 /// completing the invocation.
-#[allow(dead_code)] // reason: wired by the handler wrapper
 pub(crate) async fn drive_invocation<F>(
     handler_future: F,
     suspension_signal: Arc<SuspensionSignal>,

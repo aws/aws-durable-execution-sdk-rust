@@ -103,6 +103,18 @@ impl WaitDecision {
 /// takes a generic closure and boxes it here.
 pub(crate) type WaitStrategyFn<S> = Box<dyn Fn(S, u32) -> WaitDecision + Send + Sync>;
 
+/// Boxed, pinned condition-check closure: the user's check function after
+/// [`crate::DurableContext::wait_for_condition`] erases it for storage on
+/// the builder.
+///
+/// Crate-internal: the public API takes a generic closure and boxes it into
+/// this.
+pub(crate) type BoxedCheckFn<S> = Box<
+    dyn Fn(StepContext, S) -> Pin<Box<dyn Future<Output = Result<S, BoxError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Internal state for wait-for-condition execution.
 pub(crate) struct WaitForConditionExecution<S> {
     pub(crate) ctx: DurableContext,
@@ -111,12 +123,7 @@ pub(crate) struct WaitForConditionExecution<S> {
     pub(crate) initial_state: S,
     pub(crate) wait_strategy: Option<WaitStrategyFn<S>>,
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
-    #[allow(clippy::type_complexity)] // reason: boxed Fn closure is inherently complex
-    pub(crate) check: Box<
-        dyn Fn(StepContext, S) -> Pin<Box<dyn Future<Output = Result<S, BoxError>> + Send>>
-            + Send
-            + Sync,
-    >,
+    pub(crate) check: BoxedCheckFn<S>,
 }
 
 impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForConditionExecution<S> {

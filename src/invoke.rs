@@ -18,6 +18,7 @@ use crate::context::DurableContext;
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{InvokeError, InvokeErrorKind, OperationError, OperationErrorKind};
 
+#[cfg(test)]
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -169,7 +170,12 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
 // ── Serialization helpers ───────────────────────────────────────────────
 
 /// Serializes the invoke input payload using the configured serdes.
-#[allow(dead_code)] // reason: used in unit tests, may be needed by future callers
+///
+/// The production path serializes through the pre-erased two-phase flow in
+/// [`InvokeExecution::execute`] (`prepare_value` at builder time, then
+/// `serialize_off_runtime`); this one-shot form is retained as the direct
+/// unit-test harness for the payload-serdes behavior both share.
+#[cfg(test)]
 pub(crate) async fn serialize_invoke_input<I: Serialize>(
     payload_serdes: Option<&Arc<dyn Serdes>>,
     input: &I,
