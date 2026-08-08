@@ -248,6 +248,42 @@ impl<O: Send + 'static> StepBuilder<O> {
         self
     }
 
+    /// Sets the retry strategy for this step from a
+    /// [`RetryStrategyConfig`](crate::RetryStrategyConfig).
+    ///
+    /// Use this for the common case — shaping retry delays (attempt count,
+    /// initial delay, cap, backoff rate, jitter) — without hand-writing a
+    /// closure. For decisions a delay schedule cannot express, such as
+    /// inspecting the error, use [`retry_strategy`](Self::retry_strategy)
+    /// instead.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk_rust::RetryStrategyConfig;
+    /// use std::time::Duration;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<i32, durable::BoxError> {
+    ///     let result = ctx.step(|_| async { Ok(42) })
+    ///         .retry_strategy_config(
+    ///             RetryStrategyConfig::builder()
+    ///                 .max_attempts(3)
+    ///                 .initial_delay(Duration::from_secs(1))
+    ///                 .build(),
+    ///         )
+    ///         .await?;
+    ///     Ok(result)
+    /// }
+    /// ```
+    pub fn retry_strategy_config(mut self, config: crate::RetryStrategyConfig) -> Self {
+        self.retry_strategy = Some(config.into_retry_strategy());
+        self
+    }
+
     /// Sets a custom serializer/deserializer for this step's result.
     pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
         self.serdes = Some(Arc::new(serdes));
@@ -1314,6 +1350,44 @@ impl<O: Send + 'static> WaitForCallbackBuilder<O> {
         F: Fn(&crate::StepError, u32) -> crate::RetryDecision + Send + Sync + 'static,
     {
         self.submitter_retry = Some(Box::new(strategy));
+        self
+    }
+
+    /// Sets the submitter retry strategy from a
+    /// [`RetryStrategyConfig`](crate::RetryStrategyConfig).
+    ///
+    /// Use this for the common case — shaping retry delays (attempt count,
+    /// initial delay, cap, backoff rate, jitter) — without hand-writing a
+    /// closure. For decisions a delay schedule cannot express, such as
+    /// inspecting the error, use [`submitter_retry`](Self::submitter_retry)
+    /// instead.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk_rust::RetryStrategyConfig;
+    /// use std::time::Duration;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, durable::BoxError> {
+    ///     let result = ctx.wait_for_callback::<String, _, _>(
+    ///         |_step_ctx, _cb_id| async { Ok(()) }
+    ///     ).name("with-retry")
+    ///      .submitter_retry_config(
+    ///          RetryStrategyConfig::builder()
+    ///              .max_attempts(2)
+    ///              .initial_delay(Duration::from_secs(1))
+    ///              .build(),
+    ///      )
+    ///      .await?;
+    ///     Ok(result)
+    /// }
+    /// ```
+    pub fn submitter_retry_config(mut self, config: crate::RetryStrategyConfig) -> Self {
+        self.submitter_retry = Some(config.into_retry_strategy());
         self
     }
 

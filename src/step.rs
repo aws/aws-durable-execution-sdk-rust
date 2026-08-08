@@ -22,40 +22,86 @@ use crate::context::{DurableContext, StepContext};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
 use crate::tracing_layer;
-use crate::{BoxError, RetryDecision, RetryStrategy, Serdes, SerdesContext};
+use crate::{
+    BoxError, JitterStrategy, RetryDecision, RetryStrategy, RetryStrategyConfig, Serdes,
+    SerdesContext,
+};
 
 /// The default retry strategy: 6 total attempts, 5s initial delay, 60s max
 /// delay, 2x backoff rate, FULL jitter.
 ///
-/// Matches the standard `ExponentialBackoff` defaults.
+/// Matches the standard `ExponentialBackoff` defaults. The constants live in
+/// [`RetryStrategyConfig::default`]; this is one call so they are defined in
+/// exactly one place.
 pub(crate) fn default_retry_strategy() -> RetryStrategy {
-    Box::new(|_err: &StepError, attempt: u32| {
-        const MAX_ATTEMPTS: u32 = 6;
-        const INITIAL_DELAY_SECS: f64 = 5.0;
-        const MAX_DELAY_SECS: f64 = 60.0;
-        const BACKOFF_RATE: f64 = 2.0;
+    RetryStrategyConfig::default().into_retry_strategy()
+}
 
-        if attempt >= MAX_ATTEMPTS {
+impl RetryStrategyConfig {
+    /// Computes the retry decision for a 1-based failed attempt number.
+    ///
+    /// Exponential backoff: `initial_delay * backoff_rate^(attempt - 1)`,
+    /// capped at `max_delay`, jittered per the configured
+    /// [`JitterStrategy`], and quantized to whole seconds with a
+    /// one-second minimum (see [`quantize_delay_secs`] for the
+    /// per-strategy rounding). Stops once `attempt` reaches
+    /// `max_attempts`.
+    pub(crate) fn decide(&self, attempt: u32) -> RetryDecision {
+        if attempt >= self.max_attempts() {
             return RetryDecision::Stop;
         }
 
         // Exponential backoff: initial * rate^(attempt-1), capped at max.
         // attempt is 1-based: first failure is attempt=1.
-        #[allow(clippy::cast_possible_truncation)] // reason: attempt is small (≤6)
         let exponent = (i32::try_from(attempt).unwrap_or(1)) - 1;
-        let base = (INITIAL_DELAY_SECS * BACKOFF_RATE.powi(exponent)).min(MAX_DELAY_SECS);
+        let base = (self.initial_delay().as_secs_f64() * self.backoff_rate().powi(exponent))
+            .min(self.max_delay().as_secs_f64());
 
-        // FULL jitter: random in [0, base] (the default jitter strategy).
-        let jittered = rand_full_jitter(base);
+        let jittered = match self.jitter() {
+            JitterStrategy::None => base,
+            // Half jitter: base/2 plus random in [0, base/2] => [base/2, base].
+            JitterStrategy::Half => base / 2.0 + rand_full_jitter(base / 2.0),
+            // Full jitter: random in [0, base].
+            JitterStrategy::Full => rand_full_jitter(base),
+        };
 
-        // Round to whole seconds, minimum 1.
-        #[allow(clippy::cast_possible_truncation)] // reason: result is ≤ 60
-        #[allow(clippy::cast_sign_loss)] // reason: jittered ≥ 0
-        let delay_secs = jittered.round().max(1.0) as u64;
         RetryDecision::Retry {
-            delay: Duration::from_secs(delay_secs),
+            delay: Duration::from_secs(quantize_delay_secs(jittered, self.jitter())),
         }
-    })
+    }
+
+    /// Converts this configuration into the boxed retry-strategy closure
+    /// the step engine consumes. The decision ignores the error value:
+    /// delay shaping depends only on the attempt number.
+    pub(crate) fn into_retry_strategy(self) -> RetryStrategy {
+        Box::new(move |_err: &StepError, attempt: u32| self.decide(attempt))
+    }
+}
+
+/// Quantizes a fractional delay in seconds to whole seconds, minimum 1.
+///
+/// The rounding rule depends on the jitter strategy:
+///
+/// - [`JitterStrategy::Full`] rounds to the **nearest** whole second. This
+///   is the SDK's legacy quantization, preserved so
+///   [`RetryStrategyConfig::default`] reproduces the historical
+///   full-jitter delay distribution exactly.
+/// - [`JitterStrategy::None`] rounds **up**: a deterministic configured
+///   delay must never fire earlier than requested, matching the wait and
+///   retry-checkpoint behavior.
+/// - [`JitterStrategy::Half`] rounds **up**: the documented
+///   `[base / 2, base]` lower bound survives quantization only under a
+///   ceiling (nearest-rounding could dip up to half a second below it).
+fn quantize_delay_secs(jittered: f64, jitter: JitterStrategy) -> u64 {
+    let quantized = match jitter {
+        JitterStrategy::Full => jittered.round(),
+        JitterStrategy::None | JitterStrategy::Half => jittered.ceil(),
+    };
+    #[allow(clippy::cast_possible_truncation)] // reason: delays are far below u64::MAX seconds
+    #[allow(clippy::cast_sign_loss)] // reason: quantized ≥ 0
+    {
+        quantized.max(1.0) as u64
+    }
 }
 
 /// Full jitter: returns a value in `[0, max_secs]`.
@@ -1413,5 +1459,182 @@ mod tests {
             executed.load(Ordering::SeqCst),
             "closure SHOULD execute under AtLeastOncePerRetry with Started replay"
         );
+    }
+
+    // ── RetryStrategyConfig delay shaping ───────────────────────────────
+
+    use crate::{JitterStrategy, RetryStrategyConfig};
+
+    fn sample_error() -> StepError {
+        StepError::from_kind(StepErrorKind::ExecutionFailed {
+            message: "boom".to_owned(),
+        })
+    }
+
+    /// Extracts the retry delay in whole seconds, panicking on `Stop`.
+    fn retry_secs(decision: &RetryDecision) -> u64 {
+        match decision {
+            RetryDecision::Retry { delay } => delay.as_secs(),
+            RetryDecision::Stop => panic!("expected Retry, got Stop"),
+        }
+    }
+
+    /// The default config with jitter disabled reproduces the documented
+    /// constants attempt by attempt: 5s initial delay doubling to a 60s
+    /// cap, stopping at the 6th attempt. This pins the deterministic
+    /// backbone that `default_retry_strategy` jitters over.
+    #[test]
+    fn default_config_without_jitter_matches_documented_constants() {
+        let config = RetryStrategyConfig::builder()
+            .jitter(JitterStrategy::None)
+            .build();
+
+        // initial 5s, rate 2.0: 5, 10, 20, 40, then capped at 60.
+        let expected = [5u64, 10, 20, 40, 60];
+        for (attempt, expected_secs) in (1u32..).zip(expected) {
+            assert_eq!(
+                retry_secs(&config.decide(attempt)),
+                expected_secs,
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(config.decide(6), RetryDecision::Stop);
+        assert_eq!(config.decide(7), RetryDecision::Stop);
+    }
+
+    /// `default_retry_strategy` agrees with `RetryStrategyConfig::default`
+    /// attempt by attempt, modulo jitter: it stops at exactly the same
+    /// attempts, and each retry delay falls within the full-jitter envelope
+    /// `[1, base]` where `base` is the no-jitter delay for that attempt.
+    #[test]
+    fn default_retry_strategy_matches_default_config_modulo_jitter() {
+        let strategy = default_retry_strategy();
+        let no_jitter = RetryStrategyConfig::builder()
+            .jitter(JitterStrategy::None)
+            .build();
+        let err = sample_error();
+
+        for attempt in 1u32..=5 {
+            // Sample repeatedly: full jitter randomizes within [1, base].
+            let base = retry_secs(&no_jitter.decide(attempt));
+            for _ in 0..50 {
+                let secs = retry_secs(&strategy(&err, attempt));
+                assert!(
+                    (1..=base).contains(&secs),
+                    "attempt {attempt}: delay {secs}s outside full-jitter envelope [1, {base}]"
+                );
+            }
+        }
+        // Both stop at the same attempt boundary (6 total attempts).
+        assert_eq!(strategy(&err, 6), RetryDecision::Stop);
+        assert_eq!(no_jitter.decide(6), RetryDecision::Stop);
+        assert_eq!(strategy(&err, 7), RetryDecision::Stop);
+    }
+
+    /// Half jitter keeps every sampled delay within `[base / 2, base]`.
+    #[test]
+    fn half_jitter_delays_stay_within_bounds() {
+        let config = RetryStrategyConfig::builder()
+            .initial_delay(Duration::from_secs(8))
+            .max_delay(Duration::from_secs(64))
+            .backoff_rate(2.0)
+            .jitter(JitterStrategy::Half)
+            .build();
+
+        for attempt in 1u32..=3 {
+            // base: 8, 16, 32 — half-jitter bounds [4, 8], [8, 16], [16, 32].
+            let base = 8u64 << (attempt - 1);
+            for _ in 0..100 {
+                let secs = retry_secs(&config.decide(attempt));
+                assert!(
+                    (base / 2..=base).contains(&secs),
+                    "attempt {attempt}: delay {secs}s outside half-jitter bounds \
+                     [{}, {base}]",
+                    base / 2
+                );
+            }
+        }
+    }
+
+    /// The computed delay is capped at `max_delay` and never drops below
+    /// one second, whatever the configuration.
+    #[test]
+    fn delays_are_capped_and_have_one_second_floor() {
+        // Sub-second initial delay rounds up to the 1s floor.
+        let tiny = RetryStrategyConfig::builder()
+            .initial_delay(Duration::from_millis(1))
+            .jitter(JitterStrategy::None)
+            .build();
+        assert_eq!(retry_secs(&tiny.decide(1)), 1);
+
+        // A huge backoff rate hits the cap immediately.
+        let capped = RetryStrategyConfig::builder()
+            .initial_delay(Duration::from_secs(30))
+            .max_delay(Duration::from_secs(45))
+            .backoff_rate(100.0)
+            .jitter(JitterStrategy::None)
+            .build();
+        assert_eq!(retry_secs(&capped.decide(1)), 30);
+        assert_eq!(retry_secs(&capped.decide(2)), 45);
+    }
+
+    /// `max_attempts(1)` never retries: the first failure already reaches
+    /// the attempt budget.
+    #[test]
+    fn max_attempts_one_never_retries() {
+        let config = RetryStrategyConfig::builder().max_attempts(1).build();
+        assert_eq!(config.decide(1), RetryDecision::Stop);
+    }
+
+    /// Non-jittered fractional delays round UP, never down: a 1.1s
+    /// configured delay must schedule 2s, not 1s. Nearest-rounding would
+    /// truncate 1.1s to 1s and retry EARLIER than configured, conflicting
+    /// with the wait and retry-checkpoint behavior, which both ceil
+    /// fractional delays.
+    #[test]
+    fn fractional_delays_round_up_not_to_nearest() {
+        let config = RetryStrategyConfig::builder()
+            .initial_delay(Duration::from_millis(1100))
+            .jitter(JitterStrategy::None)
+            .build();
+        // 1.1s must become 2s (ceil), not 1s (round-to-nearest).
+        assert_eq!(retry_secs(&config.decide(1)), 2);
+
+        // Backoff-computed fractions ceil too: 1.1 * 2 = 2.2s → 3s.
+        assert_eq!(retry_secs(&config.decide(2)), 3);
+
+        // Whole-second delays are unchanged by the ceiling: the default
+        // 5s/10s/... schedule is preserved.
+        let whole = RetryStrategyConfig::builder()
+            .jitter(JitterStrategy::None)
+            .build();
+        assert_eq!(retry_secs(&whole.decide(1)), 5);
+        assert_eq!(retry_secs(&whole.decide(2)), 10);
+    }
+
+    /// Regression for the default full-jitter quantization: full jitter
+    /// keeps the SDK's legacy nearest-integer rounding
+    /// (`round().max(1.0)`), because issue #12 requires
+    /// `RetryStrategyConfig::default()` to reproduce the pre-config
+    /// behavior exactly — including how fractional jitter samples map to
+    /// whole seconds. A ceiling here would shift the delay distribution
+    /// for nearly every fractional sample.
+    #[test]
+    fn default_full_jitter_keeps_legacy_nearest_rounding() {
+        // Full jitter: nearest rounding, exactly as before issue #12.
+        assert_eq!(quantize_delay_secs(4.4, JitterStrategy::Full), 4);
+        assert_eq!(quantize_delay_secs(4.5, JitterStrategy::Full), 5);
+        assert_eq!(quantize_delay_secs(59.9, JitterStrategy::Full), 60);
+        // Samples near zero still respect the one-second floor.
+        assert_eq!(quantize_delay_secs(0.2, JitterStrategy::Full), 1);
+
+        // Non-jittered fractional delays ceil: a configured delay never
+        // fires earlier than requested.
+        assert_eq!(quantize_delay_secs(4.4, JitterStrategy::None), 5);
+        assert_eq!(quantize_delay_secs(4.0, JitterStrategy::None), 4);
+
+        // Half jitter ceils so the documented [base / 2, base] lower
+        // bound survives quantization.
+        assert_eq!(quantize_delay_secs(4.4, JitterStrategy::Half), 5);
     }
 }

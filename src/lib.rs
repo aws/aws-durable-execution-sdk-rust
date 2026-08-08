@@ -170,6 +170,247 @@ pub enum RetryDecision {
 /// take a generic closure and box it here.
 pub(crate) type RetryStrategy = Box<dyn Fn(&StepError, u32) -> RetryDecision + Send + Sync>;
 
+/// Jitter applied to a computed retry delay by [`RetryStrategyConfig`].
+///
+/// Jitter randomizes retry delays so simultaneous failures do not retry in
+/// lockstep. Given a computed backoff delay `base`:
+///
+/// - [`JitterStrategy::None`] uses `base` unchanged (deterministic delays).
+/// - [`JitterStrategy::Half`] picks a random delay in `[base / 2, base]`.
+/// - [`JitterStrategy::Full`] picks a random delay in `[0, base]`.
+///
+/// The default is [`JitterStrategy::Full`], matching the SDK's default
+/// retry behavior.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::JitterStrategy;
+///
+/// assert_eq!(JitterStrategy::default(), JitterStrategy::Full);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum JitterStrategy {
+    /// No jitter: use the computed backoff delay unchanged.
+    None,
+    /// Half jitter: random delay in `[base / 2, base]`.
+    Half,
+    /// Full jitter: random delay in `[0, base]`. This is the default.
+    #[default]
+    Full,
+}
+
+/// Builder-based configuration for retry delay shaping.
+///
+/// The common retry customization is shaping delays — how many attempts,
+/// how the delay grows, where it caps, and how it is jittered — without
+/// hand-writing a closure over `(error, attempt)`. `RetryStrategyConfig`
+/// captures exactly those knobs. Pass it to
+/// [`StepBuilder::retry_strategy_config`] or
+/// [`WaitForCallbackBuilder::submitter_retry_config`]; the closure setters
+/// ([`StepBuilder::retry_strategy`],
+/// [`WaitForCallbackBuilder::submitter_retry`]) remain the escape hatch for
+/// decisions a delay schedule cannot express, such as inspecting the error.
+///
+/// The configured schedule stops once the failing attempt number reaches
+/// `max_attempts`, so `max_attempts` is the total number of executions
+/// (initial attempt plus retries). Before that, the delay before attempt
+/// `n + 1` is `initial_delay * backoff_rate^(n - 1)` capped at `max_delay`,
+/// then jittered per [`JitterStrategy`] and quantized to whole seconds
+/// with a one-second minimum. Full jitter rounds to the nearest whole
+/// second (the SDK's legacy behavior, preserved so [`Default`] reproduces
+/// it exactly); no jitter and half jitter round up, so a deterministic
+/// configured delay never fires earlier than requested and half jitter's
+/// lower bound survives quantization.
+///
+/// [`Default`] reproduces the SDK's built-in retry behavior exactly:
+/// 6 total attempts, 5 second initial delay, 60 second maximum delay,
+/// 2.0 backoff rate, full jitter.
+///
+/// Construct with [`RetryStrategyConfig::builder`] — unset values keep
+/// their [`Default`] value. Fields are private per C-STRUCT-PRIVATE; read
+/// values back through the accessors.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::{JitterStrategy, RetryStrategyConfig};
+/// use std::time::Duration;
+///
+/// let config = RetryStrategyConfig::builder()
+///     .max_attempts(3)
+///     .initial_delay(Duration::from_secs(2))
+///     .jitter(JitterStrategy::None)
+///     .build();
+/// assert_eq!(config.max_attempts(), 3);
+/// assert_eq!(config.initial_delay(), Duration::from_secs(2));
+/// // Unset values keep the default.
+/// assert_eq!(config.max_delay(), RetryStrategyConfig::default().max_delay());
+/// ```
+#[derive(Debug, Clone)]
+pub struct RetryStrategyConfig {
+    /// Total number of attempts (initial attempt plus retries) before the
+    /// error propagates.
+    max_attempts: u32,
+    /// Delay before the first retry, prior to jitter.
+    initial_delay: std::time::Duration,
+    /// Upper bound on the computed backoff delay, prior to jitter.
+    max_delay: std::time::Duration,
+    /// Multiplier applied to the delay after each failed attempt.
+    backoff_rate: f64,
+    /// Jitter applied to each computed delay.
+    jitter: JitterStrategy,
+}
+
+impl Default for RetryStrategyConfig {
+    /// Returns the SDK default retry configuration: 6 total attempts,
+    /// 5 second initial delay, 60 second maximum delay, 2.0 backoff rate,
+    /// full jitter.
+    fn default() -> Self {
+        Self {
+            max_attempts: 6,
+            initial_delay: std::time::Duration::from_secs(5),
+            max_delay: std::time::Duration::from_mins(1),
+            backoff_rate: 2.0,
+            jitter: JitterStrategy::Full,
+        }
+    }
+}
+
+impl RetryStrategyConfig {
+    /// Creates a new [`RetryStrategyConfigBuilder`] seeded with the default
+    /// values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::RetryStrategyConfig;
+    ///
+    /// let config = RetryStrategyConfig::builder()
+    ///     .backoff_rate(1.5)
+    ///     .build();
+    /// assert!((config.backoff_rate() - 1.5).abs() < f64::EPSILON);
+    /// ```
+    pub fn builder() -> RetryStrategyConfigBuilder {
+        RetryStrategyConfigBuilder::default()
+    }
+
+    /// Returns the total number of attempts (initial attempt plus retries).
+    #[must_use]
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Returns the delay before the first retry, prior to jitter.
+    #[must_use]
+    pub fn initial_delay(&self) -> std::time::Duration {
+        self.initial_delay
+    }
+
+    /// Returns the upper bound on the computed backoff delay, prior to
+    /// jitter.
+    #[must_use]
+    pub fn max_delay(&self) -> std::time::Duration {
+        self.max_delay
+    }
+
+    /// Returns the multiplier applied to the delay after each failed
+    /// attempt.
+    #[must_use]
+    pub fn backoff_rate(&self) -> f64 {
+        self.backoff_rate
+    }
+
+    /// Returns the jitter applied to each computed delay.
+    #[must_use]
+    pub fn jitter(&self) -> JitterStrategy {
+        self.jitter
+    }
+}
+
+/// Builder for [`RetryStrategyConfig`].
+///
+/// Follows the Rust API Guidelines C-BUILDER pattern. All methods consume
+/// and return `self` for chaining. Values left unset keep the
+/// [`RetryStrategyConfig::default`] value.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::{JitterStrategy, RetryStrategyConfig};
+/// use std::time::Duration;
+///
+/// let config = RetryStrategyConfig::builder()
+///     .max_attempts(4)
+///     .initial_delay(Duration::from_millis(500))
+///     .max_delay(Duration::from_secs(10))
+///     .backoff_rate(3.0)
+///     .jitter(JitterStrategy::Half)
+///     .build();
+/// assert_eq!(config.max_delay(), Duration::from_secs(10));
+/// assert_eq!(config.jitter(), JitterStrategy::Half);
+/// ```
+#[derive(Debug, Clone, Default)]
+#[must_use = "builders do nothing unless .build() is called"]
+#[non_exhaustive]
+pub struct RetryStrategyConfigBuilder {
+    max_attempts: Option<u32>,
+    initial_delay: Option<std::time::Duration>,
+    max_delay: Option<std::time::Duration>,
+    backoff_rate: Option<f64>,
+    jitter: Option<JitterStrategy>,
+}
+
+impl RetryStrategyConfigBuilder {
+    /// Sets the total number of attempts (initial attempt plus retries).
+    ///
+    /// The strategy stops retrying once the failing attempt number reaches
+    /// this value, so `max_attempts(1)` never retries.
+    pub fn max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = Some(max_attempts);
+        self
+    }
+
+    /// Sets the delay before the first retry, prior to jitter.
+    pub fn initial_delay(mut self, delay: std::time::Duration) -> Self {
+        self.initial_delay = Some(delay);
+        self
+    }
+
+    /// Sets the upper bound on the computed backoff delay, prior to jitter.
+    pub fn max_delay(mut self, delay: std::time::Duration) -> Self {
+        self.max_delay = Some(delay);
+        self
+    }
+
+    /// Sets the multiplier applied to the delay after each failed attempt.
+    pub fn backoff_rate(mut self, rate: f64) -> Self {
+        self.backoff_rate = Some(rate);
+        self
+    }
+
+    /// Sets the jitter applied to each computed delay.
+    pub fn jitter(mut self, jitter: JitterStrategy) -> Self {
+        self.jitter = Some(jitter);
+        self
+    }
+
+    /// Builds the [`RetryStrategyConfig`], filling unset values from
+    /// [`RetryStrategyConfig::default`].
+    #[must_use]
+    pub fn build(self) -> RetryStrategyConfig {
+        let defaults = RetryStrategyConfig::default();
+        RetryStrategyConfig {
+            max_attempts: self.max_attempts.unwrap_or(defaults.max_attempts),
+            initial_delay: self.initial_delay.unwrap_or(defaults.initial_delay),
+            max_delay: self.max_delay.unwrap_or(defaults.max_delay),
+            backoff_rate: self.backoff_rate.unwrap_or(defaults.backoff_rate),
+            jitter: self.jitter.unwrap_or(defaults.jitter),
+        }
+    }
+}
+
 /// Configuration for completion behavior in map and parallel operations.
 ///
 /// Controls early-completion thresholds: how many items must succeed and
@@ -1240,6 +1481,49 @@ mod tests {
     use std::future::IntoFuture;
 
     use super::*;
+
+    /// The `RetryStrategyConfig` builder round-trips every knob through the
+    /// accessors, and unset knobs keep their `Default` value.
+    #[test]
+    fn retry_strategy_config_builder_round_trips() {
+        let config = RetryStrategyConfig::builder()
+            .max_attempts(4)
+            .initial_delay(std::time::Duration::from_millis(500))
+            .max_delay(std::time::Duration::from_secs(10))
+            .backoff_rate(3.0)
+            .jitter(JitterStrategy::Half)
+            .build();
+
+        assert_eq!(config.max_attempts(), 4);
+        assert_eq!(
+            config.initial_delay(),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(config.max_delay(), std::time::Duration::from_secs(10));
+        assert!((config.backoff_rate() - 3.0).abs() < f64::EPSILON);
+        assert_eq!(config.jitter(), JitterStrategy::Half);
+
+        // Unset values fall back to the defaults.
+        let partial = RetryStrategyConfig::builder().max_attempts(2).build();
+        let defaults = RetryStrategyConfig::default();
+        assert_eq!(partial.max_attempts(), 2);
+        assert_eq!(partial.initial_delay(), defaults.initial_delay());
+        assert_eq!(partial.max_delay(), defaults.max_delay());
+        assert!((partial.backoff_rate() - defaults.backoff_rate()).abs() < f64::EPSILON);
+        assert_eq!(partial.jitter(), defaults.jitter());
+    }
+
+    /// `RetryStrategyConfig::default` carries the documented SDK constants:
+    /// 6 attempts, 5s initial delay, 60s max delay, 2.0 rate, full jitter.
+    #[test]
+    fn retry_strategy_config_default_matches_documented_constants() {
+        let config = RetryStrategyConfig::default();
+        assert_eq!(config.max_attempts(), 6);
+        assert_eq!(config.initial_delay(), std::time::Duration::from_secs(5));
+        assert_eq!(config.max_delay(), std::time::Duration::from_mins(1));
+        assert!((config.backoff_rate() - 2.0).abs() < f64::EPSILON);
+        assert_eq!(config.jitter(), JitterStrategy::Full);
+    }
 
     /// The `CompletionConfig` builder combines thresholds in one expression —
     /// no `Default`-then-mutate — and the built config drives the same

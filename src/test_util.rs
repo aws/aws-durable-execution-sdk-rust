@@ -1914,6 +1914,99 @@ mod tests {
         assert!(result.operations().iter().any(TestOperation::failed));
     }
 
+    // 1. step retry via RetryStrategyConfig ───────────────────────────────
+
+    #[tokio::test]
+    async fn step_retry_config_drives_retries_to_success() {
+        // A config-based strategy (no hand-written closure): 3 total
+        // attempts, 1s deterministic delays. The step fails on attempts 1
+        // and 2 and succeeds on attempt 3, exercising the config through
+        // real suspend/replay cycles.
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_seen = Arc::clone(&attempts);
+
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let attempts_seen = Arc::clone(&attempts_seen);
+                    async move {
+                        let attempts_seen = Arc::clone(&attempts_seen);
+                        let config = crate::RetryStrategyConfig::builder()
+                            .max_attempts(3)
+                            .initial_delay(std::time::Duration::from_secs(1))
+                            .max_delay(std::time::Duration::from_secs(1))
+                            .jitter(crate::JitterStrategy::None)
+                            .build();
+                        let v: i32 = ctx
+                            .step(move |sc| {
+                                let attempts_seen = Arc::clone(&attempts_seen);
+                                async move {
+                                    attempts_seen.fetch_add(1, Ordering::SeqCst);
+                                    if sc.attempt() < 3 {
+                                        Err(format!("attempt {} failed", sc.attempt()).into())
+                                    } else {
+                                        Ok(7)
+                                    }
+                                }
+                            })
+                            .name("flaky-config")
+                            .retry_strategy_config(config)
+                            .await?;
+                        Ok::<_, BoxError>(v)
+                    }
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&7));
+        // Body executed exactly 3 times (attempts 1, 2, 3).
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(result.invocation_count() >= 3);
+    }
+
+    #[tokio::test]
+    async fn step_retry_config_max_attempts_exhausts_and_fails() {
+        // max_attempts(2): the body runs exactly twice, then the error
+        // propagates instead of retrying a third time.
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_seen = Arc::clone(&attempts);
+
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let attempts_seen = Arc::clone(&attempts_seen);
+                    async move {
+                        let attempts_seen = Arc::clone(&attempts_seen);
+                        let config = crate::RetryStrategyConfig::builder()
+                            .max_attempts(2)
+                            .initial_delay(std::time::Duration::from_secs(1))
+                            .jitter(crate::JitterStrategy::None)
+                            .build();
+                        let v: i32 = ctx
+                            .step(move |_| {
+                                let attempts_seen = Arc::clone(&attempts_seen);
+                                async move {
+                                    attempts_seen.fetch_add(1, Ordering::SeqCst);
+                                    Err("always fails".into())
+                                }
+                            })
+                            .name("always-fails")
+                            .retry_strategy_config(config)
+                            .await?;
+                        Ok::<_, BoxError>(v)
+                    }
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_failure());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(result.operations().iter().any(TestOperation::failed));
+    }
+
     // 1. step retry (retry strategy honored) ──────────────────────────────
 
     #[tokio::test]
