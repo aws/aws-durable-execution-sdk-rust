@@ -130,34 +130,38 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
         let wire_id = self.op_id.wire().to_owned();
         let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
 
-        // 2. Check checkpoint log for replay / resume status.
+        // 2. Check checkpoint log for replay / resume status. The validated
+        // view covers the non-terminal branches without cloning.
         let mut already_started = false;
-        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection: verify the record's identity matches.
-            self.ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "Step",
-                Some(WFC_SUB_TYPE),
-                self.name.as_deref(),
-            )?;
-            match &record.status {
+        if let Some(view) = self.ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "Step",
+            Some(WFC_SUB_TYPE),
+            self.name.as_deref(),
+        )? {
+            match view.status {
                 CheckpointStatus::Succeeded => {
                     // Terminal success: deserialize the final state.
                     // CRITICAL: LOUD error on deserialization failure.
                     // Never fall back to initial_state (Python #574 / JS #754).
+                    let payload = self.ctx.checkpoint_result_payload(&positional_id);
                     return replay_terminal_success(
                         self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-                        record.result.as_ref(),
+                        payload.as_ref(),
                         &serdes_ctx,
                     )
                     .await;
                 }
                 CheckpointStatus::Failed => {
                     // Terminal failure: reconstruct error from checkpoint.
+                    let (error_type, error_message) = self
+                        .ctx
+                        .checkpoint_error_parts(&positional_id)
+                        .unwrap_or_default();
                     return Err(replay_terminal_failure(
-                        record.error_type.as_deref(),
-                        record.error_message.as_deref(),
+                        error_type.as_deref(),
+                        error_message.as_deref(),
                     ));
                 }
                 CheckpointStatus::Pending => {
@@ -189,22 +193,19 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
         // carried state with initial_state and prevent the condition from
         // ever advancing. The carried state is a property of the prior
         // attempt's checkpoint, independent of this attempt's START.
-        let current_state = if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            if record.result.is_some() {
+        let current_state =
+            if let Some(payload) = self.ctx.checkpoint_result_payload(&positional_id) {
                 // On deserialization failure, surface the error loudly and
                 // never silently fall back to initial_state.
                 deserialize_state(
                     self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-                    record.result.as_ref(),
+                    Some(&payload),
                     &serdes_ctx,
                 )
                 .await?
             } else {
                 self.initial_state.clone()
-            }
-        } else {
-            self.initial_state.clone()
-        };
+            };
 
         // Checkpoint START if not already started.
         if !already_started {

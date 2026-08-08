@@ -20,7 +20,10 @@ use crate::builders::{
 };
 use crate::client::{CheckpointOutput, ClientError, ExecutionClient};
 use crate::driver::{SuspensionSignal, TaskOwnership};
-use crate::engine::{CheckpointLog, CheckpointRecord, EngineState, OperationId};
+use crate::engine::{
+    CheckpointLog, CheckpointRecord, CheckpointStatusView, EngineState, OperationId,
+    TerminalReplaySnapshot,
+};
 use crate::error::{
     ChildFnError, NonDeterministicExecutionError, NonDeterministicExecutionErrorKind,
     OperationError, OperationErrorKind, StepError, StepErrorKind,
@@ -480,16 +483,135 @@ impl DurableContext {
         self.inner.engine.is_replaying_at(positional_id)
     }
 
-    /// Returns the checkpoint record for the given positional ID, if any.
+    /// Reads the checkpoint record for the given positional ID in place,
+    /// applying `f` under the log's read guard.
+    ///
+    /// Returns `None` when no record exists. This (and the targeted
+    /// accessors below) replaces the removed full-record clone: `f` borrows
+    /// the stored record, so only what `f` returns is cloned. `f` must not
+    /// touch the checkpoint log (the read guard is held while it runs).
     ///
     /// NOTE: The checkpoint log is keyed by wire ID (the hash), which is
     /// what the backend returns in Operations[].Id. We look up by wire ID
     /// computed from the positional ID.
-    pub(crate) fn checkpoint_record(&self, positional_id: &str) -> Option<CheckpointRecord> {
-        // The log is keyed by wire ID (hash of the positional string),
-        // because parse_inline_operations uses the Id field from the backend.
+    pub(crate) fn with_checkpoint_record<R>(
+        &self,
+        positional_id: &str,
+        f: impl FnOnce(&CheckpointRecord) -> R,
+    ) -> Option<R> {
         let wire_id = crate::engine::compute_wire_id_public(positional_id);
-        self.inner.engine.checkpoint_log.get(&wire_id)
+        self.inner.engine.checkpoint_log.with_record(&wire_id, f)
+    }
+
+    /// Returns the compact copy-type view (status, attempt,
+    /// `replay_children`) of the checkpoint record for the given positional
+    /// ID, without cloning any of the record's owned strings.
+    pub(crate) fn checkpoint_status_view(
+        &self,
+        positional_id: &str,
+    ) -> Option<CheckpointStatusView> {
+        let wire_id = crate::engine::compute_wire_id_public(positional_id);
+        self.inner.engine.checkpoint_log.status_view(&wire_id)
+    }
+
+    /// Returns whether a checkpoint record exists for the given positional
+    /// ID, without cloning anything.
+    pub(crate) fn has_checkpoint_record(&self, positional_id: &str) -> bool {
+        let wire_id = crate::engine::compute_wire_id_public(positional_id);
+        self.inner.engine.checkpoint_log.contains(&wire_id)
+    }
+
+    /// Returns the recorded result payload for the given positional ID,
+    /// cloning only that one string.
+    ///
+    /// `None` means either no record exists or the record carries no
+    /// result — callers that need to distinguish should use
+    /// [`Self::with_checkpoint_record`].
+    pub(crate) fn checkpoint_result_payload(&self, positional_id: &str) -> Option<String> {
+        self.with_checkpoint_record(positional_id, |record| record.result.clone())
+            .flatten()
+    }
+
+    /// Returns the backend-assigned callback ID for the given positional
+    /// ID, cloning only that one string.
+    pub(crate) fn checkpoint_callback_id(&self, positional_id: &str) -> Option<String> {
+        self.with_checkpoint_record(positional_id, |record| record.callback_id.clone())
+            .flatten()
+    }
+
+    /// Returns the recorded error type/message pair for the given
+    /// positional ID, cloning only those strings. `None` means no record
+    /// exists.
+    pub(crate) fn checkpoint_error_parts(
+        &self,
+        positional_id: &str,
+    ) -> Option<(Option<String>, Option<String>)> {
+        self.with_checkpoint_record(positional_id, |record| {
+            (record.error_type.clone(), record.error_message.clone())
+        })
+    }
+
+    /// Returns the terminal-replay projection (status, `replay_children`,
+    /// and the result/error strings) of the checkpoint record for the
+    /// given positional ID, cloning only those payload strings.
+    ///
+    /// This is what the map/parallel replay helpers consume when
+    /// reconstructing a terminal batch or child item; the record's invoke,
+    /// callback, attempt, ID, and identity fields are never cloned. `None`
+    /// means no record exists.
+    pub(crate) fn checkpoint_terminal_replay(
+        &self,
+        positional_id: &str,
+    ) -> Option<TerminalReplaySnapshot> {
+        self.with_checkpoint_record(positional_id, |record| TerminalReplaySnapshot {
+            status: record.status,
+            replay_children: record.replay_children,
+            result: record.result.clone(),
+            error_message: record.error_message.clone(),
+            error_type: record.error_type.clone(),
+        })
+    }
+
+    /// Validates the claimed operation identity against the checkpoint
+    /// record and returns the compact status view, in a single read-guard
+    /// pass — the common preamble of every operation's replay check.
+    ///
+    /// Returns `Ok(None)` when no record exists (live position, nothing to
+    /// validate), `Ok(Some(view))` when the identity matches, and the
+    /// `NonDeterministicExecution` error (also recorded on the fatal slot,
+    /// exactly as [`Self::validate_replay_identity`] does) on mismatch.
+    /// Nothing is cloned on the match path.
+    pub(crate) fn checkpoint_view_validated(
+        &self,
+        positional_id: &str,
+        wire_id: &str,
+        claimed_type: &str,
+        claimed_sub_type: Option<&str>,
+        claimed_name: Option<&str>,
+    ) -> Result<Option<CheckpointStatusView>, OperationError> {
+        let Some((mismatch, view)) = self.with_checkpoint_record(positional_id, |record| {
+            (
+                replay_identity_mismatch(record, claimed_type, claimed_sub_type, claimed_name),
+                CheckpointStatusView {
+                    status: record.status,
+                    attempt: record.attempt,
+                    replay_children: record.replay_children,
+                },
+            )
+        }) else {
+            return Ok(None);
+        };
+        if let Some(expected) = mismatch {
+            // Built (and the fatal slot written) OUTSIDE the read guard.
+            return Err(self.replay_mismatch_error(
+                wire_id,
+                &expected,
+                claimed_type,
+                claimed_sub_type,
+                claimed_name,
+            ));
+        }
+        Ok(Some(view))
     }
 
     /// Eagerly validates a claimed operation's replay identity against the
@@ -516,15 +638,13 @@ impl DurableContext {
         claimed_sub_type: Option<&str>,
         claimed_name: Option<&str>,
     ) -> Result<(), OperationError> {
-        if let Some(record) = self.checkpoint_record(op_id.positional()) {
-            self.validate_replay_identity(
-                &record,
-                op_id.wire(),
-                claimed_type,
-                claimed_sub_type,
-                claimed_name,
-            )?;
-        }
+        self.checkpoint_view_validated(
+            op_id.positional(),
+            op_id.wire(),
+            claimed_type,
+            claimed_sub_type,
+            claimed_name,
+        )?;
         Ok(())
     }
 
@@ -540,6 +660,12 @@ impl DurableContext {
     /// `RunInChildContext`) or `None` for operations without a sub-type.
     ///
     /// `claimed_name` is the user-supplied `.name("...")` or `None`.
+    ///
+    /// Production paths validate through [`Self::checkpoint_view_validated`]
+    /// (one read-guard pass, no record clone); this record-taking form is
+    /// retained as the direct unit-test harness for the identity-matching
+    /// rules both share.
+    #[allow(dead_code)] // reason: exercised by unit tests; production uses checkpoint_view_validated
     pub(crate) fn validate_replay_identity(
         &self,
         record: &CheckpointRecord,
@@ -548,85 +674,49 @@ impl DurableContext {
         claimed_sub_type: Option<&str>,
         claimed_name: Option<&str>,
     ) -> Result<(), OperationError> {
-        // A record without a stored operation type predates identity
-        // recording (legacy checkpoint) — there is genuinely nothing to
-        // validate against, so skip. This is the ONLY lenient path; once a
-        // record carries identity, every field is compared in full.
-        let Some(expected_type) = record.op_type.as_deref() else {
-            return Ok(());
-        };
-
-        let mismatch = || {
-            let err = OperationError::from_kind(OperationErrorKind::NonDeterministicExecution(
-                NonDeterministicExecutionError::from_kind(
-                    NonDeterministicExecutionErrorKind::OperationMismatch {
-                        wire_id: wire_id.to_owned(),
-                        expected: format_op_identity(
-                            expected_type,
-                            record.sub_type.as_deref(),
-                            record.op_name.as_deref(),
-                        ),
-                        actual: format_op_identity(claimed_type, claimed_sub_type, claimed_name),
-                    },
-                ),
-            ));
-            // A replay identity mismatch is execution-fatal: record it on the
-            // shared slot so the invocation driver fails the execution with
-            // the dedicated error even if this `Err` is swallowed on its way
-            // up — stored as a rejected outcome by `join_all`, out-raced by a
-            // sibling's success in `select_ok`, stringified through a
-            // child-context boundary, or tolerated by a map/parallel
-            // completion config.
-            self.inner
-                .suspension_signal
-                .record_fatal("NonDeterministicExecutionError".to_owned(), err.to_string());
-            err
-        };
-
-        // Compare canonicalized types: the checkpoint log stores PascalCase
-        // on the typed SDK path but the raw wire form (e.g.
-        // `CHAINED_INVOKE`) on the inline JSON envelope path, so both sides
-        // canonicalize through `OperationType` before comparison.
-        if canonical_op_type(expected_type) != canonical_op_type(claimed_type) {
-            return Err(mismatch());
+        match replay_identity_mismatch(record, claimed_type, claimed_sub_type, claimed_name) {
+            None => Ok(()),
+            Some(expected) => Err(self.replay_mismatch_error(
+                wire_id,
+                &expected,
+                claimed_type,
+                claimed_sub_type,
+                claimed_name,
+            )),
         }
+    }
 
-        // Sub-type is compared as a complete Option in both directions: a
-        // stored sub-type with no claimed sub-type (or the reverse) is a
-        // mismatch, not a skip. Otherwise a reordered same-type operation
-        // could consume the wrong checkpoint silently.
-        let sub_type_matches = match (record.sub_type.as_deref(), claimed_sub_type) {
-            (Some(expected), Some(claimed)) => expected.eq_ignore_ascii_case(claimed),
-            (None, None) => true,
-            (Some(_), None) | (None, Some(_)) => false,
-        };
-        if !sub_type_matches {
-            return Err(mismatch());
-        }
-
-        // Name is likewise compared as a complete Option in both directions.
-        // Adding or removing `.name(...)` between runs changes the operation's
-        // replay identity and must be flagged, for the same reason as above.
-        //
-        // Empty names are normalized to `None` on BOTH sides before the
-        // comparison: the checkpoint builders deliberately omit the `Name`
-        // field when the string is empty (see `build_child_update` in
-        // `map_parallel`), so the record stores `None` where the claim
-        // computes `Some("")` — e.g. a map `item_namer` or a parallel
-        // `Branch` whose name is the empty string. Without normalization an
-        // UNCHANGED handler would be rejected on resume.
-        let claimed_name = claimed_name.filter(|n| !n.is_empty());
-        let expected_name = record.op_name.as_deref().filter(|n| !n.is_empty());
-        let name_matches = match (expected_name, claimed_name) {
-            (Some(expected), Some(claimed)) => expected == claimed,
-            (None, None) => true,
-            (Some(_), None) | (None, Some(_)) => false,
-        };
-        if !name_matches {
-            return Err(mismatch());
-        }
-
-        Ok(())
+    /// Builds the `NonDeterministicExecution` mismatch error and records it
+    /// on the shared fatal slot.
+    ///
+    /// A replay identity mismatch is execution-fatal: recording it on the
+    /// shared slot makes the invocation driver fail the execution with the
+    /// dedicated error even if the returned `Err` is swallowed on its way
+    /// up — stored as a rejected outcome by `join_all`, out-raced by a
+    /// sibling's success in `select_ok`, stringified through a
+    /// child-context boundary, or tolerated by a map/parallel completion
+    /// config.
+    fn replay_mismatch_error(
+        &self,
+        wire_id: &str,
+        expected: &str,
+        claimed_type: &str,
+        claimed_sub_type: Option<&str>,
+        claimed_name: Option<&str>,
+    ) -> OperationError {
+        let err = OperationError::from_kind(OperationErrorKind::NonDeterministicExecution(
+            NonDeterministicExecutionError::from_kind(
+                NonDeterministicExecutionErrorKind::OperationMismatch {
+                    wire_id: wire_id.to_owned(),
+                    expected: expected.to_owned(),
+                    actual: format_op_identity(claimed_type, claimed_sub_type, claimed_name),
+                },
+            ),
+        ));
+        self.inner
+            .suspension_signal
+            .record_fatal("NonDeterministicExecutionError".to_owned(), err.to_string());
+        err
     }
 
     /// Requests suspension of THIS context's scope (used by operations that
@@ -745,8 +835,8 @@ impl DurableContext {
     pub(crate) fn get_attempt(&self, op_id: &OperationId) -> u32 {
         // On re-invocation after a RETRY, the backend returns the operation
         // with step_details.attempt set to the last completed attempt number.
-        self.checkpoint_record(op_id.positional())
-            .map_or(0, |r| r.attempt)
+        self.checkpoint_status_view(op_id.positional())
+            .map_or(0, |view| view.attempt)
     }
 
     /// Returns the execution ARN identifying this durable execution.
@@ -1513,6 +1603,82 @@ fn canonical_op_type(raw: &str) -> String {
         .as_str()
         .to_owned()
 }
+
+/// Compares a checkpoint record's stored identity against a claimed one.
+///
+/// Returns `None` when the identities match (or the record predates
+/// identity recording), and `Some(expected)` — the stored identity
+/// formatted for the mismatch error — when they differ. The comparisons
+/// borrow the record, so the match path clones nothing; only the cold
+/// mismatch path allocates. This is the shared core behind
+/// `DurableContext::validate_replay_identity` and
+/// `DurableContext::checkpoint_view_validated`.
+fn replay_identity_mismatch(
+    record: &CheckpointRecord,
+    claimed_type: &str,
+    claimed_sub_type: Option<&str>,
+    claimed_name: Option<&str>,
+) -> Option<String> {
+    // A record without a stored operation type predates identity
+    // recording (legacy checkpoint) — there is genuinely nothing to
+    // validate against, so skip. This is the ONLY lenient path; once a
+    // record carries identity, every field is compared in full.
+    let expected_type = record.op_type.as_deref()?;
+
+    let mismatch = || {
+        Some(format_op_identity(
+            expected_type,
+            record.sub_type.as_deref(),
+            record.op_name.as_deref(),
+        ))
+    };
+
+    // Compare canonicalized types: the checkpoint log stores PascalCase
+    // on the typed SDK path but the raw wire form (e.g.
+    // `CHAINED_INVOKE`) on the inline JSON envelope path, so both sides
+    // canonicalize through `OperationType` before comparison.
+    if canonical_op_type(expected_type) != canonical_op_type(claimed_type) {
+        return mismatch();
+    }
+
+    // Sub-type is compared as a complete Option in both directions: a
+    // stored sub-type with no claimed sub-type (or the reverse) is a
+    // mismatch, not a skip. Otherwise a reordered same-type operation
+    // could consume the wrong checkpoint silently.
+    let sub_type_matches = match (record.sub_type.as_deref(), claimed_sub_type) {
+        (Some(expected), Some(claimed)) => expected.eq_ignore_ascii_case(claimed),
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    };
+    if !sub_type_matches {
+        return mismatch();
+    }
+
+    // Name is likewise compared as a complete Option in both directions.
+    // Adding or removing `.name(...)` between runs changes the operation's
+    // replay identity and must be flagged, for the same reason as above.
+    //
+    // Empty names are normalized to `None` on BOTH sides before the
+    // comparison: the checkpoint builders deliberately omit the `Name`
+    // field when the string is empty (see `build_child_update` in
+    // `map_parallel`), so the record stores `None` where the claim
+    // computes `Some("")` — e.g. a map `item_namer` or a parallel
+    // `Branch` whose name is the empty string. Without normalization an
+    // UNCHANGED handler would be rejected on resume.
+    let claimed_name = claimed_name.filter(|n| !n.is_empty());
+    let expected_name = record.op_name.as_deref().filter(|n| !n.is_empty());
+    let name_matches = match (expected_name, claimed_name) {
+        (Some(expected), Some(claimed)) => expected == claimed,
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    };
+    if !name_matches {
+        return mismatch();
+    }
+
+    None
+}
+
 /// Formats an operation's identity as a human-readable string for error
 /// messages (e.g. `"Step/Step named \"fetch-name\""` or `"Wait/Wait"`).
 fn format_op_identity(op_type: &str, sub_type: Option<&str>, name: Option<&str>) -> String {
@@ -1856,6 +2022,172 @@ mod tests {
         let result =
             ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), Some("my-step"));
         assert!(result.is_ok());
+    }
+
+    // ── Targeted checkpoint accessors ────────────────────────────────────
+
+    /// Builds a context whose checkpoint log holds one record at positional
+    /// ID `"1"` (keyed by its wire ID, matching the production log shape).
+    fn ctx_with_record_at_1(record: CheckpointRecord) -> DurableContext {
+        let wire_id = crate::engine::compute_wire_id_public("1");
+        let log = Arc::new(CheckpointLog::from_records(vec![(wire_id, record)]));
+        DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        )
+    }
+
+    #[test]
+    fn checkpoint_view_validated_returns_view_on_identity_match() {
+        let ctx = ctx_with_record_at_1(CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: Some("42".to_owned()),
+            error_type: None,
+            error_message: None,
+            attempt: 2,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: true,
+            callback_id: None,
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            op_name: Some("my-step".to_owned()),
+        });
+
+        let result =
+            ctx.checkpoint_view_validated("1", "wire-1", "Step", Some("Step"), Some("my-step"));
+        assert!(result.is_ok());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Ok above
+        let view = result.unwrap();
+        assert!(view.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
+        let view = view.unwrap();
+        assert_eq!(view.status, CheckpointStatus::Succeeded);
+        assert_eq!(view.attempt, 2);
+        assert!(view.replay_children);
+
+        // No record at another position: Ok(None), nothing to validate.
+        let live = ctx.checkpoint_view_validated("2", "wire-2", "Step", Some("Step"), None);
+        assert!(matches!(live, Ok(None)));
+    }
+
+    #[test]
+    fn checkpoint_view_validated_errors_on_identity_mismatch() {
+        let ctx = ctx_with_record_at_1(CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            op_name: None,
+        });
+
+        // Claimed as Wait but checkpointed as Step → the same
+        // NonDeterministicExecution error `validate_replay_identity` builds.
+        let result = ctx.checkpoint_view_validated("1", "wire-1", "Wait", Some("Wait"), None);
+        assert!(result.is_err());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Err above
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::NonDeterministicExecution(_)
+        ));
+        let display = err.to_string();
+        assert!(
+            display.contains("Step") && display.contains("Wait"),
+            "expected both identities in error: {display}"
+        );
+    }
+
+    #[test]
+    fn targeted_getters_return_single_fields() {
+        let ctx = ctx_with_record_at_1(CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Failed,
+            result: Some(r#""state""#.to_owned()),
+            error_type: Some("SomeError".to_owned()),
+            error_message: Some("it broke".to_owned()),
+            attempt: 5,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: Some("cb-42".to_owned()),
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        });
+
+        assert!(ctx.has_checkpoint_record("1"));
+        assert!(!ctx.has_checkpoint_record("2"));
+
+        assert_eq!(
+            ctx.checkpoint_result_payload("1").as_deref(),
+            Some(r#""state""#)
+        );
+        assert!(ctx.checkpoint_result_payload("2").is_none());
+
+        assert_eq!(ctx.checkpoint_callback_id("1").as_deref(), Some("cb-42"));
+
+        let parts = ctx.checkpoint_error_parts("1");
+        assert_eq!(
+            parts,
+            Some((Some("SomeError".to_owned()), Some("it broke".to_owned())))
+        );
+        assert!(ctx.checkpoint_error_parts("2").is_none());
+
+        let view = ctx.checkpoint_status_view("1");
+        assert!(view.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
+        let view = view.unwrap();
+        assert_eq!(view.status, CheckpointStatus::Failed);
+        assert_eq!(view.attempt, 5);
+    }
+
+    #[test]
+    fn checkpoint_terminal_replay_projects_payload_and_error_fields() {
+        let ctx = ctx_with_record_at_1(CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Failed,
+            result: Some(r#""summary""#.to_owned()),
+            error_type: Some("BatchError".to_owned()),
+            error_message: Some("batch broke".to_owned()),
+            attempt: 3,
+            invoke_result: Some("never-projected".to_owned()),
+            invoke_error_type: Some("never-projected".to_owned()),
+            invoke_error_message: Some("never-projected".to_owned()),
+            replay_children: true,
+            callback_id: Some("cb-99".to_owned()),
+            op_type: Some("Context".to_owned()),
+            sub_type: Some("Map".to_owned()),
+            op_name: Some("batch".to_owned()),
+        });
+
+        let snapshot = ctx.checkpoint_terminal_replay("1");
+        assert_eq!(
+            snapshot,
+            Some(TerminalReplaySnapshot {
+                status: CheckpointStatus::Failed,
+                replay_children: true,
+                result: Some(r#""summary""#.to_owned()),
+                error_message: Some("batch broke".to_owned()),
+                error_type: Some("BatchError".to_owned()),
+            })
+        );
+
+        // No record → no snapshot.
+        assert!(ctx.checkpoint_terminal_replay("2").is_none());
     }
 
     #[test]

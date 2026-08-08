@@ -203,31 +203,36 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
 
-        // 2. Check checkpoint log for replay.
+        // 2. Check checkpoint log for replay. The validated view covers the
+        // non-terminal branches without cloning; the terminal branches fetch
+        // only the one field they consume.
         let mut already_started = false;
-        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection: verify the record's identity matches.
-            self.ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "Step",
-                Some(STEP_SUB_TYPE),
-                self.name.as_deref(),
-            )?;
-            match &record.status {
+        if let Some(view) = self.ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "Step",
+            Some(STEP_SUB_TYPE),
+            self.name.as_deref(),
+        )? {
+            match view.status {
                 CheckpointStatus::Succeeded => {
                     let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
+                    let payload = self.ctx.checkpoint_result_payload(&positional_id);
                     return replay_success(
                         self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-                        record.result.as_ref(),
+                        payload.as_ref(),
                         &serdes_ctx,
                     )
                     .await;
                 }
                 CheckpointStatus::Failed => {
+                    let (error_type, error_message) = self
+                        .ctx
+                        .checkpoint_error_parts(&positional_id)
+                        .unwrap_or_default();
                     return Err(replay_failure(
-                        record.error_type.as_deref(),
-                        record.error_message.as_deref(),
+                        error_type.as_deref(),
+                        error_message.as_deref(),
                     ));
                 }
                 CheckpointStatus::Pending => {

@@ -959,20 +959,24 @@ where
     let parent_wire = parent_op_id.wire().to_owned();
 
     // 2. Check if the parent batch is already terminal in the checkpoint log.
-    if let Some(record) = ctx.checkpoint_record(&parent_positional) {
-        // Non-determinism detection: verify the record's identity matches.
-        ctx.validate_replay_identity(
-            &record,
-            &parent_wire,
-            "Context",
-            Some(parent_sub_type),
-            parent_name.as_deref(),
-        )?;
-        if record.status.is_terminal() {
+    // Identity validation and the status read happen in one read-guard pass;
+    // the terminal payload/error projection is cloned only when the batch is
+    // actually terminal and must be replayed.
+    if let Some(view) = ctx.checkpoint_view_validated(
+        &parent_positional,
+        &parent_wire,
+        "Context",
+        Some(parent_sub_type),
+        parent_name.as_deref(),
+    )? {
+        if view.status.is_terminal() {
+            let snapshot = ctx
+                .checkpoint_terminal_replay(&parent_positional)
+                .ok_or_else(|| batch_error("terminal batch has no checkpoint record"))?;
             let serdes_ctx = SerdesContext::new(&parent_wire, ctx.execution_arn());
             match replay_terminal_batch::<O>(
                 &ctx,
-                &record,
+                &snapshot,
                 &parent_positional,
                 total_items,
                 serdes.as_ref(),
@@ -1072,19 +1076,17 @@ where
             let child_positional = child_op_id.positional().to_owned();
             let child_wire = child_op_id.wire().to_owned();
             let child_name = item_namer.as_ref().map(|namer| namer(i));
-            let is_terminal = if let Some(record) = ctx.checkpoint_record(&child_positional) {
-                // Non-determinism detection on child items.
-                ctx.validate_replay_identity(
-                    &record,
+            // Non-determinism detection on child items happens inside the
+            // validated view fetch; only the status is consumed here.
+            let is_terminal = ctx
+                .checkpoint_view_validated(
+                    &child_positional,
                     &child_wire,
                     "Context",
                     Some(child_sub_type),
                     child_name.as_deref(),
-                )?;
-                record.status.is_terminal()
-            } else {
-                false
-            };
+                )?
+                .is_some_and(|view| view.status.is_terminal());
             pre_claimed.push(PreClaimed {
                 index: i,
                 op_id: child_op_id,
@@ -1103,24 +1105,24 @@ where
     // checkpointed on the owning task before any spawned task runs.
     if concurrency > 1 {
         for pre in &pre_claimed {
-            if !pre.is_terminal && nesting != NestingMode::Flat {
-                let record = ctx.checkpoint_record(pre.op_id.positional());
-                if record.is_none() {
-                    let child_wire = pre.op_id.wire().to_owned();
-                    let item_name_str = item_namer
-                        .as_ref()
-                        .map_or_else(String::new, |namer| namer(pre.index));
-                    let update = build_child_update(
-                        &child_wire,
-                        &item_name_str,
-                        child_sub_type,
-                        &parent_wire,
-                        OperationAction::Start,
-                    );
-                    ctx.checkpoint_updates(vec![update])
-                        .await
-                        .map_err(|e| batch_error(&format!("checkpoint child start: {e}")))?;
-                }
+            if !pre.is_terminal
+                && nesting != NestingMode::Flat
+                && !ctx.has_checkpoint_record(pre.op_id.positional())
+            {
+                let child_wire = pre.op_id.wire().to_owned();
+                let item_name_str = item_namer
+                    .as_ref()
+                    .map_or_else(String::new, |namer| namer(pre.index));
+                let update = build_child_update(
+                    &child_wire,
+                    &item_name_str,
+                    child_sub_type,
+                    &parent_wire,
+                    OperationAction::Start,
+                );
+                ctx.checkpoint_updates(vec![update])
+                    .await
+                    .map_err(|e| batch_error(&format!("checkpoint child start: {e}")))?;
             }
         }
     }
@@ -1256,19 +1258,17 @@ where
                 let child_positional = child_op_id.positional().to_owned();
                 let child_wire = child_op_id.wire().to_owned();
                 let child_name = item_namer.as_ref().map(|namer| namer(i));
-                let is_terminal = if let Some(record) = ctx.checkpoint_record(&child_positional) {
-                    // Non-determinism detection on child items.
-                    ctx.validate_replay_identity(
-                        &record,
+                // Non-determinism detection on child items happens inside
+                // the validated view fetch; only the status is consumed.
+                let is_terminal = ctx
+                    .checkpoint_view_validated(
+                        &child_positional,
                         &child_wire,
                         "Context",
                         Some(child_sub_type),
                         child_name.as_deref(),
-                    )?;
-                    record.status.is_terminal()
-                } else {
-                    false
-                };
+                    )?
+                    .is_some_and(|view| view.status.is_terminal());
                 PreClaimed {
                     index: i,
                     op_id: child_op_id,
@@ -1652,20 +1652,17 @@ where
     // Check if we need to checkpoint START for this child.
     // Skip if the caller already checkpointed START synchronously (for
     // concurrency safety).
-    if !start_checkpointed {
-        let record = ctx.checkpoint_record(&child_positional);
-        if record.is_none() {
-            let update = build_child_update(
-                &child_wire,
-                item_name,
-                child_sub_type,
-                parent_wire,
-                OperationAction::Start,
-            );
-            ctx.checkpoint_updates(vec![update])
-                .await
-                .map_err(|e| batch_error(&format!("checkpoint child start: {e}")))?;
-        }
+    if !start_checkpointed && !ctx.has_checkpoint_record(&child_positional) {
+        let update = build_child_update(
+            &child_wire,
+            item_name,
+            child_sub_type,
+            parent_wire,
+            OperationAction::Start,
+        );
+        ctx.checkpoint_updates(vec![update])
+            .await
+            .map_err(|e| batch_error(&format!("checkpoint child start: {e}")))?;
     }
 
     // Create child context (with its OWN suspension scope) and run the item
@@ -1781,18 +1778,22 @@ where
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Replays a terminal batch (parent already succeeded/failed in the log).
+///
+/// Takes the targeted [`crate::engine::TerminalReplaySnapshot`] projection
+/// rather than the full checkpoint record — the status, `replay_children`,
+/// and payload/error strings are all this helper reads.
 async fn replay_terminal_batch<O: DeserializeOwned>(
     _ctx: &DurableContext,
-    record: &crate::engine::CheckpointRecord,
+    snapshot: &crate::engine::TerminalReplaySnapshot,
     _parent_positional: &str,
     _total_items: usize,
     serdes: Option<&Arc<dyn Serdes>>,
     result_serdes: Option<&Arc<dyn Serdes>>,
     serdes_ctx: &SerdesContext,
 ) -> Result<BatchResult<O>, OperationError> {
-    match &record.status {
+    match &snapshot.status {
         CheckpointStatus::Succeeded => {
-            if record.replay_children {
+            if snapshot.replay_children {
                 // ReplayChildren mode: cannot reconstruct from the payload
                 // alone — the caller must fall through to re-execution.
                 // Signal this by returning a sentinel error that the caller
@@ -1800,7 +1801,7 @@ async fn replay_terminal_batch<O: DeserializeOwned>(
                 return Err(batch_error(REPLAY_CHILDREN_SENTINEL));
             }
             // Deserialize the stored batch summary.
-            let payload_str = record
+            let payload_str = snapshot
                 .result
                 .as_deref()
                 .ok_or_else(|| batch_error("terminal batch has no result payload"))?;
@@ -1820,7 +1821,7 @@ async fn replay_terminal_batch<O: DeserializeOwned>(
             .await
         }
         CheckpointStatus::Failed => {
-            let msg = record.error_message.as_deref().unwrap_or("batch failed");
+            let msg = snapshot.error_message.as_deref().unwrap_or("batch failed");
             Err(batch_error(msg))
         }
         _ => {
@@ -1845,7 +1846,7 @@ async fn replay_terminal_child<O: DeserializeOwned>(
     serdes_ctx: &SerdesContext,
 ) -> Result<BatchItem<O>, OperationError> {
     let record = ctx
-        .checkpoint_record(child_positional)
+        .checkpoint_terminal_replay(child_positional)
         .ok_or_else(|| batch_error("replay child has no checkpoint record"))?;
 
     match &record.status {

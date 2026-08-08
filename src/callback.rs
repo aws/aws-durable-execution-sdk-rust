@@ -70,17 +70,21 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
 
-        // 2. Check checkpoint log for replay.
-        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection: verify the record's identity matches.
-            self.ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "Callback",
-                Some(CALLBACK_SUB_TYPE),
-                self.name.as_deref(),
-            )?;
-            match &record.status {
+        // 2. Check checkpoint log for replay. Every branch consumes the
+        // backend-assigned callback ID; the terminal branches additionally
+        // fetch only the field they consume.
+        if let Some(view) = self.ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "Callback",
+            Some(CALLBACK_SUB_TYPE),
+            self.name.as_deref(),
+        )? {
+            let callback_id = self
+                .ctx
+                .checkpoint_callback_id(&positional_id)
+                .unwrap_or_default();
+            match view.status {
                 CheckpointStatus::Succeeded => {
                     // Callback completed successfully during a previous
                     // invocation — return settled Callback with the result.
@@ -88,8 +92,8 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
                     // the deserialize side of the serdes acts on it. Per-op
                     // serdes wins; otherwise the execution-wide serdes decodes
                     // it (default JSON).
-                    let callback_id = record.callback_id.clone().unwrap_or_default();
-                    let result_str = record.result.as_deref().unwrap_or("null");
+                    let payload = self.ctx.checkpoint_result_payload(&positional_id);
+                    let result_str = payload.as_deref().unwrap_or("null");
                     let serdes_ctx =
                         SerdesContext::new(self.op_id.wire(), self.ctx.execution_arn());
                     let value: O = deserialize_callback_result(
@@ -102,13 +106,13 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
                 }
                 CheckpointStatus::Failed => {
                     // Callback failed externally.
-                    let callback_id = record.callback_id.clone().unwrap_or_default();
-                    let error_type = record.error_type.as_deref().unwrap_or("Error").to_owned();
-                    let error_message = record
-                        .error_message
-                        .as_deref()
-                        .unwrap_or("callback failed")
-                        .to_owned();
+                    let (error_type, error_message) = self
+                        .ctx
+                        .checkpoint_error_parts(&positional_id)
+                        .unwrap_or_default();
+                    let error_type = error_type.unwrap_or_else(|| "Error".to_owned());
+                    let error_message =
+                        error_message.unwrap_or_else(|| "callback failed".to_owned());
                     let kind = classify_callback_error(&error_type, &error_message);
                     let err = OperationError::from_kind(OperationErrorKind::Callback(
                         CallbackError::from_kind(kind),
@@ -117,7 +121,6 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
                 }
                 CheckpointStatus::TimedOut => {
                     // Callback timed out.
-                    let callback_id = record.callback_id.clone().unwrap_or_default();
                     let kind = CallbackErrorKind::TimedOut;
                     let err = OperationError::from_kind(OperationErrorKind::Callback(
                         CallbackError::from_kind(kind),
@@ -127,14 +130,13 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
                 CheckpointStatus::Started | CheckpointStatus::Pending => {
                     // Callback is in flight — return pending (will suspend on
                     // .result()).
-                    let callback_id = record.callback_id.clone().unwrap_or_default();
                     return Ok(Callback::new_pending(callback_id, self.ctx.clone()));
                 }
                 _ => {
                     // Unexpected status — treat as internal error.
                     return Err(callback_internal_error(&format!(
                         "unexpected checkpointed status: {:?}",
-                        record.status
+                        view.status
                     )));
                 }
             }
@@ -174,8 +176,7 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
         // Read it from the (now-updated) checkpoint log.
         let callback_id = self
             .ctx
-            .checkpoint_record(&positional_id)
-            .and_then(|r| r.callback_id.clone())
+            .checkpoint_callback_id(&positional_id)
             .unwrap_or_default();
 
         // Return pending — Result() will fire suspend.
@@ -214,29 +215,32 @@ impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<
         let ctx = self.ctx.clone();
         let name = self.name.clone();
 
-        // 2. Check checkpoint log for replay (context-level terminal).
-        if let Some(record) = ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection: verify the record's identity matches.
-            ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "Context",
-                Some(WFCB_SUB_TYPE),
-                name.as_deref(),
-            )?;
-            match &record.status {
+        // 2. Check checkpoint log for replay (context-level terminal). The
+        // validated view covers the non-terminal branches without cloning.
+        if let Some(view) = ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "Context",
+            Some(WFCB_SUB_TYPE),
+            name.as_deref(),
+        )? {
+            match view.status {
                 CheckpointStatus::Succeeded => {
                     // WaitForCallback context completed — deserialize result.
-                    let result_str = record.result.as_deref().unwrap_or("null");
+                    let payload = ctx.checkpoint_result_payload(&positional_id);
+                    let result_str = payload.as_deref().unwrap_or("null");
                     let value: O = serde_json::from_str(result_str)
                         .map_err(|e| wfcb_internal_error(&format!("deserialize result: {e}")))?;
                     return Ok(value);
                 }
                 CheckpointStatus::Failed => {
                     // Context failed — classify the error.
+                    let (error_type, error_message) = ctx
+                        .checkpoint_error_parts(&positional_id)
+                        .unwrap_or_default();
                     return Err(wfcb_failed_error(
-                        record.error_type.as_deref(),
-                        record.error_message.as_deref(),
+                        error_type.as_deref(),
+                        error_message.as_deref(),
                     ));
                 }
                 // Started/Pending/Ready: fall through to execute/resume.

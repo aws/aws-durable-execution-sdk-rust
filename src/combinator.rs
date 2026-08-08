@@ -83,24 +83,28 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
 
-        // Replay path: check checkpoint log.
-        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection: verify the record's identity matches.
-            self.ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "Context",
-                Some(COMBINATOR_SUB_TYPE),
-                self.name.as_deref(),
-            )?;
-            match &record.status {
+        // Replay path: check checkpoint log. The validated view covers the
+        // non-terminal branches without cloning.
+        if let Some(view) = self.ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "Context",
+            Some(COMBINATOR_SUB_TYPE),
+            self.name.as_deref(),
+        )? {
+            match view.status {
                 CheckpointStatus::Succeeded => {
-                    return replay_vec_success::<O>(record.result.as_ref());
+                    let payload = self.ctx.checkpoint_result_payload(&positional_id);
+                    return replay_vec_success::<O>(payload.as_ref());
                 }
                 CheckpointStatus::Failed => {
+                    let (error_type, error_message) = self
+                        .ctx
+                        .checkpoint_error_parts(&positional_id)
+                        .unwrap_or_default();
                     return Err(replay_combinator_failure(
-                        record.error_type.as_deref(),
-                        record.error_message.as_deref(),
+                        error_type.as_deref(),
+                        error_message.as_deref(),
                     ));
                 }
                 _ => {} // Started/Pending: fall through to re-execute
@@ -245,24 +249,28 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
 
-        // Replay path.
-        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection.
-            self.ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "Context",
-                Some(COMBINATOR_SUB_TYPE),
-                self.name.as_deref(),
-            )?;
-            match &record.status {
+        // Replay path. The validated view covers the non-terminal branches
+        // without cloning.
+        if let Some(view) = self.ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "Context",
+            Some(COMBINATOR_SUB_TYPE),
+            self.name.as_deref(),
+        )? {
+            match view.status {
                 CheckpointStatus::Succeeded => {
-                    return replay_settled_success::<O>(record.result.as_ref());
+                    let payload = self.ctx.checkpoint_result_payload(&positional_id);
+                    return replay_settled_success::<O>(payload.as_ref());
                 }
                 CheckpointStatus::Failed => {
+                    let (error_type, error_message) = self
+                        .ctx
+                        .checkpoint_error_parts(&positional_id)
+                        .unwrap_or_default();
                     return Err(replay_combinator_failure(
-                        record.error_type.as_deref(),
-                        record.error_message.as_deref(),
+                        error_type.as_deref(),
+                        error_message.as_deref(),
                     ));
                 }
                 _ => {}
@@ -375,24 +383,28 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
 
-        // Replay path.
-        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection.
-            self.ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "Context",
-                Some(COMBINATOR_SUB_TYPE),
-                self.name.as_deref(),
-            )?;
-            match &record.status {
+        // Replay path. The validated view covers the non-terminal branches
+        // without cloning.
+        if let Some(view) = self.ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "Context",
+            Some(COMBINATOR_SUB_TYPE),
+            self.name.as_deref(),
+        )? {
+            match view.status {
                 CheckpointStatus::Succeeded => {
-                    return replay_single_success::<O>(record.result.as_ref());
+                    let payload = self.ctx.checkpoint_result_payload(&positional_id);
+                    return replay_single_success::<O>(payload.as_ref());
                 }
                 CheckpointStatus::Failed => {
+                    let (error_type, error_message) = self
+                        .ctx
+                        .checkpoint_error_parts(&positional_id)
+                        .unwrap_or_default();
                     return Err(replay_combinator_failure(
-                        record.error_type.as_deref(),
-                        record.error_message.as_deref(),
+                        error_type.as_deref(),
+                        error_message.as_deref(),
                     ));
                 }
                 _ => {}
@@ -510,24 +522,28 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
 
-        // Replay path.
-        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection.
-            self.ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "Context",
-                Some(COMBINATOR_SUB_TYPE),
-                self.name.as_deref(),
-            )?;
-            match &record.status {
+        // Replay path. The validated view covers the non-terminal branches
+        // without cloning.
+        if let Some(view) = self.ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "Context",
+            Some(COMBINATOR_SUB_TYPE),
+            self.name.as_deref(),
+        )? {
+            match view.status {
                 CheckpointStatus::Succeeded => {
-                    return replay_single_success::<O>(record.result.as_ref());
+                    let payload = self.ctx.checkpoint_result_payload(&positional_id);
+                    return replay_single_success::<O>(payload.as_ref());
                 }
                 CheckpointStatus::Failed => {
+                    let (error_type, error_message) = self
+                        .ctx
+                        .checkpoint_error_parts(&positional_id)
+                        .unwrap_or_default();
                     return Err(replay_combinator_failure(
-                        record.error_type.as_deref(),
-                        record.error_message.as_deref(),
+                        error_type.as_deref(),
+                        error_message.as_deref(),
                     ));
                 }
                 _ => {}

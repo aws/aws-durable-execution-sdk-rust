@@ -32,17 +32,16 @@ impl WaitExecution {
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
 
-        // 2. Check checkpoint log for replay.
-        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection: verify the record's identity matches.
-            self.ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "Wait",
-                Some(WAIT_SUB_TYPE),
-                self.name.as_deref(),
-            )?;
-            match &record.status {
+        // 2. Check checkpoint log for replay. The validated view carries
+        // everything the wait replay path reads, so nothing is cloned.
+        if let Some(view) = self.ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "Wait",
+            Some(WAIT_SUB_TYPE),
+            self.name.as_deref(),
+        )? {
+            match view.status {
                 CheckpointStatus::Succeeded => {
                     // Timer completed — return immediately.
                     return Ok(());
@@ -62,7 +61,7 @@ impl WaitExecution {
                     // Unexpected status for wait — treat as error.
                     return Err(OperationError::from_kind(OperationErrorKind::Wait(
                         WaitError::from_kind(WaitErrorKind::UnexpectedStatus {
-                            status: format!("{:?}", record.status),
+                            status: format!("{:?}", view.status),
                         }),
                     )));
                 }

@@ -61,19 +61,19 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
         let wire_id = self.op_id.wire().to_owned();
         let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
 
-        // 2. Check checkpoint log for replay.
-        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection: verify the record's identity matches.
-            self.ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "Context",
-                Some(CHILD_SUB_TYPE),
-                self.name.as_deref(),
-            )?;
-            match &record.status {
+        // 2. Check checkpoint log for replay. The validated view carries
+        // status and `replay_children` without cloning; the terminal
+        // branches fetch only the fields they consume.
+        if let Some(view) = self.ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "Context",
+            Some(CHILD_SUB_TYPE),
+            self.name.as_deref(),
+        )? {
+            match view.status {
                 CheckpointStatus::Succeeded => {
-                    if record.replay_children {
+                    if view.replay_children {
                         // ReplayChildren mode: the result was too large to
                         // checkpoint; re-execute the child body to reconstruct it.
                         let child_ctx = self.ctx.new_child(&positional_id);
@@ -104,17 +104,22 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
                             )),
                         };
                     }
+                    let payload = self.ctx.checkpoint_result_payload(&positional_id);
                     return replay_success::<O>(
                         self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-                        record.result.as_ref(),
+                        payload.as_ref(),
                         &serdes_ctx,
                     )
                     .await;
                 }
                 CheckpointStatus::Failed => {
+                    let (error_type, error_message) = self
+                        .ctx
+                        .checkpoint_error_parts(&positional_id)
+                        .unwrap_or_default();
                     return Err(replay_failure(
-                        record.error_type.as_deref(),
-                        record.error_message.as_deref(),
+                        error_type.as_deref(),
+                        error_message.as_deref(),
                     ));
                 }
                 // Started/Pending/Ready: re-enter child body (resume path).

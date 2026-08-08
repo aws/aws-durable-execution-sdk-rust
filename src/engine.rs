@@ -169,7 +169,7 @@ impl IdCounter {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// The status of a checkpointed operation, as recorded by the backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // reason: variants constructed by the checkpoint client
 pub(crate) enum CheckpointStatus {
     /// Operation started but not yet resolved.
@@ -193,7 +193,7 @@ pub(crate) enum CheckpointStatus {
 impl CheckpointStatus {
     /// Returns true if this status represents a terminal (settled) outcome
     /// that replay can return without re-executing.
-    pub(crate) fn is_terminal(&self) -> bool {
+    pub(crate) fn is_terminal(self) -> bool {
         matches!(
             self,
             Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Stopped
@@ -242,6 +242,49 @@ pub(crate) struct CheckpointRecord {
     pub(crate) op_name: Option<String>,
 }
 
+/// A compact, copyable view of a checkpoint record.
+///
+/// Carries the fields that nearly every operation reads at the start of its
+/// replay check — the status, the attempt counter, and the
+/// `replay_children` marker — without cloning any of the record's owned
+/// strings. Use `CheckpointLog::status_view` (or the context-level
+/// `checkpoint_status_view`) instead of `CheckpointLog::get` when the
+/// caller consumes only these fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CheckpointStatusView {
+    /// The operation's status.
+    pub(crate) status: CheckpointStatus,
+    /// The attempt number from the backend's step details (0 if unavailable).
+    pub(crate) attempt: u32,
+    /// Whether the child context result was too large and must be
+    /// reconstructed by re-executing the child body (`ReplayChildren` mode).
+    pub(crate) replay_children: bool,
+}
+
+/// The terminal-replay projection of a checkpoint record.
+///
+/// Carries exactly the fields the map/parallel replay helpers consume when
+/// reconstructing a terminal batch or child item from the log — the status,
+/// the `replay_children` marker, and the payload/error strings — so terminal
+/// replay clones at most three optional strings instead of the whole record
+/// (which also carries invoke, callback, ID, and identity fields those
+/// helpers never read). Built via the context-level
+/// `checkpoint_terminal_replay` accessor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalReplaySnapshot {
+    /// The operation's status.
+    pub(crate) status: CheckpointStatus,
+    /// Whether the result was too large to store and must be reconstructed
+    /// by re-executing the children (`ReplayChildren` mode).
+    pub(crate) replay_children: bool,
+    /// The serialized result payload (for succeeded operations).
+    pub(crate) result: Option<String>,
+    /// Error message (for failed operations).
+    pub(crate) error_message: Option<String>,
+    /// Error type identifier (for failed operations).
+    pub(crate) error_type: Option<String>,
+}
+
 /// The checkpoint log: maps positional operation IDs to stored records.
 ///
 /// The log is populated from the backend on invocation start and is
@@ -279,12 +322,54 @@ impl CheckpointLog {
     ///
     /// Returns `Some` with the frozen result for replayed operations;
     /// `None` for live (not-yet-checkpointed) operations.
+    ///
+    /// This deep-clones the whole record (up to seven owned strings), so no
+    /// production path uses it anymore: they read through
+    /// [`Self::with_record`], [`Self::status_view`], or [`Self::contains`]
+    /// instead. Retained for tests, which assert on whole stored records.
+    #[allow(dead_code)] // reason: test-only whole-record accessor; production uses targeted reads
     pub(crate) fn get(&self, wire_id: &str) -> Option<CheckpointRecord> {
+        self.with_record(wire_id, Clone::clone)
+    }
+
+    /// Reads a stored record under the lock's read guard, applying `f` to
+    /// it in place.
+    ///
+    /// Returns `None` when no record exists for `wire_id`. This is the
+    /// zero-clone primitive behind the targeted accessors: `f` borrows the
+    /// record and returns only what the caller consumes, so nothing is
+    /// cloned that the caller does not take. `f` must not touch the
+    /// checkpoint log (the read guard is held while it runs).
+    pub(crate) fn with_record<R>(
+        &self,
+        wire_id: &str,
+        f: impl FnOnce(&CheckpointRecord) -> R,
+    ) -> Option<R> {
         let guard = self
             .records
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.get(wire_id).cloned()
+        guard.get(wire_id).map(f)
+    }
+
+    /// Returns a compact copy-type view (status, attempt, `replay_children`)
+    /// of the stored record, without cloning its owned strings.
+    pub(crate) fn status_view(&self, wire_id: &str) -> Option<CheckpointStatusView> {
+        self.with_record(wire_id, |record| CheckpointStatusView {
+            status: record.status,
+            attempt: record.attempt,
+            replay_children: record.replay_children,
+        })
+    }
+
+    /// Returns whether a record exists for the given wire ID, without
+    /// cloning anything.
+    pub(crate) fn contains(&self, wire_id: &str) -> bool {
+        let guard = self
+            .records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.contains_key(wire_id)
     }
 
     /// Inserts or replaces a record in the log.
@@ -372,8 +457,8 @@ impl EngineState {
     pub(crate) fn is_replaying_at(&self, positional_id: &str) -> bool {
         let wire_id = compute_wire_id(positional_id);
         self.checkpoint_log
-            .get(&wire_id)
-            .is_some_and(|r| r.status.is_terminal())
+            .status_view(&wire_id)
+            .is_some_and(|view| view.status.is_terminal())
     }
 
     /// Returns whether the context is currently in replay mode (there are
@@ -393,7 +478,7 @@ impl EngineState {
         }
         let next_positional = self.id_counter.peek_next();
         let next_wire = compute_wire_id(&next_positional);
-        self.checkpoint_log.get(&next_wire).is_some()
+        self.checkpoint_log.contains(&next_wire)
     }
 }
 
@@ -635,6 +720,86 @@ mod tests {
         let log = CheckpointLog::empty();
         assert!(log.get("1").is_none());
         assert!(log.get("anything").is_none());
+    }
+
+    // ── Targeted accessors (clone-free lookups) ─────────────────────────
+
+    /// Builds a record with every string field populated, so the tests can
+    /// assert the targeted accessors surface the right values without
+    /// needing the full-record clone that `get` performs.
+    fn full_record() -> CheckpointRecord {
+        CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Failed,
+            result: Some(r#""payload""#.to_owned()),
+            error_type: Some("SomeError".to_owned()),
+            error_message: Some("it broke".to_owned()),
+            attempt: 3,
+            invoke_result: Some(r#""invoke-payload""#.to_owned()),
+            invoke_error_type: Some("InvokeError".to_owned()),
+            invoke_error_message: Some("invoke broke".to_owned()),
+            replay_children: true,
+            callback_id: Some("cb-123".to_owned()),
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            op_name: Some("my-step".to_owned()),
+        }
+    }
+
+    #[test]
+    fn status_view_carries_status_attempt_and_replay_children() {
+        let log = CheckpointLog::from_records(vec![("1".to_owned(), full_record())]);
+
+        let view = log.status_view("1");
+        assert!(view.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified present above
+        let view = view.unwrap();
+        assert_eq!(view.status, CheckpointStatus::Failed);
+        assert_eq!(view.attempt, 3);
+        assert!(view.replay_children);
+
+        // The view is a copy type: using it twice must compile.
+        let copy = view;
+        assert_eq!(copy, view);
+
+        assert!(log.status_view("missing").is_none());
+    }
+
+    #[test]
+    fn contains_reports_existence_without_cloning() {
+        let log = CheckpointLog::from_records(vec![("1".to_owned(), full_record())]);
+        assert!(log.contains("1"));
+        assert!(!log.contains("2"));
+        assert!(!CheckpointLog::empty().contains("1"));
+    }
+
+    #[test]
+    fn with_record_projects_only_what_the_closure_takes() {
+        let log = CheckpointLog::from_records(vec![("1".to_owned(), full_record())]);
+
+        // Project a single owned field.
+        let callback_id = log.with_record("1", |r| r.callback_id.clone()).flatten();
+        assert_eq!(callback_id.as_deref(), Some("cb-123"));
+
+        // Project a borrowed comparison — nothing cloned at all.
+        let is_failed = log.with_record("1", |r| r.status == CheckpointStatus::Failed);
+        assert_eq!(is_failed, Some(true));
+
+        // Miss: the closure never runs.
+        let ran = log.with_record("missing", |_| true);
+        assert!(ran.is_none());
+    }
+
+    #[test]
+    fn get_still_returns_the_full_record() {
+        let log = CheckpointLog::from_records(vec![("1".to_owned(), full_record())]);
+        let record = log.get("1");
+        assert!(record.is_some());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified present above
+        let record = record.unwrap();
+        assert_eq!(record.result.as_deref(), Some(r#""payload""#));
+        assert_eq!(record.invoke_error_message.as_deref(), Some("invoke broke"));
+        assert_eq!(record.op_name.as_deref(), Some("my-step"));
     }
 
     // ── Replay-mode detection ───────────────────────────────────────────

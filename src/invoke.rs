@@ -62,25 +62,30 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
         let wire_id = self.op_id.wire().to_owned();
         let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
 
-        // 2. Check checkpoint log for replay.
-        if let Some(record) = self.ctx.checkpoint_record(&positional_id) {
-            // Non-determinism detection: verify the record's identity matches.
-            self.ctx.validate_replay_identity(
-                &record,
-                &wire_id,
-                "ChainedInvoke",
-                Some(CHAINED_INVOKE_SUB_TYPE),
-                self.name.as_deref(),
-            )?;
-            match &record.status {
+        // 2. Check checkpoint log for replay. The validated view covers the
+        // non-terminal branches without cloning; the terminal branches fetch
+        // only the invoke fields they consume.
+        if let Some(view) = self.ctx.checkpoint_view_validated(
+            &positional_id,
+            &wire_id,
+            "ChainedInvoke",
+            Some(CHAINED_INVOKE_SUB_TYPE),
+            self.name.as_deref(),
+        )? {
+            match view.status {
                 CheckpointStatus::Succeeded => {
                     // Invoke succeeded — deserialize the result from invoke details.
-                    let payload = record.invoke_result.as_deref().unwrap_or("null");
+                    let payload = self
+                        .ctx
+                        .with_checkpoint_record(&positional_id, |record| {
+                            record.invoke_result.clone()
+                        })
+                        .flatten();
                     return deserialize_invoke_result(
                         self.result_serdes
                             .as_ref()
                             .or_else(|| self.ctx.default_serdes()),
-                        payload,
+                        payload.as_deref().unwrap_or("null"),
                         &serdes_ctx,
                     )
                     .await;
@@ -89,10 +94,19 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
                 | CheckpointStatus::TimedOut
                 | CheckpointStatus::Stopped => {
                     // Invoke failed — reconstruct InvokeError from details.
+                    let (error_type, error_message) = self
+                        .ctx
+                        .with_checkpoint_record(&positional_id, |record| {
+                            (
+                                record.invoke_error_type.clone(),
+                                record.invoke_error_message.clone(),
+                            )
+                        })
+                        .unwrap_or_default();
                     return Err(invoke_error_from_record(
                         &self.function_id,
-                        record.invoke_error_type.as_deref(),
-                        record.invoke_error_message.as_deref(),
+                        error_type.as_deref(),
+                        error_message.as_deref(),
                     ));
                 }
                 CheckpointStatus::Started | CheckpointStatus::Pending | CheckpointStatus::Ready => {
