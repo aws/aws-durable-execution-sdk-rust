@@ -49,6 +49,27 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps
 
+  # Verify the declared minimum supported Rust version (rust-version in
+  # Cargo.toml) actually compiles the crate. Without this leg the true MSRV
+  # can silently drift above the declared one, and the rust-version field
+  # would then be wrong rather than protective.
+  msrv:
+    name: check (msrv 1.94.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          rustup default 1.94.1
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+
+      - name: Check on MSRV
+        run: cargo check --all-targets --all-features
+
   # Dependency policy: advisories, bans, licenses, sources, plus the
   # direct-dependency allowlist that keeps the production graph closed.
   dependencies:

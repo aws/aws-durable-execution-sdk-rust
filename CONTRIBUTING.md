@@ -34,10 +34,24 @@ them, so a reviewer checks the subject line instead. Keep the subject under 50
 characters, write it in the imperative mood, drop the trailing period, and wrap
 body text at 72 characters.
 
-The crate declares `rust-version = "1.94.1"` and edition 2024. CI builds on
-stable, so a feature newer than the declared minimum compiles locally and in CI
-while still breaking a consumer who honors the minimum. Respect the declared
-version when you reach for something recent.
+The crate declares `rust-version = "1.94.1"` and edition 2024. Most CI jobs
+build on stable, but a dedicated `msrv` job in `ci.yml` runs `cargo check
+--all-targets --all-features` on the declared minimum, so reaching for a
+feature newer than 1.94.1 fails that leg rather than silently raising the
+true minimum above the declared one. Bumping the minimum supported Rust
+version is an intentional, documented change: while the crate is pre-1.0, an
+MSRV bump ships as a minor release (0.x → 0.x+1), never as a patch, and the
+change must update every declaration in the same pull request: the root
+`Cargo.toml` is the source of truth, and every `Cargo.toml` under
+`compliance/` and `examples/` that declares `rust-version` (200+ manifests),
+the `msrv` CI job, and the README must agree with it.
+`scripts/check-msrv-consistency.sh`, wired into `make check`, enforces this
+mechanically, so a bump that misses a declaration fails the quality gate
+rather than leaving stale minimums behind. There is deliberately no
+`rust-toolchain.toml`: pinning one would override `rustup default stable` in
+every CI job (the file takes precedence over the default toolchain), quietly
+turning the stable legs into MSRV legs. Contributors build on any toolchain
+at or above the minimum; the `msrv` job is what guards the floor.
 
 Four places go beyond what the standard guidance asks for, and each one exists
 for a reason worth knowing:
@@ -275,7 +289,8 @@ you have changed the public API. A pull request that fails the gate wastes a CI
 run and a reviewer's first pass.
 
 CI runs four workflows on a pull request. `ci.yml` splits `make check` into a
-`check` job and a `dependencies` job, then builds and lints the `compliance` and
+`check` job and a `dependencies` job, verifies the declared minimum Rust
+version with an `msrv` job, then builds and lints the `compliance` and
 `examples` workspaces. `codeql.yml` runs static analysis over the Rust sources.
 `conformance-tests.yml` runs the ten conformance suites when the SDK or the
 handlers change. `cloud-tests.yml` deploys the example stacks and runs the cloud

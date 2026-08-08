@@ -11,3 +11,4 @@ check:
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 	cargo deny check
 	sh scripts/check-direct-deps.sh
+	sh scripts/check-msrv-consistency.sh
