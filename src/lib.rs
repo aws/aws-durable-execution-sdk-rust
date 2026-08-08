@@ -1206,8 +1206,9 @@ fn parse_envelope(
 /// The envelope is always required: [`run`] and [`wrap`] reject an
 /// envelope-free payload before reaching this function, and there is no
 /// raw-payload fallback. Local testing goes through
-/// [`LocalRunner`](test_util::LocalRunner), which drives the handler
-/// directly and never routes through the service entry points.
+/// [`LocalRunner`](test_util::LocalRunner), which invokes the
+/// [`wrap`]-produced service with synthesized envelopes, so this function
+/// runs on the local path exactly as it does in production.
 fn extract_customer_input<E>(payload: &serde_json::Value) -> Result<E, lambda_runtime::Error>
 where
     E: for<'de> Deserialize<'de>,
@@ -1522,8 +1523,6 @@ where
 {
     use std::sync::Arc as StdArc;
 
-    let handler = StdArc::new(handler);
-
     // Consume Options once, at wrap time. The execution client is resolved a
     // single time here and reused across every invocation (cold-start best
     // practice); the execution-wide default serdes is threaded into each root
@@ -1533,13 +1532,73 @@ where
         sdk_config,
         lambda_client,
     } = options;
-    let default_serdes: Option<StdArc<dyn Serdes>> = serdes;
     let preset_client: Option<StdArc<dyn client::ExecutionClient>> =
         base_lambda_client_from_options(sdk_config, lambda_client).map(|c| {
             StdArc::new(client::LambdaExecutionClient::new(c))
                 as StdArc<dyn client::ExecutionClient>
         });
-    let provider = StdArc::new(ClientProvider::new(preset_client));
+    wrap_with_provider(handler, serdes, ClientProvider::new(preset_client))
+}
+
+/// Creates a durable Lambda service function whose execution client is the
+/// supplied [`client::ExecutionClient`] — the injection point the `test-util`
+/// [`LocalRunner`](test_util::LocalRunner) uses to drive the handler through
+/// the exact production entry path (envelope parsing, bootstrap pagination,
+/// driver, wire-error mapping, response envelope) against a fake transport.
+///
+/// The `default_serdes` plays the same role as [`Options::builder`]'s
+/// `serdes`: the execution-wide fallback for operations that set none.
+#[cfg(feature = "test-util")]
+#[allow(clippy::type_complexity)] // reason: Lambda service function signature is inherently complex
+pub(crate) fn wrap_with_execution_client<F, E, Fut, O>(
+    handler: F,
+    default_serdes: Option<std::sync::Arc<dyn Serdes>>,
+    exec_client: std::sync::Arc<dyn client::ExecutionClient>,
+) -> impl Fn(
+    lambda_runtime::LambdaEvent<serde_json::Value>,
+) -> std::pin::Pin<
+    Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
+> + Send
++ Sync
+where
+    F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+    E: for<'de> Deserialize<'de> + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send,
+    O: Serialize + Send + 'static,
+{
+    wrap_with_provider(
+        handler,
+        default_serdes,
+        ClientProvider::new(Some(exec_client)),
+    )
+}
+
+/// Shared body of [`wrap`] and [`wrap_with_execution_client`]: builds the
+/// per-invocation service function on top of an already-resolved
+/// [`ClientProvider`] and execution-wide default serdes. Keeping a single
+/// body guarantees the `test-util` runner and production execute the same
+/// envelope parsing, pagination, driver, and error-mapping code.
+#[allow(clippy::type_complexity)] // reason: Lambda service function signature is inherently complex
+fn wrap_with_provider<F, E, Fut, O>(
+    handler: F,
+    default_serdes: Option<std::sync::Arc<dyn Serdes>>,
+    provider: ClientProvider,
+) -> impl Fn(
+    lambda_runtime::LambdaEvent<serde_json::Value>,
+) -> std::pin::Pin<
+    Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
+> + Send
++ Sync
+where
+    F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+    E: for<'de> Deserialize<'de> + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send,
+    O: Serialize + Send + 'static,
+{
+    use std::sync::Arc as StdArc;
+
+    let handler = StdArc::new(handler);
+    let provider = StdArc::new(provider);
     let default_serdes = StdArc::new(default_serdes);
 
     move |event: lambda_runtime::LambdaEvent<serde_json::Value>| -> std::pin::Pin<
@@ -2561,7 +2620,9 @@ mod tests {
     fn extract_customer_input_no_envelope_errors() {
         // A payload with no envelope shape at all is an error: there is no
         // raw-payload fallback, with or without `test-util`. Local testing
-        // uses `LocalRunner`, which never routes through this function.
+        // uses `LocalRunner`, which drives the `wrap`-produced service and
+        // therefore routes through this function with well-formed
+        // synthesized envelopes.
         let payload = serde_json::json!({ "count": 42 });
         let result: Result<serde_json::Value, _> = extract_customer_input(&payload);
         assert!(result.is_err());

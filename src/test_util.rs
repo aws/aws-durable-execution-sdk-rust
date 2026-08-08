@@ -1,12 +1,28 @@
 //! In-process local testing runner (`test-util` feature).
 //!
 //! [`LocalRunner`] drives a durable handler to completion entirely in
-//! memory: it runs the handler through the same driver and operation
-//! machinery the production runtime uses, backed by an internal in-memory
-//! execution client instead of the Lambda checkpoint API. When the handler
-//! suspends, the runner advances the simulated backend (timers fire, retry
-//! delays elapse, callbacks are delivered) and re-invokes, exactly as the
-//! real service would, until the execution reaches a terminal outcome.
+//! memory: each simulated invocation goes through the **same service
+//! function production uses** — the one [`wrap`](crate::wrap) builds —
+//! fed a synthesized invocation envelope and backed by an internal
+//! in-memory execution client instead of the Lambda checkpoint API.
+//! Envelope parsing, bootstrap pagination, the suspension driver, wire
+//! error mapping, and the response envelope are therefore the production
+//! code paths, not a parallel reimplementation. When the handler
+//! suspends, the runner advances the simulated backend (timers fire,
+//! retry delays elapse, callbacks are delivered) and re-invokes, exactly
+//! as the real service would, until the execution reaches a terminal
+//! outcome.
+//!
+//! The runner also reproduces the **production task topology**: the
+//! service future is awaited inline (under the caller's `block_on`, as
+//! `lambda_runtime` does), never on a spawned task, so
+//! `tokio::task::try_id()` is `None` at context-creation time and the
+//! task-ownership guard behaves exactly as it does in deployment.
+//!
+//! By default the in-memory backend serves execution state in **multiple
+//! pages** (2+ whenever the recorded history is large enough), matching
+//! the paginating service; [`LocalRunner::single_page`] opts into the
+//! single-page special case.
 //!
 //! The runner records every checkpointed operation so a test can assert on
 //! the execution history via [`TestResult::operations`] and
@@ -86,8 +102,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use tracing::Instrument as _;
-
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -99,19 +113,22 @@ use aws_sdk_lambda::types::{
 };
 
 use crate::BoxError;
-use crate::client::{
-    CheckpointOutput, ClientError, ExecutionClient, GetStateOutput, operations_to_checkpoint_log,
-    resolve_bootstrap_log,
-};
+use crate::client::{CheckpointOutput, ClientError, ExecutionClient, GetStateOutput};
 use crate::context::DurableContext;
-use crate::driver::{InvocationOutcome, drive_invocation};
-use crate::error::{OperationError, OperationErrorKind};
 
 /// Default cap on the number of invocations the runner will drive before
 /// declaring the execution stuck. Generous enough for deep timer/retry
 /// chains, low enough to fail a non-terminating handler (e.g. a
 /// `wait_for_condition` that never advances) instead of looping forever.
 const DEFAULT_MAX_INVOCATIONS: usize = 100;
+
+/// Default page size for simulated execution-state pagination. `1` maximizes
+/// fidelity pressure: any history of two or more operations is served as 2+
+/// pages (inline first page plus a `get_state` fetch), so every non-trivial
+/// test exercises the bootstrap and checkpoint pagination paths by default —
+/// the dimension where a missing-pagination defect was previously untestable
+/// by construction.
+const DEFAULT_STATE_PAGE_SIZE: usize = 1;
 
 // ────────────────────────────────────────────────────────────────────────────
 // TestOperation
@@ -388,15 +405,18 @@ enum CallbackOutcome {
 pub struct LocalRunner {
     max_invocations: usize,
     callback_outcomes: Vec<CallbackOutcome>,
-    /// When set, simulates paginated execution state: the initial
-    /// checkpoint log is truncated to this many operations, and the backend
-    /// returns a pagination marker so the context fetches the remainder via
-    /// `get_state`. This exercises the bootstrap pagination path.
+    /// Initial-state page size. When set, the synthesized invocation
+    /// envelope carries at most this many history operations inline plus a
+    /// pagination marker, so the context fetches the remainder via
+    /// `get_state` — the paginating service is the DEFAULT
+    /// ([`DEFAULT_STATE_PAGE_SIZE`]); [`LocalRunner::single_page`] opts
+    /// into the single-page special case (`None`).
     initial_page_size: Option<usize>,
-    /// When set, the backend's checkpoint response includes `next_marker`
-    /// once the total stored operations exceed this threshold, simulating a
-    /// paginated checkpoint response. This exercises the checkpoint
-    /// pagination path in `DurableContext::checkpoint_updates`.
+    /// Checkpoint-response page size. When set, the backend's checkpoint
+    /// response includes `next_marker` once the total stored operations
+    /// exceed this threshold, simulating a paginated checkpoint response
+    /// (the default; see [`DEFAULT_STATE_PAGE_SIZE`]). This exercises the
+    /// checkpoint pagination path in `DurableContext::checkpoint_updates`.
     checkpoint_page_size: Option<usize>,
 }
 
@@ -409,6 +429,12 @@ impl Default for LocalRunner {
 impl LocalRunner {
     /// Creates a runner with default settings and no queued callback
     /// outcomes.
+    ///
+    /// By default the simulated backend **paginates execution state**
+    /// (both the initial invocation envelope and checkpoint responses
+    /// split into 2+ pages once history is large enough), matching the
+    /// real service. Use [`single_page`](Self::single_page) for the
+    /// explicit single-page special case.
     ///
     /// # Examples
     ///
@@ -423,9 +449,32 @@ impl LocalRunner {
         Self {
             max_invocations: DEFAULT_MAX_INVOCATIONS,
             callback_outcomes: Vec::new(),
-            initial_page_size: None,
-            checkpoint_page_size: None,
+            initial_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
+            checkpoint_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
         }
+    }
+
+    /// Disables state pagination: the invocation envelope carries the full
+    /// history inline and checkpoint responses never set a pagination
+    /// marker.
+    ///
+    /// This is the **special case** — the real service paginates, and the
+    /// runner does too by default. Reach for this only when a test
+    /// specifically targets single-page behavior.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().single_page();
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn single_page(mut self) -> Self {
+        self.initial_page_size = None;
+        self.checkpoint_page_size = None;
+        self
     }
 
     /// Sets the maximum number of invocations the runner will drive before
@@ -531,10 +580,17 @@ impl LocalRunner {
 
     /// Drives `handler` to a terminal outcome, feeding it `event`.
     ///
-    /// The handler is invoked once per simulated invocation. The event is
-    /// serialized once and a fresh copy is deserialized for each invocation,
-    /// mirroring the way the service re-delivers the input payload on every
-    /// re-invocation.
+    /// Each simulated invocation goes through the **production service
+    /// function** ([`wrap`](crate::wrap)'s body) fed a synthesized
+    /// invocation envelope, so envelope parsing, bootstrap pagination, the
+    /// suspension driver, and wire error mapping are the exact code
+    /// production runs. The service future is awaited inline — the same
+    /// task topology `lambda_runtime` produces under `block_on` — so
+    /// task-ownership behavior matches deployment.
+    ///
+    /// The event is serialized once and embedded in each invocation's
+    /// envelope, mirroring the way the service re-delivers the input
+    /// payload on every re-invocation.
     ///
     /// # Examples
     ///
@@ -561,20 +617,42 @@ impl LocalRunner {
     where
         E: Serialize + DeserializeOwned + Send + 'static,
         O: Serialize + DeserializeOwned + Send + 'static,
-        F: Fn(E, DurableContext) -> Fut + Send + Sync,
+        F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send,
     {
-        let backend = if let Some(cp_size) = self.checkpoint_page_size {
-            Arc::new(Backend::with_checkpoint_page_size(
-                self.callback_outcomes.clone(),
-                cp_size,
-            ))
-        } else {
-            Arc::new(Backend::new(self.callback_outcomes.clone()))
-        };
+        let backend = Arc::new(Backend::new(
+            self.callback_outcomes.clone(),
+            self.checkpoint_page_size,
+        ));
+        self.run_on_backend(backend, handler, event).await
+    }
+
+    /// The invoke → parse → advance loop over an externally supplied
+    /// backend. Internal seam: unit tests inject a backend they retain a
+    /// handle to, so they can assert on transport-level facts (e.g. how
+    /// many `get_state` fetches pagination forced).
+    #[allow(clippy::too_many_lines)] // reason: the invoke → drive → advance loop reads better as one flow
+    async fn run_on_backend<E, O, F, Fut>(
+        &self,
+        backend: Arc<Backend>,
+        handler: F,
+        event: E,
+    ) -> TestResult<O>
+    where
+        E: Serialize + DeserializeOwned + Send + 'static,
+        O: Serialize + DeserializeOwned + Send + 'static,
+        F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send,
+    {
         let client: Arc<dyn ExecutionClient> = Arc::clone(&backend) as Arc<dyn ExecutionClient>;
 
-        // Serialize the event once; deserialize a fresh copy per invocation.
+        // The handler runs behind the SAME service function production
+        // registers with the Lambda runtime — only the transport (the
+        // execution client) is faked.
+        let service = crate::wrap_with_execution_client(handler, None, client);
+
+        // Serialize the event once; the envelope re-delivers it per
+        // invocation.
         let event_json = match serde_json::to_string(&event) {
             Ok(json) => json,
             Err(e) => {
@@ -607,91 +685,36 @@ impl LocalRunner {
                 };
             }
 
-            let ops = backend.build_operations();
+            let payload = build_envelope(&backend, &event_json, self.initial_page_size);
+            let lambda_event =
+                lambda_runtime::LambdaEvent::new(payload, lambda_runtime::Context::default());
 
-            // Simulate initial-state pagination: if a page size is
-            // configured and the history exceeds it, hand the context only
-            // a truncated first page plus a pagination marker — exactly
-            // what the service embeds in InitialExecutionState — and let
-            // the shared production bootstrap helper decide whether to
-            // fetch the remainder via get_state.
-            let (first_page_ops, initial_marker) = match self.initial_page_size {
-                Some(page_size) if ops.len() > page_size => {
-                    let first_page = ops.get(..page_size).unwrap_or(&ops).to_vec();
-                    (first_page, Some(format!("initial-marker-{}", ops.len())))
-                }
-                _ => (ops, None),
-            };
-            let first_page_log = operations_to_checkpoint_log(&first_page_ops);
-            let checkpoint_log = match resolve_bootstrap_log(
-                client.as_ref(),
-                "arn:aws:lambda:us-west-2:000000000000:function:local-test",
-                &backend.current_token(),
-                first_page_log,
-                initial_marker.as_deref(),
-            )
-            .await
-            {
-                Ok(log) => Arc::new(log),
+            // Await the service future INLINE — never on a spawned task.
+            // This reproduces the production topology (`lambda_runtime`
+            // awaits the handler under `block_on`), so
+            // `tokio::task::try_id()` is `None` at context-creation time
+            // and the task-ownership guard behaves as it does deployed.
+            let response = match service(lambda_event).await {
+                Ok(envelope) => envelope,
                 Err(e) => {
                     return TestResult {
                         disposition: Disposition::Failed,
                         output: None,
-                        error_type: Some("BootstrapFailed".to_owned()),
-                        error_message: Some(format!("paginate initial state: {e}")),
-                        operations: backend.snapshot_operations(),
-                        invocations,
-                    };
-                }
-            };
-            let token = backend.current_token();
-
-            let ctx = DurableContext::new_root_with_client(
-                String::from("arn:aws:lambda:us-west-2:000000000000:function:local-test"),
-                lambda_runtime::Context::default(),
-                checkpoint_log,
-                Arc::clone(&client),
-                token,
-            );
-            let signal = ctx.suspension_signal().clone();
-
-            // Deserialize a fresh event for this invocation.
-            let event_inst: E = match serde_json::from_str(&event_json) {
-                Ok(v) => v,
-                Err(e) => {
-                    return TestResult {
-                        disposition: Disposition::Failed,
-                        output: None,
-                        error_type: Some("SerializationFailed".to_owned()),
-                        error_message: Some(format!("deserialize event: {e}")),
+                        error_type: Some("RuntimeError".to_owned()),
+                        error_message: Some(e.to_string()),
                         operations: backend.snapshot_operations(),
                         invocations,
                     };
                 }
             };
 
-            let handler_ref = &handler;
-            // Mirror production: instrument the handler future with the
-            // handler-level span so replay-aware log filters behave the same
-            // under the local runner as on Lambda.
-            let replay_span = ctx.replay_span();
-            let outcome = drive_invocation(
-                async move {
-                    match handler_ref(event_inst, ctx).await {
-                        Ok(value) => serde_json::to_string(&value)
-                            .map_err(|e| ("HandlerError".to_owned(), e.to_string())),
-                        Err(e) => Ok(wire_error_from_box_error(e))
-                            .map_or_else(|never: (String, String)| Err(never), Err),
-                    }
-                }
-                .instrument(replay_span),
-                signal,
-            )
-            .await;
-
-            match outcome {
-                InvocationOutcome::Complete(serialized) => {
-                    let output = serde_json::from_str::<O>(&serialized).ok();
+            match response.get("Status").and_then(serde_json::Value::as_str) {
+                Some("SUCCEEDED") => {
+                    let serialized = response
+                        .get("Result")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("null");
+                    let output = serde_json::from_str::<O>(serialized).ok();
                     let (error_type, error_message, disposition) = if output.is_some() {
                         (None, None, Disposition::Succeeded)
                     } else {
@@ -710,10 +733,18 @@ impl LocalRunner {
                         invocations,
                     };
                 }
-                InvocationOutcome::Failed {
-                    error_type,
-                    error_message,
-                } => {
+                Some("FAILED") => {
+                    let error = response.get("Error");
+                    let error_type = error
+                        .and_then(|e| e.get("ErrorType"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("HandlerError")
+                        .to_owned();
+                    let error_message = error
+                        .and_then(|e| e.get("ErrorMessage"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
                     return TestResult {
                         disposition: Disposition::Failed,
                         output: None,
@@ -723,7 +754,7 @@ impl LocalRunner {
                         invocations,
                     };
                 }
-                InvocationOutcome::Pending => {
+                Some("PENDING") => {
                     // Advance the simulated backend (timers, retries,
                     // callbacks). If nothing can advance, the execution is
                     // genuinely stuck.
@@ -742,32 +773,73 @@ impl LocalRunner {
                         };
                     }
                 }
+                other => {
+                    return TestResult {
+                        disposition: Disposition::Failed,
+                        output: None,
+                        error_type: Some("RuntimeError".to_owned()),
+                        error_message: Some(format!(
+                            "unexpected response envelope status: {other:?}"
+                        )),
+                        operations: backend.snapshot_operations(),
+                        invocations,
+                    };
+                }
             }
         }
     }
 }
 
-/// Extracts a `(wire_error_type, message)` pair from a boxed handler error.
-fn wire_error_from_box_error(err: BoxError) -> (String, String) {
-    match err.downcast::<OperationError>() {
-        Ok(op_err) => (operation_error_type(&op_err), op_err.to_string()),
-        Err(other) => ("HandlerError".to_owned(), other.to_string()),
-    }
-}
+/// The execution ARN the local runner stamps on every synthesized envelope.
+const LOCAL_EXECUTION_ARN: &str = "arn:aws:lambda:us-west-2:000000000000:function:local-test";
 
-/// Maps an `OperationError` kind to its wire error type name.
-fn operation_error_type(err: &OperationError) -> String {
-    match err.kind() {
-        OperationErrorKind::Step(_) => "StepError",
-        OperationErrorKind::Wait(_) => "WaitError",
-        OperationErrorKind::Invoke(_) => "InvokeError",
-        OperationErrorKind::Callback(_) => "CallbackError",
-        OperationErrorKind::ChildContext(_) => "ChildContextError",
-        OperationErrorKind::WaitForCondition(_) => "WaitForConditionError",
-        OperationErrorKind::Combinator(_) => "PromiseCombinatorError",
-        OperationErrorKind::NonDeterministicExecution(_) => "NonDeterministicExecutionError",
-    }
-    .to_owned()
+/// Synthesizes the durable invocation envelope for one simulated
+/// invocation, in the exact wire shape the service delivers and
+/// [`wrap`](crate::wrap) parses: `DurableExecutionArn`, `CheckpointToken`,
+/// and `InitialExecutionState.Operations` with the customer input embedded
+/// in the leading `Execution` operation's `ExecutionDetails.InputPayload`.
+///
+/// When `initial_page_size` is set and the recorded history exceeds it,
+/// only the first page of history rides inline and
+/// `InitialExecutionState.NextMarker` signals the truncation — the
+/// production bootstrap path then fetches the remainder via `get_state`,
+/// exactly as it does against the paginating service.
+fn build_envelope(
+    backend: &Backend,
+    event_json: &str,
+    initial_page_size: Option<usize>,
+) -> serde_json::Value {
+    let history = backend.envelope_history();
+    let (page, next_marker) = match initial_page_size {
+        Some(size) if history.len() > size => (
+            history.get(..size).unwrap_or(&history).to_vec(),
+            Some(format!("initial-marker-{}", history.len())),
+        ),
+        _ => (history, None),
+    };
+
+    let mut operations = Vec::with_capacity(page.len() + 1);
+    operations.push(serde_json::json!({
+        "Id": "execution",
+        "Type": "Execution",
+        "Status": "Started",
+        "ExecutionDetails": { "InputPayload": event_json }
+    }));
+    operations.extend(page);
+
+    let initial_state = match next_marker {
+        Some(marker) => serde_json::json!({
+            "Operations": operations,
+            "NextMarker": marker,
+        }),
+        None => serde_json::json!({ "Operations": operations }),
+    };
+
+    serde_json::json!({
+        "DurableExecutionArn": LOCAL_EXECUTION_ARN,
+        "CheckpointToken": backend.current_token(),
+        "InitialExecutionState": initial_state,
+    })
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1409,10 +1481,14 @@ struct Backend {
     /// the number of updated operations exceeds this value, simulating a
     /// paginated checkpoint response.
     checkpoint_page_size: Option<usize>,
+    /// Counts `get_state` calls — lets tests assert that pagination
+    /// actually forced a state fetch (or, under `single_page`, that none
+    /// occurred).
+    get_state_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl Backend {
-    fn new(callback_outcomes: Vec<CallbackOutcome>) -> Self {
+    fn new(callback_outcomes: Vec<CallbackOutcome>, checkpoint_page_size: Option<usize>) -> Self {
         Self {
             state: Mutex::new(BackendState {
                 ops: Vec::new(),
@@ -1420,23 +1496,17 @@ impl Backend {
                 callback_counter: 0,
                 callback_outcomes,
             }),
-            checkpoint_page_size: None,
+            checkpoint_page_size,
+            get_state_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    fn with_checkpoint_page_size(
-        callback_outcomes: Vec<CallbackOutcome>,
-        page_size: usize,
-    ) -> Self {
-        Self {
-            state: Mutex::new(BackendState {
-                ops: Vec::new(),
-                token_counter: 0,
-                callback_counter: 0,
-                callback_outcomes,
-            }),
-            checkpoint_page_size: Some(page_size),
-        }
+    /// The number of `get_state` calls the SDK has made against this
+    /// backend.
+    #[cfg(test)]
+    fn get_state_call_count(&self) -> usize {
+        self.get_state_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BackendState> {
@@ -1456,6 +1526,14 @@ impl Backend {
     fn build_operations(&self) -> Vec<Operation> {
         let state = self.lock();
         state.ops.iter().filter_map(build_operation).collect()
+    }
+
+    /// Renders the recorded history as envelope-wire JSON operation
+    /// objects — the exact shape `parse_inline_operations` reads from
+    /// `InitialExecutionState.Operations`.
+    fn envelope_history(&self) -> Vec<serde_json::Value> {
+        let state = self.lock();
+        state.ops.iter().map(stored_op_envelope_json).collect()
     }
 
     /// Snapshots the recorded operations as public [`TestOperation`]s.
@@ -1735,6 +1813,8 @@ impl ExecutionClient for Backend {
         _checkpoint_token: &str,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
     {
+        self.get_state_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let operations = self.build_operations();
         Box::pin(async move { Ok(GetStateOutput { operations }) })
     }
@@ -1821,6 +1901,80 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
     }
 
     builder.build().ok()
+}
+
+/// Renders a stored op as an envelope-wire JSON operation object, placing
+/// result/error in the details bucket `parse_single_operation` reads for
+/// that operation type. Mirrors [`build_operation`] field-for-field so the
+/// inline envelope page and the `get_state` fetch describe identical
+/// records.
+fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("Id".to_owned(), serde_json::json!(stored.id));
+    obj.insert(
+        "Type".to_owned(),
+        serde_json::json!(operation_type_str(&stored.op_type)),
+    );
+    obj.insert(
+        "Status".to_owned(),
+        serde_json::json!(operation_status_str(&stored.status)),
+    );
+    if let Some(st) = &stored.sub_type {
+        obj.insert("SubType".to_owned(), serde_json::json!(st));
+    }
+    if let Some(n) = &stored.name {
+        obj.insert("Name".to_owned(), serde_json::json!(n));
+    }
+
+    let error_obj = (stored.error_type.is_some() || stored.error_message.is_some()).then(|| {
+        let mut err = serde_json::Map::new();
+        if let Some(t) = &stored.error_type {
+            err.insert("ErrorType".to_owned(), serde_json::json!(t));
+        }
+        if let Some(m) = &stored.error_message {
+            err.insert("ErrorMessage".to_owned(), serde_json::json!(m));
+        }
+        serde_json::Value::Object(err)
+    });
+
+    let mut details = serde_json::Map::new();
+    if let Some(r) = &stored.result {
+        details.insert("Result".to_owned(), serde_json::json!(r));
+    }
+    if let Some(e) = error_obj {
+        details.insert("Error".to_owned(), e);
+    }
+
+    match stored.op_type {
+        OperationType::Step => {
+            details.insert("Attempt".to_owned(), serde_json::json!(stored.attempt));
+            obj.insert("StepDetails".to_owned(), serde_json::Value::Object(details));
+        }
+        OperationType::Context => {
+            obj.insert(
+                "ContextDetails".to_owned(),
+                serde_json::Value::Object(details),
+            );
+        }
+        OperationType::Callback => {
+            if let Some(id) = &stored.callback_id {
+                details.insert("CallbackId".to_owned(), serde_json::json!(id));
+            }
+            obj.insert(
+                "CallbackDetails".to_owned(),
+                serde_json::Value::Object(details),
+            );
+        }
+        OperationType::ChainedInvoke => {
+            obj.insert(
+                "ChainedInvokeDetails".to_owned(),
+                serde_json::Value::Object(details),
+            );
+        }
+        _ => {}
+    }
+
+    serde_json::Value::Object(obj)
 }
 
 /// Human-readable operation type for [`TestOperation::op_type`].
@@ -3230,7 +3384,7 @@ mod tests {
     /// should then paginate via `get_state`.
     #[tokio::test]
     async fn backend_paginated_checkpoint_returns_marker() {
-        let backend = Arc::new(Backend::with_checkpoint_page_size(Vec::new(), 1));
+        let backend = Arc::new(Backend::new(Vec::new(), Some(1)));
 
         // Checkpoint two operations so we exceed page_size=1.
         let updates = vec![
@@ -3361,6 +3515,188 @@ mod tests {
         assert_eq!(
             calls_after_no_marker, 1,
             "no-marker path must not call get_state again"
+        );
+    }
+
+    // ── Harness fidelity: production task topology ──────────────────────
+
+    /// The runner awaits the handler INLINE under the caller's `block_on`
+    /// — the production `lambda_runtime` topology — so the context is
+    /// created where `tokio::task::try_id()` is `None`, not on a spawned
+    /// task. This is the dimension that previously hid the ownership
+    /// guard's production inertness.
+    #[tokio::test]
+    async fn runner_topology_matches_production_inline_block_on() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    // Same task visibility production gives the handler:
+                    // awaited inline under block_on → no task ID.
+                    let inline = tokio::task::try_id().is_none();
+                    let v = ctx.step(|_| async { Ok(1_i32) }).await?;
+                    Ok::<_, BoxError>((inline, v))
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            result.output(),
+            Some(&(true, 1)),
+            "handler must run inline (try_id() == None), matching the deployed topology"
+        );
+    }
+
+    /// Under the production topology, a durable operation invoked from a
+    /// bare user `tokio::spawn` (unblessed) is rejected by the ownership
+    /// guard — the runner must reproduce that, not mask it.
+    #[tokio::test]
+    async fn runner_rejects_durable_ops_from_unblessed_spawned_task() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let foreign = ctx.clone();
+                    let joined: Result<i32, String> = tokio::spawn(async move {
+                        foreign
+                            .step(|_| async { Ok(7_i32) })
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let v = joined.map_err(BoxError::from)?;
+                    Ok::<_, BoxError>(v)
+                },
+                (),
+            )
+            .await;
+
+        assert!(
+            result.is_failure(),
+            "unblessed tokio::spawn must fail the ownership check as it does in production"
+        );
+        let msg = result.error_message().unwrap_or_default();
+        assert!(
+            msg.contains("Use .spawn()"),
+            "ownership rejection should carry the production guidance: {msg}"
+        );
+    }
+
+    // ── Harness fidelity: state pagination is the DEFAULT ───────────────
+
+    /// By default the backend serves execution state in 2+ pages: a
+    /// re-invocation with two or more recorded operations gets a truncated
+    /// inline envelope page plus `NextMarker`, and checkpoint responses
+    /// paginate — both force real `get_state` fetches through the
+    /// production pagination paths.
+    #[tokio::test]
+    async fn default_state_pagination_forces_get_state_fetches() {
+        let runner = LocalRunner::new();
+        let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
+
+        let result = runner
+            .run_on_backend(
+                Arc::clone(&backend),
+                |(), ctx: DurableContext| async move {
+                    let a = ctx.step(|_| async { Ok(1_i32) }).name("a").await?;
+                    // Suspend so the next invocation bootstraps from a
+                    // multi-operation (hence multi-page) history.
+                    ctx.wait(std::time::Duration::from_secs(1))
+                        .name("cooldown")
+                        .await?;
+                    let b = ctx
+                        .step(move |_| async move { Ok(a + 1) })
+                        .name("b")
+                        .await?;
+                    Ok::<_, BoxError>(b)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&2));
+        assert!(
+            result.invocation_count() >= 2,
+            "wait must force a re-invocation"
+        );
+        assert!(
+            backend.get_state_call_count() >= 2,
+            "multi-page default must force get_state fetches for both the bootstrap \
+             (envelope NextMarker) and checkpoint pagination paths; saw {}",
+            backend.get_state_call_count()
+        );
+    }
+
+    /// `single_page()` is the explicit special case: the full history rides
+    /// inline in every envelope and no checkpoint response paginates, so
+    /// the SDK never needs a `get_state` fetch.
+    #[tokio::test]
+    async fn single_page_never_fetches_state() {
+        let runner = LocalRunner::new().single_page();
+        let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
+
+        let result = runner
+            .run_on_backend(
+                Arc::clone(&backend),
+                |(), ctx: DurableContext| async move {
+                    let a = ctx.step(|_| async { Ok(1_i32) }).name("a").await?;
+                    ctx.wait(std::time::Duration::from_secs(1))
+                        .name("cooldown")
+                        .await?;
+                    let b = ctx
+                        .step(move |_| async move { Ok(a + 1) })
+                        .name("b")
+                        .await?;
+                    Ok::<_, BoxError>(b)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            backend.get_state_call_count(),
+            0,
+            "single-page mode must never require a get_state fetch"
+        );
+    }
+
+    // ── Harness fidelity: production wire-error mapping ─────────────────
+
+    /// The runner reports the SAME wire error message production reports.
+    /// For `ChildContextError::ChildFailed`, production extracts the RAW
+    /// child message (via `wire_error_from_operation_error`), not the full
+    /// `Display` chain — the divergence the old duplicated
+    /// `wire_error_from_box_error` in this module had.
+    #[tokio::test]
+    async fn child_failure_wire_error_matches_production_raw_message() {
+        let result: TestResult<i32> = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let v = ctx
+                        .run_in_child_context(|_child| async move {
+                            Err::<i32, BoxError>("boom-child".into())
+                        })
+                        .await?;
+                    Ok::<_, BoxError>(v)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_failure());
+        assert_eq!(result.error_type(), Some("ChildContextError"));
+        let msg = result.error_message().unwrap_or_default();
+        assert!(
+            msg.contains("boom-child"),
+            "raw child message must survive: {msg}"
+        );
+        assert!(
+            !msg.contains("child failed:"),
+            "wire message must be the raw child message (production extraction), not the \
+             Display chain: {msg}"
         );
     }
 }
