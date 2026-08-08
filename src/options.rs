@@ -1,8 +1,9 @@
 //! Configuration types for the durable execution runtime.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::Serdes;
+use crate::{Serdes, WaitStrategy};
 
 /// Error returned when [`OptionsBuilder::build()`] detects an invalid
 /// configuration combination.
@@ -64,6 +65,18 @@ pub struct Options {
     /// A pre-built Lambda client. When set, it is used directly instead of
     /// building one from [`Self::sdk_config`].
     pub(crate) lambda_client: Option<aws_sdk_lambda::Client>,
+    /// Delay/backoff schedule applied between retries of the durable
+    /// execution service calls (`CheckpointDurableExecution`,
+    /// `GetDurableExecutionState`). `None` keeps the SDK's built-in
+    /// schedule.
+    pub(crate) polling_strategy: Option<WaitStrategy>,
+    /// Coalescing window for checkpoint writes. `None` (the default) writes
+    /// every checkpoint immediately, exactly as before this knob existed.
+    pub(crate) checkpoint_delay: Option<Duration>,
+    /// Whether checkpoint writes batch behind the single-writer flush lock
+    /// even without a coalescing window. `false` (the default) keeps
+    /// immediate writes.
+    pub(crate) checkpoint_batching: bool,
 }
 
 impl Default for Options {
@@ -82,6 +95,9 @@ impl Default for Options {
             serdes: None,
             sdk_config: None,
             lambda_client: None,
+            polling_strategy: None,
+            checkpoint_delay: None,
+            checkpoint_batching: false,
         }
     }
 }
@@ -125,6 +141,9 @@ pub struct OptionsBuilder {
     serdes: Option<Arc<dyn Serdes>>,
     sdk_config: Option<aws_config::SdkConfig>,
     lambda_client: Option<aws_sdk_lambda::Client>,
+    polling_strategy: Option<WaitStrategy>,
+    checkpoint_delay: Option<Duration>,
+    checkpoint_batching: Option<bool>,
 }
 
 impl OptionsBuilder {
@@ -208,6 +227,144 @@ impl OptionsBuilder {
         self
     }
 
+    /// Sets the delay/backoff schedule the SDK applies between retries of
+    /// its durable execution service calls (`CheckpointDurableExecution`
+    /// and `GetDurableExecutionState`).
+    ///
+    /// The strategy's `initial_delay` is the delay before the first retry,
+    /// multiplied by `backoff_factor` after each subsequent failed attempt
+    /// and capped at `max_delay`. It shapes only the *delays* between
+    /// attempts; the retry attempt budget and the retryable/non-retryable
+    /// classification of service errors are unchanged.
+    ///
+    /// When unset, the SDK keeps its built-in schedule: 100 ms initial
+    /// delay, 2.0 backoff factor, capped at 2 seconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::{Options, WaitStrategy};
+    /// use std::time::Duration;
+    ///
+    /// let opts = Options::builder()
+    ///     .polling_strategy(
+    ///         WaitStrategy::builder()
+    ///             .initial_delay(Duration::from_millis(250))
+    ///             .max_delay(Duration::from_secs(5))
+    ///             .backoff_factor(3.0)
+    ///             .build(),
+    ///     )
+    ///     .build()
+    ///     .expect("valid config");
+    /// # drop(opts);
+    /// ```
+    pub fn polling_strategy(mut self, strategy: WaitStrategy) -> Self {
+        self.polling_strategy = Some(strategy);
+        self
+    }
+
+    /// Defers checkpoint writes for up to `delay` so that checkpoints from
+    /// concurrently running operations coalesce into fewer service calls.
+    ///
+    /// With a delay configured, a checkpoint written while other operations
+    /// are also checkpointing joins a shared batch; the batch is sent as a
+    /// single `CheckpointDurableExecution` call when the window elapses.
+    /// For high-fan-out executions (large `map`/`parallel` batches) this
+    /// trades up to `delay` of extra latency per checkpoint for
+    /// substantially fewer API calls. A coalesced batch is split to respect
+    /// the service's per-request limits (operation count and payload size),
+    /// preserving write order across the splits. Every operation still
+    /// awaits its own checkpoint before proceeding, so ordering and replay
+    /// semantics are unchanged.
+    ///
+    /// # Flush contract
+    ///
+    /// A checkpoint that must land before the execution can make progress
+    /// is never held back by the window. Pending checkpoints are flushed
+    /// unconditionally at these points:
+    ///
+    /// - **Suspension** — before an invocation reports `PENDING` to the
+    ///   service, every buffered checkpoint is written, so no recorded
+    ///   progress is lost across the suspend/resume boundary.
+    /// - **Execution completion** — before an invocation reports its
+    ///   terminal `SUCCEEDED`/`FAILED` envelope, the buffer is drained.
+    /// - **Callback creation** — creating a callback flushes immediately,
+    ///   because the service assigns the callback ID in the checkpoint
+    ///   response and the handler needs that ID right away.
+    ///
+    /// When unset (the default), every checkpoint is written immediately.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::Options;
+    /// use std::time::Duration;
+    ///
+    /// let opts = Options::builder()
+    ///     .checkpoint_delay(Duration::from_millis(20))
+    ///     .build()
+    ///     .expect("valid config");
+    /// # drop(opts);
+    /// ```
+    pub fn checkpoint_delay(mut self, delay: Duration) -> Self {
+        self.checkpoint_delay = Some(delay);
+        self
+    }
+
+    /// Batches multiple checkpoint requests into fewer API calls, without
+    /// adding latency to any individual checkpoint.
+    ///
+    /// With batching enabled, checkpoint writes go through a single ordered
+    /// writer. A checkpoint that arrives while an earlier write is still in
+    /// flight joins a shared buffer, and the whole buffer is sent together
+    /// in the next `CheckpointDurableExecution` call once the writer is
+    /// free. Under high fan-out (large `map`/`parallel` batches) this
+    /// substantially reduces API calls; a sequential handler sees one call
+    /// per checkpoint exactly as today. Batches are split to respect the
+    /// service's per-request limits (operation count and payload size),
+    /// preserving write order across the splits, and every operation still
+    /// awaits its own checkpoint before proceeding, so ordering and replay
+    /// semantics are unchanged.
+    ///
+    /// Combine with [`checkpoint_delay`](Self::checkpoint_delay) to also
+    /// hold writes open for a coalescing window; batching alone never
+    /// delays a write.
+    ///
+    /// # Flush contract
+    ///
+    /// A checkpoint that must land before the execution can make progress
+    /// is never held back by batching. Pending checkpoints are flushed
+    /// unconditionally — and any in-flight batched write is awaited — at
+    /// these points:
+    ///
+    /// - **Suspension** — before an invocation reports `PENDING` to the
+    ///   service, every buffered checkpoint is written, so no recorded
+    ///   progress is lost across the suspend/resume boundary.
+    /// - **Execution completion** — before an invocation reports its
+    ///   terminal `SUCCEEDED`/`FAILED` envelope, the buffer is drained.
+    /// - **Callback creation** — creating a callback flushes immediately,
+    ///   because the service assigns the callback ID in the checkpoint
+    ///   response and the handler needs that ID right away.
+    ///
+    /// When unset or `false` (the default), every checkpoint is written
+    /// immediately.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::Options;
+    ///
+    /// let opts = Options::builder()
+    ///     .checkpoint_batching(true)
+    ///     .build()
+    ///     .expect("valid config");
+    /// # drop(opts);
+    /// ```
+    pub fn checkpoint_batching(mut self, enabled: bool) -> Self {
+        self.checkpoint_batching = Some(enabled);
+        self
+    }
+
     /// Builds the [`Options`] from the configured values.
     ///
     /// # Errors
@@ -240,6 +397,9 @@ impl OptionsBuilder {
             serdes: self.serdes,
             sdk_config: self.sdk_config,
             lambda_client: self.lambda_client,
+            polling_strategy: self.polling_strategy,
+            checkpoint_delay: self.checkpoint_delay,
+            checkpoint_batching: self.checkpoint_batching.unwrap_or(false),
         })
     }
 }
@@ -319,5 +479,85 @@ mod tests {
         // Verify it implements std::error::Error via trait object coercion.
         let _: &dyn std::error::Error = &err;
         assert!(err.to_string().contains("test"));
+    }
+
+    #[test]
+    fn default_options_carry_no_execution_tuning() {
+        let opts = Options::builder().build().expect("valid");
+        assert!(
+            opts.polling_strategy.is_none(),
+            "unset polling strategy must stay None so the client keeps its built-in schedule"
+        );
+        assert!(
+            opts.checkpoint_delay.is_none(),
+            "unset checkpoint delay must stay None so checkpoints write immediately"
+        );
+    }
+
+    #[test]
+    fn polling_strategy_is_stored() {
+        let strategy = WaitStrategy::builder()
+            .initial_delay(Duration::from_millis(250))
+            .max_delay(Duration::from_secs(5))
+            .backoff_factor(3.0)
+            .build();
+        let opts = Options::builder()
+            .polling_strategy(strategy)
+            .build()
+            .expect("valid");
+        let stored = opts.polling_strategy.expect("polling strategy preserved");
+        assert_eq!(stored.initial_delay(), Duration::from_millis(250));
+        assert_eq!(stored.max_delay(), Duration::from_secs(5));
+        assert!((stored.backoff_factor() - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn checkpoint_delay_is_stored() {
+        let opts = Options::builder()
+            .checkpoint_delay(Duration::from_millis(20))
+            .build()
+            .expect("valid");
+        assert_eq!(opts.checkpoint_delay, Some(Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn checkpoint_batching_enabled_builds_and_is_stored() {
+        let opts = Options::builder()
+            .checkpoint_batching(true)
+            .build()
+            .expect("checkpoint_batching(true) is a valid configuration");
+        assert!(
+            opts.checkpoint_batching,
+            "the enabled batching knob must be preserved, not dropped"
+        );
+    }
+
+    #[test]
+    fn checkpoint_batching_disabled_is_valid() {
+        let opts = Options::builder()
+            .checkpoint_batching(false)
+            .build()
+            .expect("explicitly-disabled batching is valid");
+        assert!(!opts.checkpoint_batching, "disabled batching stays off");
+    }
+
+    #[test]
+    fn checkpoint_batching_defaults_off() {
+        let opts = Options::builder().build().expect("valid");
+        assert!(
+            !opts.checkpoint_batching,
+            "unset batching must stay off so checkpoints write immediately"
+        );
+    }
+
+    #[test]
+    fn checkpoint_batching_combines_with_delay() {
+        let opts = Options::builder()
+            .checkpoint_delay(Duration::from_millis(10))
+            .checkpoint_batching(true)
+            .build()
+            .expect("delay and batching combine");
+        assert_eq!(opts.checkpoint_delay, Some(Duration::from_millis(10)));
+        assert!(opts.checkpoint_batching);
     }
 }

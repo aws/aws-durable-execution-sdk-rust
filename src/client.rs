@@ -13,6 +13,7 @@ use aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableEx
 use aws_sdk_lambda::operation::get_durable_execution_state::GetDurableExecutionStateError;
 use aws_sdk_lambda::types::{Operation, OperationType, OperationUpdate};
 
+use crate::WaitStrategy;
 use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -107,23 +108,74 @@ pub(crate) fn classify_get_state_error(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Retry Parameters (3 attempts, 100ms base, 2s max)
+// Retry Parameters (3 attempts; delays shaped by the polling strategy)
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Maximum number of attempts for a retryable checkpoint call.
 const MAX_ATTEMPTS: u32 = 3;
 
-/// Initial backoff delay before the first retry.
+/// Initial backoff delay before the first retry (built-in schedule).
 const BASE_DELAY: Duration = Duration::from_millis(100);
 
-/// Maximum backoff delay cap.
+/// Maximum backoff delay cap (built-in schedule).
 const MAX_DELAY: Duration = Duration::from_secs(2);
 
-/// Computes exponential backoff for the given zero-based attempt index.
-/// `attempt` 0 → `BASE_DELAY`, 1 → 2×`BASE_DELAY`, capped at `MAX_DELAY`.
-fn backoff_delay(attempt: u32) -> Duration {
-    let delay = BASE_DELAY.saturating_mul(2_u32.saturating_pow(attempt));
-    if delay > MAX_DELAY { MAX_DELAY } else { delay }
+/// The SDK's built-in service-call polling schedule: 100 ms initial delay,
+/// 2.0 backoff factor, capped at 2 seconds. Used when
+/// [`Options`](crate::Options) sets no
+/// [`polling_strategy`](crate::OptionsBuilder::polling_strategy), so the
+/// default configuration reproduces the historical delays exactly.
+pub(crate) fn default_polling_strategy() -> WaitStrategy {
+    WaitStrategy::builder()
+        .initial_delay(BASE_DELAY)
+        .max_delay(MAX_DELAY)
+        .backoff_factor(2.0)
+        .build()
+}
+
+/// Computes the delay before the retry following the given zero-based
+/// attempt index, per the configured polling strategy: `attempt` 0 →
+/// `initial_delay`, then multiplied by `backoff_factor` per attempt, capped
+/// at `max_delay`. A non-finite or negative intermediate value (possible
+/// only with a pathological strategy) clamps to `max_delay`.
+fn polling_delay(strategy: &WaitStrategy, attempt: u32) -> Duration {
+    let factor = strategy.backoff_factor();
+    let scaled =
+        strategy.initial_delay().as_secs_f64() * factor.powi(i32::try_from(attempt).unwrap_or(0));
+    let max = strategy.max_delay();
+    if scaled.is_finite() && scaled >= 0.0 {
+        Duration::try_from_secs_f64(scaled).unwrap_or(max).min(max)
+    } else {
+        max
+    }
+}
+
+/// Runs `attempt_fn` up to [`MAX_ATTEMPTS`] times, sleeping the
+/// strategy-shaped [`polling_delay`] between retryable failures. A
+/// non-retryable error returns immediately; the last retryable error is
+/// returned once attempts are exhausted.
+async fn retry_with_polling<T, Fut>(
+    strategy: &WaitStrategy,
+    mut attempt_fn: impl FnMut(u32) -> Fut,
+) -> Result<T, ClientError>
+where
+    Fut: Future<Output = Result<T, ClientError>>,
+{
+    let mut last_err: Option<ClientError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match attempt_fn(attempt).await {
+            Ok(value) => return Ok(value),
+            Err(err) if !err.is_retryable() => return Err(err),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < MAX_ATTEMPTS - 1 {
+                    tokio::time::sleep(polling_delay(strategy, attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| ClientError::from_retryable("retry attempts exhausted".to_owned())))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -131,19 +183,18 @@ fn backoff_delay(attempt: u32) -> Duration {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Checkpoint client error type wrapping the underlying cause.
-#[derive(Debug)]
+///
+/// `Clone` because a coalesced checkpoint batch publishes one result to
+/// every operation that contributed updates to it.
+#[derive(Debug, Clone)]
 pub(crate) struct ClientError {
     message: String,
     /// Whether the underlying failure was classified as retryable.
     ///
-    /// Production code classifies retryability *before* constructing the
-    /// error (see `classify_checkpoint_error` / `classify_get_state_error`)
-    /// and drives its retry loops off that classification, so nothing in the
-    /// production path reads this flag back. Unit tests read it through
-    /// [`ClientError::retryable`] to assert the constructors preserve the
-    /// classification.
-    #[allow(dead_code)]
-    // reason: read only by the cfg(test) accessor below; production classifies before construction
+    /// Classification happens *before* constructing the error (see
+    /// `classify_checkpoint_error` / `classify_get_state_error`); the retry
+    /// loop ([`retry_with_polling`]) reads it back through
+    /// [`ClientError::is_retryable`] to decide whether to retry.
     retryable: bool,
 }
 
@@ -156,10 +207,9 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 impl ClientError {
-    /// Whether this error is classified as retryable (test-only accessor;
-    /// see the field docs for why production never reads this back).
-    #[cfg(test)]
-    pub(crate) fn retryable(&self) -> bool {
+    /// Whether this error is classified as retryable. Drives the retry
+    /// decision in [`retry_with_polling`].
+    pub(crate) fn is_retryable(&self) -> bool {
         self.retryable
     }
 
@@ -241,12 +291,18 @@ pub(crate) trait ExecutionClient: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Clone)]
 pub(crate) struct LambdaExecutionClient {
     client: aws_sdk_lambda::Client,
+    /// Delay schedule between retries of the service calls. Defaults to
+    /// [`default_polling_strategy`]; overridden via
+    /// [`Options`](crate::Options)'s `polling_strategy`.
+    polling: WaitStrategy,
 }
 
 impl LambdaExecutionClient {
-    /// Creates a new client wrapping the provided Lambda SDK client.
-    pub(crate) fn new(client: aws_sdk_lambda::Client) -> Self {
-        Self { client }
+    /// Creates a new client wrapping the provided Lambda SDK client, with
+    /// the given retry-delay schedule (see [`default_polling_strategy`] for
+    /// the built-in one).
+    pub(crate) fn with_polling(client: aws_sdk_lambda::Client, polling: WaitStrategy) -> Self {
+        Self { client, polling }
     }
 }
 
@@ -260,54 +316,53 @@ impl ExecutionClient for LambdaExecutionClient {
         let arn = execution_arn.to_owned();
         let token = checkpoint_token.to_owned();
         Box::pin(async move {
-            let mut last_err: Option<ClientError> = None;
+            retry_with_polling(&self.polling, |_attempt| {
+                let arn = arn.clone();
+                let token = token.clone();
+                let updates = updates.clone();
+                async move {
+                    let result = self
+                        .client
+                        .checkpoint_durable_execution()
+                        .durable_execution_arn(&arn)
+                        .checkpoint_token(&token)
+                        .set_updates(Some(updates))
+                        .send()
+                        .await;
 
-            for attempt in 0..MAX_ATTEMPTS {
-                let result = self
-                    .client
-                    .checkpoint_durable_execution()
-                    .durable_execution_arn(&arn)
-                    .checkpoint_token(&token)
-                    .set_updates(Some(updates.clone()))
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(output) => {
-                        let new_token = output.checkpoint_token.unwrap_or_default();
-                        if new_token.is_empty() {
-                            return Err(ClientError::non_retryable(
-                                "backend returned no checkpoint token".to_owned(),
-                            ));
+                    match result {
+                        Ok(output) => {
+                            let new_token = output.checkpoint_token.unwrap_or_default();
+                            if new_token.is_empty() {
+                                return Err(ClientError::non_retryable(
+                                    "backend returned no checkpoint token".to_owned(),
+                                ));
+                            }
+                            let (updated_ops, next_marker) = match output.new_execution_state {
+                                Some(state) => (
+                                    state.operations.unwrap_or_default(),
+                                    state.next_marker.filter(|m| !m.is_empty()),
+                                ),
+                                None => (Vec::new(), None),
+                            };
+                            Ok(CheckpointOutput {
+                                checkpoint_token: new_token,
+                                updated_operations: updated_ops,
+                                next_marker,
+                            })
                         }
-                        let (updated_ops, next_marker) = match output.new_execution_state {
-                            Some(state) => (
-                                state.operations.unwrap_or_default(),
-                                state.next_marker.filter(|m| !m.is_empty()),
-                            ),
-                            None => (Vec::new(), None),
-                        };
-                        return Ok(CheckpointOutput {
-                            checkpoint_token: new_token,
-                            updated_operations: updated_ops,
-                            next_marker,
-                        });
-                    }
-                    Err(err) => {
-                        let classification = classify_checkpoint_error(&err);
-                        if classification == RetryClassification::NonRetryable {
-                            return Err(ClientError::non_retryable(format!("{err}")));
-                        }
-                        last_err = Some(ClientError::from_retryable(format!("{err}")));
-                        if attempt < MAX_ATTEMPTS - 1 {
-                            tokio::time::sleep(backoff_delay(attempt)).await;
-                        }
+                        Err(err) => match classify_checkpoint_error(&err) {
+                            RetryClassification::NonRetryable => {
+                                Err(ClientError::non_retryable(format!("{err}")))
+                            }
+                            RetryClassification::Retryable => {
+                                Err(ClientError::from_retryable(format!("{err}")))
+                            }
+                        },
                     }
                 }
-            }
-            Err(last_err.unwrap_or_else(|| {
-                ClientError::from_retryable("retry attempts exhausted".to_owned())
-            }))
+            })
+            .await
         })
     }
 
@@ -323,43 +378,35 @@ impl ExecutionClient for LambdaExecutionClient {
             let mut marker: Option<String> = None;
 
             loop {
-                let mut last_err: Option<ClientError> = None;
-                let mut page_result = None;
+                let output = retry_with_polling(&self.polling, |_attempt| {
+                    let arn = arn.clone();
+                    let token = token.clone();
+                    let marker = marker.clone();
+                    async move {
+                        let mut builder = self
+                            .client
+                            .get_durable_execution_state()
+                            .durable_execution_arn(&arn)
+                            .checkpoint_token(&token);
 
-                for attempt in 0..MAX_ATTEMPTS {
-                    let mut builder = self
-                        .client
-                        .get_durable_execution_state()
-                        .durable_execution_arn(&arn)
-                        .checkpoint_token(&token);
-
-                    if let Some(ref m) = marker {
-                        builder = builder.marker(m.as_str());
-                    }
-
-                    match builder.send().await {
-                        Ok(output) => {
-                            page_result = Some(output);
-                            break;
+                        if let Some(ref m) = marker {
+                            builder = builder.marker(m.as_str());
                         }
-                        Err(err) => {
-                            let classification = classify_get_state_error(&err);
-                            if classification == RetryClassification::NonRetryable {
-                                return Err(ClientError::non_retryable(format!("{err}")));
-                            }
-                            last_err = Some(ClientError::from_retryable(format!("{err}")));
-                            if attempt < MAX_ATTEMPTS - 1 {
-                                tokio::time::sleep(backoff_delay(attempt)).await;
-                            }
-                        }
-                    }
-                }
 
-                let Some(output) = page_result else {
-                    return Err(last_err.unwrap_or_else(|| {
-                        ClientError::from_retryable("retry attempts exhausted".to_owned())
-                    }));
-                };
+                        builder
+                            .send()
+                            .await
+                            .map_err(|err| match classify_get_state_error(&err) {
+                                RetryClassification::NonRetryable => {
+                                    ClientError::non_retryable(format!("{err}"))
+                                }
+                                RetryClassification::Retryable => {
+                                    ClientError::from_retryable(format!("{err}"))
+                                }
+                            })
+                    }
+                })
+                .await?;
 
                 all_operations.extend(output.operations);
 
@@ -848,13 +895,111 @@ mod tests {
 
     // ── Backoff computation ─────────────────────────────────────────────
 
+    /// The default polling strategy reproduces the historical built-in
+    /// schedule byte-for-byte: 100 ms, 200 ms, 400 ms, ... capped at 2 s.
     #[test]
-    fn backoff_delays_are_exponential_and_capped() {
-        assert_eq!(backoff_delay(0), Duration::from_millis(100));
-        assert_eq!(backoff_delay(1), Duration::from_millis(200));
-        assert_eq!(backoff_delay(2), Duration::from_millis(400));
-        assert_eq!(backoff_delay(10), MAX_DELAY);
-        assert_eq!(backoff_delay(100), MAX_DELAY);
+    fn default_polling_delays_are_exponential_and_capped() {
+        let strategy = default_polling_strategy();
+        assert_eq!(polling_delay(&strategy, 0), Duration::from_millis(100));
+        assert_eq!(polling_delay(&strategy, 1), Duration::from_millis(200));
+        assert_eq!(polling_delay(&strategy, 2), Duration::from_millis(400));
+        assert_eq!(polling_delay(&strategy, 10), MAX_DELAY);
+        assert_eq!(polling_delay(&strategy, 100), MAX_DELAY);
+    }
+
+    /// A configured strategy shapes the delays: initial × factor^attempt,
+    /// capped at the strategy's own max.
+    #[test]
+    fn configured_polling_delays_follow_the_strategy() {
+        let strategy = WaitStrategy::builder()
+            .initial_delay(Duration::from_secs(1))
+            .max_delay(Duration::from_secs(5))
+            .backoff_factor(3.0)
+            .build();
+        assert_eq!(polling_delay(&strategy, 0), Duration::from_secs(1));
+        assert_eq!(polling_delay(&strategy, 1), Duration::from_secs(3));
+        // 9 s exceeds the 5 s cap.
+        assert_eq!(polling_delay(&strategy, 2), Duration::from_secs(5));
+    }
+
+    /// A pathological strategy (non-finite or negative computed delay)
+    /// clamps to the strategy's max delay instead of panicking.
+    #[test]
+    fn pathological_polling_delays_clamp_to_max() {
+        let negative = WaitStrategy::builder()
+            .initial_delay(Duration::from_secs(1))
+            .max_delay(Duration::from_secs(7))
+            .backoff_factor(-2.0)
+            .build();
+        // Odd power of a negative factor → negative delay → clamped.
+        assert_eq!(polling_delay(&negative, 1), Duration::from_secs(7));
+
+        let huge = WaitStrategy::builder()
+            .initial_delay(Duration::from_secs(u64::MAX))
+            .max_delay(Duration::from_secs(9))
+            .backoff_factor(f64::MAX)
+            .build();
+        // Overflow to infinity → clamped.
+        assert_eq!(polling_delay(&huge, 100), Duration::from_secs(9));
+    }
+
+    /// The retry loop honors the configured strategy's delays: with paused
+    /// time, a fake operation that fails twice observes exactly the
+    /// configured sleep before each retry.
+    #[tokio::test(start_paused = true)]
+    async fn retry_loop_sleeps_the_configured_strategy_delays() {
+        let strategy = WaitStrategy::builder()
+            .initial_delay(Duration::from_secs(4))
+            .max_delay(Duration::from_mins(1))
+            .backoff_factor(2.0)
+            .build();
+
+        let attempt_times = Mutex::new(Vec::new());
+        let start = tokio::time::Instant::now();
+
+        let result: Result<u32, ClientError> = retry_with_polling(&strategy, |attempt| {
+            attempt_times
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(start.elapsed());
+            async move {
+                if attempt < 2 {
+                    Err(ClientError::from_retryable("transient".to_owned()))
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+
+        #[allow(clippy::expect_used)] // reason: test assertion
+        let value = result.expect("third attempt succeeds");
+        assert_eq!(value, 2);
+        let times = attempt_times
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // Attempt 0 immediately; attempt 1 after 4 s; attempt 2 after
+        // 4 s + 8 s = 12 s (initial × factor^attempt schedule).
+        assert_eq!(times.len(), 3);
+        assert_eq!(times.first().copied(), Some(Duration::ZERO));
+        assert_eq!(times.get(1).copied(), Some(Duration::from_secs(4)));
+        assert_eq!(times.get(2).copied(), Some(Duration::from_secs(12)));
+    }
+
+    /// A non-retryable failure returns immediately with no sleep.
+    #[tokio::test(start_paused = true)]
+    async fn retry_loop_stops_immediately_on_non_retryable() {
+        let start = tokio::time::Instant::now();
+        let result: Result<u32, ClientError> =
+            retry_with_polling(&default_polling_strategy(), |_attempt| async {
+                Err(ClientError::non_retryable("permanent".to_owned()))
+            })
+            .await;
+        #[allow(clippy::expect_used)] // reason: test assertion
+        let err = result.expect_err("must fail");
+        assert!(!err.is_retryable());
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
     // ── Test double behavior ────────────────────────────────────────────
@@ -869,12 +1014,12 @@ mod tests {
         let first = client.checkpoint("arn:test", "token-0", Vec::new()).await;
         #[allow(clippy::unwrap_used)] // reason: test assertion — err verified above
         let first_err = first.unwrap_err();
-        assert!(first_err.retryable());
+        assert!(first_err.is_retryable());
 
         let second = client.checkpoint("arn:test", "token-0", Vec::new()).await;
         #[allow(clippy::unwrap_used)] // reason: test assertion — err verified above
         let second_err = second.unwrap_err();
-        assert!(!second_err.retryable());
+        assert!(!second_err.is_retryable());
 
         let third = client.checkpoint("arn:test", "token-0", Vec::new()).await;
         assert!(third.is_ok());

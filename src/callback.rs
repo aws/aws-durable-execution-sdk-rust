@@ -167,8 +167,11 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
             .build()
             .expect("all required OperationUpdate fields set");
 
+        // Callback creation is a flush point of the checkpoint-delay
+        // contract: the backend assigns the callback_id in this response,
+        // so the write cannot wait out a coalescing window.
         self.ctx
-            .checkpoint_updates(vec![update])
+            .checkpoint_updates_urgent(vec![update])
             .await
             .map_err(|e| callback_internal_error(&format!("checkpoint start: {e}")))?;
 
@@ -1472,6 +1475,7 @@ mod tests {
             client,
             "token-1".to_owned(),
             Some(Arc::new(MarkerSerdes)),
+            None,
         );
         let op_id = ctx.mint_id();
         let exec: CreateCallbackExecution<String> = CreateCallbackExecution {

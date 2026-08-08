@@ -45,6 +45,7 @@
 
 mod builders;
 pub(crate) mod callback;
+pub(crate) mod checkpoint_coalescer;
 pub(crate) mod child;
 pub(crate) mod client;
 pub(crate) mod combinator;
@@ -1533,13 +1534,33 @@ where
         serdes,
         sdk_config,
         lambda_client,
+        polling_strategy,
+        checkpoint_delay,
+        checkpoint_batching,
     } = options;
+    // The checkpoint buffer window: a configured delay is the coalescing
+    // window; batching without a delay buffers with a zero window (writes
+    // batch behind the single-writer lock but are never held back); neither
+    // knob means immediate writes, exactly the pre-knob behavior.
+    let checkpoint_buffer_window = match (checkpoint_delay, checkpoint_batching) {
+        (Some(delay), _) => Some(delay),
+        (None, true) => Some(std::time::Duration::ZERO),
+        (None, false) => None,
+    };
+    let polling = polling_strategy.unwrap_or_else(client::default_polling_strategy);
     let preset_client: Option<StdArc<dyn client::ExecutionClient>> =
         base_lambda_client_from_options(sdk_config, lambda_client).map(|c| {
-            StdArc::new(client::LambdaExecutionClient::new(c))
-                as StdArc<dyn client::ExecutionClient>
+            StdArc::new(client::LambdaExecutionClient::with_polling(
+                c,
+                polling.clone(),
+            )) as StdArc<dyn client::ExecutionClient>
         });
-    wrap_with_provider(handler, serdes, ClientProvider::new(preset_client))
+    wrap_with_provider(
+        handler,
+        serdes,
+        ClientProvider::new(preset_client, polling),
+        checkpoint_buffer_window,
+    )
 }
 
 /// Creates a durable Lambda service function whose execution client is the
@@ -1550,11 +1571,17 @@ where
 ///
 /// The `default_serdes` plays the same role as [`Options::builder`]'s
 /// `serdes`: the execution-wide fallback for operations that set none.
+/// `checkpoint_buffer_window` mirrors the `checkpoint_delay` /
+/// `checkpoint_batching` options (`Some(window)` for a coalescing window,
+/// `Some(Duration::ZERO)` for pure batching, `None` for immediate writes),
+/// letting the [`LocalRunner`](test_util::LocalRunner) exercise checkpoint
+/// buffering against its fake transport.
 #[cfg(feature = "test-util")]
 pub(crate) fn wrap_with_execution_client<F, E, Fut, O>(
     handler: F,
     default_serdes: Option<std::sync::Arc<dyn Serdes>>,
     exec_client: std::sync::Arc<dyn client::ExecutionClient>,
+    checkpoint_buffer_window: Option<std::time::Duration>,
 ) -> impl Fn(lambda_runtime::LambdaEvent<serde_json::Value>) -> BoxedInvocationFuture + Send + Sync
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
@@ -1565,7 +1592,8 @@ where
     wrap_with_provider(
         handler,
         default_serdes,
-        ClientProvider::new(Some(exec_client)),
+        ClientProvider::new(Some(exec_client), client::default_polling_strategy()),
+        checkpoint_buffer_window,
     )
 }
 
@@ -1578,6 +1606,7 @@ fn wrap_with_provider<F, E, Fut, O>(
     handler: F,
     default_serdes: Option<std::sync::Arc<dyn Serdes>>,
     provider: ClientProvider,
+    checkpoint_buffer_window: Option<std::time::Duration>,
 ) -> impl Fn(lambda_runtime::LambdaEvent<serde_json::Value>) -> BoxedInvocationFuture + Send + Sync
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
@@ -1645,8 +1674,12 @@ where
                 exec_client,
                 checkpoint_token,
                 (*default_serdes).clone(),
+                checkpoint_buffer_window,
             );
 
+            // Retained past the handler move so the post-outcome flush can
+            // drain the checkpoint coalescing buffer (a cheap Arc clone).
+            let flush_ctx = ctx.clone();
             let suspension_signal = ctx.suspension_signal().clone();
             let replay_span = ctx.replay_span();
 
@@ -1666,6 +1699,22 @@ where
                 suspension_signal,
             )
             .await;
+
+            // Unconditional flush point of the checkpoint buffering
+            // contract (`checkpoint_delay` / `checkpoint_batching`):
+            // whatever the outcome — suspension (PENDING), completion
+            // (SUCCEEDED), or failure (FAILED) — every buffered checkpoint
+            // is written, and every in-flight batched write is awaited,
+            // BEFORE the envelope reports the invocation's state to the
+            // service, so buffering can never hold a checkpoint past the
+            // end of the invocation. A no-op without configured buffering.
+            // Updates still buffered here belong to operations whose
+            // futures were dropped (e.g. losers of a `race`), so a flush
+            // failure cannot change the outcome; it is logged rather than
+            // propagated.
+            if let Err(e) = flush_ctx.flush_pending_checkpoints().await {
+                tracing::warn!(error = %e, "failed to flush coalesced checkpoints at invocation end");
+            }
 
             // Convert outcome to the durable response envelope.
             //
@@ -1744,15 +1793,24 @@ pub(crate) fn base_lambda_client_from_options(
 /// cached, so no per-invocation client construction or config load occurs.
 pub(crate) struct ClientProvider {
     preset: Option<std::sync::Arc<dyn client::ExecutionClient>>,
+    /// Retry-delay schedule for the ambient-default client, threaded from
+    /// [`Options`]'s `polling_strategy` (or the built-in schedule).
+    polling: WaitStrategy,
     default_cell: tokio::sync::OnceCell<std::sync::Arc<dyn client::ExecutionClient>>,
 }
 
 impl ClientProvider {
     /// Creates a provider. `preset` is the client resolved from `Options`, or
-    /// `None` to defer to the ambient default on first use.
-    pub(crate) fn new(preset: Option<std::sync::Arc<dyn client::ExecutionClient>>) -> Self {
+    /// `None` to defer to the ambient default on first use; `polling` shapes
+    /// the ambient-default client's retry delays (a preset client already
+    /// carries its own).
+    pub(crate) fn new(
+        preset: Option<std::sync::Arc<dyn client::ExecutionClient>>,
+        polling: WaitStrategy,
+    ) -> Self {
         Self {
             preset,
+            polling,
             default_cell: tokio::sync::OnceCell::new(),
         }
     }
@@ -1770,8 +1828,10 @@ impl ClientProvider {
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
-                StdArc::new(client::LambdaExecutionClient::new(lambda_client))
-                    as StdArc<dyn client::ExecutionClient>
+                StdArc::new(client::LambdaExecutionClient::with_polling(
+                    lambda_client,
+                    self.polling.clone(),
+                )) as StdArc<dyn client::ExecutionClient>
             })
             .await;
         StdArc::clone(client)
@@ -2469,7 +2529,10 @@ mod tests {
 
         let preset: StdArc<dyn client::ExecutionClient> =
             StdArc::new(InMemoryExecutionClient::new(Vec::new()));
-        let provider = ClientProvider::new(Some(StdArc::clone(&preset)));
+        let provider = ClientProvider::new(
+            Some(StdArc::clone(&preset)),
+            client::default_polling_strategy(),
+        );
 
         let first = provider.get().await;
         let second = provider.get().await;

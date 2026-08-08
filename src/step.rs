@@ -915,6 +915,7 @@ mod tests {
             client.clone(),
             "token0".to_owned(),
             Some(Arc::new(Upper)),
+            None,
         );
         let op_id = ctx.mint_id();
         let closure: BoxedStepBody<String> =

@@ -18,6 +18,9 @@ use crate::builders::{
     ParallelBuilder, RaceBuilder, SelectOkBuilder, StepBuilder, TryJoinAllBuilder, WaitBuilder,
     WaitForCallbackBuilder, WaitForConditionBuilder, WithRetryBuilder,
 };
+use crate::checkpoint_coalescer::{
+    BatchLimits, CheckpointBatch, CheckpointCoalescer, split_into_requests,
+};
 use crate::client::{CheckpointOutput, ClientError, ExecutionClient};
 use crate::driver::{SuspensionSignal, TaskOwnership};
 use crate::engine::{
@@ -54,6 +57,12 @@ struct Inner {
     /// must be held across `await` points in [`DurableContext::checkpoint_updates`],
     /// serializing all concurrent checkpoint callers through one critical section.
     checkpoint_token: Arc<Mutex<String>>,
+    /// Checkpoint-write coalescer, present only when
+    /// [`Options`](crate::Options) configured a `checkpoint_delay` and/or
+    /// `checkpoint_batching`. Shared with every child context so updates
+    /// from all namespaces coalesce into the same batches. `None` means
+    /// every checkpoint writes immediately (the default).
+    coalescer: Option<Arc<CheckpointCoalescer>>,
     /// Cached parent wire ID — the SHA-256 hash of this context's prefix
     /// (positional ID of the parent operation). `None` for root contexts.
     parent_wire_id: Option<String>,
@@ -159,6 +168,7 @@ impl DurableContext {
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
+                coalescer: None,
                 parent_wire_id: None,
                 default_serdes: None,
                 replay_span,
@@ -191,6 +201,7 @@ impl DurableContext {
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
+                coalescer: None,
                 parent_wire_id: None,
                 default_serdes: None,
                 replay_span,
@@ -223,6 +234,7 @@ impl DurableContext {
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
+                coalescer: None,
                 parent_wire_id: None,
                 default_serdes: None,
                 replay_span,
@@ -230,8 +242,13 @@ impl DurableContext {
         }
     }
 
-    /// Creates a root context with a client, token, and execution-wide default
-    /// serdes threaded in from [`Options`](crate::Options) (internal).
+    /// Creates a root context with a client, token, execution-wide default
+    /// serdes, and checkpoint buffering window threaded in from
+    /// [`Options`](crate::Options) (internal). `checkpoint_buffer_window`
+    /// is `None` for immediate writes (the default), `Some(window)` for a
+    /// `checkpoint_delay` coalescing window, and `Some(Duration::ZERO)` for
+    /// pure `checkpoint_batching` (no added delay; writes batch behind the
+    /// single-writer lock).
     pub(crate) fn new_root_with_client_and_defaults(
         execution_arn: String,
         lambda_context: lambda_runtime::Context,
@@ -239,6 +256,7 @@ impl DurableContext {
         client: Arc<dyn ExecutionClient>,
         checkpoint_token: String,
         default_serdes: Option<Arc<dyn Serdes>>,
+        checkpoint_buffer_window: Option<Duration>,
     ) -> Self {
         let engine = Arc::new(EngineState::new_root(checkpoint_log));
         let replay_span = crate::tracing_layer::execution_span(
@@ -255,6 +273,7 @@ impl DurableContext {
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
+                coalescer: checkpoint_buffer_window.map(|d| Arc::new(CheckpointCoalescer::new(d))),
                 parent_wire_id: None,
                 default_serdes,
                 replay_span,
@@ -268,6 +287,41 @@ impl DurableContext {
     /// call sites can clone it into `spawn_blocking`.
     pub(crate) fn default_serdes(&self) -> Option<&Arc<dyn Serdes>> {
         self.inner.default_serdes.as_ref()
+    }
+
+    /// Test-only root constructor that accepts an explicit
+    /// [`CheckpointCoalescer`], letting tests force small [`BatchLimits`]
+    /// so batch splitting is observable with a handful of updates.
+    #[cfg(test)]
+    pub(crate) fn new_root_with_client_and_coalescer(
+        execution_arn: String,
+        lambda_context: lambda_runtime::Context,
+        checkpoint_log: Arc<CheckpointLog>,
+        client: Arc<dyn ExecutionClient>,
+        checkpoint_token: String,
+        coalescer: CheckpointCoalescer,
+    ) -> Self {
+        let engine = Arc::new(EngineState::new_root(checkpoint_log));
+        let replay_span = crate::tracing_layer::execution_span(
+            &execution_arn,
+            &lambda_context.request_id,
+            engine.is_replaying(),
+        );
+        Self {
+            inner: Arc::new(Inner {
+                execution_arn,
+                lambda_context,
+                engine,
+                suspension_signal: Arc::new(SuspensionSignal::new()),
+                task_ownership: Arc::new(TaskOwnership::new_current()),
+                execution_client: Some(client),
+                checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
+                coalescer: Some(Arc::new(coalescer)),
+                parent_wire_id: None,
+                default_serdes: None,
+                replay_span,
+            }),
+        }
     }
     pub(crate) fn new_child(&self, parent_positional_id: &str) -> Self {
         let engine = Arc::new(EngineState::new_child(
@@ -293,6 +347,7 @@ impl DurableContext {
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
+                coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: Some(crate::engine::compute_wire_id_public(parent_positional_id)),
                 default_serdes: self.inner.default_serdes.clone(),
                 replay_span,
@@ -357,6 +412,7 @@ impl DurableContext {
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
+                coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: Some(crate::engine::compute_wire_id_public(parent_positional_id)),
                 default_serdes: self.inner.default_serdes.clone(),
                 replay_span,
@@ -392,6 +448,7 @@ impl DurableContext {
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
+                coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: Some(parent_wire_id_override.to_owned()),
                 default_serdes: self.inner.default_serdes.clone(),
                 replay_span,
@@ -420,6 +477,7 @@ impl DurableContext {
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
+                coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: self.inner.parent_wire_id.clone(),
                 default_serdes: self.inner.default_serdes.clone(),
                 // Same engine (same ID counter and namespace), so mints
@@ -747,13 +805,178 @@ impl DurableContext {
 
     /// Checkpoints operation updates via the execution client.
     ///
+    /// When [`Options`](crate::Options) configured a `checkpoint_delay`
+    /// and/or `checkpoint_batching`, the updates join the shared coalescing
+    /// batch and this call resolves with the batch's result once it flushes
+    /// (after at most the configured delay, or earlier if a flush point
+    /// drains the buffer). Without either knob, the write happens
+    /// immediately via [`Self::checkpoint_updates_direct`].
+    pub(crate) async fn checkpoint_updates(
+        &self,
+        updates: Vec<OperationUpdate>,
+    ) -> Result<CheckpointOutput, ClientError> {
+        self.checkpoint_with_urgency(updates, false).await
+    }
+
+    /// Checkpoints operation updates, flushing the coalescing buffer
+    /// immediately instead of waiting out the delay window.
+    ///
+    /// This is the "callback creation" flush point of the
+    /// [`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay)
+    /// contract: the caller needs the backend's response right away (the
+    /// service assigns the callback ID in it), so the batch — including any
+    /// previously buffered updates, which keeps write order intact — is
+    /// written now. Identical to [`Self::checkpoint_updates`] when no
+    /// delay is configured.
+    pub(crate) async fn checkpoint_updates_urgent(
+        &self,
+        updates: Vec<OperationUpdate>,
+    ) -> Result<CheckpointOutput, ClientError> {
+        self.checkpoint_with_urgency(updates, true).await
+    }
+
+    /// Shared body of the buffered checkpoint paths: joins the batch, then
+    /// awaits its published result. A non-urgent contributor under a
+    /// non-zero delay arms the delay timer and requests the flush itself
+    /// when the window elapses; an urgent contributor — or any contributor
+    /// under a zero-delay coalescer (pure `checkpoint_batching` mode) —
+    /// requests the flush right away. Either way the flush task claims and
+    /// writes the batch under the coalescer's writer lock, so batching
+    /// still emerges while an earlier write is in flight.
+    async fn checkpoint_with_urgency(
+        &self,
+        updates: Vec<OperationUpdate>,
+        urgent: bool,
+    ) -> Result<CheckpointOutput, ClientError> {
+        let Some(coalescer) = self.inner.coalescer.clone() else {
+            return self.checkpoint_updates_direct(updates).await;
+        };
+
+        let batch = coalescer.join(updates);
+        let flush_now = urgent || coalescer.delay().is_zero();
+        if flush_now {
+            self.spawn_batch_flush(&coalescer, &batch);
+        }
+
+        loop {
+            // `enable()` registers the waiter BEFORE the result check, so a
+            // publish landing between the check and the await still wakes us.
+            let mut notified = std::pin::pin!(batch.notified());
+            notified.as_mut().enable();
+            if let Some(result) = batch.result_clone() {
+                return result;
+            }
+            if flush_now {
+                notified.await;
+            } else {
+                tokio::select! {
+                    () = notified => {}
+                    () = tokio::time::sleep(coalescer.delay()) => {
+                        self.spawn_batch_flush(&coalescer, &batch);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spawns a task that claims `batch` (if it is still the open batch)
+    /// and writes its buffered updates, publishing the result to every
+    /// contributor. The claim and the write both happen while holding the
+    /// coalescer's writer lock, so buffered writes are totally ordered and
+    /// a flush point that acquires the lock waits for this write to finish.
+    ///
+    /// The write runs on its own task deliberately: a contributor dropped
+    /// mid-await (a lost `race`, a dropped `DurableFuture`) must not cancel
+    /// an in-flight batch write that other contributors are waiting on.
+    fn spawn_batch_flush(
+        &self,
+        coalescer: &Arc<CheckpointCoalescer>,
+        batch: &Arc<CheckpointBatch>,
+    ) {
+        let ctx = self.clone();
+        let coalescer = Arc::clone(coalescer);
+        let batch = Arc::clone(batch);
+        drop(tokio::spawn(async move {
+            let _writer = coalescer.writer_lock().lock().await;
+            if let Some(updates) = coalescer.take_batch(&batch) {
+                let result = ctx.write_batched_updates(updates, coalescer.limits()).await;
+                batch.publish(result);
+            }
+        }));
+    }
+
+    /// Writes a sealed batch, splitting it into request-sized chunks that
+    /// respect the coalescer's [`BatchLimits`] (operation count and
+    /// estimated payload bytes) while preserving join order. Returns the
+    /// last chunk's output on success — backend-assigned fields from every
+    /// chunk are already merged into the checkpoint log by
+    /// [`Self::checkpoint_updates_direct`] — or the first chunk error,
+    /// which aborts the remaining chunks so contributors observe it.
+    ///
+    /// Callers must hold the coalescer's writer lock (see the invariants in
+    /// [`crate::checkpoint_coalescer`]).
+    async fn write_batched_updates(
+        &self,
+        updates: Vec<OperationUpdate>,
+        limits: BatchLimits,
+    ) -> Result<CheckpointOutput, ClientError> {
+        if updates.is_empty() {
+            // An empty seal (possible only defensively) still performs one
+            // call so a waiting contributor receives a published result.
+            return self.checkpoint_updates_direct(updates).await;
+        }
+        let mut last = None;
+        for chunk in split_into_requests(updates, &limits) {
+            last = Some(self.checkpoint_updates_direct(chunk).await?);
+        }
+        last.ok_or_else(|| {
+            ClientError::new_non_retryable("internal: batched checkpoint produced no requests")
+        })
+    }
+
+    /// Unconditionally drains the checkpoint coalescing buffer, writing any
+    /// pending batches now, and waits for any in-flight batch write to
+    /// finish before returning.
+    ///
+    /// This is the "suspension" and "execution completion" flush point of
+    /// the [`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay) /
+    /// [`checkpoint_batching`](crate::OptionsBuilder::checkpoint_batching)
+    /// contract: the invocation wrapper calls it after the driver settles —
+    /// before reporting `PENDING`, `SUCCEEDED`, or `FAILED` to the service —
+    /// so a checkpoint that must land before the invocation ends is never
+    /// held back by the buffer. Because every claimed batch is written while
+    /// holding the coalescer's writer lock, acquiring that lock here makes
+    /// this a true barrier: a batch a delay timer already claimed cannot
+    /// still be in flight when this returns. A no-op when no buffering is
+    /// configured or the buffer is idle.
+    pub(crate) async fn flush_pending_checkpoints(&self) -> Result<(), ClientError> {
+        let Some(coalescer) = self.inner.coalescer.clone() else {
+            return Ok(());
+        };
+        // Acquiring the writer lock waits out any in-flight batch write
+        // (batches are only claimed and written under it), then holding it
+        // across the drain keeps this flush ordered after those writes.
+        let _writer = coalescer.writer_lock().lock().await;
+        while let Some((batch, updates)) = coalescer.take_any() {
+            let result = self
+                .write_batched_updates(updates, coalescer.limits())
+                .await;
+            let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+            batch.publish(result);
+            outcome?;
+        }
+        Ok(())
+    }
+
+    /// Writes operation updates through the execution client immediately.
+    ///
     /// Serializes all concurrent callers through a single critical section:
     /// the lock is held across the full read-token → API-call →
     /// rotate-token sequence, and — when the response carries a pagination
     /// marker — through the follow-up `get_state` fetch as well, so no
     /// concurrent branch can rotate the token out from under the paginated
     /// state read.
-    pub(crate) async fn checkpoint_updates(
+    pub(crate) async fn checkpoint_updates_direct(
         &self,
         updates: Vec<OperationUpdate>,
     ) -> Result<CheckpointOutput, ClientError> {
@@ -1680,7 +1903,9 @@ fn format_op_identity(op_type: &str, sub_type: Option<&str>, name: Option<&str>)
 #[allow(clippy::unwrap_used)] // reason: test assertions
 mod tests {
     use super::*;
-    use crate::client::{InMemoryExecutionClient, TestResponse, operations_to_checkpoint_log};
+    use crate::client::{
+        GetStateOutput, InMemoryExecutionClient, TestResponse, operations_to_checkpoint_log,
+    };
     use crate::engine::{CheckpointLog, CheckpointStatus};
     use aws_sdk_lambda::types::Operation;
     use std::sync::Arc;
@@ -1825,11 +2050,8 @@ mod tests {
             &self,
             _execution_arn: &str,
             checkpoint_token: &str,
-        ) -> std::pin::Pin<
-            Box<
-                dyn Future<Output = Result<crate::client::GetStateOutput, ClientError>> + Send + '_,
-            >,
-        > {
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
+        {
             let submitted = checkpoint_token.to_owned();
             Box::pin(async move {
                 self.get_state_calls
@@ -1848,7 +2070,7 @@ mod tests {
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 drop(current);
-                Ok(crate::client::GetStateOutput {
+                Ok(GetStateOutput {
                     operations: Vec::new(),
                 })
             })
@@ -2704,6 +2926,379 @@ mod tests {
         assert!(
             debug_output.contains("arn:aws:lambda:us-east-1:123456789012:function:my-fn"),
             "expected execution_arn in Debug output: {debug_output}"
+        );
+    }
+
+    // ── Checkpoint coalescing tests ─────────────────────────────────────
+
+    /// Builds a root context with a checkpoint-coalescing delay, backed by
+    /// the in-memory client.
+    fn coalescing_ctx(client: Arc<dyn ExecutionClient>, delay: Duration) -> DurableContext {
+        DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client,
+            "token-0".to_owned(),
+            None,
+            Some(delay),
+        )
+    }
+
+    /// Helper: builds a bare step START update with the given wire ID.
+    #[allow(clippy::expect_used)]
+    fn make_update(id: &str) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(id.to_owned())
+            .r#type(aws_sdk_lambda::types::OperationType::Step)
+            .action(aws_sdk_lambda::types::OperationAction::Start)
+            .build()
+            .expect("all required OperationUpdate fields set")
+    }
+
+    /// Two concurrent checkpoint calls inside the delay window coalesce
+    /// into ONE client call carrying both updates.
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_checkpoints_batch_into_one_call() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = coalescing_ctx(client.clone(), Duration::from_millis(50));
+
+        let (a, b) = tokio::join!(
+            ctx.checkpoint_updates(vec![make_update("op-a")]),
+            ctx.checkpoint_updates(vec![make_update("op-b")]),
+        );
+        assert!(a.is_ok(), "first coalesced caller succeeds");
+        assert!(b.is_ok(), "second coalesced caller succeeds");
+
+        #[allow(clippy::unwrap_used)]
+        let call_count = *client.checkpoint_call_count.lock().unwrap();
+        assert_eq!(call_count, 1, "both updates must share one API call");
+
+        let ids: Vec<String> = client
+            .recorded_updates()
+            .iter()
+            .map(|u| u.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["op-a".to_owned(), "op-b".to_owned()],
+            "the single call carries both updates in join order"
+        );
+    }
+
+    /// An urgent checkpoint (the callback-creation flush point) does not
+    /// wait out the delay window: it flushes immediately, carrying any
+    /// previously buffered updates with it.
+    #[tokio::test(start_paused = true)]
+    async fn urgent_checkpoint_flushes_without_waiting_the_window() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        // A window long enough that waiting it out would be visible in
+        // paused time.
+        let ctx = coalescing_ctx(client.clone(), Duration::from_hours(1));
+
+        let start = tokio::time::Instant::now();
+        ctx.checkpoint_updates_urgent(vec![make_update("op-urgent")])
+            .await
+            .expect("urgent checkpoint succeeds");
+
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "urgent flush must not wait for the coalescing window"
+        );
+        #[allow(clippy::unwrap_used)]
+        let call_count = *client.checkpoint_call_count.lock().unwrap();
+        assert_eq!(call_count, 1);
+    }
+
+    /// `flush_pending_checkpoints` (the suspension / end-of-invocation
+    /// flush point) drains a buffered batch long before its window
+    /// elapses, and the buffered caller observes the flushed result.
+    #[tokio::test(start_paused = true)]
+    async fn flush_pending_checkpoints_drains_the_buffer() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = coalescing_ctx(client.clone(), Duration::from_hours(1));
+
+        let start = tokio::time::Instant::now();
+        let buffered = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                ctx.checkpoint_updates(vec![make_update("op-buffered")])
+                    .await
+            }
+        });
+        // Let the spawned caller join the batch (well under the window).
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        ctx.flush_pending_checkpoints()
+            .await
+            .expect("flush succeeds");
+
+        let result = buffered.await.expect("buffered caller task completes");
+        assert!(result.is_ok(), "buffered caller observes the flush result");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "flush must not wait for the one-hour window"
+        );
+        #[allow(clippy::unwrap_used)]
+        let call_count = *client.checkpoint_call_count.lock().unwrap();
+        assert_eq!(call_count, 1);
+    }
+
+    /// Without a configured delay, `checkpoint_updates` writes immediately
+    /// — one call per checkpoint, exactly the pre-knob behavior.
+    #[tokio::test(start_paused = true)]
+    async fn no_delay_checkpoints_write_immediately() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client.clone(),
+            "token-0".to_owned(),
+        );
+
+        let start = tokio::time::Instant::now();
+        ctx.checkpoint_updates(vec![make_update("op-1")])
+            .await
+            .expect("first write succeeds");
+        ctx.checkpoint_updates(vec![make_update("op-2")])
+            .await
+            .expect("second write succeeds");
+
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        #[allow(clippy::unwrap_used)]
+        let call_count = *client.checkpoint_call_count.lock().unwrap();
+        assert_eq!(call_count, 2, "no coalescing without a configured delay");
+    }
+
+    /// A test client whose `checkpoint` calls block until released,
+    /// delegating to an [`InMemoryExecutionClient`] once the gate opens.
+    /// Lets tests hold a batched write "in flight" deterministically.
+    #[derive(Debug)]
+    struct GatedClient {
+        inner: InMemoryExecutionClient,
+        gate: tokio::sync::Semaphore,
+        /// Snapshot of update-ID lists, one entry per checkpoint call, in
+        /// call order.
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl GatedClient {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryExecutionClient::new(Vec::new()),
+                gate: tokio::sync::Semaphore::new(0),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Allows one blocked (or future) checkpoint call to proceed.
+        fn release_one(&self) {
+            self.gate.add_permits(1);
+        }
+
+        fn call_ids(&self) -> Vec<Vec<String>> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl ExecutionClient for GatedClient {
+        fn checkpoint(
+            &self,
+            execution_arn: &str,
+            checkpoint_token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>,
+        > {
+            let arn = execution_arn.to_owned();
+            let token = checkpoint_token.to_owned();
+            Box::pin(async move {
+                // Block until the test releases the gate. The permit is
+                // consumed (forgotten) so each call needs its own release.
+                let permit = self
+                    .gate
+                    .acquire()
+                    .await
+                    .map_err(|e| ClientError::non_retryable(format!("gate closed: {e}")))?;
+                permit.forget();
+                self.calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(updates.iter().map(|u| u.id.clone()).collect());
+                self.inner.checkpoint(&arn, &token, updates).await
+            })
+        }
+
+        fn get_state(
+            &self,
+            execution_arn: &str,
+            checkpoint_token: &str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
+        {
+            self.inner.get_state(execution_arn, checkpoint_token)
+        }
+    }
+
+    /// REGRESSION (flush contract): once a delay timer claims a batch and
+    /// its write is in flight, `flush_pending_checkpoints` must NOT return
+    /// until that write finishes — the wrapper reports
+    /// PENDING/SUCCEEDED/FAILED right after the flush, and an unawaited
+    /// in-flight checkpoint would cross that boundary.
+    #[tokio::test(start_paused = true)]
+    async fn flush_waits_for_in_flight_timer_claimed_batch() {
+        let client = Arc::new(GatedClient::new());
+        let ctx = coalescing_ctx(
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            Duration::from_millis(10),
+        );
+
+        // A buffered contributor: its delay timer fires at +10ms, claiming
+        // the batch and starting a write that blocks on the gate.
+        let contributor = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                ctx.checkpoint_updates(vec![make_update("op-in-flight")])
+                    .await
+            }
+        });
+        // Advance past the window so the timer claims the batch and the
+        // write task blocks inside the gated client.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The end-of-invocation flush must now WAIT for that in-flight
+        // write. Prove it stays pending while the gate is closed: in
+        // paused time, the timeout can only fire because every task is
+        // blocked on the (non-timer) gate.
+        let mut flush = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { ctx.flush_pending_checkpoints().await }
+        });
+        let raced = tokio::time::timeout(Duration::from_mins(1), &mut flush).await;
+        assert!(
+            raced.is_err(),
+            "flush returned while the timer-claimed batch write was still in flight — \
+             the flush barrier is broken"
+        );
+
+        // Release the write; now both the contributor and the flush finish.
+        client.release_one();
+        flush
+            .await
+            .expect("flush task completes")
+            .expect("flush succeeds");
+        contributor
+            .await
+            .expect("contributor task completes")
+            .expect("contributor observes the published write");
+        assert_eq!(
+            client.call_ids(),
+            vec![vec!["op-in-flight".to_owned()]],
+            "exactly the claimed batch was written, once"
+        );
+    }
+
+    /// A fan-out exceeding one request's operation-count limit is split
+    /// into multiple ordered requests rather than one oversized call.
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_fanout_splits_into_size_capped_requests() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let limits = BatchLimits {
+            max_operations: 2,
+            max_payload_bytes: usize::MAX,
+        };
+        let ctx = DurableContext::new_root_with_client_and_coalescer(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client.clone(),
+            "token-0".to_owned(),
+            CheckpointCoalescer::with_limits(Duration::from_millis(50), limits),
+        );
+
+        // Five contributors join one coalescing window.
+        let results = tokio::join!(
+            ctx.checkpoint_updates(vec![make_update("op-1")]),
+            ctx.checkpoint_updates(vec![make_update("op-2")]),
+            ctx.checkpoint_updates(vec![make_update("op-3")]),
+            ctx.checkpoint_updates(vec![make_update("op-4")]),
+            ctx.checkpoint_updates(vec![make_update("op-5")]),
+        );
+        for outcome in [results.0, results.1, results.2, results.3, results.4] {
+            assert!(outcome.is_ok(), "every contributor observes success");
+        }
+
+        #[allow(clippy::unwrap_used)]
+        let call_count = *client.checkpoint_call_count.lock().unwrap();
+        assert_eq!(
+            call_count, 3,
+            "five updates under a two-op cap must go out as 2+2+1 requests"
+        );
+        let ids: Vec<String> = client
+            .recorded_updates()
+            .iter()
+            .map(|u| u.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["op-1", "op-2", "op-3", "op-4", "op-5"],
+            "join order is preserved across the split requests"
+        );
+    }
+
+    /// Pure batching mode (zero window): checkpoints arriving while an
+    /// earlier write is in flight batch into ONE follow-up call, and no
+    /// artificial delay is added anywhere.
+    #[tokio::test(start_paused = true)]
+    async fn batching_mode_batches_writes_behind_in_flight_call() {
+        let client = Arc::new(GatedClient::new());
+        let ctx = coalescing_ctx(
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            Duration::ZERO,
+        );
+
+        // First checkpoint drives immediately and blocks in the client.
+        let first = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { ctx.checkpoint_updates(vec![make_update("op-first")]).await }
+        });
+        tokio::task::yield_now().await;
+
+        // Two more checkpoints arrive while the first write is in flight:
+        // they join the open batch behind the writer lock.
+        let second = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { ctx.checkpoint_updates(vec![make_update("op-second")]).await }
+        });
+        let third = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { ctx.checkpoint_updates(vec![make_update("op-third")]).await }
+        });
+        // Let both join and block on the writer lock / gate.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // Release both calls (first write, then the batched follow-up).
+        client.release_one();
+        client.release_one();
+
+        for task in [first, second, third] {
+            task.await
+                .expect("contributor task completes")
+                .expect("contributor observes success");
+        }
+
+        assert_eq!(
+            client.call_ids(),
+            vec![
+                vec!["op-first".to_owned()],
+                vec!["op-second".to_owned(), "op-third".to_owned()],
+            ],
+            "the two checkpoints that arrived during the in-flight write \
+             must batch into one follow-up call"
         );
     }
 }

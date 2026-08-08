@@ -418,6 +418,13 @@ pub struct LocalRunner {
     /// (the default; see [`DEFAULT_STATE_PAGE_SIZE`]). This exercises the
     /// checkpoint pagination path in `DurableContext::checkpoint_updates`.
     checkpoint_page_size: Option<usize>,
+    /// Checkpoint coalescing window, mirroring
+    /// [`Options`](crate::Options)'s `checkpoint_delay`. `None` (the
+    /// default) writes every checkpoint immediately.
+    checkpoint_delay: Option<std::time::Duration>,
+    /// Whether checkpoint batching is enabled, mirroring
+    /// [`Options`](crate::Options)'s `checkpoint_batching`.
+    checkpoint_batching: bool,
 }
 
 impl Default for LocalRunner {
@@ -451,6 +458,8 @@ impl LocalRunner {
             callback_outcomes: Vec::new(),
             initial_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
             checkpoint_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
+            checkpoint_delay: None,
+            checkpoint_batching: false,
         }
     }
 
@@ -532,6 +541,50 @@ impl LocalRunner {
     #[must_use]
     pub fn checkpoint_page_size(mut self, size: usize) -> Self {
         self.checkpoint_page_size = Some(size.max(1));
+        self
+    }
+
+    /// Enables checkpoint coalescing with the given delay window, exactly
+    /// as [`Options`](crate::Options)'s
+    /// [`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay) does
+    /// in production: checkpoints from concurrently running operations
+    /// coalesce into fewer writes, and the buffer flushes unconditionally
+    /// at suspension, execution completion, and callback creation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use std::time::Duration;
+    ///
+    /// let runner = LocalRunner::new().checkpoint_delay(Duration::from_millis(20));
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn checkpoint_delay(mut self, delay: std::time::Duration) -> Self {
+        self.checkpoint_delay = Some(delay);
+        self
+    }
+
+    /// Enables checkpoint batching, exactly as [`Options`](crate::Options)'s
+    /// [`checkpoint_batching`](crate::OptionsBuilder::checkpoint_batching)
+    /// does in production: checkpoint writes go through a single ordered
+    /// writer, checkpoints arriving while a write is in flight are sent
+    /// together in the next call (split to respect per-request size
+    /// limits), and the buffer flushes unconditionally at suspension,
+    /// execution completion, and callback creation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().checkpoint_batching();
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn checkpoint_batching(mut self) -> Self {
+        self.checkpoint_batching = true;
         self
     }
 
@@ -648,8 +701,15 @@ impl LocalRunner {
 
         // The handler runs behind the SAME service function production
         // registers with the Lambda runtime — only the transport (the
-        // execution client) is faked.
-        let service = crate::wrap_with_execution_client(handler, None, client);
+        // execution client) is faked. The buffer window is derived from the
+        // two knobs exactly as `wrap` derives it from `Options`.
+        let checkpoint_buffer_window = match (self.checkpoint_delay, self.checkpoint_batching) {
+            (Some(delay), _) => Some(delay),
+            (None, true) => Some(std::time::Duration::ZERO),
+            (None, false) => None,
+        };
+        let service =
+            crate::wrap_with_execution_client(handler, None, client, checkpoint_buffer_window);
 
         // Serialize the event once; the envelope re-delivers it per
         // invocation.
@@ -1485,6 +1545,10 @@ struct Backend {
     /// actually forced a state fetch (or, under `single_page`, that none
     /// occurred).
     get_state_calls: std::sync::atomic::AtomicUsize,
+    /// Counts `checkpoint` calls — lets tests assert that checkpoint
+    /// coalescing (`checkpoint_delay`) actually reduced the number of
+    /// writes.
+    checkpoint_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl Backend {
@@ -1498,6 +1562,7 @@ impl Backend {
             }),
             checkpoint_page_size,
             get_state_calls: std::sync::atomic::AtomicUsize::new(0),
+            checkpoint_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1506,6 +1571,14 @@ impl Backend {
     #[cfg(test)]
     fn get_state_call_count(&self) -> usize {
         self.get_state_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The number of `checkpoint` calls the SDK has made against this
+    /// backend.
+    #[cfg(test)]
+    fn checkpoint_call_count(&self) -> usize {
+        self.checkpoint_calls
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -1761,6 +1834,8 @@ impl ExecutionClient for Backend {
         updates: Vec<OperationUpdate>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>>
     {
+        self.checkpoint_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let updated_ops: Vec<Operation> = {
             let mut state = self.lock();
             state.token_counter += 1;
@@ -3660,6 +3735,208 @@ mod tests {
             backend.get_state_call_count(),
             0,
             "single-page mode must never require a get_state fetch"
+        );
+    }
+
+    // ── Checkpoint coalescing (`checkpoint_delay`) ──────────────────────
+
+    /// A handler with two concurrently-spawned steps, a suspension, and a
+    /// post-resume step. `executions` counts step-body runs so replay
+    /// fidelity is observable from outside.
+    fn coalescing_probe_handler(
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl Fn(
+        (),
+        DurableContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
+    + Send
+    + Sync
+    + 'static {
+        move |(), ctx: DurableContext| {
+            let executions = Arc::clone(&executions);
+            Box::pin(async move {
+                let e1 = Arc::clone(&executions);
+                let e2 = Arc::clone(&executions);
+                let e3 = Arc::clone(&executions);
+
+                // Two concurrent steps: their START checkpoints (and their
+                // SUCCEED checkpoints) land within one coalescing window.
+                let a = ctx
+                    .step(move |_| {
+                        let e = e1;
+                        async move {
+                            e.fetch_add(1, Ordering::SeqCst);
+                            Ok(1_i32)
+                        }
+                    })
+                    .name("a")
+                    .spawn();
+                let b = ctx
+                    .step(move |_| {
+                        let e = e2;
+                        async move {
+                            e.fetch_add(1, Ordering::SeqCst);
+                            Ok(2_i32)
+                        }
+                    })
+                    .name("b")
+                    .spawn();
+                let (ra, rb) = tokio::join!(a, b);
+                let sum = ra? + rb?;
+
+                // Suspension boundary: the coalesced SUCCEED checkpoints
+                // above must have landed by now, or replay after resume
+                // would re-execute the bodies.
+                ctx.wait(std::time::Duration::from_secs(1))
+                    .name("pause")
+                    .await?;
+
+                let c = ctx
+                    .step(move |_| {
+                        let e = e3;
+                        async move {
+                            e.fetch_add(1, Ordering::SeqCst);
+                            Ok(sum + 39)
+                        }
+                    })
+                    .name("c")
+                    .await?;
+                Ok::<_, BoxError>(c)
+            })
+        }
+    }
+
+    /// `checkpoint_delay` coalesces concurrent checkpoints into fewer API
+    /// calls, and everything that must land before the suspension still
+    /// does: the spawned step bodies run exactly once across the
+    /// suspend/resume boundary, proving their coalesced checkpoints
+    /// flushed before the invocation reported PENDING.
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_delay_coalesces_and_flushes_before_suspension() {
+        // Baseline: identical handler, no coalescing.
+        let baseline_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let baseline_runner = LocalRunner::new().single_page();
+        let baseline_backend = Arc::new(Backend::new(Vec::new(), None));
+        let baseline = baseline_runner
+            .run_on_backend(
+                Arc::clone(&baseline_backend),
+                coalescing_probe_handler(Arc::clone(&baseline_execs)),
+                (),
+            )
+            .await;
+        assert!(baseline.is_success(), "{:?}", baseline.error_message());
+        assert_eq!(baseline.output(), Some(&42));
+
+        // Coalesced: same handler with a checkpoint delay window.
+        let coalesced_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let coalesced_runner = LocalRunner::new()
+            .single_page()
+            .checkpoint_delay(std::time::Duration::from_millis(50));
+        let coalesced_backend = Arc::new(Backend::new(Vec::new(), None));
+        let coalesced = coalesced_runner
+            .run_on_backend(
+                Arc::clone(&coalesced_backend),
+                coalescing_probe_handler(Arc::clone(&coalesced_execs)),
+                (),
+            )
+            .await;
+        assert!(coalesced.is_success(), "{:?}", coalesced.error_message());
+        assert_eq!(
+            coalesced.output(),
+            Some(&42),
+            "coalescing must not change the handler's result"
+        );
+
+        // Coalescing must have merged the concurrent steps' checkpoints
+        // into fewer API calls than the immediate-write baseline.
+        let baseline_calls = baseline_backend.checkpoint_call_count();
+        let coalesced_calls = coalesced_backend.checkpoint_call_count();
+        assert!(
+            coalesced_calls < baseline_calls,
+            "expected fewer checkpoint calls with coalescing: \
+             coalesced={coalesced_calls}, baseline={baseline_calls}"
+        );
+
+        // Flush-before-suspension: each step body ran exactly once. A
+        // checkpoint held past the PENDING boundary would force the
+        // resumed invocation to re-execute the body.
+        assert_eq!(
+            coalesced_execs.load(Ordering::SeqCst),
+            3,
+            "each step body must run exactly once across suspend/resume"
+        );
+        assert_eq!(
+            baseline_execs.load(Ordering::SeqCst),
+            3,
+            "baseline sanity: each step body runs exactly once"
+        );
+    }
+
+    /// `checkpoint_delay` with a whole-handler completion: the terminal
+    /// SUCCEEDED envelope is only reported after the end-of-invocation
+    /// flush drains the buffer, so a sequential handler under a large
+    /// delay window still completes with all operations recorded.
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_delay_completes_sequential_handlers() {
+        let result = LocalRunner::new()
+            .single_page()
+            .checkpoint_delay(std::time::Duration::from_millis(20))
+            .run(
+                |n: i32, ctx: DurableContext| async move {
+                    let v = ctx
+                        .step(move |_| async move { Ok(n + 1) })
+                        .name("inc")
+                        .await?;
+                    Ok::<_, BoxError>(v)
+                },
+                41_i32,
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&42));
+        // The step's START and SUCCEED records both landed.
+        assert!(
+            result
+                .operations()
+                .iter()
+                .any(|op| op.status == "Succeeded" && op.name.as_deref() == Some("inc")),
+            "the step's coalesced checkpoints must be recorded: {:?}",
+            result.operations()
+        );
+    }
+
+    /// `checkpoint_batching` preserves handler semantics end-to-end: the
+    /// same probe handler (concurrent steps, a suspension, a post-resume
+    /// step) completes with the same output, and every step body runs
+    /// exactly once across the suspend/resume boundary — proving the
+    /// batched checkpoints flushed (and any in-flight batched write was
+    /// awaited) before the invocation reported PENDING.
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_batching_preserves_handler_semantics() {
+        let execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = Arc::new(Backend::new(Vec::new(), None));
+        let result = LocalRunner::new()
+            .single_page()
+            .checkpoint_batching()
+            .run_on_backend(
+                Arc::clone(&backend),
+                coalescing_probe_handler(Arc::clone(&execs)),
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            result.output(),
+            Some(&42),
+            "batching must not change the handler's result"
+        );
+        assert_eq!(
+            execs.load(Ordering::SeqCst),
+            3,
+            "each step body must run exactly once across suspend/resume — \
+             a checkpoint held past the PENDING boundary would re-execute it"
         );
     }
 
