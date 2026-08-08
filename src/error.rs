@@ -784,6 +784,21 @@ pub enum CombinatorErrorKind {
         /// Error messages from each future.
         errors: Vec<String>,
     },
+    /// The first settled future in `race` was a failure.
+    ///
+    /// `race` propagates the first outcome to settle, success or failure.
+    /// When that outcome is a failure, the losing future's error is
+    /// flattened to its display message and carried here.
+    FirstSettledFailed {
+        /// The flattened message of the first-settled future's error.
+        message: String,
+    },
+    /// The combinator was called with no futures.
+    ///
+    /// Returned by `race` and `select_ok`, which cannot produce a winner
+    /// from an empty input. `try_join_all` and `join_all` instead resolve
+    /// successfully to an empty collection.
+    EmptyInput,
     /// An internal error occurred.
     Internal {
         /// Description of the internal failure.
@@ -803,6 +818,10 @@ impl fmt::Display for CombinatorErrorKind {
             Self::AllFailed { errors } => {
                 write!(f, "all failed ({} errors)", errors.len())
             }
+            Self::FirstSettledFailed { message } => {
+                write!(f, "first settled future failed: {message}")
+            }
+            Self::EmptyInput => write!(f, "combinator called with no futures"),
             Self::Internal { message } => write!(f, "internal error: {message}"),
         }
     }

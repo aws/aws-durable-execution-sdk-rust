@@ -1212,6 +1212,11 @@ impl DurableContext {
     /// Returns `Vec<O>` on success, or the first `OperationError`
     /// encountered.
     ///
+    /// # Empty input
+    ///
+    /// Called with no futures, resolves to `Ok` with an empty `Vec`,
+    /// matching `futures::future::try_join_all`.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1245,6 +1250,11 @@ impl DurableContext {
     /// Never fails fast — all futures run to completion regardless of
     /// individual errors.
     ///
+    /// # Empty input
+    ///
+    /// Called with no futures, resolves to `Ok` with an empty `Vec`,
+    /// matching `futures::future::join_all`.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1276,6 +1286,15 @@ impl DurableContext {
     /// Returns the first successful result.
     ///
     /// Losers are dropped (cancelled) when the first success resolves.
+    /// If every future fails, the operation fails with
+    /// [`CombinatorErrorKind::AllFailed`](crate::CombinatorErrorKind::AllFailed)
+    /// carrying each future's error message.
+    ///
+    /// # Empty input
+    ///
+    /// Called with no futures, fails with
+    /// [`CombinatorErrorKind::EmptyInput`](crate::CombinatorErrorKind::EmptyInput) —
+    /// there is no future that could succeed.
     ///
     /// # Examples
     ///
@@ -1308,6 +1327,17 @@ impl DurableContext {
     /// Returns the first settled result, whether success or failure.
     ///
     /// Losers are dropped (cancelled) when the first future resolves.
+    /// When the first settled outcome is a failure, the operation fails
+    /// with
+    /// [`CombinatorErrorKind::FirstSettledFailed`](crate::CombinatorErrorKind::FirstSettledFailed)
+    /// carrying the losing future's error message; the same variant is
+    /// produced live and on replay.
+    ///
+    /// # Empty input
+    ///
+    /// Called with no futures, fails with
+    /// [`CombinatorErrorKind::EmptyInput`](crate::CombinatorErrorKind::EmptyInput) —
+    /// there is no future that could settle.
     ///
     /// # Examples
     ///

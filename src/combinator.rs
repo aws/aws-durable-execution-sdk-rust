@@ -10,7 +10,12 @@
 //! - `try_join_all` — await all; fail fast on the first error.
 //! - `join_all` — await all; collect each outcome as `Settled` (never short-circuits).
 //! - `select_ok` — return the first success; fail only if all branches fail.
-//! - `race` — return the first settled outcome (success or failure).
+//! - `race` — return the first settled outcome (success or failure). A
+//!   failure winner surfaces as `CombinatorErrorKind::FirstSettledFailed`.
+//!
+//! Empty input: `try_join_all` and `join_all` resolve to an empty
+//! collection (matching `futures-rs`); `select_ok` and `race` fail with
+//! `CombinatorErrorKind::EmptyInput` since no winner can exist.
 //!
 //! Losers are dropped (cancelled) when a combinator resolves; each
 //! combinator runs inside a child context so the combined result is
@@ -31,6 +36,26 @@ use crate::future::{DurableFuture, Settled};
 /// Wire sub-type for combinator operations (shared with child context
 /// since combinators ARE child-context ops with a combinator-flavored closure).
 pub(crate) const COMBINATOR_SUB_TYPE: &str = "RunInChildContext";
+
+/// Wire `error_type` for a combinator failure whose specific kind carries
+/// no dedicated wire discriminator (`JoinFailed`, `AllFailed`, internal
+/// errors). Replay reconstructs these as `CombinatorErrorKind::Internal`.
+const COMBINATOR_ERROR_TYPE: &str = "CombinatorError";
+
+/// Wire `error_type` recording that a `race` settled first on a failure.
+///
+/// [`replay_combinator_failure`] maps this back to
+/// [`CombinatorErrorKind::FirstSettledFailed`], so the live and replay
+/// paths surface the same variant.
+const FIRST_SETTLED_FAILED_ERROR_TYPE: &str = "CombinatorError.FirstSettledFailed";
+
+/// Wire `error_type` recording an empty-input failure (`race` and
+/// `select_ok` called with no futures).
+///
+/// [`replay_combinator_failure`] maps this back to
+/// [`CombinatorErrorKind::EmptyInput`], so the live and replay paths
+/// surface the same variant.
+const EMPTY_INPUT_ERROR_TYPE: &str = "CombinatorError.EmptyInput";
 
 // ────────────────────────────────────────────────────────────────────────────
 // TryJoinAll (fail-fast concurrent join)
@@ -145,7 +170,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
                 &self.ctx,
                 &wire_id,
                 self.name.as_deref(),
-                "CombinatorError",
+                COMBINATOR_ERROR_TYPE,
                 &err_msg,
             )
             .await?;
@@ -376,6 +401,21 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
             checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
         }
 
+        // Empty input — there is no future that could succeed. Fail
+        // explicitly with `EmptyInput` (matching `race`) rather than an
+        // `AllFailed` carrying zero errors.
+        if self.futures.is_empty() {
+            checkpoint_fail(
+                &self.ctx,
+                &wire_id,
+                self.name.as_deref(),
+                EMPTY_INPUT_ERROR_TYPE,
+                "select_ok called with no futures",
+            )
+            .await?;
+            return Err(combinator_empty_input_error());
+        }
+
         // Live path: race all futures, keep going until one succeeds or all fail.
         let count = self.futures.len();
         let mut join_set = tokio::task::JoinSet::new();
@@ -433,7 +473,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
             &self.ctx,
             &wire_id,
             self.name.as_deref(),
-            "CombinatorError",
+            COMBINATOR_ERROR_TYPE,
             &err_display,
         )
         .await?;
@@ -496,6 +536,20 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
             checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
         }
 
+        // Empty input — there is no future that could settle. Fail
+        // explicitly with `EmptyInput` (matching `select_ok`).
+        if self.futures.is_empty() {
+            checkpoint_fail(
+                &self.ctx,
+                &wire_id,
+                self.name.as_deref(),
+                EMPTY_INPUT_ERROR_TYPE,
+                "race called with no futures",
+            )
+            .await?;
+            return Err(combinator_empty_input_error());
+        }
+
         // Live path: race all futures, first settled wins.
         let mut join_set = tokio::task::JoinSet::new();
 
@@ -507,64 +561,59 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
             });
         }
 
-        // Wait for the first completed task.
-        if let Some(task_result) = join_set.join_next().await {
-            // Cancel all remaining losers.
-            join_set.abort_all();
+        // Wait for the first completed task. The join set is non-empty
+        // (empty input returned above), so a settled task always arrives.
+        let Some(task_result) = join_set.join_next().await else {
+            return Err(combinator_internal_error(
+                "race: join set drained without a settled future",
+            ));
+        };
 
-            match task_result {
-                Ok((_idx, Ok(value))) => {
-                    // Winner is a success.
-                    let serialized = serde_json::to_string(&value).map_err(|e| {
-                        combinator_internal_error(&format!("serialization failed: {e}"))
-                    })?;
-                    checkpoint_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized)
-                        .await?;
-                    return Ok(value);
-                }
-                Ok((_idx, Err(op_err))) => {
-                    // Winner is a failure — race propagates it.
-                    let err_msg = op_err.to_string();
-                    checkpoint_fail(
-                        &self.ctx,
-                        &wire_id,
-                        self.name.as_deref(),
-                        "CombinatorError",
-                        &err_msg,
-                    )
-                    .await?;
-                    return Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                        CombinatorError::from_kind(CombinatorErrorKind::Internal {
-                            message: err_msg,
-                        }),
-                    )));
-                }
-                Err(join_err) => {
-                    let msg = format!("task join failed: {join_err}");
-                    checkpoint_fail(
-                        &self.ctx,
-                        &wire_id,
-                        self.name.as_deref(),
-                        "CombinatorError",
-                        &msg,
-                    )
-                    .await?;
-                    return Err(combinator_internal_error(&msg));
-                }
+        // Cancel all remaining losers.
+        join_set.abort_all();
+
+        match task_result {
+            Ok((_idx, Ok(value))) => {
+                // Winner is a success.
+                let serialized = serde_json::to_string(&value).map_err(|e| {
+                    combinator_internal_error(&format!("serialization failed: {e}"))
+                })?;
+                checkpoint_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized).await?;
+                Ok(value)
+            }
+            Ok((_idx, Err(op_err))) => {
+                // Winner is a failure — race propagates it. The losing
+                // error is flattened to its display message and surfaced
+                // as `FirstSettledFailed`; the wire `error_type` carries
+                // the discriminator so replay reproduces the same variant.
+                let err_msg = op_err.to_string();
+                checkpoint_fail(
+                    &self.ctx,
+                    &wire_id,
+                    self.name.as_deref(),
+                    FIRST_SETTLED_FAILED_ERROR_TYPE,
+                    &err_msg,
+                )
+                .await?;
+                Err(OperationError::from_kind(OperationErrorKind::Combinator(
+                    CombinatorError::from_kind(CombinatorErrorKind::FirstSettledFailed {
+                        message: err_msg,
+                    }),
+                )))
+            }
+            Err(join_err) => {
+                let msg = format!("task join failed: {join_err}");
+                checkpoint_fail(
+                    &self.ctx,
+                    &wire_id,
+                    self.name.as_deref(),
+                    COMBINATOR_ERROR_TYPE,
+                    &msg,
+                )
+                .await?;
+                Err(combinator_internal_error(&msg))
             }
         }
-
-        // Empty iterator — no futures provided.
-        let msg = "race called with empty iterator";
-        checkpoint_fail(
-            &self.ctx,
-            &wire_id,
-            self.name.as_deref(),
-            "CombinatorError",
-            msg,
-        )
-        .await?;
-        Err(combinator_internal_error(msg))
     }
 }
 
@@ -731,6 +780,14 @@ fn combinator_internal_error(message: &str) -> OperationError {
     )))
 }
 
+/// Creates the `EmptyInput` combinator `OperationError` shared by `race`
+/// and `select_ok` (live and replay paths).
+fn combinator_empty_input_error() -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::from_kind(
+        CombinatorErrorKind::EmptyInput,
+    )))
+}
+
 /// Replays a successful `Vec<O>` from a checkpoint record.
 fn replay_vec_success<O: DeserializeOwned>(
     result: Option<&String>,
@@ -777,15 +834,31 @@ fn replay_settled_success<O: DeserializeOwned>(
 }
 
 /// Replays a failed combinator from a checkpoint record.
+///
+/// The wire `error_type` is the variant discriminator: failures recorded
+/// as [`FIRST_SETTLED_FAILED_ERROR_TYPE`] or [`EMPTY_INPUT_ERROR_TYPE`]
+/// reconstruct the same [`CombinatorErrorKind`] variant the live path
+/// produced, so an error observed live and the same error observed on
+/// replay are indistinguishable. Everything else (including records
+/// written before these discriminators existed) reconstructs as
+/// `Internal` carrying the recorded message.
 fn replay_combinator_failure(
-    _error_type: Option<&str>,
+    error_type: Option<&str>,
     error_message: Option<&str>,
 ) -> OperationError {
+    if error_type == Some(EMPTY_INPUT_ERROR_TYPE) {
+        return combinator_empty_input_error();
+    }
     let message = error_message
         .unwrap_or("unknown combinator error")
         .to_owned();
+    let kind = if error_type == Some(FIRST_SETTLED_FAILED_ERROR_TYPE) {
+        CombinatorErrorKind::FirstSettledFailed { message }
+    } else {
+        CombinatorErrorKind::Internal { message }
+    };
     OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::from_kind(
-        CombinatorErrorKind::Internal { message },
+        kind,
     )))
 }
 
@@ -1285,7 +1358,163 @@ mod tests {
             futures: vec![a, b],
         };
         let err = exec.execute().await.unwrap_err();
-        assert!(matches!(err.kind(), OperationErrorKind::Combinator(_)));
+        match err.kind() {
+            OperationErrorKind::Combinator(ce) => match ce.kind() {
+                CombinatorErrorKind::FirstSettledFailed { message } => {
+                    assert!(
+                        message.contains("fast-fail"),
+                        "loser's message must be preserved: {message}"
+                    );
+                }
+                other => panic!("expected FirstSettledFailed, got: {other:?}"),
+            },
+            other => panic!("expected Combinator, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn race_replay_failure_reproduces_first_settled_failed() {
+        // A race that settled on a failure records the FirstSettledFailed
+        // discriminator on the wire; replay must reconstruct the SAME
+        // variant the live path produced.
+        let (wire_id, record) = failed_record(
+            "1",
+            "CombinatorError.FirstSettledFailed",
+            "step failed: fast-fail",
+        );
+        let log = CheckpointLog::from_records(vec![(wire_id, record)]);
+        let ctx = test_ctx(log);
+
+        let op_id = ctx.mint_id();
+        let exec = RaceExecution::<String> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        };
+        let err = exec.execute().await.unwrap_err();
+        match err.kind() {
+            OperationErrorKind::Combinator(ce) => match ce.kind() {
+                CombinatorErrorKind::FirstSettledFailed { message } => {
+                    assert!(
+                        message.contains("fast-fail"),
+                        "replayed message must match the recorded one: {message}"
+                    );
+                }
+                other => panic!("expected FirstSettledFailed, got: {other:?}"),
+            },
+            other => panic!("expected Combinator, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn race_empty_input() {
+        let ctx = test_ctx_with_client(CheckpointLog::empty());
+
+        let op_id = ctx.mint_id();
+        let exec = RaceExecution::<String> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        };
+        let err = exec.execute().await.unwrap_err();
+        match err.kind() {
+            OperationErrorKind::Combinator(ce) => {
+                assert!(
+                    matches!(ce.kind(), CombinatorErrorKind::EmptyInput),
+                    "expected EmptyInput, got: {:?}",
+                    ce.kind()
+                );
+            }
+            other => panic!("expected Combinator, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn select_ok_empty_input() {
+        let ctx = test_ctx_with_client(CheckpointLog::empty());
+
+        let op_id = ctx.mint_id();
+        let exec = SelectOkExecution::<String> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        };
+        let err = exec.execute().await.unwrap_err();
+        match err.kind() {
+            OperationErrorKind::Combinator(ce) => {
+                assert!(
+                    matches!(ce.kind(), CombinatorErrorKind::EmptyInput),
+                    "expected EmptyInput, got: {:?}",
+                    ce.kind()
+                );
+            }
+            other => panic!("expected Combinator, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_input_replay_reproduces_empty_input() {
+        // A recorded empty-input failure replays as EmptyInput — the same
+        // variant the live path produced — for both race and select_ok.
+        let (wire_id, record) = failed_record(
+            "1",
+            "CombinatorError.EmptyInput",
+            "race called with no futures",
+        );
+        let log = CheckpointLog::from_records(vec![(wire_id, record)]);
+        let ctx = test_ctx(log);
+
+        let op_id = ctx.mint_id();
+        let exec = RaceExecution::<String> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        };
+        let err = exec.execute().await.unwrap_err();
+        match err.kind() {
+            OperationErrorKind::Combinator(ce) => {
+                assert!(
+                    matches!(ce.kind(), CombinatorErrorKind::EmptyInput),
+                    "expected EmptyInput, got: {:?}",
+                    ce.kind()
+                );
+            }
+            other => panic!("expected Combinator, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_join_all_empty_returns_empty_vec() {
+        let ctx = test_ctx_with_client(CheckpointLog::empty());
+
+        let op_id = ctx.mint_id();
+        let exec = TryJoinAllExecution::<i32> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        };
+        let result = exec.execute().await.unwrap();
+        assert!(result.is_empty(), "try_join_all([]) must be Ok(empty)");
+    }
+
+    #[tokio::test]
+    async fn join_all_empty_returns_empty_vec() {
+        let ctx = test_ctx_with_client(CheckpointLog::empty());
+
+        let op_id = ctx.mint_id();
+        let exec = JoinAllExecution::<i32> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        };
+        let result = exec.execute().await.unwrap();
+        assert!(result.is_empty(), "join_all([]) must be Ok(empty)");
     }
 
     #[tokio::test]
