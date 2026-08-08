@@ -508,22 +508,26 @@ impl WaitStrategyBuilder {
 ///
 /// This is the primary entry point. It configures the Lambda runtime with
 /// durable execution support using default [`Options`], then runs the
-/// handler for each invocation.
+/// handler for each invocation. Equivalent to calling [`run_with_options`]
+/// with [`Options::default`].
 ///
 /// The handler closure is called once per invocation. It receives the
 /// deserialized event and a [`DurableContext`] for performing durable
-/// operations.
+/// operations. Per invocation, the runtime parses the durable envelope into
+/// a checkpoint log, constructs a [`DurableContext`] seeded with that log,
+/// and drives the handler closure so that completed operations replay from
+/// the log instead of re-executing.
 ///
 /// # Errors
 ///
-/// Returns an error if the Lambda runtime fails to start or if
-/// configuration is invalid.
+/// Returns an error if the Lambda runtime fails to start or encounters an
+/// unrecoverable error during execution.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use aws_durable_execution_sdk_rust as durable;
-/// use serde::{Deserialize, Serialize};
+/// use serde::Deserialize;
 ///
 /// #[derive(Deserialize)]
 /// struct MyEvent { name: String }
@@ -535,17 +539,6 @@ impl WaitStrategyBuilder {
 ///     }).await
 /// }
 /// ```
-/// Starts the Lambda runtime with durable execution support.
-///
-/// It registers the handler with the Lambda runtime and, per invocation,
-/// parses the durable envelope into a checkpoint log, constructs a
-/// [`DurableContext`] seeded with that log, and drives the handler closure
-/// so that completed operations replay from the log instead of re-executing.
-///
-/// # Errors
-///
-/// Returns an error if the Lambda runtime fails to start or encounters an
-/// unrecoverable error during execution.
 pub async fn run<F, E, Fut, O>(handler: F) -> Result<(), lambda_runtime::Error>
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
@@ -553,122 +546,57 @@ where
     Fut: Future<Output = Result<O, BoxError>> + Send,
     O: Serialize + Send + 'static,
 {
-    use std::sync::Arc as StdArc;
+    run_with_options(handler, Options::default()).await
+}
 
-    let handler = StdArc::new(handler);
-
-    // Create the Lambda client once (cold-start best practice — reused
-    // across invocations).
-    let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
-    let lambda_client = StdArc::new(lambda_client);
-
-    lambda_runtime::run(lambda_runtime::service_fn(
-        move |event: lambda_runtime::LambdaEvent<serde_json::Value>| {
-            let handler = StdArc::clone(&handler);
-            let lambda_client = StdArc::clone(&lambda_client);
-            async move {
-                let (raw_payload, lambda_ctx) = event.into_parts();
-
-                // Parse and validate the durable invocation envelope.
-                let envelope = parse_envelope(&raw_payload)?.ok_or_else(|| {
-                    lambda_runtime::Error::from(
-                        "invocation payload is not a durable execution envelope \
-                             (missing DurableExecutionArn, CheckpointToken, and \
-                             InitialExecutionState)"
-                            .to_owned(),
-                    )
-                })?;
-                let execution_arn = envelope.execution_arn;
-                let checkpoint_token = envelope.checkpoint_token;
-
-                let customer_input: E = extract_customer_input(&raw_payload)?;
-
-                // Parse the initial execution state into a checkpoint log,
-                // then paginate if the backend indicates more pages.
-                let (checkpoint_log, initial_marker) = parse_inline_operations(&raw_payload);
-
-                // Create the production execution client.
-                let exec_client: StdArc<dyn client::ExecutionClient> =
-                    StdArc::new(client::LambdaExecutionClient::new((*lambda_client).clone()));
-
-                // If the initial state was paginated, fetch remaining pages.
-                let checkpoint_log = StdArc::new(
-                    client::resolve_bootstrap_log(
-                        exec_client.as_ref(),
-                        &execution_arn,
-                        &checkpoint_token,
-                        checkpoint_log,
-                        initial_marker.as_deref(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        lambda_runtime::Error::from(format!(
-                            "failed to paginate initial state: {e}"
-                        ))
-                    })?,
-                );
-
-                let ctx = DurableContext::new_root_with_client(
-                    execution_arn,
-                    lambda_ctx,
-                    checkpoint_log,
-                    exec_client,
-                    checkpoint_token,
-                );
-
-                let suspension_signal = ctx.suspension_signal().clone();
-                let replay_span = ctx.replay_span();
-
-                // Run the handler through the driver which handles
-                // suspension. The handler future is instrumented with the
-                // handler-level span so user log events between operations
-                // carry the execution ARN and the live `isReplay` flag.
-                let outcome = driver::drive_invocation(
-                    async {
-                        match (handler)(customer_input, ctx).await {
-                            Ok(result) => serde_json::to_string(&result)
-                                .map_err(|e| ("HandlerError".to_owned(), e.to_string())),
-                            Err(e) => Err(wire_error_from_box_error(e)),
-                        }
-                    }
-                    .instrument(replay_span),
-                    suspension_signal,
-                )
-                .await;
-
-                // Convert outcome to the durable response envelope.
-                let response = match outcome {
-                    driver::InvocationOutcome::Complete(serialized) => {
-                        serde_json::json!({
-                            "Status": "SUCCEEDED",
-                            "Result": serialized
-                        })
-                    }
-                    driver::InvocationOutcome::Pending => {
-                        serde_json::json!({
-                            "Status": "PENDING"
-                        })
-                    }
-                    driver::InvocationOutcome::Failed {
-                        error_type,
-                        error_message,
-                    } => {
-                        serde_json::json!({
-                            "Status": "FAILED",
-                            "Error": {
-                                "ErrorType": error_type,
-                                "ErrorMessage": error_message
-                            }
-                        })
-                    }
-                };
-
-                Ok::<serde_json::Value, lambda_runtime::Error>(response)
-            }
-        },
-    ))
-    .await
+/// Starts the durable function runtime with the given handler and options.
+///
+/// Like [`run`], but applies the supplied [`Options`] — for example an
+/// execution-wide default [`Serdes`] or a preconfigured Lambda client — to
+/// every invocation. Equivalent to registering [`wrap`] with the Lambda
+/// runtime yourself:
+/// `lambda_runtime::run(lambda_runtime::service_fn(wrap(handler, options)))`.
+///
+/// The handler closure is called once per invocation. It receives the
+/// deserialized event and a [`DurableContext`] for performing durable
+/// operations.
+///
+/// # Errors
+///
+/// Returns an error if the Lambda runtime fails to start or encounters an
+/// unrecoverable error during execution.
+///
+/// # Examples
+///
+/// ```no_run
+/// use aws_durable_execution_sdk_rust as durable;
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct MyEvent { name: String }
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), lambda_runtime::Error> {
+///     let options = durable::Options::default();
+///     durable::run_with_options(
+///         |event: MyEvent, ctx: durable::DurableContext| async move {
+///             Ok(format!("Hello, {}!", event.name))
+///         },
+///         options,
+///     ).await
+/// }
+/// ```
+pub async fn run_with_options<F, E, Fut, O>(
+    handler: F,
+    options: Options,
+) -> Result<(), lambda_runtime::Error>
+where
+    F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+    E: for<'de> Deserialize<'de> + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send,
+    O: Serialize + Send + 'static,
+{
+    lambda_runtime::run(lambda_runtime::service_fn(wrap(handler, options))).await
 }
 
 /// Parsed and validated durable invocation envelope fields.
