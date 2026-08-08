@@ -59,7 +59,7 @@ unsafe_code = "forbid"
 workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 lambda_runtime = "1"
 aws-config = "1"
 aws-sdk-lambda = "1"
@@ -73,7 +73,7 @@ sha2 = "0.10"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 aws-smithy-runtime-api = { version = "1", features = ["http-1x"] }
 aws-smithy-types = "1"
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
 
 [[test]]
 name = "nondeterminism"

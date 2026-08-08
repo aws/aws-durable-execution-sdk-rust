@@ -17,4 +17,4 @@ workspace = true
 aws-durable-execution-sdk-rust = { path = "../../.." }
 lambda_runtime = "1"
 serde_json = "1"
-tokio = { version = "1", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
