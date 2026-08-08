@@ -85,7 +85,7 @@ pub use self::error::{
     CallbackError, CallbackErrorKind, ChildContextError, ChildContextErrorKind, CombinatorError,
     CombinatorErrorKind, InvokeError, InvokeErrorKind, NonDeterministicExecutionError,
     NonDeterministicExecutionErrorKind, OperationError, OperationErrorKind, StepError,
-    StepErrorKind, WaitForConditionError, WaitForConditionErrorKind,
+    StepErrorKind, WaitError, WaitErrorKind, WaitForConditionError, WaitForConditionErrorKind,
 };
 pub use self::future::{Branch, Callback, DurableFuture, Settled};
 pub use self::map_parallel::{
@@ -757,6 +757,7 @@ fn wire_error_from_box_error(err: BoxError) -> (String, String) {
 fn wire_error_from_operation_error(err: &OperationError) -> (String, String) {
     match err.kind() {
         OperationErrorKind::Step(_) => ("StepError".to_owned(), err.to_string()),
+        OperationErrorKind::Wait(_) => ("WaitError".to_owned(), err.to_string()),
         OperationErrorKind::Invoke(_) => ("InvokeError".to_owned(), err.to_string()),
         OperationErrorKind::Callback(cb_err) => {
             let message = match cb_err.kind() {

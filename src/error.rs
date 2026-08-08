@@ -19,6 +19,7 @@ use std::fmt;
 /// fn handle_error(err: OperationError) {
 ///     match err.kind() {
 ///         OperationErrorKind::Step(_) => tracing::error!("step failed"),
+///         OperationErrorKind::Wait(_) => tracing::error!("wait failed"),
 ///         OperationErrorKind::Invoke(_) => tracing::error!("invoke failed"),
 ///         OperationErrorKind::Callback(_) => tracing::error!("callback failed"),
 ///         OperationErrorKind::WaitForCondition(_) => tracing::error!("condition failed"),
@@ -97,6 +98,8 @@ impl std::error::Error for OperationError {
 pub enum OperationErrorKind {
     /// A step operation failed.
     Step(StepError),
+    /// A wait operation failed.
+    Wait(WaitError),
     /// An invoke operation failed.
     Invoke(InvokeError),
     /// A callback operation failed.
@@ -116,6 +119,7 @@ impl fmt::Display for OperationErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Step(e) => write!(f, "step: {e}"),
+            Self::Wait(e) => write!(f, "wait: {e}"),
             Self::Invoke(e) => write!(f, "invoke: {e}"),
             Self::Callback(e) => write!(f, "callback: {e}"),
             Self::WaitForCondition(e) => write!(f, "wait_for_condition: {e}"),
@@ -130,6 +134,7 @@ impl std::error::Error for OperationErrorKind {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Step(e) => Some(e),
+            Self::Wait(e) => Some(e),
             Self::Invoke(e) => Some(e),
             Self::Callback(e) => Some(e),
             Self::WaitForCondition(e) => Some(e),
@@ -240,6 +245,93 @@ impl fmt::Display for StepErrorKind {
 }
 
 impl std::error::Error for StepErrorKind {}
+
+// --- WaitError ---
+
+/// Error from a wait operation.
+///
+/// Use [`kind()`](Self::kind) to determine the failure mode.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::{WaitError, WaitErrorKind};
+///
+/// fn check_wait_error(err: &WaitError) {
+///     match err.kind() {
+///         WaitErrorKind::CheckpointFailed { message } => {
+///             tracing::error!(%message, "wait could not be checkpointed");
+///         }
+///         _ => {}
+///     }
+/// }
+/// ```
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct WaitError {
+    kind: WaitErrorKind,
+}
+
+impl WaitError {
+    /// Returns the specific kind of wait error.
+    #[must_use]
+    pub fn kind(&self) -> &WaitErrorKind {
+        &self.kind
+    }
+
+    /// Creates a `WaitError` from its kind (internal).
+    pub(crate) fn from_kind(kind: WaitErrorKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl fmt::Display for WaitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.kind)
+    }
+}
+
+impl std::error::Error for WaitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.kind)
+    }
+}
+
+/// Specific kinds of wait failures.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::WaitErrorKind;
+/// ```
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum WaitErrorKind {
+    /// The wait's start could not be checkpointed with the service.
+    CheckpointFailed {
+        /// Description of the checkpoint failure.
+        message: String,
+    },
+    /// The wait's checkpointed record carries a status the SDK cannot
+    /// resume from.
+    UnexpectedStatus {
+        /// The unexpected status found in the checkpoint log.
+        status: String,
+    },
+}
+
+impl fmt::Display for WaitErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CheckpointFailed { message } => write!(f, "checkpoint failed: {message}"),
+            Self::UnexpectedStatus { status } => {
+                write!(f, "unexpected checkpointed status: {status}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WaitErrorKind {}
 
 // --- InvokeError ---
 
@@ -867,6 +959,8 @@ const _: () = {
         assert_send_sync_static::<OperationErrorKind>();
         assert_send_sync_static::<StepError>();
         assert_send_sync_static::<StepErrorKind>();
+        assert_send_sync_static::<WaitError>();
+        assert_send_sync_static::<WaitErrorKind>();
         assert_send_sync_static::<InvokeError>();
         assert_send_sync_static::<InvokeErrorKind>();
         assert_send_sync_static::<CallbackError>();
@@ -950,6 +1044,11 @@ mod tests {
             OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
                 StepErrorKind::ExecutionFailed {
                     message: "s".to_owned(),
+                },
+            ))),
+            OperationError::from_kind(OperationErrorKind::Wait(WaitError::from_kind(
+                WaitErrorKind::UnexpectedStatus {
+                    status: "Failed".to_owned(),
                 },
             ))),
             OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::from_kind(
@@ -1066,6 +1165,24 @@ mod tests {
     }
 
     #[test]
+    fn wait_error_display_and_kind_accessor() {
+        let err = WaitError::from_kind(WaitErrorKind::UnexpectedStatus {
+            status: "Cancelled".to_owned(),
+        });
+        assert!(matches!(err.kind(), WaitErrorKind::UnexpectedStatus { .. }));
+        assert!(err.to_string().contains("Cancelled"), "display: {err}");
+
+        let op_err = OperationError::from_kind(OperationErrorKind::Wait(WaitError::from_kind(
+            WaitErrorKind::CheckpointFailed {
+                message: "throttled".to_owned(),
+            },
+        )));
+        let display = op_err.to_string();
+        assert!(display.contains("wait"), "display: {display}");
+        assert!(display.contains("throttled"), "display: {display}");
+    }
+
+    #[test]
     fn wait_for_condition_error_display() {
         let err = WaitForConditionError::from_kind(WaitForConditionErrorKind::MaxChecksExceeded {
             checks: 10,
@@ -1095,6 +1212,11 @@ mod tests {
             message: "x".to_owned(),
         });
         check_error(&step_err);
+
+        let wait_err = WaitError::from_kind(WaitErrorKind::CheckpointFailed {
+            message: "x".to_owned(),
+        });
+        check_error(&wait_err);
 
         let invoke_err = InvokeError::from_kind(InvokeErrorKind::FunctionFailed {
             message: "x".to_owned(),

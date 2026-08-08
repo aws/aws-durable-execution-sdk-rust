@@ -10,7 +10,7 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate, Wai
 use crate::client::ClientError;
 use crate::context::DurableContext;
 use crate::engine::{CheckpointStatus, OperationId};
-use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
+use crate::error::{OperationError, OperationErrorKind, WaitError, WaitErrorKind};
 
 /// Wire sub-type for wait operations.
 pub(crate) const WAIT_SUB_TYPE: &str = "Wait";
@@ -60,12 +60,9 @@ impl WaitExecution {
                 | CheckpointStatus::TimedOut
                 | CheckpointStatus::Stopped => {
                     // Unexpected status for wait — treat as error.
-                    return Err(OperationError::from_kind(OperationErrorKind::Step(
-                        StepError::from_kind(StepErrorKind::ExecutionFailed {
-                            message: format!(
-                                "wait has unexpected checkpointed status: {:?}",
-                                record.status
-                            ),
+                    return Err(OperationError::from_kind(OperationErrorKind::Wait(
+                        WaitError::from_kind(WaitErrorKind::UnexpectedStatus {
+                            status: format!("{:?}", record.status),
                         }),
                     )));
                 }
@@ -119,8 +116,8 @@ fn build_wait_start_update(
 }
 
 fn client_error_to_op_error(err: &ClientError) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
-        StepErrorKind::ExecutionFailed {
+    OperationError::from_kind(OperationErrorKind::Wait(WaitError::from_kind(
+        WaitErrorKind::CheckpointFailed {
             message: err.to_string(),
         },
     )))
@@ -209,6 +206,57 @@ mod tests {
         let signal = Arc::clone(ctx.suspension_signal());
         let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+    }
+
+    #[tokio::test]
+    async fn wait_unexpected_status_yields_wait_error() {
+        let wire_key = crate::engine::compute_wire_id_public("1");
+        let record = CheckpointRecord {
+            id: wire_key.clone(),
+            status: CheckpointStatus::Failed,
+            result: None,
+            error_type: None,
+            error_message: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        };
+        let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+        let op_id = ctx.mint_id();
+
+        let exec = WaitExecution {
+            ctx,
+            op_id,
+            name: None,
+            duration_secs: 5,
+        };
+
+        let err = exec.execute().await.unwrap_err();
+        // A failed wait surfaces as OperationErrorKind::Wait, not Step.
+        assert!(
+            matches!(
+                err.kind(),
+                OperationErrorKind::Wait(e)
+                    if matches!(e.kind(), WaitErrorKind::UnexpectedStatus { .. })
+            ),
+            "expected Wait/UnexpectedStatus error, got {:?}",
+            err.kind()
+        );
+        assert!(
+            err.to_string().contains("Failed"),
+            "display must carry the offending status: {err}"
+        );
     }
 
     #[tokio::test]

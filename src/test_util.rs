@@ -759,6 +759,7 @@ fn wire_error_from_box_error(err: BoxError) -> (String, String) {
 fn operation_error_type(err: &OperationError) -> String {
     match err.kind() {
         OperationErrorKind::Step(_) => "StepError",
+        OperationErrorKind::Wait(_) => "WaitError",
         OperationErrorKind::Invoke(_) => "InvokeError",
         OperationErrorKind::Callback(_) => "CallbackError",
         OperationErrorKind::ChildContext(_) => "ChildContextError",
