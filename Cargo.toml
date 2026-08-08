@@ -86,3 +86,7 @@ required-features = ["test-util"]
 [[test]]
 name = "replay_logging"
 required-features = ["test-util", "replay-filter"]
+
+[[test]]
+name = "lifecycle_events"
+required-features = ["test-util"]

@@ -113,15 +113,36 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
                             )),
                         };
                     }
+                    // Recorded terminal outcome returned without re-running
+                    // the body (the ReplayChildren branch above re-executes,
+                    // so it is deliberately not a replay event). Decode the
+                    // payload FIRST, then emit `operation_replayed`: a
+                    // corrupt payload or failing serdes surfaces as an error
+                    // without claiming a recorded outcome was returned.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    return replay_success::<O>(
+                    let value = replay_success::<O>(
                         self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                         payload.as_ref(),
                         &serdes_ctx,
                     )
-                    .await;
+                    .await?;
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Context",
+                        Some(CHILD_SUB_TYPE),
+                        view.attempt,
+                    );
+                    return Ok(value);
                 }
                 CheckpointStatus::Failed => {
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Context",
+                        Some(CHILD_SUB_TYPE),
+                        view.attempt,
+                    );
                     let (error_type, error_message) = self
                         .ctx
                         .checkpoint_error_parts(&positional_id)

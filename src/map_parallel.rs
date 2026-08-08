@@ -972,6 +972,15 @@ where
             .await
             {
                 Ok(result) => {
+                    // Recorded terminal batch summary returned without
+                    // re-running the batch (see `crate::observability`).
+                    ctx.emit_operation_replayed(
+                        &parent_wire,
+                        parent_name.as_deref(),
+                        "Context",
+                        Some(parent_sub_type),
+                        view.attempt,
+                    );
                     // Advance the parent counter past the iteration IDs that
                     // were consumed during the original execution. Sequential
                     // (concurrency=1) only claims started items; concurrent
@@ -991,6 +1000,18 @@ where
                     // from its terminal record.
                     let is_replay_children = e.to_string().contains(REPLAY_CHILDREN_SENTINEL);
                     if !is_replay_children {
+                        // A recorded batch FAILURE replays as this error; an
+                        // internal replay problem (missing/corrupt payload)
+                        // is not a replayed outcome and emits nothing.
+                        if matches!(snapshot.status, CheckpointStatus::Failed) {
+                            ctx.emit_operation_replayed(
+                                &parent_wire,
+                                parent_name.as_deref(),
+                                "Context",
+                                Some(parent_sub_type),
+                                view.attempt,
+                            );
+                        }
                         return Err(e);
                     }
                     // Fall through: the batch parent is terminal but we need

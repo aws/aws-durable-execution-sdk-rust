@@ -152,16 +152,34 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                     // Terminal success: deserialize the final state.
                     // CRITICAL: LOUD error on deserialization failure.
                     // Never fall back to initial_state (Python #574 / JS #754).
+                    // Decode FIRST, then emit `operation_replayed`: a corrupt
+                    // payload or failing serdes surfaces as an error without
+                    // claiming a recorded outcome was returned.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    return replay_terminal_success(
+                    let value = replay_terminal_success(
                         self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                         payload.as_ref(),
                         &serdes_ctx,
                     )
-                    .await;
+                    .await?;
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Step",
+                        Some(WFC_SUB_TYPE),
+                        view.attempt,
+                    );
+                    return Ok(value);
                 }
                 CheckpointStatus::Failed => {
                     // Terminal failure: reconstruct error from checkpoint.
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Step",
+                        Some(WFC_SUB_TYPE),
+                        view.attempt,
+                    );
                     let (error_type, error_message) = self
                         .ctx
                         .checkpoint_error_parts(&positional_id)

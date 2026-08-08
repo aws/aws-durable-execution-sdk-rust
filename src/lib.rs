@@ -42,6 +42,15 @@
 //!    of `tokio::select!` over durable futures.
 //! 4. On suspension, the user future is dropped — do not rely on `Drop`
 //!    ordering for correctness between durable operations.
+//!
+//! # Observability
+//!
+//! The SDK instruments the operation lifecycle through the [`tracing`]
+//! facade: spans around the handler and each live step body, and `DEBUG`
+//! events at operation start/finish/replay/retry and execution
+//! start/resume/suspend. The span names, event names, and field names are a
+//! documented, stable contract — including how to bridge it to
+//! OpenTelemetry — in the [`observability`] module.
 
 mod builders;
 pub(crate) mod callback;
@@ -56,6 +65,7 @@ mod error;
 mod future;
 pub(crate) mod invoke;
 pub(crate) mod map_parallel; // public types re-exported above
+pub mod observability;
 mod options;
 mod serdes;
 pub(crate) mod step;
@@ -1683,6 +1693,21 @@ where
             let suspension_signal = ctx.suspension_signal().clone();
             let replay_span = ctx.replay_span();
 
+            // Lifecycle event: exactly one of `execution_started` /
+            // `execution_resumed` per invocation, emitted while the
+            // handler's `durable_execution` span is entered so it is a
+            // span event of that span (which is what lets the documented
+            // tracing-opentelemetry bridge export it on the execution
+            // span). See `crate::observability`.
+            {
+                let _execution_scope = replay_span.enter();
+                tracing_layer::invocation_begin_event(
+                    ctx.is_replaying(),
+                    ctx.execution_arn(),
+                    &ctx.lambda_context().request_id,
+                );
+            }
+
             // Run the handler through the driver which handles suspension.
             // The handler future is instrumented with the handler-level span
             // so user log events between operations carry the execution ARN
@@ -1734,37 +1759,54 @@ where
             // execution status (`GetDurableExecution` /
             // `ListDurableExecutionsByFunction`) instead. See the rustdoc on
             // [`run`] and [`wrap`].
-            let response = match outcome {
-                driver::InvocationOutcome::Complete(serialized) => {
-                    serde_json::json!({
-                        "Status": "SUCCEEDED",
-                        "Result": serialized
-                    })
-                }
-                driver::InvocationOutcome::Pending => {
-                    serde_json::json!({
-                        "Status": "PENDING"
-                    })
-                }
-                driver::InvocationOutcome::Failed {
-                    error_type,
-                    error_message,
-                } => {
-                    // Deliberately wrapped in `Ok` by the return below: the
-                    // FAILED status travels in the envelope, not as a Lambda
-                    // invocation error. See the envelope contract note above.
-                    serde_json::json!({
-                        "Status": "FAILED",
-                        "Error": {
-                            "ErrorType": error_type,
-                            "ErrorMessage": error_message
-                        }
-                    })
-                }
-            };
-
-            Ok(response)
+            Ok(outcome_envelope(outcome, &flush_ctx))
         })
+    }
+}
+
+/// Converts the driver's invocation outcome into the durable response
+/// envelope, emitting the `execution_suspended` lifecycle event on the
+/// suspension path (see [`crate::observability`]).
+///
+/// The FAILED status deliberately travels in the envelope, not as a Lambda
+/// invocation error — see the envelope contract note at the call site.
+fn outcome_envelope(outcome: driver::InvocationOutcome, ctx: &DurableContext) -> serde_json::Value {
+    match outcome {
+        driver::InvocationOutcome::Complete(serialized) => {
+            serde_json::json!({
+                "Status": "SUCCEEDED",
+                "Result": serialized
+            })
+        }
+        driver::InvocationOutcome::Pending => {
+            // Emitted while the handler's `durable_execution` span is
+            // entered — the instrumented handler future has already been
+            // dropped, but the context still holds the span handle — so
+            // the event is a span event of the execution span, matching
+            // the documented OpenTelemetry bridge (see
+            // `crate::observability`).
+            let execution_span = ctx.replay_span();
+            let _execution_scope = execution_span.enter();
+            tracing_layer::execution_suspended_event(
+                ctx.execution_arn(),
+                &ctx.lambda_context().request_id,
+            );
+            serde_json::json!({
+                "Status": "PENDING"
+            })
+        }
+        driver::InvocationOutcome::Failed {
+            error_type,
+            error_message,
+        } => {
+            serde_json::json!({
+                "Status": "FAILED",
+                "Error": {
+                    "ErrorType": error_type,
+                    "ErrorMessage": error_message
+                }
+            })
+        }
     }
 }
 

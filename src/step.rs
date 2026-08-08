@@ -224,16 +224,35 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
         )? {
             match view.status {
                 CheckpointStatus::Succeeded => {
+                    // Decode the recorded payload FIRST: `operation_replayed`
+                    // promises a recorded terminal outcome was returned, so a
+                    // corrupt payload or failing serdes surfaces as an error
+                    // without the event.
                     let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    return replay_success(
+                    let value = replay_success(
                         self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                         payload.as_ref(),
                         &serdes_ctx,
                     )
-                    .await;
+                    .await?;
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Step",
+                        Some(STEP_SUB_TYPE),
+                        view.attempt,
+                    );
+                    return Ok(value);
                 }
                 CheckpointStatus::Failed => {
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Step",
+                        Some(STEP_SUB_TYPE),
+                        view.attempt,
+                    );
                     let (error_type, error_message) = self
                         .ctx
                         .checkpoint_error_parts(&positional_id)

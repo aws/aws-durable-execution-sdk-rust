@@ -37,6 +37,12 @@
 //!   `DurableContext::spawn_batch_flush`), so a contributor that is dropped
 //!   mid-await (a lost `race`, for example) cannot cancel an in-flight batch
 //!   write and strand the other contributors.
+//! - Each buffered update carries its lifecycle event with it (see
+//!   [`TrackedUpdate`]): the flusher that persists a chunk emits that
+//!   chunk's events immediately after the chunk's write succeeds. Telemetry
+//!   for a persisted transition therefore cannot be lost to a dropped
+//!   contributor, and a chunk persisted before a later chunk fails still
+//!   emits its events even though the batch as a whole publishes the error.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -46,6 +52,39 @@ use tokio::sync::Notify;
 use tokio::sync::futures::Notified;
 
 use crate::client::{CheckpointOutput, ClientError};
+use crate::tracing_layer::PendingTransitionEvent;
+
+/// An operation update paired with the lifecycle event describing the
+/// transition it records (see
+/// [`PendingTransitionEvent`](crate::tracing_layer::PendingTransitionEvent)).
+///
+/// The pair travels together through the whole write path — into the
+/// coalescing buffer, across batch splits, and into the flush task — so
+/// the code that actually persists the update also owns its event and
+/// emits it the moment that write succeeds. Keeping the event with the
+/// update (rather than in the contributor future awaiting the batch) is
+/// what upholds the documented guarantee that every persisted transition
+/// emits telemetry: a contributor dropped after joining a batch (a lost
+/// `race`/`select_ok` branch) cannot take its events down with it, and a
+/// chunk persisted before a later chunk fails still emits its events.
+#[derive(Debug)]
+pub(crate) struct TrackedUpdate {
+    /// The update to checkpoint.
+    pub(crate) update: OperationUpdate,
+    /// The lifecycle event to emit once the update is persisted.
+    pub(crate) event: PendingTransitionEvent,
+}
+
+impl TrackedUpdate {
+    /// Pairs an update with the lifecycle event captured from it. The
+    /// capture snapshots the current [`tracing::Span`], so call this from
+    /// the originating operation's context (the checkpoint chokepoint),
+    /// not from the flush task.
+    pub(crate) fn capture(update: OperationUpdate, attempt: u32) -> Self {
+        let event = PendingTransitionEvent::capture(&update, attempt);
+        Self { update, event }
+    }
+}
 
 /// Size caps for one `CheckpointDurableExecution` request. A sealed batch
 /// larger than either cap is split into multiple requests, preserving
@@ -121,17 +160,19 @@ pub(crate) fn estimated_update_size(update: &OperationUpdate) -> usize {
 /// preserving order. A single update whose estimated size alone exceeds the
 /// payload cap is emitted as its own one-update request (it cannot be split
 /// further; the service applies its own limit to it exactly as it would to
-/// an immediate write).
+/// an immediate write). Each update's lifecycle event stays paired with it
+/// across the split, so the writer emits exactly the events of the chunk it
+/// just persisted.
 pub(crate) fn split_into_requests(
-    updates: Vec<OperationUpdate>,
+    updates: Vec<TrackedUpdate>,
     limits: &BatchLimits,
-) -> Vec<Vec<OperationUpdate>> {
-    let mut requests: Vec<Vec<OperationUpdate>> = Vec::new();
-    let mut current: Vec<OperationUpdate> = Vec::new();
+) -> Vec<Vec<TrackedUpdate>> {
+    let mut requests: Vec<Vec<TrackedUpdate>> = Vec::new();
+    let mut current: Vec<TrackedUpdate> = Vec::new();
     let mut current_bytes = 0_usize;
 
-    for update in updates {
-        let size = estimated_update_size(&update);
+    for tracked in updates {
+        let size = estimated_update_size(&tracked.update);
         let over_count = current.len() >= limits.max_operations.max(1);
         let over_bytes = !current.is_empty() && current_bytes + size > limits.max_payload_bytes;
         if over_count || over_bytes {
@@ -139,7 +180,7 @@ pub(crate) fn split_into_requests(
             current_bytes = 0;
         }
         current_bytes += size;
-        current.push(update);
+        current.push(tracked);
     }
     if !current.is_empty() {
         requests.push(current);
@@ -170,8 +211,9 @@ pub(crate) struct CheckpointCoalescer {
 /// Buffer state guarded by the coalescer lock.
 #[derive(Debug, Default)]
 struct CoalescerState {
-    /// Updates awaiting the next flush, in join order.
-    pending: Vec<OperationUpdate>,
+    /// Updates (each paired with its lifecycle event) awaiting the next
+    /// flush, in join order.
+    pending: Vec<TrackedUpdate>,
     /// The batch the pending updates belong to, if one is open.
     batch: Option<Arc<CheckpointBatch>>,
 }
@@ -245,8 +287,11 @@ impl CheckpointCoalescer {
     }
 
     /// Adds `updates` to the buffer and returns the batch they joined,
-    /// opening a new batch if none is pending.
-    pub(crate) fn join(&self, updates: Vec<OperationUpdate>) -> Arc<CheckpointBatch> {
+    /// opening a new batch if none is pending. The buffer takes ownership
+    /// of each update's lifecycle event along with it: from this point the
+    /// flusher that persists the update — not the (cancellable)
+    /// contributor — is responsible for emitting it.
+    pub(crate) fn join(&self, updates: Vec<TrackedUpdate>) -> Arc<CheckpointBatch> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.pending.extend(updates);
         Arc::clone(state.batch.get_or_insert_with(Arc::default))
@@ -255,7 +300,7 @@ impl CheckpointCoalescer {
     /// Claims `target`'s buffered updates for flushing, if `target` is still
     /// the open batch. Returns `None` when another flusher already claimed
     /// it (its result will be published by that flusher).
-    pub(crate) fn take_batch(&self, target: &Arc<CheckpointBatch>) -> Option<Vec<OperationUpdate>> {
+    pub(crate) fn take_batch(&self, target: &Arc<CheckpointBatch>) -> Option<Vec<TrackedUpdate>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match &state.batch {
             Some(open) if Arc::ptr_eq(open, target) => {
@@ -270,7 +315,7 @@ impl CheckpointCoalescer {
     /// points (suspension, end of invocation) that must drain the buffer
     /// regardless of which batch is pending. Returns `None` when the buffer
     /// is idle.
-    pub(crate) fn take_any(&self) -> Option<(Arc<CheckpointBatch>, Vec<OperationUpdate>)> {
+    pub(crate) fn take_any(&self) -> Option<(Arc<CheckpointBatch>, Vec<TrackedUpdate>)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let batch = state.batch.take()?;
         Some((batch, std::mem::take(&mut state.pending)))
@@ -292,6 +337,12 @@ mod tests {
             .expect("all required OperationUpdate fields set")
     }
 
+    /// Pairs a test update with a captured lifecycle event, as the
+    /// checkpoint chokepoint does in production.
+    fn track(update: OperationUpdate) -> TrackedUpdate {
+        TrackedUpdate::capture(update, 1)
+    }
+
     fn dummy_output() -> CheckpointOutput {
         CheckpointOutput {
             checkpoint_token: "token-1".to_owned(),
@@ -303,8 +354,8 @@ mod tests {
     #[test]
     fn joins_accumulate_into_one_batch() {
         let coalescer = CheckpointCoalescer::new(Duration::from_millis(10));
-        let first = coalescer.join(vec![dummy_update("a")]);
-        let second = coalescer.join(vec![dummy_update("b")]);
+        let first = coalescer.join(vec![track(dummy_update("a"))]);
+        let second = coalescer.join(vec![track(dummy_update("b"))]);
         assert!(
             Arc::ptr_eq(&first, &second),
             "concurrent joins share one batch"
@@ -317,11 +368,11 @@ mod tests {
     #[test]
     fn take_batch_is_a_no_op_for_a_stale_batch() {
         let coalescer = CheckpointCoalescer::new(Duration::from_millis(10));
-        let old = coalescer.join(vec![dummy_update("a")]);
+        let old = coalescer.join(vec![track(dummy_update("a"))]);
         assert!(coalescer.take_batch(&old).is_some());
 
         // A new batch opens after the take; the stale handle cannot claim it.
-        let new = coalescer.join(vec![dummy_update("b")]);
+        let new = coalescer.join(vec![track(dummy_update("b"))]);
         assert!(!Arc::ptr_eq(&old, &new), "a fresh batch opened");
         assert!(
             coalescer.take_batch(&old).is_none(),
@@ -347,11 +398,11 @@ mod tests {
             max_payload_bytes: usize::MAX,
         };
         let updates = vec![
-            dummy_update("a"),
-            dummy_update("b"),
-            dummy_update("c"),
-            dummy_update("d"),
-            dummy_update("e"),
+            track(dummy_update("a")),
+            track(dummy_update("b")),
+            track(dummy_update("c")),
+            track(dummy_update("d")),
+            track(dummy_update("e")),
         ];
         let requests = split_into_requests(updates, &limits);
         assert_eq!(
@@ -359,7 +410,11 @@ mod tests {
             vec![2, 2, 1],
             "five updates under a two-op cap split into 2+2+1"
         );
-        let flat: Vec<&str> = requests.iter().flatten().map(|u| u.id.as_str()).collect();
+        let flat: Vec<&str> = requests
+            .iter()
+            .flatten()
+            .map(|t| t.update.id.as_str())
+            .collect();
         assert_eq!(
             flat,
             vec!["a", "b", "c", "d", "e"],
@@ -384,9 +439,9 @@ mod tests {
             max_payload_bytes: 2560,
         };
         let updates = vec![
-            payload_update("a", 1024),
-            payload_update("b", 1024),
-            payload_update("c", 1024),
+            track(payload_update("a", 1024)),
+            track(payload_update("b", 1024)),
+            track(payload_update("c", 1024)),
         ];
         let requests = split_into_requests(updates, &limits);
         assert_eq!(
@@ -395,7 +450,10 @@ mod tests {
             "1 KiB payloads plus overhead exceed the cap pairwise, so each goes alone"
         );
 
-        let small = vec![payload_update("a", 10), payload_update("b", 10)];
+        let small = vec![
+            track(payload_update("a", 10)),
+            track(payload_update("b", 10)),
+        ];
         let requests = split_into_requests(small, &limits);
         assert_eq!(
             requests.len(),
@@ -417,8 +475,14 @@ mod tests {
             max_operations: 10,
             max_payload_bytes: 1024,
         };
-        let requests =
-            split_into_requests(vec![dummy_update("a"), big, dummy_update("b")], &limits);
+        let requests = split_into_requests(
+            vec![
+                track(dummy_update("a")),
+                track(big),
+                track(dummy_update("b")),
+            ],
+            &limits,
+        );
         assert_eq!(
             requests.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![1, 1, 1],
@@ -428,7 +492,7 @@ mod tests {
             .get(1)
             .and_then(|r| r.first())
             .expect("the middle request holds the oversized update");
-        assert_eq!(middle.id, "big");
+        assert_eq!(middle.update.id, "big");
     }
 
     #[test]
@@ -486,7 +550,7 @@ mod tests {
             max_operations: usize::MAX,
             max_payload_bytes: 3000,
         };
-        let updates = vec![quote_update("a"), quote_update("b")];
+        let updates = vec![track(quote_update("a")), track(quote_update("b"))];
         let requests = split_into_requests(updates, &limits);
         assert_eq!(
             requests.iter().map(Vec::len).collect::<Vec<_>>(),

@@ -19,7 +19,7 @@ use crate::builders::{
     WaitForCallbackBuilder, WaitForConditionBuilder, WithRetryBuilder,
 };
 use crate::checkpoint_coalescer::{
-    BatchLimits, CheckpointBatch, CheckpointCoalescer, split_into_requests,
+    BatchLimits, CheckpointBatch, CheckpointCoalescer, TrackedUpdate, split_into_requests,
 };
 use crate::client::{CheckpointOutput, ClientError, ExecutionClient};
 use crate::driver::{SuspensionSignal, TaskOwnership};
@@ -378,6 +378,32 @@ impl DurableContext {
     /// request ID, and the namespace's live `isReplay` flag.
     pub(crate) fn replay_span(&self) -> tracing::Span {
         self.inner.replay_span.clone()
+    }
+
+    /// Emits the
+    /// [`operation_replayed`](crate::observability::event_names::OPERATION_REPLAYED)
+    /// lifecycle event: the operation's recorded terminal outcome is being
+    /// returned without re-running it (see [`crate::observability`]).
+    ///
+    /// `recorded_attempt` is the checkpoint record's retry count; the event
+    /// reports the 1-based attempt that produced the recorded outcome.
+    pub(crate) fn emit_operation_replayed(
+        &self,
+        wire_id: &str,
+        operation_name: Option<&str>,
+        operation_type: &str,
+        operation_sub_type: Option<&str>,
+        recorded_attempt: u32,
+    ) {
+        crate::tracing_layer::operation_replayed_event(&crate::tracing_layer::OperationIdentity {
+            execution_arn: self.execution_arn(),
+            request_id: &self.lambda_context().request_id,
+            operation_id: wire_id,
+            operation_name,
+            operation_type,
+            operation_sub_type,
+            attempt: recorded_attempt.saturating_add(1),
+        });
     }
 
     /// Creates a child context with its OWN fresh suspension scope.
@@ -835,21 +861,69 @@ impl DurableContext {
         self.checkpoint_with_urgency(updates, true).await
     }
 
-    /// Shared body of the buffered checkpoint paths: joins the batch, then
-    /// awaits its published result. A non-urgent contributor under a
-    /// non-zero delay arms the delay timer and requests the flush itself
-    /// when the window elapses; an urgent contributor — or any contributor
-    /// under a zero-delay coalescer (pure `checkpoint_batching` mode) —
-    /// requests the flush right away. Either way the flush task claims and
-    /// writes the batch under the coalescer's writer lock, so batching
-    /// still emerges while an earlier write is in flight.
+    /// Shared body of the buffered checkpoint paths: pairs each update
+    /// with its captured lifecycle-event metadata, then hands the pairs to
+    /// the write path, which emits each event as soon as the write that
+    /// persists its update succeeds.
     async fn checkpoint_with_urgency(
         &self,
         updates: Vec<OperationUpdate>,
         urgent: bool,
     ) -> Result<CheckpointOutput, ClientError> {
+        // Lifecycle events (see `crate::observability`): every operation
+        // transition the SDK records passes through here, so this one site
+        // covers `operation_started` / `operation_succeeded` /
+        // `operation_failed` / `operation_retry_scheduled` for every
+        // operation type. The metadata is captured BEFORE the write (the
+        // checkpoint response mutates the log the attempt is derived from,
+        // and the updates themselves are consumed by it; the capture also
+        // snapshots this call's span so the event keeps its originating
+        // context). Ownership then travels WITH the update into the write
+        // path — the buffered flush task, not this possibly-cancelled
+        // future, emits the event — so a contributor dropped after joining
+        // a batch (a lost `race`/`select_ok` branch) cannot suppress
+        // telemetry for a transition the flush still persists, and events
+        // are emitted per persisted chunk rather than per batch. A rejected
+        // write records nothing, so it emits nothing.
+        let tracked: Vec<TrackedUpdate> = updates
+            .into_iter()
+            .map(|update| {
+                // The current attempt is one past the recorded retry count,
+                // exactly as the step live path derives it.
+                let attempt = self
+                    .inner
+                    .engine
+                    .checkpoint_log
+                    .status_view(update.id())
+                    .map_or(0, |view| view.attempt)
+                    .saturating_add(1);
+                TrackedUpdate::capture(update, attempt)
+            })
+            .collect();
+
+        self.write_with_urgency(tracked, urgent).await
+    }
+
+    /// Dispatches a checkpoint write: joins the coalescing batch when one
+    /// is configured, otherwise writes directly. A non-urgent contributor
+    /// under a non-zero delay arms the delay timer and requests the flush
+    /// itself when the window elapses; an urgent contributor — or any
+    /// contributor under a zero-delay coalescer (pure `checkpoint_batching`
+    /// mode) — requests the flush right away. Either way the flush task
+    /// claims and writes the batch under the coalescer's writer lock, so
+    /// batching still emerges while an earlier write is in flight.
+    ///
+    /// Joining the batch transfers ownership of each update's lifecycle
+    /// event to the coalescer: the flush task that persists the update
+    /// emits it, so this future can be dropped mid-await without losing
+    /// telemetry for a transition the flush still records.
+    async fn write_with_urgency(
+        &self,
+        updates: Vec<TrackedUpdate>,
+        urgent: bool,
+    ) -> Result<CheckpointOutput, ClientError> {
         let Some(coalescer) = self.inner.coalescer.clone() else {
-            return self.checkpoint_updates_direct(updates).await;
+            return self.write_tracked_direct(updates).await;
         };
 
         let batch = coalescer.join(updates);
@@ -877,6 +951,26 @@ impl DurableContext {
                 }
             }
         }
+    }
+
+    /// Writes one request's worth of tracked updates immediately and, if —
+    /// and only if — the checkpoint call that persists them succeeds, emits
+    /// each update's lifecycle event (inside the span captured with it).
+    /// This is the single site that pairs "the transition was persisted"
+    /// with "its telemetry was emitted": both the unbuffered path and every
+    /// chunk of a batched write funnel through it. The emission happens
+    /// inside [`Self::checkpoint_direct_with_events`], immediately after
+    /// the service accepts the write — before the fallible pagination
+    /// hydration that follows it — so a transition the service recorded
+    /// always emits its event even when hydrating the paginated state
+    /// fails afterwards.
+    async fn write_tracked_direct(
+        &self,
+        tracked: Vec<TrackedUpdate>,
+    ) -> Result<CheckpointOutput, ClientError> {
+        let (updates, events): (Vec<_>, Vec<_>) =
+            tracked.into_iter().map(|t| (t.update, t.event)).unzip();
+        self.checkpoint_direct_with_events(updates, &events).await
     }
 
     /// Spawns a task that claims `batch` (if it is still the open batch)
@@ -913,21 +1007,27 @@ impl DurableContext {
     /// [`Self::checkpoint_updates_direct`] — or the first chunk error,
     /// which aborts the remaining chunks so contributors observe it.
     ///
+    /// Each chunk's lifecycle events are emitted immediately after that
+    /// chunk's write succeeds (see [`Self::write_tracked_direct`]): a chunk
+    /// persisted before a later chunk fails still emits its events, even
+    /// though the batch as a whole publishes the error, so telemetry stays
+    /// faithful to what was actually recorded.
+    ///
     /// Callers must hold the coalescer's writer lock (see the invariants in
     /// [`crate::checkpoint_coalescer`]).
     async fn write_batched_updates(
         &self,
-        updates: Vec<OperationUpdate>,
+        updates: Vec<TrackedUpdate>,
         limits: BatchLimits,
     ) -> Result<CheckpointOutput, ClientError> {
         if updates.is_empty() {
             // An empty seal (possible only defensively) still performs one
             // call so a waiting contributor receives a published result.
-            return self.checkpoint_updates_direct(updates).await;
+            return self.checkpoint_updates_direct(Vec::new()).await;
         }
         let mut last = None;
         for chunk in split_into_requests(updates, &limits) {
-            last = Some(self.checkpoint_updates_direct(chunk).await?);
+            last = Some(self.write_tracked_direct(chunk).await?);
         }
         last.ok_or_else(|| {
             ClientError::new_non_retryable("internal: batched checkpoint produced no requests")
@@ -980,6 +1080,22 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
     ) -> Result<CheckpointOutput, ClientError> {
+        self.checkpoint_direct_with_events(updates, &[]).await
+    }
+
+    /// Body of [`Self::checkpoint_updates_direct`] that additionally owns
+    /// the lifecycle events paired with the updates. Each event is emitted
+    /// the moment `client.checkpoint` returns success — the point at which
+    /// the service has durably recorded the transitions — and **before**
+    /// the pagination hydration below, which can fail after the write
+    /// already persisted. Emitting first keeps telemetry faithful to what
+    /// was recorded: a rejected write emits nothing, and a persisted write
+    /// emits everything even when the follow-up `get_state` fetch fails.
+    async fn checkpoint_direct_with_events(
+        &self,
+        updates: Vec<OperationUpdate>,
+        events: &[crate::tracing_layer::PendingTransitionEvent],
+    ) -> Result<CheckpointOutput, ClientError> {
         let client = self
             .inner
             .execution_client
@@ -995,6 +1111,13 @@ impl DurableContext {
         let output = client
             .checkpoint(&self.inner.execution_arn, &token_guard, updates)
             .await?;
+
+        // The service has recorded the transitions: emit their lifecycle
+        // events now, before the fallible pagination hydration below can
+        // turn an already-persisted write into a caller-visible error.
+        for event in events {
+            event.emit(self.execution_arn(), &self.lambda_context().request_id);
+        }
 
         // Rotate the token while still holding the lock.
         token_guard.clone_from(&output.checkpoint_token);
@@ -3299,6 +3422,402 @@ mod tests {
             ],
             "the two checkpoints that arrived during the in-flight write \
              must batch into one follow-up call"
+        );
+    }
+
+    // ── Lifecycle-event ownership regression tests ──────────────────────
+    //
+    // The documented contract (`crate::observability`) guarantees that
+    // every transition the service records emits its lifecycle event.
+    // These tests pin the two ways the old contributor-owned emission
+    // violated that: a contributor dropped after joining a buffered batch,
+    // and a split batch whose earlier chunk persists before a later chunk
+    // fails.
+
+    /// A `MakeWriter` that captures subscriber output in a shared buffer.
+    #[derive(Clone)]
+    struct EventCaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for EventCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut inner) = self.0.lock() {
+                inner.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for EventCaptureWriter {
+        type Writer = EventCaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Installs a JSON capture subscriber (all levels, flattened fields,
+    /// span list included) and returns the shared buffer plus the guard.
+    fn lifecycle_capture() -> (
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_span_list(true)
+            .with_writer(EventCaptureWriter(Arc::clone(&buffer)));
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (buffer, guard)
+    }
+
+    /// Parses the captured output into the JSON lifecycle-event lines with
+    /// the given event name, returning each line's parsed JSON.
+    fn captured_lifecycle_events(
+        buffer: &Arc<std::sync::Mutex<Vec<u8>>>,
+        event_name: &str,
+    ) -> Vec<serde_json::Value> {
+        let output = buffer.lock().map_or_else(
+            |_| String::new(),
+            |b| String::from_utf8_lossy(&b).to_string(),
+        );
+        output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| {
+                v.get("message").and_then(serde_json::Value::as_str) == Some(event_name)
+                    && v.get("target").and_then(serde_json::Value::as_str)
+                        == Some(crate::observability::TARGET)
+            })
+            .collect()
+    }
+
+    /// REGRESSION (event ownership, dropped contributor): a buffered
+    /// contributor dropped after joining a batch — explicitly supported for
+    /// `race`/`select_ok` losers — must not take its lifecycle events with
+    /// it. The flush task persists the update, so the write path must emit
+    /// the event, inside the span the contributor captured.
+    ///
+    /// The scenario retries a few times because `tracing`'s global
+    /// max-level hint and callsite-interest caches are rebuilt whenever any
+    /// concurrently running test registers or drops a subscriber, and a
+    /// rebuild racing this test's `DEBUG`-level emission can drop the event
+    /// before it reaches this test's (thread-local) subscriber. The
+    /// persistence invariant is asserted on every attempt; a genuine
+    /// emission regression fails all attempts.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_buffered_contributor_still_emits_events_for_persisted_updates() {
+        use crate::observability::event_names;
+
+        let mut emitted = false;
+        for _attempt in 0..5 {
+            let (buffer, _guard) = lifecycle_capture();
+            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+            let ctx = coalescing_ctx(client.clone(), Duration::from_hours(1));
+
+            // The contributor polls once inside its own span — far enough
+            // to capture its events and join the coalescing batch — then is
+            // dropped, exactly like a lost `race` branch.
+            {
+                let span = tracing::info_span!("contributor-span");
+                let _entered = span.enter();
+                let mut fut = Box::pin(ctx.checkpoint_updates(vec![make_update("op-dropped")]));
+                let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(
+                    Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+                    "the buffered contributor must be awaiting the batch"
+                );
+            } // `fut` dropped here, before any flush.
+
+            // The end-of-invocation flush persists the batch anyway.
+            ctx.flush_pending_checkpoints()
+                .await
+                .expect("flush persists the dropped contributor's update");
+
+            let ids: Vec<String> = client
+                .recorded_updates()
+                .iter()
+                .map(|u| u.id.clone())
+                .collect();
+            assert_eq!(
+                ids,
+                vec!["op-dropped".to_owned()],
+                "the dropped contributor's update must still be persisted"
+            );
+
+            let events = captured_lifecycle_events(&buffer, event_names::OPERATION_STARTED);
+            if events.is_empty() {
+                // A concurrent subscriber rebuild dropped the event before
+                // it reached this test's subscriber; retry the scenario.
+                continue;
+            }
+
+            let matching: Vec<&serde_json::Value> = events
+                .iter()
+                .filter(|v| {
+                    v.get(crate::tracing_layer::fields::OPERATION_ID)
+                        .and_then(serde_json::Value::as_str)
+                        == Some("op-dropped")
+                })
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "the persisted transition must emit exactly one operation_started \
+                 event even though its contributor was dropped; got {events:?}"
+            );
+            let spans = format!("{:?}", matching.first().and_then(|v| v.get("spans")));
+            assert!(
+                spans.contains("contributor-span"),
+                "the event must carry the originating contributor's span context, \
+                 got spans: {spans}"
+            );
+            emitted = true;
+            break;
+        }
+        assert!(
+            emitted,
+            "no attempt emitted operation_started for the dropped contributor's \
+             persisted update — telemetry for a persisted transition was lost"
+        );
+    }
+
+    /// A client whose second (and any later) `checkpoint` call fails,
+    /// delegating the first to an [`InMemoryExecutionClient`]. Lets tests
+    /// persist an early batch chunk and then fail a later one.
+    #[derive(Debug)]
+    struct FailSecondCallClient {
+        inner: InMemoryExecutionClient,
+        calls: std::sync::Mutex<u32>,
+    }
+
+    impl FailSecondCallClient {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryExecutionClient::new(Vec::new()),
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    impl ExecutionClient for FailSecondCallClient {
+        fn checkpoint(
+            &self,
+            execution_arn: &str,
+            checkpoint_token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>,
+        > {
+            let arn = execution_arn.to_owned();
+            let token = checkpoint_token.to_owned();
+            Box::pin(async move {
+                let call_index = {
+                    let mut calls = self
+                        .calls
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *calls += 1;
+                    *calls
+                };
+                if call_index >= 2 {
+                    return Err(ClientError::new_non_retryable(
+                        "injected failure on the second chunk",
+                    ));
+                }
+                self.inner.checkpoint(&arn, &token, updates).await
+            })
+        }
+
+        fn get_state(
+            &self,
+            execution_arn: &str,
+            checkpoint_token: &str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
+        {
+            self.inner.get_state(execution_arn, checkpoint_token)
+        }
+    }
+
+    /// REGRESSION (event ownership, split batch): when a sealed batch splits
+    /// into several requests and an earlier request persists before a later
+    /// one fails, the persisted chunk's events must be emitted — the
+    /// aggregate batch error published to contributors must not suppress
+    /// telemetry for transitions the service actually recorded.
+    ///
+    /// Retries for the same reason as
+    /// [`dropped_buffered_contributor_still_emits_events_for_persisted_updates`]:
+    /// concurrent tests rebuilding `tracing`'s global caches can race a
+    /// `DEBUG` emission. Hard invariants assert on every attempt.
+    #[tokio::test(start_paused = true)]
+    async fn split_batch_emits_events_for_chunks_persisted_before_a_failure() {
+        use crate::observability::event_names;
+
+        let mut emitted = false;
+        for _attempt in 0..5 {
+            let (buffer, _guard) = lifecycle_capture();
+            let client = Arc::new(FailSecondCallClient::new());
+            let limits = BatchLimits {
+                max_operations: 1,
+                max_payload_bytes: usize::MAX,
+            };
+            let ctx = DurableContext::new_root_with_client_and_coalescer(
+                "arn:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(CheckpointLog::empty()),
+                Arc::clone(&client) as Arc<dyn ExecutionClient>,
+                "token-0".to_owned(),
+                CheckpointCoalescer::with_limits(Duration::from_millis(50), limits),
+            );
+
+            // Two contributors share one batch; the one-op cap splits it
+            // into two requests. The first persists, the second fails.
+            let (first, second) = tokio::join!(
+                ctx.checkpoint_updates(vec![make_update("op-persisted")]),
+                ctx.checkpoint_updates(vec![make_update("op-rejected")]),
+            );
+            assert!(
+                first.is_err() && second.is_err(),
+                "every contributor observes the aggregate batch error"
+            );
+
+            let ids: Vec<String> = client
+                .inner
+                .recorded_updates()
+                .iter()
+                .map(|u| u.id.clone())
+                .collect();
+            assert_eq!(
+                ids,
+                vec!["op-persisted".to_owned()],
+                "exactly the first chunk was persisted"
+            );
+
+            let events = captured_lifecycle_events(&buffer, event_names::OPERATION_STARTED);
+            if events.is_empty() {
+                // A concurrent subscriber rebuild dropped the event before
+                // it reached this test's subscriber; retry the scenario.
+                continue;
+            }
+
+            let persisted: Vec<&serde_json::Value> = events
+                .iter()
+                .filter(|v| {
+                    v.get(crate::tracing_layer::fields::OPERATION_ID)
+                        .and_then(serde_json::Value::as_str)
+                        == Some("op-persisted")
+                })
+                .collect();
+            assert_eq!(
+                persisted.len(),
+                1,
+                "the persisted chunk must emit its operation_started event \
+                 despite the later chunk's failure; got {events:?}"
+            );
+            assert!(
+                !events.iter().any(|v| {
+                    v.get(crate::tracing_layer::fields::OPERATION_ID)
+                        .and_then(serde_json::Value::as_str)
+                        == Some("op-rejected")
+                }),
+                "the rejected chunk recorded nothing, so it must emit nothing; \
+                 got {events:?}"
+            );
+            emitted = true;
+            break;
+        }
+        assert!(
+            emitted,
+            "no attempt emitted operation_started for the persisted chunk — \
+             telemetry for a persisted transition was lost"
+        );
+    }
+
+    /// REGRESSION (event ownership, failed pagination hydration): the
+    /// checkpoint call can persist the transitions and *then* fail while
+    /// hydrating paginated state through `get_state`. The persisted
+    /// transitions' events must already be emitted by then — emission
+    /// happens immediately after the service accepts the write, before the
+    /// fallible pagination fetch — even though the caller observes an error.
+    ///
+    /// Retries for the same reason as
+    /// [`dropped_buffered_contributor_still_emits_events_for_persisted_updates`]:
+    /// concurrent tests rebuilding `tracing`'s global caches can race a
+    /// `DEBUG` emission. Hard invariants assert on every attempt.
+    #[tokio::test]
+    async fn persisted_checkpoint_emits_events_when_pagination_hydration_fails() {
+        use crate::observability::event_names;
+
+        let mut emitted = false;
+        for _attempt in 0..5 {
+            let (buffer, _guard) = lifecycle_capture();
+            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+            // The write itself succeeds but signals more pages, and the
+            // follow-up get_state fetch fails.
+            client.enqueue_checkpoint_response(TestResponse::SuccessPaginated(
+                Vec::new(),
+                "page-2-token".to_owned(),
+            ));
+            client.fail_get_state("injected get_state failure");
+
+            let ctx = DurableContext::new_root_with_client(
+                "arn:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(CheckpointLog::empty()),
+                Arc::clone(&client) as Arc<dyn ExecutionClient>,
+                "token-0".to_owned(),
+            );
+
+            let result = ctx
+                .checkpoint_updates(vec![make_update("op-hydration")])
+                .await;
+            assert!(
+                result.is_err(),
+                "the caller must observe the pagination-hydration failure"
+            );
+            let ids: Vec<String> = client
+                .recorded_updates()
+                .iter()
+                .map(|u| u.id.clone())
+                .collect();
+            assert_eq!(
+                ids,
+                vec!["op-hydration".to_owned()],
+                "the transition was persisted before get_state failed"
+            );
+
+            let events = captured_lifecycle_events(&buffer, event_names::OPERATION_STARTED);
+            if events.is_empty() {
+                // A concurrent subscriber rebuild dropped the event before
+                // it reached this test's subscriber; retry the scenario.
+                continue;
+            }
+
+            let matching: Vec<&serde_json::Value> = events
+                .iter()
+                .filter(|v| {
+                    v.get(crate::tracing_layer::fields::OPERATION_ID)
+                        .and_then(serde_json::Value::as_str)
+                        == Some("op-hydration")
+                })
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "the persisted transition must emit exactly one operation_started \
+                 event even though pagination hydration failed; got {events:?}"
+            );
+            emitted = true;
+            break;
+        }
+        assert!(
+            emitted,
+            "no attempt emitted operation_started for the persisted transition — \
+             telemetry was suppressed by a failed pagination fetch"
         );
     }
 }

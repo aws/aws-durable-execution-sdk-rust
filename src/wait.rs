@@ -44,6 +44,13 @@ impl WaitExecution {
             match view.status {
                 CheckpointStatus::Succeeded => {
                     // Timer completed — return immediately.
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Wait",
+                        Some(WAIT_SUB_TYPE),
+                        view.attempt,
+                    );
                     return Ok(());
                 }
                 CheckpointStatus::Started => {

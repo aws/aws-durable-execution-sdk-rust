@@ -459,6 +459,10 @@ pub(crate) struct InMemoryExecutionClient {
     pub(crate) checkpoint_call_count: Mutex<u32>,
     /// Counter for `get_state` calls made.
     pub(crate) get_state_call_count: Mutex<u32>,
+    /// When set, `get_state` fails with a non-retryable error carrying this
+    /// message (used to test that a persisted checkpoint's lifecycle events
+    /// survive a failed pagination fetch).
+    get_state_failure: Mutex<Option<String>>,
     /// Token counter for generating unique tokens.
     token_counter: Mutex<u32>,
     /// All operation updates received across checkpoint calls.
@@ -474,6 +478,7 @@ impl InMemoryExecutionClient {
             checkpoint_responses: Mutex::new(Vec::new()),
             checkpoint_call_count: Mutex::new(0),
             get_state_call_count: Mutex::new(0),
+            get_state_failure: Mutex::new(None),
             token_counter: Mutex::new(0),
             recorded_updates: Mutex::new(Vec::new()),
         }
@@ -486,6 +491,16 @@ impl InMemoryExecutionClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         responses.push(response);
+    }
+
+    /// Makes every subsequent `get_state` call fail non-retryably with the
+    /// given message.
+    pub(crate) fn fail_get_state(&self, message: &str) {
+        let mut failure = self
+            .get_state_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *failure = Some(message.to_owned());
     }
 
     /// Returns all operation updates recorded across checkpoint calls.
@@ -589,6 +604,15 @@ impl ExecutionClient for InMemoryExecutionClient {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *count += 1;
+        }
+
+        let failure = self
+            .get_state_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(message) = failure {
+            return Box::pin(async move { Err(ClientError::non_retryable(message)) });
         }
 
         let ops = self

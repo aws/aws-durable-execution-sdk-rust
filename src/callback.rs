@@ -63,6 +63,7 @@ pub(crate) struct CreateCallbackExecution<O> {
 
 impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
     /// Executes the create-callback operation: replay or live path.
+    #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<Callback<O>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -84,6 +85,17 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
                 .ctx
                 .checkpoint_callback_id(&positional_id)
                 .unwrap_or_default();
+            // Terminal statuses replay the recorded outcome without waiting
+            // on the external system again (see `crate::observability`).
+            let emit_replayed = || {
+                self.ctx.emit_operation_replayed(
+                    &wire_id,
+                    self.name.as_deref(),
+                    "Callback",
+                    Some(CALLBACK_SUB_TYPE),
+                    view.attempt,
+                );
+            };
             match view.status {
                 CheckpointStatus::Succeeded => {
                     // Callback completed successfully during a previous
@@ -91,7 +103,10 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
                     // The payload was written by an external caller, so only
                     // the deserialize side of the serdes acts on it. Per-op
                     // serdes wins; otherwise the execution-wide serdes decodes
-                    // it (default JSON).
+                    // it (default JSON). Decode FIRST, then emit
+                    // `operation_replayed`: a corrupt payload or failing
+                    // serdes surfaces as an error without claiming a recorded
+                    // outcome was returned.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
                     let result_str = payload.as_deref().unwrap_or("null");
                     let serdes_ctx =
@@ -102,10 +117,12 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
                         &serdes_ctx,
                     )
                     .await?;
+                    emit_replayed();
                     return Ok(Callback::new_settled(callback_id, Ok(value)));
                 }
                 CheckpointStatus::Failed => {
                     // Callback failed externally.
+                    emit_replayed();
                     let (error_type, error_message) = self
                         .ctx
                         .checkpoint_error_parts(&positional_id)
@@ -121,6 +138,7 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
                 }
                 CheckpointStatus::TimedOut => {
                     // Callback timed out.
+                    emit_replayed();
                     let kind = CallbackErrorKind::TimedOut;
                     let err = OperationError::from_kind(OperationErrorKind::Callback(
                         CallbackError::from_kind(kind),
@@ -229,15 +247,32 @@ impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<
         )? {
             match view.status {
                 CheckpointStatus::Succeeded => {
-                    // WaitForCallback context completed — deserialize result.
+                    // WaitForCallback context completed — deserialize the
+                    // result FIRST, then emit `operation_replayed`: a corrupt
+                    // payload surfaces as an error without claiming a
+                    // recorded outcome was returned.
                     let payload = ctx.checkpoint_result_payload(&positional_id);
                     let result_str = payload.as_deref().unwrap_or("null");
                     let value: O = serde_json::from_str(result_str)
                         .map_err(|e| wfcb_internal_error(&format!("deserialize result: {e}")))?;
+                    ctx.emit_operation_replayed(
+                        &wire_id,
+                        name.as_deref(),
+                        "Context",
+                        Some(WFCB_SUB_TYPE),
+                        view.attempt,
+                    );
                     return Ok(value);
                 }
                 CheckpointStatus::Failed => {
                     // Context failed — classify the error.
+                    ctx.emit_operation_replayed(
+                        &wire_id,
+                        name.as_deref(),
+                        "Context",
+                        Some(WFCB_SUB_TYPE),
+                        view.attempt,
+                    );
                     let (error_type, error_message) = ctx
                         .checkpoint_error_parts(&positional_id)
                         .unwrap_or_default();

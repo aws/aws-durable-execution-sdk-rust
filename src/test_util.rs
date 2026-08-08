@@ -425,6 +425,10 @@ pub struct LocalRunner {
     /// Whether checkpoint batching is enabled, mirroring
     /// [`Options`](crate::Options)'s `checkpoint_batching`.
     checkpoint_batching: bool,
+    /// Number of upcoming checkpoint calls the backend rejects with a
+    /// non-retryable error (fault injection; see
+    /// [`fail_next_checkpoints`](Self::fail_next_checkpoints)).
+    checkpoint_failures: usize,
 }
 
 impl Default for LocalRunner {
@@ -460,6 +464,7 @@ impl LocalRunner {
             checkpoint_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
             checkpoint_delay: None,
             checkpoint_batching: false,
+            checkpoint_failures: 0,
         }
     }
 
@@ -563,6 +568,29 @@ impl LocalRunner {
     #[must_use]
     pub fn checkpoint_delay(mut self, delay: std::time::Duration) -> Self {
         self.checkpoint_delay = Some(delay);
+        self
+    }
+
+    /// Makes the simulated backend reject the next `count` checkpoint
+    /// calls with a non-retryable error, persisting nothing for them —
+    /// exactly like a service-side rejection.
+    ///
+    /// Use it to test how a handler (and the SDK's telemetry — see
+    /// [`crate::observability`]) behaves when a checkpoint write fails:
+    /// the operation whose transition was rejected surfaces the error, and
+    /// no record-transition lifecycle event is emitted for it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().fail_next_checkpoints(1);
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn fail_next_checkpoints(mut self, count: usize) -> Self {
+        self.checkpoint_failures = count;
         self
     }
 
@@ -677,6 +705,10 @@ impl LocalRunner {
             self.callback_outcomes.clone(),
             self.checkpoint_page_size,
         ));
+        backend.checkpoint_failures_remaining.store(
+            self.checkpoint_failures,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         self.run_on_backend(backend, handler, event).await
     }
 
@@ -1549,6 +1581,10 @@ struct Backend {
     /// coalescing (`checkpoint_delay`) actually reduced the number of
     /// writes.
     checkpoint_calls: std::sync::atomic::AtomicUsize,
+    /// Number of upcoming `checkpoint` calls to reject with a
+    /// non-retryable error, before touching any state (fault injection;
+    /// see [`LocalRunner::fail_next_checkpoints`]).
+    checkpoint_failures_remaining: std::sync::atomic::AtomicUsize,
 }
 
 impl Backend {
@@ -1563,6 +1599,7 @@ impl Backend {
             checkpoint_page_size,
             get_state_calls: std::sync::atomic::AtomicUsize::new(0),
             checkpoint_calls: std::sync::atomic::AtomicUsize::new(0),
+            checkpoint_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1836,6 +1873,24 @@ impl ExecutionClient for Backend {
     {
         self.checkpoint_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Injected fault (`LocalRunner::fail_next_checkpoints`): reject
+        // BEFORE touching any state, so the rejected write persists
+        // nothing — exactly like a service-side rejection.
+        if self
+            .checkpoint_failures_remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Box::pin(async {
+                Err(ClientError::new_non_retryable(
+                    "injected checkpoint failure (LocalRunner::fail_next_checkpoints)",
+                ))
+            });
+        }
         let updated_ops: Vec<Operation> = {
             let mut state = self.lock();
             state.token_counter += 1;

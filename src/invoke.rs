@@ -40,6 +40,7 @@ pub(crate) struct InvokeExecution<O> {
 
 impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
     /// Executes the invoke operation: replay path or live path.
+    #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -75,26 +76,44 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
         )? {
             match view.status {
                 CheckpointStatus::Succeeded => {
-                    // Invoke succeeded — deserialize the result from invoke details.
+                    // Invoke succeeded — deserialize the result from invoke
+                    // details FIRST, then emit `operation_replayed`: a corrupt
+                    // payload or failing serdes surfaces as an error without
+                    // claiming a recorded outcome was returned.
                     let payload = self
                         .ctx
                         .with_checkpoint_record(&positional_id, |record| {
                             record.invoke_result.clone()
                         })
                         .flatten();
-                    return deserialize_invoke_result(
+                    let value = deserialize_invoke_result(
                         self.result_serdes
                             .as_ref()
                             .or_else(|| self.ctx.default_serdes()),
                         payload.as_deref().unwrap_or("null"),
                         &serdes_ctx,
                     )
-                    .await;
+                    .await?;
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "ChainedInvoke",
+                        Some(CHAINED_INVOKE_SUB_TYPE),
+                        view.attempt,
+                    );
+                    return Ok(value);
                 }
                 CheckpointStatus::Failed
                 | CheckpointStatus::TimedOut
                 | CheckpointStatus::Stopped => {
                     // Invoke failed — reconstruct InvokeError from details.
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "ChainedInvoke",
+                        Some(CHAINED_INVOKE_SUB_TYPE),
+                        view.attempt,
+                    );
                     let (error_type, error_message) = self
                         .ctx
                         .with_checkpoint_record(&positional_id, |record| {
@@ -115,6 +134,13 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
                     return self.ctx.suspend_now().await;
                 }
                 CheckpointStatus::Cancelled => {
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "ChainedInvoke",
+                        Some(CHAINED_INVOKE_SUB_TYPE),
+                        view.attempt,
+                    );
                     return Err(OperationError::from_kind(OperationErrorKind::Invoke(
                         InvokeError::from_kind(InvokeErrorKind::FunctionFailed {
                             message: "invoke cancelled".to_owned(),

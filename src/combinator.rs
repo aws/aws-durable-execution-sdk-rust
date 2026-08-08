@@ -94,10 +94,27 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         )? {
             match view.status {
                 CheckpointStatus::Succeeded => {
+                    // Decode FIRST, then emit `operation_replayed`: a corrupt
+                    // payload surfaces as an error without the event.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    return replay_vec_success::<O>(payload.as_ref());
+                    let value = replay_vec_success::<O>(payload.as_ref())?;
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Context",
+                        Some(COMBINATOR_SUB_TYPE),
+                        view.attempt,
+                    );
+                    return Ok(value);
                 }
                 CheckpointStatus::Failed => {
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Context",
+                        Some(COMBINATOR_SUB_TYPE),
+                        view.attempt,
+                    );
                     let (error_type, error_message) = self
                         .ctx
                         .checkpoint_error_parts(&positional_id)
@@ -242,6 +259,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
     /// as `Settled::Fulfilled(O)` or `Settled::Rejected(OperationError)`.
     /// Checkpoints with error-aware serdes so Err values survive round-trip.
     /// Replay path: returns frozen `Vec<Settled<O>>`.
+    #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<Vec<Settled<O>>, OperationError> {
         // Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -260,10 +278,27 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
         )? {
             match view.status {
                 CheckpointStatus::Succeeded => {
+                    // Decode FIRST, then emit `operation_replayed`: a corrupt
+                    // payload surfaces as an error without the event.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    return replay_settled_success::<O>(payload.as_ref());
+                    let value = replay_settled_success::<O>(payload.as_ref())?;
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Context",
+                        Some(COMBINATOR_SUB_TYPE),
+                        view.attempt,
+                    );
+                    return Ok(value);
                 }
                 CheckpointStatus::Failed => {
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Context",
+                        Some(COMBINATOR_SUB_TYPE),
+                        view.attempt,
+                    );
                     let (error_type, error_message) = self
                         .ctx
                         .checkpoint_error_parts(&positional_id)
@@ -377,6 +412,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
     /// If all fail, returns `CombinatorError::AllFailed` with all error messages.
     /// Losers are dropped (cancelled) on first success.
     /// Replay path: returns the frozen winner.
+    #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         self.ctx.enforce_task_ownership()?;
 
@@ -394,10 +430,27 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         )? {
             match view.status {
                 CheckpointStatus::Succeeded => {
+                    // Decode FIRST, then emit `operation_replayed`: a corrupt
+                    // payload surfaces as an error without the event.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    return replay_single_success::<O>(payload.as_ref());
+                    let value = replay_single_success::<O>(payload.as_ref())?;
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Context",
+                        Some(COMBINATOR_SUB_TYPE),
+                        view.attempt,
+                    );
+                    return Ok(value);
                 }
                 CheckpointStatus::Failed => {
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Context",
+                        Some(COMBINATOR_SUB_TYPE),
+                        view.attempt,
+                    );
                     let (error_type, error_message) = self
                         .ctx
                         .checkpoint_error_parts(&positional_id)
@@ -516,6 +569,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
     /// Live path: races all futures; returns the first settled (success OR
     /// failure). Losers are dropped (cancelled).
     /// Replay path: returns the frozen result.
+    #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         self.ctx.enforce_task_ownership()?;
 
@@ -533,10 +587,27 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
         )? {
             match view.status {
                 CheckpointStatus::Succeeded => {
+                    // Decode FIRST, then emit `operation_replayed`: a corrupt
+                    // payload surfaces as an error without the event.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    return replay_single_success::<O>(payload.as_ref());
+                    let value = replay_single_success::<O>(payload.as_ref())?;
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Context",
+                        Some(COMBINATOR_SUB_TYPE),
+                        view.attempt,
+                    );
+                    return Ok(value);
                 }
                 CheckpointStatus::Failed => {
+                    self.ctx.emit_operation_replayed(
+                        &wire_id,
+                        self.name.as_deref(),
+                        "Context",
+                        Some(COMBINATOR_SUB_TYPE),
+                        view.attempt,
+                    );
                     let (error_type, error_message) = self
                         .ctx
                         .checkpoint_error_parts(&positional_id)

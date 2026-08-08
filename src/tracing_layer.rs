@@ -1,4 +1,9 @@
-//! Tracing integration: replay-aware filter layer and span helpers.
+//! Tracing integration: replay-aware filter layer, span helpers, and
+//! lifecycle-event emitters.
+//!
+//! This module implements the instrumentation whose public, documented
+//! contract lives in [`crate::observability`] — span names, lifecycle event
+//! names, and field names are all specified there.
 //!
 //! The SDK creates two kinds of [`tracing::Span`]:
 //!
@@ -67,25 +72,10 @@ use tracing::span::Attributes;
 
 /// Field name constants for the structured-log contract.
 ///
-/// These field names appear as top-level JSON keys in `CloudWatch` structured
-/// logs. The validator queries them via:
-/// `filter coalesce(durableExecutionArn, executionArn) like "<arn>"`
-pub(crate) mod fields {
-    /// Durable execution ARN — identifies the orchestration instance.
-    pub(crate) const EXECUTION_ARN: &str = "executionArn";
-
-    /// Lambda invocation request ID.
-    pub(crate) const REQUEST_ID: &str = "requestId";
-
-    /// Wire operation ID (SHA-256 hex digest).
-    pub(crate) const OPERATION_ID: &str = "operationId";
-
-    /// Current attempt number (1-based).
-    pub(crate) const ATTEMPT: &str = "attempt";
-
-    /// Whether this operation is being replayed (`true`/`false`).
-    pub(crate) const IS_REPLAY: &str = "isReplay";
-}
+/// The canonical, documented definitions live in
+/// [`crate::observability::field_names`]; this alias keeps the internal
+/// spelling short.
+pub(crate) use crate::observability::field_names as fields;
 
 /// Creates a `tracing::Span` for a durable operation with the structured-log
 /// field contract.
@@ -179,10 +169,298 @@ pub(crate) fn scoped_execution_span(
     )
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Lifecycle events (see `crate::observability` for the documented contract)
+// ────────────────────────────────────────────────────────────────────────────
+
+use crate::observability::{TARGET, event_names};
+
+/// Identity fields shared by every operation lifecycle event.
+///
+/// Groups the per-operation fields of the documented contract so each
+/// emitter takes one argument instead of seven.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OperationIdentity<'a> {
+    /// Durable execution ARN.
+    pub(crate) execution_arn: &'a str,
+    /// Lambda invocation request ID.
+    pub(crate) request_id: &'a str,
+    /// Wire operation ID (SHA-256 hex digest).
+    pub(crate) operation_id: &'a str,
+    /// User-supplied `.name("...")`, when present.
+    pub(crate) operation_name: Option<&'a str>,
+    /// Operation type (`Step`, `Wait`, `Context`, `Callback`,
+    /// `ChainedInvoke`).
+    pub(crate) operation_type: &'a str,
+    /// Wire sub-type, when present.
+    pub(crate) operation_sub_type: Option<&'a str>,
+    /// 1-based attempt number the event describes.
+    pub(crate) attempt: u32,
+}
+
+/// Maps the wire [`OperationType`] to the contract's `operationType` value.
+///
+/// The contract uses the same `PascalCase` spellings the SDK's replay-identity
+/// checks use (`Step`, not the wire enum's `STEP`).
+fn operation_type_str(op_type: &aws_sdk_lambda::types::OperationType) -> &'static str {
+    use aws_sdk_lambda::types::OperationType;
+    match *op_type {
+        OperationType::Step => "Step",
+        OperationType::Wait => "Wait",
+        OperationType::Context => "Context",
+        OperationType::Callback => "Callback",
+        OperationType::ChainedInvoke => "ChainedInvoke",
+        OperationType::Execution => "Execution",
+        _ => "Unknown",
+    }
+}
+
+/// A record-transition lifecycle event captured from one checkpoint update
+/// before the write, to be emitted only after the checkpoint that persists
+/// the transition succeeds.
+///
+/// The checkpoint path is the single chokepoint every operation type's
+/// `Start`/`Succeed`/`Fail`/`Retry` transition passes through, so
+/// record-transition events cover steps, waits, invokes, callbacks,
+/// `wait_for_condition`, child contexts, and map/parallel batches uniformly.
+/// The metadata is captured eagerly (the checkpoint response mutates the
+/// log the attempt number is derived from) and owned (the update itself is
+/// consumed by the write), but nothing is emitted until the write that
+/// persists the transition succeeds: a rejected checkpoint records no
+/// transition, so it must produce no telemetry claiming one was recorded.
+///
+/// The event travels **with its update** into the write path (see
+/// `crate::checkpoint_coalescer::TrackedUpdate`): when checkpoint buffering
+/// is configured, the flush task — not the contributor future — owns and
+/// emits it, so a contributor dropped after joining a batch (a lost `race`
+/// or `select_ok` branch) cannot suppress the telemetry for a transition
+/// the flush still persists. The capture also snapshots
+/// [`tracing::Span::current()`], and emission re-enters that span, so the
+/// event keeps the originating operation's span context even when emitted
+/// from the detached flush task.
+#[derive(Debug)]
+pub(crate) struct PendingTransitionEvent {
+    /// Wire operation ID.
+    operation_id: String,
+    /// User-supplied operation name, when present.
+    operation_name: Option<String>,
+    /// Contract spelling of the operation type.
+    operation_type: &'static str,
+    /// Wire sub-type, when present.
+    operation_sub_type: Option<String>,
+    /// 1-based attempt the transition describes.
+    attempt: u32,
+    /// The transition being recorded.
+    action: aws_sdk_lambda::types::OperationAction,
+    /// Retry delay (`operation_retry_scheduled` only).
+    delay_seconds: i32,
+    /// Error message (`operation_failed` / `operation_retry_scheduled`).
+    error: String,
+    /// Span current when the transition was captured; emission re-enters
+    /// it so the event stays parented to the originating operation even
+    /// when emitted from the detached batch-flush task.
+    span: tracing::Span,
+}
+
+impl PendingTransitionEvent {
+    /// Captures the event metadata from an update about to be checkpointed.
+    pub(crate) fn capture(update: &aws_sdk_lambda::types::OperationUpdate, attempt: u32) -> Self {
+        Self {
+            span: tracing::Span::current(),
+            operation_id: update.id().to_owned(),
+            operation_name: update.name().map(str::to_owned),
+            operation_type: operation_type_str(update.r#type()),
+            operation_sub_type: update.sub_type().map(str::to_owned),
+            attempt,
+            action: update.action().clone(),
+            delay_seconds: update
+                .step_options()
+                .and_then(aws_sdk_lambda::types::StepOptions::next_attempt_delay_seconds)
+                .unwrap_or_default(),
+            error: update
+                .error()
+                .and_then(|e| e.error_message())
+                .unwrap_or_default()
+                .to_owned(),
+        }
+    }
+
+    /// Emits the captured lifecycle event. Call only after the checkpoint
+    /// write that persists this transition has succeeded.
+    ///
+    /// The event is emitted inside the span captured at
+    /// [`Self::capture`] time, preserving the originating operation's
+    /// span context even when this runs on the detached batch-flush task.
+    pub(crate) fn emit(&self, execution_arn: &str, request_id: &str) {
+        use aws_sdk_lambda::types::OperationAction;
+
+        let op = OperationIdentity {
+            execution_arn,
+            request_id,
+            operation_id: &self.operation_id,
+            operation_name: self.operation_name.as_deref(),
+            operation_type: self.operation_type,
+            operation_sub_type: self.operation_sub_type.as_deref(),
+            attempt: self.attempt,
+        };
+        self.span.in_scope(|| match self.action {
+            OperationAction::Start => operation_started_event(&op),
+            OperationAction::Succeed => operation_succeeded_event(&op),
+            OperationAction::Fail => operation_failed_event(&op, &self.error),
+            OperationAction::Retry => {
+                operation_retry_scheduled_event(&op, self.delay_seconds, &self.error);
+            }
+            _ => {}
+        });
+    }
+}
+
+/// Emits [`event_names::OPERATION_STARTED`].
+fn operation_started_event(op: &OperationIdentity<'_>) {
+    tracing::event!(
+        target: TARGET,
+        tracing::Level::DEBUG,
+        { fields::EXECUTION_ARN } = op.execution_arn,
+        { fields::REQUEST_ID } = op.request_id,
+        { fields::OPERATION_ID } = op.operation_id,
+        { fields::OPERATION_NAME } = op.operation_name,
+        { fields::OPERATION_TYPE } = op.operation_type,
+        { fields::OPERATION_SUB_TYPE } = op.operation_sub_type,
+        { fields::ATTEMPT } = op.attempt,
+        { fields::IS_REPLAY } = false,
+        "{}",
+        event_names::OPERATION_STARTED,
+    );
+}
+
+/// Emits [`event_names::OPERATION_SUCCEEDED`].
+fn operation_succeeded_event(op: &OperationIdentity<'_>) {
+    tracing::event!(
+        target: TARGET,
+        tracing::Level::DEBUG,
+        { fields::EXECUTION_ARN } = op.execution_arn,
+        { fields::REQUEST_ID } = op.request_id,
+        { fields::OPERATION_ID } = op.operation_id,
+        { fields::OPERATION_NAME } = op.operation_name,
+        { fields::OPERATION_TYPE } = op.operation_type,
+        { fields::OPERATION_SUB_TYPE } = op.operation_sub_type,
+        { fields::ATTEMPT } = op.attempt,
+        { fields::IS_REPLAY } = false,
+        "{}",
+        event_names::OPERATION_SUCCEEDED,
+    );
+}
+
+/// Emits [`event_names::OPERATION_FAILED`].
+fn operation_failed_event(op: &OperationIdentity<'_>, error: &str) {
+    tracing::event!(
+        target: TARGET,
+        tracing::Level::DEBUG,
+        { fields::EXECUTION_ARN } = op.execution_arn,
+        { fields::REQUEST_ID } = op.request_id,
+        { fields::OPERATION_ID } = op.operation_id,
+        { fields::OPERATION_NAME } = op.operation_name,
+        { fields::OPERATION_TYPE } = op.operation_type,
+        { fields::OPERATION_SUB_TYPE } = op.operation_sub_type,
+        { fields::ATTEMPT } = op.attempt,
+        { fields::IS_REPLAY } = false,
+        { fields::ERROR } = error,
+        "{}",
+        event_names::OPERATION_FAILED,
+    );
+}
+
+/// Emits [`event_names::OPERATION_RETRY_SCHEDULED`].
+fn operation_retry_scheduled_event(op: &OperationIdentity<'_>, delay_seconds: i32, error: &str) {
+    tracing::event!(
+        target: TARGET,
+        tracing::Level::DEBUG,
+        { fields::EXECUTION_ARN } = op.execution_arn,
+        { fields::REQUEST_ID } = op.request_id,
+        { fields::OPERATION_ID } = op.operation_id,
+        { fields::OPERATION_NAME } = op.operation_name,
+        { fields::OPERATION_TYPE } = op.operation_type,
+        { fields::OPERATION_SUB_TYPE } = op.operation_sub_type,
+        { fields::ATTEMPT } = op.attempt,
+        { fields::IS_REPLAY } = false,
+        { fields::DELAY_SECONDS } = delay_seconds,
+        { fields::ERROR } = error,
+        "{}",
+        event_names::OPERATION_RETRY_SCHEDULED,
+    );
+}
+
+/// Emits [`event_names::OPERATION_REPLAYED`] — a recorded terminal outcome
+/// was returned without re-running the operation.
+pub(crate) fn operation_replayed_event(op: &OperationIdentity<'_>) {
+    tracing::event!(
+        target: TARGET,
+        tracing::Level::DEBUG,
+        { fields::EXECUTION_ARN } = op.execution_arn,
+        { fields::REQUEST_ID } = op.request_id,
+        { fields::OPERATION_ID } = op.operation_id,
+        { fields::OPERATION_NAME } = op.operation_name,
+        { fields::OPERATION_TYPE } = op.operation_type,
+        { fields::OPERATION_SUB_TYPE } = op.operation_sub_type,
+        { fields::ATTEMPT } = op.attempt,
+        { fields::IS_REPLAY } = true,
+        "{}",
+        event_names::OPERATION_REPLAYED,
+    );
+}
+
+/// Emits the invocation-begin lifecycle event: exactly one of
+/// [`event_names::EXECUTION_RESUMED`] (the invocation begins with recorded
+/// operations to replay) or [`event_names::EXECUTION_STARTED`].
+pub(crate) fn invocation_begin_event(is_replaying: bool, execution_arn: &str, request_id: &str) {
+    if is_replaying {
+        execution_resumed_event(execution_arn, request_id);
+    } else {
+        execution_started_event(execution_arn, request_id);
+    }
+}
+
+/// Emits [`event_names::EXECUTION_STARTED`].
+pub(crate) fn execution_started_event(execution_arn: &str, request_id: &str) {
+    tracing::event!(
+        target: TARGET,
+        tracing::Level::DEBUG,
+        { fields::EXECUTION_ARN } = execution_arn,
+        { fields::REQUEST_ID } = request_id,
+        "{}",
+        event_names::EXECUTION_STARTED,
+    );
+}
+
+/// Emits [`event_names::EXECUTION_RESUMED`].
+pub(crate) fn execution_resumed_event(execution_arn: &str, request_id: &str) {
+    tracing::event!(
+        target: TARGET,
+        tracing::Level::DEBUG,
+        { fields::EXECUTION_ARN } = execution_arn,
+        { fields::REQUEST_ID } = request_id,
+        "{}",
+        event_names::EXECUTION_RESUMED,
+    );
+}
+
+/// Emits [`event_names::EXECUTION_SUSPENDED`].
+pub(crate) fn execution_suspended_event(execution_arn: &str, request_id: &str) {
+    tracing::event!(
+        target: TARGET,
+        tracing::Level::DEBUG,
+        { fields::EXECUTION_ARN } = execution_arn,
+        { fields::REQUEST_ID } = request_id,
+        "{}",
+        event_names::EXECUTION_SUSPENDED,
+    );
+}
+
 /// Visitor that extracts the `isReplay` boolean field from recorded values.
 ///
-/// Shared by [`is_replay_event`] (span attributes at creation) and
-/// [`replay_flag_in_record`] (`span.record()` updates after creation).
+/// Shared by [`is_replay_event`] (span attributes at creation),
+/// [`replay_flag_in_record`] (`span.record()` updates after creation), and
+/// [`ReplayFilterLayer`]'s `event_enabled` (an event's own fields).
 #[cfg(any(test, feature = "replay-filter"))]
 struct ReplayVisitor {
     is_replay: Option<bool>,
@@ -260,8 +538,10 @@ impl ReplayTracker {
 // `tracing-subscriber` is an optional dependency)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// A per-layer filter that suppresses log events emitted inside spans
-/// marked `isReplay = true`.
+/// A per-layer filter that suppresses events describing replayed work:
+/// events carrying their own `isReplay = true` field (the SDK's lifecycle
+/// events — see [`crate::observability`]) and events emitted inside spans
+/// marked `isReplay = true` (application log lines during replay).
 ///
 /// When an execution resumes, the handler re-runs from the top and replays
 /// recorded results, so handler code between operations executes — and logs —
@@ -269,6 +549,13 @@ impl ReplayTracker {
 /// tracks the live replay status; this filter drops events while that flag
 /// is `true`, so a log line is written once, on the invocation that first
 /// executed it, not again on every resume.
+///
+/// For events that carry an explicit `isReplay` field, that field is
+/// authoritative and the span scope is not consulted: the execution span's
+/// flag tracks the *next* operation claim, so at the replay high-water
+/// boundary the final `operation_replayed` lifecycle event can fire under
+/// a span already flipped to live. Inspecting the event's own field keeps
+/// suppression exact at that boundary.
 ///
 /// # Usage
 ///
@@ -322,7 +609,21 @@ where
         event: &tracing::Event<'_>,
         ctx: &tracing_subscriber::layer::Context<'_, S>,
     ) -> bool {
-        // Walk the span scope to check if any ancestor has isReplay=true.
+        // An event carrying its own `isReplay` field (every SDK lifecycle
+        // event does — see `crate::observability`) is authoritative: the
+        // execution span's flag tracks the NEXT operation claim, so at the
+        // replay high-water boundary the final `operation_replayed` event
+        // can fire under a span already flipped to `isReplay = false`.
+        // Trusting the event's field suppresses exactly the events that
+        // describe replayed work, wherever they fire.
+        let mut visitor = ReplayVisitor { is_replay: None };
+        event.record(&mut visitor);
+        if let Some(is_replay) = visitor.is_replay {
+            return !is_replay;
+        }
+
+        // Otherwise (application log lines carry no `isReplay` field), walk
+        // the span scope to check if any ancestor has isReplay=true.
         if let Some(scope) = ctx.event_scope(event) {
             for span in scope {
                 let extensions = span.extensions();
@@ -637,6 +938,92 @@ mod tests {
         assert!(
             !output.contains("replay event"),
             "Replay events must be suppressed. Got: {output}"
+        );
+    }
+
+    /// REGRESSION (replay high-water boundary): the execution span's
+    /// `isReplay` flag tracks the NEXT operation claim (`mint_id` re-records
+    /// it before the claimed operation resolves), so the final replay hit
+    /// fires its `operation_replayed` event — which carries `isReplay =
+    /// true` — under a span already flipped to `isReplay = false`. The
+    /// filter must trust the event's own field, not just the span scope,
+    /// so that event is still suppressed; and conversely an event carrying
+    /// an explicit `isReplay = false` must pass even under a span still
+    /// marked as replaying.
+    #[test]
+    fn replay_filter_trusts_event_own_is_replay_field_at_boundary() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Ok(mut inner) = self.0.lock() {
+                    inner.extend_from_slice(buf);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = BufWriter(Arc::clone(&buffer));
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_span_list(false)
+            .with_writer(writer)
+            .with_filter(ReplayFilterLayer);
+
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // The boundary: the span starts replaying, then the next mint flips
+        // it to live, and only afterwards does the final replay hit emit its
+        // event (carrying isReplay = true).
+        {
+            let span = execution_span("arn:test", "req-1", true);
+            span.record(fields::IS_REPLAY, false); // mint_id: next op is live
+            let _entered = span.enter();
+            tracing::info!({ fields::IS_REPLAY } = true, "boundary replay hit");
+        }
+
+        // The converse: a live-work event under a span still marked as
+        // replaying must pass — its own field is authoritative.
+        {
+            let span = execution_span("arn:test", "req-1", true);
+            let _entered = span.enter();
+            tracing::info!({ fields::IS_REPLAY } = false, "live work under replay span");
+        }
+
+        let output = buffer.lock().map_or_else(
+            |_| String::new(),
+            |b| String::from_utf8_lossy(&b).to_string(),
+        );
+
+        assert!(
+            !output.contains("boundary replay hit"),
+            "an event carrying isReplay=true must be suppressed even when its \
+             span has already flipped to live. Got: {output}"
+        );
+        assert!(
+            output.contains("live work under replay span"),
+            "an event carrying isReplay=false must pass even under a span \
+             still marked as replaying. Got: {output}"
         );
     }
 
