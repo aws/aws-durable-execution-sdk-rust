@@ -23,7 +23,7 @@ requires Rust 1.94.1 or newer and edition 2024.
 ```toml
 [dependencies]
 aws-durable-execution-sdk-rust = { git = "https://github.com/aws/aws-durable-execution-sdk-rust", branch = "alpha" }
-lambda_runtime = "0.13"
+lambda_runtime = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros"] }
 ```

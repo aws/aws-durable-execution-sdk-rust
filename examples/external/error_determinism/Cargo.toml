@@ -15,6 +15,6 @@ workspace = true
 
 [dependencies]
 aws-durable-execution-sdk-rust = { path = "../../.." }
-lambda_runtime = "0.13"
+lambda_runtime = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros"] }

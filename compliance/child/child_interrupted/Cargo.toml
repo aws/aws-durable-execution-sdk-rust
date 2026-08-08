@@ -26,7 +26,7 @@ unsafe_code = "forbid"
 [dependencies]
 aws-durable-execution-sdk-rust = { path = "../../.." }
 compliance = { path = "../.." }
-lambda_runtime = "0.13"
+lambda_runtime = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "time"] }
