@@ -17,7 +17,8 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  # The six gates of `make check`, split so a failure names itself.
+  # The eight commands of `make check`, split across this job and the
+  # `dependencies` job so a failure names itself.
   check:
     name: check (sdk)
     runs-on: ubuntu-latest
@@ -41,13 +42,16 @@ jobs:
       - name: Test
         run: cargo test
 
-      - name: Test with test-util feature
-        run: cargo test --features test-util
+      - name: Test with all features
+        run: cargo test --all-features
 
       - name: Docs
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --all-features
+
+      - name: MSRV declaration consistency
+        run: sh scripts/check-msrv-consistency.sh
 
   # Verify the declared minimum supported Rust version (rust-version in
   # Cargo.toml) actually compiles the crate. Without this leg the true MSRV

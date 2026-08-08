@@ -73,8 +73,10 @@ fi
 if [ $# -gt 0 ]; then
     operations="$*"
 else
+    # `build` is scratch the conformance runner leaves behind (gitignored),
+    # not a suite; discovering it as an operation fails the cargo build.
     operations=$(find . -maxdepth 1 -mindepth 1 -type d \
-        ! -name publish ! -name src ! -name target ! -name '.*' \
+        ! -name publish ! -name src ! -name target ! -name build ! -name '.*' \
         -exec basename {} \;)
 fi
 # Stable signature (sorted, single-space-joined) for the skip stamp.

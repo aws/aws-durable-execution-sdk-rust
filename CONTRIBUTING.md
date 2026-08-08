@@ -74,7 +74,7 @@ dependency policy section below explains what adding to it involves.
 ## The quality gate
 
 `make check` is the single entry point, and it must pass before you push. It
-runs seven commands in order, and any one of them failing fails the gate:
+runs eight commands in order, and any one of them failing fails the gate:
 
 | Command | Rejects |
 | --- | --- |
@@ -85,6 +85,7 @@ runs seven commands in order, and any one of them failing fails the gate:
 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | a broken intra-doc link or malformed rustdoc markup anywhere in the documented surface, including feature-gated items |
 | `cargo deny check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source |
 | `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlists do not name, in either the default-feature or the all-features graph |
+| `sh scripts/check-msrv-consistency.sh` | a `rust-version` declaration — in any manifest, the `msrv` CI job, or the README — that disagrees with the root `Cargo.toml`'s |
 
 Two of those are stricter than their defaults. Clippy normally reports warnings
 and exits zero; `-D warnings` turns every one into an error, so a `pedantic`
