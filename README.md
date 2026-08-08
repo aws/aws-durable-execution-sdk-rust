@@ -163,6 +163,15 @@ per invocation. The event type needs `Deserialize` and the output type needs
 conversion. Use `durable::wrap` instead of `durable::run` when you want to
 supply `Options` or add your own middleware around the service function.
 
+A handler failure does not fail the Lambda invocation. The SDK reports it
+inside a successful invocation response, as a `FAILED` envelope the durable
+execution service reads, which is what moves the execution to the `FAILED`
+status. Lambda-level error signals therefore stay quiet: the CloudWatch
+`Errors` metric does not fire, dead-letter queues and `OnFailure`
+destinations do not trigger, and X-Ray does not mark the trace as an error.
+Monitor and alarm on the durable execution status instead, via
+`get-durable-execution` or `list-durable-executions-by-function`.
+
 `DurableContext` is a cheap-to-clone handle backed by an `Arc`, and it is
 `Send + Sync`, so clone it across async boundaries at will. Besides the
 operations below it exposes `execution_arn()`, `lambda_context()` for the

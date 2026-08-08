@@ -518,6 +518,23 @@ impl WaitStrategyBuilder {
 /// and drives the handler closure so that completed operations replay from
 /// the log instead of re-executing.
 ///
+/// # How handler failures are reported
+///
+/// When the handler returns `Err`, the runtime reports the failure *inside a
+/// successful Lambda invocation response*, as a `FAILED` status envelope
+/// that the durable execution service reads. The invocation itself does not
+/// error. This is required by the durable service protocol, and it inverts
+/// the usual Lambda observability signals:
+///
+/// - the `CloudWatch` `Errors` metric for the function does not fire,
+/// - dead-letter queues and `OnFailure` destinations do not trigger,
+/// - X-Ray does not mark the trace as an error.
+///
+/// Handler failures surface through the durable execution status instead:
+/// poll `GetDurableExecution` for a `FAILED` status, or alarm on the
+/// durable-execution metrics (for example, executions that reach a failed
+/// terminal state) rather than on Lambda invocation errors.
+///
 /// # Errors
 ///
 /// Returns an error if the Lambda runtime fails to start or encounters an
@@ -560,6 +577,11 @@ where
 /// The handler closure is called once per invocation. It receives the
 /// deserialized event and a [`DurableContext`] for performing durable
 /// operations.
+///
+/// Handler failures are reported the same way as [`run`]: inside a
+/// successful Lambda invocation response, surfacing through the durable
+/// execution status (`GetDurableExecution`) rather than as Lambda
+/// invocation errors. See [`run`] for the observability implications.
 ///
 /// # Errors
 ///
@@ -952,6 +974,15 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
 /// composable setups where you need additional middleware or custom
 /// runtime configuration.
 ///
+/// The service function reports handler failures inside a *successful*
+/// Lambda invocation response — a `FAILED` status envelope the durable
+/// execution service reads — never as a Lambda invocation error. Middleware
+/// wrapped around this service therefore sees `Ok` for failed handlers, and
+/// Lambda-level error signals (the `Errors` metric, DLQs and `OnFailure`
+/// destinations, X-Ray error status) do not fire. Monitor the durable
+/// execution status (`GetDurableExecution`) instead; see [`run`] for
+/// details.
+///
 /// # Errors
 ///
 /// Returns an error if configuration is invalid.
@@ -1091,6 +1122,23 @@ where
             .await;
 
             // Convert outcome to the durable response envelope.
+            //
+            // ENVELOPE CONTRACT — do not "fix" the `Ok` below. Every outcome,
+            // including a handler failure, is reported inside a *successful*
+            // Lambda invocation response: the durable execution service reads
+            // the `Status` field of this envelope to record the execution
+            // result, and it can only do that when the invocation itself
+            // succeeds. Returning `Err` here would make the service treat the
+            // invocation as a runtime fault and retry it, rather than marking
+            // the execution FAILED with the handler's error.
+            //
+            // The observable consequence, which is intentional: a handler
+            // failure does not increment the Lambda `Errors` metric, does not
+            // route to a DLQ or OnFailure destination, and does not mark the
+            // X-Ray trace as an error. Operators must monitor the durable
+            // execution status (`GetDurableExecution` /
+            // `ListDurableExecutionsByFunction`) instead. See the rustdoc on
+            // [`run`] and [`wrap`].
             let response = match outcome {
                 driver::InvocationOutcome::Complete(serialized) => {
                     serde_json::json!({
@@ -1107,6 +1155,9 @@ where
                     error_type,
                     error_message,
                 } => {
+                    // Deliberately wrapped in `Ok` by the return below: the
+                    // FAILED status travels in the envelope, not as a Lambda
+                    // invocation error. See the envelope contract note above.
                     serde_json::json!({
                         "Status": "FAILED",
                         "Error": {
