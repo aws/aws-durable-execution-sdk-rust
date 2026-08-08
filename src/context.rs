@@ -1068,8 +1068,9 @@ impl DurableContext {
     /// Creates a wait-for-callback operation that registers and waits for
     /// an external callback in one step.
     ///
-    /// The submitter closure receives the callback ID and is responsible
-    /// for delivering it to the external system that will complete it.
+    /// The submitter closure receives the callback ID as an owned
+    /// [`String`] and is responsible for delivering it to the external
+    /// system that will complete it.
     ///
     /// # Examples
     ///
@@ -1096,7 +1097,7 @@ impl DurableContext {
     /// ```
     pub fn wait_for_callback<O, F, Fut>(&self, submitter: F) -> WaitForCallbackBuilder<O>
     where
-        F: FnOnce(StepContext, &str) -> Fut + Send + 'static,
+        F: FnOnce(StepContext, String) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
         O: DeserializeOwned + Send + 'static,
     {

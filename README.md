@@ -353,17 +353,14 @@ let approval = cb.result().await?;
 
 `wait_for_callback` collapses those two halves into one operation: it mints
 the ID, passes it to your submitter closure, and resolves with the payload.
-The submitter receives the ID as a `&str` and its future has to outlive that
-borrow, so own the ID before the async block.
+The submitter receives the ID as an owned `String`, so move it straight into
+the async block.
 
 ```rust
 let approval: String = ctx
-    .wait_for_callback::<String, _, _>(|_step_ctx, callback_id| {
-        let callback_id = callback_id.to_owned();
-        async move {
-            publish_approval_request(callback_id).await?;
-            Ok(())
-        }
+    .wait_for_callback::<String, _, _>(|_step_ctx, callback_id| async move {
+        publish_approval_request(callback_id).await?;
+        Ok(())
     })
     .name("await-approval")
     .await?;

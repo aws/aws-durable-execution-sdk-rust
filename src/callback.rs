@@ -38,10 +38,11 @@ pub(crate) const CALLBACK_SUB_TYPE: &str = "Callback";
 pub(crate) const WFCB_SUB_TYPE: &str = "WaitForCallback";
 
 /// Boxed submitter closure type used by `WaitForCallbackExecution` and
-/// `run_wfcb_body`. Receives a step context and the callback ID string,
-/// and returns a future that delivers the callback ID to an external system.
+/// `run_wfcb_body`. Receives a step context and the owned callback ID
+/// string, and returns a future that delivers the callback ID to an
+/// external system.
 pub(crate) type BoxedSubmitter = Box<
-    dyn FnOnce(StepContext, &str) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>
+    dyn FnOnce(StepContext, String) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>
         + Send,
 >;
 
@@ -373,7 +374,7 @@ async fn run_wfcb_body<O: DeserializeOwned + Send + 'static>(
         semantics: crate::step::StepSemantics::default(),
         closure: Box::new(move |step_ctx| {
             Box::pin(async move {
-                (submitter)(step_ctx, &callback_id)
+                (submitter)(step_ctx, callback_id)
                     .await
                     .map_err(|e| -> BoxError { e })?;
                 Ok(())
