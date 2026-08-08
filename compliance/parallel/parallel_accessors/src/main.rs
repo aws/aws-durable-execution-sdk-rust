@@ -1,15 +1,10 @@
 //! Conformance requirement 8-20: Parallel `BatchResult` accessors
-//! (succeeded/failed/get_errors/has_failure).
-//!
-//! NOTE: The Rust SDK does not expose a public `BatchResult` type with these
-//! accessor methods. The handler catches the error path to infer metadata.
-//! Conformance mismatch expected — the test wants a SUCCEEDED response with
-//! accessor values, but the SDK returns Err on any branch failure.
+//! (success/failure counts, errors, has-failure).
 
 use aws_durable_execution_sdk_rust as durable;
 use durable::{Branch, CompletionConfig, DurableContext};
 
-/// Handler: returns accessor-derived projection.
+/// Handler: returns accessor-derived projection from the batch result.
 async fn handler(
     _event: serde_json::Value,
     ctx: DurableContext,
@@ -22,27 +17,20 @@ async fn handler(
         Branch::new("2", |_: DurableContext| async { Ok("ok2".to_owned()) }),
     ];
 
-    let result = ctx
+    let batch = ctx
         .parallel(branches)
         .name("accessors")
         .max_concurrency(1)
         .completion(CompletionConfig::with_tolerated_failure_count(1))
-        .await;
+        .await_batch()
+        .await?;
 
-    match result {
-        Ok(values) => Ok(serde_json::json!({
-            "hasFailure": false,
-            "successCount": values.len(),
-            "failureCount": 0,
-            "errorCount": 0,
-        })),
-        Err(_) => Ok(serde_json::json!({
-            "hasFailure": true,
-            "successCount": 2,
-            "failureCount": 1,
-            "errorCount": 1,
-        })),
-    }
+    Ok(serde_json::json!({
+        "hasFailure": batch.has_failure(),
+        "successCount": batch.success_count(),
+        "failureCount": batch.failure_count(),
+        "errorCount": batch.errors().len(),
+    }))
 }
 
 #[tokio::main]

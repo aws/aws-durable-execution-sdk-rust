@@ -404,10 +404,12 @@ impl<
 
     /// Executes the map operation and returns the full `BatchResult`.
     ///
-    /// Unlike `execute()` which returns `Vec<O>` (only successes), this
+    /// Unlike `execute()` — which returns `Vec<O>` holding only successful
+    /// items and turns a tolerance-exceeded batch into an error — this
     /// returns the raw `BatchResult` including per-item status, completion
-    /// reason, and error messages. Used by handlers that need batch metadata
-    /// (e.g., success/failure counts for projection results).
+    /// reason, and error messages, without converting tolerated failures
+    /// into errors. Used by handlers that need batch metadata (e.g.,
+    /// success/failure counts for projection results).
     pub(crate) async fn execute_batch_result(self) -> Result<BatchResult<O>, OperationError> {
         let total_items = self.items.len();
         let items = into_item_slots(self.items);
@@ -467,6 +469,50 @@ pub(crate) struct ParallelExecution<O> {
 impl<O: Serialize + DeserializeOwned + Send + 'static> ParallelExecution<O> {
     /// Executes the parallel operation.
     pub(crate) async fn execute(self) -> Result<Vec<O>, OperationError> {
+        let batch_result = self.execute_batch_result().await?;
+
+        let mut results = Vec::with_capacity(batch_result.items.len());
+        for item in batch_result.items {
+            match item.status {
+                BatchItemStatus::Succeeded => {
+                    if let Some(value) = item.result {
+                        results.push(value);
+                    }
+                }
+                BatchItemStatus::Failed => {
+                    // Mirrors map's tolerance handling (issue #27): if the
+                    // batch completed within tolerance (AllCompleted or
+                    // MinSuccessfulReached), failed branches are expected and
+                    // NOT propagated as errors. Only propagate as Err when
+                    // the batch ended because the failure tolerance was
+                    // exceeded (including the fail-fast case).
+                    if batch_result.reason != CompletionReason::AllCompleted
+                        && batch_result.reason != CompletionReason::MinSuccessfulReached
+                    {
+                        let msg = item
+                            .error_message
+                            .unwrap_or_else(|| "branch failed".to_owned());
+                        return Err(batch_error(&msg));
+                    }
+                    // Within tolerance: skip this branch in the Vec<O> output.
+                }
+            }
+        }
+        if batch_result.reason == CompletionReason::FailureToleranceExceeded {
+            return Err(batch_error("failure tolerance exceeded"));
+        }
+        Ok(results)
+    }
+
+    /// Executes the parallel operation and returns the full `BatchResult`.
+    ///
+    /// Unlike `execute()` — which returns `Vec<O>` holding only successful
+    /// branches and turns a tolerance-exceeded batch into an error — this
+    /// returns the raw `BatchResult` including per-branch status, completion
+    /// reason, and error messages, without converting tolerated failures
+    /// into errors. Used by handlers that need batch metadata (e.g.,
+    /// success/failure counts for projection results).
+    pub(crate) async fn execute_batch_result(self) -> Result<BatchResult<O>, OperationError> {
         let total = self.branches.len();
         // Split each branch into its display name (threaded to the
         // coordinator as the item namer so it reaches child checkpoint
@@ -496,7 +542,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ParallelExecution<O> {
             Arc::new(move |index| names.get(index).cloned().unwrap_or_default());
 
         let branch_slots_ref = Arc::clone(&branch_slots);
-        let batch_result = execute_batch(
+        execute_batch(
             self.ctx,
             self.op_id,
             self.name,
@@ -527,28 +573,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ParallelExecution<O> {
                 }
             },
         )
-        .await?;
-
-        let mut results = Vec::with_capacity(batch_result.items.len());
-        for item in batch_result.items {
-            match item.status {
-                BatchItemStatus::Succeeded => {
-                    if let Some(value) = item.result {
-                        results.push(value);
-                    }
-                }
-                BatchItemStatus::Failed => {
-                    let msg = item
-                        .error_message
-                        .unwrap_or_else(|| "branch failed".to_owned());
-                    return Err(batch_error(&msg));
-                }
-            }
-        }
-        if batch_result.reason == CompletionReason::FailureToleranceExceeded {
-            return Err(batch_error("failure tolerance exceeded"));
-        }
-        Ok(results)
+        .await
     }
 }
 
@@ -2001,6 +2026,191 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// `await_batch` on a tolerated mixed batch must report each branch's
+    /// terminal status (with names and error messages) and the completion
+    /// reason, without converting the tolerated failure into an error.
+    #[tokio::test]
+    async fn parallel_await_batch_reports_per_branch_status_and_reason() {
+        use crate::future::Branch;
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let batch = ctx
+            .parallel(vec![
+                Branch::new("ok-0", |_ctx| async move { Ok(1_i32) }),
+                Branch::new("boom", |_ctx| async move { Err("intentional".into()) }),
+                Branch::new("ok-2", |_ctx| async move { Ok(3_i32) }),
+            ])
+            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .await_batch()
+            .await
+            .expect("a tolerated branch failure must not become an operation error");
+
+        assert_eq!(batch.reason, CompletionReason::AllCompleted);
+        assert_eq!(batch.items.len(), 3);
+        assert_eq!(batch.success_count(), 2);
+        assert_eq!(batch.failure_count(), 1);
+        assert_eq!(batch.status(), "FAILED");
+
+        let by_index = |idx: usize| {
+            batch
+                .items
+                .iter()
+                .find(|i| i.index == idx)
+                .expect("batch must contain an item for every started branch")
+        };
+        assert_eq!(by_index(0).status, BatchItemStatus::Succeeded);
+        assert_eq!(by_index(0).result, Some(1));
+        assert_eq!(by_index(0).name, "ok-0");
+        assert_eq!(by_index(1).status, BatchItemStatus::Failed);
+        assert_eq!(by_index(1).result, None);
+        assert_eq!(by_index(1).name, "boom");
+        assert!(
+            by_index(1)
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("intentional"),
+            "failed branch must carry its error message: {:?}",
+            by_index(1).error_message
+        );
+        assert_eq!(by_index(2).status, BatchItemStatus::Succeeded);
+        assert_eq!(by_index(2).result, Some(3));
+    }
+
+    /// `await_batch` surfaces a tolerance-exceeded batch as-is: the reason
+    /// says why it ended and the failed branch keeps its status, while the
+    /// plain `.await` on the same workload converts it into an error.
+    #[tokio::test]
+    async fn parallel_await_batch_surfaces_tolerance_exceeded_without_error() {
+        use crate::future::Branch;
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let batch = ctx
+            .parallel(vec![Branch::new("boom", |_ctx| async move {
+                Err::<i32, _>("intentional".into())
+            })])
+            .completion(
+                crate::CompletionConfig::builder()
+                    .tolerated_failure_count(0)
+                    .build(),
+            )
+            .await_batch()
+            .await
+            .expect("await_batch must return the batch even when tolerance is exceeded");
+
+        assert_eq!(batch.reason, CompletionReason::FailureToleranceExceeded);
+        assert_eq!(batch.failure_count(), 1);
+        assert_eq!(
+            batch.items.first().map(|i| i.status),
+            Some(BatchItemStatus::Failed)
+        );
+    }
+
+    /// Issue #27: `parallel` must honor the failure tolerance a
+    /// `CompletionConfig` expresses, exactly as `map` does. A failed branch
+    /// within tolerance is omitted from the plain `.await`'s `Vec<O>`
+    /// output rather than failing the whole operation.
+    #[tokio::test]
+    async fn parallel_plain_await_tolerates_failures_within_tolerance() {
+        use crate::future::Branch;
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let results: Vec<i32> = ctx
+            .parallel(vec![
+                Branch::new("ok-0", |_ctx| async move { Ok(1_i32) }),
+                Branch::new("boom", |_ctx| async move { Err("intentional".into()) }),
+                Branch::new("ok-2", |_ctx| async move { Ok(3_i32) }),
+            ])
+            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .await
+            .expect("a tolerated branch failure must not fail the parallel operation");
+
+        assert_eq!(
+            results,
+            vec![1, 3],
+            "successful branch values must be returned in order, tolerated failure omitted"
+        );
+
+        // Same workload on map must agree (parity with map's tolerance).
+        let (map_ctx, _c) = test_ctx_with_client(CheckpointLog::empty());
+        let map_results: Vec<i32> = map_ctx
+            .map(vec![1_i32, -1, 3], |_child, item, _idx| async move {
+                if item < 0 {
+                    Err("intentional".into())
+                } else {
+                    Ok(item)
+                }
+            })
+            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .await
+            .expect("map must tolerate the failure");
+        assert_eq!(
+            map_results, results,
+            "map and parallel plain `.await` must agree under the same tolerance"
+        );
+    }
+
+    /// Parity: `map` and `parallel` `await_batch` must agree on the batch
+    /// shape for equivalent workloads — same completion reason, same
+    /// per-index statuses, values, counts, and overall status string.
+    #[tokio::test]
+    async fn map_and_parallel_await_batch_agree_on_shape() {
+        use crate::future::Branch;
+
+        // Equivalent workload: 3 slots, the middle one fails, one failure
+        // tolerated. `map` derives it from items; `parallel` from branches.
+        let (map_ctx, _c1) = test_ctx_with_client(CheckpointLog::empty());
+        let map_batch = map_ctx
+            .map(vec![0_i32, 1, 2], |_child, item, _idx| async move {
+                if item == 1 {
+                    Err("intentional".into())
+                } else {
+                    Ok(item * 10)
+                }
+            })
+            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .await_batch()
+            .await
+            .expect("map await_batch must tolerate the failure");
+
+        let (par_ctx, _c2) = test_ctx_with_client(CheckpointLog::empty());
+        let par_batch = par_ctx
+            .parallel((0_i32..3).map(|i| {
+                Branch::new(format!("branch-{i}"), move |_ctx| async move {
+                    if i == 1 {
+                        Err("intentional".into())
+                    } else {
+                        Ok(i * 10)
+                    }
+                })
+            }))
+            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .await_batch()
+            .await
+            .expect("parallel await_batch must tolerate the failure");
+
+        assert_eq!(map_batch.reason, par_batch.reason);
+        assert_eq!(map_batch.items.len(), par_batch.items.len());
+        assert_eq!(map_batch.success_count(), par_batch.success_count());
+        assert_eq!(map_batch.failure_count(), par_batch.failure_count());
+        assert_eq!(map_batch.status(), par_batch.status());
+
+        let shape = |batch: &BatchResult<i32>| {
+            let mut items: Vec<_> = batch
+                .items
+                .iter()
+                .map(|i| (i.index, i.status, i.result))
+                .collect();
+            items.sort_unstable_by_key(|(idx, _, _)| *idx);
+            items
+        };
+        assert_eq!(
+            shape(&map_batch),
+            shape(&par_batch),
+            "map and parallel batches must report identical per-index outcomes"
+        );
+    }
+
     // Compile-level proof that map items and parallel branches accept any
     // `IntoIterator` (array, Vec, lazy iterator) and that closures are plain
     // `async move` bodies using `?` — no manual `Box::pin`, no error
@@ -2783,6 +2993,11 @@ mod tests {
             ctx.parallel(vec![Branch::new("boom", |_ctx| {
                 Box::pin(async { panic!("boom in parallel branch") })
             })])
+            .completion(
+                crate::CompletionConfig::builder()
+                    .tolerated_failure_count(0)
+                    .build(),
+            )
             .await
         };
 

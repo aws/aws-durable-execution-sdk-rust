@@ -15,29 +15,21 @@ async fn handler(
         Branch::new("2", |_: DurableContext| async { Ok("ok2".to_owned()) }),
     ];
 
-    let result = ctx
+    let batch = ctx
         .parallel(branches)
         .name("min-not-reached")
         .max_concurrency(1)
         .completion(CompletionConfig::with_min_successful(3))
-        .await;
+        .await_batch()
+        .await?;
 
-    match result {
-        Ok(values) => Ok(serde_json::json!({
-            "completionReason": "ALL_COMPLETED",
-            "status": "SUCCEEDED",
-            "successCount": values.len(),
-            "failureCount": 0,
-            "totalCount": values.len(),
-        })),
-        Err(_) => Ok(serde_json::json!({
-            "completionReason": "ALL_COMPLETED",
-            "status": "FAILED",
-            "successCount": 2,
-            "failureCount": 1,
-            "totalCount": 3,
-        })),
-    }
+    Ok(serde_json::json!({
+        "completionReason": batch.reason.as_str(),
+        "status": batch.status(),
+        "successCount": batch.success_count(),
+        "failureCount": batch.failure_count(),
+        "totalCount": batch.total_count(),
+    }))
 }
 
 #[tokio::main]

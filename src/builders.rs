@@ -1645,7 +1645,9 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     ///
     /// Use this when you need to inspect batch completion details (e.g., when
     /// using a completion config that tolerates failures). The standard
-    /// `.await` returns only `Vec<O>` with successful items.
+    /// `.await` returns `Vec<O>` with only the successful items and cannot
+    /// report which items failed; it returns an error only when the batch
+    /// ends because the configured failure tolerance was exceeded.
     ///
     /// Always returns the full `BatchResult<O>` including per-item outcomes.
     ///
@@ -1653,10 +1655,12 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     ///
     /// Returns an error if the batch execution encounters an infrastructure
     /// failure (checkpoint client error, task-ownership violation, invalid
-    /// configuration). Item-level failures within tolerance are NOT errors —
-    /// they appear as `BatchItemStatus::Failed` entries in the result.
+    /// configuration). Item-level failures are NOT errors — they appear as
+    /// `BatchItemStatus::Failed` entries in the result, and the batch's
+    /// [`CompletionReason`] records why the batch ended.
     ///
     /// [`BatchResult`]: crate::BatchResult
+    /// [`CompletionReason`]: crate::CompletionReason
     pub async fn await_batch(self) -> Result<crate::BatchResult<O>, OperationError>
     where
         I: serde::Serialize + serde::de::DeserializeOwned + Sync,
@@ -1902,6 +1906,78 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     pub fn nesting(mut self, mode: crate::map_parallel::NestingMode) -> Self {
         self.nesting = mode;
         self
+    }
+
+    /// Executes the parallel operation and returns the full [`BatchResult`]
+    /// including completion metadata (reason, success/failure counts,
+    /// per-branch status).
+    ///
+    /// Use this when you need to inspect batch completion details (e.g., when
+    /// using a completion config that tolerates failures). The standard
+    /// `.await` returns `Vec<O>` with only the successful branches and
+    /// cannot report which branches failed; it returns an error only when
+    /// the batch ends because the configured failure tolerance was
+    /// exceeded.
+    ///
+    /// Always returns the full `BatchResult<O>` including per-branch
+    /// outcomes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch execution encounters an infrastructure
+    /// failure (checkpoint client error, task-ownership violation, invalid
+    /// configuration). Branch-level failures are NOT errors — they appear as
+    /// `BatchItemStatus::Failed` entries in the result, and the batch's
+    /// [`CompletionReason`] records why the batch ended.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk_rust as durable;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<(), durable::BoxError> {
+    ///     let branches = vec![
+    ///         durable::Branch::new("a", |_| async { Ok(1) }),
+    ///         durable::Branch::new("b", |_| async { Ok(2) }),
+    ///     ];
+    ///     let batch = ctx
+    ///         .parallel(branches)
+    ///         .name("fan-out")
+    ///         .completion(durable::CompletionConfig::with_tolerated_failure_count(1))
+    ///         .await_batch()
+    ///         .await?;
+    ///     for item in &batch.items {
+    ///         println!("{} -> {:?}", item.name, item.status);
+    ///     }
+    ///     println!("batch ended because {:?}", batch.reason);
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// [`BatchResult`]: crate::BatchResult
+    /// [`CompletionReason`]: crate::CompletionReason
+    pub async fn await_batch(self) -> Result<crate::BatchResult<O>, OperationError>
+    where
+        O: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        use crate::map_parallel::ParallelExecution;
+
+        let execution = ParallelExecution {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            max_concurrency: self.max_concurrency,
+            completion: self.completion,
+            serdes: self.serdes,
+            result_serdes: self.result_serdes,
+            nesting: self.nesting,
+            branches: self.branches,
+        };
+
+        execution.execute_batch_result().await
     }
 
     /// Converts this builder into a [`DurableFuture`] explicitly.

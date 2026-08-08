@@ -16,29 +16,21 @@ async fn handler(
         Branch::new("3", |_: DurableContext| async { Ok("ok3".to_owned()) }),
     ];
 
-    let result = ctx
+    let batch = ctx
         .parallel(branches)
         .name("pct-boundary")
         .max_concurrency(1)
         .completion(CompletionConfig::with_tolerated_failure_percentage(25))
-        .await;
+        .await_batch()
+        .await?;
 
-    match result {
-        Ok(values) => Ok(serde_json::json!({
-            "completionReason": "ALL_COMPLETED",
-            "status": "SUCCEEDED",
-            "successCount": values.len(),
-            "failureCount": 1,
-            "totalCount": values.len() + 1,
-        })),
-        Err(_) => Ok(serde_json::json!({
-            "completionReason": "ALL_COMPLETED",
-            "status": "FAILED",
-            "successCount": 3,
-            "failureCount": 1,
-            "totalCount": 4,
-        })),
-    }
+    Ok(serde_json::json!({
+        "completionReason": batch.reason.as_str(),
+        "status": batch.status(),
+        "successCount": batch.success_count(),
+        "failureCount": batch.failure_count(),
+        "totalCount": batch.total_count(),
+    }))
 }
 
 #[tokio::main]

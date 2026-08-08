@@ -1,9 +1,5 @@
 //! Conformance requirement 8-9: Parallel tolerating one failure completes all
 //! branches.
-//!
-//! NOTE: The Rust SDK's `Vec<O>` return only includes successful items. When
-//! tolerance allows failures, the batch completes but the simple API only
-//! returns successes. We construct the metadata projection from error handling.
 
 use aws_durable_execution_sdk_rust as durable;
 use durable::{Branch, CompletionConfig, DurableContext};
@@ -19,29 +15,21 @@ async fn handler(
         Branch::new("2", |_: DurableContext| async { Ok("ok2".to_owned()) }),
     ];
 
-    let result = ctx
+    let batch = ctx
         .parallel(branches)
         .name("tolerated")
         .max_concurrency(1)
         .completion(CompletionConfig::with_tolerated_failure_count(1))
-        .await;
+        .await_batch()
+        .await?;
 
-    match result {
-        Ok(values) => Ok(serde_json::json!({
-            "completionReason": "ALL_COMPLETED",
-            "status": "SUCCEEDED",
-            "successCount": values.len(),
-            "failureCount": 1,
-            "totalCount": values.len() + 1,
-        })),
-        Err(_) => Ok(serde_json::json!({
-            "completionReason": "ALL_COMPLETED",
-            "status": "FAILED",
-            "successCount": 2,
-            "failureCount": 1,
-            "totalCount": 3,
-        })),
-    }
+    Ok(serde_json::json!({
+        "completionReason": batch.reason.as_str(),
+        "status": batch.status(),
+        "successCount": batch.success_count(),
+        "failureCount": batch.failure_count(),
+        "totalCount": batch.total_count(),
+    }))
 }
 
 #[tokio::main]
