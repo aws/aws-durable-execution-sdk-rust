@@ -1915,7 +1915,12 @@ mod scoped_suspension {
                 ];
                 let r = ctx_h
                     .parallel(branches)
-                    .completion(crate::CompletionConfig::builder().min_successful(1).build())
+                    .completion(
+                        crate::CompletionConfig::builder()
+                            .min_successful(1)
+                            .build()
+                            .expect("valid completion config"),
+                    )
                     .await;
                 Ok::<_, (String, String)>(format!("ok={}", r.is_ok()))
             },

@@ -12,7 +12,7 @@ async fn handler(
     let cfg = CompletionConfig::builder()
         .tolerated_failure_count(1)
         .min_successful(3)
-        .build();
+        .build()?;
 
     let branches: Vec<Branch<String>> = vec![
         Branch::new("0", |_: DurableContext| async { Err("fail0".into()) }),

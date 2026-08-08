@@ -429,7 +429,20 @@ Both accept `.max_concurrency(...)` and `.completion(...)`. A
 `CompletionConfig` ends the batch early: `with_min_successful(n)` stops once
 `n` items succeed, `with_tolerated_failure_count(0)` fails fast on the first
 error, and `CompletionConfig::builder()` combines thresholds so the first one
-to fire wins. `MapBuilder` and `ParallelBuilder` also expose `.await_batch()`:
+to fire wins; its `build()` validates the combination and rejects a
+misconfiguration (such as a percentage above 100) at construction time. The
+builder's `.completion_predicate(...)` adds a custom trigger: a function of
+the running batch statistics (succeeded count, failed count, total items,
+and the settled outcomes so far) that returns `true` to end the batch with
+the `PredicateMatched` reason. The predicate must be a deterministic, pure
+function of the statistics it receives — the SDK evaluates it only on state
+derived from recorded results, and anything else (clock, randomness, outside
+state) can make replay diverge. To keep those statistics reproducible, item
+outcomes feed them strictly in input order (item `i` enters only once items
+`0..i` have all settled), whatever order the items actually finished in. It
+composes with the fixed thresholds under the same first-trigger-wins rule,
+checked after them.
+`MapBuilder` and `ParallelBuilder` also expose `.await_batch()`:
 await it instead of the builder to get a `BatchResult<O>` that reports each
 item's status and why the batch ended. `BatchResult::status()` returns a
 `BatchStatus` enum, and `BatchResult::errors()` returns `BatchError` entries

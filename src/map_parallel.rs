@@ -231,8 +231,9 @@ pub struct BatchError<'a> {
 
 /// Why the batch completed.
 ///
-/// Records the reason a [`BatchResult`] finished: either all items ran,
-/// the success threshold was met, or the failure tolerance was exceeded.
+/// Records the reason a [`BatchResult`] finished: all items ran, the
+/// success threshold was met, the failure tolerance was exceeded, or a
+/// custom completion predicate reported the batch done.
 ///
 /// # Examples
 ///
@@ -251,6 +252,15 @@ pub enum CompletionReason {
     MinSuccessfulReached,
     /// The failure tolerance was exceeded.
     FailureToleranceExceeded,
+    /// The custom completion predicate returned `true`.
+    ///
+    /// Set when a batch ends early because the predicate configured through
+    /// [`crate::CompletionConfig::with_completion_predicate`] or
+    /// [`crate::CompletionConfigBuilder::completion_predicate`] fired. Like
+    /// [`CompletionReason::MinSuccessfulReached`], a batch completed this
+    /// way is a successful early completion: item failures inside it are
+    /// tolerated rather than propagated as errors.
+    PredicateMatched,
 }
 
 impl CompletionReason {
@@ -264,6 +274,7 @@ impl CompletionReason {
             Self::AllCompleted => "ALL_COMPLETED",
             Self::MinSuccessfulReached => "MIN_SUCCESSFUL_REACHED",
             Self::FailureToleranceExceeded => "FAILURE_TOLERANCE_EXCEEDED",
+            Self::PredicateMatched => "PREDICATE_MATCHED",
         }
     }
 
@@ -276,8 +287,164 @@ impl CompletionReason {
         match s {
             "MIN_SUCCESSFUL_REACHED" => Self::MinSuccessfulReached,
             "FAILURE_TOLERANCE_EXCEEDED" => Self::FailureToleranceExceeded,
+            "PREDICATE_MATCHED" => Self::PredicateMatched,
             _ => Self::AllCompleted,
         }
+    }
+}
+
+/// The settled outcome of one batch item, as seen by a completion predicate.
+///
+/// Carries the item's zero-based input position and whether it succeeded or
+/// failed. Entries are appended to [`BatchStats::outcomes`] strictly in
+/// input order: item `i`'s outcome enters the statistics only after the
+/// outcomes of items `0..i` have all entered, whatever order the items
+/// actually settled in at run time. Live settlement order is
+/// scheduler-timed and is not recorded in the checkpoint log, so it cannot
+/// be reproduced on replay; the input-order prefix can always be derived
+/// from recorded state alone. That canonical ordering is what keeps an
+/// order-sensitive predicate deterministic across replay — identical
+/// recorded state always produces the identical outcome sequence.
+///
+/// The public constructor exists so a completion predicate can be unit
+/// tested against hand-built statistics without running a batch.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::{BatchItemStatus, SettledOutcome};
+///
+/// let outcome = SettledOutcome::new(3, BatchItemStatus::Failed);
+/// assert_eq!(outcome.index(), 3);
+/// assert_eq!(outcome.status(), BatchItemStatus::Failed);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettledOutcome {
+    /// Zero-based position of the item in the original input.
+    index: usize,
+    /// Whether the item succeeded or failed.
+    status: BatchItemStatus,
+}
+
+impl SettledOutcome {
+    /// Creates a settled outcome (public so predicates can be unit tested).
+    #[must_use]
+    pub fn new(index: usize, status: BatchItemStatus) -> Self {
+        Self { index, status }
+    }
+
+    /// Returns the item's zero-based position in the original input.
+    #[must_use]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Returns whether the item succeeded or failed.
+    #[must_use]
+    pub fn status(&self) -> BatchItemStatus {
+        self.status
+    }
+}
+
+/// Running statistics of a map/parallel batch, passed to a custom
+/// completion predicate.
+///
+/// A snapshot of the batch's *committed prefix*: the settled outcomes of
+/// items `0..settled()`, in input order, plus the total item count. An
+/// item's outcome is committed — and the predicate re-evaluated — only
+/// once every earlier item's outcome is known, so a still-running (or
+/// suspended) item holds later items' outcomes out of the statistics until
+/// it settles. Live settlement order is scheduler-timed and unrecorded;
+/// the committed prefix derives from recorded checkpoint state alone, so a
+/// predicate that is a pure function of these statistics sees the
+/// identical sequence of snapshots on the original run and on every
+/// replay — see the determinism requirement on
+/// [`CompletionConfigBuilder::completion_predicate`](crate::CompletionConfigBuilder::completion_predicate).
+///
+/// The public constructor exists so a completion predicate can be unit
+/// tested against hand-built statistics without running a batch.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::{BatchItemStatus, BatchStats, SettledOutcome};
+///
+/// let outcomes = [
+///     SettledOutcome::new(0, BatchItemStatus::Failed),
+///     SettledOutcome::new(1, BatchItemStatus::Succeeded),
+/// ];
+/// let stats = BatchStats::new(1, 1, 5, &outcomes);
+/// assert_eq!(stats.succeeded(), 1);
+/// assert_eq!(stats.failed(), 1);
+/// assert_eq!(stats.settled(), 2);
+/// assert_eq!(stats.total_items(), 5);
+/// assert_eq!(stats.outcomes().len(), 2);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct BatchStats<'a> {
+    /// Count of committed items that have succeeded so far.
+    succeeded: usize,
+    /// Count of committed items that have failed so far.
+    failed: usize,
+    /// Total number of items in the batch.
+    total_items: usize,
+    /// Committed per-item settled outcomes, in input order (see
+    /// [`SettledOutcome`]).
+    outcomes: &'a [SettledOutcome],
+}
+
+impl<'a> BatchStats<'a> {
+    /// Creates a statistics snapshot (public so predicates can be unit
+    /// tested).
+    #[must_use]
+    pub fn new(
+        succeeded: usize,
+        failed: usize,
+        total_items: usize,
+        outcomes: &'a [SettledOutcome],
+    ) -> Self {
+        Self {
+            succeeded,
+            failed,
+            total_items,
+            outcomes,
+        }
+    }
+
+    /// Returns the count of committed items that have succeeded so far.
+    #[must_use]
+    pub fn succeeded(&self) -> usize {
+        self.succeeded
+    }
+
+    /// Returns the count of committed items that have failed so far.
+    #[must_use]
+    pub fn failed(&self) -> usize {
+        self.failed
+    }
+
+    /// Returns the count of committed items (succeeded or failed) so far.
+    ///
+    /// Because outcomes commit strictly in input order, this is also the
+    /// length of the committed prefix: the items `0..settled()` are exactly
+    /// the ones whose outcomes [`outcomes`](Self::outcomes) holds.
+    #[must_use]
+    pub fn settled(&self) -> usize {
+        self.succeeded + self.failed
+    }
+
+    /// Returns the total number of items in the batch.
+    #[must_use]
+    pub fn total_items(&self) -> usize {
+        self.total_items
+    }
+
+    /// Returns the committed per-item settled outcomes, strictly in input
+    /// order: the outcome at position `i` belongs to item `i` (see
+    /// [`SettledOutcome`] for why the SDK canonicalizes the order).
+    #[must_use]
+    pub fn outcomes(&self) -> &'a [SettledOutcome] {
+        self.outcomes
     }
 }
 
@@ -513,14 +680,13 @@ impl<
                     }
                 }
                 BatchItemStatus::Failed => {
-                    // If the batch completed within tolerance (AllCompleted),
-                    // failed items are expected and NOT propagated as errors.
-                    // Only propagate as Err when there is no completion config
-                    // that allows failures (i.e. the default fail-fast case
-                    // where FailureToleranceExceeded is the reason).
-                    if batch_result.reason != CompletionReason::AllCompleted
-                        && batch_result.reason != CompletionReason::MinSuccessfulReached
-                    {
+                    // If the batch completed within tolerance (AllCompleted)
+                    // or ended early on a success trigger (min_successful or
+                    // a custom predicate), failed items are expected and NOT
+                    // propagated as errors. Only propagate as Err when the
+                    // batch ended because the failure tolerance was exceeded
+                    // (including the default fail-fast case).
+                    if batch_result.reason == CompletionReason::FailureToleranceExceeded {
                         let msg = item
                             .error_message
                             .unwrap_or_else(|| "branch failed".to_owned());
@@ -616,14 +782,13 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ParallelExecution<O> {
                 }
                 BatchItemStatus::Failed => {
                     // Mirrors map's tolerance handling (issue #27): if the
-                    // batch completed within tolerance (AllCompleted or
-                    // MinSuccessfulReached), failed branches are expected and
+                    // batch completed within tolerance (AllCompleted) or
+                    // ended early on a success trigger (MinSuccessfulReached
+                    // or PredicateMatched), failed branches are expected and
                     // NOT propagated as errors. Only propagate as Err when
                     // the batch ended because the failure tolerance was
                     // exceeded (including the fail-fast case).
-                    if batch_result.reason != CompletionReason::AllCompleted
-                        && batch_result.reason != CompletionReason::MinSuccessfulReached
-                    {
+                    if batch_result.reason == CompletionReason::FailureToleranceExceeded {
                         let msg = item
                             .error_message
                             .unwrap_or_else(|| "branch failed".to_owned());
@@ -986,21 +1151,93 @@ where
         std::collections::HashMap::with_capacity(total_items);
 
     let mut results: Vec<Option<BatchItem<O>>> = (0..total_items).map(|_| None).collect();
-    let mut success_count: usize = 0;
-    let mut failure_count: usize = 0;
     let mut suspended_count: usize = 0;
     let mut running: usize = 0;
     let mut next_index: usize = 0;
-    let mut stopped = false;
+    // Running completion statistics plus the first trigger to fire (first
+    // trigger wins). A fired trigger halts new dispatch; already-running
+    // branches are still drained.
+    let mut tracker = CompletionTracker::new(total_items);
     let mut any_suspended = false;
+
+    // 7b. Replay pass (concurrent mode): resolve every recorded-terminal
+    // child inline on the coordinator, in input order, BEFORE dispatching
+    // any live work — never through the `JoinSet`. This is what keeps
+    // completion triggers deterministic under replay: outcomes already in
+    // the checkpoint log feed the statistics in canonical input order
+    // before any live settlement joins, so identical recorded state yields
+    // identical trigger decisions no matter how the scheduler orders the
+    // join events of resumed live branches. Recorded terminals are
+    // completed history — real work whose outcome the service persisted —
+    // so they are applied unconditionally: a trigger firing mid-pass halts
+    // future live dispatch but never drops an already-recorded outcome
+    // from the result.
+    //
+    // The sequential path (`concurrency == 1`) discovers terminality lazily
+    // at the dispatch cursor instead, where settlement order and input
+    // order already coincide.
+    if concurrency > 1 {
+        for i in 0..total_items {
+            let Some(pre) = pre_claimed.get(i) else {
+                return Err(batch_error("pre-claimed index out of range"));
+            };
+            if !pre.is_terminal {
+                continue;
+            }
+            let item_name = item_namer
+                .as_ref()
+                .map_or_else(String::new, |namer| namer(i));
+            let outcome = execute_single_item(
+                &ctx,
+                &pre.op_id,
+                i,
+                true,
+                false,
+                &parent_wire,
+                child_sub_type,
+                &item_name,
+                nesting,
+                &*run_item,
+                serdes.as_ref(),
+            )
+            .await?;
+            match outcome {
+                ItemOutcome::Terminal(item) => {
+                    tracker.settle(&completion_cfg, total_items, i, item.status);
+                    if let Some(slot) = results.get_mut(i) {
+                        *slot = Some(item);
+                    }
+                }
+                ItemOutcome::Suspended => {
+                    // Defensive: a recorded-terminal child re-executing in
+                    // ReplayChildren mode replays recorded operations and
+                    // should not park; if it does, treat it like any
+                    // suspended branch (it keeps a slot and the batch
+                    // suspends unless a trigger fires).
+                    suspended_count += 1;
+                    any_suspended = true;
+                }
+            }
+        }
+    }
 
     loop {
         // Dispatch while capacity remains and not-started eligible work exists.
-        // A threshold hit (`stopped`) halts new dispatch; already-running
-        // branches are still drained below (in-flight branches always complete).
-        while !stopped && next_index < total_items && running + suspended_count < concurrency {
+        // A completion trigger (`tracker.stop_reason`) halts new dispatch;
+        // already-running branches are still drained below (in-flight
+        // branches always complete).
+        while tracker.stop_reason.is_none()
+            && next_index < total_items
+            && running + suspended_count < concurrency
+        {
             let i = next_index;
             next_index += 1;
+
+            // Concurrent mode: recorded-terminal children were already
+            // applied by the replay pass above — skip them here.
+            if concurrency > 1 && pre_claimed.get(i).is_some_and(|pre| pre.is_terminal) {
+                continue;
+            }
 
             // Determine the PreClaimed item: for concurrent mode use the
             // pre-claimed vector; for sequential mode, mint lazily (only
@@ -1038,6 +1275,51 @@ where
                     is_terminal,
                 }
             };
+
+            // Recorded-terminal child (sequential path only — the
+            // concurrent path applied its recorded terminals in the replay
+            // pass above): resolve it inline on the coordinator, at the
+            // dispatch cursor, in input order — never through the
+            // `JoinSet`. With one item in flight at a time, settlement
+            // order and input order coincide, so completion triggers see
+            // the same canonical sequence here as everywhere else.
+            if pc.is_terminal {
+                let item_name = item_namer
+                    .as_ref()
+                    .map_or_else(String::new, |namer| namer(pc.index));
+                let outcome = execute_single_item(
+                    &ctx,
+                    &pc.op_id,
+                    pc.index,
+                    true,
+                    false,
+                    &parent_wire,
+                    child_sub_type,
+                    &item_name,
+                    nesting,
+                    &*run_item,
+                    serdes.as_ref(),
+                )
+                .await?;
+                match outcome {
+                    ItemOutcome::Terminal(item) => {
+                        tracker.settle(&completion_cfg, total_items, pc.index, item.status);
+                        if let Some(slot) = results.get_mut(pc.index) {
+                            *slot = Some(item);
+                        }
+                    }
+                    ItemOutcome::Suspended => {
+                        // Defensive: a recorded-terminal child re-executing
+                        // in ReplayChildren mode replays recorded operations
+                        // and should not park; if it does, treat it like any
+                        // suspended branch (it keeps a slot and the batch
+                        // suspends unless a trigger fires).
+                        suspended_count += 1;
+                        any_suspended = true;
+                    }
+                }
+                continue;
+            }
 
             let start_checkpointed =
                 concurrency > 1 && !pc.is_terminal && nesting != NestingMode::Flat;
@@ -1113,17 +1395,9 @@ where
                 branch_meta.remove(&task_id);
                 match outcome {
                     Ok(ItemOutcome::Terminal(item)) => {
-                        match item.status {
-                            BatchItemStatus::Succeeded => success_count += 1,
-                            BatchItemStatus::Failed => failure_count += 1,
-                        }
+                        tracker.settle(&completion_cfg, total_items, index, item.status);
                         if let Some(slot) = results.get_mut(index) {
                             *slot = Some(item);
-                        }
-                        if should_stop_min(&completion_cfg, success_count)
-                            || should_stop_failure(&completion_cfg, failure_count, total_items)
-                        {
-                            stopped = true;
                         }
                     }
                     Ok(ItemOutcome::Suspended) => {
@@ -1178,7 +1452,12 @@ where
                     }
                 }
 
-                failure_count += 1;
+                tracker.settle(
+                    &completion_cfg,
+                    total_items,
+                    meta.index,
+                    BatchItemStatus::Failed,
+                );
                 if let Some(slot) = results.get_mut(meta.index) {
                     *slot = Some(BatchItem {
                         index: meta.index,
@@ -1189,25 +1468,20 @@ where
                         error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
                     });
                 }
-                if should_stop_min(&completion_cfg, success_count)
-                    || should_stop_failure(&completion_cfg, failure_count, total_items)
-                {
-                    stopped = true;
-                }
             }
         }
     }
 
-    // Quiescent. If a branch is parked and no completion threshold was met,
-    // the batch cannot finish this invocation: suspend the coordinator's OWN
+    // Quiescent. If a branch is parked and no completion trigger fired, the
+    // batch cannot finish this invocation: suspend the coordinator's OWN
     // scope so whoever drives it (the invocation driver at the root, or an
     // outer coordinator's branch driver when nested) observes the suspension
     // and reports PENDING for its subtree. `suspend_now` never returns; the
     // coordinator future is dropped at teardown, aborting the guards.
     // Started-not-terminal children replay on the next invocation. When a
-    // threshold WAS met, parked branches are excluded (like never-started
+    // trigger DID fire, parked branches are excluded (like never-started
     // work) and the batch completes normally.
-    if any_suspended && !stopped {
+    if any_suspended && tracker.stop_reason.is_none() {
         return Ok(ctx.suspend_now::<BatchResult<O>>().await);
     }
 
@@ -1215,14 +1489,34 @@ where
     // never-started branches are omitted).
     let final_items: Vec<BatchItem<O>> = results.into_iter().flatten().collect();
 
-    // 10. Determine completion reason.
-    let reason = if should_stop_min(&completion_cfg, success_count) {
-        CompletionReason::MinSuccessfulReached
-    } else if should_stop_failure(&completion_cfg, failure_count, total_items) {
-        CompletionReason::FailureToleranceExceeded
-    } else {
-        CompletionReason::AllCompleted
-    };
+    // 10. Determine completion reason: the first trigger to fire during the
+    // run (recorded at the settle event that fired it — first trigger wins),
+    // or `AllCompleted` when no trigger fired. Capturing the reason at
+    // trigger time keeps a non-monotonic predicate stable: the reason
+    // reflects the statistics the trigger actually saw, not a re-evaluation
+    // against the final counts after in-flight branches drained.
+    //
+    // A batch that recorded NO settle event never ran a trigger evaluation,
+    // so for that degenerate case fall back to the fixed-threshold
+    // evaluation against the final counts, exactly as the pre-predicate
+    // code evaluated at the end of every run. (Today a zero-item batch
+    // returns early at step 4 before this loop, so the fallback is a guard
+    // that keeps the fixed-threshold semantics intact if that early return
+    // ever changes; it never rewrites the reason of a batch that settled
+    // items.)
+    let reason = tracker.stop_reason.unwrap_or_else(|| {
+        if tracker.settled_count() == 0 {
+            if should_stop_min(&completion_cfg, tracker.success_count) {
+                CompletionReason::MinSuccessfulReached
+            } else if should_stop_failure(&completion_cfg, tracker.failure_count, total_items) {
+                CompletionReason::FailureToleranceExceeded
+            } else {
+                CompletionReason::AllCompleted
+            }
+        } else {
+            CompletionReason::AllCompleted
+        }
+    });
 
     let batch_result = BatchResult {
         items: final_items,
@@ -1695,6 +1989,158 @@ fn build_child_update(
 // ────────────────────────────────────────────────────────────────────────────
 // Completion logic
 // ────────────────────────────────────────────────────────────────────────────
+
+/// Running completion state of one batch coordinator: the settled counts,
+/// the canonical committed prefix the predicate observes, and the first
+/// completion trigger to fire.
+///
+/// Every settlement — a recorded-terminal child applied inline in input
+/// order, a live join, or a controlled `JoinError` failure — flows through
+/// [`settle`](Self::settle), so the statistics a completion trigger sees are
+/// updated and evaluated in exactly one place.
+///
+/// # Two evaluation streams
+///
+/// The fixed thresholds and the custom predicate deliberately read from
+/// different streams:
+///
+/// * **Fixed thresholds** (`min_successful`, the failure tolerances) are
+///   evaluated on the raw settlement counts, immediately at every settle
+///   event. They are monotonic in those counts, so whether they fire is a
+///   function of the settled *set*, never of the settlement *order* — a
+///   threshold that did not fire before a suspension cannot fire while
+///   replay re-applies the same recorded set. Immediate evaluation
+///   preserves the pre-predicate semantics: the batch stops the moment the
+///   threshold is objectively met.
+///
+/// * **The custom predicate** is an arbitrary, order-sensitive function, so
+///   it is evaluated only on the *committed prefix*: settled outcomes are
+///   buffered per index and committed strictly in input order (item `i`
+///   commits only after items `0..i` have all committed). Live settlement
+///   order is scheduler-timed and is not recorded anywhere, so it cannot be
+///   reproduced on replay; the committed prefix is derivable from recorded
+///   state alone, which makes the sequence of predicate evaluations — and
+///   therefore its decisions — identical on the original run and on every
+///   replay.
+struct CompletionTracker {
+    /// Count of items that have succeeded so far (settlement order).
+    success_count: usize,
+    /// Count of items that have failed so far (settlement order).
+    failure_count: usize,
+    /// Per-index settled status, buffered until the item commits (its index
+    /// becomes part of the contiguous committed prefix).
+    pending: Vec<Option<BatchItemStatus>>,
+    /// The next input index to commit: items `0..next_commit` have
+    /// committed, in input order.
+    next_commit: usize,
+    /// Count of committed items that succeeded.
+    committed_success: usize,
+    /// Count of committed items that failed.
+    committed_failure: usize,
+    /// The committed outcomes, in input order: `committed_outcomes[i]` is
+    /// item `i`'s outcome. This is what the custom predicate observes.
+    committed_outcomes: Vec<SettledOutcome>,
+    /// The first completion trigger to fire (first trigger wins). `Some`
+    /// halts new dispatch.
+    stop_reason: Option<CompletionReason>,
+}
+
+impl CompletionTracker {
+    fn new(total_items: usize) -> Self {
+        Self {
+            success_count: 0,
+            failure_count: 0,
+            pending: vec![None; total_items],
+            next_commit: 0,
+            committed_success: 0,
+            committed_failure: 0,
+            committed_outcomes: Vec::with_capacity(total_items),
+            stop_reason: None,
+        }
+    }
+
+    /// Returns how many items have settled so far (either status, any
+    /// order).
+    fn settled_count(&self) -> usize {
+        self.success_count + self.failure_count
+    }
+
+    /// Applies one settled outcome to the running statistics and, while no
+    /// trigger has fired yet, evaluates the completion triggers (first
+    /// trigger wins — once `stop_reason` is set it never changes).
+    ///
+    /// Within one settle event the check order is fixed — `min_successful`,
+    /// then the failure tolerances, then the custom predicate — matching
+    /// the precedence the fixed thresholds always had.
+    fn settle(
+        &mut self,
+        cfg: &crate::CompletionConfig,
+        total_items: usize,
+        index: usize,
+        status: BatchItemStatus,
+    ) {
+        match status {
+            BatchItemStatus::Succeeded => self.success_count += 1,
+            BatchItemStatus::Failed => self.failure_count += 1,
+        }
+        if let Some(slot) = self.pending.get_mut(index) {
+            *slot = Some(status);
+        }
+        // Fixed thresholds: evaluated immediately, on the settlement-order
+        // counts (see the type-level docs for why this is order-safe).
+        if self.stop_reason.is_none() {
+            self.stop_reason =
+                evaluate_thresholds(cfg, self.success_count, self.failure_count, total_items);
+        }
+        // Custom predicate: evaluated once per newly *committed* item, on
+        // the committed prefix only. Draining continues even after a
+        // trigger fired so the committed statistics stay consistent; the
+        // predicate itself is no longer consulted once `stop_reason` is
+        // set (first trigger wins).
+        while let Some(ready) = self.pending.get(self.next_commit).copied().flatten() {
+            self.committed_outcomes
+                .push(SettledOutcome::new(self.next_commit, ready));
+            match ready {
+                BatchItemStatus::Succeeded => self.committed_success += 1,
+                BatchItemStatus::Failed => self.committed_failure += 1,
+            }
+            self.next_commit += 1;
+            if self.stop_reason.is_none() {
+                let snapshot = BatchStats::new(
+                    self.committed_success,
+                    self.committed_failure,
+                    total_items,
+                    &self.committed_outcomes,
+                );
+                if cfg.predicate_matches(&snapshot) {
+                    self.stop_reason = Some(CompletionReason::PredicateMatched);
+                }
+            }
+        }
+    }
+}
+
+/// Evaluates the fixed completion thresholds against the running batch
+/// counts, returning the first that fires (or `None`).
+///
+/// Called after each settled item. Within one settle event the check order
+/// is fixed — `min_successful`, then the failure tolerances — matching the
+/// precedence the thresholds always had. The custom predicate is evaluated
+/// separately, on the committed prefix (see [`CompletionTracker`]).
+fn evaluate_thresholds(
+    cfg: &crate::CompletionConfig,
+    success_count: usize,
+    failure_count: usize,
+    total_items: usize,
+) -> Option<CompletionReason> {
+    if should_stop_min(cfg, success_count) {
+        return Some(CompletionReason::MinSuccessfulReached);
+    }
+    if should_stop_failure(cfg, failure_count, total_items) {
+        return Some(CompletionReason::FailureToleranceExceeded);
+    }
+    None
+}
 
 /// Checks if the `min_successful` threshold has been met.
 fn should_stop_min(cfg: &crate::CompletionConfig, success_count: usize) -> bool {
@@ -2338,7 +2784,8 @@ mod tests {
             .completion(
                 crate::CompletionConfig::builder()
                     .tolerated_failure_count(0)
-                    .build(),
+                    .build()
+                    .expect("valid completion config"),
             )
             .await_batch()
             .await
@@ -2552,7 +2999,10 @@ mod tests {
 
     #[tokio::test]
     async fn completion_config_min_successful() {
-        let cfg = crate::CompletionConfig::builder().min_successful(2).build();
+        let cfg = crate::CompletionConfig::builder()
+            .min_successful(2)
+            .build()
+            .expect("valid completion config");
         assert!(should_stop_min(&cfg, 2));
         assert!(should_stop_min(&cfg, 3));
         assert!(!should_stop_min(&cfg, 1));
@@ -2562,7 +3012,8 @@ mod tests {
     async fn completion_config_tolerated_failure_count() {
         let cfg = crate::CompletionConfig::builder()
             .tolerated_failure_count(0)
-            .build();
+            .build()
+            .expect("valid completion config");
         // 0 tolerated means fail-fast: first failure exceeds.
         assert!(should_stop_failure(&cfg, 1, 10));
         assert!(!should_stop_failure(&cfg, 0, 10));
@@ -2572,7 +3023,8 @@ mod tests {
     async fn completion_config_tolerated_failure_percentage() {
         let cfg = crate::CompletionConfig::builder()
             .tolerated_failure_percentage(20)
-            .build();
+            .build()
+            .expect("valid completion config");
         // 3/10 = 30% > 20%: should stop.
         assert!(should_stop_failure(&cfg, 3, 10));
         // 2/10 = 20% == 20%: should NOT stop (strictly exceeds).
@@ -2587,7 +3039,8 @@ mod tests {
         // Cross-multiplication: 1*100=100 > 33*3=99 → true (correctly stops).
         let cfg = crate::CompletionConfig::builder()
             .tolerated_failure_percentage(33)
-            .build();
+            .build()
+            .expect("valid completion config");
         assert!(
             should_stop_failure(&cfg, 1, 3),
             "1/3 = 33.3% should exceed 33% threshold"
@@ -2603,7 +3056,8 @@ mod tests {
         // means 33.3% < 34%, should NOT stop.
         let cfg34 = crate::CompletionConfig::builder()
             .tolerated_failure_percentage(34)
-            .build();
+            .build()
+            .expect("valid completion config");
         assert!(
             !should_stop_failure(&cfg34, 1, 3),
             "1/3 = 33.3% should not exceed 34%"
@@ -2615,7 +3069,8 @@ mod tests {
         // pct=0 means fail on first failure (fail-fast).
         let cfg = crate::CompletionConfig::builder()
             .tolerated_failure_percentage(0)
-            .build();
+            .build()
+            .expect("valid completion config");
         // First failure must stop the batch.
         assert!(
             should_stop_failure(&cfg, 1, 10),
@@ -2693,7 +3148,10 @@ mod tests {
     async fn never_started_branches_omitted_from_results() {
         // A batch with min_successful=1 should omit branches that never started.
         // We test the completion logic directly.
-        let cfg = crate::CompletionConfig::builder().min_successful(1).build();
+        let cfg = crate::CompletionConfig::builder()
+            .min_successful(1)
+            .build()
+            .expect("valid completion config");
         // After 1 success, should stop.
         assert!(should_stop_min(&cfg, 1));
     }
@@ -2705,8 +3163,309 @@ mod tests {
         let cfg = crate::CompletionConfig::builder()
             .min_successful(2)
             .tolerated_failure_count(1)
-            .build();
+            .build()
+            .expect("valid completion config");
         assert!(cfg.validate().is_ok());
+    }
+
+    /// Within one settle event the tracker checks the triggers in a fixed
+    /// order — `min_successful`, then the failure tolerances, then the
+    /// custom predicate — so when several would fire at once the fixed
+    /// thresholds keep the precedence they always had.
+    #[test]
+    fn completion_tracker_orders_triggers_within_one_event() {
+        /// Drives a fresh tracker through one success (item 0) and one
+        /// failure (item 1) out of 4 items, returning the first trigger.
+        fn first_trigger(cfg: &crate::CompletionConfig) -> Option<CompletionReason> {
+            let mut tracker = CompletionTracker::new(4);
+            tracker.settle(cfg, 4, 0, BatchItemStatus::Succeeded);
+            tracker.settle(cfg, 4, 1, BatchItemStatus::Failed);
+            tracker.stop_reason
+        }
+
+        // All three triggers satisfied at once: min_successful wins.
+        let all = crate::CompletionConfig::builder()
+            .min_successful(1)
+            .tolerated_failure_count(0)
+            .completion_predicate(|_| true)
+            .build()
+            .expect("valid completion config");
+        assert_eq!(
+            first_trigger(&all),
+            Some(CompletionReason::MinSuccessfulReached)
+        );
+
+        // Failure tolerance and predicate satisfied at the same settle
+        // event (item 1's failure): failure tolerance wins.
+        let failure_and_predicate = crate::CompletionConfig::builder()
+            .tolerated_failure_count(0)
+            .completion_predicate(|stats| stats.settled() >= 2)
+            .build()
+            .expect("valid completion config");
+        assert_eq!(
+            first_trigger(&failure_and_predicate),
+            Some(CompletionReason::FailureToleranceExceeded)
+        );
+
+        // Only the predicate fires.
+        let predicate_only = crate::CompletionConfig::builder()
+            .min_successful(10)
+            .completion_predicate(|stats| stats.settled() >= 2)
+            .build()
+            .expect("valid completion config");
+        assert_eq!(
+            first_trigger(&predicate_only),
+            Some(CompletionReason::PredicateMatched)
+        );
+
+        // Nothing fires.
+        let none = crate::CompletionConfig::builder()
+            .min_successful(10)
+            .completion_predicate(|stats| stats.settled() >= 3)
+            .build()
+            .expect("valid completion config");
+        assert_eq!(first_trigger(&none), None);
+    }
+
+    /// The custom predicate observes only the committed prefix: outcomes
+    /// commit strictly in input order, so an item that settles ahead of an
+    /// earlier, still-unsettled item stays out of the statistics until the
+    /// earlier item settles — whatever the live settlement order was. This
+    /// is the property that makes predicate decisions reproducible from
+    /// recorded state alone.
+    #[test]
+    fn completion_tracker_commits_outcomes_in_input_order() {
+        /// Every predicate evaluation's view of the outcomes, as
+        /// `(index, status)` pairs.
+        type ObservedPrefixes = Vec<Vec<(usize, BatchItemStatus)>>;
+        let observed: std::sync::Arc<std::sync::Mutex<ObservedPrefixes>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_handle = std::sync::Arc::clone(&observed);
+        let cfg = crate::CompletionConfig::builder()
+            .completion_predicate(move |stats| {
+                if let Ok(mut log) = observed_handle.lock() {
+                    log.push(
+                        stats
+                            .outcomes()
+                            .iter()
+                            .map(|o| (o.index(), o.status()))
+                            .collect(),
+                    );
+                }
+                false
+            })
+            .build()
+            .expect("valid completion config");
+
+        let mut tracker = CompletionTracker::new(3);
+        // Reversed live settlement order: item 1 fails before item 0
+        // succeeds; item 2 settles last.
+        tracker.settle(&cfg, 3, 1, BatchItemStatus::Failed);
+        assert_eq!(
+            tracker.settled_count(),
+            1,
+            "settlement-order counts advance immediately"
+        );
+        tracker.settle(&cfg, 3, 0, BatchItemStatus::Succeeded);
+        tracker.settle(&cfg, 3, 2, BatchItemStatus::Succeeded);
+
+        // Item 1's settle committed nothing (item 0 was outstanding), item
+        // 0's settle committed the prefix [0, 1], item 2's settle extended
+        // it to [0, 1, 2]: three evaluations, each on an input-order prefix.
+        let log = observed.lock().expect("no poisoned lock in test");
+        assert_eq!(
+            *log,
+            vec![
+                vec![(0, BatchItemStatus::Succeeded)],
+                vec![
+                    (0, BatchItemStatus::Succeeded),
+                    (1, BatchItemStatus::Failed)
+                ],
+                vec![
+                    (0, BatchItemStatus::Succeeded),
+                    (1, BatchItemStatus::Failed),
+                    (2, BatchItemStatus::Succeeded)
+                ],
+            ]
+        );
+    }
+
+    /// A custom completion predicate ends a live map batch early, dispatch
+    /// stops, and the recorded batch payload carries the
+    /// `PREDICATE_MATCHED` reason.
+    #[tokio::test]
+    async fn completion_predicate_ends_map_batch_early() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let batch = ctx
+            .map(
+                vec![10_u32, 20, 30, 40, 50],
+                |_child, item, _idx| async move { Ok(item) },
+            )
+            .name("predicated")
+            .max_concurrency(1)
+            .completion(
+                crate::CompletionConfig::builder()
+                    .completion_predicate(|stats| stats.settled() >= 2)
+                    .build()
+                    .expect("valid completion config"),
+            )
+            .await_batch()
+            .await
+            .expect("a predicate-completed batch must not become an operation error");
+
+        assert_eq!(batch.reason, CompletionReason::PredicateMatched);
+        assert_eq!(
+            batch.items.len(),
+            2,
+            "the predicate fires after the second settle; later items never start"
+        );
+        assert_eq!(batch.success_count(), 2);
+
+        // The batch parent SUCCEED payload records the reason string, which
+        // is what replay reads back through `CompletionReason::from_wire`.
+        let parent_success_payload = client
+            .recorded_updates()
+            .iter()
+            .filter(|u| matches!(u.action(), OperationAction::Succeed) && u.parent_id().is_none())
+            .filter_map(|u| u.payload().map(str::to_owned))
+            .next_back()
+            .expect("the batch parent must record a SUCCEED payload");
+        assert!(
+            parent_success_payload.contains("PREDICATE_MATCHED"),
+            "recorded payload must carry the predicate reason, got: {parent_success_payload}"
+        );
+    }
+
+    /// The predicate receives the per-item settled outcomes, so it can key
+    /// off WHICH item settled and how — not just the counts.
+    #[tokio::test]
+    async fn completion_predicate_observes_settled_outcomes() {
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+
+        // Stop as soon as item index 1 is observed to have failed. The high
+        // failure tolerance keeps the failure trigger out of the way.
+        let batch = ctx
+            .map(vec![0_u32, 1, 2, 3], |_child, item, _idx| async move {
+                if item == 1 {
+                    Err("item 1 fails".into())
+                } else {
+                    Ok(item)
+                }
+            })
+            .max_concurrency(1)
+            .completion(
+                crate::CompletionConfig::builder()
+                    .tolerated_failure_count(10)
+                    .completion_predicate(|stats| {
+                        stats.outcomes().iter().any(|outcome| {
+                            outcome.index() == 1 && outcome.status() == BatchItemStatus::Failed
+                        })
+                    })
+                    .build()
+                    .expect("valid completion config"),
+            )
+            .await_batch()
+            .await
+            .expect("a predicate-completed batch must not become an operation error");
+
+        assert_eq!(batch.reason, CompletionReason::PredicateMatched);
+        assert_eq!(
+            batch.items.len(),
+            2,
+            "items 2 and 3 must never start once the predicate fires"
+        );
+        assert_eq!(batch.failure_count(), 1);
+    }
+
+    /// The predicate composes with `min_successful`: within one settle event
+    /// the fixed threshold is checked first, so when both fire at the same
+    /// settle the recorded reason is `MinSuccessfulReached` (first trigger
+    /// wins, matching the existing threshold semantics).
+    #[tokio::test]
+    async fn completion_predicate_composes_with_min_successful() {
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+
+        // Both min_successful(2) and the predicate (settled >= 2) fire at
+        // the second settle: the threshold wins.
+        let batch = ctx
+            .map(vec![1_u32, 2, 3, 4], |_child, item, _idx| async move {
+                Ok(item)
+            })
+            .max_concurrency(1)
+            .completion(
+                crate::CompletionConfig::builder()
+                    .min_successful(2)
+                    .completion_predicate(|stats| stats.settled() >= 2)
+                    .build()
+                    .expect("valid completion config"),
+            )
+            .await_batch()
+            .await
+            .expect("batch must complete early");
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        assert_eq!(batch.items.len(), 2);
+
+        // The predicate fires at an earlier settle event than the threshold:
+        // the predicate wins (first trigger across events).
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = ctx
+            .map(vec![1_u32, 2, 3, 4], |_child, item, _idx| async move {
+                Ok(item)
+            })
+            .max_concurrency(1)
+            .completion(
+                crate::CompletionConfig::builder()
+                    .min_successful(3)
+                    .completion_predicate(|stats| stats.settled() >= 1)
+                    .build()
+                    .expect("valid completion config"),
+            )
+            .await_batch()
+            .await
+            .expect("batch must complete early");
+        assert_eq!(batch.reason, CompletionReason::PredicateMatched);
+        assert_eq!(batch.items.len(), 1);
+    }
+
+    /// Zero-item batches keep their pre-predicate behavior: the empty
+    /// collection short-circuits before the coordinator loop and records
+    /// `ALL_COMPLETED`, whatever completion thresholds or predicate are
+    /// configured. (`min_successful(0)` means "no minimum" — the trigger
+    /// only arms for `min > 0` — so it never rewrote the reason before the
+    /// predicate feature either, and the predicate is never consulted when
+    /// nothing settles.)
+    #[tokio::test]
+    async fn empty_batch_records_all_completed_regardless_of_completion_config() {
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let batch = ctx
+            .map(
+                Vec::<u32>::new(),
+                |_child, item, _idx| async move { Ok(item) },
+            )
+            .completion(
+                crate::CompletionConfig::builder()
+                    .min_successful(0)
+                    .completion_predicate(|_| true)
+                    .build()
+                    .expect("valid completion config"),
+            )
+            .await_batch()
+            .await
+            .expect("an empty batch completes immediately");
+
+        assert_eq!(batch.reason, CompletionReason::AllCompleted);
+        assert!(batch.items.is_empty());
+    }
+
+    /// The predicate's wire reason survives the checkpoint round-trip.
+    #[test]
+    fn completion_reason_predicate_round_trips_wire() {
+        assert_eq!(
+            CompletionReason::from_wire(CompletionReason::PredicateMatched.as_str()),
+            CompletionReason::PredicateMatched
+        );
     }
 
     // ── Gap 1: BatchResult/BatchItem public API tests ───────────────────
@@ -3429,7 +4188,8 @@ mod tests {
             .completion(
                 crate::CompletionConfig::builder()
                     .tolerated_failure_count(0)
-                    .build(),
+                    .build()
+                    .expect("valid completion config"),
             )
             .await;
 
@@ -3484,7 +4244,8 @@ mod tests {
             .completion(
                 crate::CompletionConfig::builder()
                     .tolerated_failure_count(0)
-                    .build(),
+                    .build()
+                    .expect("valid completion config"),
             )
             .await
         };
@@ -3524,7 +4285,8 @@ mod tests {
             .completion(
                 crate::CompletionConfig::builder()
                     .tolerated_failure_count(0)
-                    .build(),
+                    .build()
+                    .expect("valid completion config"),
             )
             .await
         };

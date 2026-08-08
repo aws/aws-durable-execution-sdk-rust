@@ -46,7 +46,7 @@ async fn handler(
         .completion(
             CompletionConfig::builder()
                 .tolerated_failure_count(1)
-                .build(),
+                .build()?,
         )
         .await?;
     Ok(results.len())
