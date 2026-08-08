@@ -25,7 +25,7 @@ async fn handler(
 
     Ok(serde_json::json!({
         "completionReason": batch.reason.as_str(),
-        "status": batch.status(),
+        "status": batch.status().as_str(),
         "successCount": batch.success_count(),
         "failureCount": batch.failure_count(),
         "totalCount": batch.total_count(),

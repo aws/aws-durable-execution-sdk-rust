@@ -56,6 +56,12 @@ const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 /// through to normal re-execution instead of short-circuiting.
 const REPLAY_CHILDREN_SENTINEL: &str = "__replay_children_reexecute__";
 
+/// The error type identifier recorded for a batch item whose body failed.
+///
+/// Matches the `errorType` the per-child FAIL checkpoint carries, so the
+/// batch summary payload and the child records agree on error identity.
+const CHILD_FN_ERROR_TYPE: &str = "ChildFnError";
+
 /// The terminal status of one item or branch in a batch operation.
 ///
 /// Each item in a [`BatchResult`] has a status indicating whether it
@@ -72,7 +78,7 @@ pub enum BatchItemStatus {
 /// The outcome of one item or branch in a batch operation.
 ///
 /// Contains the index, optional display name, terminal status, and either
-/// the result value or an error message.
+/// the result value or an error (type identifier plus message).
 ///
 /// # Examples
 ///
@@ -84,6 +90,7 @@ pub enum BatchItemStatus {
 ///     String::new(),
 ///     BatchItemStatus::Succeeded,
 ///     Some(42),
+///     None,
 ///     None,
 /// );
 /// assert_eq!(item.status, BatchItemStatus::Succeeded);
@@ -101,6 +108,13 @@ pub struct BatchItem<O> {
     pub result: Option<O>,
     /// Error message (only meaningful when status is Failed).
     pub error_message: Option<String>,
+    /// Error type identifier (only meaningful when status is Failed).
+    ///
+    /// Carries the `errType` recorded in the batch checkpoint payload
+    /// (`"ChildFnError"` for a failed item body), so error identity
+    /// survives checkpoint replay alongside the message. `None` when the
+    /// payload recorded no type (a payload written before error typing).
+    pub error_type: Option<String>,
 }
 
 impl<O> BatchItem<O> {
@@ -112,6 +126,7 @@ impl<O> BatchItem<O> {
         status: BatchItemStatus,
         result: Option<O>,
         error_message: Option<String>,
+        error_type: Option<String>,
     ) -> Self {
         Self {
             index,
@@ -119,8 +134,99 @@ impl<O> BatchItem<O> {
             status,
             result,
             error_message,
+            error_type,
         }
     }
+}
+
+/// The overall status of a completed batch.
+///
+/// Returned by [`BatchResult::status`]: [`BatchStatus::Succeeded`] when no
+/// started item failed, [`BatchStatus::Failed`] otherwise. The `Display`
+/// implementation renders the wire strings `"SUCCEEDED"` and `"FAILED"`.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::BatchStatus;
+///
+/// assert_eq!(BatchStatus::Succeeded.as_str(), "SUCCEEDED");
+/// assert_eq!(BatchStatus::Failed.to_string(), "FAILED");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BatchStatus {
+    /// No started item failed.
+    Succeeded,
+    /// At least one started item failed.
+    Failed,
+}
+
+impl BatchStatus {
+    /// Wire representation of the batch status.
+    ///
+    /// Returns the string used in checkpoint payloads and conformance
+    /// assertions.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+impl std::fmt::Display for BatchStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A failed item's error, tied to the item that produced it.
+///
+/// Returned by [`BatchResult::errors`]. Each entry borrows from the
+/// [`BatchItem`] it describes and carries the item's position, display
+/// name, error type identifier, and error message, so callers can
+/// associate a failure with the input that caused it rather than
+/// receiving a bare message string.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::{BatchResult, BatchItem, BatchItemStatus, CompletionReason};
+///
+/// let result: BatchResult<i32> = BatchResult::new(
+///     vec![BatchItem::new(
+///         2,
+///         "branch-c".to_owned(),
+///         BatchItemStatus::Failed,
+///         None,
+///         Some("boom".into()),
+///         Some("ChildFnError".into()),
+///     )],
+///     CompletionReason::AllCompleted,
+/// );
+/// let errors = result.errors();
+/// assert_eq!(errors[0].index, 2);
+/// assert_eq!(errors[0].name, "branch-c");
+/// assert_eq!(errors[0].message, "boom");
+/// assert_eq!(errors[0].error_type, Some("ChildFnError"));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BatchError<'a> {
+    /// Zero-based position of the failed item in the original input.
+    pub index: usize,
+    /// Display name of the failed item. Empty when the item has no name
+    /// (an unnamed map iteration).
+    pub name: &'a str,
+    /// The error message the item failed with.
+    pub message: &'a str,
+    /// The error type identifier the item failed with, as recorded in the
+    /// batch checkpoint payload (`"ChildFnError"` for a failed item body).
+    /// `None` when the payload recorded no type (a payload written before
+    /// error typing).
+    pub error_type: Option<&'a str>,
 }
 
 /// Why the batch completed.
@@ -160,6 +266,19 @@ impl CompletionReason {
             Self::FailureToleranceExceeded => "FAILURE_TOLERANCE_EXCEEDED",
         }
     }
+
+    /// Parses the wire representation back into a completion reason.
+    ///
+    /// Unrecognized strings map to [`CompletionReason::AllCompleted`],
+    /// matching the checkpoint replay path's tolerance for payloads written
+    /// by newer SDK versions.
+    pub(crate) fn from_wire(s: &str) -> Self {
+        match s {
+            "MIN_SUCCESSFUL_REACHED" => Self::MinSuccessfulReached,
+            "FAILURE_TOLERANCE_EXCEEDED" => Self::FailureToleranceExceeded,
+            _ => Self::AllCompleted,
+        }
+    }
 }
 
 /// The collected outcome of a map/parallel operation.
@@ -173,19 +292,30 @@ impl CompletionReason {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{BatchResult, BatchItem, BatchItemStatus, CompletionReason};
+/// use aws_durable_execution_sdk_rust::{
+///     BatchResult, BatchItem, BatchItemStatus, BatchStatus, CompletionReason,
+/// };
 ///
 /// let result: BatchResult<i32> = BatchResult::new(
 ///     vec![
-///         BatchItem::new(0, String::new(), BatchItemStatus::Succeeded, Some(10), None),
-///         BatchItem::new(1, String::new(), BatchItemStatus::Failed, None, Some("oops".into())),
+///         BatchItem::new(0, String::new(), BatchItemStatus::Succeeded, Some(10), None, None),
+///         BatchItem::new(
+///             1,
+///             String::new(),
+///             BatchItemStatus::Failed,
+///             None,
+///             Some("oops".into()),
+///             Some("ChildFnError".into()),
+///         ),
 ///     ],
 ///     CompletionReason::FailureToleranceExceeded,
 /// );
 /// assert!(result.has_failure());
 /// assert_eq!(result.success_count(), 1);
 /// assert_eq!(result.failure_count(), 1);
-/// assert_eq!(result.status(), "FAILED");
+/// assert_eq!(result.status(), BatchStatus::Failed);
+/// assert_eq!(result.errors()[0].index, 1);
+/// assert_eq!(result.errors()[0].message, "oops");
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]
@@ -246,13 +376,14 @@ impl<O> BatchResult<O> {
             .any(|i| i.status == BatchItemStatus::Failed)
     }
 
-    /// Returns `"SUCCEEDED"` if no item failed, `"FAILED"` otherwise.
+    /// Returns [`BatchStatus::Succeeded`] if no item failed,
+    /// [`BatchStatus::Failed`] otherwise.
     #[must_use]
-    pub fn status(&self) -> &'static str {
+    pub fn status(&self) -> BatchStatus {
         if self.has_failure() {
-            "FAILED"
+            BatchStatus::Failed
         } else {
-            "SUCCEEDED"
+            BatchStatus::Succeeded
         }
     }
 
@@ -263,16 +394,20 @@ impl<O> BatchResult<O> {
     }
 
     /// Returns the errors from failed items, in input order.
+    ///
+    /// Each [`BatchError`] carries the failed item's index, display name,
+    /// error type identifier, and error message, so a caller can tell
+    /// which input produced which failure and what kind of error it was.
     #[must_use]
-    pub fn errors(&self) -> Vec<&str> {
+    pub fn errors(&self) -> Vec<BatchError<'_>> {
         self.items
             .iter()
-            .filter_map(|item| {
-                if item.status == BatchItemStatus::Failed {
-                    item.error_message.as_deref()
-                } else {
-                    None
-                }
+            .filter(|item| item.status == BatchItemStatus::Failed)
+            .map(|item| BatchError {
+                index: item.index,
+                name: &item.name,
+                message: item.error_message.as_deref().unwrap_or_default(),
+                error_type: item.error_type.as_deref(),
             })
             .collect()
     }
@@ -1034,7 +1169,7 @@ where
                         .parent_id(parent_wire.clone())
                         .error(
                             aws_sdk_lambda::types::ErrorObject::builder()
-                                .error_type("ChildFnError")
+                                .error_type(CHILD_FN_ERROR_TYPE)
                                 .error_message(message.clone())
                                 .build(),
                         );
@@ -1051,6 +1186,7 @@ where
                         status: BatchItemStatus::Failed,
                         result: None,
                         error_message: Some(message),
+                        error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
                     });
                 }
                 if should_stop_min(&completion_cfg, success_count)
@@ -1160,7 +1296,16 @@ where
 
     // Replay path: child already terminal.
     if is_terminal {
-        match replay_terminal_child::<O>(ctx, &child_positional, index, serdes, &serdes_ctx).await {
+        match replay_terminal_child::<O>(
+            ctx,
+            &child_positional,
+            index,
+            item_name,
+            serdes,
+            &serdes_ctx,
+        )
+        .await
+        {
             Ok(item) => return Ok(ItemOutcome::Terminal(item)),
             Err(e) => {
                 // ReplayChildren sentinel: fall through to re-execution.
@@ -1196,6 +1341,7 @@ where
                     status: BatchItemStatus::Succeeded,
                     result: Some(deserialized),
                     error_message: None,
+                    error_type: None,
                 }))
             }
             ScopeOutcome::Completed(Err(child_err)) => Ok(ItemOutcome::Terminal(BatchItem {
@@ -1204,6 +1350,7 @@ where
                 status: BatchItemStatus::Failed,
                 result: None,
                 error_message: Some(child_err.to_string()),
+                error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
             })),
         };
     }
@@ -1289,6 +1436,7 @@ where
                 status: BatchItemStatus::Succeeded,
                 result: Some(deserialized),
                 error_message: None,
+                error_type: None,
             }))
         }
         ScopeOutcome::Completed(Err(child_err)) => {
@@ -1309,7 +1457,7 @@ where
                 .parent_id(parent_wire.to_owned())
                 .error(
                     aws_sdk_lambda::types::ErrorObject::builder()
-                        .error_type("ChildFnError")
+                        .error_type(CHILD_FN_ERROR_TYPE)
                         .error_message(err_message.clone())
                         .build(),
                 );
@@ -1328,6 +1476,7 @@ where
                 status: BatchItemStatus::Failed,
                 result: None,
                 error_message: Some(err_message),
+                error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
             }))
         }
     }
@@ -1388,10 +1537,16 @@ async fn replay_terminal_batch<O: DeserializeOwned>(
 }
 
 /// Replays a terminal child item from the checkpoint log.
+///
+/// `item_name` is the validated per-item name the caller derived for this
+/// slot (branch name for `parallel`, generated name for `map`); the replayed
+/// [`BatchItem`] carries it so structured error access reports the producing
+/// item's name even when the item reaches the batch result through replay.
 async fn replay_terminal_child<O: DeserializeOwned>(
     ctx: &DurableContext,
     child_positional: &str,
     index: usize,
+    item_name: &str,
     serdes: Option<&Arc<dyn Serdes>>,
     serdes_ctx: &SerdesContext,
 ) -> Result<BatchItem<O>, OperationError> {
@@ -1412,20 +1567,22 @@ async fn replay_terminal_child<O: DeserializeOwned>(
             let value: O = deserialize_value(payload, serdes, serdes_ctx).await?;
             Ok(BatchItem {
                 index,
-                name: String::new(),
+                name: item_name.to_owned(),
                 status: BatchItemStatus::Succeeded,
                 result: Some(value),
                 error_message: None,
+                error_type: None,
             })
         }
         CheckpointStatus::Failed => {
             let msg = record.error_message.as_deref().unwrap_or("child failed");
             Ok(BatchItem {
                 index,
-                name: String::new(),
+                name: item_name.to_owned(),
                 status: BatchItemStatus::Failed,
                 result: None,
                 error_message: Some(msg.to_owned()),
+                error_type: record.error_type.clone(),
             })
         }
         _ => Err(batch_error(
@@ -1699,6 +1856,7 @@ fn from_batch_result<'a, O: Serialize>(
                 item.name.clone(),
                 item.status,
                 item.error_message.clone().unwrap_or_default(),
+                item.error_type.clone(),
                 prepared,
             ))
         })
@@ -1710,7 +1868,7 @@ fn from_batch_result<'a, O: Serialize>(
     async move {
         let prepared_items = prepared_items?;
         let mut items = Vec::with_capacity(prepared_items.len());
-        for (index, name, status, err_message, prepared) in prepared_items {
+        for (index, name, status, err_message, error_type, prepared) in prepared_items {
             let status_str = match status {
                 BatchItemStatus::Succeeded => "SUCCEEDED",
                 BatchItemStatus::Failed => "FAILED",
@@ -1730,7 +1888,7 @@ fn from_batch_result<'a, O: Serialize>(
                 status: status_str.to_owned(),
                 result: result_str,
                 err_type: if status == BatchItemStatus::Failed {
-                    "ChildFnError".to_owned()
+                    error_type.unwrap_or_else(|| CHILD_FN_ERROR_TYPE.to_owned())
                 } else {
                     String::new()
                 },
@@ -1774,14 +1932,15 @@ async fn to_batch_result<O: DeserializeOwned>(
             } else {
                 None
             },
+            error_type: if status == BatchItemStatus::Failed && !cp.err_type.is_empty() {
+                Some(cp.err_type.clone())
+            } else {
+                None
+            },
         });
     }
 
-    let reason = match payload.reason.as_str() {
-        "MIN_SUCCESSFUL_REACHED" => CompletionReason::MinSuccessfulReached,
-        "FAILURE_TOLERANCE_EXCEEDED" => CompletionReason::FailureToleranceExceeded,
-        _ => CompletionReason::AllCompleted,
-    };
+    let reason = CompletionReason::from_wire(&payload.reason);
 
     Ok(BatchResult { items, reason })
 }
@@ -1950,7 +2109,6 @@ mod tests {
         );
     }
 
-    #[allow(dead_code)] // reason: used by future test cases
     fn succeeded_record(positional_id: &str, result: &str) -> (String, CheckpointRecord) {
         let wire_id = crate::engine::compute_wire_id_public(positional_id);
         (
@@ -1974,7 +2132,6 @@ mod tests {
         )
     }
 
-    #[allow(dead_code)] // reason: used by future test cases
     fn failed_record(positional_id: &str, msg: &str) -> (String, CheckpointRecord) {
         let wire_id = crate::engine::compute_wire_id_public(positional_id);
         (
@@ -2049,7 +2206,7 @@ mod tests {
         assert_eq!(batch.items.len(), 3);
         assert_eq!(batch.success_count(), 2);
         assert_eq!(batch.failure_count(), 1);
-        assert_eq!(batch.status(), "FAILED");
+        assert_eq!(batch.status(), BatchStatus::Failed);
 
         let by_index = |idx: usize| {
             batch
@@ -2075,6 +2232,95 @@ mod tests {
         );
         assert_eq!(by_index(2).status, BatchItemStatus::Succeeded);
         assert_eq!(by_index(2).result, Some(3));
+
+        // The structured error view must associate the failure with the
+        // branch that produced it.
+        let errors = batch.errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].index, 1);
+        assert_eq!(errors[0].name, "boom");
+        assert!(
+            errors[0].message.contains("intentional"),
+            "structured error must carry the branch's message: {:?}",
+            errors[0].message
+        );
+        // Live execution grades a failed branch body as ChildFnError, and
+        // the structured view exposes that identity alongside the message.
+        assert_eq!(errors[0].error_type, Some(CHILD_FN_ERROR_TYPE));
+        assert_eq!(by_index(1).error_type.as_deref(), Some(CHILD_FN_ERROR_TYPE));
+    }
+
+    /// Partial replay must not discard branch names: when a branch reached a
+    /// terminal state on a previous invocation (e.g. it failed while a
+    /// sibling suspended), the next invocation reconstructs it from the
+    /// checkpoint log via `replay_terminal_child`, and the resulting
+    /// [`BatchItem`] — and the structured error view — must still carry the
+    /// producing branch's name. The live branch bodies here return values
+    /// that CONTRADICT the recorded outcomes, proving the items came from
+    /// replay rather than re-execution.
+    #[tokio::test]
+    async fn parallel_replayed_terminal_branches_retain_names() {
+        use crate::future::Branch;
+
+        // Second-invocation state: the batch parent (positional "1") is not
+        // yet terminal, child 0 (positional "2") failed, and child 1
+        // (positional "3") succeeded with 7.
+        let log = CheckpointLog::from_records(vec![
+            failed_record("2", "recorded failure"),
+            succeeded_record("3", "7"),
+        ]);
+        let (ctx, _client) = test_ctx_with_client(log);
+
+        let batch = ctx
+            .parallel(vec![
+                // Would SUCCEED if re-executed — the failure below proves
+                // the item was reconstructed from the checkpoint record.
+                Branch::new("boom", |_ctx| async move { Ok(999_i32) }),
+                // Would return 999 if re-executed — the 7 below proves
+                // replay.
+                Branch::new("steady", |_ctx| async move { Ok(999_i32) }),
+            ])
+            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .await_batch()
+            .await
+            .expect("a tolerated replayed failure must not become an operation error");
+
+        assert_eq!(batch.items.len(), 2);
+        let by_index = |idx: usize| {
+            batch
+                .items
+                .iter()
+                .find(|i| i.index == idx)
+                .expect("batch must contain an item for every branch")
+        };
+
+        let failed = by_index(0);
+        assert_eq!(failed.status, BatchItemStatus::Failed);
+        assert_eq!(
+            failed.name, "boom",
+            "a replayed failed branch must retain its branch name"
+        );
+        assert_eq!(failed.error_message.as_deref(), Some("recorded failure"));
+
+        let succeeded = by_index(1);
+        assert_eq!(succeeded.status, BatchItemStatus::Succeeded);
+        assert_eq!(succeeded.result, Some(7));
+        assert_eq!(
+            succeeded.name, "steady",
+            "a replayed succeeded branch must retain its branch name"
+        );
+
+        // The structured error view must associate the replayed failure
+        // with the branch that produced it.
+        let errors = batch.errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].index, 0);
+        assert_eq!(
+            errors[0].name, "boom",
+            "structured errors must name the replayed failed branch"
+        );
+        assert_eq!(errors[0].message, "recorded failure");
+        assert_eq!(errors[0].error_type, Some(CHILD_FN_ERROR_TYPE));
     }
 
     /// `await_batch` surfaces a tolerance-exceeded batch as-is: the reason
@@ -2473,27 +2719,44 @@ mod tests {
             BatchItemStatus::Succeeded,
             Some("hello".to_owned()),
             None,
+            None,
         );
         assert_eq!(item.index, 3);
         assert_eq!(item.name, "my-item");
         assert_eq!(item.status, BatchItemStatus::Succeeded);
         assert_eq!(item.result.as_deref(), Some("hello"));
         assert!(item.error_message.is_none());
+        assert!(item.error_type.is_none());
     }
 
     #[test]
     fn batch_result_accessors_match_go_sdk() {
         let result: BatchResult<i32> = BatchResult::new(
             vec![
-                BatchItem::new(0, String::new(), BatchItemStatus::Succeeded, Some(10), None),
+                BatchItem::new(
+                    0,
+                    String::new(),
+                    BatchItemStatus::Succeeded,
+                    Some(10),
+                    None,
+                    None,
+                ),
                 BatchItem::new(
                     1,
                     String::new(),
                     BatchItemStatus::Failed,
                     None,
                     Some("err".into()),
+                    Some("ChildFnError".into()),
                 ),
-                BatchItem::new(2, String::new(), BatchItemStatus::Succeeded, Some(30), None),
+                BatchItem::new(
+                    2,
+                    String::new(),
+                    BatchItemStatus::Succeeded,
+                    Some(30),
+                    None,
+                    None,
+                ),
             ],
             CompletionReason::FailureToleranceExceeded,
         );
@@ -2501,8 +2764,13 @@ mod tests {
         assert_eq!(result.failure_count(), 1);
         assert_eq!(result.total_count(), 3);
         assert!(result.has_failure());
-        assert_eq!(result.status(), "FAILED");
-        assert_eq!(result.errors(), vec!["err"]);
+        assert_eq!(result.status(), BatchStatus::Failed);
+        let errors = result.errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].index, 1);
+        assert_eq!(errors[0].name, "");
+        assert_eq!(errors[0].message, "err");
+        assert_eq!(errors[0].error_type, Some("ChildFnError"));
         assert_eq!(result.results(), vec![&10, &30]);
         assert_eq!(result.reason, CompletionReason::FailureToleranceExceeded);
     }
@@ -2517,6 +2785,7 @@ mod tests {
                     BatchItemStatus::Succeeded,
                     Some("a"),
                     None,
+                    None,
                 ),
                 BatchItem::new(
                     1,
@@ -2524,15 +2793,274 @@ mod tests {
                     BatchItemStatus::Succeeded,
                     Some("b"),
                     None,
+                    None,
                 ),
             ],
             CompletionReason::AllCompleted,
         );
         assert!(!result.has_failure());
-        assert_eq!(result.status(), "SUCCEEDED");
+        assert_eq!(result.status(), BatchStatus::Succeeded);
         assert_eq!(result.success_count(), 2);
         assert_eq!(result.failure_count(), 0);
         assert!(result.errors().is_empty());
+    }
+
+    /// `BatchStatus` must render exactly the strings the old string-typed
+    /// `status()` accessor returned.
+    #[test]
+    fn batch_status_display_preserves_wire_strings() {
+        assert_eq!(BatchStatus::Succeeded.as_str(), "SUCCEEDED");
+        assert_eq!(BatchStatus::Failed.as_str(), "FAILED");
+        assert_eq!(BatchStatus::Succeeded.to_string(), "SUCCEEDED");
+        assert_eq!(BatchStatus::Failed.to_string(), "FAILED");
+    }
+
+    /// Every completion reason `execute_batch` can produce must round-trip
+    /// through its wire representation.
+    #[test]
+    fn completion_reason_round_trips_through_wire() {
+        for reason in [
+            CompletionReason::AllCompleted,
+            CompletionReason::MinSuccessfulReached,
+            CompletionReason::FailureToleranceExceeded,
+        ] {
+            assert_eq!(CompletionReason::from_wire(reason.as_str()), reason);
+        }
+        // Unknown strings from a newer SDK degrade to AllCompleted.
+        assert_eq!(
+            CompletionReason::from_wire("SOME_FUTURE_REASON"),
+            CompletionReason::AllCompleted
+        );
+    }
+
+    /// `errors()` must associate each error with the item that produced it:
+    /// the item's index, its display name, the error type, and the message.
+    #[test]
+    fn errors_carry_item_index_name_and_message() {
+        let result: BatchResult<i32> = BatchResult::new(
+            vec![
+                BatchItem::new(
+                    0,
+                    "a".to_owned(),
+                    BatchItemStatus::Succeeded,
+                    Some(1),
+                    None,
+                    None,
+                ),
+                BatchItem::new(
+                    1,
+                    "b".to_owned(),
+                    BatchItemStatus::Failed,
+                    None,
+                    Some("first failure".into()),
+                    Some("ChildFnError".into()),
+                ),
+                BatchItem::new(
+                    2,
+                    "c".to_owned(),
+                    BatchItemStatus::Succeeded,
+                    Some(3),
+                    None,
+                    None,
+                ),
+                BatchItem::new(
+                    4,
+                    "e".to_owned(),
+                    BatchItemStatus::Failed,
+                    None,
+                    Some("second failure".into()),
+                    Some("TimeoutError".into()),
+                ),
+            ],
+            CompletionReason::AllCompleted,
+        );
+
+        let errors = result.errors();
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].index, 1);
+        assert_eq!(errors[0].name, "b");
+        assert_eq!(errors[0].message, "first failure");
+        assert_eq!(errors[0].error_type, Some("ChildFnError"));
+        assert_eq!(errors[1].index, 4);
+        assert_eq!(errors[1].name, "e");
+        assert_eq!(errors[1].message, "second failure");
+        assert_eq!(errors[1].error_type, Some("TimeoutError"));
+    }
+
+    /// A failed item with no recorded message or error type yields an empty
+    /// message and a `None` type rather than being dropped from `errors()`.
+    #[test]
+    fn errors_include_failed_items_without_messages() {
+        let result: BatchResult<i32> = BatchResult::new(
+            vec![BatchItem::new(
+                0,
+                "x".to_owned(),
+                BatchItemStatus::Failed,
+                None,
+                None,
+                None,
+            )],
+            CompletionReason::AllCompleted,
+        );
+        let errors = result.errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].index, 0);
+        assert_eq!(errors[0].name, "x");
+        assert_eq!(errors[0].message, "");
+        assert_eq!(errors[0].error_type, None);
+    }
+
+    /// A failed item's error type and message must survive the checkpoint
+    /// payload round-trip (`from_batch_result` → `to_batch_result`), so
+    /// error identity is preserved across suspension and replay rather
+    /// than being discarded on the way back in.
+    #[tokio::test]
+    async fn batch_checkpoint_round_trips_error_type_and_message() {
+        let original: BatchResult<i32> = BatchResult::new(
+            vec![
+                BatchItem::new(
+                    0,
+                    "ok".to_owned(),
+                    BatchItemStatus::Succeeded,
+                    Some(7),
+                    None,
+                    None,
+                ),
+                BatchItem::new(
+                    1,
+                    "boom".to_owned(),
+                    BatchItemStatus::Failed,
+                    None,
+                    Some("it broke".to_owned()),
+                    Some("CustomFailure".to_owned()),
+                ),
+            ],
+            CompletionReason::FailureToleranceExceeded,
+        );
+
+        let payload = from_batch_result(&original, None, "parent-wire", "arn:test")
+            .await
+            .expect("serializing a batch result must succeed");
+        let replayed: BatchResult<i32> = to_batch_result(&payload, None, "parent-wire", "arn:test")
+            .await
+            .expect("deserializing the payload must succeed");
+
+        assert_eq!(replayed.reason, CompletionReason::FailureToleranceExceeded);
+        assert_eq!(replayed.items.len(), 2);
+        let failed = &replayed.items[1];
+        assert_eq!(failed.index, 1);
+        assert_eq!(failed.name, "boom");
+        assert_eq!(failed.status, BatchItemStatus::Failed);
+        assert_eq!(failed.error_message.as_deref(), Some("it broke"));
+        assert_eq!(failed.error_type.as_deref(), Some("CustomFailure"));
+        let errors = replayed.errors();
+        assert_eq!(errors[0].error_type, Some("CustomFailure"));
+        assert_eq!(errors[0].message, "it broke");
+        let ok = &replayed.items[0];
+        assert_eq!(ok.result, Some(7));
+        assert!(ok.error_type.is_none());
+    }
+
+    /// A failed item that recorded no error type (a live item defaults to
+    /// `ChildFnError`) writes the default to the wire, so payloads keep
+    /// the `errType` field older readers expect.
+    #[tokio::test]
+    async fn from_batch_result_defaults_missing_error_type() {
+        let original: BatchResult<i32> = BatchResult::new(
+            vec![BatchItem::new(
+                0,
+                String::new(),
+                BatchItemStatus::Failed,
+                None,
+                Some("boom".to_owned()),
+                None,
+            )],
+            CompletionReason::AllCompleted,
+        );
+        let payload = from_batch_result(&original, None, "parent-wire", "arn:test")
+            .await
+            .expect("serializing a batch result must succeed");
+        assert_eq!(
+            payload.results.first().map(|r| r.err_type.as_str()),
+            Some(CHILD_FN_ERROR_TYPE)
+        );
+    }
+
+    /// A checkpoint payload whose failed item carries no `errType` (written
+    /// before error typing) replays with `error_type: None` rather than a
+    /// fabricated type.
+    #[tokio::test]
+    async fn to_batch_result_missing_err_type_is_none() {
+        let payload: BatchCheckpointPayload = serde_json::from_value(serde_json::json!({
+            "results": [
+                {"index": 0, "status": "FAILED", "errMessage": "boom"}
+            ],
+            "reason": "ALL_COMPLETED"
+        }))
+        .expect("payload literal must deserialize");
+        let replayed: BatchResult<i32> = to_batch_result(&payload, None, "parent-wire", "arn:test")
+            .await
+            .expect("deserializing the payload must succeed");
+        let item = replayed.items.first().expect("one item");
+        assert_eq!(item.error_message.as_deref(), Some("boom"));
+        assert_eq!(item.error_type, None);
+        assert_eq!(replayed.errors()[0].error_type, None);
+    }
+
+    /// Replaying a frozen terminal batch whose payload carries per-item
+    /// `errType` exposes that type through `errors()` without re-executing
+    /// any item body.
+    #[tokio::test]
+    async fn replay_frozen_batch_preserves_error_type() {
+        let payload = serde_json::json!({
+            "results": [
+                {"index": 0, "status": "SUCCEEDED", "result": "\"hello\""},
+                {"index": 1, "status": "FAILED", "errType": "ChildFnError", "errMessage": "boom"}
+            ],
+            "reason": "ALL_COMPLETED"
+        });
+        let log = CheckpointLog::from_records(vec![{
+            let wire_id = crate::engine::compute_wire_id_public("1");
+            (
+                wire_id.clone(),
+                CheckpointRecord {
+                    id: wire_id,
+                    status: CheckpointStatus::Succeeded,
+                    result: Some(payload.to_string()),
+                    error_type: None,
+                    error_message: None,
+                    attempt: 0,
+                    invoke_result: None,
+                    invoke_error_type: None,
+                    invoke_error_message: None,
+                    replay_children: false,
+                    callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
+                },
+            )
+        }]);
+        let ctx = test_ctx(log);
+
+        let batch = ctx
+            .map(
+                vec!["a".to_owned(), "b".to_owned()],
+                |_child, _item: String, _idx| async move {
+                    Err::<String, _>("should not execute during replay".into())
+                },
+            )
+            .await_batch()
+            .await
+            .expect("frozen batch must replay from the payload");
+
+        assert_eq!(batch.success_count(), 1);
+        assert_eq!(batch.failure_count(), 1);
+        let errors = batch.errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].index, 1);
+        assert_eq!(errors[0].message, "boom");
+        assert_eq!(errors[0].error_type, Some(CHILD_FN_ERROR_TYPE));
     }
 
     // ── Gap 3: NestingMode tests ────────────────────────────────────────

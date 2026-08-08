@@ -1650,6 +1650,9 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     /// ends because the configured failure tolerance was exceeded.
     ///
     /// Always returns the full `BatchResult<O>` including per-item outcomes.
+    /// [`BatchResult::status`] reports the overall outcome as a
+    /// [`BatchStatus`], and [`BatchResult::errors`] associates each failure
+    /// with the index and name of the item that produced it.
     ///
     /// # Errors
     ///
@@ -1659,7 +1662,47 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     /// `BatchItemStatus::Failed` entries in the result, and the batch's
     /// [`CompletionReason`] records why the batch ended.
     ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk_rust as durable;
+    ///
+    /// async fn handler(
+    ///     event: Vec<String>,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<(), durable::BoxError> {
+    ///     let batch = ctx
+    ///         .map(event, |child, item, _idx| async move {
+    ///             let len = child
+    ///                 .step(move |_| async move { Ok(item.len()) })
+    ///                 .name("measure")
+    ///                 .await?;
+    ///             Ok(len)
+    ///         })
+    ///         .name("measure-all")
+    ///         .completion(durable::CompletionConfig::with_tolerated_failure_count(2))
+    ///         .await_batch()
+    ///         .await?;
+    ///
+    ///     if batch.status() == durable::BatchStatus::Failed {
+    ///         for error in batch.errors() {
+    ///             println!(
+    ///                 "item {} failed with {}: {}",
+    ///                 error.index,
+    ///                 error.error_type.unwrap_or("unknown error type"),
+    ///                 error.message,
+    ///             );
+    ///         }
+    ///     }
+    ///     println!("batch ended because {:?}", batch.reason);
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
     /// [`BatchResult`]: crate::BatchResult
+    /// [`BatchResult::status`]: crate::BatchResult::status
+    /// [`BatchResult::errors`]: crate::BatchResult::errors
+    /// [`BatchStatus`]: crate::BatchStatus
     /// [`CompletionReason`]: crate::CompletionReason
     pub async fn await_batch(self) -> Result<crate::BatchResult<O>, OperationError>
     where
@@ -1920,7 +1963,9 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     /// exceeded.
     ///
     /// Always returns the full `BatchResult<O>` including per-branch
-    /// outcomes.
+    /// outcomes. [`BatchResult::status`] reports the overall outcome as a
+    /// [`BatchStatus`], and [`BatchResult::errors`] associates each failure
+    /// with the index and name of the branch that produced it.
     ///
     /// # Errors
     ///
@@ -1949,8 +1994,15 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     ///         .completion(durable::CompletionConfig::with_tolerated_failure_count(1))
     ///         .await_batch()
     ///         .await?;
-    ///     for item in &batch.items {
-    ///         println!("{} -> {:?}", item.name, item.status);
+    ///     if batch.status() == durable::BatchStatus::Failed {
+    ///         for error in batch.errors() {
+    ///             println!(
+    ///                 "branch {} failed with {}: {}",
+    ///                 error.name,
+    ///                 error.error_type.unwrap_or("unknown error type"),
+    ///                 error.message,
+    ///             );
+    ///         }
     ///     }
     ///     println!("batch ended because {:?}", batch.reason);
     ///     Ok(())
@@ -1958,6 +2010,9 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     /// ```
     ///
     /// [`BatchResult`]: crate::BatchResult
+    /// [`BatchResult::status`]: crate::BatchResult::status
+    /// [`BatchResult::errors`]: crate::BatchResult::errors
+    /// [`BatchStatus`]: crate::BatchStatus
     /// [`CompletionReason`]: crate::CompletionReason
     pub async fn await_batch(self) -> Result<crate::BatchResult<O>, OperationError>
     where

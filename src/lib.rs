@@ -89,7 +89,7 @@ pub use self::error::{
 };
 pub use self::future::{Branch, Callback, DurableFuture, Settled};
 pub use self::map_parallel::{
-    BatchItem, BatchItemStatus, BatchResult, CompletionReason, NestingMode,
+    BatchError, BatchItem, BatchItemStatus, BatchResult, BatchStatus, CompletionReason, NestingMode,
 };
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
 pub use self::serdes::{

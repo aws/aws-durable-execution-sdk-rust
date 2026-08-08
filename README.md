@@ -429,9 +429,12 @@ Both accept `.max_concurrency(...)` and `.completion(...)`. A
 `CompletionConfig` ends the batch early: `with_min_successful(n)` stops once
 `n` items succeed, `with_tolerated_failure_count(0)` fails fast on the first
 error, and `CompletionConfig::builder()` combines thresholds so the first one
-to fire wins. `MapBuilder` also exposes `.await_batch()`: await it instead of
-the builder to get a `BatchResult<O>` that reports each item's status and why
-the batch ended.
+to fire wins. `MapBuilder` and `ParallelBuilder` also expose `.await_batch()`:
+await it instead of the builder to get a `BatchResult<O>` that reports each
+item's status and why the batch ended. `BatchResult::status()` returns a
+`BatchStatus` enum, and `BatchResult::errors()` returns `BatchError` entries
+that tie each failure to the index and name of the item that produced it,
+along with the error's type identifier and message.
 
 ### combinators
 
