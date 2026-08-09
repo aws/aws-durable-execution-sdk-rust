@@ -1,0 +1,58 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (Nondeterminism)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  NondetReordered:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["12-1"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/nondet_reordered/
+      Handler: bootstrap
+      Description: 'Conformance 12-1: reordered operations fail replay'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  NondetTypeChanged:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["12-2"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/nondet_type_changed/
+      Handler: bootstrap
+      Description: 'Conformance 12-2: type-changed operation fails replay'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  NondetRemoved:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["12-3"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/nondet_removed/
+      Handler: bootstrap
+      Description: 'Conformance 12-3: removed operation fails replay'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

@@ -189,6 +189,12 @@ jobs:
         run: |
           pip install "git+https://github.com/aws/aws-durable-execution-conformance-tests.git@main#subdirectory=packages/aws-durable-execution-conformance-tests"
 
+      # The history, nondeterminism, and combinator suites are contributed
+      # by this repo's extension package (compliance/conformance_ext); the
+      # runner discovers them through its extension entry point.
+      - name: Install Rust SDK conformance extension
+        run: pip install ./conformance_ext
+
       - name: Compute stack-safe suite slug
         run: |
           # CloudFormation stack names allow only [a-zA-Z][-a-zA-Z0-9]*;

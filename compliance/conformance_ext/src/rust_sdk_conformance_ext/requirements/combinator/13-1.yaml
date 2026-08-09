@@ -1,0 +1,21 @@
+---
+# 13-1: try_join_all task ownership (issue #7)
+description: try_join_all runs blessed branch tasks and aggregates results
+handler: |
+  Spawns two steps as durable futures and joins them with try_join_all.
+  The combinator drives its branches on internal JoinSet tasks, which must
+  be registered (blessed) with the task-ownership guard — without the
+  blessing the branches are rejected as foreign tasks and the combinator
+  fails. The handler returns the sum of both branch results.
+invocations: |
+  - Handler creates two step futures, awaits try_join_all, both branches
+    succeed on blessed tasks, handler returns 1 + 2.
+Input:
+ExpectedResult:
+  ExecutionStatus: SUCCEEDED
+  Result: 3
+ExpectedExecutionHistory:
+  # Branch scheduling order is nondeterministic, so individual step events
+  # are not pinned; the Result value is the load-bearing assertion.
+  - EventId: 2
+    EventTimestamp: '*'

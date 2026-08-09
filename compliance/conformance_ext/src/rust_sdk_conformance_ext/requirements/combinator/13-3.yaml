@@ -1,0 +1,20 @@
+---
+# 13-3: select_ok task ownership (issue #7)
+description: select_ok returns the first successful branch from blessed tasks
+handler: |
+  Spawns two steps as durable futures — one fails permanently, one
+  succeeds — and awaits select_ok. Without task-ownership blessing every
+  branch is rejected as a foreign task, so no branch can win. The handler
+  returns the winning value.
+invocations: |
+  - Handler creates one failing and one succeeding step future, awaits
+    select_ok, the succeeding branch wins, handler returns "winner".
+Input:
+ExpectedResult:
+  ExecutionStatus: SUCCEEDED
+  Result: winner
+ExpectedExecutionHistory:
+  # Branch scheduling order is nondeterministic, so individual step events
+  # are not pinned; the Result value is the load-bearing assertion.
+  - EventId: 2
+    EventTimestamp: '*'

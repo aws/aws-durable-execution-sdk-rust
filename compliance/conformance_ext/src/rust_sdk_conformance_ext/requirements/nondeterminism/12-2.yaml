@@ -1,0 +1,26 @@
+---
+# 12-2: Non-determinism detection — operation changes type (issue #6)
+description: An operation that changes type on replay fails with a non-determinism error
+handler: |
+  On the first execution, runs a step named "flip" and then a 1-second
+  wait that suspends the execution. On replay the handler creates a wait
+  in place of the step, so the first claimed operation is a Wait where the
+  checkpoint record is a Step. The SDK must detect the type mismatch and
+  fail the execution.
+invocations: |
+  - First invocation: step "flip" succeeds, wait starts, invocation
+    completes, execution suspends.
+  - Replay 1: Re-invoked because the wait completed. The handler claims a
+    Wait where a Step was recorded; the SDK raises
+    NonDeterministicExecution and the execution fails.
+Input:
+ExpectedResult:
+  ExecutionStatus: FAILED
+ExpectedExecutionHistory:
+  - EventType: StepStarted
+    SubType: Step
+    EventId: 2
+    Id: ${ID1}
+    Name: flip
+    EventTimestamp: '*'
+    StepStartedDetails: {}

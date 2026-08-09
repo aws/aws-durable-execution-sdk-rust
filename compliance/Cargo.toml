@@ -16,6 +16,9 @@ members = [
     "parallel/*",
     "wait_for_callback/*",
     "wait_for_condition/*",
+    "history/*",
+    "nondeterminism/*",
+    "combinator/*",
 ]
 resolver = "2"
 

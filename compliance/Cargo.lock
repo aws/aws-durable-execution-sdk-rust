@@ -1120,6 +1120,58 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "combinator_join_all"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk-rust",
+ "compliance",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "combinator_race"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk-rust",
+ "compliance",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "combinator_select_ok"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk-rust",
+ "compliance",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "combinator_try_join_all"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk-rust",
+ "compliance",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "compliance"
 version = "0.0.0"
 dependencies = [
@@ -1487,6 +1539,20 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "history_multi_page"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk-rust",
+ "compliance",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "hmac"
@@ -2375,6 +2441,45 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nondet_removed"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk-rust",
+ "compliance",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "nondet_reordered"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk-rust",
+ "compliance",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "nondet_type_changed"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk-rust",
+ "compliance",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

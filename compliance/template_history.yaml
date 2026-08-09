@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (History)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  HistoryMultiPage:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["11-1"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/history_multi_page/
+      Handler: bootstrap
+      Description: 'Conformance 11-1: multi-page history replay'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

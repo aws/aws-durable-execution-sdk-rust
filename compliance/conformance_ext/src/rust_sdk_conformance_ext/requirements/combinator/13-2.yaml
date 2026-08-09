@@ -1,0 +1,24 @@
+---
+# 13-2: join_all task ownership — settled outcomes are genuine (issue #7)
+description: join_all reports real per-branch outcomes, not ownership rejections
+handler: |
+  Spawns two steps as durable futures — one succeeds, one fails permanently
+  — and joins them with join_all. This is the silent-corruption case from
+  issue #7: without task-ownership blessing, EVERY branch settles Rejected
+  (with the ownership error) and join_all still reports overall success.
+  The handler counts fulfilled and rejected outcomes and returns
+  "fulfilled=1,rejected=1", which is only produced when the branches
+  actually ran.
+invocations: |
+  - Handler creates one succeeding and one failing step future, awaits
+    join_all, receives exactly one Fulfilled and one Rejected outcome,
+    returns the counts.
+Input:
+ExpectedResult:
+  ExecutionStatus: SUCCEEDED
+  Result: fulfilled=1,rejected=1
+ExpectedExecutionHistory:
+  # Branch scheduling order is nondeterministic, so individual step events
+  # are not pinned; the Result value is the load-bearing assertion.
+  - EventId: 2
+    EventTimestamp: '*'

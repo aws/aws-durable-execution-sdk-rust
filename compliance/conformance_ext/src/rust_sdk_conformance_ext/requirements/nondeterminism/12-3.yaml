@@ -1,0 +1,27 @@
+---
+# 12-3: Non-determinism detection — removed operation (issue #6)
+description: A removed operation on replay fails with a non-determinism error
+handler: |
+  On the first execution, runs step "load-config" then step "process-data",
+  then a 1-second wait that suspends the execution. On replay the handler
+  no longer creates "load-config", so its first claimed operation
+  ("process-data") lands on the checkpoint record for "load-config". The
+  SDK must detect the identity mismatch and fail the execution instead of
+  handing "load-config"'s recorded result to "process-data".
+invocations: |
+  - First invocation: step "load-config" succeeds, step "process-data"
+    succeeds, wait starts, invocation completes, execution suspends.
+  - Replay 1: Re-invoked because the wait completed. The handler skips
+    "load-config"; the SDK raises NonDeterministicExecution and the
+    execution fails.
+Input:
+ExpectedResult:
+  ExecutionStatus: FAILED
+ExpectedExecutionHistory:
+  - EventType: StepStarted
+    SubType: Step
+    EventId: 2
+    Id: ${ID1}
+    Name: load-config
+    EventTimestamp: '*'
+    StepStartedDetails: {}

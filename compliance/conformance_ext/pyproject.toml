@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rust-sdk-conformance-ext"
+version = "0.1.0"
+description = "Rust SDK extension suites for the AWS Durable Execution conformance runner"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "aws-durable-execution-conformance-tests>=1.0,<2",
+]
+
+[project.entry-points."aws_durable_execution_conformance_tests.extensions"]
+rust-sdk-conformance-ext = "rust_sdk_conformance_ext:extension"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rust_sdk_conformance_ext"]

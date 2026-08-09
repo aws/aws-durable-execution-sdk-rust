@@ -1,0 +1,29 @@
+---
+# 12-1: Non-determinism detection — reordered operations (issue #6)
+description: Reordered operations on replay fail with a non-determinism error
+handler: |
+  On the first execution, runs step "alpha" then step "beta", then a
+  1-second wait that suspends the execution. On replay the handler creates
+  the two steps in the opposite order, so the first claimed operation
+  ("beta") lands on the checkpoint record for "alpha". The SDK must detect
+  the identity mismatch and fail the execution instead of silently
+  replaying the wrong recorded result.
+invocations: |
+  - First invocation: step "alpha" succeeds, step "beta" succeeds, wait
+    starts, invocation completes, execution suspends.
+  - Replay 1: Re-invoked because the wait completed. The handler claims
+    "beta" first; the SDK raises NonDeterministicExecution and the
+    execution fails.
+Input:
+ExpectedResult:
+  ExecutionStatus: FAILED
+ExpectedExecutionHistory:
+  # First invocation recorded the original order — pin the first step's
+  # identity so the mismatch on replay is attributable.
+  - EventType: StepStarted
+    SubType: Step
+    EventId: 2
+    Id: ${ID1}
+    Name: alpha
+    EventTimestamp: '*'
+    StepStartedDetails: {}

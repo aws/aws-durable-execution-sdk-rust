@@ -33,7 +33,8 @@
 #
 # Operations (default: all found in this directory):
 #   smoke, step, wait, callback, child, invoke, parallel,
-#   wait_for_callback, wait_for_condition, map
+#   wait_for_callback, wait_for_condition, map, history,
+#   nondeterminism, combinator
 #
 # Examples:
 #   ./build_examples.sh smoke          # build only the smoke suite
@@ -75,8 +76,11 @@ if [ $# -gt 0 ]; then
 else
     # `build` is scratch the conformance runner leaves behind (gitignored),
     # not a suite; discovering it as an operation fails the cargo build.
+    # conformance_ext is the Python runner-extension package, not a handler
+    # suite — exclude it from auto-discovery.
     operations=$(find . -maxdepth 1 -mindepth 1 -type d \
         ! -name publish ! -name src ! -name target ! -name build ! -name '.*' \
+        ! -name conformance_ext \
         -exec basename {} \;)
 fi
 # Stable signature (sorted, single-space-joined) for the skip stamp.

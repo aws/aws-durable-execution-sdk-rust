@@ -1,0 +1,21 @@
+---
+# 13-4: race task ownership (issue #7)
+description: race returns the first settled branch from blessed tasks
+handler: |
+  Spawns two steps as durable futures, both returning the same value, and
+  awaits race. Without task-ownership blessing the branches fail with the
+  ownership error instead of settling normally (issue #7 observed race
+  failing loudly in that state). Both branches return "done" so the winner
+  is deterministic regardless of scheduling.
+invocations: |
+  - Handler creates two step futures that both return "done", awaits race,
+    the first settled branch wins, handler returns "done".
+Input:
+ExpectedResult:
+  ExecutionStatus: SUCCEEDED
+  Result: done
+ExpectedExecutionHistory:
+  # Branch scheduling order is nondeterministic, so individual step events
+  # are not pinned; the Result value is the load-bearing assertion.
+  - EventId: 2
+    EventTimestamp: '*'

@@ -1,0 +1,44 @@
+---
+# 11-1: Multi-page history replay (issue #5)
+description: Multi-page history replay (bootstrap paginates execution state)
+handler: |
+  Creates 150 sequential steps, each returning an index-tagged ~1KB payload
+  and logging a marker exactly once, then a 1-second wait that suspends the
+  execution. The recorded history exceeds a single GetDurableExecutionState
+  page, so the replay after the wait only completes correctly when the
+  bootstrap path follows the pagination marker. The handler sums the index
+  prefixes of every replayed step result and returns the sum.
+invocations: |
+  - First invocation: 150 steps execute (each logs the marker once), wait
+    starts, invocation completes, execution suspends.
+  - Replay 1: Re-invoked because the wait completed. Bootstrap must paginate
+    through the full multi-page history; every step replays its recorded
+    result WITHOUT re-executing (marker log count stays 150). The summed
+    result is only correct when no page was dropped.
+Input:
+ExpectedResult:
+  ExecutionStatus: SUCCEEDED
+  Result: 11175
+ExpectedExecutionHistory:
+  # 150 steps x 2 events each make the full history impractical to pin;
+  # the load-bearing assertions are the Result (proves every page replayed)
+  # and the log count (proves no step re-executed). Pin the first step here.
+  - EventType: StepStarted
+    SubType: Step
+    EventId: 2
+    Id: ${ID1}
+    EventTimestamp: '*'
+    StepStartedDetails: {}
+  - EventType: StepSucceeded
+    SubType: Step
+    EventId: 3
+    Id: ${ID1}
+    EventTimestamp: '*'
+    StepSucceededDetails: {}
+ExpectedLogs:
+  # Each of the 150 steps logs the marker exactly once, on the first
+  # invocation only. A truncated (single-page) replay silently re-executes
+  # steps, which would raise this count above 150.
+  - match:
+      message: '/history-multi-page-step-executed/'
+    count: 150
