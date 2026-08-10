@@ -192,11 +192,28 @@ You need a Rust toolchain,
 [cargo-lambda](https://www.cargo-lambda.info/), the
 [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html),
 Python, an AWS account you can deploy to, and the ARN of a Lambda execution role
-in that account. The role needs:
+in that account. The quickest way to get one is the template this repository
+ships — a one-time deploy with IAM-capable credentials; the test stacks
+themselves never create IAM resources, so day-to-day runs need no IAM
+permissions:
+
+```sh
+aws cloudformation deploy \
+    --template-file scripts/test-execution-role.yaml \
+    --stack-name durable-sdk-test-execution-role \
+    --capabilities CAPABILITY_IAM
+```
+
+Its `RoleArn` output is what you pass as `ExecutionRoleArn` below. If you build
+the role yourself instead, it needs the union of what all suites use:
 
 - CloudWatch Logs write access (to receive handler output).
 - `lambda:CheckpointDurableExecution` and `lambda:GetDurableExecutionState`
   (the two durable execution service actions the SDK calls).
+- `lambda:InvokeFunction` on your test functions (the invoke suite and the
+  chained-invoke examples call other functions in their stack).
+- `lambda:SendDurableExecutionCallbackSuccess`, `...CallbackFailure`, and
+  `...CallbackHeartbeat` (callback handlers).
 - DynamoDB read and write access to the stack's Attempts table (the step and
   child suites deploy a DynamoDB table and their retry handlers record attempt
   counts through it).

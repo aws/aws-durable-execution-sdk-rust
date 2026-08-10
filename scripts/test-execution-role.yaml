@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  One-time setup: Lambda execution role for running this repository's cloud
+  test suites (the conformance suites under compliance/ and the example suite
+  under examples/) in your own AWS account. Deploy once with IAM-capable
+  credentials, then pass the RoleArn output as ExecutionRoleArn to every test
+  stack. The test stacks themselves never create IAM resources, so day-to-day
+  test runs need no IAM permissions.
+
+    aws cloudformation deploy \
+        --template-file test-execution-role.yaml \
+        --stack-name durable-sdk-test-execution-role \
+        --capabilities CAPABILITY_IAM
+
+    aws cloudformation describe-stacks \
+        --stack-name durable-sdk-test-execution-role \
+        --query 'Stacks[0].Outputs[0].OutputValue' --output text
+
+Resources:
+  TestExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: >-
+        Execution role for aws-durable-execution-sdk-rust cloud test suites.
+        Grants the union of what the conformance suites and the example suite
+        need. Intended for a dedicated test account.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # CloudWatch Logs write access, so handler output is visible.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DurableExecutionTestPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The two durable execution service actions the SDK itself calls.
+              - Effect: Allow
+                Action:
+                  - lambda:CheckpointDurableExecution
+                  - lambda:GetDurableExecutionState
+                Resource: '*'
+              # Chained invocation: the invoke conformance suite and the
+              # invoke/comprehensive examples call other functions in their
+              # stack via ctx.invoke.
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+              # Callback completion and heartbeats, used by callback handlers.
+              - Effect: Allow
+                Action:
+                  - lambda:SendDurableExecutionCallbackSuccess
+                  - lambda:SendDurableExecutionCallbackFailure
+                  - lambda:SendDurableExecutionCallbackHeartbeat
+                Resource: '*'
+              # The step and child conformance suites deploy a DynamoDB
+              # Attempts table; their retry handlers record attempt counts.
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*'
+
+Outputs:
+  RoleArn:
+    Description: Pass this as ExecutionRoleArn when deploying the test stacks.
+    Value: !GetAtt TestExecutionRole.Arn
