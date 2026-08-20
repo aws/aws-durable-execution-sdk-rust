@@ -13,11 +13,8 @@
 //! - `ParentId`: wire ID of the parent context's prefix (if child of child)
 
 use std::future::Future;
-use std::sync::Arc;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use tracing::Instrument as _;
 
 use crate::Serdes;
@@ -45,21 +42,22 @@ const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 /// (`E = ChildFnError`). The one erasure point is the builder's
 /// `.future()` / `into_future`, which boxes the whole execution future
 /// once inside [`DurableFuture`](crate::DurableFuture).
-pub(crate) struct ChildExecution<O, F> {
+pub(crate) struct ChildExecution<O, F, S> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
-    pub(crate) serdes: Option<Arc<dyn Serdes>>,
+    pub(crate) serdes: S,
     pub(crate) closure: F,
     pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
 }
 
-impl<O, F, Fut, E> ChildExecution<O, F>
+impl<O, F, Fut, E, S> ChildExecution<O, F, S>
 where
-    O: Serialize + DeserializeOwned + Send + 'static,
+    O: Send + 'static,
     F: FnOnce(DurableContext) -> Fut + Send + 'static,
     Fut: Future<Output = Result<O, E>> + Send + 'static,
     E: Into<ChildFnError>,
+    S: Serdes<O>,
 {
     /// Executes the child context operation.
     ///
@@ -114,11 +112,11 @@ where
 /// `O` — no user closure reaches this state machine, so its substantial
 /// replay/checkpoint logic compiles once per result type instead of once
 /// per call site.
-struct ChildCore<O> {
+struct ChildCore<O, S> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: S,
     _marker: std::marker::PhantomData<fn() -> O>,
 }
 
@@ -134,7 +132,7 @@ enum ChildRunMode {
 /// What [`ChildCore::before`] decided: the operation is already resolved
 /// from the checkpoint log, or the body must run in the prepared child
 /// context.
-enum ChildPrelude<O> {
+enum ChildPrelude<O, S> {
     /// Resolved without running the body (replayed success or failure).
     Done(Result<O, OperationError>),
     /// The body must run in `child_ctx`; `after` settles the outcome under
@@ -145,24 +143,25 @@ enum ChildPrelude<O> {
         /// Live execution vs `ReplayChildren` reconstruction.
         mode: ChildRunMode,
         /// The post-closure half that settles the outcome.
-        after: ChildAfter<O>,
+        after: ChildAfter<O, S>,
     },
 }
 
 /// The post-closure half of a child context: outcome checkpointing (live)
 /// or result round-tripping (`ReplayChildren`). Generic only over the
 /// result type.
-struct ChildAfter<O> {
+struct ChildAfter<O, S> {
     ctx: DurableContext,
     wire_id: String,
     name: Option<String>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: S,
     _marker: std::marker::PhantomData<fn() -> O>,
 }
 
-impl<O> ChildCore<O>
+impl<O, S> ChildCore<O, S>
 where
-    O: Serialize + DeserializeOwned + Send + 'static,
+    O: Send + 'static,
+    S: Serdes<O>,
 {
     /// Runs everything that precedes the child closure: replay resolution
     /// or the live-path preamble ending at the START checkpoint.
@@ -171,7 +170,7 @@ where
     /// identity, then resolves recorded outcomes ([`Self::replay_succeeded`],
     /// [`Self::replay_failed`]) or prepares the child context for the body
     /// to run (live, or `ReplayChildren` reconstruction).
-    async fn before(self) -> Result<ChildPrelude<O>, OperationError> {
+    async fn before(self) -> Result<ChildPrelude<O, S>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
 
@@ -260,12 +259,7 @@ where
         serdes_ctx: &SerdesContext,
     ) -> Result<O, OperationError> {
         let payload = self.ctx.checkpoint_result_payload(positional_id);
-        let value = replay_success::<O>(
-            self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-            payload.as_ref(),
-            serdes_ctx,
-        )
-        .await?;
+        let value = replay_success(&self.serdes, payload, serdes_ctx.clone()).await?;
         self.ctx.emit_operation_replayed(
             wire_id,
             self.name.as_deref(),
@@ -302,9 +296,10 @@ where
     }
 }
 
-impl<O> ChildAfter<O>
+impl<O, S> ChildAfter<O, S>
 where
-    O: Serialize + DeserializeOwned + Send + 'static,
+    O: Send + 'static,
+    S: Serdes<O>,
 {
     /// Settles the child body's outcome.
     ///
@@ -327,13 +322,12 @@ where
             ..
         } = self;
         let serdes_ctx = SerdesContext::new(&wire_id, ctx.execution_arn());
-        let effective_serdes = serdes.as_ref().or_else(|| ctx.default_serdes());
 
         match (mode, result) {
             (ChildRunMode::Reconstruct, Ok(value)) => {
                 // Round-trip through serialization for consistency.
-                let serialized = serialize_value(&value, effective_serdes, &serdes_ctx).await?;
-                deserialize_value::<O>(&serialized, effective_serdes, &serdes_ctx).await
+                let serialized = serialize_value(value, &serdes, serdes_ctx.clone()).await?;
+                deserialize_value(serialized, &serdes, serdes_ctx).await
             }
             (ChildRunMode::Reconstruct, Err(child_err)) => {
                 Err(OperationError::from_kind(OperationErrorKind::ChildContext(
@@ -344,14 +338,14 @@ where
             }
             (ChildRunMode::Live, Ok(value)) => {
                 // Success: serialize and checkpoint.
-                let serialized = serialize_value(&value, effective_serdes, &serdes_ctx).await?;
+                let serialized = serialize_value(value, &serdes, serdes_ctx.clone()).await?;
                 let update = build_succeed_update(&wire_id, name.as_deref(), &ctx, &serialized);
                 ctx.checkpoint_updates(vec![update])
                     .await
                     .map_err(|e| child_internal_error(&format!("checkpoint succeed: {e}")))?;
 
                 // Round-trip deserialize for consistency (first-run == replay).
-                deserialize_value::<O>(&serialized, effective_serdes, &serdes_ctx).await
+                deserialize_value(serialized, &serdes, serdes_ctx).await
             }
             (ChildRunMode::Live, Err(child_err)) => {
                 // Failure: checkpoint FAIL with error details.
@@ -477,15 +471,15 @@ async fn checkpoint_live_failure(
 }
 
 /// Replays a successful child context result from the checkpoint log.
-async fn replay_success<O: DeserializeOwned>(
-    serdes: Option<&Arc<dyn Serdes>>,
-    result: Option<&String>,
-    serdes_ctx: &SerdesContext,
+async fn replay_success<O, S: Serdes<O>>(
+    serdes: &S,
+    result: Option<String>,
+    serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
     let payload = result.ok_or_else(|| {
         child_internal_error("checkpointed Succeeded operation has no result payload")
     })?;
-    deserialize_value::<O>(payload, serdes, serdes_ctx).await
+    deserialize_value(payload, serdes, serdes_ctx).await
 }
 
 /// Replays a failed child context result from the checkpoint log.
@@ -498,44 +492,28 @@ fn replay_failure(error_type: Option<&str>, error_message: Option<&str>) -> Oper
     ))
 }
 
-/// Serializes a value using the configured serdes or JSON default.
-fn serialize_value<'a, O: Serialize>(
-    value: &O,
-    serdes: Option<&'a Arc<dyn Serdes>>,
-    serdes_ctx: &'a SerdesContext,
-) -> impl Future<Output = Result<String, OperationError>> + Send + 'a {
-    // Phase 1 (sync): consume the `&O` borrow now, so the returned future
-    // holds no `&O` across its await (which would force `O: Sync` on every
-    // operation future). No custom serdes renders straight to the wire; a
-    // custom serdes receives the value erased to `serde_json::Value` — the
-    // same shape every other operation path provides.
-    let prepared = crate::serdes::prepare_value(serdes, value);
-    // Phase 2 (async): a custom serdes may block (e.g. filesystem I/O), so
-    // the call runs off the async runtime.
-    async move {
-        prepared
-            .map_err(|e| child_internal_error(&format!("serialize result: {e}")))?
-            .into_wire(serdes_ctx)
-            .await
-            .map_err(|e| child_internal_error(&format!("serialize result (custom): {e}")))
-    }
+/// Serializes a value through the configured serdes (ownership transfers;
+/// the serdes decides where its work runs).
+async fn serialize_value<O, S: Serdes<O>>(
+    value: O,
+    serdes: &S,
+    serdes_ctx: SerdesContext,
+) -> Result<String, OperationError> {
+    serdes
+        .serialize(value, serdes_ctx)
+        .await
+        .map_err(|e| child_internal_error(&format!("serialize result: {e}")))
 }
 
-/// Deserializes a value using the configured serdes or JSON default.
-async fn deserialize_value<O: DeserializeOwned>(
-    payload: &str,
-    serdes: Option<&Arc<dyn Serdes>>,
-    serdes_ctx: &SerdesContext,
+/// Deserializes a wire payload through the configured serdes.
+async fn deserialize_value<O, S: Serdes<O>>(
+    payload: String,
+    serdes: &S,
+    serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
-    let Some(s) = serdes else {
-        return serde_json::from_str(payload)
-            .map_err(|e| child_internal_error(&format!("deserialize result: {e}")));
-    };
-    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
-    let json_value = crate::serdes::deserialize_off_runtime(s, payload.to_owned(), serdes_ctx)
+    serdes
+        .deserialize(payload, serdes_ctx)
         .await
-        .map_err(|e| child_internal_error(&format!("deserialize result (custom): {e}")))?;
-    serde_json::from_value(json_value)
         .map_err(|e| child_internal_error(&format!("deserialize result: {e}")))
 }
 

@@ -31,11 +31,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-
 use crate::context::DurableContext;
 use crate::error::{ChildFnError, StepError, StepErrorKind};
+use crate::serdes::Serdes;
 use crate::{BoxError, RetryDecision, RetryStrategy};
 
 /// Runs the retry loop inside the outer `with_retry` child context.
@@ -51,15 +49,22 @@ use crate::{BoxError, RetryDecision, RetryStrategy};
 /// `run_in_child_context` without its own box — the single erasure point
 /// stays at the enclosing builder's [`DurableFuture`](crate::DurableFuture).
 /// `Arc` because the block runs the closure once per attempt.
-pub(crate) async fn retry_loop<O, F, Fut>(
+/// The builder's configured serdes is shared into every attempt's nested
+/// child context (through the forwarding `impl Serdes<T> for Arc<S>`), so
+/// each attempt round-trips `O` through the SAME wire format as the block
+/// itself — which is also what lets a custom serdes carry an `O` without
+/// `Serialize`/`DeserializeOwned` implementations.
+pub(crate) async fn retry_loop<O, F, Fut, S>(
     outer: DurableContext,
     closure: Arc<F>,
     strategy: Arc<RetryStrategy>,
+    serdes: Arc<S>,
 ) -> Result<O, ChildFnError>
 where
-    O: Serialize + DeserializeOwned + Send + 'static,
+    O: Send + 'static,
     F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    S: Serdes<O>,
 {
     let mut attempt: u32 = 1;
     loop {
@@ -71,6 +76,7 @@ where
         let result: Result<O, crate::error::OperationError> = outer
             .run_in_child_context(move |attempt_ctx| f(attempt_ctx))
             .name(format!("attempt-{attempt}"))
+            .serdes(Arc::clone(&serdes))
             .await;
 
         let err = match result {

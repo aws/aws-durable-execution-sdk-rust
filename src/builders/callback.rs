@@ -7,7 +7,6 @@
 
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::BoxError;
@@ -18,6 +17,7 @@ use crate::context::StepContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
+use crate::serdes::JsonSerdes;
 
 pub use crate::future::Callback;
 
@@ -35,10 +35,10 @@ pub use crate::future::Callback;
 ///
 /// ```no_run
 /// use aws_durable_execution_sdk_rust as durable;
-/// use serde::Deserialize;
+/// use serde::{Deserialize, Serialize};
 /// use std::time::Duration;
 ///
-/// #[derive(Deserialize)]
+/// #[derive(Serialize, Deserialize)]
 /// struct Approval { ok: bool }
 ///
 /// async fn handler(
@@ -54,17 +54,17 @@ pub use crate::future::Callback;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct CreateCallbackBuilder<O> {
+pub struct CreateCallbackBuilder<O, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     timeout: Option<Duration>,
     heartbeat: Option<Duration>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: S,
     _marker: PhantomData<O>,
 }
 
-impl<O> std::fmt::Debug for CreateCallbackBuilder<O> {
+impl<O, S> std::fmt::Debug for CreateCallbackBuilder<O, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreateCallbackBuilder")
             .field("name", &self.name)
@@ -72,7 +72,7 @@ impl<O> std::fmt::Debug for CreateCallbackBuilder<O> {
     }
 }
 
-impl<O: serde::de::DeserializeOwned + Send + 'static> CreateCallbackBuilder<O> {
+impl<O: Send + 'static> CreateCallbackBuilder<O> {
     /// Creates a new builder (internal).
     pub(crate) fn new(ctx: DurableContext, op_id: OperationId) -> Self {
         Self {
@@ -81,11 +81,13 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> CreateCallbackBuilder<O> {
             name: None,
             timeout: None,
             heartbeat: None,
-            serdes: None,
+            serdes: JsonSerdes,
             _marker: PhantomData,
         }
     }
+}
 
+impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     /// Sets a human-readable name for this callback.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -109,26 +111,47 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> CreateCallbackBuilder<O> {
     /// The callback payload is produced by an external caller through the
     /// callback-completion API, so the SDK never serializes a value on the
     /// way out — only the deserialize half of this serdes acts on the
-    /// delivered payload when the result is read. When no serdes is set here,
-    /// the callback decode falls back to the execution-wide serdes configured
-    /// on [`Options`](crate::Options), whose own default is JSON.
-    pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Arc::new(serdes));
-        self
+    /// delivered payload when the result is read. The serdes must implement
+    /// [`Serdes<O>`](crate::Serdes) for this callback's payload type —
+    /// attaching a serdes for a different type fails at compile time. The
+    /// default is [`JsonSerdes`].
+    pub fn serdes<S2>(self, serdes: S2) -> CreateCallbackBuilder<O, S2>
+    where
+        S2: Serdes<O>,
+    {
+        CreateCallbackBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            timeout: self.timeout,
+            heartbeat: self.heartbeat,
+            serdes,
+            _marker: PhantomData,
+        }
     }
 
     /// Converts this builder into a [`DurableFuture`] explicitly.
-    pub fn future(self) -> DurableFuture<Callback<O>> {
+    pub fn future(self) -> DurableFuture<Callback<O>>
+    where
+        S: Serdes<O>,
+    {
         self.into_future()
     }
 
     /// Eagerly spawns the callback creation on a tokio task.
-    pub fn spawn(self) -> DurableFuture<Callback<O>> {
+    pub fn spawn(self) -> DurableFuture<Callback<O>>
+    where
+        S: Serdes<O>,
+    {
         spawn_terminal!(self)
     }
 }
 
-impl<O: serde::de::DeserializeOwned + Send + 'static> IntoFuture for CreateCallbackBuilder<O> {
+impl<O, S> IntoFuture for CreateCallbackBuilder<O, S>
+where
+    O: Send + 'static,
+    S: Serdes<O>,
+{
     type Output = Result<Callback<O>, OperationError>;
     type IntoFuture = DurableFuture<Callback<O>>;
 
@@ -190,7 +213,7 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> IntoFuture for CreateCallb
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct WaitForCallbackBuilder<O, F, Fut> {
+pub struct WaitForCallbackBuilder<O, F, Fut, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
@@ -198,11 +221,11 @@ pub struct WaitForCallbackBuilder<O, F, Fut> {
     heartbeat: Option<Duration>,
     submitter: F,
     submitter_retry: Option<RetryStrategy>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: S,
     _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
-impl<O, F, Fut> std::fmt::Debug for WaitForCallbackBuilder<O, F, Fut> {
+impl<O, F, Fut, S> std::fmt::Debug for WaitForCallbackBuilder<O, F, Fut, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WaitForCallbackBuilder")
             .field("name", &self.name)
@@ -228,11 +251,18 @@ where
             heartbeat: None,
             submitter,
             submitter_retry: None,
-            serdes: None,
+            serdes: JsonSerdes,
             _marker: PhantomData,
         }
     }
+}
 
+impl<O, F, Fut, S> WaitForCallbackBuilder<O, F, Fut, S>
+where
+    O: Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+{
     /// Sets a human-readable name for this operation.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -336,20 +366,34 @@ where
     /// The callback payload is produced by an external caller through the
     /// callback-completion API, so the SDK never serializes a value on the
     /// way out — only the deserialize half of this serdes acts on the
-    /// delivered payload. When no serdes is set here, the callback decode
-    /// falls back to the execution-wide serdes configured on
-    /// [`Options`](crate::Options), whose own default is JSON.
-    pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Arc::new(serdes));
-        self
+    /// delivered payload. The serdes must implement
+    /// [`Serdes<O>`](crate::Serdes) for this callback's payload type —
+    /// attaching a serdes for a different type fails at compile time. The
+    /// default is [`JsonSerdes`].
+    pub fn serdes<S2>(self, serdes: S2) -> WaitForCallbackBuilder<O, F, Fut, S2>
+    where
+        S2: Serdes<O>,
+    {
+        WaitForCallbackBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            timeout: self.timeout,
+            heartbeat: self.heartbeat,
+            submitter: self.submitter,
+            submitter_retry: self.submitter_retry,
+            serdes,
+            _marker: PhantomData,
+        }
     }
 }
 
-impl<O, F, Fut> WaitForCallbackBuilder<O, F, Fut>
+impl<O, F, Fut, S> WaitForCallbackBuilder<O, F, Fut, S>
 where
     O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
     F: FnOnce(StepContext, String) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    S: Serdes<O>,
 {
     /// Converts this builder into a [`DurableFuture`] explicitly.
     pub fn future(self) -> DurableFuture<O> {
@@ -362,11 +406,12 @@ where
     }
 }
 
-impl<O, F, Fut> IntoFuture for WaitForCallbackBuilder<O, F, Fut>
+impl<O, F, Fut, S> IntoFuture for WaitForCallbackBuilder<O, F, Fut, S>
 where
     O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
     F: FnOnce(StepContext, String) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    S: Serdes<O>,
 {
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;

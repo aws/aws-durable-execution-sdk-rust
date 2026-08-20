@@ -12,7 +12,6 @@ use std::time::Duration;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::BoxError;
-use crate::Serdes;
 use crate::builders::{
     ChildBuilder, CreateCallbackBuilder, InvokeBuilder, JoinAllBuilder, MapBuilder,
     ParallelBuilder, RaceBuilder, SelectOkBuilder, StepBuilder, TryJoinAllBuilder, WaitBuilder,
@@ -66,10 +65,6 @@ struct Inner {
     /// Cached parent wire ID — the SHA-256 hash of this context's prefix
     /// (positional ID of the parent operation). `None` for root contexts.
     parent_wire_id: Option<String>,
-    /// Execution-wide default serdes, applied by an operation only when it
-    /// sets no serdes of its own. Threaded in from [`Options`](crate::Options)
-    /// by [`wrap`](crate::wrap); shared with every child context.
-    default_serdes: Option<Arc<dyn Serdes>>,
     /// This namespace's `durable_execution` span. For a root context it is
     /// the handler-level span wrapping the invocation; for a child context
     /// (sequential child, map/parallel branch, callback body) it is a
@@ -170,7 +165,6 @@ impl DurableContext {
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
                 coalescer: None,
                 parent_wire_id: None,
-                default_serdes: None,
                 replay_span,
             }),
         }
@@ -203,7 +197,6 @@ impl DurableContext {
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
                 coalescer: None,
                 parent_wire_id: None,
-                default_serdes: None,
                 replay_span,
             }),
         }
@@ -236,14 +229,13 @@ impl DurableContext {
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
                 coalescer: None,
                 parent_wire_id: None,
-                default_serdes: None,
                 replay_span,
             }),
         }
     }
 
-    /// Creates a root context with a client, token, execution-wide default
-    /// serdes, and checkpoint buffering window threaded in from
+    /// Creates a root context with a client, token, and checkpoint
+    /// buffering window threaded in from
     /// [`Options`](crate::Options) (internal). `checkpoint_buffer_window`
     /// is `None` for immediate writes (the default), `Some(window)` for a
     /// `checkpoint_delay` coalescing window, and `Some(Duration::ZERO)` for
@@ -255,7 +247,6 @@ impl DurableContext {
         checkpoint_log: Arc<CheckpointLog>,
         client: Arc<dyn ExecutionClient>,
         checkpoint_token: String,
-        default_serdes: Option<Arc<dyn Serdes>>,
         checkpoint_buffer_window: Option<Duration>,
     ) -> Self {
         let engine = Arc::new(EngineState::new_root(checkpoint_log));
@@ -275,18 +266,9 @@ impl DurableContext {
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
                 coalescer: checkpoint_buffer_window.map(|d| Arc::new(CheckpointCoalescer::new(d))),
                 parent_wire_id: None,
-                default_serdes,
                 replay_span,
             }),
         }
-    }
-
-    /// Returns the execution-wide default serdes, if one was configured via
-    /// [`Options`](crate::Options). Operations fall back to this when they set
-    /// no serdes of their own. Returned as the shared `Arc` handle so async
-    /// call sites can clone it into `spawn_blocking`.
-    pub(crate) fn default_serdes(&self) -> Option<&Arc<dyn Serdes>> {
-        self.inner.default_serdes.as_ref()
     }
 
     /// Test-only root constructor that accepts an explicit
@@ -318,7 +300,6 @@ impl DurableContext {
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
                 coalescer: Some(Arc::new(coalescer)),
                 parent_wire_id: None,
-                default_serdes: None,
                 replay_span,
             }),
         }
@@ -349,7 +330,6 @@ impl DurableContext {
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: Some(crate::engine::compute_wire_id_public(parent_positional_id)),
-                default_serdes: self.inner.default_serdes.clone(),
                 replay_span,
             }),
         }
@@ -440,7 +420,6 @@ impl DurableContext {
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: Some(crate::engine::compute_wire_id_public(parent_positional_id)),
-                default_serdes: self.inner.default_serdes.clone(),
                 replay_span,
             }),
         }
@@ -476,7 +455,6 @@ impl DurableContext {
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: Some(parent_wire_id_override.to_owned()),
-                default_serdes: self.inner.default_serdes.clone(),
                 replay_span,
             }),
         }
@@ -505,7 +483,6 @@ impl DurableContext {
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: self.inner.parent_wire_id.clone(),
-                default_serdes: self.inner.default_serdes.clone(),
                 // Same engine (same ID counter and namespace), so mints
                 // through the rebound context keep the shared flag current.
                 replay_span: self.inner.replay_span.clone(),
@@ -1283,7 +1260,7 @@ impl DurableContext {
     where
         F: FnOnce(StepContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
-        O: Serialize + DeserializeOwned + Send + 'static,
+        O: Send + 'static,
     {
         let op_id = self.mint_id();
         // The closure is stored unerased; the single erasure point is the
@@ -1332,10 +1309,10 @@ impl DurableContext {
     /// use aws_durable_execution_sdk_rust as durable;
     /// use serde::{Deserialize, Serialize};
     ///
-    /// #[derive(Serialize)]
+    /// #[derive(Serialize, Deserialize)]
     /// struct ChargeInput { amount: u64 }
     ///
-    /// #[derive(Deserialize)]
+    /// #[derive(Serialize, Deserialize)]
     /// struct Receipt { id: String }
     ///
     /// async fn handler(
@@ -1348,18 +1325,16 @@ impl DurableContext {
     ///     Ok(receipt.id)
     /// }
     /// ```
-    pub fn invoke<O, I>(&self, function_id: &str, input: I) -> InvokeBuilder<O>
+    pub fn invoke<O, I>(&self, function_id: &str, input: I) -> InvokeBuilder<O, I>
     where
-        I: Serialize,
-        O: DeserializeOwned + Send + 'static,
+        I: Send + 'static,
+        O: Send + 'static,
     {
         let op_id = self.mint_id();
-        // Erase input to `Value` at the call site (synchronous, before the
-        // future body): the input type is erased past this point. Carrying a
-        // `Value` rather than pre-rendered text means the custom serdes and the
-        // default path share one conversion — no re-parsing needed.
-        let erased_input = serde_json::to_value(&input).map_err(|e| e.to_string());
-        InvokeBuilder::new(self.clone(), op_id, function_id.to_owned(), erased_input)
+        // The input is carried TYPED into the builder: the payload serdes
+        // receives the owned value directly at execution time (a write-only
+        // transfer), so no intermediate representation is constructed here.
+        InvokeBuilder::new(self.clone(), op_id, function_id.to_owned(), input)
     }
 
     /// Creates a child context for fan-out / sub-orchestration.
@@ -1389,7 +1364,7 @@ impl DurableContext {
     where
         F: FnOnce(DurableContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
-        O: Serialize + DeserializeOwned + Send + 'static,
+        O: Send + 'static,
     {
         let op_id = self.mint_id();
         // The closure is stored unerased; the child execution converts the
@@ -1461,7 +1436,7 @@ impl DurableContext {
     where
         F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
-        O: Serialize + DeserializeOwned + Send + 'static,
+        O: Send + 'static,
     {
         let op_id = self.mint_id();
         WithRetryBuilder::new(self.clone(), op_id, f)
@@ -1505,7 +1480,7 @@ impl DurableContext {
     where
         F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
-        S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        S: Clone + Send + Sync + 'static,
     {
         let op_id = self.mint_id();
         WaitForConditionBuilder::new(self.clone(), op_id, initial_state, check)
@@ -1521,9 +1496,9 @@ impl DurableContext {
     ///
     /// ```no_run
     /// use aws_durable_execution_sdk_rust as durable;
-    /// use serde::Deserialize;
+    /// use serde::{Deserialize, Serialize};
     ///
-    /// #[derive(Deserialize)]
+    /// #[derive(Serialize, Deserialize)]
     /// struct Approval { approved: bool }
     ///
     /// async fn handler(
@@ -1540,7 +1515,7 @@ impl DurableContext {
     /// ```
     pub fn create_callback<O>(&self) -> CreateCallbackBuilder<O>
     where
-        O: DeserializeOwned + Send + 'static,
+        O: Send + 'static,
     {
         let op_id = self.mint_id();
         CreateCallbackBuilder::new(self.clone(), op_id)
@@ -1625,8 +1600,8 @@ impl DurableContext {
         Items: IntoIterator<Item = I>,
         F: Fn(DurableContext, I, usize) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
-        I: Serialize + DeserializeOwned + Send + 'static,
-        O: Serialize + DeserializeOwned + Send + 'static,
+        I: Send + 'static,
+        O: Send + 'static,
     {
         let op_id = self.mint_id();
         // The closure is stored unerased; at execution it is shared as
@@ -3044,7 +3019,6 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             client,
             "token-0".to_owned(),
-            None,
             Some(delay),
         )
     }

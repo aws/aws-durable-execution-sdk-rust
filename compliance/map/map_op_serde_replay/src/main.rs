@@ -11,21 +11,27 @@ use aws_durable_execution_sdk_rust as durable;
 use durable::{DurableContext, Serdes};
 use durable::serdes::SerdesContext;
 
-/// Custom operation-level serializer (same as 9-19).
+/// Custom operation-level serializer that emits `OPSERDE:<comma-joined results>`.
 ///
-/// Serializes the entire batch result into "OPSERDE:X,Y" format. On
-/// deserialization, reconstructs the batch value from that compact form.
+/// The whole-batch summary a `result_serdes` transforms is the SDK's
+/// `BatchSummary`, an opaque type. The transform is therefore written as a
+/// type-agnostic blanket `impl<T> Serdes<T>` that works through the value's
+/// serde (JSON) representation: `{"results": [...], "reason": "..."}`.
 #[derive(Debug)]
 struct OpSerdes;
 
-impl Serdes for OpSerdes {
-    fn serialize(
+impl<T> Serdes<T> for OpSerdes
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+{
+    async fn serialize(
         &self,
-        value: &serde_json::Value,
-        _context: &SerdesContext,
+        value: T,
+        _context: SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // The batch payload arrives as a structured value — no parse step.
-        let results = value
+        // Work through the summary's JSON representation.
+        let rendered: serde_json::Value = serde_json::from_str(&serde_json::to_string(&value)?)?;
+        let results = rendered
             .get("results")
             .and_then(serde_json::Value::as_array)
             .map(|arr| {
@@ -45,12 +51,12 @@ impl Serdes for OpSerdes {
         Ok(format!("OPSERDE:{}", results.join(",")))
     }
 
-    fn deserialize(
+    async fn deserialize(
         &self,
-        data: &str,
-        _context: &SerdesContext,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let body = data
+        wire: String,
+        _context: SerdesContext,
+    ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+        let body = wire
             .strip_prefix("OPSERDE:")
             .ok_or("missing OPSERDE: prefix")?;
         let items: Vec<&str> = if body.is_empty() {
@@ -58,8 +64,8 @@ impl Serdes for OpSerdes {
         } else {
             body.split(',').collect()
         };
-        // Reconstruct the batch checkpoint value with the string status/reason
-        // matching the SDK's BatchCheckpointPayload format.
+        // Reconstruct the batch summary's JSON representation, then parse it
+        // back into the summary type.
         let results: Vec<serde_json::Value> = items
             .into_iter()
             .enumerate()
@@ -71,10 +77,11 @@ impl Serdes for OpSerdes {
                 })
             })
             .collect();
-        Ok(serde_json::json!({
+        let payload = serde_json::json!({
             "results": results,
             "reason": "ALL_COMPLETED"
-        }))
+        });
+        Ok(serde_json::from_str(&serde_json::to_string(&payload)?)?)
     }
 }
 

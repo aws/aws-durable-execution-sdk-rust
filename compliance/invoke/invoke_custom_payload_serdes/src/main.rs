@@ -9,22 +9,22 @@ use aws_durable_execution_sdk_rust as durable;
 #[derive(Debug)]
 struct UppercasePayloadSerdes;
 
-impl durable::Serdes for UppercasePayloadSerdes {
-    fn serialize(
+impl durable::Serdes<serde_json::Value> for UppercasePayloadSerdes {
+    async fn serialize(
         &self,
-        value: &serde_json::Value,
-        _context: &durable::serdes::SerdesContext,
+        value: serde_json::Value,
+        _context: durable::serdes::SerdesContext,
     ) -> Result<String, durable::BoxError> {
         // Uppercase the JSON rendering of the payload value.
         Ok(value.to_string().to_uppercase())
     }
 
-    fn deserialize(
+    async fn deserialize(
         &self,
-        data: &str,
-        _context: &durable::serdes::SerdesContext,
+        wire: String,
+        _context: durable::serdes::SerdesContext,
     ) -> Result<serde_json::Value, durable::BoxError> {
-        Ok(serde_json::from_str(data)?)
+        Ok(serde_json::from_str(&wire)?)
     }
 }
 

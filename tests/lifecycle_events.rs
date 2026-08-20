@@ -616,16 +616,24 @@ async fn rejected_checkpoint_emits_no_record_transition_event() {
 #[derive(Debug)]
 struct FailOnReplayDeserializeSerdes(Arc<std::sync::atomic::AtomicU32>);
 
-impl durable::Serdes for FailOnReplayDeserializeSerdes {
-    fn deserialize(
+impl durable::Serdes<u32> for FailOnReplayDeserializeSerdes {
+    async fn serialize(
         &self,
-        data: &str,
-        _context: &durable::serdes::SerdesContext,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        value: u32,
+        _context: durable::serdes::SerdesContext,
+    ) -> Result<String, durable::BoxError> {
+        Ok(serde_json::to_string(&value)?)
+    }
+
+    async fn deserialize(
+        &self,
+        wire: String,
+        _context: durable::serdes::SerdesContext,
+    ) -> Result<u32, durable::BoxError> {
         let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if call == 0 {
             // The live path's round-trip decode.
-            Ok(serde_json::from_str(data)?)
+            Ok(serde_json::from_str(&wire)?)
         } else {
             Err("injected replay deserialize failure".into())
         }

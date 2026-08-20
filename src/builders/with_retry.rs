@@ -12,6 +12,7 @@ use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
+use crate::serdes::JsonSerdes;
 
 // ============================================================
 // WithRetryBuilder
@@ -74,17 +75,17 @@ use crate::future::DurableFuture;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct WithRetryBuilder<O, F, Fut> {
+pub struct WithRetryBuilder<O, F, Fut, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     retry_strategy: Option<RetryStrategy>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: S,
     closure: F,
     _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
-impl<O, F, Fut> std::fmt::Debug for WithRetryBuilder<O, F, Fut> {
+impl<O, F, Fut, S> std::fmt::Debug for WithRetryBuilder<O, F, Fut, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WithRetryBuilder")
             .field("name", &self.name)
@@ -106,12 +107,19 @@ where
             op_id,
             name: None,
             retry_strategy: None,
-            serdes: None,
+            serdes: JsonSerdes,
             closure,
             _marker: PhantomData,
         }
     }
+}
 
+impl<O, F, Fut, S> WithRetryBuilder<O, F, Fut, S>
+where
+    O: Send + 'static,
+    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+{
     /// Sets a human-readable name for this operation.
     ///
     /// Names appear in logs, traces, and the execution history for
@@ -204,9 +212,25 @@ where
     }
 
     /// Overrides the serialization strategy for the block's result.
-    pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Arc::new(serdes));
-        self
+    ///
+    /// Replaces the builder's serdes type parameter with `S2`, which must
+    /// implement [`Serdes<O>`](crate::Serdes) for this block's output type —
+    /// attaching a serdes for a different type fails at compile time. To
+    /// share one instance across operations, wrap it in an
+    /// [`Arc`] and clone the `Arc` handle into each builder.
+    pub fn serdes<S2>(self, serdes: S2) -> WithRetryBuilder<O, F, Fut, S2>
+    where
+        S2: Serdes<O>,
+    {
+        WithRetryBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            retry_strategy: self.retry_strategy,
+            serdes,
+            closure: self.closure,
+            _marker: PhantomData,
+        }
     }
 
     /// Converts this builder into a [`DurableFuture`] explicitly.
@@ -215,7 +239,7 @@ where
     /// patterns where you need to hold multiple futures.
     pub fn future(self) -> DurableFuture<O>
     where
-        O: serde::Serialize + serde::de::DeserializeOwned,
+        S: Serdes<O>,
     {
         <Self as IntoFuture>::into_future(self)
     }
@@ -245,17 +269,18 @@ where
     /// ```
     pub fn spawn(self) -> DurableFuture<O>
     where
-        O: serde::Serialize + serde::de::DeserializeOwned,
+        S: Serdes<O>,
     {
         spawn_terminal!(self)
     }
 }
 
-impl<O, F, Fut> IntoFuture for WithRetryBuilder<O, F, Fut>
+impl<O, F, Fut, S> IntoFuture for WithRetryBuilder<O, F, Fut, S>
 where
-    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    O: Send + 'static,
     F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    S: Serdes<O>,
 {
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
@@ -272,15 +297,22 @@ where
             self.retry_strategy
                 .unwrap_or_else(crate::step::default_retry_strategy),
         );
+        // One instance serves both the outer block result and every
+        // attempt's round trip, shared through the forwarding
+        // `impl Serdes<T> for Arc<S>`.
+        let serdes = Arc::new(self.serdes);
+        let loop_serdes = Arc::clone(&serdes);
 
         let execution = ChildExecution {
             ctx: self.ctx,
             op_id: self.op_id,
             name: self.name,
-            serdes: self.serdes,
+            serdes,
             // A concrete closure returning the concrete retry-loop future:
             // no erasure here — the one box is the DurableFuture below.
-            closure: move |outer_ctx| crate::with_retry::retry_loop(outer_ctx, closure, strategy),
+            closure: move |outer_ctx| {
+                crate::with_retry::retry_loop(outer_ctx, closure, strategy, loop_serdes)
+            },
             _marker: PhantomData,
         };
 

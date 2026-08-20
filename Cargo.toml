@@ -78,7 +78,7 @@ aws-sdk-lambda = { version = "1", default-features = false, features = [
     "rt-tokio",
 ] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["registry"] }
 sha2 = "0.10"

@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.94.1"
 publish = false
-description = "Example: a default Serdes for the whole execution via Options"
+description = "Example: one shared Serdes instance across operations via Arc"
 
 [[bin]]
 name = "serde_configure"
@@ -16,5 +16,6 @@ workspace = true
 [dependencies]
 aws-durable-execution-sdk-rust = { path = "../../.." }
 lambda_runtime = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

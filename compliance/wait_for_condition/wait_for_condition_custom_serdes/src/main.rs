@@ -11,26 +11,24 @@ use std::time::Duration;
 #[derive(Debug)]
 struct PrefixSerdes;
 
-impl Serdes for PrefixSerdes {
-    fn serialize(
+impl Serdes<String> for PrefixSerdes {
+    async fn serialize(
         &self,
-        value: &serde_json::Value,
-        _context: &SerdesContext,
+        value: String,
+        _context: SerdesContext,
     ) -> Result<String, BoxError> {
-        // The state arrives typed, so the raw string needs no JSON decode.
-        let raw = value.as_str().unwrap_or_default();
-        Ok(serde_json::to_string(&format!("ENC:{raw}"))?)
+        // The state arrives typed, so it needs no JSON decode first.
+        Ok(serde_json::to_string(&format!("ENC:{value}"))?)
     }
 
-    fn deserialize(
+    async fn deserialize(
         &self,
-        data: &str,
-        _context: &SerdesContext,
-    ) -> Result<serde_json::Value, BoxError> {
-        // `data` is a JSON-quoted string like "\"ENC:hello\"".
-        let raw: String = serde_json::from_str(data)?;
-        let stripped = raw.strip_prefix("ENC:").unwrap_or(&raw).to_owned();
-        Ok(serde_json::Value::String(stripped))
+        wire: String,
+        _context: SerdesContext,
+    ) -> Result<String, BoxError> {
+        // `wire` is a JSON-quoted string like "\"ENC:hello\"".
+        let raw: String = serde_json::from_str(&wire)?;
+        Ok(raw.strip_prefix("ENC:").unwrap_or(&raw).to_owned())
     }
 }
 

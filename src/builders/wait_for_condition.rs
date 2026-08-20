@@ -4,7 +4,6 @@
 //! type ([`WaitDecision`]).
 
 use std::future::{Future, IntoFuture};
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::BoxError;
@@ -14,6 +13,7 @@ use crate::context::StepContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
+use crate::serdes::JsonSerdes;
 
 pub use crate::wait_for_condition::WaitDecision;
 
@@ -63,18 +63,18 @@ pub use crate::wait_for_condition::WaitDecision;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct WaitForConditionBuilder<S, F, Fut> {
+pub struct WaitForConditionBuilder<S, F, Fut, SD = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     initial_state: S,
     wait_strategy: Option<crate::wait_for_condition::WaitStrategyFn<S>>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: SD,
     check: F,
     _marker: std::marker::PhantomData<fn() -> Fut>,
 }
 
-impl<S, F, Fut> std::fmt::Debug for WaitForConditionBuilder<S, F, Fut> {
+impl<S, F, Fut, SD> std::fmt::Debug for WaitForConditionBuilder<S, F, Fut, SD> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WaitForConditionBuilder")
             .field("name", &self.name)
@@ -84,7 +84,7 @@ impl<S, F, Fut> std::fmt::Debug for WaitForConditionBuilder<S, F, Fut> {
 
 impl<S, F, Fut> WaitForConditionBuilder<S, F, Fut>
 where
-    S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
     F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
 {
@@ -98,12 +98,19 @@ where
             name: None,
             initial_state,
             wait_strategy: None,
-            serdes: None,
+            serdes: JsonSerdes,
             check,
             _marker: std::marker::PhantomData,
         }
     }
+}
 
+impl<S, F, Fut, SD> WaitForConditionBuilder<S, F, Fut, SD>
+where
+    S: Clone + Send + Sync + 'static,
+    F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
+{
     /// Sets a human-readable name for this operation.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -201,27 +208,51 @@ where
     }
 
     /// Sets a custom serializer/deserializer for the state.
-    pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Arc::new(serdes));
-        self
+    ///
+    /// Replaces the builder's serdes type parameter with `SD2`, which must
+    /// implement [`Serdes<S>`](crate::Serdes) for this operation's state
+    /// type — attaching a serdes for a different type fails at compile
+    /// time. To share one instance across operations, wrap it in an
+    /// [`Arc`](std::sync::Arc) and clone the `Arc` handle into each builder.
+    pub fn serdes<SD2>(self, serdes: SD2) -> WaitForConditionBuilder<S, F, Fut, SD2>
+    where
+        SD2: Serdes<S>,
+    {
+        WaitForConditionBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            initial_state: self.initial_state,
+            wait_strategy: self.wait_strategy,
+            serdes,
+            check: self.check,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// Converts this builder into a [`DurableFuture`] explicitly.
-    pub fn future(self) -> DurableFuture<S> {
+    pub fn future(self) -> DurableFuture<S>
+    where
+        SD: Serdes<S>,
+    {
         <Self as IntoFuture>::into_future(self)
     }
 
     /// Eagerly spawns the operation on a tokio task.
-    pub fn spawn(self) -> DurableFuture<S> {
+    pub fn spawn(self) -> DurableFuture<S>
+    where
+        SD: Serdes<S>,
+    {
         spawn_terminal!(self)
     }
 }
 
-impl<S, F, Fut> IntoFuture for WaitForConditionBuilder<S, F, Fut>
+impl<S, F, Fut, SD> IntoFuture for WaitForConditionBuilder<S, F, Fut, SD>
 where
-    S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
     F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
+    SD: Serdes<S>,
 {
     type Output = Result<S, OperationError>;
     type IntoFuture = DurableFuture<S>;

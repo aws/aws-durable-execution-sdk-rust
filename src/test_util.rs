@@ -740,8 +740,7 @@ impl LocalRunner {
             (None, true) => Some(std::time::Duration::ZERO),
             (None, false) => None,
         };
-        let service =
-            crate::wrap_with_execution_client(handler, None, client, checkpoint_buffer_window);
+        let service = crate::wrap_with_execution_client(handler, client, checkpoint_buffer_window);
 
         // Serialize the event once; the envelope re-delivers it per
         // invocation.

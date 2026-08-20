@@ -3,7 +3,6 @@
 
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use crate::BoxError;
 use crate::Serdes;
@@ -11,6 +10,7 @@ use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
+use crate::serdes::JsonSerdes;
 
 // ============================================================
 // ChildBuilder
@@ -44,16 +44,16 @@ use crate::future::DurableFuture;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct ChildBuilder<O, F, Fut> {
+pub struct ChildBuilder<O, F, Fut, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: S,
     closure: F,
     _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
-impl<O, F, Fut> std::fmt::Debug for ChildBuilder<O, F, Fut> {
+impl<O, F, Fut, S> std::fmt::Debug for ChildBuilder<O, F, Fut, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChildBuilder")
             .field("name", &self.name)
@@ -74,12 +74,19 @@ where
             ctx,
             op_id,
             name: None,
-            serdes: None,
+            serdes: JsonSerdes,
             closure,
             _marker: PhantomData,
         }
     }
+}
 
+impl<O, F, Fut, S> ChildBuilder<O, F, Fut, S>
+where
+    O: Send + 'static,
+    F: FnOnce(DurableContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+{
     /// Sets a human-readable name for this operation.
     ///
     /// Names appear in logs, traces, and the execution history for
@@ -90,9 +97,24 @@ where
     }
 
     /// Overrides the serialization strategy for the child result.
-    pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Arc::new(serdes));
-        self
+    ///
+    /// Replaces the builder's serdes type parameter with `S2`, which must
+    /// implement [`Serdes<O>`](crate::Serdes) for this child's output type —
+    /// attaching a serdes for a different type fails at compile time. To
+    /// share one instance across operations, wrap it in an
+    /// [`Arc`](std::sync::Arc) and clone the `Arc` handle into each builder.
+    pub fn serdes<S2>(self, serdes: S2) -> ChildBuilder<O, F, Fut, S2>
+    where
+        S2: Serdes<O>,
+    {
+        ChildBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            serdes,
+            closure: self.closure,
+            _marker: PhantomData,
+        }
     }
 
     /// Converts this builder into a [`DurableFuture`] explicitly.
@@ -101,7 +123,7 @@ where
     /// fan-out patterns where you need to hold multiple futures.
     pub fn future(self) -> DurableFuture<O>
     where
-        O: serde::Serialize + serde::de::DeserializeOwned,
+        S: Serdes<O>,
     {
         <Self as IntoFuture>::into_future(self)
     }
@@ -131,17 +153,18 @@ where
     /// ```
     pub fn spawn(self) -> DurableFuture<O>
     where
-        O: serde::Serialize + serde::de::DeserializeOwned,
+        S: Serdes<O>,
     {
         spawn_terminal!(self)
     }
 }
 
-impl<O, F, Fut> IntoFuture for ChildBuilder<O, F, Fut>
+impl<O, F, Fut, S> IntoFuture for ChildBuilder<O, F, Fut, S>
 where
-    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    O: Send + 'static,
     F: FnOnce(DurableContext) -> Fut + Send + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    S: Serdes<O>,
 {
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;

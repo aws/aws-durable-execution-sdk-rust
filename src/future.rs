@@ -452,9 +452,9 @@ impl<O: Send + 'static> Branch<O> {
 ///
 /// ```no_run
 /// use aws_durable_execution_sdk_rust as durable;
-/// use serde::Deserialize;
+/// use serde::{Deserialize, Serialize};
 ///
-/// #[derive(Deserialize)]
+/// #[derive(Serialize, Deserialize)]
 /// struct Approval { approved: bool }
 ///
 /// async fn handler(
@@ -484,7 +484,7 @@ enum CallbackState<O> {
     Pending(DurableContext),
 }
 
-impl<O: serde::de::DeserializeOwned + Send + 'static> Callback<O> {
+impl<O: Send + 'static> Callback<O> {
     /// Creates a settled callback (replay: outcome already known).
     pub(crate) fn new_settled(id: String, result: Result<O, OperationError>) -> Self {
         Self {
@@ -510,9 +510,9 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> Callback<O> {
     ///
     /// ```no_run
     /// use aws_durable_execution_sdk_rust as durable;
-    /// use serde::Deserialize;
+    /// use serde::{Deserialize, Serialize};
     ///
-    /// #[derive(Deserialize)]
+    /// #[derive(Serialize, Deserialize)]
     /// struct Data { value: i32 }
     ///
     /// async fn handler(
@@ -554,9 +554,9 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> Callback<O> {
     ///
     /// ```no_run
     /// use aws_durable_execution_sdk_rust as durable;
-    /// use serde::Deserialize;
+    /// use serde::{Deserialize, Serialize};
     ///
-    /// #[derive(Deserialize)]
+    /// #[derive(Serialize, Deserialize)]
     /// struct Payload { msg: String }
     ///
     /// async fn handler(

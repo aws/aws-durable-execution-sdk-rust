@@ -8,12 +8,9 @@
 //! function suspends; the backend owns the timer.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use tracing::Instrument;
 
 use crate::builders::{JitterStrategy, RetryStrategyConfig};
@@ -184,22 +181,23 @@ pub(crate) const STEP_SUB_TYPE: &str = "Step";
 /// erasure point for a step is `.future()` / `into_future` on the builder,
 /// which boxes the whole execution future once inside
 /// [`DurableFuture`](crate::DurableFuture).
-pub(crate) struct StepExecution<O, F> {
+pub(crate) struct StepExecution<O, F, S> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) retry_strategy: Option<RetryStrategy>,
-    pub(crate) serdes: Option<Arc<dyn Serdes>>,
+    pub(crate) serdes: S,
     pub(crate) semantics: StepSemantics,
     pub(crate) closure: F,
     pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
 }
 
-impl<O, F, Fut> StepExecution<O, F>
+impl<O, F, Fut, S> StepExecution<O, F, S>
 where
-    O: Serialize + DeserializeOwned + Send + 'static,
+    O: Send + 'static,
     F: FnOnce(StepContext) -> Fut + Send + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    S: Serdes<O>,
 {
     /// Executes the step operation: replay path or live path with retry.
     ///
@@ -250,19 +248,19 @@ where
 /// result type `O` — no user closure reaches this state machine, so its
 /// substantial replay/checkpoint logic compiles once per result type
 /// instead of once per step call site.
-struct StepCore<O> {
+struct StepCore<O, S> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     retry_strategy: Option<RetryStrategy>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: S,
     semantics: StepSemantics,
     _marker: std::marker::PhantomData<fn() -> O>,
 }
 
 /// What [`StepCore::before`] decided: the step is already resolved from the
 /// checkpoint log (or suspended), or the body must run live.
-enum StepPrelude<O> {
+enum StepPrelude<O, S> {
     /// Resolved without running the body (replay, suspension, or an
     /// `AtMostOncePerRetry` interruption verdict).
     Done(Result<O, OperationError>),
@@ -274,29 +272,30 @@ enum StepPrelude<O> {
         /// The operation span the body runs under.
         span: tracing::Span,
         /// The post-closure half that checkpoints the outcome.
-        live: StepLive<O>,
+        live: StepLive<O, S>,
     },
 }
 
 /// The post-closure half of a step: outcome checkpointing (success payload
 /// or retry-strategy failure handling). Generic only over the result type.
-struct StepLive<O> {
+struct StepLive<O, S> {
     ctx: DurableContext,
     wire_id: String,
     name: Option<String>,
     retry_strategy: Option<RetryStrategy>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: S,
     _marker: std::marker::PhantomData<fn() -> O>,
 }
 
-impl<O> StepCore<O>
+impl<O, S> StepCore<O, S>
 where
-    O: Serialize + DeserializeOwned + Send + 'static,
+    O: Send + 'static,
+    S: Serdes<O>,
 {
     /// Runs everything that precedes the user closure: replay path, or the
     /// live-path preamble ending at the START checkpoint.
     #[allow(clippy::too_many_lines)] // reason: validation adds lines but splitting would obscure flow
-    async fn before(self) -> Result<StepPrelude<O>, OperationError> {
+    async fn before(self) -> Result<StepPrelude<O, S>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
 
@@ -322,12 +321,7 @@ where
                     // without the event.
                     let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    let value = replay_success(
-                        self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-                        payload.as_ref(),
-                        &serdes_ctx,
-                    )
-                    .await?;
+                    let value = replay_success(&self.serdes, payload, serdes_ctx).await?;
                     self.ctx.emit_operation_replayed(
                         &wire_id,
                         self.name.as_deref(),
@@ -441,20 +435,21 @@ where
     }
 }
 
-impl<O> StepLive<O>
+impl<O, S> StepLive<O, S>
 where
-    O: Serialize + DeserializeOwned + Send + 'static,
+    O: Send + 'static,
+    S: Serdes<O>,
 {
     /// Settles a live step outcome: checkpoints success or consults the
     /// retry strategy on failure.
     async fn settle(self, attempt: u32, result: Result<O, BoxError>) -> Result<O, OperationError> {
         match result {
             Ok(value) => {
-                handle_success::<O>(
+                handle_success(
                     &self.ctx,
                     &self.wire_id,
                     self.name.as_deref(),
-                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
+                    &self.serdes,
                     value,
                 )
                 .await
@@ -477,17 +472,21 @@ where
 // ── Free functions for post-closure operations ──────────────────────────
 
 /// Handles a successful step execution: serialize, checkpoint, return.
-async fn handle_success<O: Serialize + DeserializeOwned>(
+///
+/// The value round-trips through the configured wire format — ownership
+/// transfers to `serialize`, and the returned value is what `deserialize`
+/// produced from the stored wire string (round-trip parity).
+async fn handle_success<O, S: Serdes<O>>(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
-    serdes: Option<&Arc<dyn Serdes>>,
+    serdes: &S,
     value: O,
 ) -> Result<O, OperationError> {
     let serdes_ctx = SerdesContext::new(wire_id, ctx.execution_arn());
 
-    // Serialize the result.
-    let serialized = serialize_value(serdes, &value, &serdes_ctx).await?;
+    // Serialize the result (ownership transfers to the serdes).
+    let serialized = serialize_value(serdes, value, serdes_ctx.clone()).await?;
 
     // Checkpoint SUCCEED with payload.
     let update = build_succeed_update(wire_id, name, ctx.parent_wire_id(), &serialized);
@@ -496,11 +495,11 @@ async fn handle_success<O: Serialize + DeserializeOwned>(
         .map_err(|e| client_error_to_op_error(&e))?;
 
     // Return deserialized from the serialized form (round-trip parity).
-    deserialize_result(serdes, &serialized, &serdes_ctx).await
+    deserialize_result(serdes, serialized, serdes_ctx).await
 }
 
 /// Handles a failed step: consult retry strategy, checkpoint accordingly.
-async fn handle_failure<O: Serialize + DeserializeOwned>(
+async fn handle_failure<O>(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
@@ -680,41 +679,33 @@ fn build_fail_update(
 
 // ── Serialization helpers ───────────────────────────────────────────────
 
-fn serialize_value<'a, O: Serialize>(
-    serdes: Option<&'a Arc<dyn Serdes>>,
-    value: &O,
-    serdes_ctx: &'a SerdesContext,
-) -> impl Future<Output = Result<String, OperationError>> + Send + 'a {
-    // Phase 1 (sync): consume the `&O` borrow now, so the returned future
-    // holds no `&O` across its await (which would force `O: Sync` on every
-    // operation future). No custom serdes renders straight to the wire; a
-    // custom serdes receives the value erased to `serde_json::Value` — the
-    // same shape every other operation path provides.
-    let prepared = crate::serdes::prepare_value(serdes, value);
-    // Phase 2 (async): a custom serdes may block (e.g. filesystem I/O), so
-    // the call runs off the async runtime.
-    async move {
-        prepared
-            .map_err(|e| step_serialization_error(&e))?
-            .into_wire(serdes_ctx)
-            .await
-            .map_err(|e| step_serialization_error(&*e))
-    }
+/// Serializes a step value through the configured serdes.
+///
+/// The serdes decides where its work runs (inline for `JsonSerdes`, one
+/// blocking task for `FileSystemSerdes`); the SDK awaits the returned
+/// future directly. Taking `value` by ownership keeps the future `Send`
+/// without requiring `O: Sync`.
+async fn serialize_value<O, S: Serdes<O>>(
+    serdes: &S,
+    value: O,
+    serdes_ctx: SerdesContext,
+) -> Result<String, OperationError> {
+    serdes
+        .serialize(value, serdes_ctx)
+        .await
+        .map_err(|e| step_serialization_error(&*e))
 }
 
-async fn deserialize_result<O: DeserializeOwned>(
-    serdes: Option<&Arc<dyn Serdes>>,
-    serialized: &str,
-    serdes_ctx: &SerdesContext,
+/// Deserializes a step wire string through the configured serdes.
+async fn deserialize_result<O, S: Serdes<O>>(
+    serdes: &S,
+    serialized: String,
+    serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
-    let Some(s) = serdes else {
-        return serde_json::from_str(serialized).map_err(|e| step_serialization_error(&e));
-    };
-    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
-    let json_value = crate::serdes::deserialize_off_runtime(s, serialized.to_owned(), serdes_ctx)
+    serdes
+        .deserialize(serialized, serdes_ctx)
         .await
-        .map_err(|e| step_serialization_error(&*e))?;
-    serde_json::from_value(json_value).map_err(|e| step_serialization_error(&e))
+        .map_err(|e| step_serialization_error(&*e))
 }
 
 /// Wraps any error as a step `SerializationFailed` operation error.
@@ -726,12 +717,12 @@ fn step_serialization_error<E: std::fmt::Display + ?Sized>(e: &E) -> OperationEr
     )))
 }
 
-async fn replay_success<O: DeserializeOwned>(
-    serdes: Option<&Arc<dyn Serdes>>,
-    result: Option<&String>,
-    serdes_ctx: &SerdesContext,
+async fn replay_success<O, S: Serdes<O>>(
+    serdes: &S,
+    result: Option<String>,
+    serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
-    let payload = result.map_or("null", String::as_str);
+    let payload = result.unwrap_or_else(|| "null".to_owned());
     deserialize_result(serdes, payload, serdes_ctx).await
 }
 
@@ -830,14 +821,16 @@ mod tests {
     async fn replay_success_deserializes_json() {
         let payload = "42".to_owned();
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let result: Result<i32, OperationError> = replay_success(None, Some(&payload), &ctx).await;
+        let result: Result<i32, OperationError> =
+            replay_success(&crate::serdes::JsonSerdes, Some(payload), ctx).await;
         assert_eq!(result.unwrap(), 42);
     }
 
     #[tokio::test]
     async fn replay_success_null_returns_unit() {
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let result: Result<(), OperationError> = replay_success(None, None, &ctx).await;
+        let result: Result<(), OperationError> =
+            replay_success(&crate::serdes::JsonSerdes, None, ctx).await;
         assert!(result.is_ok());
     }
 
@@ -868,40 +861,37 @@ mod tests {
     #[tokio::test]
     async fn serialize_deserialize_round_trip() {
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let serialized = serialize_value::<String>(None, &"hello".to_owned(), &ctx)
+        let serialized =
+            serialize_value(&crate::serdes::JsonSerdes, "hello".to_owned(), ctx.clone())
+                .await
+                .unwrap();
+        let deserialized: String = deserialize_result(&crate::serdes::JsonSerdes, serialized, ctx)
             .await
             .unwrap();
-        let deserialized: String = deserialize_result(None, &serialized, &ctx).await.unwrap();
         assert_eq!(deserialized, "hello");
     }
 
     #[tokio::test]
     async fn serialize_with_custom_serdes_uppercases() {
         struct Upper;
-        impl std::fmt::Debug for Upper {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("Upper")
-            }
-        }
-        impl Serdes for Upper {
-            fn serialize(
+        impl Serdes<String> for Upper {
+            async fn serialize(
                 &self,
-                value: &serde_json::Value,
-                _context: &SerdesContext,
+                value: String,
+                _context: SerdesContext,
             ) -> Result<String, BoxError> {
-                Ok(value.to_string().to_uppercase())
+                Ok(serde_json::to_string(&value)?.to_uppercase())
             }
-            fn deserialize(
+            async fn deserialize(
                 &self,
-                data: &str,
-                _context: &SerdesContext,
-            ) -> Result<serde_json::Value, BoxError> {
-                Ok(serde_json::from_str(data)?)
+                wire: String,
+                _context: SerdesContext,
+            ) -> Result<String, BoxError> {
+                Ok(serde_json::from_str(&wire)?)
             }
         }
-        let serdes: Arc<dyn Serdes> = Arc::new(Upper);
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let result = serialize_value(Some(&serdes), &"hello".to_owned(), &ctx)
+        let result = serialize_value(&Upper, "hello".to_owned(), ctx)
             .await
             .unwrap();
         assert_eq!(result, "\"HELLO\"");
@@ -1003,7 +993,7 @@ mod tests {
             op_id,
             name: Some("test-step".to_owned()),
             retry_strategy: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             closure,
             _marker: std::marker::PhantomData,
@@ -1014,31 +1004,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_serdes_applies_when_step_sets_none() {
+    async fn per_operation_serdes_serializes_step_result() {
         use crate::client::InMemoryExecutionClient;
 
-        // A default serdes that uppercases on serialize and lowercases on
-        // deserialize. Threaded in via Options -> context default_serdes.
+        // A per-operation serdes that uppercases on serialize and lowercases
+        // on deserialize. The execution-wide serdes slot was removed with
+        // the generic trait; per-operation configuration is the only path.
         struct Upper;
-        impl std::fmt::Debug for Upper {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("Upper")
-            }
-        }
-        impl Serdes for Upper {
-            fn serialize(
+        impl Serdes<String> for Upper {
+            async fn serialize(
                 &self,
-                value: &serde_json::Value,
-                _context: &SerdesContext,
+                value: String,
+                _context: SerdesContext,
             ) -> Result<String, BoxError> {
-                Ok(value.to_string().to_uppercase())
+                Ok(serde_json::to_string(&value)?.to_uppercase())
             }
-            fn deserialize(
+            async fn deserialize(
                 &self,
-                data: &str,
-                _context: &SerdesContext,
-            ) -> Result<serde_json::Value, BoxError> {
-                Ok(serde_json::from_str(&data.to_lowercase())?)
+                wire: String,
+                _context: SerdesContext,
+            ) -> Result<String, BoxError> {
+                Ok(serde_json::from_str(&wire.to_lowercase())?)
             }
         }
 
@@ -1050,7 +1036,6 @@ mod tests {
             log,
             client.clone(),
             "token0".to_owned(),
-            Some(Arc::new(Upper)),
             None,
         );
         let op_id = ctx.mint_id();
@@ -1061,7 +1046,7 @@ mod tests {
             op_id,
             name: Some("greet".to_owned()),
             retry_strategy: None,
-            serdes: None, // no per-op serdes -> must fall back to the default
+            serdes: Upper,
             semantics: StepSemantics::default(),
             closure,
             _marker: std::marker::PhantomData,
@@ -1071,9 +1056,9 @@ mod tests {
         let result = exec.execute().await;
         assert_eq!(result.unwrap(), "hello");
 
-        // The Succeed checkpoint payload was serialized by the default serdes
-        // (uppercased). Without default_serdes wiring the payload would be
-        // the plain "\"hello\"".
+        // The Succeed checkpoint payload was serialized by the configured
+        // serdes (uppercased). Without the serdes the payload would be the
+        // plain "\"hello\"".
         let updates = client.recorded_updates();
         let succeed = updates
             .iter()
@@ -1082,7 +1067,7 @@ mod tests {
         assert_eq!(
             succeed.payload(),
             Some("\"HELLO\""),
-            "default serdes must serialize the step result when the step sets none"
+            "the per-operation serdes must serialize the step result"
         );
     }
 
@@ -1132,7 +1117,7 @@ mod tests {
             op_id,
             name: None,
             retry_strategy: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             closure,
             _marker: std::marker::PhantomData,
@@ -1189,7 +1174,7 @@ mod tests {
             op_id,
             name: None,
             retry_strategy: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             closure,
             _marker: std::marker::PhantomData,
@@ -1232,7 +1217,7 @@ mod tests {
             op_id,
             name: None,
             retry_strategy: Some(no_retry),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             closure,
             _marker: std::marker::PhantomData,
@@ -1275,7 +1260,7 @@ mod tests {
             op_id,
             name: None,
             retry_strategy: Some(always_retry),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             closure,
             _marker: std::marker::PhantomData,
@@ -1318,7 +1303,7 @@ mod tests {
             op_id,
             name: None,
             retry_strategy: Some(fractional_retry),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             closure,
             _marker: std::marker::PhantomData,
@@ -1390,7 +1375,7 @@ mod tests {
                     op_id,
                     name: None,
                     retry_strategy: None,
-                    serdes: None,
+                    serdes: crate::serdes::JsonSerdes,
                     semantics: StepSemantics::default(),
                     closure,
                     _marker: std::marker::PhantomData,
@@ -1468,7 +1453,7 @@ mod tests {
             op_id,
             name: Some("at-most-once-step".to_owned()),
             retry_strategy: Some(no_retry),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtMostOncePerRetry,
             closure,
             _marker: std::marker::PhantomData,
@@ -1543,7 +1528,7 @@ mod tests {
             op_id,
             name: None,
             retry_strategy: Some(always_retry),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtMostOncePerRetry,
             closure,
             _marker: std::marker::PhantomData,
@@ -1608,7 +1593,7 @@ mod tests {
             op_id,
             name: None,
             retry_strategy: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtLeastOncePerRetry,
             closure,
             _marker: std::marker::PhantomData,

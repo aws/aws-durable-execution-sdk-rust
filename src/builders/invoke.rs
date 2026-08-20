@@ -3,13 +3,13 @@
 
 use std::future::IntoFuture;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use crate::Serdes;
 use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
+use crate::serdes::JsonSerdes;
 
 // ============================================================
 // InvokeBuilder
@@ -20,16 +20,24 @@ use crate::future::DurableFuture;
 /// Created by [`DurableContext::invoke`]. Configure with `.name()` and
 /// custom serialization before awaiting.
 ///
+/// The builder carries the typed input `I` and two serdes implementations
+/// as generic parameters, both defaulting to
+/// [`JsonSerdes`]: `PS` serializes the input
+/// payload ([`payload_serdes`](Self::payload_serdes)) and `RS`
+/// deserializes the target function's result ([`serdes`](Self::serdes)).
+/// The single erasure point is `.future()` / `.await`, which produces the
+/// one [`DurableFuture<O>`] box regardless of the serdes types.
+///
 /// # Examples
 ///
 /// ```no_run
 /// use aws_durable_execution_sdk_rust as durable;
 /// use serde::{Deserialize, Serialize};
 ///
-/// #[derive(Serialize)]
+/// #[derive(Serialize, Deserialize)]
 /// struct Input { id: u64 }
 ///
-/// #[derive(Deserialize)]
+/// #[derive(Serialize, Deserialize)]
 /// struct Output { status: String }
 ///
 /// async fn handler(
@@ -43,19 +51,19 @@ use crate::future::DurableFuture;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct InvokeBuilder<O> {
+pub struct InvokeBuilder<O, I, PS = JsonSerdes, RS = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     function_id: String,
-    erased_input: Result<serde_json::Value, String>,
-    payload_serdes: Option<Arc<dyn Serdes>>,
-    result_serdes: Option<Arc<dyn Serdes>>,
+    input: I,
+    payload_serdes: PS,
+    result_serdes: RS,
     tenant_id: Option<String>,
     _marker: PhantomData<O>,
 }
 
-impl<O> std::fmt::Debug for InvokeBuilder<O> {
+impl<O, I, PS, RS> std::fmt::Debug for InvokeBuilder<O, I, PS, RS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InvokeBuilder")
             .field("name", &self.name)
@@ -64,27 +72,37 @@ impl<O> std::fmt::Debug for InvokeBuilder<O> {
     }
 }
 
-impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
+impl<O, I> InvokeBuilder<O, I>
+where
+    O: Send + 'static,
+    I: Send + 'static,
+{
     /// Creates a new invoke builder (internal).
     pub(crate) fn new(
         ctx: DurableContext,
         op_id: OperationId,
         function_id: String,
-        erased_input: Result<serde_json::Value, String>,
+        input: I,
     ) -> Self {
         Self {
             ctx,
             op_id,
             name: None,
             function_id,
-            erased_input,
-            payload_serdes: None,
-            result_serdes: None,
+            input,
+            payload_serdes: JsonSerdes,
+            result_serdes: JsonSerdes,
             tenant_id: None,
             _marker: PhantomData,
         }
     }
+}
 
+impl<O, I, PS, RS> InvokeBuilder<O, I, PS, RS>
+where
+    O: Send + 'static,
+    I: Send + 'static,
+{
     /// Sets a human-readable name for this invoke.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -95,43 +113,74 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
     /// deserialization.
     ///
     /// The serdes is applied when deserializing the invoke result payload
-    /// returned by the target function. Use this to apply custom
-    /// transformations on the result (e.g., uppercasing).
-    pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.result_serdes = Some(Arc::new(serdes));
-        self
+    /// returned by the target function. It must implement
+    /// [`Serdes<O>`](crate::Serdes) for this invoke's output type —
+    /// attaching a serdes for a different type fails at compile time. This
+    /// is independent of the payload serdes set via
+    /// [`payload_serdes`](Self::payload_serdes).
+    pub fn serdes<RS2>(self, serdes: RS2) -> InvokeBuilder<O, I, PS, RS2>
+    where
+        RS2: Serdes<O>,
+    {
+        InvokeBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            function_id: self.function_id,
+            input: self.input,
+            payload_serdes: self.payload_serdes,
+            result_serdes: serdes,
+            tenant_id: self.tenant_id,
+            _marker: PhantomData,
+        }
     }
 
-    /// Sets a custom serializer/deserializer for this invoke's input
-    /// payload serialization.
+    /// Sets a custom serializer for this invoke's input payload
+    /// serialization.
     ///
     /// The serdes is applied when serializing the input payload before
-    /// sending it to the target function. This is independent of the
-    /// result serdes set via [`.serdes()`](Self::serdes).
+    /// sending it to the target function; the owned input transfers to the
+    /// serdes directly (a write-only payload has no round-trip to
+    /// preserve). It must implement [`Serdes<I>`](crate::Serdes) for the
+    /// input's type. This is independent of the result serdes set via
+    /// [`.serdes()`](Self::serdes).
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use aws_durable_execution_sdk_rust as durable;
+    /// use durable::serdes::SerdesContext;
     ///
-    /// # #[derive(Debug)]
     /// # struct UpperSerdes;
-    /// # impl durable::Serdes for UpperSerdes {
-    /// #     fn serialize(&self, v: &serde_json::Value, _c: &durable::serdes::SerdesContext) -> Result<String, durable::BoxError> { Ok(v.to_string().to_uppercase()) }
+    /// # impl durable::Serdes<String> for UpperSerdes {
+    /// #     async fn serialize(&self, v: String, _c: SerdesContext) -> Result<String, durable::BoxError> { Ok(v.to_uppercase()) }
+    /// #     async fn deserialize(&self, w: String, _c: SerdesContext) -> Result<String, durable::BoxError> { Ok(w.to_lowercase()) }
     /// # }
     /// async fn handler(
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<String, durable::BoxError> {
-    ///     let result = ctx.invoke::<String, _>("target-fn", "hello")
+    ///     let result = ctx.invoke::<String, _>("target-fn", "hello".to_owned())
     ///         .payload_serdes(UpperSerdes)
     ///         .await?;
     ///     Ok(result)
     /// }
     /// ```
-    pub fn payload_serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.payload_serdes = Some(Arc::new(serdes));
-        self
+    pub fn payload_serdes<PS2>(self, serdes: PS2) -> InvokeBuilder<O, I, PS2, RS>
+    where
+        PS2: Serdes<I>,
+    {
+        InvokeBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            function_id: self.function_id,
+            input: self.input,
+            payload_serdes: serdes,
+            result_serdes: self.result_serdes,
+            tenant_id: self.tenant_id,
+            _marker: PhantomData,
+        }
     }
 
     /// Sets the tenant ID for tenant-isolated invocations.
@@ -142,7 +191,15 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
         self.tenant_id = Some(tenant_id.into());
         self
     }
+}
 
+impl<O, I, PS, RS> InvokeBuilder<O, I, PS, RS>
+where
+    O: Send + 'static,
+    I: Send + 'static,
+    PS: Serdes<I>,
+    RS: Serdes<O>,
+{
     /// Converts this builder into a [`DurableFuture`] explicitly.
     pub fn future(self) -> DurableFuture<O> {
         <Self as IntoFuture>::into_future(self)
@@ -159,7 +216,7 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<(), durable::BoxError> {
-    ///     let handle = ctx.invoke::<String, _>("fn", "input")
+    ///     let handle = ctx.invoke::<String, _>("fn", "input".to_owned())
     ///         .name("bg-call")
     ///         .spawn();
     ///     let _result = handle.await?;
@@ -171,7 +228,13 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> InvokeBuilder<O> {
     }
 }
 
-impl<O: serde::de::DeserializeOwned + Send + 'static> IntoFuture for InvokeBuilder<O> {
+impl<O, I, PS, RS> IntoFuture for InvokeBuilder<O, I, PS, RS>
+where
+    O: Send + 'static,
+    I: Send + 'static,
+    PS: Serdes<I>,
+    RS: Serdes<O>,
+{
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
 
@@ -189,7 +252,7 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> IntoFuture for InvokeBuild
             op_id: self.op_id,
             name: self.name,
             function_id: self.function_id,
-            erased_input: self.erased_input,
+            input: self.input,
             payload_serdes: self.payload_serdes,
             result_serdes: self.result_serdes,
             tenant_id: self.tenant_id,

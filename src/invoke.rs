@@ -9,8 +9,6 @@ use aws_sdk_lambda::types::{
     ChainedInvokeOptions, OperationAction, OperationType, OperationUpdate,
 };
 
-use std::sync::Arc;
-
 use crate::Serdes;
 use crate::client::ClientError;
 use crate::context::DurableContext;
@@ -18,47 +16,39 @@ use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{InvokeError, InvokeErrorKind, OperationError, OperationErrorKind};
 use crate::serdes::SerdesContext;
 
-#[cfg(test)]
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-
 /// Wire sub-type for chained invoke operations.
 pub(crate) const CHAINED_INVOKE_SUB_TYPE: &str = "ChainedInvoke";
 
 /// Internal state for invoke execution passed from the builder.
-pub(crate) struct InvokeExecution<O> {
+///
+/// Generic over the input type `I` (carried typed — the payload serdes
+/// receives the owned input directly, a write-only transfer) and the two
+/// serdes implementations: `PS` serializes the input payload, `RS`
+/// deserializes the target function's result.
+pub(crate) struct InvokeExecution<O, I, PS, RS> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) function_id: String,
-    pub(crate) erased_input: Result<serde_json::Value, String>,
-    pub(crate) payload_serdes: Option<Arc<dyn Serdes>>,
-    pub(crate) result_serdes: Option<Arc<dyn Serdes>>,
+    pub(crate) input: I,
+    pub(crate) payload_serdes: PS,
+    pub(crate) result_serdes: RS,
     pub(crate) tenant_id: Option<String>,
     pub(crate) _marker: std::marker::PhantomData<O>,
 }
 
-impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
+impl<O, I, PS, RS> InvokeExecution<O, I, PS, RS>
+where
+    O: Send + 'static,
+    I: Send + 'static,
+    PS: Serdes<I>,
+    RS: Serdes<O>,
+{
     /// Executes the invoke operation: replay path or live path.
     #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
-
-        // Surface an input-serialization failure now — before any replay
-        // lookup, checkpoint, or execution-client call — so a failing
-        // `Serialize` never invokes the target with a `null` payload and
-        // never records an operation the caller did not request.
-        let erased_input = match self.erased_input {
-            Ok(input) => input,
-            Err(msg) => {
-                return Err(OperationError::from_kind(OperationErrorKind::Invoke(
-                    InvokeError::from_kind(InvokeErrorKind::SerializationFailed {
-                        message: format!("serialize invoke input: {msg}"),
-                    }),
-                )));
-            }
-        };
 
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
@@ -87,11 +77,9 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
                         })
                         .flatten();
                     let value = deserialize_invoke_result(
-                        self.result_serdes
-                            .as_ref()
-                            .or_else(|| self.ctx.default_serdes()),
-                        payload.as_deref().unwrap_or("null"),
-                        &serdes_ctx,
+                        &self.result_serdes,
+                        payload.unwrap_or_else(|| "null".to_owned()),
+                        serdes_ctx.clone(),
                     )
                     .await?;
                     self.ctx.emit_operation_replayed(
@@ -150,29 +138,12 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
             }
         }
 
-        // 3. Live path: apply payload serdes then checkpoint.
-        let effective_payload_serdes = self
-            .payload_serdes
-            .as_ref()
-            .or_else(|| self.ctx.default_serdes());
-        let wire_payload = if let Some(ps) = effective_payload_serdes {
-            // The Value was erased at the call site (context.rs). The serdes
-            // receives the same shape every other path provides — no re-parsing
-            // needed. Custom serdes may block (e.g. filesystem I/O), so the
-            // call runs off the async runtime.
-            crate::serdes::serialize_off_runtime(ps, erased_input, &serdes_ctx)
-                .await
-                .map_err(|e| invoke_serialization_error(&format!("payload serdes: {e}")))?
-        } else {
-            // No custom serdes: render the Value to compact JSON for the wire.
-            // Note: this is `to_string(&Value)`, not `to_string(&I)`. The two
-            // can differ for edge cases (struct field order without
-            // `preserve_order`, 128-bit integers outside i64/u64 range,
-            // duplicate keys). Those cases fail at the `to_value` call site
-            // rather than silently producing different wire bytes.
-            serde_json::to_string(&erased_input)
-                .map_err(|e| invoke_serialization_error(&format!("serialize invoke input: {e}")))?
-        };
+        // 3. Live path: serialize the typed input through the payload
+        // serdes, then checkpoint. The input transfers by ownership — a
+        // write-only payload has no round-trip to preserve, and owning it
+        // lets the serdes move it into a blocking task when it needs one.
+        let wire_payload =
+            serialize_invoke_input(&self.payload_serdes, self.input, &serdes_ctx).await?;
 
         // Checkpoint ChainedInvokeStarted then suspend.
         let update = build_chained_invoke_start(
@@ -195,48 +166,32 @@ impl<O: DeserializeOwned + Send + 'static> InvokeExecution<O> {
 
 // ── Serialization helpers ───────────────────────────────────────────────
 
-/// Serializes the invoke input payload using the configured serdes.
+/// Serializes the invoke input payload through the configured serdes.
 ///
-/// The production path serializes through the pre-erased two-phase flow in
-/// [`InvokeExecution::execute`] (`prepare_value` at builder time, then
-/// `serialize_off_runtime`); this one-shot form is retained as the direct
-/// unit-test harness for the payload-serdes behavior both share.
-#[cfg(test)]
-pub(crate) async fn serialize_invoke_input<I: Serialize>(
-    payload_serdes: Option<&Arc<dyn Serdes>>,
-    input: &I,
+/// Ownership of the input transfers to the serdes (write-only payloads
+/// have no round-trip to preserve); the serdes decides where its work
+/// runs.
+async fn serialize_invoke_input<I, PS: Serdes<I>>(
+    payload_serdes: &PS,
+    input: I,
     serdes_ctx: &SerdesContext,
 ) -> Result<String, OperationError> {
-    // Phase 1 (sync): consume the `&I` borrow before awaiting. No custom
-    // serdes renders straight to the wire; a custom serdes receives the
-    // input erased to `serde_json::Value` — the same shape every other
-    // operation path provides.
-    let prepared = crate::serdes::prepare_value(payload_serdes, input)
-        .map_err(|e| invoke_serialization_error(&format!("serialize invoke input: {e}")))?;
-    // Phase 2 (async): a custom serdes may block (e.g. filesystem I/O), so
-    // the call runs off the async runtime.
-    prepared
-        .into_wire(serdes_ctx)
+    payload_serdes
+        .serialize(input, serdes_ctx.clone())
         .await
         .map_err(|e| invoke_serialization_error(&format!("payload serdes: {e}")))
 }
 
-/// Deserializes the invoke result payload using the configured serdes.
-async fn deserialize_invoke_result<O: DeserializeOwned>(
-    result_serdes: Option<&Arc<dyn Serdes>>,
-    payload: &str,
-    serdes_ctx: &SerdesContext,
+/// Deserializes the invoke result payload through the configured serdes.
+async fn deserialize_invoke_result<O, RS: Serdes<O>>(
+    result_serdes: &RS,
+    payload: String,
+    serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
-    let Some(s) = result_serdes else {
-        return serde_json::from_str(payload)
-            .map_err(|e| invoke_serialization_error(&format!("deserialize invoke result: {e}")));
-    };
-    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
-    let json_value = crate::serdes::deserialize_off_runtime(s, payload.to_owned(), serdes_ctx)
+    result_serdes
+        .deserialize(payload, serdes_ctx)
         .await
-        .map_err(|e| invoke_serialization_error(&format!("result serdes: {e}")))?;
-    serde_json::from_value(json_value)
-        .map_err(|e| invoke_serialization_error(&format!("deserialize invoke result: {e}")))
+        .map_err(|e| invoke_serialization_error(&format!("result serdes: {e}")))
 }
 
 /// Wraps a message as an invoke `SerializationFailed` operation error.
@@ -354,14 +309,14 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let exec = InvokeExecution::<String> {
+        let exec = InvokeExecution::<String, _, _, _> {
             ctx,
             op_id,
             name: None,
             function_id: "target-fn".to_owned(),
-            erased_input: Ok(serde_json::json!("input")),
-            payload_serdes: None,
-            result_serdes: None,
+            input: serde_json::json!("input"),
+            payload_serdes: crate::serdes::JsonSerdes,
+            result_serdes: crate::serdes::JsonSerdes,
             tenant_id: None,
             _marker: PhantomData,
         };
@@ -397,14 +352,14 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let exec = InvokeExecution::<String> {
+        let exec = InvokeExecution::<String, _, _, _> {
             ctx,
             op_id,
             name: None,
             function_id: "target-fn".to_owned(),
-            erased_input: Ok(serde_json::json!("input")),
-            payload_serdes: None,
-            result_serdes: None,
+            input: serde_json::json!("input"),
+            payload_serdes: crate::serdes::JsonSerdes,
+            result_serdes: crate::serdes::JsonSerdes,
             tenant_id: None,
             _marker: PhantomData,
         };
@@ -446,14 +401,14 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let exec = InvokeExecution::<String> {
+        let exec = InvokeExecution::<String, _, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: None,
             function_id: "target-fn".to_owned(),
-            erased_input: Ok(serde_json::json!("input")),
-            payload_serdes: None,
-            result_serdes: None,
+            input: serde_json::json!("input"),
+            payload_serdes: crate::serdes::JsonSerdes,
+            result_serdes: crate::serdes::JsonSerdes,
             tenant_id: None,
             _marker: PhantomData,
         };
@@ -478,14 +433,14 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let exec = InvokeExecution::<String> {
+        let exec = InvokeExecution::<String, _, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("charge".to_owned()),
             function_id: "payment-fn".to_owned(),
-            erased_input: Ok(serde_json::json!({"amount": 100})),
-            payload_serdes: None,
-            result_serdes: None,
+            input: serde_json::json!({"amount": 100}),
+            payload_serdes: crate::serdes::JsonSerdes,
+            result_serdes: crate::serdes::JsonSerdes,
             tenant_id: None,
             _marker: PhantomData,
         };
@@ -497,43 +452,35 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_serdes_round_trip() {
-        // Custom payload serdes uppercases input on serialization.
+        // Custom serdes: uppercases the JSON rendering on serialization,
+        // lowercases the wire payload before parsing on deserialization.
         struct Upper;
-        impl std::fmt::Debug for Upper {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("Upper")
-            }
-        }
-        impl Serdes for Upper {
-            fn serialize(
+        impl Serdes<String> for Upper {
+            async fn serialize(
                 &self,
-                value: &serde_json::Value,
-                _context: &SerdesContext,
+                value: String,
+                _context: SerdesContext,
             ) -> Result<String, crate::BoxError> {
-                Ok(value.to_string().to_uppercase())
+                Ok(serde_json::to_string(&value)?.to_uppercase())
             }
-            fn deserialize(
+            async fn deserialize(
                 &self,
-                data: &str,
-                _context: &SerdesContext,
-            ) -> Result<serde_json::Value, crate::BoxError> {
-                Ok(serde_json::from_str(&data.to_lowercase())?)
+                wire: String,
+                _context: SerdesContext,
+            ) -> Result<String, crate::BoxError> {
+                Ok(serde_json::from_str(&wire.to_lowercase())?)
             }
         }
 
-        // Test payload serialization.
+        // Test payload serialization: the serdes receives the typed input.
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let upper: Arc<dyn Serdes> = Arc::new(Upper);
-        let serialized = serialize_invoke_input(Some(&upper), &"hello", &ctx)
+        let serialized = serialize_invoke_input(&Upper, "hello".to_owned(), &ctx)
             .await
             .unwrap();
         assert_eq!(serialized, "\"HELLO\"");
 
-        // Test result deserialization.
-        // Upper::deserialize lowercases the whole payload string (including
-        // JSON quotes) and parses it into a Value, which is then deserialized
-        // into `String`: "\"WORLD\"" -> "\"world\"" -> "world".
-        let result: String = deserialize_invoke_result(Some(&upper), "\"WORLD\"", &ctx)
+        // Test result deserialization: "\"WORLD\"" -> "\"world\"" -> "world".
+        let result: String = deserialize_invoke_result(&Upper, "\"WORLD\"".to_owned(), ctx)
             .await
             .unwrap();
         assert_eq!(result, "world");
@@ -554,14 +501,14 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let exec = InvokeExecution::<serde_json::Value> {
+        let exec = InvokeExecution::<serde_json::Value, _, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("my-invoke".to_owned()),
             function_id: "fn-arn".to_owned(),
-            erased_input: Ok(serde_json::Value::Null),
-            payload_serdes: None,
-            result_serdes: None,
+            input: serde_json::Value::Null,
+            payload_serdes: crate::serdes::JsonSerdes,
+            result_serdes: crate::serdes::JsonSerdes,
             tenant_id: None,
             _marker: PhantomData,
         };
@@ -589,7 +536,7 @@ mod tests {
         // Use the public API: ctx.invoke().spawn() should succeed on a blessed task.
         let signal = Arc::clone(ctx.suspension_signal());
         let handle = ctx
-            .invoke::<serde_json::Value, _>("fn-arn", "input")
+            .invoke::<serde_json::Value, _>("fn-arn", "input".to_owned())
             .name("spawned-invoke")
             .spawn();
         // Blessed spawn: the op suspends (no ownership error), so the driver
@@ -618,14 +565,14 @@ mod tests {
             let ctx_clone = ctx.clone();
             let handle = tokio::spawn(async move {
                 let op_id = ctx_clone.mint_id();
-                let exec = InvokeExecution::<String> {
+                let exec = InvokeExecution::<String, _, _, _> {
                     ctx: ctx_clone,
                     op_id,
                     name: None,
                     function_id: "fn".to_owned(),
-                    erased_input: Ok(serde_json::json!("x")),
-                    payload_serdes: None,
-                    result_serdes: None,
+                    input: serde_json::json!("x"),
+                    payload_serdes: crate::serdes::JsonSerdes,
+                    result_serdes: crate::serdes::JsonSerdes,
                     tenant_id: None,
                     _marker: PhantomData,
                 };
@@ -672,14 +619,14 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let exec = InvokeExecution::<Option<String>> {
+        let exec = InvokeExecution::<Option<String>, _, _, _> {
             ctx,
             op_id,
             name: None,
             function_id: "fn".to_owned(),
-            erased_input: Ok(serde_json::Value::Null),
-            payload_serdes: None,
-            result_serdes: None,
+            input: serde_json::Value::Null,
+            payload_serdes: crate::serdes::JsonSerdes,
+            result_serdes: crate::serdes::JsonSerdes,
             tenant_id: None,
             _marker: PhantomData,
         };
@@ -692,27 +639,22 @@ mod tests {
     async fn invoke_payload_serdes_applies_to_input() {
         use crate::client::InMemoryExecutionClient;
 
-        // Custom payload serdes uppercases input on serialization.
+        // Custom payload serdes uppercases the input on serialization.
         struct UpperPayload;
-        impl std::fmt::Debug for UpperPayload {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("UpperPayload")
-            }
-        }
-        impl Serdes for UpperPayload {
-            fn serialize(
+        impl Serdes<String> for UpperPayload {
+            async fn serialize(
                 &self,
-                value: &serde_json::Value,
-                _context: &SerdesContext,
+                value: String,
+                _context: SerdesContext,
             ) -> Result<String, crate::BoxError> {
-                Ok(value.to_string().to_uppercase())
+                Ok(serde_json::to_string(&value)?.to_uppercase())
             }
-            fn deserialize(
+            async fn deserialize(
                 &self,
-                data: &str,
-                _context: &SerdesContext,
-            ) -> Result<serde_json::Value, crate::BoxError> {
-                Ok(serde_json::from_str(data)?)
+                wire: String,
+                _context: SerdesContext,
+            ) -> Result<String, crate::BoxError> {
+                Ok(serde_json::from_str(&wire)?)
             }
         }
 
@@ -727,14 +669,14 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let exec = InvokeExecution::<String> {
+        let exec = InvokeExecution::<String, _, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: None,
             function_id: "target-fn".to_owned(),
-            erased_input: Ok(serde_json::json!("hello")),
-            payload_serdes: Some(Arc::new(UpperPayload)),
-            result_serdes: None,
+            input: "hello".to_owned(),
+            payload_serdes: UpperPayload,
+            result_serdes: crate::serdes::JsonSerdes,
             tenant_id: None,
             _marker: PhantomData,
         };
@@ -761,25 +703,20 @@ mod tests {
     async fn invoke_result_serdes_applies_to_output() {
         // Custom result serdes lowercases output on deserialization.
         struct LowerResult;
-        impl std::fmt::Debug for LowerResult {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("LowerResult")
-            }
-        }
-        impl Serdes for LowerResult {
-            fn serialize(
+        impl Serdes<String> for LowerResult {
+            async fn serialize(
                 &self,
-                value: &serde_json::Value,
-                _context: &SerdesContext,
+                value: String,
+                _context: SerdesContext,
             ) -> Result<String, crate::BoxError> {
-                Ok(value.to_string())
+                Ok(serde_json::to_string(&value)?)
             }
-            fn deserialize(
+            async fn deserialize(
                 &self,
-                data: &str,
-                _context: &SerdesContext,
-            ) -> Result<serde_json::Value, crate::BoxError> {
-                Ok(serde_json::from_str(&data.to_lowercase())?)
+                wire: String,
+                _context: SerdesContext,
+            ) -> Result<String, crate::BoxError> {
+                Ok(serde_json::from_str(&wire.to_lowercase())?)
             }
         }
 
@@ -808,14 +745,14 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let exec = InvokeExecution::<String> {
+        let exec = InvokeExecution::<String, _, _, _> {
             ctx,
             op_id,
             name: None,
             function_id: "fn".to_owned(),
-            erased_input: Ok(serde_json::Value::Null),
-            payload_serdes: None,
-            result_serdes: Some(Arc::new(LowerResult)),
+            input: serde_json::Value::Null,
+            payload_serdes: crate::serdes::JsonSerdes,
+            result_serdes: LowerResult,
             tenant_id: None,
             _marker: PhantomData,
         };
@@ -832,9 +769,14 @@ mod tests {
 
         // A custom `Serialize` that always fails.
         struct FailingSerialize;
-        impl Serialize for FailingSerialize {
+        impl serde::Serialize for FailingSerialize {
             fn serialize<S: Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
                 Err(S::Error::custom("boom: cannot serialize"))
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for FailingSerialize {
+            fn deserialize<D: serde::Deserializer<'de>>(_d: D) -> Result<Self, D::Error> {
+                Ok(Self)
             }
         }
 

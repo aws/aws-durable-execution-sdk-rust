@@ -95,7 +95,7 @@ pub use self::error::{
 };
 pub use self::future::{Branch, DurableFuture, Settled};
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
-pub use self::serdes::Serdes;
+pub use self::serdes::{JsonSerdes, Serdes};
 pub use self::step::StepSemantics;
 
 // Re-export rule: every foreign type in the public surface is re-exported.
@@ -696,10 +696,8 @@ where
 
     // Consume Options once, at wrap time. The execution client is resolved a
     // single time here and reused across every invocation (cold-start best
-    // practice); the execution-wide default serdes is threaded into each root
-    // context so operations that set no serdes of their own fall back to it.
+    // practice).
     let Options {
-        serdes,
         sdk_config,
         lambda_client,
         checkpoint_delay,
@@ -721,7 +719,6 @@ where
         });
     wrap_with_provider(
         handler,
-        serdes,
         ClientProvider::new(preset_client),
         checkpoint_buffer_window,
     )
@@ -733,8 +730,6 @@ where
 /// the exact production entry path (envelope parsing, bootstrap pagination,
 /// driver, wire-error mapping, response envelope) against a fake transport.
 ///
-/// The `default_serdes` plays the same role as [`Options::builder`]'s
-/// `serdes`: the execution-wide fallback for operations that set none.
 /// `checkpoint_buffer_window` mirrors the `checkpoint_delay` /
 /// `checkpoint_batching` options (`Some(window)` for a coalescing window,
 /// `Some(Duration::ZERO)` for pure batching, `None` for immediate writes),
@@ -743,7 +738,6 @@ where
 #[cfg(feature = "test-util")]
 pub(crate) fn wrap_with_execution_client<F, E, Fut, O>(
     handler: F,
-    default_serdes: Option<std::sync::Arc<dyn Serdes>>,
     exec_client: std::sync::Arc<dyn client::ExecutionClient>,
     checkpoint_buffer_window: Option<std::time::Duration>,
 ) -> impl Fn(lambda_runtime::LambdaEvent<serde_json::Value>) -> BoxedInvocationFuture + Send + Sync
@@ -755,7 +749,6 @@ where
 {
     wrap_with_provider(
         handler,
-        default_serdes,
         ClientProvider::new(Some(exec_client)),
         checkpoint_buffer_window,
     )
@@ -763,12 +756,11 @@ where
 
 /// Shared body of [`wrap`] and [`wrap_with_execution_client`]: builds the
 /// per-invocation service function on top of an already-resolved
-/// [`ClientProvider`] and execution-wide default serdes. Keeping a single
-/// body guarantees the `test-util` runner and production execute the same
-/// envelope parsing, pagination, driver, and error-mapping code.
+/// [`ClientProvider`]. Keeping a single body guarantees the `test-util`
+/// runner and production execute the same envelope parsing, pagination,
+/// driver, and error-mapping code.
 fn wrap_with_provider<F, E, Fut, O>(
     handler: F,
-    default_serdes: Option<std::sync::Arc<dyn Serdes>>,
     provider: ClientProvider,
     checkpoint_buffer_window: Option<std::time::Duration>,
 ) -> impl Fn(lambda_runtime::LambdaEvent<serde_json::Value>) -> BoxedInvocationFuture + Send + Sync
@@ -782,14 +774,12 @@ where
 
     let handler = StdArc::new(handler);
     let provider = StdArc::new(provider);
-    let default_serdes = StdArc::new(default_serdes);
 
     move |event: lambda_runtime::LambdaEvent<serde_json::Value>| -> std::pin::Pin<
         Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
     > {
         let handler = StdArc::clone(&handler);
         let provider = StdArc::clone(&provider);
-        let default_serdes = StdArc::clone(&default_serdes);
         Box::pin(async move {
             let (raw_payload, lambda_ctx) = event.into_parts();
 
@@ -837,7 +827,6 @@ where
                 checkpoint_log,
                 exec_client,
                 checkpoint_token,
-                (*default_serdes).clone(),
                 checkpoint_buffer_window,
             );
 

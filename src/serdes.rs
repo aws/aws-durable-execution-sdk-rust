@@ -1,257 +1,297 @@
 //! Serialization/deserialization abstraction.
 //!
-//! The [`Serdes`] trait is object-safe and provides the extension point for
-//! custom serialization formats. The default implementation uses
+//! The [`Serdes`] trait is generic over the operation's Rust type and
+//! provides the extension point for custom serialization formats. The
+//! default implementation, [`JsonSerdes`], renders compact JSON with
 //! `serde_json`.
+//!
+//! # Configuration model
+//!
+//! Serdes are configured **per operation**: every serdes-bearing builder
+//! carries its serdes implementation as a generic type parameter defaulting
+//! to [`JsonSerdes`], and its `.serdes(...)` method swaps that parameter.
+//! There is no execution-wide serdes slot — a single trait-object slot
+//! cannot represent `Serdes<T>` for every operation output type without
+//! erasing the value again. To share one instance across a handler, create
+//! an `Arc<S>` and clone it into each operation; `Arc<S>` forwards to `S`
+//! through a blanket implementation.
+//!
+//! # Scheduling contract
+//!
+//! The SDK awaits the future a serdes returns **directly on the executor
+//! thread** — it never wraps the call in another blocking task. Each
+//! implementation therefore decides where its work runs:
+//!
+//! - [`JsonSerdes`] (and other cheap in-memory codecs) perform their work
+//!   inline in the returned future, paying no scheduling hop.
+//! - [`FileSystemSerdes`] moves its complete serialization or
+//!   deserialization path into one [`tokio::task::spawn_blocking`] call per
+//!   invocation.
+//!
+//! Custom implementations must follow the same rule: do not perform
+//! blocking filesystem calls or long-running synchronous work on the
+//! executor thread — move that work into a blocking task instead.
 //!
 //! [`FileSystemSerdes`] stores values on a durable filesystem (EFS or S3
 //! Files mounted to Lambda), keeping checkpoint payloads small regardless
 //! of value size.
 
-use std::fmt::Debug;
+use std::future::Future;
 
-/// Object-safe serialization/deserialization trait.
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::BoxError;
+
+/// Typed, asynchronous serialization/deserialization extension point.
 ///
 /// Implement this trait to provide custom serialization formats for
-/// operation results. The default implementation uses `serde_json`.
+/// operation values. The trait is generic over `T`, the operation's actual
+/// Rust type: `serialize` receives the owned value and `deserialize`
+/// returns it, so a custom format sees the real type — struct field
+/// declaration order, `i128` values outside the `i64`/`u64` ranges, and
+/// anything else a lossy intermediate representation would drop.
 ///
-/// # Serialization model
+/// # Ownership
 ///
-/// A `Serdes` sits between the SDK's typed values and the checkpoint wire
-/// format. On the way out it receives the operation's value **erased to
-/// [`serde_json::Value`]** and returns the string to store on the wire; on
-/// the way back it receives that string and returns a [`serde_json::Value`],
-/// which the SDK deserializes into the target type.
+/// Both methods take owned inputs. Taking `value: T` (rather than `&T`)
+/// lets an implementation move the complete operation into a `'static`
+/// [`tokio::task::spawn_blocking`] closure, which is what preserves the
+/// SDK's `T: Send` output bound: a `Send` future that retained `&T` would
+/// require `T: Sync` instead. Operations round-trip successful values
+/// through the configured wire format before returning them, so
+/// transferring ownership to `serialize` loses nothing.
 ///
-/// This mirrors the Go, JavaScript, and Java SDKs, whose custom serdes also
-/// receive the value rather than pre-rendered JSON text.
+/// # Scheduling
 ///
-/// # One rule on every path
+/// The SDK awaits the returned future without wrapping it in another
+/// blocking task. Implementations must not perform blocking filesystem
+/// calls or long-running synchronous work on the executor thread; move
+/// such work into [`tokio::task::spawn_blocking`] (see
+/// [`FileSystemSerdes`], which does exactly this). Cheap transformations
+/// should run inline in the returned future (see [`JsonSerdes`]).
 ///
-/// Steps, invoke payloads, invoke results, callback payloads, child-context
-/// results, `wait_for_condition` state, individual map/parallel item results,
-/// and whole map/parallel batch results all hand the serdes the *same* shape:
-/// the [`serde_json::Value`] of the value being serialized. A `String` result
-/// of `X` arrives as `Value::String("X")` on every path — there is no
-/// per-path quoting rule to compensate for, so a type that implements this
-/// trait behaves identically wherever it is attached.
+/// # Type pairing
 ///
-/// ```
+/// A type-specific format implements `Serdes<ConcreteType>` directly and
+/// can only be attached to an operation producing that type — attaching it
+/// elsewhere fails at compile time. A type-agnostic format (a wire-format
+/// swap such as CBOR, or storage indirection such as
+/// [`FileSystemSerdes`]) implements `Serdes<T>` for all supported `T`
+/// through a blanket `impl`.
+///
+/// ```compile_fail,E0277
+/// use aws_durable_execution_sdk_rust as durable;
 /// use aws_durable_execution_sdk_rust::serdes::{Serdes, SerdesContext};
-/// use serde_json::Value;
 ///
-/// #[derive(Debug)]
-/// struct WrapSerdes;
+/// #[derive(serde::Serialize, serde::Deserialize)]
+/// struct Order { id: u64 }
 ///
-/// impl Serdes for WrapSerdes {
-///     fn serialize(
+/// struct OrderSerdes;
+///
+/// impl Serdes<Order> for OrderSerdes {
+///     async fn serialize(
 ///         &self,
-///         value: &Value,
-///         _context: &SerdesContext,
-///     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-///         // The value arrives typed — a string result is a `Value::String`,
-///         // so there is no JSON quoting to strip first.
-///         let raw = value.as_str().unwrap_or_default();
-///         Ok(format!("wrapped:{raw}"))
+///         value: Order,
+///         _context: SerdesContext,
+///     ) -> Result<String, durable::BoxError> {
+///         Ok(value.id.to_string())
 ///     }
 ///
-///     fn deserialize(
+///     async fn deserialize(
 ///         &self,
-///         data: &str,
-///         _context: &SerdesContext,
-///     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-///         let raw = data.strip_prefix("wrapped:").unwrap_or(data);
-///         Ok(Value::String(raw.to_owned()))
+///         wire: String,
+///         _context: SerdesContext,
+///     ) -> Result<Order, durable::BoxError> {
+///         Ok(Order { id: wire.parse()? })
 ///     }
 /// }
 ///
-/// let context = SerdesContext::new("step-1", "arn:test");
-/// let wire = WrapSerdes.serialize(&Value::String("X".to_owned()), &context)?;
-/// assert_eq!(wire, "wrapped:X");
-/// assert_eq!(
-///     WrapSerdes.deserialize(&wire, &context)?,
-///     Value::String("X".to_owned()),
-/// );
-/// # Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<String, durable::BoxError> {
+///     // ERROR: OrderSerdes implements `Serdes<Order>`, not `Serdes<String>`.
+///     let result: String = ctx
+///         .step(|_| async { Ok("not an order".to_owned()) })
+///         .serdes(OrderSerdes)
+///         .await?;
+///     Ok(result)
+/// }
 /// ```
-///
-/// # Object safety
-///
-/// This trait is deliberately object-safe so it can be stored as
-/// `Box<dyn Serdes>` in builders and options.
 ///
 /// # Examples
 ///
+/// A custom wire format over one concrete type. `async fn` in the trait
+/// implementation satisfies the `impl Future` return type:
+///
 /// ```
+/// use aws_durable_execution_sdk_rust::BoxError;
 /// use aws_durable_execution_sdk_rust::serdes::{Serdes, SerdesContext};
 ///
 /// struct UppercaseSerdes;
 ///
-/// impl std::fmt::Debug for UppercaseSerdes {
-///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-///         f.write_str("UppercaseSerdes")
+/// impl Serdes<String> for UppercaseSerdes {
+///     async fn serialize(
+///         &self,
+///         value: String,
+///         _context: SerdesContext,
+///     ) -> Result<String, BoxError> {
+///         Ok(value.to_uppercase())
+///     }
+///
+///     async fn deserialize(
+///         &self,
+///         wire: String,
+///         _context: SerdesContext,
+///     ) -> Result<String, BoxError> {
+///         Ok(wire.to_lowercase())
 ///     }
 /// }
 ///
-/// impl Serdes for UppercaseSerdes {
-///     fn serialize(
-///         &self,
-///         value: &serde_json::Value,
-///         _context: &SerdesContext,
-///     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-///         Ok(value.to_string().to_uppercase())
-///     }
-///
-///     fn deserialize(
-///         &self,
-///         data: &str,
-///         _context: &SerdesContext,
-///     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-///         Ok(serde_json::from_str(&data.to_lowercase())?)
-///     }
-/// }
-///
-/// let serdes: Box<dyn Serdes> = Box::new(UppercaseSerdes);
-/// # drop(serdes);
+/// # tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+/// let context = SerdesContext::new("step-1", "arn:test");
+/// let wire = UppercaseSerdes
+///     .serialize("hello".to_owned(), context.clone())
+///     .await?;
+/// assert_eq!(wire, "HELLO");
+/// assert_eq!(UppercaseSerdes.deserialize(wire, context).await?, "hello");
+/// # Ok::<(), BoxError>(())
+/// # }).unwrap();
 /// ```
-pub trait Serdes: Debug + Send + Sync {
-    /// Serializes a structured value to the string stored on the wire.
-    ///
-    /// `value` is the operation's value erased to [`serde_json::Value`]. The
-    /// default implementation renders compact JSON via `value.to_string()`.
-    /// Note that this may differ from what `serde_json::to_string` would
-    /// produce on the original typed value — struct field order may change
-    /// (without `preserve_order`), 128-bit integers outside i64/u64 range
-    /// cannot be represented in `Value`, and duplicate keys collapse.
+pub trait Serdes<T>: Send + Sync + 'static {
+    /// Serializes an owned value to the string stored on the wire.
     ///
     /// `context` carries the operation's wire ID and the execution ARN.
     /// Implementations that store data externally (e.g.
     /// [`FileSystemSerdes`]) use it for deterministic path resolution;
     /// implementations that do not need it can ignore it.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the transformation fails.
+    /// The returned future resolves to an error if the transformation
+    /// fails. The SDK awaits the future on the executor thread, so the
+    /// implementation must not block it (see the trait-level scheduling
+    /// contract).
     fn serialize(
         &self,
-        value: &serde_json::Value,
-        _context: &SerdesContext,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(value.to_string())
-    }
+        value: T,
+        context: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send;
 
-    /// Deserializes a wire string back into a structured value.
+    /// Deserializes a wire string back into the operation's value.
     ///
-    /// `data` is the string a previous [`serialize`](Serdes::serialize) call
-    /// returned (or, for callbacks, the payload an external caller delivered).
-    /// The returned [`serde_json::Value`] is deserialized into the target type
-    /// by the SDK, so no runtime downcast is involved.
+    /// `wire` is the string a previous [`serialize`](Serdes::serialize)
+    /// call returned (or, for callbacks, the payload an external caller
+    /// delivered).
     ///
-    /// The default implementation parses `data` as JSON.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the transformation fails.
+    /// The returned future resolves to an error if the transformation
+    /// fails. The SDK awaits the future on the executor thread, so the
+    /// implementation must not block it (see the trait-level scheduling
+    /// contract).
     fn deserialize(
         &self,
-        data: &str,
-        _context: &SerdesContext,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(serde_json::from_str(data)?)
+        wire: String,
+        context: SerdesContext,
+    ) -> impl Future<Output = Result<T, BoxError>> + Send;
+}
+
+/// Forwards to the inner implementation, so one instance can be shared
+/// across operations (and output types) without erasing `T`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk_rust::serdes::FileSystemSerdes;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<u32, durable::BoxError> {
+///     let shared = Arc::new(FileSystemSerdes::new("/mnt/efs"));
+///     let a: String = ctx
+///         .step(|_| async { Ok("large".to_owned()) })
+///         .serdes(Arc::clone(&shared))
+///         .await?;
+///     let b: u32 = ctx
+///         .step(|_| async { Ok(42_u32) })
+///         .serdes(shared)
+///         .await?;
+///     let _ = a;
+///     Ok(b)
+/// }
+/// ```
+impl<T, S> Serdes<T> for std::sync::Arc<S>
+where
+    S: Serdes<T> + ?Sized,
+{
+    fn serialize(
+        &self,
+        value: T,
+        context: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
+        self.as_ref().serialize(value, context)
+    }
+
+    fn deserialize(
+        &self,
+        wire: String,
+        context: SerdesContext,
+    ) -> impl Future<Output = Result<T, BoxError>> + Send {
+        self.as_ref().deserialize(wire, context)
     }
 }
 
 // ============================================================
-// Off-runtime invocation helpers
+// JsonSerdes
 // ============================================================
 
-/// Runs a custom serdes `serialize` on the blocking thread pool.
+/// The default serdes: compact JSON via `serde_json`.
 ///
-/// The `Serdes` trait is sync, but implementations like [`FileSystemSerdes`]
-/// perform filesystem I/O that can stall for arbitrarily long on network
-/// mounts (EFS, S3 Files). Every async call site in the SDK routes custom
-/// serdes invocations through `tokio::task::spawn_blocking` so that a slow
-/// serialize never blocks an executor thread.
+/// Implements [`Serdes<T>`] for every `T` that is `Serialize +
+/// DeserializeOwned + Send + 'static`, so a builder that never calls
+/// `.serdes(...)` needs no configuration and no type annotation.
 ///
-/// A `JoinError` (the blocking task panicked or was cancelled at runtime
-/// shutdown) is mapped to an ordinary error — it never panics the caller.
-pub(crate) async fn serialize_off_runtime(
-    serdes: &std::sync::Arc<dyn Serdes>,
-    value: serde_json::Value,
-    serdes_ctx: &SerdesContext,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let serdes = std::sync::Arc::clone(serdes);
-    let serdes_ctx = serdes_ctx.clone();
-    tokio::task::spawn_blocking(move || serdes.serialize(&value, &serdes_ctx))
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("serdes serialize task did not complete: {e}").into()
-        })?
-}
+/// Serialization and deserialization run **inline** in the returned
+/// future — an in-memory JSON transform is cheap, so it pays no
+/// `spawn_blocking` scheduling hop.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::BoxError;
+/// use aws_durable_execution_sdk_rust::serdes::{JsonSerdes, Serdes, SerdesContext};
+///
+/// # tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+/// let context = SerdesContext::new("step-1", "arn:test");
+/// let wire = JsonSerdes.serialize(vec![1_u32, 2, 3], context.clone()).await?;
+/// assert_eq!(wire, "[1,2,3]");
+/// let back: Vec<u32> = JsonSerdes.deserialize(wire, context).await?;
+/// assert_eq!(back, vec![1, 2, 3]);
+/// # Ok::<(), BoxError>(())
+/// # }).unwrap();
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JsonSerdes;
 
-/// Runs a custom serdes `deserialize` on the blocking thread pool.
-///
-/// See [`serialize_off_runtime`] for why: sync serdes implementations may
-/// block on filesystem I/O, which must not run on the async executor.
-///
-/// A `JoinError` (the blocking task panicked or was cancelled at runtime
-/// shutdown) is mapped to an ordinary error — it never panics the caller.
-pub(crate) async fn deserialize_off_runtime(
-    serdes: &std::sync::Arc<dyn Serdes>,
-    data: String,
-    serdes_ctx: &SerdesContext,
-) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let serdes = std::sync::Arc::clone(serdes);
-    let serdes_ctx = serdes_ctx.clone();
-    tokio::task::spawn_blocking(move || serdes.deserialize(&data, &serdes_ctx))
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("serdes deserialize task did not complete: {e}").into()
-        })?
-}
-
-/// A value prepared for the wire: either already-rendered JSON (no custom
-/// serdes) or the erased [`serde_json::Value`] awaiting a custom serdes.
-///
-/// The two-phase split exists for `Send` reasons: preparation borrows the
-/// typed `&O` value and runs synchronously, so the borrow ends before any
-/// `.await`. The async completion phase ([`PreparedValue::into_wire`]) then
-/// owns everything it touches — otherwise every operation future would
-/// require `O: Sync` just to hold `&O` across the `spawn_blocking` await.
-pub(crate) enum PreparedValue<'a> {
-    /// Default path: the wire string is already rendered by `serde_json`.
-    Wire(String),
-    /// Custom path: the erased value plus the serdes that will render it.
-    Erased(serde_json::Value, &'a std::sync::Arc<dyn Serdes>),
-}
-
-/// Prepares a typed value for the wire, consuming the `&O` borrow now.
-///
-/// With no serdes this renders compact JSON directly from the typed value
-/// (`serde_json::to_string`), preserving the historical default-path bytes.
-/// With a custom serdes it erases to [`serde_json::Value`], to be completed
-/// off-runtime by [`PreparedValue::into_wire`].
-pub(crate) fn prepare_value<'a, O: serde::Serialize>(
-    serdes: Option<&'a std::sync::Arc<dyn Serdes>>,
-    value: &O,
-) -> Result<PreparedValue<'a>, serde_json::Error> {
-    match serdes {
-        None => serde_json::to_string(value).map(PreparedValue::Wire),
-        Some(s) => serde_json::to_value(value).map(|v| PreparedValue::Erased(v, s)),
+impl<T> Serdes<T> for JsonSerdes
+where
+    T: Serialize + DeserializeOwned + Send + 'static,
+{
+    fn serialize(
+        &self,
+        value: T,
+        _context: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
+        std::future::ready(serde_json::to_string(&value).map_err(Into::into))
     }
-}
 
-impl PreparedValue<'_> {
-    /// Completes preparation: returns the wire string, invoking a custom
-    /// serdes on the blocking thread pool when one is attached.
-    pub(crate) async fn into_wire(
-        self,
-        serdes_ctx: &SerdesContext,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        match self {
-            Self::Wire(wire) => Ok(wire),
-            Self::Erased(value, serdes) => serialize_off_runtime(serdes, value, serdes_ctx).await,
-        }
+    fn deserialize(
+        &self,
+        wire: String,
+        _context: SerdesContext,
+    ) -> impl Future<Output = Result<T, BoxError>> + Send {
+        std::future::ready(serde_json::from_str(&wire).map_err(Into::into))
     }
 }
 
@@ -469,15 +509,23 @@ impl FileSystemSerdesConfigBuilder {
 /// On replay, a different environment may be used and the file will not
 /// be found. Use only with a durable, shared filesystem (EFS or S3 Files).
 ///
-/// # Blocking I/O
+/// # Blocking I/O and Tokio runtime requirement
 ///
-/// [`serialize`](Serdes::serialize) and [`deserialize`](Serdes::deserialize)
-/// perform synchronous `std::fs` I/O, which can stall for arbitrarily long
-/// on a network mount. When the SDK invokes a serdes from its async
-/// operation paths it routes the call through
-/// `tokio::task::spawn_blocking`, so the executor is never blocked. If you
-/// call these methods directly from your own async code, apply the same
-/// treatment rather than calling them inline on the runtime.
+/// Each [`serialize`](Serdes::serialize) or [`deserialize`](Serdes::deserialize)
+/// call moves its **entire** implementation — JSON rendering or parsing,
+/// hashing, path validation and canonicalization, directory creation, and
+/// the file read or write — into one [`tokio::task::spawn_blocking`] task,
+/// so no blocking filesystem operation ever runs on the executor thread
+/// and each call pays exactly one blocking-pool hop. Related filesystem
+/// operations are deliberately batched into that single task rather than
+/// issued through individual `tokio::fs` helpers (each of which would
+/// spawn its own blocking task).
+///
+/// Because of this, the returned futures must be awaited **inside a Tokio
+/// runtime**; awaiting them elsewhere panics in `spawn_blocking`. A
+/// blocking-task join failure (the task panicked or the runtime shut
+/// down) is mapped to an ordinary [`BoxError`] rather than propagating a
+/// panic.
 ///
 /// # Envelope format
 ///
@@ -551,26 +599,22 @@ impl FileSystemSerdes {
         }
     }
 
-    /// Serializes a value to the filesystem envelope format.
+    /// Serializes a value to the filesystem envelope format (synchronous).
     ///
-    /// Returns the envelope JSON string to be stored in the checkpoint.
-    /// The `context` provides the operation identity for path resolution.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if directory creation or file writing fails.
-    pub fn serialize_with_context(
+    /// This is the complete serialization path — JSON rendering, path
+    /// resolution, directory creation, and the file write. The
+    /// [`Serdes`] implementation runs it inside one
+    /// [`tokio::task::spawn_blocking`] task.
+    fn serialize_sync<T: Serialize>(
         &self,
-        value: &serde_json::Value,
+        value: &T,
         context: &SerdesContext,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let json_str = serde_json::to_string(value).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "failed to render value as JSON: {e}"
-                )))
-            },
-        )?;
+    ) -> Result<String, BoxError> {
+        let json_str = serde_json::to_string(value).map_err(|e| -> BoxError {
+            Box::new(FileSystemSerdesError::new(format!(
+                "failed to render value as JSON: {e}"
+            )))
+        })?;
         match self.config.storage_mode {
             FileSystemSerdesMode::Always => {
                 let file_path = self.write_to_file(&json_str, context)?;
@@ -578,9 +622,10 @@ impl FileSystemSerdes {
                 Ok(format!(r#"{{"file":"{escaped_path}"}}"#))
             }
             FileSystemSerdesMode::Overflow => {
-                // The value is always valid JSON (it came from a `Value`), so
-                // it can be embedded directly in the `{"data":...}` envelope.
-                // No sniffing, and no `{"raw":...}` variant to fall back to.
+                // `json_str` is valid JSON (it came straight from
+                // `serde_json::to_string`), so it can be embedded directly in
+                // the `{"data":...}` envelope. No sniffing, and no
+                // `{"raw":...}` variant to fall back to.
                 let inline_envelope = format!(r#"{{"data":{json_str}}}"#);
                 if inline_envelope.len() > self.config.overflow_threshold_bytes {
                     let file_path = self.write_to_file(&json_str, context)?;
@@ -593,55 +638,71 @@ impl FileSystemSerdes {
         }
     }
 
-    /// Deserializes from the filesystem envelope format.
+    /// Deserializes from the filesystem envelope format (synchronous).
     ///
-    /// Reads from the file if the envelope contains a file pointer,
-    /// otherwise extracts inline data.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the envelope is malformed or the referenced
-    /// file cannot be read.
-    pub fn deserialize_with_context(
+    /// This is the complete deserialization path — envelope parsing, the
+    /// file read, and JSON parsing into `T`. The [`Serdes`] implementation
+    /// runs it inside one [`tokio::task::spawn_blocking`] task.
+    #[allow(clippy::unused_self)] // reason: kept as a method for parity with serialize_sync
+    fn deserialize_sync<T: DeserializeOwned>(
         &self,
         envelope: &str,
         _context: &SerdesContext,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        // Parse the envelope to determine storage location.
-        // Envelope is: {"file":"<path>"} or {"data":<json>}
-        let parsed: serde_json::Value = serde_json::from_str(envelope).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "invalid envelope JSON: {e}"
-                )))
-            },
-        )?;
+    ) -> Result<T, BoxError> {
+        /// Envelope shape: `{"file":"<path>"}`, `{"data":<json>}`, or the
+        /// legacy `{"raw":"<string>"}`. `RawValue` keeps the inline data as
+        /// unparsed JSON text so `T` is parsed straight from the wire bytes
+        /// with no intermediate DOM.
+        #[derive(serde::Deserialize)]
+        struct Envelope<'a> {
+            #[serde(borrow)]
+            file: Option<std::borrow::Cow<'a, str>>,
+            #[serde(borrow)]
+            data: Option<&'a serde_json::value::RawValue>,
+            raw: Option<String>,
+        }
 
-        if let Some(file_path) = parsed.get("file").and_then(serde_json::Value::as_str) {
+        let parsed: Envelope<'_> = serde_json::from_str(envelope).map_err(|e| -> BoxError {
+            Box::new(FileSystemSerdesError::new(format!(
+                "invalid envelope JSON: {e}"
+            )))
+        })?;
+
+        if let Some(file_path) = parsed.file.as_deref() {
             // File pointer: read from file.
-            let contents = std::fs::read_to_string(file_path).map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(FileSystemSerdesError::new(format!(
-                        "failed to read file '{file_path}': {e}"
-                    )))
-                },
-            )?;
-            serde_json::from_str(&contents).map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(FileSystemSerdesError::new(format!(
-                        "invalid JSON in file '{file_path}': {e}"
-                    )))
-                },
-            )
-        } else if let Some(raw) = parsed.get("raw").and_then(serde_json::Value::as_str) {
-            // Legacy inline envelope. The writer no longer produces `{"raw":..}`
-            // (a `Value` is always embeddable under `"data"`), but executions
-            // checkpointed by an earlier version may still contain one, so the
-            // read path keeps handling it.
-            Ok(serde_json::Value::String(raw.to_owned()))
-        } else if let Some(data) = parsed.get("data") {
-            // Inline data: the "data" field holds the value verbatim.
-            Ok(data.clone())
+            let contents = std::fs::read_to_string(file_path).map_err(|e| -> BoxError {
+                Box::new(FileSystemSerdesError::new(format!(
+                    "failed to read file '{file_path}': {e}"
+                )))
+            })?;
+            serde_json::from_str(&contents).map_err(|e| -> BoxError {
+                Box::new(FileSystemSerdesError::new(format!(
+                    "invalid JSON in file '{file_path}': {e}"
+                )))
+            })
+        } else if let Some(data) = parsed.data {
+            // Inline data: the "data" field holds the value's JSON verbatim.
+            serde_json::from_str(data.get()).map_err(|e| -> BoxError {
+                Box::new(FileSystemSerdesError::new(format!(
+                    "invalid inline data in envelope: {e}"
+                )))
+            })
+        } else if let Some(raw) = parsed.raw {
+            // Legacy inline envelope. The writer no longer produces
+            // `{"raw":..}`, but executions checkpointed by an earlier version
+            // may still contain one, so the read path keeps handling it. The
+            // raw form stored the value as a plain string; re-encode it as a
+            // JSON string literal and parse `T` from that.
+            let as_json = serde_json::to_string(&raw).map_err(|e| -> BoxError {
+                Box::new(FileSystemSerdesError::new(format!(
+                    "failed to re-encode legacy raw envelope: {e}"
+                )))
+            })?;
+            serde_json::from_str(&as_json).map_err(|e| -> BoxError {
+                Box::new(FileSystemSerdesError::new(format!(
+                    "invalid legacy raw data in envelope: {e}"
+                )))
+            })
         } else {
             Err(Box::new(FileSystemSerdesError::new(
                 "envelope contains neither 'file' nor 'data' field".to_owned(),
@@ -774,32 +835,52 @@ impl FileSystemSerdes {
     }
 }
 
-/// # Context-Aware Engine Wiring
+/// One blocking-pool hop per call, containing the entire implementation.
 ///
-/// The engine calls [`Serdes::serialize`] and [`Serdes::deserialize`] at every
-/// serialization point, passing a [`SerdesContext`] with the operation's wire
-/// ID and execution ARN. `FileSystemSerdes` implements them by delegating to
-/// [`serialize_with_context`](FileSystemSerdes::serialize_with_context) and
-/// [`deserialize_with_context`](FileSystemSerdes::deserialize_with_context),
-/// enabling deterministic file-path resolution.
+/// The engine calls [`Serdes::serialize`] and [`Serdes::deserialize`] at
+/// every serialization point, passing a [`SerdesContext`] with the
+/// operation's wire ID and execution ARN for deterministic file-path
+/// resolution. Each call moves the complete synchronous path — including
+/// JSON rendering or parsing — into a single
+/// [`tokio::task::spawn_blocking`] task, so the executor thread never
+/// touches the filesystem. Blocking-task join failures are mapped to
+/// [`BoxError`].
 ///
-/// There is no context-free fallback: both trait methods carry the context, so
-/// there is no path on which `FileSystemSerdes` silently declines to persist.
-impl Serdes for FileSystemSerdes {
+/// There is no context-free fallback: both trait methods carry the
+/// context, so there is no path on which `FileSystemSerdes` silently
+/// declines to persist.
+impl<T> Serdes<T> for FileSystemSerdes
+where
+    T: Serialize + DeserializeOwned + Send + 'static,
+{
     fn serialize(
         &self,
-        value: &serde_json::Value,
-        context: &SerdesContext,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.serialize_with_context(value, context)
+        value: T,
+        context: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
+        let this = self.clone();
+        async move {
+            tokio::task::spawn_blocking(move || this.serialize_sync(&value, &context))
+                .await
+                .map_err(|e| -> BoxError {
+                    format!("filesystem serdes serialize task did not complete: {e}").into()
+                })?
+        }
     }
 
     fn deserialize(
         &self,
-        data: &str,
-        context: &SerdesContext,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        self.deserialize_with_context(data, context)
+        wire: String,
+        context: SerdesContext,
+    ) -> impl Future<Output = Result<T, BoxError>> + Send {
+        let this = self.clone();
+        async move {
+            tokio::task::spawn_blocking(move || this.deserialize_sync(&wire, &context))
+                .await
+                .map_err(|e| -> BoxError {
+                    format!("filesystem serdes deserialize task did not complete: {e}").into()
+                })?
+        }
     }
 }
 
@@ -991,10 +1072,12 @@ fn path_clean(path: &str) -> String {
 /// The point of the shared types is that ONE `Serdes` implementation must
 /// behave identically on every operation path — step results, invoke payloads,
 /// callback payloads, child results, and map/parallel item and batch results —
-/// now that all of them hand the serdes the same [`serde_json::Value`].
+/// now that all of them hand the serdes the operation's typed value directly.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{Serdes, SerdesContext};
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
     use std::sync::{Arc, Mutex};
 
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -1004,29 +1087,25 @@ pub(crate) mod test_support {
     ///
     /// Two properties make this useful as a probe:
     ///
-    /// 1. It receives the typed value as a [`serde_json::Value`], so it needs
-    ///    no per-path decoding to find the payload.
+    /// 1. It receives the operation's typed value directly, so it exercises
+    ///    the generic (blanket-`impl`) shape a type-agnostic custom serdes
+    ///    uses.
     /// 2. Plain `serde_json` cannot parse a `HEX1:`-prefixed payload, so a
     ///    successful round-trip proves the transform was actually applied and
     ///    reversed rather than incidentally bypassed by a JSON-only path.
     #[derive(Debug)]
     pub(crate) struct HexEnvelopeSerdes;
 
-    impl Serdes for HexEnvelopeSerdes {
-        fn serialize(
-            &self,
-            value: &serde_json::Value,
-            _context: &SerdesContext,
-        ) -> Result<String, BoxError> {
-            Ok(hex_envelope(&value.to_string()))
+    impl<T> Serdes<T> for HexEnvelopeSerdes
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+    {
+        async fn serialize(&self, value: T, _context: SerdesContext) -> Result<String, BoxError> {
+            Ok(hex_envelope(&serde_json::to_string(&value)?))
         }
 
-        fn deserialize(
-            &self,
-            data: &str,
-            _context: &SerdesContext,
-        ) -> Result<serde_json::Value, BoxError> {
-            Ok(serde_json::from_str(&hex_decode(data)?)?)
+        async fn deserialize(&self, wire: String, _context: SerdesContext) -> Result<T, BoxError> {
+            Ok(serde_json::from_str(&hex_decode(&wire)?)?)
         }
     }
 
@@ -1068,10 +1147,11 @@ pub(crate) mod test_support {
     /// A `HexEnvelopeSerdes` that also records every value the engine hands it.
     ///
     /// Where `HexEnvelopeSerdes` pins the wire form a path *produces*, this
-    /// pins the shape a path *provides*: the exact [`serde_json::Value`] passed
-    /// to [`Serdes::serialize`] and the exact `Value` returned from
-    /// [`Serdes::deserialize`]. It keeps the non-JSON hex wire form, so a path
-    /// that bypassed the transform would fail rather than quietly pass.
+    /// pins the shape a path *provides*: the JSON rendering of the typed value
+    /// passed to [`Serdes::serialize`] and of the value returned from
+    /// [`Serdes::deserialize`] (recorded as parsed [`serde_json::Value`]s for
+    /// order-insensitive assertions). It keeps the non-JSON hex wire form, so
+    /// a path that bypassed the transform would fail rather than quietly pass.
     ///
     /// Cloning shares the recording buffers, so a clone can be attached to an
     /// operation while the original is inspected.
@@ -1116,28 +1196,24 @@ pub(crate) mod test_support {
         }
     }
 
-    impl Serdes for RecordingSerdes {
-        fn serialize(
-            &self,
-            value: &serde_json::Value,
-            _context: &SerdesContext,
-        ) -> Result<String, BoxError> {
+    impl<T> Serdes<T> for RecordingSerdes
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+    {
+        async fn serialize(&self, value: T, _context: SerdesContext) -> Result<String, BoxError> {
+            let json = serde_json::to_string(&value)?;
             if let Ok(mut seen) = self.serialize_inputs.lock() {
-                seen.push(value.clone());
+                seen.push(serde_json::from_str(&json)?);
             }
-            Ok(hex_envelope(&value.to_string()))
+            Ok(hex_envelope(&json))
         }
 
-        fn deserialize(
-            &self,
-            data: &str,
-            _context: &SerdesContext,
-        ) -> Result<serde_json::Value, BoxError> {
-            let value: serde_json::Value = serde_json::from_str(&hex_decode(data)?)?;
+        async fn deserialize(&self, wire: String, _context: SerdesContext) -> Result<T, BoxError> {
+            let json = hex_decode(&wire)?;
             if let Ok(mut seen) = self.deserialize_outputs.lock() {
-                seen.push(value.clone());
+                seen.push(serde_json::from_str(&json)?);
             }
-            Ok(value)
+            Ok(serde_json::from_str(&json)?)
         }
     }
 }
@@ -1197,7 +1273,7 @@ mod tests {
 
         let input = serde_json::json!({"value": 42, "name": "test"});
         let envelope = serdes
-            .serialize_with_context(&input, &ctx)
+            .serialize_sync(&input, &ctx)
             .expect("serialize should succeed");
 
         // Envelope should be a file pointer
@@ -1206,7 +1282,7 @@ mod tests {
 
         // Deserialize should return the original value
         let output = serdes
-            .deserialize_with_context(&envelope, &ctx)
+            .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
             .expect("deserialize should succeed");
         assert_eq!(output, input);
 
@@ -1232,7 +1308,7 @@ mod tests {
 
         let small = serde_json::json!({"x": 1});
         let envelope = serdes
-            .serialize_with_context(&small, &ctx)
+            .serialize_sync(&small, &ctx)
             .expect("serialize should succeed");
 
         // Small value should be inline
@@ -1241,7 +1317,7 @@ mod tests {
 
         // Deserialize returns the original
         let output = serdes
-            .deserialize_with_context(&envelope, &ctx)
+            .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
             .expect("deserialize should succeed");
         assert_eq!(output, small);
 
@@ -1268,7 +1344,7 @@ mod tests {
         let large =
             serde_json::json!({"big": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"});
         let envelope = serdes
-            .serialize_with_context(&large, &ctx)
+            .serialize_sync(&large, &ctx)
             .expect("serialize should succeed");
 
         // Large value should overflow to file
@@ -1276,7 +1352,7 @@ mod tests {
 
         // Deserialize reads from file
         let output = serdes
-            .deserialize_with_context(&envelope, &ctx)
+            .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
             .expect("deserialize should succeed");
         assert_eq!(output, large);
 
@@ -1299,7 +1375,7 @@ mod tests {
 
         let value = serde_json::json!("hello");
         let envelope = serdes
-            .serialize_with_context(&value, &ctx)
+            .serialize_sync(&value, &ctx)
             .expect("serialize should succeed");
 
         // File path should use SHA-256 hashes (64 hex chars)
@@ -1312,7 +1388,7 @@ mod tests {
 
         // Round-trip
         let output = serdes
-            .deserialize_with_context(&envelope, &ctx)
+            .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
             .expect("deserialize should succeed");
         assert_eq!(output, value);
 
@@ -1328,7 +1404,7 @@ mod tests {
         };
 
         let envelope = r#"{"file":"/nonexistent/path/does-not-exist.json"}"#;
-        let result = serdes.deserialize_with_context(envelope, &ctx);
+        let result = serdes.deserialize_sync::<serde_json::Value>(envelope, &ctx);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("failed to read file"), "err: {err_msg}");
@@ -1348,7 +1424,7 @@ mod tests {
         };
 
         let envelope = serdes
-            .serialize_with_context(&serde_json::json!(42), &ctx)
+            .serialize_sync(&serde_json::json!(42), &ctx)
             .expect("serialize");
 
         // Parse the envelope and verify its structure
@@ -1380,7 +1456,7 @@ mod tests {
         };
 
         let envelope = serdes
-            .serialize_with_context(&serde_json::json!("data"), &ctx)
+            .serialize_sync(&serde_json::json!("data"), &ctx)
             .expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
         let path = parsed.get("file").and_then(|v| v.as_str()).unwrap();
@@ -1407,19 +1483,19 @@ mod tests {
 
         // Inline envelope: the value is returned verbatim, not re-rendered.
         let result = serdes
-            .deserialize_with_context(r#"{"data":"hello"}"#, &ctx)
+            .deserialize_sync::<serde_json::Value>(r#"{"data":"hello"}"#, &ctx)
             .expect("should parse inline");
         assert_eq!(result, serde_json::json!("hello"));
 
         let result = serdes
-            .deserialize_with_context(r#"{"data":{"value":42}}"#, &ctx)
+            .deserialize_sync::<serde_json::Value>(r#"{"data":{"value":42}}"#, &ctx)
             .expect("should parse inline object");
         assert_eq!(result, serde_json::json!({"value": 42}));
 
         // Neither 'file' nor 'data': a loud error, never a silent passthrough.
         assert!(
             serdes
-                .deserialize_with_context(r#"{"value":42}"#, &ctx)
+                .deserialize_sync::<serde_json::Value>(r#"{"value":42}"#, &ctx)
                 .is_err()
         );
 
@@ -1437,7 +1513,7 @@ mod tests {
         let ctx = SerdesContext::new("op", "arn:test");
 
         let result = serdes
-            .deserialize_with_context(r#"{"raw":"not json at all"}"#, &ctx)
+            .deserialize_sync::<serde_json::Value>(r#"{"raw":"not json at all"}"#, &ctx)
             .expect("legacy raw envelope must still be readable");
         assert_eq!(result, serde_json::Value::String("not json at all".into()));
     }
@@ -1458,13 +1534,11 @@ mod tests {
 
         // A bare string is the case that previously took the {"raw":...} arm.
         let value = serde_json::json!("plain text");
-        let envelope = serdes
-            .serialize_with_context(&value, &ctx)
-            .expect("serialize");
+        let envelope = serdes.serialize_sync(&value, &ctx).expect("serialize");
         assert_eq!(envelope, r#"{"data":"plain text"}"#);
         assert_eq!(
             serdes
-                .deserialize_with_context(&envelope, &ctx)
+                .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
                 .expect("deserialize"),
             value
         );
@@ -1489,14 +1563,12 @@ mod tests {
         // First invocation: serialize
         let serdes1 = FileSystemSerdes::new(base.clone());
         let input = serde_json::json!({"items": [1, 2, 3]});
-        let envelope = serdes1
-            .serialize_with_context(&input, &ctx)
-            .expect("serialize");
+        let envelope = serdes1.serialize_sync(&input, &ctx).expect("serialize");
 
         // Second invocation (replay): deserialize from a fresh instance
         let serdes2 = FileSystemSerdes::new(base);
         let output = serdes2
-            .deserialize_with_context(&envelope, &ctx)
+            .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
             .expect("deserialize on replay");
         assert_eq!(output, input);
 
@@ -1532,7 +1604,7 @@ mod tests {
 
         let input = serde_json::json!({"value": "test"});
         let envelope = serdes
-            .serialize_with_context(&input, &ctx)
+            .serialize_sync(&input, &ctx)
             .expect("serialize should succeed");
 
         // The envelope must be valid JSON
@@ -1542,25 +1614,24 @@ mod tests {
 
         // And round-trips back
         let output = serdes
-            .deserialize_with_context(&envelope, &ctx)
+            .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
             .expect("deserialize should succeed");
         assert_eq!(output, input);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // ── Engine-wiring tests: context-aware path activates via trait methods ──
+    // ── Engine-wiring tests: the generic async trait drives the file path ──
 
-    #[test]
-    fn serialize_via_trait_writes_file() {
-        // Proves that calling the trait method `Serdes::serialize` on a
-        // `Box<dyn Serdes>` holding a FileSystemSerdes activates the
-        // context-aware file-writing path (the engine code path).
+    /// `Serdes::serialize` on `FileSystemSerdes` activates the context-aware
+    /// file-writing path (the engine code path) through one blocking task.
+    #[tokio::test]
+    async fn serialize_via_trait_writes_file() {
         let tmp = std::env::temp_dir().join("fs_serdes_trait_ctx_ser");
         let _ = std::fs::remove_dir_all(&tmp);
         let base = tmp.to_string_lossy().to_string();
 
-        let serdes: Box<dyn Serdes> = Box::new(FileSystemSerdes::new(base.clone()));
+        let serdes = FileSystemSerdes::new(base.clone());
         let ctx = SerdesContext::new(
             "step-result-1",
             "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/exec-1/inv-1",
@@ -1568,7 +1639,8 @@ mod tests {
 
         let input = serde_json::json!({"total": 42});
         let envelope = serdes
-            .serialize(&input, &ctx)
+            .serialize(input, ctx)
+            .await
             .expect("Serdes::serialize should succeed");
 
         // The envelope must be a file pointer.
@@ -1591,15 +1663,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
-    fn deserialize_via_trait_reads_file() {
-        // Proves that calling the trait method `Serdes::deserialize` on a
-        // `Box<dyn Serdes>` holding a FileSystemSerdes reads from the file.
+    /// `Serdes::deserialize` on `FileSystemSerdes` reads back what
+    /// `Serdes::serialize` wrote, through the same generic trait surface.
+    #[tokio::test]
+    async fn deserialize_via_trait_reads_file() {
         let tmp = std::env::temp_dir().join("fs_serdes_trait_ctx_deser");
         let _ = std::fs::remove_dir_all(&tmp);
         let base = tmp.to_string_lossy().to_string();
 
-        let serdes: Box<dyn Serdes> = Box::new(FileSystemSerdes::new(base.clone()));
+        let serdes = FileSystemSerdes::new(base.clone());
         let ctx = SerdesContext::new(
             "op-deser-1",
             "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/exec-1/inv-1",
@@ -1607,11 +1679,15 @@ mod tests {
 
         // Write via the trait.
         let input = serde_json::json!({"key": "value"});
-        let envelope = serdes.serialize(&input, &ctx).expect("serialize");
+        let envelope = serdes
+            .serialize(input.clone(), ctx.clone())
+            .await
+            .expect("serialize");
 
-        // Read back via the trait (same Box<dyn Serdes>).
-        let output = serdes
-            .deserialize(&envelope, &ctx)
+        // Read back via the trait (same instance).
+        let output: serde_json::Value = serdes
+            .deserialize(envelope, ctx)
+            .await
             .expect("Serdes::deserialize should succeed");
         assert_eq!(output, input);
 
@@ -1622,83 +1698,259 @@ mod tests {
     /// only the two value methods, and its transform must be exactly
     /// reversible. It is the fixture the operation-path equivalence tests
     /// depend on, so it gets its own round-trip check.
-    #[test]
-    fn hex_envelope_probe_serdes_round_trips() {
+    #[tokio::test]
+    async fn hex_envelope_probe_serdes_round_trips() {
         use super::test_support::{HexEnvelopeSerdes, hex_envelope_of};
 
-        let serdes: Box<dyn Serdes> = Box::new(HexEnvelopeSerdes);
         let ctx = SerdesContext::new("op-1", "arn:test");
 
         let value = serde_json::json!({"label": "a\"b\\c\nd ☃", "nested": [[1, -2], []]});
-        let wire = serdes.serialize(&value, &ctx).expect("serialize");
+        let wire = HexEnvelopeSerdes
+            .serialize(value.clone(), ctx.clone())
+            .await
+            .expect("serialize");
         assert_eq!(wire, hex_envelope_of(&value));
         // The wire form must not be parseable as JSON — that is what makes it
         // a useful probe for "was the transform actually applied?".
         assert!(serde_json::from_str::<serde_json::Value>(&wire).is_err());
 
-        let back = serdes.deserialize(&wire, &ctx).expect("deserialize");
+        let back: serde_json::Value = HexEnvelopeSerdes
+            .deserialize(wire, ctx.clone())
+            .await
+            .expect("deserialize");
         assert_eq!(back, value);
 
         // A payload that never went through the transform must be rejected
         // rather than silently passed through.
-        assert!(serdes.deserialize(&value.to_string(), &ctx).is_err());
+        assert!(
+            Serdes::<serde_json::Value>::deserialize(&HexEnvelopeSerdes, value.to_string(), ctx)
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn default_trait_methods_are_plain_json() {
-        // A serdes that overrides nothing must behave exactly like plain
-        // `serde_json`: compact rendering out, JSON parse in.
-        #[derive(Debug)]
-        struct Passthrough;
-        impl Serdes for Passthrough {}
-
-        let serdes: Box<dyn Serdes> = Box::new(Passthrough);
+    /// `JsonSerdes` behaves exactly like plain `serde_json`: compact
+    /// rendering out, JSON parse in.
+    #[tokio::test]
+    async fn json_serdes_is_plain_json() {
         let ctx = SerdesContext::new("op-1", "arn:test");
 
         let value = serde_json::json!({"a": [1, "two"], "b": null});
-        let wire = serdes.serialize(&value, &ctx).expect("serialize");
+        let wire = JsonSerdes
+            .serialize(value.clone(), ctx.clone())
+            .await
+            .expect("serialize");
         assert_eq!(wire, value.to_string());
-        assert_eq!(serdes.deserialize(&wire, &ctx).expect("deserialize"), value);
+        let back: serde_json::Value = JsonSerdes
+            .deserialize(wire, ctx)
+            .await
+            .expect("deserialize");
+        assert_eq!(back, value);
     }
 
-    #[test]
-    fn plain_custom_serdes_receives_the_value() {
-        // Proves that a plain custom Serdes (not FileSystemSerdes) is handed
-        // the typed value, so a string payload needs no quote-stripping.
+    /// A custom `Serdes` receives the operation's actual typed value — a
+    /// `String` value arrives as `String`, with no JSON quoting to strip.
+    #[tokio::test]
+    async fn custom_serdes_receives_the_typed_value() {
         struct UpperSerdes;
-        impl Debug for UpperSerdes {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("UpperSerdes")
-            }
-        }
-        impl Serdes for UpperSerdes {
-            fn serialize(
+
+        impl Serdes<String> for UpperSerdes {
+            async fn serialize(
                 &self,
-                value: &serde_json::Value,
-                _context: &SerdesContext,
-            ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-                let raw = value.as_str().unwrap_or_default();
-                Ok(raw.to_uppercase())
+                value: String,
+                _context: SerdesContext,
+            ) -> Result<String, BoxError> {
+                Ok(value.to_uppercase())
             }
-            fn deserialize(
+
+            async fn deserialize(
                 &self,
-                data: &str,
-                _context: &SerdesContext,
-            ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(serde_json::Value::String(data.to_lowercase()))
+                wire: String,
+                _context: SerdesContext,
+            ) -> Result<String, BoxError> {
+                Ok(wire.to_lowercase())
             }
         }
 
-        let serdes: Box<dyn Serdes> = Box::new(UpperSerdes);
         let ctx = SerdesContext::new("op-1", "arn:test");
 
-        let result = serdes
-            .serialize(&serde_json::json!("hello"), &ctx)
+        let wire = UpperSerdes
+            .serialize("hello".to_owned(), ctx.clone())
+            .await
             .expect("serialize");
-        assert_eq!(result, "HELLO");
+        assert_eq!(wire, "HELLO");
 
-        let result = serdes.deserialize("WORLD", &ctx).expect("deserialize");
-        assert_eq!(result, serde_json::json!("world"));
+        let back = UpperSerdes
+            .deserialize("WORLD".to_owned(), ctx)
+            .await
+            .expect("deserialize");
+        assert_eq!(back, "world");
+    }
+
+    /// `7i128 << 100` survives a custom-serdes round trip: the serdes
+    /// receives the real `i128`, a value no `serde_json::Value` intermediary
+    /// could represent (it exceeds both the `i64` and `u64` ranges).
+    #[tokio::test]
+    async fn i128_survives_custom_serdes_round_trip() {
+        struct DecimalSerdes;
+
+        impl Serdes<i128> for DecimalSerdes {
+            async fn serialize(
+                &self,
+                value: i128,
+                _context: SerdesContext,
+            ) -> Result<String, BoxError> {
+                Ok(value.to_string())
+            }
+
+            async fn deserialize(
+                &self,
+                wire: String,
+                _context: SerdesContext,
+            ) -> Result<i128, BoxError> {
+                Ok(wire.parse()?)
+            }
+        }
+
+        let ctx = SerdesContext::new("op-1", "arn:test");
+        let value = 7_i128 << 100;
+
+        let wire = DecimalSerdes
+            .serialize(value, ctx.clone())
+            .await
+            .expect("serialize");
+        let back = DecimalSerdes
+            .deserialize(wire, ctx)
+            .await
+            .expect("deserialize");
+        assert_eq!(back, value);
+    }
+
+    /// Struct field declaration order survives a custom-serdes round trip:
+    /// the serdes sees the typed value's own `Serialize` output, not a
+    /// key-sorted DOM.
+    #[tokio::test]
+    async fn struct_field_declaration_order_survives_custom_serdes() {
+        // Deliberately anti-alphabetical declaration order.
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Ordered {
+            zebra: u8,
+            mango: u8,
+            apple: u8,
+        }
+
+        /// A pass-through custom serdes: renders the typed value itself.
+        struct PassThrough;
+
+        impl Serdes<Ordered> for PassThrough {
+            async fn serialize(
+                &self,
+                value: Ordered,
+                _context: SerdesContext,
+            ) -> Result<String, BoxError> {
+                Ok(serde_json::to_string(&value)?)
+            }
+
+            async fn deserialize(
+                &self,
+                wire: String,
+                _context: SerdesContext,
+            ) -> Result<Ordered, BoxError> {
+                Ok(serde_json::from_str(&wire)?)
+            }
+        }
+
+        let ctx = SerdesContext::new("op-1", "arn:test");
+        let value = Ordered {
+            zebra: 1,
+            mango: 2,
+            apple: 3,
+        };
+
+        let wire = PassThrough
+            .serialize(value, ctx.clone())
+            .await
+            .expect("serialize");
+        // Declaration order, not alphabetical order.
+        assert_eq!(wire, r#"{"zebra":1,"mango":2,"apple":3}"#);
+
+        let back = PassThrough
+            .deserialize(wire, ctx)
+            .await
+            .expect("deserialize");
+        assert_eq!(
+            back,
+            Ordered {
+                zebra: 1,
+                mango: 2,
+                apple: 3
+            }
+        );
+    }
+
+    /// One `Arc<S>` instance works across output types supported by `S`,
+    /// through the forwarding `impl<T, S> Serdes<T> for Arc<S>`.
+    #[tokio::test]
+    async fn arc_serdes_shared_across_output_types() {
+        let shared = std::sync::Arc::new(JsonSerdes);
+        let ctx = SerdesContext::new("op-1", "arn:test");
+
+        let s = Serdes::<String>::serialize(&shared, "x".to_owned(), ctx.clone())
+            .await
+            .expect("string serialize");
+        assert_eq!(s, "\"x\"");
+
+        let n = Serdes::<u32>::serialize(&shared, 7_u32, ctx.clone())
+            .await
+            .expect("u32 serialize");
+        assert_eq!(n, "7");
+
+        let back: u32 = shared
+            .deserialize("7".to_owned(), ctx)
+            .await
+            .expect("u32 deserialize");
+        assert_eq!(back, 7);
+    }
+
+    /// A `Send` but non-`Sync` value round-trips through `FileSystemSerdes`:
+    /// owned inputs let the whole operation move into the blocking task, so
+    /// the returned future is `Send` without requiring `T: Sync`.
+    #[tokio::test]
+    async fn send_not_sync_value_round_trips_through_filesystem() {
+        // `Cell` is `Send` but not `Sync`.
+        #[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct NotSync {
+            value: String,
+            #[serde(skip)]
+            cell: std::cell::Cell<u8>,
+        }
+
+        fn assert_send<F: Send>(f: F) -> F {
+            f
+        }
+
+        let tmp = std::env::temp_dir().join("fs_serdes_not_sync");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let ctx = SerdesContext::new(
+            "op-1",
+            "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e/i",
+        );
+
+        let input = NotSync {
+            value: "send-not-sync".to_owned(),
+            cell: std::cell::Cell::new(3),
+        };
+        let envelope = assert_send(serdes.serialize(input, ctx.clone()))
+            .await
+            .expect("serialize");
+        let back: NotSync = assert_send(serdes.deserialize(envelope, ctx))
+            .await
+            .expect("deserialize");
+        assert_eq!(back.value, "send-not-sync");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // ================================================================
@@ -1726,7 +1978,7 @@ mod tests {
         };
 
         let input = serde_json::json!({"data": "test"});
-        let result = serdes.serialize_with_context(&input, &ctx);
+        let result = serdes.serialize_sync(&input, &ctx);
 
         // Either serialize succeeds and writes inside base_path, or it errors.
         match result {
@@ -1767,7 +2019,7 @@ mod tests {
         };
 
         let input = serde_json::json!({"data": "test"});
-        let result = serdes.serialize_with_context(&input, &ctx);
+        let result = serdes.serialize_sync(&input, &ctx);
 
         match result {
             Ok(envelope) => {
@@ -1805,7 +2057,7 @@ mod tests {
         };
 
         let input = serde_json::json!({"data": "test"});
-        let result = serdes.serialize_with_context(&input, &ctx);
+        let result = serdes.serialize_sync(&input, &ctx);
 
         match result {
             Ok(envelope) => {
@@ -1847,11 +2099,11 @@ mod tests {
 
         let input = serde_json::json!({"round": "trip", "value": 99});
         let envelope = serdes
-            .serialize_with_context(&input, &ctx)
+            .serialize_sync(&input, &ctx)
             .expect("serialize should succeed with encoded components");
 
         let output = serdes
-            .deserialize_with_context(&envelope, &ctx)
+            .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
             .expect("deserialize should find the file written by serialize");
 
         assert_eq!(output, input);
@@ -1877,7 +2129,7 @@ mod tests {
             durable_execution_arn: arn_fn,
         };
         let input = serde_json::json!({"test": "bare_dotdot"});
-        match serdes.serialize_with_context(&input, &ctx_fn) {
+        match serdes.serialize_sync(&input, &ctx_fn) {
             Ok(envelope) => {
                 let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
                 let file_path = parsed["file"].as_str().unwrap();
@@ -1902,7 +2154,7 @@ mod tests {
             operation_id: "step-1".to_owned(),
             durable_execution_arn: arn_exec,
         };
-        match serdes.serialize_with_context(&input, &ctx_exec) {
+        match serdes.serialize_sync(&input, &ctx_exec) {
             Ok(envelope) => {
                 let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
                 let file_path = parsed["file"].as_str().unwrap();
@@ -1927,7 +2179,7 @@ mod tests {
             operation_id: "step-1".to_owned(),
             durable_execution_arn: arn_inv,
         };
-        match serdes.serialize_with_context(&input, &ctx_inv) {
+        match serdes.serialize_sync(&input, &ctx_inv) {
             Ok(envelope) => {
                 let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
                 let file_path = parsed["file"].as_str().unwrap();
@@ -1972,7 +2224,7 @@ mod tests {
             durable_execution_arn: traversal_arn("my-fn", "exec-1", "inv-1"),
         };
 
-        let result = serdes.serialize_with_context(&serde_json::json!({"data": "test"}), &ctx);
+        let result = serdes.serialize_sync(&serde_json::json!({"data": "test"}), &ctx);
         let err = result.expect_err("symlink escape must be rejected");
         assert!(
             err.to_string().contains("escapes base_path"),
@@ -2018,7 +2270,7 @@ mod tests {
         };
 
         let envelope = serdes
-            .serialize_with_context(&serde_json::json!({"data": "test"}), &ctx)
+            .serialize_sync(&serde_json::json!({"data": "test"}), &ctx)
             .expect("write through a symlinked base path must succeed");
         let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
         let file_path = parsed["file"].as_str().unwrap();

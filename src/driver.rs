@@ -1254,7 +1254,7 @@ mod suspension_containment_and_task_ownership {
         let outcome = drive_invocation(
             async move {
                 let _ = ctx_h
-                    .invoke::<serde_json::Value, _>("target-fn", "input")
+                    .invoke::<serde_json::Value, _>("target-fn", "input".to_owned())
                     .await;
                 ran_c.store(true, Ordering::SeqCst);
                 Ok::<_, (String, String)>("done".to_owned())

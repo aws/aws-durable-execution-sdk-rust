@@ -6,23 +6,23 @@ use aws_durable_execution_sdk_rust as durable;
 #[derive(Debug)]
 struct UppercaseSerdes;
 
-impl durable::Serdes for UppercaseSerdes {
-    fn serialize(
+impl durable::Serdes<serde_json::Value> for UppercaseSerdes {
+    async fn serialize(
         &self,
-        value: &serde_json::Value,
-        _context: &durable::serdes::SerdesContext,
+        value: serde_json::Value,
+        _context: durable::serdes::SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // The value arrives typed, so the raw string needs no quote-stripping.
         Ok(value.as_str().unwrap_or_default().to_uppercase())
     }
 
-    fn deserialize(
+    async fn deserialize(
         &self,
-        data: &str,
-        _context: &durable::serdes::SerdesContext,
+        wire: String,
+        _context: durable::serdes::SerdesContext,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         // Reverse: the raw payload is the string value itself.
-        Ok(serde_json::Value::String(data.to_owned()))
+        Ok(serde_json::Value::String(wire))
     }
 }
 

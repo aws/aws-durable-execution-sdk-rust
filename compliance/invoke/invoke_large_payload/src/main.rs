@@ -1,10 +1,10 @@
 //! Conformance requirement 5-7: invoke with a large payload.
 
 use aws_durable_execution_sdk_rust as durable;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Large payload structure.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Payload {
     data: String,
 }

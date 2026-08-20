@@ -1955,6 +1955,7 @@ version = "0.0.0"
 dependencies = [
  "aws-durable-execution-sdk-rust",
  "lambda_runtime",
+ "serde",
  "serde_json",
  "tokio",
 ]

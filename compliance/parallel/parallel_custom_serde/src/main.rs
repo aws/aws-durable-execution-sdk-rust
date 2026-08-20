@@ -8,30 +8,27 @@ use durable::serdes::SerdesContext;
 #[derive(Debug)]
 struct WrappedSerdes;
 
-impl Serdes for WrappedSerdes {
-    fn serialize(
+impl Serdes<String> for WrappedSerdes {
+    async fn serialize(
         &self,
-        value: &serde_json::Value,
-        _context: &SerdesContext,
+        value: String,
+        _context: SerdesContext,
     ) -> Result<String, durable::BoxError> {
-        let inner = value.as_str().unwrap_or_default();
         Ok(serde_json::to_string(
-            &serde_json::json!({"wrapped": inner}),
+            &serde_json::json!({"wrapped": value}),
         )?)
     }
 
-    fn deserialize(
+    async fn deserialize(
         &self,
-        data: &str,
-        _context: &SerdesContext,
-    ) -> Result<serde_json::Value, durable::BoxError> {
-        let v: serde_json::Value = serde_json::from_str(data)?;
-        let inner = v
-            .get("wrapped")
+        wire: String,
+        _context: SerdesContext,
+    ) -> Result<String, durable::BoxError> {
+        let v: serde_json::Value = serde_json::from_str(&wire)?;
+        Ok(v.get("wrapped")
             .and_then(serde_json::Value::as_str)
             .ok_or("WrappedSerdes: missing 'wrapped' field")?
-            .to_owned();
-        Ok(serde_json::Value::String(inner))
+            .to_owned())
     }
 }
 

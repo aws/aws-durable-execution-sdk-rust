@@ -36,20 +36,29 @@ struct ReceivedData {
 #[derive(Debug)]
 struct TimestampSerdes;
 
-impl Serdes for TimestampSerdes {
-    fn deserialize(
+impl Serdes<ReceivedData> for TimestampSerdes {
+    async fn serialize(
         &self,
-        data: &str,
-        _context: &durable::serdes::SerdesContext,
-    ) -> Result<serde_json::Value, BoxError> {
-        let raw: CallbackPayload = serde_json::from_str(data)?;
+        value: ReceivedData,
+        _context: durable::serdes::SerdesContext,
+    ) -> Result<String, BoxError> {
+        // The callback payload is produced externally; the SDK never
+        // serializes a value on the way out. Plain JSON keeps the impl total.
+        Ok(serde_json::to_string(&value)?)
+    }
+
+    async fn deserialize(
+        &self,
+        wire: String,
+        _context: durable::serdes::SerdesContext,
+    ) -> Result<ReceivedData, BoxError> {
+        let raw: CallbackPayload = serde_json::from_str(&wire)?;
         let timestamp = parse_iso_timestamp(&raw.timestamp)?;
-        let received = ReceivedData {
+        Ok(ReceivedData {
             id: raw.id,
             message: raw.message,
             timestamp,
-        };
-        Ok(serde_json::to_value(&received)?)
+        })
     }
 }
 

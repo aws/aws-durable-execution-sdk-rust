@@ -22,23 +22,23 @@ use durable::serdes::SerdesContext;
 #[derive(Debug)]
 struct UppercaseSerdes;
 
-impl Serdes for UppercaseSerdes {
-    fn serialize(
+impl Serdes<String> for UppercaseSerdes {
+    async fn serialize(
         &self,
-        value: &serde_json::Value,
-        _context: &SerdesContext,
+        value: String,
+        _context: SerdesContext,
     ) -> Result<String, durable::BoxError> {
-        // The serdes receives the operation's value erased to
-        // `serde_json::Value`, not pre-rendered JSON text.
-        Ok(value.to_string().to_uppercase())
+        // The serdes receives the operation's typed value directly, not
+        // pre-rendered JSON text or an erased intermediate.
+        Ok(serde_json::to_string(&value)?.to_uppercase())
     }
 
-    fn deserialize(
+    async fn deserialize(
         &self,
-        data: &str,
-        _context: &SerdesContext,
-    ) -> Result<serde_json::Value, durable::BoxError> {
-        Ok(serde_json::from_str(data)?)
+        wire: String,
+        _context: SerdesContext,
+    ) -> Result<String, durable::BoxError> {
+        Ok(serde_json::from_str(&wire)?)
     }
 }
 

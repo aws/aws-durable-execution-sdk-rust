@@ -14,10 +14,11 @@ use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
+use crate::serdes::JsonSerdes;
 
 pub use crate::map_parallel::{
-    BatchError, BatchItem, BatchItemStatus, BatchResult, BatchStats, BatchStatus, CompletionReason,
-    NestingMode, SettledOutcome,
+    BatchError, BatchItem, BatchItemStatus, BatchResult, BatchStats, BatchStatus, BatchSummary,
+    CompletionReason, NestingMode, SettledOutcome,
 };
 
 // ============================================================
@@ -63,14 +64,14 @@ pub use crate::map_parallel::{
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct MapBuilder<I, O, F, Fut> {
+pub struct MapBuilder<I, O, F, Fut, IS = JsonSerdes, RS = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     max_concurrency: Option<usize>,
     completion: Option<CompletionConfig>,
-    serdes: Option<Arc<dyn Serdes>>,
-    result_serdes: Option<Arc<dyn Serdes>>,
+    serdes: IS,
+    result_serdes: RS,
     nesting: NestingMode,
     item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
     items: Vec<I>,
@@ -78,7 +79,7 @@ pub struct MapBuilder<I, O, F, Fut> {
     _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
-impl<I, O, F, Fut> std::fmt::Debug for MapBuilder<I, O, F, Fut> {
+impl<I, O, F, Fut, IS, RS> std::fmt::Debug for MapBuilder<I, O, F, Fut, IS, RS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MapBuilder")
             .field("name", &self.name)
@@ -104,8 +105,8 @@ where
             name: None,
             max_concurrency: None,
             completion: None,
-            serdes: None,
-            result_serdes: None,
+            serdes: JsonSerdes,
+            result_serdes: JsonSerdes,
             nesting: NestingMode::Normal,
             item_namer: None,
             items,
@@ -113,7 +114,15 @@ where
             _marker: PhantomData,
         }
     }
+}
 
+impl<I, O, F, Fut, IS, RS> MapBuilder<I, O, F, Fut, IS, RS>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: Fn(DurableContext, I, usize) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+{
     /// Sets a human-readable name for this map operation.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -134,21 +143,55 @@ where
 
     /// Sets a custom serializer/deserializer for item results.
     ///
-    /// Item results go through the same JSON-string transform model as every
-    /// other operation, so a [`Serdes`] attached here behaves exactly as it
-    /// does on a step, invoke, callback, or `result_serdes`.
-    pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Arc::new(serdes));
-        self
+    /// The serdes must implement [`Serdes<O>`](crate::Serdes) for this
+    /// map's item output type — attaching a serdes for a different type
+    /// fails at compile time. It goes through the same transform boundary
+    /// as every other operation, so a [`Serdes`] attached here behaves
+    /// exactly as it does on a step, invoke, callback, or `result_serdes`.
+    pub fn serdes<IS2>(self, serdes: IS2) -> MapBuilder<I, O, F, Fut, IS2, RS>
+    where
+        IS2: Serdes<O>,
+    {
+        MapBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            max_concurrency: self.max_concurrency,
+            completion: self.completion,
+            serdes,
+            result_serdes: self.result_serdes,
+            nesting: self.nesting,
+            item_namer: self.item_namer,
+            items: self.items,
+            closure: self.closure,
+            _marker: PhantomData,
+        }
     }
 
     /// Sets a custom serializer/deserializer for the whole batch result.
     ///
     /// This is the operation-level serdes: it serializes and deserializes
-    /// the entire [`BatchResult`] rather than individual items.
-    pub fn result_serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.result_serdes = Some(Arc::new(serdes));
-        self
+    /// the entire batch summary ([`BatchSummary`]) rather than individual
+    /// items, so it must implement `Serdes<BatchSummary>` — typically
+    /// through a type-agnostic blanket `impl<T> Serdes<T>`.
+    pub fn result_serdes<RS2>(self, serdes: RS2) -> MapBuilder<I, O, F, Fut, IS, RS2>
+    where
+        RS2: Serdes<BatchSummary>,
+    {
+        MapBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            max_concurrency: self.max_concurrency,
+            completion: self.completion,
+            serdes: self.serdes,
+            result_serdes: serdes,
+            nesting: self.nesting,
+            item_namer: self.item_namer,
+            items: self.items,
+            closure: self.closure,
+            _marker: PhantomData,
+        }
     }
 
     /// Sets the nesting mode for the map operation.
@@ -235,8 +278,8 @@ where
     /// [`CompletionReason`]: CompletionReason
     pub async fn await_batch(self) -> Result<BatchResult<O>, OperationError>
     where
-        I: serde::Serialize + serde::de::DeserializeOwned + Sync,
-        O: serde::Serialize + serde::de::DeserializeOwned,
+        IS: Serdes<O>,
+        RS: Serdes<BatchSummary>,
     {
         use crate::map_parallel::MapExecution;
 
@@ -261,8 +304,8 @@ where
     /// Converts this builder into a [`DurableFuture`] explicitly.
     pub fn future(self) -> DurableFuture<Vec<O>>
     where
-        I: serde::Serialize + serde::de::DeserializeOwned + Sync,
-        O: serde::Serialize + serde::de::DeserializeOwned,
+        IS: Serdes<O>,
+        RS: Serdes<BatchSummary>,
     {
         self.into_future()
     }
@@ -270,19 +313,21 @@ where
     /// Eagerly spawns the map operation on a tokio task.
     pub fn spawn(self) -> DurableFuture<Vec<O>>
     where
-        I: serde::Serialize + serde::de::DeserializeOwned + Sync,
-        O: serde::Serialize + serde::de::DeserializeOwned,
+        IS: Serdes<O>,
+        RS: Serdes<BatchSummary>,
     {
         spawn_terminal!(self)
     }
 }
 
-impl<I, O, F, Fut> IntoFuture for MapBuilder<I, O, F, Fut>
+impl<I, O, F, Fut, IS, RS> IntoFuture for MapBuilder<I, O, F, Fut, IS, RS>
 where
-    I: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
-    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    I: Send + 'static,
+    O: Send + 'static,
     F: Fn(DurableContext, I, usize) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    IS: Serdes<O>,
+    RS: Serdes<BatchSummary>,
 {
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;
@@ -341,20 +386,20 @@ where
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct ParallelBuilder<O> {
+pub struct ParallelBuilder<O, IS = JsonSerdes, RS = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     max_concurrency: Option<usize>,
     completion: Option<CompletionConfig>,
-    serdes: Option<Arc<dyn Serdes>>,
-    result_serdes: Option<Arc<dyn Serdes>>,
+    serdes: IS,
+    result_serdes: RS,
     nesting: NestingMode,
     branches: Vec<(String, crate::future::BranchBody<O>)>,
     _marker: PhantomData<O>,
 }
 
-impl<O> std::fmt::Debug for ParallelBuilder<O> {
+impl<O, IS, RS> std::fmt::Debug for ParallelBuilder<O, IS, RS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParallelBuilder")
             .field("name", &self.name)
@@ -377,14 +422,16 @@ impl<O: Send + 'static> ParallelBuilder<O> {
             name: None,
             max_concurrency: None,
             completion: None,
-            serdes: None,
-            result_serdes: None,
+            serdes: JsonSerdes,
+            result_serdes: JsonSerdes,
             nesting: NestingMode::Normal,
             branches,
             _marker: PhantomData,
         }
     }
+}
 
+impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// Sets a human-readable name for this parallel operation.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -405,21 +452,52 @@ impl<O: Send + 'static> ParallelBuilder<O> {
 
     /// Sets a custom serializer/deserializer for branch results.
     ///
-    /// Branch results go through the same JSON-string transform model as every
-    /// other operation, so a [`Serdes`] attached here behaves exactly as it
-    /// does on a step, invoke, callback, or `result_serdes`.
-    pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Arc::new(serdes));
-        self
+    /// The serdes must implement [`Serdes<O>`](crate::Serdes) for this
+    /// operation's branch output type — attaching a serdes for a different
+    /// type fails at compile time. It goes through the same transform
+    /// boundary as every other operation, so a [`Serdes`] attached here
+    /// behaves exactly as it does on a step, invoke, callback, or
+    /// `result_serdes`.
+    pub fn serdes<IS2>(self, serdes: IS2) -> ParallelBuilder<O, IS2, RS>
+    where
+        IS2: Serdes<O>,
+    {
+        ParallelBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            max_concurrency: self.max_concurrency,
+            completion: self.completion,
+            serdes,
+            result_serdes: self.result_serdes,
+            nesting: self.nesting,
+            branches: self.branches,
+            _marker: PhantomData,
+        }
     }
 
     /// Sets a custom serializer/deserializer for the whole batch result.
     ///
     /// This is the operation-level serdes: it serializes and deserializes
-    /// the entire [`BatchResult`] rather than individual items.
-    pub fn result_serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.result_serdes = Some(Arc::new(serdes));
-        self
+    /// the entire batch summary ([`BatchSummary`]) rather than individual
+    /// items, so it must implement `Serdes<BatchSummary>` — typically
+    /// through a type-agnostic blanket `impl<T> Serdes<T>`.
+    pub fn result_serdes<RS2>(self, serdes: RS2) -> ParallelBuilder<O, IS, RS2>
+    where
+        RS2: Serdes<BatchSummary>,
+    {
+        ParallelBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            max_concurrency: self.max_concurrency,
+            completion: self.completion,
+            serdes: self.serdes,
+            result_serdes: serdes,
+            nesting: self.nesting,
+            branches: self.branches,
+            _marker: PhantomData,
+        }
     }
 
     /// Sets the nesting mode for the parallel operation.
@@ -496,7 +574,8 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     /// [`CompletionReason`]: CompletionReason
     pub async fn await_batch(self) -> Result<BatchResult<O>, OperationError>
     where
-        O: serde::Serialize + serde::de::DeserializeOwned,
+        IS: Serdes<O>,
+        RS: Serdes<BatchSummary>,
     {
         use crate::map_parallel::ParallelExecution;
 
@@ -518,7 +597,8 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     /// Converts this builder into a [`DurableFuture`] explicitly.
     pub fn future(self) -> DurableFuture<Vec<O>>
     where
-        O: serde::Serialize + serde::de::DeserializeOwned,
+        IS: Serdes<O>,
+        RS: Serdes<BatchSummary>,
     {
         self.into_future()
     }
@@ -526,14 +606,18 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     /// Eagerly spawns the parallel operation on a tokio task.
     pub fn spawn(self) -> DurableFuture<Vec<O>>
     where
-        O: serde::Serialize + serde::de::DeserializeOwned,
+        IS: Serdes<O>,
+        RS: Serdes<BatchSummary>,
     {
         spawn_terminal!(self)
     }
 }
 
-impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFuture
-    for ParallelBuilder<O>
+impl<O, IS, RS> IntoFuture for ParallelBuilder<O, IS, RS>
+where
+    O: Send + 'static,
+    IS: Serdes<O>,
+    RS: Serdes<BatchSummary>,
 {
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;

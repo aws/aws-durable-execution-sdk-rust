@@ -551,29 +551,37 @@ let winner: String = ctx.race([first, second]).name("fastest").await?;
 
 ## Custom serialization
 
-The SDK stores operation payloads as JSON by default. Implement `Serdes` to
-change that. `serialize` receives the operation's value erased to
-`&serde_json::Value` and returns the `String` to store on the wire;
-`deserialize` takes that wire string back to a `serde_json::Value`, which
-the SDK then deserializes into your type.
+The SDK stores operation payloads as JSON by default. Implement
+`Serdes<T>` to change that. The trait is generic over the operation's
+actual Rust type and asynchronous: `serialize` receives the **owned typed
+value** and returns the `String` to store on the wire; `deserialize` takes
+that wire string back to the typed value. There is no intermediate
+representation — a custom format sees struct field declaration order,
+`i128` values outside the `i64`/`u64` ranges, and everything else the real
+type carries.
 
-The trait receives the typed value, not pre-rendered JSON text. A `String`
-result arrives as `Value::String("X")`, so there is no JSON quoting to strip
-or re-add. A correct implementation must round-trip every `Value` variant the
-operation can produce.
+The SDK awaits the future a serdes returns directly on the executor
+thread. Cheap in-memory transforms (like the default `JsonSerdes`) run
+inline in the returned future; an implementation that blocks — filesystem
+I/O, long-running synchronous work — must move that work into
+`tokio::task::spawn_blocking` itself, the way `FileSystemSerdes` does.
+`async fn` in the implementation satisfies the trait's `impl Future`
+return type:
 
 ```rust
-#[derive(Debug)]
 struct Base64JsonSerdes;
 
-impl Serdes for Base64JsonSerdes {
-    fn serialize(
+impl<T> Serdes<T> for Base64JsonSerdes
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+{
+    async fn serialize(
         &self,
-        value: &serde_json::Value,
-        _context: &SerdesContext,
+        value: T,
+        _context: SerdesContext,
     ) -> Result<String, durable::BoxError> {
         use std::io::Write;
-        let json = serde_json::to_vec(value)?;
+        let json = serde_json::to_vec(&value)?;
         let mut buf = Vec::new();
         let engine = base64::engine::general_purpose::STANDARD;
         {
@@ -585,15 +593,15 @@ impl Serdes for Base64JsonSerdes {
         Ok(String::from_utf8(buf)?)
     }
 
-    fn deserialize(
+    async fn deserialize(
         &self,
-        data: &str,
-        _context: &SerdesContext,
-    ) -> Result<serde_json::Value, durable::BoxError> {
+        wire: String,
+        _context: SerdesContext,
+    ) -> Result<T, durable::BoxError> {
         use std::io::Read;
         let engine = base64::engine::general_purpose::STANDARD;
         let mut decoder =
-            base64::read::DecoderReader::new(data.as_bytes(), &engine);
+            base64::read::DecoderReader::new(wire.as_bytes(), &engine);
         let mut json = Vec::new();
         decoder.read_to_end(&mut json)?;
         Ok(serde_json::from_slice(&json)?)
@@ -601,28 +609,53 @@ impl Serdes for Base64JsonSerdes {
 }
 ```
 
-Set one per operation with `.serdes(...)` on `StepBuilder`, `InvokeBuilder`,
-`ChildBuilder`, `WaitForConditionBuilder`, `CreateCallbackBuilder`,
-`WaitForCallbackBuilder`, `MapBuilder`, or `ParallelBuilder`. `WaitBuilder`
-and the combinator builders carry no serdes method because their payloads
-are structural, not user-typed. Set an execution-wide default through
-`Options`, which `durable::wrap` consumes; it applies to step, invoke,
-child context, callback, and `wait_for_condition` operations that set no
-per-operation serdes of their own. `map` and `parallel` use their own
-per-operation item serdes and ignore the `Options` default.
+A **type-agnostic** format like the one above uses a blanket
+`impl<T> Serdes<T>` and attaches to any operation. A **type-specific**
+format implements `Serdes<ConcreteType>` directly — `impl Serdes<Order>
+for OrderSerdes` — and gains compile-time pairing: attaching it to an
+operation that produces another type fails to compile.
+
+Serdes are configured **per operation**, with `.serdes(...)` on
+`StepBuilder`, `InvokeBuilder`, `ChildBuilder`, `WithRetryBuilder`,
+`WaitForConditionBuilder`, `CreateCallbackBuilder`,
+`WaitForCallbackBuilder`, `MapBuilder`, or `ParallelBuilder`. Each builder
+carries its serdes as a generic type parameter defaulting to `JsonSerdes`,
+and `.serdes(...)` swaps that parameter; `.await` still produces a
+`DurableFuture<O>` regardless of the serdes type, so futures configured
+with different serdes implementations coexist in one combinator input
+collection. `WaitBuilder` and the combinator builders carry no serdes
+method because their payloads are structural, not user-typed.
+
+There is no execution-wide serdes slot: a single trait-object slot cannot
+represent `Serdes<T>` for every operation output type without erasing the
+value again. To share one instance across a handler, create an `Arc<S>`
+and clone it into each operation — `Arc<S>` forwards to `S`:
 
 ```rust
-let options = durable::Options::builder().serdes(Base64JsonSerdes).build()?;
-let service = durable::wrap(handler, options);
-lambda_runtime::run(lambda_runtime::service_fn(service)).await
+let shared = std::sync::Arc::new(Base64JsonSerdes);
+let a: String = ctx
+    .step(|_| async { Ok("a".to_owned()) })
+    .serdes(std::sync::Arc::clone(&shared))
+    .await?;
+let b: u32 = ctx.step(|_| async { Ok(7_u32) }).serdes(shared).await?;
 ```
+
+Operations transfer the owned value to `serialize` and return the value
+`deserialize` reconstructs from the stored wire string, so live execution
+and replay observe identical values. Ownership transfer is also what keeps
+operation outputs at `Send` (not `Sync`): the serdes can move the whole
+call into a `'static` blocking task without borrowing across an `.await`.
 
 `FileSystemSerdes` stores payloads on a durable shared filesystem (Amazon EFS
 or S3 Files mounted to Lambda), resolving a deterministic path from the
-`SerdesContext` so replay finds the same file. Do not use it with Lambda's
-ephemeral `/tmp`: that storage is local to a single execution environment and
-does not persist across invocations. Mount EFS or S3 Files and point
-`FileSystemSerdes` at the mount path.
+`SerdesContext` so replay finds the same file. Each `serialize` or
+`deserialize` call runs its complete implementation — JSON rendering or
+parsing, path resolution, and the file I/O — inside one
+`tokio::task::spawn_blocking` task, so the executor thread never touches
+the filesystem. Do not use it with Lambda's ephemeral `/tmp`: that storage
+is local to a single execution environment and does not persist across
+invocations. Mount EFS or S3 Files and point `FileSystemSerdes` at the
+mount path.
 
 ```rust
 use durable::serdes::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};

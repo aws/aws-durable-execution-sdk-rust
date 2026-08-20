@@ -12,7 +12,6 @@
 //! - `CallbackDetails { callback_id, result }`
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
@@ -41,17 +40,21 @@ pub(crate) const WFCB_SUB_TYPE: &str = "WaitForCallback";
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Internal state for `create_callback` execution passed from the builder.
-pub(crate) struct CreateCallbackExecution<O> {
+pub(crate) struct CreateCallbackExecution<O, S> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) heartbeat: Option<Duration>,
-    pub(crate) serdes: Option<Arc<dyn Serdes>>,
+    pub(crate) serdes: S,
     pub(crate) _marker: std::marker::PhantomData<O>,
 }
 
-impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
+impl<O, S> CreateCallbackExecution<O, S>
+where
+    O: Send + 'static,
+    S: Serdes<O>,
+{
     /// Executes the create-callback operation: replay or live path.
     #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<Callback<O>, OperationError> {
@@ -91,22 +94,16 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
                     // Callback completed successfully during a previous
                     // invocation — return settled Callback with the result.
                     // The payload was written by an external caller, so only
-                    // the deserialize side of the serdes acts on it. Per-op
-                    // serdes wins; otherwise the execution-wide serdes decodes
-                    // it (default JSON). Decode FIRST, then emit
-                    // `operation_replayed`: a corrupt payload or failing
-                    // serdes surfaces as an error without claiming a recorded
-                    // outcome was returned.
+                    // the deserialize side of the serdes acts on it. Decode
+                    // FIRST, then emit `operation_replayed`: a corrupt
+                    // payload or failing serdes surfaces as an error without
+                    // claiming a recorded outcome was returned.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    let result_str = payload.as_deref().unwrap_or("null");
+                    let result_str = payload.unwrap_or_else(|| "null".to_owned());
                     let serdes_ctx =
                         SerdesContext::new(self.op_id.wire(), self.ctx.execution_arn());
-                    let value: O = deserialize_callback_result(
-                        self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-                        result_str,
-                        &serdes_ctx,
-                    )
-                    .await?;
+                    let value: O =
+                        deserialize_callback_result(&self.serdes, result_str, serdes_ctx).await?;
                     emit_replayed();
                     return Ok(Callback::new_settled(callback_id, Ok(value)));
                 }
@@ -206,7 +203,7 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
 /// erasure point is the builder's `.future()` / `into_future`, which boxes
 /// the whole execution future once inside
 /// [`DurableFuture`](crate::DurableFuture).
-pub(crate) struct WaitForCallbackExecution<O, F> {
+pub(crate) struct WaitForCallbackExecution<O, F, S> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
@@ -214,15 +211,16 @@ pub(crate) struct WaitForCallbackExecution<O, F> {
     pub(crate) heartbeat: Option<Duration>,
     pub(crate) submitter: F,
     pub(crate) submitter_retry: Option<crate::RetryStrategy>,
-    pub(crate) serdes: Option<Arc<dyn Serdes>>,
+    pub(crate) serdes: S,
     pub(crate) _marker: std::marker::PhantomData<O>,
 }
 
-impl<O, F, Fut> WaitForCallbackExecution<O, F>
+impl<O, F, Fut, S> WaitForCallbackExecution<O, F, S>
 where
     O: DeserializeOwned + Serialize + Send + 'static,
     F: FnOnce(StepContext, String) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    S: Serdes<O>,
 {
     /// Executes the wait-for-callback operation: replay or live path.
     ///
@@ -258,7 +256,7 @@ where
                 // replay-aware span so a resumed body's log lines are
                 // suppressed while its nested operations replay.
                 let child_span = child_ctx.replay_span();
-                let body_result = run_wfcb_body::<O, _, _>(
+                let body_result = run_wfcb_body::<O, _, _, _>(
                     child_ctx,
                     timeout,
                     heartbeat,
@@ -474,23 +472,24 @@ where
 ///
 /// The submitter is executed as a proper step operation (producing
 /// `StepStarted`/`StepSucceeded`/`StepFailed` checkpoint events).
-async fn run_wfcb_body<O, F, Fut>(
+async fn run_wfcb_body<O, F, Fut, S>(
     child_ctx: DurableContext,
     timeout: Option<Duration>,
     heartbeat: Option<Duration>,
     submitter: F,
     submitter_retry: Option<crate::RetryStrategy>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: S,
 ) -> Result<O, OperationError>
 where
-    O: DeserializeOwned + Send + 'static,
+    O: Send + 'static,
     F: FnOnce(StepContext, String) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    S: Serdes<O>,
 {
     // Step 1: create the inner callback (no name, per wire spec). The per-op
     // serdes flows through to the inner callback's decode so a serdes set on
     // wait_for_callback actually reaches the delivered payload.
-    let cb_exec: CreateCallbackExecution<O> = CreateCallbackExecution {
+    let cb_exec: CreateCallbackExecution<O, S> = CreateCallbackExecution {
         ctx: child_ctx.clone(),
         op_id: child_ctx.mint_id(),
         name: None,
@@ -511,7 +510,7 @@ where
         op_id: child_ctx.mint_id(),
         name: None,
         retry_strategy: submitter_retry,
-        serdes: None,
+        serdes: crate::serdes::JsonSerdes,
         semantics: crate::step::StepSemantics::default(),
         closure: move |step_ctx: StepContext| async move {
             (submitter)(step_ctx, callback_id).await?;
@@ -654,15 +653,6 @@ fn extract_error_info(err: &OperationError) -> (String, String) {
     }
 }
 
-/// Creates a callback deserialization error.
-fn callback_deser_error(e: &serde_json::Error) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Callback(CallbackError::from_kind(
-        CallbackErrorKind::DeserializationFailed {
-            message: e.to_string(),
-        },
-    )))
-}
-
 /// Creates a callback deserialization error from a message.
 fn callback_deser_error_msg(message: String) -> OperationError {
     OperationError::from_kind(OperationErrorKind::Callback(CallbackError::from_kind(
@@ -673,22 +663,17 @@ fn callback_deser_error_msg(message: String) -> OperationError {
 /// Decodes an externally-delivered callback payload into the target type.
 ///
 /// The payload is produced by an external caller, so only the deserialize
-/// side of the serdes is meaningful: `serdes` (when present) turns the wire
-/// payload back into a `serde_json::Value`, which is then deserialized into
-/// `O`. With no serdes the payload is parsed as JSON directly.
-pub(crate) async fn deserialize_callback_result<O: DeserializeOwned>(
-    serdes: Option<&Arc<dyn Serdes>>,
-    payload: &str,
-    serdes_ctx: &SerdesContext,
+/// side of the serdes is meaningful: the configured serdes turns the wire
+/// payload directly into `O`.
+pub(crate) async fn deserialize_callback_result<O, S: Serdes<O>>(
+    serdes: &S,
+    payload: String,
+    serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
-    let Some(s) = serdes else {
-        return serde_json::from_str(payload).map_err(|e| callback_deser_error(&e));
-    };
-    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
-    let json_value = crate::serdes::deserialize_off_runtime(s, payload.to_owned(), serdes_ctx)
+    serdes
+        .deserialize(payload, serdes_ctx)
         .await
-        .map_err(|e| callback_deser_error_msg(format!("callback serdes: {e}")))?;
-    serde_json::from_value(json_value).map_err(|e| callback_deser_error(&e))
+        .map_err(|e| callback_deser_error_msg(format!("callback serdes: {e}")))
 }
 
 /// Creates a callback internal error.
@@ -778,13 +763,13 @@ mod tests {
             Some("cb-123"),
         )]);
         let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
             ctx: ctx.clone(),
             op_id,
             name: Some("test".to_owned()),
             timeout: None,
             heartbeat: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should succeed");
@@ -808,13 +793,13 @@ mod tests {
             Some("cb-race"),
         )]);
         let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
             ctx: ctx.clone(),
             op_id,
             name: Some("racer".to_owned()),
             timeout: None,
             heartbeat: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should succeed");
@@ -845,13 +830,13 @@ mod tests {
             Some("cb-join"),
         )]);
         let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
             ctx: ctx.clone(),
             op_id,
             name: Some("joiner".to_owned()),
             timeout: None,
             heartbeat: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should succeed");
@@ -877,13 +862,13 @@ mod tests {
             Some("cb-456"),
         )]);
         let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
             ctx: ctx.clone(),
             op_id,
             name: None,
             timeout: Some(Duration::from_secs(5)),
             heartbeat: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should return callback");
@@ -907,13 +892,13 @@ mod tests {
             Some("cb-789"),
         )]);
         let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
             ctx: ctx.clone(),
             op_id,
             name: None,
             timeout: None,
             heartbeat: Some(Duration::from_secs(10)),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should return callback");
@@ -937,13 +922,13 @@ mod tests {
             Some("cb-fail"),
         )]);
         let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
             ctx: ctx.clone(),
             op_id,
             name: None,
             timeout: None,
             heartbeat: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should return callback");
@@ -967,13 +952,13 @@ mod tests {
             "token-1".to_owned(),
         );
         let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
             ctx: ctx.clone(),
             op_id,
             name: Some("my-cb".to_owned()),
             timeout: Some(Duration::from_mins(1)),
             heartbeat: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should succeed");
@@ -1001,7 +986,7 @@ mod tests {
             None,
         )]);
         let op_id = ctx.mint_id();
-        let exec = WaitForCallbackExecution::<String, _> {
+        let exec = WaitForCallbackExecution::<String, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("wfcb-test".to_owned()),
@@ -1009,7 +994,7 @@ mod tests {
             heartbeat: None,
             submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
             submitter_retry: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let result = exec.execute().await.expect("should succeed");
@@ -1028,7 +1013,7 @@ mod tests {
             None,
         )]);
         let op_id = ctx.mint_id();
-        let exec = WaitForCallbackExecution::<String, _> {
+        let exec = WaitForCallbackExecution::<String, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: None,
@@ -1036,7 +1021,7 @@ mod tests {
             heartbeat: None,
             submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
             submitter_retry: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let err = exec.execute().await.unwrap_err();
@@ -1059,7 +1044,7 @@ mod tests {
             None,
         )]);
         let op_id = ctx.mint_id();
-        let exec = WaitForCallbackExecution::<String, _> {
+        let exec = WaitForCallbackExecution::<String, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: None,
@@ -1067,7 +1052,7 @@ mod tests {
             heartbeat: None,
             submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
             submitter_retry: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let err = exec.execute().await.unwrap_err();
@@ -1093,7 +1078,7 @@ mod tests {
             "token-1".to_owned(),
         );
         let op_id = ctx.mint_id();
-        let exec = WaitForCallbackExecution::<String, _> {
+        let exec = WaitForCallbackExecution::<String, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("sub-fail-test".to_owned()),
@@ -1103,7 +1088,7 @@ mod tests {
                 Err::<(), BoxError>("submitter exploded".into())
             },
             submitter_retry: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         // The submitter step fails; the default retry strategy schedules a
@@ -1152,13 +1137,13 @@ mod tests {
             let ctx_clone = ctx.clone();
             let handle = tokio::spawn(async move {
                 let op_id = ctx_clone.mint_id();
-                let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+                let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
                     ctx: ctx_clone,
                     op_id,
                     name: None,
                     timeout: None,
                     heartbeat: None,
-                    serdes: None,
+                    serdes: crate::serdes::JsonSerdes,
                     _marker: std::marker::PhantomData,
                 };
                 exec.execute().await
@@ -1203,7 +1188,7 @@ mod tests {
         let submitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let submitted_clone = Arc::clone(&submitted);
 
-        let exec = WaitForCallbackExecution::<String, _> {
+        let exec = WaitForCallbackExecution::<String, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("step-check".to_owned()),
@@ -1214,7 +1199,7 @@ mod tests {
                 async { Ok::<(), BoxError>(()) }
             },
             submitter_retry: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
 
@@ -1331,7 +1316,7 @@ mod tests {
         let submitter_called_clone = Arc::clone(&submitter_called);
 
         let op_id = ctx.mint_id();
-        let exec = WaitForCallbackExecution::<String, _> {
+        let exec = WaitForCallbackExecution::<String, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("replay-test".to_owned()),
@@ -1342,7 +1327,7 @@ mod tests {
                 async { Ok::<(), BoxError>(()) }
             },
             submitter_retry: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
 
@@ -1376,7 +1361,7 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let exec = WaitForCallbackExecution::<String, _> {
+        let exec = WaitForCallbackExecution::<String, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("fail-check".to_owned()),
@@ -1386,7 +1371,7 @@ mod tests {
                 Err::<(), BoxError>("submission failed".into())
             },
             submitter_retry: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
 
@@ -1430,7 +1415,7 @@ mod tests {
         let received_attempt = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let received_attempt_clone = Arc::clone(&received_attempt);
 
-        let exec = WaitForCallbackExecution::<String, _> {
+        let exec = WaitForCallbackExecution::<String, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("attempt-check".to_owned()),
@@ -1441,7 +1426,7 @@ mod tests {
                 async { Ok::<(), BoxError>(()) }
             },
             submitter_retry: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
 
@@ -1470,13 +1455,16 @@ mod tests {
     #[derive(Debug)]
     struct MarkerSerdes;
 
-    impl Serdes for MarkerSerdes {
-        fn deserialize(
-            &self,
-            data: &str,
-            _context: &SerdesContext,
-        ) -> Result<serde_json::Value, BoxError> {
-            let body = data
+    impl<T> Serdes<T> for MarkerSerdes
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+    {
+        async fn serialize(&self, value: T, _context: SerdesContext) -> Result<String, BoxError> {
+            Ok(format!("MARK:{}", serde_json::to_string(&value)?))
+        }
+
+        async fn deserialize(&self, wire: String, _context: SerdesContext) -> Result<T, BoxError> {
+            let body = wire
                 .strip_prefix("MARK:")
                 .ok_or_else(|| -> BoxError { "missing MARK: prefix".into() })?;
             Ok(serde_json::from_str(body)?)
@@ -1496,13 +1484,13 @@ mod tests {
             Some("cb-marker"),
         )]);
         let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
             ctx: ctx.clone(),
             op_id,
             name: None,
             timeout: None,
             heartbeat: None,
-            serdes: Some(Arc::new(MarkerSerdes)),
+            serdes: MarkerSerdes,
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should settle");
@@ -1543,13 +1531,13 @@ mod tests {
             Some("cb-probe"),
         )]);
         let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<Doc> = CreateCallbackExecution {
+        let exec: CreateCallbackExecution<Doc, _> = CreateCallbackExecution {
             ctx: ctx.clone(),
             op_id,
             name: None,
             timeout: None,
             heartbeat: None,
-            serdes: Some(Arc::new(HexEnvelopeSerdes)),
+            serdes: HexEnvelopeSerdes,
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should settle");
@@ -1572,13 +1560,13 @@ mod tests {
             Some("cb-marker"),
         )]);
         let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
             ctx: ctx.clone(),
             op_id,
             name: None,
             timeout: None,
             heartbeat: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let err = exec.execute().await.unwrap_err();
@@ -1587,47 +1575,6 @@ mod tests {
             OperationErrorKind::Callback(e)
                 if matches!(e.kind(), CallbackErrorKind::DeserializationFailed { .. })
         ));
-    }
-
-    #[tokio::test]
-    async fn callback_falls_back_to_execution_wide_serdes() {
-        // With no per-op serdes, the decode falls back to the execution-wide
-        // serdes from Options.
-        let wire = crate::engine::compute_wire_id_public("1");
-        let log = CheckpointLog::from_records(vec![callback_record(
-            &wire,
-            CheckpointStatus::Succeeded,
-            Some(r#"MARK:"world""#),
-            None,
-            None,
-            Some("cb-fallback"),
-        )]);
-        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
-        let ctx = DurableContext::new_root_with_client_and_defaults(
-            "arn:aws:lambda:us-east-1:123:function:test".to_owned(),
-            lambda_runtime::Context::default(),
-            Arc::new(log),
-            client,
-            "token-1".to_owned(),
-            Some(Arc::new(MarkerSerdes)),
-            None,
-        );
-        let op_id = ctx.mint_id();
-        let exec: CreateCallbackExecution<String> = CreateCallbackExecution {
-            ctx: ctx.clone(),
-            op_id,
-            name: None,
-            timeout: None,
-            heartbeat: None,
-            serdes: None,
-            _marker: std::marker::PhantomData,
-        };
-        let cb = exec.execute().await.expect("should settle via fallback");
-        let value = cb
-            .result()
-            .await
-            .expect("execution-wide serdes should decode");
-        assert_eq!(value, "world");
     }
 
     #[tokio::test]
@@ -1671,7 +1618,7 @@ mod tests {
             ),
         ]);
         let op_id = ctx.mint_id();
-        let exec = WaitForCallbackExecution::<String, _> {
+        let exec = WaitForCallbackExecution::<String, _, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("wfcb-serdes".to_owned()),
@@ -1679,7 +1626,7 @@ mod tests {
             heartbeat: None,
             submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
             submitter_retry: None,
-            serdes: Some(Arc::new(MarkerSerdes)),
+            serdes: MarkerSerdes,
             _marker: std::marker::PhantomData,
         };
         let result = exec

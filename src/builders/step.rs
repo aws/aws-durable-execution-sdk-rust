@@ -3,7 +3,6 @@
 
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use crate::RetryStrategy;
 use crate::Serdes;
@@ -11,6 +10,7 @@ use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
+use crate::serdes::JsonSerdes;
 use crate::{BoxError, context::StepContext};
 
 // ============================================================
@@ -24,9 +24,14 @@ use crate::{BoxError, context::StepContext};
 ///
 /// The builder is generic over the step closure `F` and its future `Fut`
 /// so the body is stored **without type erasure**; both parameters are
-/// inferred at the call site and never written by users. The single
-/// erasure point is `.future()` / `.await`, which produces the one
-/// [`DurableFuture`] box.
+/// inferred at the call site and never written by users. It also carries
+/// the serdes implementation `S` (defaulting to
+/// [`JsonSerdes`]); [`serdes`](Self::serdes)
+/// swaps that parameter. The single erasure point is `.future()` /
+/// `.await`, which produces the one [`DurableFuture`] box — the future is
+/// [`DurableFuture<O>`] regardless of `S`, so futures configured with
+/// different serdes implementations coexist in one combinator input
+/// collection.
 ///
 /// # Examples
 ///
@@ -53,18 +58,18 @@ use crate::{BoxError, context::StepContext};
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct StepBuilder<O, F, Fut> {
+pub struct StepBuilder<O, F, Fut, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     retry_strategy: Option<RetryStrategy>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: S,
     semantics: crate::step::StepSemantics,
     closure: F,
     _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
-impl<O, F, Fut> std::fmt::Debug for StepBuilder<O, F, Fut> {
+impl<O, F, Fut, S> std::fmt::Debug for StepBuilder<O, F, Fut, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StepBuilder")
             .field("name", &self.name)
@@ -86,13 +91,20 @@ where
             op_id,
             name: None,
             retry_strategy: None,
-            serdes: None,
+            serdes: JsonSerdes,
             semantics: crate::step::StepSemantics::default(),
             closure,
             _marker: PhantomData,
         }
     }
+}
 
+impl<O, F, Fut, S> StepBuilder<O, F, Fut, S>
+where
+    O: Send + 'static,
+    F: FnOnce(StepContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+{
     /// Sets a human-readable name for this step.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -175,9 +187,26 @@ where
     }
 
     /// Sets a custom serializer/deserializer for this step's result.
-    pub fn serdes(mut self, serdes: impl Serdes + 'static) -> Self {
-        self.serdes = Some(Arc::new(serdes));
-        self
+    ///
+    /// Replaces the builder's serdes type parameter with `S2`, which must
+    /// implement [`Serdes<O>`](crate::Serdes) for this step's output type —
+    /// attaching a serdes for a different type fails at compile time. To
+    /// share one instance across operations, wrap it in an
+    /// [`Arc`](std::sync::Arc) and clone the `Arc` handle into each builder.
+    pub fn serdes<S2>(self, serdes: S2) -> StepBuilder<O, F, Fut, S2>
+    where
+        S2: Serdes<O>,
+    {
+        StepBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            retry_strategy: self.retry_strategy,
+            serdes,
+            semantics: self.semantics,
+            closure: self.closure,
+            _marker: PhantomData,
+        }
     }
 
     /// Sets the execution semantics for this step.
@@ -216,11 +245,12 @@ where
     }
 }
 
-impl<O, F, Fut> StepBuilder<O, F, Fut>
+impl<O, F, Fut, S> StepBuilder<O, F, Fut, S>
 where
-    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    O: Send + 'static,
     F: FnOnce(StepContext) -> Fut + Send + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    S: Serdes<O>,
 {
     /// Converts this builder into a [`DurableFuture`] explicitly.
     pub fn future(self) -> DurableFuture<O> {
@@ -244,19 +274,17 @@ where
     ///     Ok(())
     /// }
     /// ```
-    pub fn spawn(self) -> DurableFuture<O>
-    where
-        O: serde::Serialize + serde::de::DeserializeOwned,
-    {
+    pub fn spawn(self) -> DurableFuture<O> {
         spawn_terminal!(self)
     }
 }
 
-impl<O, F, Fut> IntoFuture for StepBuilder<O, F, Fut>
+impl<O, F, Fut, S> IntoFuture for StepBuilder<O, F, Fut, S>
 where
-    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    O: Send + 'static,
     F: FnOnce(StepContext) -> Fut + Send + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    S: Serdes<O>,
 {
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;

@@ -1,60 +1,74 @@
-//! Configure one default [`Serdes`] for the whole execution via [`Options`].
+//! Share one [`Serdes`] instance across operations with an `Arc`.
 //!
-//! Instead of attaching a serdes to each operation, set it once on
-//! [`Options`] and compose the handler with
-//! [`wrap`](aws_durable_execution_sdk_rust::wrap). Every operation that does
-//! not override its own serdes then uses this default — the construction-time
-//! analogue of the per-operation `serde_basic` example.
+//! Serdes are configured per operation — there is no execution-wide slot,
+//! because a single erased slot cannot represent `Serdes<T>` for every
+//! operation output type. To apply one configured instance across a
+//! handler, wrap it in an [`Arc`](std::sync::Arc) and clone the handle into
+//! each operation: `Arc<S>` forwards to `S`, so the same instance (and any
+//! state or configuration it carries) serves every operation and output
+//! type it supports.
 //!
 //! [`Serdes`]: aws_durable_execution_sdk_rust::Serdes
-//! [`Options`]: aws_durable_execution_sdk_rust::Options
+
+use std::sync::Arc;
 
 use aws_durable_execution_sdk_rust as durable;
 use durable::Serdes;
 use durable::serdes::SerdesContext;
 
-/// A serdes that uppercases the JSON wire form (illustrative).
+/// A serdes that uppercases the JSON wire form (illustrative). The blanket
+/// implementation over every JSON-able `T` is what lets ONE instance serve
+/// operations with different output types.
 #[derive(Debug)]
 struct UppercaseSerdes;
 
-impl Serdes for UppercaseSerdes {
-    fn serialize(
+impl<T> Serdes<T> for UppercaseSerdes
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+{
+    async fn serialize(
         &self,
-        value: &serde_json::Value,
-        _context: &SerdesContext,
+        value: T,
+        _context: SerdesContext,
     ) -> Result<String, durable::BoxError> {
-        // The serdes receives the operation's value erased to
-        // `serde_json::Value`, not pre-rendered JSON text.
-        Ok(value.to_string().to_uppercase())
+        Ok(serde_json::to_string(&value)?.to_uppercase())
     }
 
-    fn deserialize(
+    async fn deserialize(
         &self,
-        data: &str,
-        _context: &SerdesContext,
-    ) -> Result<serde_json::Value, durable::BoxError> {
-        Ok(serde_json::from_str(data)?)
+        wire: String,
+        _context: SerdesContext,
+    ) -> Result<T, durable::BoxError> {
+        Ok(serde_json::from_str(&wire.to_lowercase())?)
     }
 }
 
-/// Runs a step; its result is checkpointed through the execution-wide serdes.
+/// Runs two steps with different output types; both results are
+/// checkpointed through the SAME shared serdes instance.
 async fn handler(
     _event: serde_json::Value,
     ctx: durable::DurableContext,
 ) -> Result<String, durable::BoxError> {
+    let shared = Arc::new(UppercaseSerdes);
+
     let value = ctx
         .step(|_| async { Ok("hello".to_owned()) })
         .name("produce")
+        .serdes(Arc::clone(&shared))
         .await?;
-    Ok(value)
+
+    // The same instance serves a step with a different output type.
+    let count: u32 = ctx
+        .step(|_| async { Ok(2_u32) })
+        .name("count")
+        .serdes(shared)
+        .await?;
+
+    Ok(format!("{value}x{count}"))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
     lambda_runtime::tracing::init_default_subscriber();
-    let options = durable::Options::builder()
-        .serdes(UppercaseSerdes)
-        .build()?;
-    let service = durable::wrap(handler, options);
-    lambda_runtime::run(lambda_runtime::service_fn(service)).await
+    durable::run(handler).await
 }

@@ -9,7 +9,7 @@ async fn handler(
 ) -> Result<String, durable::BoxError> {
     let target = std::env::var("TARGET_FUNCTION_NAME")
         .map_err(|e| -> durable::BoxError { e.to_string().into() })?;
-    let invoke_result = ctx.invoke::<serde_json::Value, _>(&target, &event).await?;
+    let invoke_result = ctx.invoke::<serde_json::Value, _>(&target, event.clone()).await?;
     let step_result = ctx
         .step(move |_| async move { Ok(format!("processed: {}", invoke_result)) })
         .await?;

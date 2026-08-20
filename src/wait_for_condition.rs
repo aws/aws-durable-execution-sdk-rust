@@ -14,12 +14,9 @@
 //! - Wait strategy exhaustion raises `WaitForConditionError::MaxChecksExceeded`.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 
 use crate::context::{DurableContext, StepContext};
 use crate::engine::CheckpointStatus;
@@ -110,21 +107,22 @@ pub(crate) type WaitStrategyFn<S> = Box<dyn Fn(S, u32) -> WaitDecision + Send + 
 /// The one erasure point is the builder's `.future()` / `into_future`,
 /// which boxes the whole execution future once inside
 /// [`DurableFuture`](crate::DurableFuture).
-pub(crate) struct WaitForConditionExecution<S, F> {
+pub(crate) struct WaitForConditionExecution<S, F, SD> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) initial_state: S,
     pub(crate) wait_strategy: Option<WaitStrategyFn<S>>,
-    pub(crate) serdes: Option<Arc<dyn Serdes>>,
+    pub(crate) serdes: SD,
     pub(crate) check: F,
 }
 
-impl<S, F, Fut> WaitForConditionExecution<S, F>
+impl<S, F, Fut, SD> WaitForConditionExecution<S, F, SD>
 where
-    S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
     F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
+    SD: Serdes<S>,
 {
     /// Executes the wait-for-condition operation.
     ///
@@ -172,18 +170,18 @@ where
 /// only over the state type `S` — no user closure reaches this state
 /// machine, so its substantial replay/checkpoint logic compiles once per
 /// state type instead of once per call site.
-struct WfcCore<S> {
+struct WfcCore<S, SD> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     initial_state: S,
     wait_strategy: Option<WaitStrategyFn<S>>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: SD,
 }
 
 /// What [`WfcCore::before`] decided: the operation is already resolved from
 /// the checkpoint log (or suspended), or one check-attempt cycle must run.
-enum WfcPrelude<S> {
+enum WfcPrelude<S, SD> {
     /// Resolved without running the check (replay or suspension).
     Done(Result<S, OperationError>),
     /// The check must run at `attempt` against the carried `state`; `after`
@@ -194,29 +192,30 @@ enum WfcPrelude<S> {
         /// The carried state the check receives.
         state: S,
         /// The post-check half that runs the strategy/decision protocol.
-        after: WfcAfter<S>,
+        after: WfcAfter<S, SD>,
     },
 }
 
 /// The post-check half of `wait_for_condition`: state serialization, wait
 /// strategy consultation, and the Succeed/Retry/Fail checkpoint protocol.
 /// Generic only over the state type.
-struct WfcAfter<S> {
+struct WfcAfter<S, SD> {
     ctx: DurableContext,
     wire_id: String,
     name: Option<String>,
     wait_strategy: Option<WaitStrategyFn<S>>,
-    serdes: Option<Arc<dyn Serdes>>,
+    serdes: SD,
 }
 
-impl<S> WfcCore<S>
+impl<S, SD> WfcCore<S, SD>
 where
-    S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    SD: Serdes<S>,
 {
     /// Runs everything that precedes the check closure: replay path, or
     /// the live-path preamble (carried-state derivation + START checkpoint).
     #[allow(clippy::too_many_lines)] // reason: replay-status protocol is a single logical unit; splitting would obscure it
-    async fn before(self) -> Result<WfcPrelude<S>, OperationError> {
+    async fn before(self) -> Result<WfcPrelude<S, SD>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
 
@@ -243,12 +242,8 @@ where
                     // payload or failing serdes surfaces as an error without
                     // claiming a recorded outcome was returned.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    let value = replay_terminal_success(
-                        self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-                        payload.as_ref(),
-                        &serdes_ctx,
-                    )
-                    .await?;
+                    let value =
+                        replay_terminal_success(&self.serdes, payload, serdes_ctx.clone()).await?;
                     self.ctx.emit_operation_replayed(
                         &wire_id,
                         self.name.as_deref(),
@@ -309,12 +304,7 @@ where
             if let Some(payload) = self.ctx.checkpoint_result_payload(&positional_id) {
                 // On deserialization failure, surface the error loudly and
                 // never silently fall back to initial_state.
-                deserialize_state(
-                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-                    Some(&payload),
-                    &serdes_ctx,
-                )
-                .await?
+                deserialize_state_str(&self.serdes, payload, serdes_ctx.clone()).await?
             } else {
                 self.initial_state.clone()
             };
@@ -357,9 +347,10 @@ where
     }
 }
 
-impl<S> WfcAfter<S>
+impl<S, SD> WfcAfter<S, SD>
 where
-    S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    SD: Serdes<S>,
 {
     /// Settles one check cycle: serializes the new state, consults the wait
     /// strategy, and runs the Succeed/Retry/Fail checkpoint protocol.
@@ -371,21 +362,14 @@ where
         let serdes_ctx = SerdesContext::new(&self.wire_id, self.ctx.execution_arn());
         match check_result {
             Ok(new_state) => {
-                // Serialize the new state.
-                let serialized = serialize_state(
-                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-                    &new_state,
-                    &serdes_ctx,
-                )
-                .await?;
+                // Serialize the new state (ownership transfers to the
+                // serdes; the round trip below reconstructs it).
+                let serialized =
+                    serialize_state(&self.serdes, new_state, serdes_ctx.clone()).await?;
 
                 // Round-trip through serdes for consistency.
-                let deserialized: S = deserialize_state_str(
-                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
-                    &serialized,
-                    &serdes_ctx,
-                )
-                .await?;
+                let deserialized: S =
+                    deserialize_state_str(&self.serdes, serialized.clone(), serdes_ctx).await?;
 
                 // Consult the wait strategy.
                 let decision = if let Some(strategy) = &self.wait_strategy {
@@ -482,12 +466,12 @@ where
 
 /// Replays a terminal success from the checkpoint log.
 /// CRITICAL: NEVER falls back to `initial_state` (Python #574 / JS #754 fix).
-async fn replay_terminal_success<S: DeserializeOwned>(
-    serdes: Option<&Arc<dyn Serdes>>,
-    result: Option<&String>,
-    serdes_ctx: &SerdesContext,
+async fn replay_terminal_success<S, SD: Serdes<S>>(
+    serdes: &SD,
+    result: Option<String>,
+    serdes_ctx: SerdesContext,
 ) -> Result<S, OperationError> {
-    let payload = result.map_or("null", String::as_str);
+    let payload = result.unwrap_or_else(|| "null".to_owned());
     deserialize_state_str(serdes, payload, serdes_ctx).await
 }
 
@@ -505,70 +489,28 @@ fn replay_terminal_failure(
     wfc_op_error(WaitForConditionErrorKind::CheckFailed { message: msg })
 }
 
-/// Serializes state using the configured serdes or default JSON.
-fn serialize_state<'a, S: Serialize>(
-    serdes: Option<&'a Arc<dyn Serdes>>,
-    value: &S,
-    serdes_ctx: &'a SerdesContext,
-) -> impl Future<Output = Result<String, OperationError>> + Send + 'a {
-    // Phase 1 (sync): consume the `&S` borrow now, so the returned future
-    // holds no `&S` across its await (which would force `S: Sync`). No
-    // custom serdes renders straight to the wire; a custom serdes receives
-    // the state erased to `serde_json::Value` — the same shape every other
-    // operation path provides.
-    let prepared = crate::serdes::prepare_value(serdes, value);
-    // Phase 2 (async): a custom serdes may block (e.g. filesystem I/O), so
-    // the call runs off the async runtime.
-    async move {
-        prepared
-            .map_err(|e| {
-                wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-                    message: e.to_string(),
-                })
-            })?
-            .into_wire(serdes_ctx)
-            .await
-            .map_err(|e| {
-                wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-                    message: e.to_string(),
-                })
-            })
-    }
-}
-
-/// Deserializes state from checkpoint result (Option<&String>).
-/// LOUD error on failure — never silently resets (Python #574 fix).
-async fn deserialize_state<S: DeserializeOwned>(
-    serdes: Option<&Arc<dyn Serdes>>,
-    result: Option<&String>,
-    serdes_ctx: &SerdesContext,
-) -> Result<S, OperationError> {
-    let payload = result.map_or("null", String::as_str);
-    deserialize_state_str(serdes, payload, serdes_ctx).await
+/// Serializes state through the configured serdes (ownership transfers;
+/// the serdes decides where its work runs).
+async fn serialize_state<S, SD: Serdes<S>>(
+    serdes: &SD,
+    value: S,
+    serdes_ctx: SerdesContext,
+) -> Result<String, OperationError> {
+    serdes.serialize(value, serdes_ctx).await.map_err(|e| {
+        wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
+            message: e.to_string(),
+        })
+    })
 }
 
 /// Deserializes state from a string payload.
-async fn deserialize_state_str<S: DeserializeOwned>(
-    serdes: Option<&Arc<dyn Serdes>>,
-    payload: &str,
-    serdes_ctx: &SerdesContext,
+/// LOUD error on failure — never silently resets (Python #574 fix).
+async fn deserialize_state_str<S, SD: Serdes<S>>(
+    serdes: &SD,
+    payload: String,
+    serdes_ctx: SerdesContext,
 ) -> Result<S, OperationError> {
-    let Some(s) = serdes else {
-        return serde_json::from_str(payload).map_err(|e| {
-            wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-                message: format!("state deserialization failed: {e}"),
-            })
-        });
-    };
-    // Custom serdes may block (e.g. filesystem I/O): run off the runtime.
-    let json_value = crate::serdes::deserialize_off_runtime(s, payload.to_owned(), serdes_ctx)
-        .await
-        .map_err(|e| {
-            wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-                message: format!("state deserialization failed: {e}"),
-            })
-        })?;
-    serde_json::from_value(json_value).map_err(|e| {
+    serdes.deserialize(payload, serdes_ctx).await.map_err(|e| {
         wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
             message: format!("state deserialization failed: {e}"),
         })
@@ -775,7 +717,7 @@ mod tests {
                     WaitDecision::continue_with(Duration::from_secs(1))
                 }
             })),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             check: move |_ctx, state: i32| {
                 *seen_check
                     .lock()
@@ -820,7 +762,7 @@ mod tests {
                     WaitDecision::continue_with(Duration::from_secs(1))
                 }
             })),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state) },
         };
 
@@ -866,7 +808,7 @@ mod tests {
                     WaitDecision::continue_with(Duration::from_secs(1))
                 }
             })),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state + 1) },
         };
 
@@ -896,7 +838,7 @@ mod tests {
                     WaitDecision::continue_with(Duration::from_secs(1))
                 }
             })),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state + 1) },
         };
 
@@ -943,13 +885,13 @@ mod tests {
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
 
-        let exec = WaitForConditionExecution::<i32, _> {
+        let exec = WaitForConditionExecution::<i32, _, _> {
             ctx,
             op_id,
             name: Some("regression".to_owned()),
             initial_state: 0,
             wait_strategy: Some(Box::new(|_state: i32, _attempt| WaitDecision::complete())),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
                 #[allow(unreachable_code)] // reason: type anchor for the diverging body
                 {
@@ -986,13 +928,13 @@ mod tests {
         let ctx = make_ctx_with_client();
         let op_id = ctx.mint_id();
 
-        let exec = WaitForConditionExecution::<i32, _> {
+        let exec = WaitForConditionExecution::<i32, _, _> {
             ctx,
             op_id,
             name: None,
             initial_state: 0,
             wait_strategy: Some(Box::new(|_state: i32, _attempt| WaitDecision::complete())),
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async {
                 Err::<i32, BoxError>("check function failed".into())
             },
@@ -1027,13 +969,13 @@ mod tests {
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
 
-        let exec = WaitForConditionExecution::<i32, _> {
+        let exec = WaitForConditionExecution::<i32, _, _> {
             ctx,
             op_id,
             name: None,
             initial_state: 0,
             wait_strategy: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
                 #[allow(unreachable_code)] // reason: type anchor for the diverging body
                 {
@@ -1070,13 +1012,13 @@ mod tests {
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
 
-        let exec = WaitForConditionExecution::<i32, _> {
+        let exec = WaitForConditionExecution::<i32, _, _> {
             ctx,
             op_id,
             name: None,
             initial_state: 0,
             wait_strategy: None,
-            serdes: None,
+            serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
                 #[allow(unreachable_code)] // reason: type anchor for the diverging body
                 {
