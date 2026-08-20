@@ -179,13 +179,20 @@ impl<O: Send + 'static> DurableFuture<O> {
         // Register BEFORE spawning so the count is already correct even if the
         // task settles before the owner is polled again.
         owner_scope.register_spawn();
-        let task_scope = std::sync::Arc::clone(&owner_scope);
+        // Construct the settling guard BEFORE spawning and move it into the
+        // task. The guard must exist from the moment `register_spawn` takes
+        // effect: dropping the returned future aborts the task, and an abort
+        // that lands before the task's first poll drops the task body — and
+        // this guard with it — settling `Aborted`. Constructing the guard
+        // inside the task body instead would leave that window unguarded,
+        // permanently counting a phantom outstanding spawn that parks the
+        // owner forever (issue #48).
+        let mut accounting = SpawnAccounting {
+            scope: std::sync::Arc::clone(&owner_scope),
+            settled: false,
+        };
 
         let handle = tokio::spawn(async move {
-            let mut accounting = SpawnAccounting {
-                scope: task_scope,
-                settled: false,
-            };
             // Register this task as blessed AFTER spawn (we need the task ID).
             if let Some(task_id) = tokio::task::try_id() {
                 task_ownership.bless_task(task_id);
