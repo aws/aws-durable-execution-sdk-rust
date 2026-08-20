@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{Serdes, WaitStrategy};
+use crate::Serdes;
 
 /// Error returned when [`OptionsBuilder::build()`] detects an invalid
 /// configuration combination.
@@ -41,6 +41,16 @@ impl std::error::Error for OptionsValidationError {}
 /// Use [`Options::builder()`] to construct. All settings are optional;
 /// defaults are suitable for standard Lambda deployments.
 ///
+/// # Customizing the service client
+///
+/// The SDK calls the durable execution service through an
+/// `aws_sdk_lambda::Client` and relies on that client's own standard,
+/// jittered retry for transient failures. To customize transport behavior —
+/// retry policy, timeouts, endpoint, credentials — build the client (or an
+/// `aws_config::SdkConfig`) yourself and supply it via
+/// [`lambda_client`](OptionsBuilder::lambda_client) (or
+/// [`sdk_config`](OptionsBuilder::sdk_config)); the SDK uses it as-is.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -65,11 +75,6 @@ pub struct Options {
     /// A pre-built Lambda client. When set, it is used directly instead of
     /// building one from [`Self::sdk_config`].
     pub(crate) lambda_client: Option<aws_sdk_lambda::Client>,
-    /// Delay/backoff schedule applied between retries of the durable
-    /// execution service calls (`CheckpointDurableExecution`,
-    /// `GetDurableExecutionState`). `None` keeps the SDK's built-in
-    /// schedule.
-    pub(crate) polling_strategy: Option<WaitStrategy>,
     /// Coalescing window for checkpoint writes. `None` (the default) writes
     /// every checkpoint immediately, exactly as before this knob existed.
     pub(crate) checkpoint_delay: Option<Duration>,
@@ -95,7 +100,6 @@ impl Default for Options {
             serdes: None,
             sdk_config: None,
             lambda_client: None,
-            polling_strategy: None,
             checkpoint_delay: None,
             checkpoint_batching: false,
         }
@@ -141,7 +145,6 @@ pub struct OptionsBuilder {
     serdes: Option<Arc<dyn Serdes>>,
     sdk_config: Option<aws_config::SdkConfig>,
     lambda_client: Option<aws_sdk_lambda::Client>,
-    polling_strategy: Option<WaitStrategy>,
     checkpoint_delay: Option<Duration>,
     checkpoint_batching: Option<bool>,
 }
@@ -207,6 +210,13 @@ impl OptionsBuilder {
     /// When provided, the SDK uses this client instead of building one
     /// from the SDK config.
     ///
+    /// This is the supported path for customizing how the SDK talks to the
+    /// durable execution service: configure retry, timeouts, endpoint, or
+    /// credentials on the client (or use
+    /// [`sdk_config`](Self::sdk_config)) and the SDK uses it verbatim.
+    /// Transient-failure retry of the service calls is the client's own
+    /// standard retry; the SDK adds no retry layer of its own.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -224,42 +234,6 @@ impl OptionsBuilder {
     /// ```
     pub fn lambda_client(mut self, client: aws_sdk_lambda::Client) -> Self {
         self.lambda_client = Some(client);
-        self
-    }
-
-    /// Sets the delay/backoff schedule the SDK applies between retries of
-    /// its durable execution service calls (`CheckpointDurableExecution`
-    /// and `GetDurableExecutionState`).
-    ///
-    /// The strategy's `initial_delay` is the delay before the first retry,
-    /// multiplied by `backoff_factor` after each subsequent failed attempt
-    /// and capped at `max_delay`. It shapes only the *delays* between
-    /// attempts; the retry attempt budget and the retryable/non-retryable
-    /// classification of service errors are unchanged.
-    ///
-    /// When unset, the SDK keeps its built-in schedule: 100 ms initial
-    /// delay, 2.0 backoff factor, capped at 2 seconds.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use aws_durable_execution_sdk_rust::{Options, WaitStrategy};
-    /// use std::time::Duration;
-    ///
-    /// let opts = Options::builder()
-    ///     .polling_strategy(
-    ///         WaitStrategy::builder()
-    ///             .initial_delay(Duration::from_millis(250))
-    ///             .max_delay(Duration::from_secs(5))
-    ///             .backoff_factor(3.0)
-    ///             .build(),
-    ///     )
-    ///     .build()
-    ///     .expect("valid config");
-    /// # drop(opts);
-    /// ```
-    pub fn polling_strategy(mut self, strategy: WaitStrategy) -> Self {
-        self.polling_strategy = Some(strategy);
         self
     }
 
@@ -397,7 +371,6 @@ impl OptionsBuilder {
             serdes: self.serdes,
             sdk_config: self.sdk_config,
             lambda_client: self.lambda_client,
-            polling_strategy: self.polling_strategy,
             checkpoint_delay: self.checkpoint_delay,
             checkpoint_batching: self.checkpoint_batching.unwrap_or(false),
         })
@@ -485,30 +458,9 @@ mod tests {
     fn default_options_carry_no_execution_tuning() {
         let opts = Options::builder().build().expect("valid");
         assert!(
-            opts.polling_strategy.is_none(),
-            "unset polling strategy must stay None so the client keeps its built-in schedule"
-        );
-        assert!(
             opts.checkpoint_delay.is_none(),
             "unset checkpoint delay must stay None so checkpoints write immediately"
         );
-    }
-
-    #[test]
-    fn polling_strategy_is_stored() {
-        let strategy = WaitStrategy::builder()
-            .initial_delay(Duration::from_millis(250))
-            .max_delay(Duration::from_secs(5))
-            .backoff_factor(3.0)
-            .build();
-        let opts = Options::builder()
-            .polling_strategy(strategy)
-            .build()
-            .expect("valid");
-        let stored = opts.polling_strategy.expect("polling strategy preserved");
-        assert_eq!(stored.initial_delay(), Duration::from_millis(250));
-        assert_eq!(stored.max_delay(), Duration::from_secs(5));
-        assert!((stored.backoff_factor() - 3.0).abs() < f64::EPSILON);
     }
 
     #[test]

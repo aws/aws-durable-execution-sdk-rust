@@ -7,176 +7,10 @@
 use std::pin::Pin;
 #[cfg(test)]
 use std::sync::Mutex;
-use std::time::Duration;
 
-use aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError;
-use aws_sdk_lambda::operation::get_durable_execution_state::GetDurableExecutionStateError;
 use aws_sdk_lambda::types::{Operation, OperationType, OperationUpdate};
 
-use crate::WaitStrategy;
 use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
-
-// ────────────────────────────────────────────────────────────────────────────
-// Error Classification
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Whether a checkpoint failure should be retried.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RetryClassification {
-    /// Transient failure — retry with backoff.
-    Retryable,
-    /// Permanent failure — do not retry.
-    NonRetryable,
-}
-
-/// Classifies a checkpoint `SdkError` into a retry decision.
-///
-/// Classification rules:
-/// 1. `TooManyRequestsException` → retryable (throttling).
-/// 2. `ServiceException` → retryable (server-side 5xx).
-/// 3. Timeout/dispatch/network errors → retryable (transient).
-/// 4. `InvalidParameterValueException`, KMS errors → non-retryable (client fault).
-/// 5. Unknown structured errors → non-retryable. This default is deliberate:
-///    treating an unrecognized service error as retryable risks a retry storm
-///    against an error class we know nothing about, and a wrong non-retryable
-///    is cushioned because the durable service re-invokes the execution
-///    regardless, giving the call another chance on the next invocation.
-pub(crate) fn classify_checkpoint_error(
-    err: &aws_sdk_lambda::error::SdkError<CheckpointDurableExecutionError>,
-) -> RetryClassification {
-    match err {
-        aws_sdk_lambda::error::SdkError::ServiceError(service_err) => {
-            match service_err.err() {
-                CheckpointDurableExecutionError::TooManyRequestsException(_)
-                | CheckpointDurableExecutionError::ServiceException(_) => {
-                    RetryClassification::Retryable
-                }
-                // Client faults: invalid params, KMS issues.
-                CheckpointDurableExecutionError::InvalidParameterValueException(_)
-                | CheckpointDurableExecutionError::KmsAccessDeniedException(_)
-                | CheckpointDurableExecutionError::KmsDisabledException(_)
-                | CheckpointDurableExecutionError::KmsInvalidStateException(_)
-                | CheckpointDurableExecutionError::KmsNotFoundException(_) => {
-                    RetryClassification::NonRetryable
-                }
-                // Unknown service errors default to non-retryable
-                // deliberately (see rule 5 in the doc above): no retry storm
-                // on an unrecognized error class, and the durable service's
-                // re-invocation cushions a wrong non-retryable.
-                _ => RetryClassification::NonRetryable,
-            }
-        }
-        // Timeout, dispatch, and response errors are transient.
-        aws_sdk_lambda::error::SdkError::TimeoutError(_)
-        | aws_sdk_lambda::error::SdkError::DispatchFailure(_)
-        | aws_sdk_lambda::error::SdkError::ResponseError(_) => RetryClassification::Retryable,
-        // Construction failures are non-retryable.
-        aws_sdk_lambda::error::SdkError::ConstructionFailure(_) => {
-            RetryClassification::NonRetryable
-        }
-        _ => RetryClassification::NonRetryable,
-    }
-}
-
-/// Classifies a `GetDurableExecutionState` error into a retry decision.
-pub(crate) fn classify_get_state_error(
-    err: &aws_sdk_lambda::error::SdkError<GetDurableExecutionStateError>,
-) -> RetryClassification {
-    match err {
-        aws_sdk_lambda::error::SdkError::ServiceError(service_err) => match service_err.err() {
-            GetDurableExecutionStateError::TooManyRequestsException(_)
-            | GetDurableExecutionStateError::ServiceException(_) => RetryClassification::Retryable,
-            GetDurableExecutionStateError::InvalidParameterValueException(_)
-            | GetDurableExecutionStateError::KmsAccessDeniedException(_)
-            | GetDurableExecutionStateError::KmsDisabledException(_)
-            | GetDurableExecutionStateError::KmsInvalidStateException(_)
-            | GetDurableExecutionStateError::KmsNotFoundException(_) => {
-                RetryClassification::NonRetryable
-            }
-            // Unknown service errors default to non-retryable deliberately —
-            // same rationale as [`classify_checkpoint_error`] rule 5.
-            _ => RetryClassification::NonRetryable,
-        },
-        aws_sdk_lambda::error::SdkError::TimeoutError(_)
-        | aws_sdk_lambda::error::SdkError::DispatchFailure(_)
-        | aws_sdk_lambda::error::SdkError::ResponseError(_) => RetryClassification::Retryable,
-        aws_sdk_lambda::error::SdkError::ConstructionFailure(_) => {
-            RetryClassification::NonRetryable
-        }
-        _ => RetryClassification::NonRetryable,
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Retry Parameters (3 attempts; delays shaped by the polling strategy)
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Maximum number of attempts for a retryable checkpoint call.
-const MAX_ATTEMPTS: u32 = 3;
-
-/// Initial backoff delay before the first retry (built-in schedule).
-const BASE_DELAY: Duration = Duration::from_millis(100);
-
-/// Maximum backoff delay cap (built-in schedule).
-const MAX_DELAY: Duration = Duration::from_secs(2);
-
-/// The SDK's built-in service-call polling schedule: 100 ms initial delay,
-/// 2.0 backoff factor, capped at 2 seconds. Used when
-/// [`Options`](crate::Options) sets no
-/// [`polling_strategy`](crate::OptionsBuilder::polling_strategy), so the
-/// default configuration reproduces the historical delays exactly.
-pub(crate) fn default_polling_strategy() -> WaitStrategy {
-    WaitStrategy::builder()
-        .initial_delay(BASE_DELAY)
-        .max_delay(MAX_DELAY)
-        .backoff_factor(2.0)
-        .build()
-}
-
-/// Computes the delay before the retry following the given zero-based
-/// attempt index, per the configured polling strategy: `attempt` 0 →
-/// `initial_delay`, then multiplied by `backoff_factor` per attempt, capped
-/// at `max_delay`. A non-finite or negative intermediate value (possible
-/// only with a pathological strategy) clamps to `max_delay`.
-fn polling_delay(strategy: &WaitStrategy, attempt: u32) -> Duration {
-    let factor = strategy.backoff_factor();
-    let scaled =
-        strategy.initial_delay().as_secs_f64() * factor.powi(i32::try_from(attempt).unwrap_or(0));
-    let max = strategy.max_delay();
-    if scaled.is_finite() && scaled >= 0.0 {
-        Duration::try_from_secs_f64(scaled).unwrap_or(max).min(max)
-    } else {
-        max
-    }
-}
-
-/// Runs `attempt_fn` up to [`MAX_ATTEMPTS`] times, sleeping the
-/// strategy-shaped [`polling_delay`] between retryable failures. A
-/// non-retryable error returns immediately; the last retryable error is
-/// returned once attempts are exhausted.
-async fn retry_with_polling<T, Fut>(
-    strategy: &WaitStrategy,
-    mut attempt_fn: impl FnMut(u32) -> Fut,
-) -> Result<T, ClientError>
-where
-    Fut: Future<Output = Result<T, ClientError>>,
-{
-    let mut last_err: Option<ClientError> = None;
-    for attempt in 0..MAX_ATTEMPTS {
-        match attempt_fn(attempt).await {
-            Ok(value) => return Ok(value),
-            Err(err) if !err.is_retryable() => return Err(err),
-            Err(err) => {
-                last_err = Some(err);
-                if attempt < MAX_ATTEMPTS - 1 {
-                    tokio::time::sleep(polling_delay(strategy, attempt)).await;
-                }
-            }
-        }
-    }
-    Err(last_err
-        .unwrap_or_else(|| ClientError::from_retryable("retry attempts exhausted".to_owned())))
-}
 
 // ────────────────────────────────────────────────────────────────────────────
 // `ExecutionClient` Trait
@@ -189,12 +23,15 @@ where
 #[derive(Debug, Clone)]
 pub(crate) struct ClientError {
     message: String,
-    /// Whether the underlying failure was classified as retryable.
+    /// Whether the underlying failure was considered retryable.
     ///
-    /// Classification happens *before* constructing the error (see
-    /// `classify_checkpoint_error` / `classify_get_state_error`); the retry
-    /// loop ([`retry_with_polling`]) reads it back through
-    /// [`ClientError::is_retryable`] to decide whether to retry.
+    /// The production client relies on the aws-sdk's standard retry, so by
+    /// the time an error carries this flag the SDK has already exhausted
+    /// its attempts; no in-process retry loop reads it back. It records how
+    /// the failure was mapped (a failed service call is retryable — the
+    /// invocation fails and the durable service re-invokes) and lets tests
+    /// assert on that mapping.
+    #[cfg_attr(not(test), allow(dead_code))] // reason: read only by test assertions
     retryable: bool,
 }
 
@@ -207,8 +44,10 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 impl ClientError {
-    /// Whether this error is classified as retryable. Drives the retry
-    /// decision in [`retry_with_polling`].
+    /// Whether this error was mapped as retryable. Test-only: production
+    /// code no longer branches on it — the aws-sdk's standard retry owns
+    /// the retry decision.
+    #[cfg(test)]
     pub(crate) fn is_retryable(&self) -> bool {
         self.retryable
     }
@@ -266,7 +105,9 @@ pub(crate) struct GetStateOutput {
 pub(crate) trait ExecutionClient: Send + Sync + std::fmt::Debug {
     /// Checkpoints operation updates, rotating the token.
     ///
-    /// Implementations MUST handle retry internally for retryable errors.
+    /// Transient-failure retry is the transport's responsibility: the
+    /// production implementation relies on the aws-sdk's standard retry,
+    /// and an error returned here is final for this invocation.
     fn checkpoint(
         &self,
         execution_arn: &str,
@@ -288,21 +129,24 @@ pub(crate) trait ExecutionClient: Send + Sync + std::fmt::Debug {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Production `ExecutionClient` backed by `aws_sdk_lambda::Client`.
+///
+/// Retry is delegated entirely to the wrapped SDK client's own retry
+/// strategy (standard retry by default: jittered exponential backoff, 3
+/// attempts). This matches the sibling JS and Python SDKs, which rely on
+/// their AWS SDKs' built-in retry. A call that exhausts the SDK's retries
+/// fails the invocation; the durable execution service re-invokes the
+/// handler, which is the recovery path — longer in-process retry would
+/// only delay it. Callers who need a different retry policy supply a
+/// preconfigured client via [`Options`](crate::Options)'s `lambda_client`.
 #[derive(Debug, Clone)]
 pub(crate) struct LambdaExecutionClient {
     client: aws_sdk_lambda::Client,
-    /// Delay schedule between retries of the service calls. Defaults to
-    /// [`default_polling_strategy`]; overridden via
-    /// [`Options`](crate::Options)'s `polling_strategy`.
-    polling: WaitStrategy,
 }
 
 impl LambdaExecutionClient {
-    /// Creates a new client wrapping the provided Lambda SDK client, with
-    /// the given retry-delay schedule (see [`default_polling_strategy`] for
-    /// the built-in one).
-    pub(crate) fn with_polling(client: aws_sdk_lambda::Client, polling: WaitStrategy) -> Self {
-        Self { client, polling }
+    /// Creates a new client wrapping the provided Lambda SDK client.
+    pub(crate) fn new(client: aws_sdk_lambda::Client) -> Self {
+        Self { client }
     }
 }
 
@@ -316,53 +160,42 @@ impl ExecutionClient for LambdaExecutionClient {
         let arn = execution_arn.to_owned();
         let token = checkpoint_token.to_owned();
         Box::pin(async move {
-            retry_with_polling(&self.polling, |_attempt| {
-                let arn = arn.clone();
-                let token = token.clone();
-                let updates = updates.clone();
-                async move {
-                    let result = self
-                        .client
-                        .checkpoint_durable_execution()
-                        .durable_execution_arn(&arn)
-                        .checkpoint_token(&token)
-                        .set_updates(Some(updates))
-                        .send()
-                        .await;
+            let result = self
+                .client
+                .checkpoint_durable_execution()
+                .durable_execution_arn(&arn)
+                .checkpoint_token(&token)
+                .set_updates(Some(updates))
+                .send()
+                .await;
 
-                    match result {
-                        Ok(output) => {
-                            let new_token = output.checkpoint_token.unwrap_or_default();
-                            if new_token.is_empty() {
-                                return Err(ClientError::non_retryable(
-                                    "backend returned no checkpoint token".to_owned(),
-                                ));
-                            }
-                            let (updated_ops, next_marker) = match output.new_execution_state {
-                                Some(state) => (
-                                    state.operations.unwrap_or_default(),
-                                    state.next_marker.filter(|m| !m.is_empty()),
-                                ),
-                                None => (Vec::new(), None),
-                            };
-                            Ok(CheckpointOutput {
-                                checkpoint_token: new_token,
-                                updated_operations: updated_ops,
-                                next_marker,
-                            })
-                        }
-                        Err(err) => match classify_checkpoint_error(&err) {
-                            RetryClassification::NonRetryable => {
-                                Err(ClientError::non_retryable(format!("{err}")))
-                            }
-                            RetryClassification::Retryable => {
-                                Err(ClientError::from_retryable(format!("{err}")))
-                            }
-                        },
+            match result {
+                Ok(output) => {
+                    let new_token = output.checkpoint_token.unwrap_or_default();
+                    if new_token.is_empty() {
+                        return Err(ClientError::non_retryable(
+                            "backend returned no checkpoint token".to_owned(),
+                        ));
                     }
+                    let (updated_ops, next_marker) = match output.new_execution_state {
+                        Some(state) => (
+                            state.operations.unwrap_or_default(),
+                            state.next_marker.filter(|m| !m.is_empty()),
+                        ),
+                        None => (Vec::new(), None),
+                    };
+                    Ok(CheckpointOutput {
+                        checkpoint_token: new_token,
+                        updated_operations: updated_ops,
+                        next_marker,
+                    })
                 }
-            })
-            .await
+                // The SDK's standard retry has already retried everything
+                // transient; the final error maps into a retryable
+                // `ClientError` so invocation-level behavior is unchanged:
+                // the invocation fails and the durable service re-invokes.
+                Err(err) => Err(ClientError::from_retryable(format!("{err}"))),
+            }
         })
     }
 
@@ -378,35 +211,23 @@ impl ExecutionClient for LambdaExecutionClient {
             let mut marker: Option<String> = None;
 
             loop {
-                let output = retry_with_polling(&self.polling, |_attempt| {
-                    let arn = arn.clone();
-                    let token = token.clone();
-                    let marker = marker.clone();
-                    async move {
-                        let mut builder = self
-                            .client
-                            .get_durable_execution_state()
-                            .durable_execution_arn(&arn)
-                            .checkpoint_token(&token);
+                let mut builder = self
+                    .client
+                    .get_durable_execution_state()
+                    .durable_execution_arn(&arn)
+                    .checkpoint_token(&token);
 
-                        if let Some(ref m) = marker {
-                            builder = builder.marker(m.as_str());
-                        }
+                if let Some(ref m) = marker {
+                    builder = builder.marker(m.as_str());
+                }
 
-                        builder
-                            .send()
-                            .await
-                            .map_err(|err| match classify_get_state_error(&err) {
-                                RetryClassification::NonRetryable => {
-                                    ClientError::non_retryable(format!("{err}"))
-                                }
-                                RetryClassification::Retryable => {
-                                    ClientError::from_retryable(format!("{err}"))
-                                }
-                            })
-                    }
-                })
-                .await?;
+                // As with `checkpoint`, the SDK's standard retry owns the
+                // transient-failure retry; the final error maps into a
+                // retryable `ClientError`.
+                let output = builder
+                    .send()
+                    .await
+                    .map_err(|err| ClientError::from_retryable(format!("{err}")))?;
 
                 all_operations.extend(output.operations);
 
@@ -832,198 +653,213 @@ fn extract_error_message(op: &Operation) -> Option<String> {
 mod tests {
     use super::*;
 
-    // Helper to build a minimal HTTP response for `SdkError::service_error`.
-    #[allow(clippy::expect_used)] // reason: test helper — valid status codes will never fail
-    fn test_http_response(
-        status: u16,
-    ) -> aws_smithy_runtime_api::client::orchestrator::HttpResponse {
-        aws_smithy_runtime_api::http::Response::new(
-            aws_smithy_runtime_api::http::StatusCode::try_from(status)
-                .expect("valid test status code"),
-            aws_smithy_types::body::SdkBody::empty(),
-        )
+    // ── Request mapping (aws-smithy-mocks) ──────────────────────────────
+    //
+    // These tests mock the Lambda SDK client at the HTTP layer and pin the
+    // per-operation request mapping of `LambdaExecutionClient`: what the
+    // client puts on the wire, how it maps responses back, and how the
+    // final error (after the SDK's own retry) maps into `ClientError`.
+
+    use aws_sdk_lambda::operation::checkpoint_durable_execution::{
+        CheckpointDurableExecutionError, CheckpointDurableExecutionOutput,
+    };
+    use aws_sdk_lambda::operation::get_durable_execution_state::{
+        GetDurableExecutionStateError, GetDurableExecutionStateOutput,
+    };
+    use aws_sdk_lambda::types::{CheckpointUpdatedExecutionState, OperationAction};
+    use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+    /// Builds a minimal `OperationUpdate` for request-mapping assertions.
+    #[allow(clippy::expect_used)] // reason: test helper — all required fields are set
+    fn make_update(id: &str, action: OperationAction) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(id)
+            .r#type(OperationType::Step)
+            .action(action)
+            .build()
+            .expect("valid OperationUpdate")
     }
 
-    // ── Classification tests ────────────────────────────────────────────
-
-    #[test]
-    fn classify_too_many_requests_is_retryable() {
-        let inner = CheckpointDurableExecutionError::TooManyRequestsException(
-            aws_sdk_lambda::types::error::TooManyRequestsException::builder().build(),
-        );
-        let err = aws_sdk_lambda::error::SdkError::service_error(inner, test_http_response(429));
-        assert_eq!(
-            classify_checkpoint_error(&err),
-            RetryClassification::Retryable
-        );
-    }
-
-    #[test]
-    fn classify_service_exception_is_retryable() {
-        let inner = CheckpointDurableExecutionError::ServiceException(
-            aws_sdk_lambda::types::error::ServiceException::builder().build(),
-        );
-        let err = aws_sdk_lambda::error::SdkError::service_error(inner, test_http_response(500));
-        assert_eq!(
-            classify_checkpoint_error(&err),
-            RetryClassification::Retryable
-        );
-    }
-
-    #[test]
-    fn classify_invalid_parameter_is_non_retryable() {
-        let inner = CheckpointDurableExecutionError::InvalidParameterValueException(
-            aws_sdk_lambda::types::error::InvalidParameterValueException::builder().build(),
-        );
-        let err = aws_sdk_lambda::error::SdkError::service_error(inner, test_http_response(400));
-        assert_eq!(
-            classify_checkpoint_error(&err),
-            RetryClassification::NonRetryable
-        );
-    }
-
-    #[test]
-    fn classify_kms_access_denied_is_non_retryable() {
-        let inner = CheckpointDurableExecutionError::KmsAccessDeniedException(
-            aws_sdk_lambda::types::error::KmsAccessDeniedException::builder().build(),
-        );
-        let err = aws_sdk_lambda::error::SdkError::service_error(inner, test_http_response(403));
-        assert_eq!(
-            classify_checkpoint_error(&err),
-            RetryClassification::NonRetryable
-        );
-    }
-
-    #[test]
-    fn classify_timeout_is_retryable() {
-        let err: aws_sdk_lambda::error::SdkError<CheckpointDurableExecutionError> =
-            aws_sdk_lambda::error::SdkError::timeout_error(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "timed out",
-            ));
-        assert_eq!(
-            classify_checkpoint_error(&err),
-            RetryClassification::Retryable
-        );
-    }
-
-    #[test]
-    fn classify_construction_failure_is_non_retryable() {
-        let err: aws_sdk_lambda::error::SdkError<CheckpointDurableExecutionError> =
-            aws_sdk_lambda::error::SdkError::construction_failure("bad input");
-        assert_eq!(
-            classify_checkpoint_error(&err),
-            RetryClassification::NonRetryable
-        );
-    }
-
-    // ── Backoff computation ─────────────────────────────────────────────
-
-    /// The default polling strategy reproduces the historical built-in
-    /// schedule byte-for-byte: 100 ms, 200 ms, 400 ms, ... capped at 2 s.
-    #[test]
-    fn default_polling_delays_are_exponential_and_capped() {
-        let strategy = default_polling_strategy();
-        assert_eq!(polling_delay(&strategy, 0), Duration::from_millis(100));
-        assert_eq!(polling_delay(&strategy, 1), Duration::from_millis(200));
-        assert_eq!(polling_delay(&strategy, 2), Duration::from_millis(400));
-        assert_eq!(polling_delay(&strategy, 10), MAX_DELAY);
-        assert_eq!(polling_delay(&strategy, 100), MAX_DELAY);
-    }
-
-    /// A configured strategy shapes the delays: initial × factor^attempt,
-    /// capped at the strategy's own max.
-    #[test]
-    fn configured_polling_delays_follow_the_strategy() {
-        let strategy = WaitStrategy::builder()
-            .initial_delay(Duration::from_secs(1))
-            .max_delay(Duration::from_secs(5))
-            .backoff_factor(3.0)
-            .build();
-        assert_eq!(polling_delay(&strategy, 0), Duration::from_secs(1));
-        assert_eq!(polling_delay(&strategy, 1), Duration::from_secs(3));
-        // 9 s exceeds the 5 s cap.
-        assert_eq!(polling_delay(&strategy, 2), Duration::from_secs(5));
-    }
-
-    /// A pathological strategy (non-finite or negative computed delay)
-    /// clamps to the strategy's max delay instead of panicking.
-    #[test]
-    fn pathological_polling_delays_clamp_to_max() {
-        let negative = WaitStrategy::builder()
-            .initial_delay(Duration::from_secs(1))
-            .max_delay(Duration::from_secs(7))
-            .backoff_factor(-2.0)
-            .build();
-        // Odd power of a negative factor → negative delay → clamped.
-        assert_eq!(polling_delay(&negative, 1), Duration::from_secs(7));
-
-        let huge = WaitStrategy::builder()
-            .initial_delay(Duration::from_secs(u64::MAX))
-            .max_delay(Duration::from_secs(9))
-            .backoff_factor(f64::MAX)
-            .build();
-        // Overflow to infinity → clamped.
-        assert_eq!(polling_delay(&huge, 100), Duration::from_secs(9));
-    }
-
-    /// The retry loop honors the configured strategy's delays: with paused
-    /// time, a fake operation that fails twice observes exactly the
-    /// configured sleep before each retry.
-    #[tokio::test(start_paused = true)]
-    async fn retry_loop_sleeps_the_configured_strategy_delays() {
-        let strategy = WaitStrategy::builder()
-            .initial_delay(Duration::from_secs(4))
-            .max_delay(Duration::from_mins(1))
-            .backoff_factor(2.0)
-            .build();
-
-        let attempt_times = Mutex::new(Vec::new());
-        let start = tokio::time::Instant::now();
-
-        let result: Result<u32, ClientError> = retry_with_polling(&strategy, |attempt| {
-            attempt_times
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(start.elapsed());
-            async move {
-                if attempt < 2 {
-                    Err(ClientError::from_retryable("transient".to_owned()))
-                } else {
-                    Ok(attempt)
-                }
-            }
-        })
-        .await;
-
-        #[allow(clippy::expect_used)] // reason: test assertion
-        let value = result.expect("third attempt succeeds");
-        assert_eq!(value, 2);
-        let times = attempt_times
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        // Attempt 0 immediately; attempt 1 after 4 s; attempt 2 after
-        // 4 s + 8 s = 12 s (initial × factor^attempt schedule).
-        assert_eq!(times.len(), 3);
-        assert_eq!(times.first().copied(), Some(Duration::ZERO));
-        assert_eq!(times.get(1).copied(), Some(Duration::from_secs(4)));
-        assert_eq!(times.get(2).copied(), Some(Duration::from_secs(12)));
-    }
-
-    /// A non-retryable failure returns immediately with no sleep.
-    #[tokio::test(start_paused = true)]
-    async fn retry_loop_stops_immediately_on_non_retryable() {
-        let start = tokio::time::Instant::now();
-        let result: Result<u32, ClientError> =
-            retry_with_polling(&default_polling_strategy(), |_attempt| async {
-                Err(ClientError::non_retryable("permanent".to_owned()))
+    /// `checkpoint` maps its arguments onto the `CheckpointDurableExecution`
+    /// request — ARN, token, and every update — and maps the response's
+    /// token, updated operations, and pagination marker back out.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // reason: test assertions
+    async fn checkpoint_maps_request_and_response() {
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
+            .match_requests(|req| {
+                req.durable_execution_arn() == Some("arn:aws:lambda:us-east-1:1:function:f")
+                    && req.checkpoint_token() == Some("tok-in")
+                    && req.updates().len() == 2
+                    && req.updates().first().map(OperationUpdate::id) == Some("op-1")
+                    && req.updates().get(1).map(OperationUpdate::id) == Some("op-2")
             })
-            .await;
-        #[allow(clippy::expect_used)] // reason: test assertion
-        let err = result.expect_err("must fail");
+            .then_output(|| {
+                CheckpointDurableExecutionOutput::builder()
+                    .checkpoint_token("tok-out")
+                    .new_execution_state(
+                        CheckpointUpdatedExecutionState::builder()
+                            .operations(make_step_op("op-1", r#""r1""#))
+                            .next_marker("more-pages")
+                            .build(),
+                    )
+                    .build()
+            });
+        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
+        let client = LambdaExecutionClient::new(sdk_client);
+
+        let updates = vec![
+            make_update("op-1", OperationAction::Start),
+            make_update("op-2", OperationAction::Succeed),
+        ];
+        let output = client
+            .checkpoint("arn:aws:lambda:us-east-1:1:function:f", "tok-in", updates)
+            .await
+            .expect("mocked checkpoint succeeds");
+
+        assert_eq!(output.checkpoint_token, "tok-out");
+        assert_eq!(output.updated_operations.len(), 1);
+        assert_eq!(
+            output.updated_operations.first().map(Operation::id),
+            Some("op-1")
+        );
+        assert_eq!(output.next_marker.as_deref(), Some("more-pages"));
+        assert_eq!(rule.num_calls(), 1);
+    }
+
+    /// A checkpoint response without a token is a protocol violation and
+    /// maps to a non-retryable `ClientError`.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // reason: test assertions
+    async fn checkpoint_without_token_is_non_retryable() {
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
+            .then_output(|| CheckpointDurableExecutionOutput::builder().build());
+        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
+        let client = LambdaExecutionClient::new(sdk_client);
+
+        let err = client
+            .checkpoint("arn:test", "tok", Vec::new())
+            .await
+            .expect_err("missing token must fail");
         assert!(!err.is_retryable());
-        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(err.to_string().contains("no checkpoint token"));
+    }
+
+    /// A checkpoint call whose final outcome is an error — here a modeled
+    /// client fault the SDK does not retry — maps into a retryable
+    /// `ClientError`: the invocation fails and the durable execution
+    /// service re-invokes, which is the recovery path.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // reason: test assertions
+    async fn checkpoint_final_error_maps_to_retryable_client_error() {
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution).then_error(|| {
+            CheckpointDurableExecutionError::InvalidParameterValueException(
+                aws_sdk_lambda::types::error::InvalidParameterValueException::builder().build(),
+            )
+        });
+        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
+        let client = LambdaExecutionClient::new(sdk_client);
+
+        let err = client
+            .checkpoint("arn:test", "tok", Vec::new())
+            .await
+            .expect_err("modeled error must fail the call");
+        assert!(err.is_retryable());
+        assert_eq!(rule.num_calls(), 1, "a client fault is not retried");
+    }
+
+    /// Transient-failure retry belongs to the aws-sdk's standard retry and
+    /// nothing else: a persistent 503 is attempted exactly the SDK's
+    /// default 3 times — not 9, which the deleted hand-rolled outer loop
+    /// used to multiply it to — and the exhausted call maps to a retryable
+    /// `ClientError`.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // reason: test assertions
+    async fn checkpoint_retry_is_the_sdk_standard_retry_alone() {
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
+            .sequence()
+            .http_status(503, None)
+            .repeatedly()
+            .build();
+        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
+        let client = LambdaExecutionClient::new(sdk_client);
+
+        let err = client
+            .checkpoint("arn:test", "tok", Vec::new())
+            .await
+            .expect_err("persistent 503 must exhaust retries");
+        assert!(err.is_retryable());
+        assert_eq!(
+            rule.num_calls(),
+            3,
+            "attempts must equal the SDK standard-retry budget — no outer loop multiplying them"
+        );
+    }
+
+    /// `get_state` maps ARN and token onto the request, sends no marker on
+    /// the first page, echoes the response's `next_marker` as the next
+    /// request's `marker`, and concatenates the pages in order.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // reason: test assertions
+    async fn get_state_paginates_with_marker() {
+        let first_page = mock!(aws_sdk_lambda::Client::get_durable_execution_state)
+            .match_requests(|req| {
+                req.durable_execution_arn() == Some("arn:test")
+                    && req.checkpoint_token() == Some("tok")
+                    && req.marker().is_none()
+            })
+            .then_output(|| {
+                GetDurableExecutionStateOutput::builder()
+                    .operations(make_step_op("op-1", r#""p1""#))
+                    .next_marker("page-2")
+                    .build()
+                    .expect("operations is set")
+            });
+        let second_page = mock!(aws_sdk_lambda::Client::get_durable_execution_state)
+            .match_requests(|req| req.marker() == Some("page-2"))
+            .then_output(|| {
+                GetDurableExecutionStateOutput::builder()
+                    .operations(make_step_op("op-2", r#""p2""#))
+                    .build()
+                    .expect("operations is set")
+            });
+        let sdk_client = mock_client!(
+            aws_sdk_lambda,
+            RuleMode::Sequential,
+            [&first_page, &second_page]
+        );
+        let client = LambdaExecutionClient::new(sdk_client);
+
+        let state = client
+            .get_state("arn:test", "tok")
+            .await
+            .expect("paginated get_state succeeds");
+
+        assert_eq!(state.operations.len(), 2);
+        assert_eq!(state.operations.first().map(Operation::id), Some("op-1"));
+        assert_eq!(state.operations.get(1).map(Operation::id), Some("op-2"));
+        assert_eq!(first_page.num_calls(), 1);
+        assert_eq!(second_page.num_calls(), 1);
+    }
+
+    /// A `get_state` failure maps into a retryable `ClientError` exactly
+    /// like a checkpoint failure.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // reason: test assertions
+    async fn get_state_final_error_maps_to_retryable_client_error() {
+        let rule = mock!(aws_sdk_lambda::Client::get_durable_execution_state).then_error(|| {
+            GetDurableExecutionStateError::InvalidParameterValueException(
+                aws_sdk_lambda::types::error::InvalidParameterValueException::builder().build(),
+            )
+        });
+        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
+        let client = LambdaExecutionClient::new(sdk_client);
+
+        let err = client
+            .get_state("arn:test", "tok")
+            .await
+            .expect_err("modeled error must fail the call");
+        assert!(err.is_retryable());
     }
 
     // ── Test double behavior ────────────────────────────────────────────

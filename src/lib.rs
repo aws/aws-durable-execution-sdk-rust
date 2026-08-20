@@ -1544,7 +1544,6 @@ where
         serdes,
         sdk_config,
         lambda_client,
-        polling_strategy,
         checkpoint_delay,
         checkpoint_batching,
     } = options;
@@ -1557,18 +1556,15 @@ where
         (None, true) => Some(std::time::Duration::ZERO),
         (None, false) => None,
     };
-    let polling = polling_strategy.unwrap_or_else(client::default_polling_strategy);
     let preset_client: Option<StdArc<dyn client::ExecutionClient>> =
         base_lambda_client_from_options(sdk_config, lambda_client).map(|c| {
-            StdArc::new(client::LambdaExecutionClient::with_polling(
-                c,
-                polling.clone(),
-            )) as StdArc<dyn client::ExecutionClient>
+            StdArc::new(client::LambdaExecutionClient::new(c))
+                as StdArc<dyn client::ExecutionClient>
         });
     wrap_with_provider(
         handler,
         serdes,
-        ClientProvider::new(preset_client, polling),
+        ClientProvider::new(preset_client),
         checkpoint_buffer_window,
     )
 }
@@ -1602,7 +1598,7 @@ where
     wrap_with_provider(
         handler,
         default_serdes,
-        ClientProvider::new(Some(exec_client), client::default_polling_strategy()),
+        ClientProvider::new(Some(exec_client)),
         checkpoint_buffer_window,
     )
 }
@@ -1835,24 +1831,15 @@ pub(crate) fn base_lambda_client_from_options(
 /// cached, so no per-invocation client construction or config load occurs.
 pub(crate) struct ClientProvider {
     preset: Option<std::sync::Arc<dyn client::ExecutionClient>>,
-    /// Retry-delay schedule for the ambient-default client, threaded from
-    /// [`Options`]'s `polling_strategy` (or the built-in schedule).
-    polling: WaitStrategy,
     default_cell: tokio::sync::OnceCell<std::sync::Arc<dyn client::ExecutionClient>>,
 }
 
 impl ClientProvider {
     /// Creates a provider. `preset` is the client resolved from `Options`, or
-    /// `None` to defer to the ambient default on first use; `polling` shapes
-    /// the ambient-default client's retry delays (a preset client already
-    /// carries its own).
-    pub(crate) fn new(
-        preset: Option<std::sync::Arc<dyn client::ExecutionClient>>,
-        polling: WaitStrategy,
-    ) -> Self {
+    /// `None` to defer to the ambient default on first use.
+    pub(crate) fn new(preset: Option<std::sync::Arc<dyn client::ExecutionClient>>) -> Self {
         Self {
             preset,
-            polling,
             default_cell: tokio::sync::OnceCell::new(),
         }
     }
@@ -1870,10 +1857,8 @@ impl ClientProvider {
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
-                StdArc::new(client::LambdaExecutionClient::with_polling(
-                    lambda_client,
-                    self.polling.clone(),
-                )) as StdArc<dyn client::ExecutionClient>
+                StdArc::new(client::LambdaExecutionClient::new(lambda_client))
+                    as StdArc<dyn client::ExecutionClient>
             })
             .await;
         StdArc::clone(client)
@@ -2571,10 +2556,7 @@ mod tests {
 
         let preset: StdArc<dyn client::ExecutionClient> =
             StdArc::new(InMemoryExecutionClient::new(Vec::new()));
-        let provider = ClientProvider::new(
-            Some(StdArc::clone(&preset)),
-            client::default_polling_strategy(),
-        );
+        let provider = ClientProvider::new(Some(StdArc::clone(&preset)));
 
         let first = provider.get().await;
         let second = provider.get().await;

@@ -87,6 +87,11 @@ sha2 = "0.10"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 aws-smithy-runtime-api = { version = "1", features = ["http-1x"] }
 aws-smithy-types = "1"
+# Request-mapping tests mock the Lambda SDK client at the HTTP layer.
+# `mock_client!` requires the service crate's `test-util` feature; keep
+# default features off here so the dev graph matches the production one.
+aws-smithy-mocks = "0.3"
+aws-sdk-lambda = { version = "1", default-features = false, features = ["test-util"] }
 tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
 
 [[test]]
