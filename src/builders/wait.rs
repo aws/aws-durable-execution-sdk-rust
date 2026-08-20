@@ -1,0 +1,115 @@
+//! The wait (durable timer) operation: [`WaitBuilder`], returned by
+//! [`DurableContext::wait`](crate::DurableContext::wait).
+
+use std::future::IntoFuture;
+
+use crate::context::DurableContext;
+use crate::engine::OperationId;
+use crate::error::OperationError;
+use crate::future::DurableFuture;
+
+// ============================================================
+// WaitBuilder
+// ============================================================
+
+/// Builder for a durable wait (timer) operation.
+///
+/// Created by [`DurableContext::wait`]. The wait duration is set at
+/// creation; chain `.name()` for identification.
+///
+/// # Examples
+///
+/// ```no_run
+/// use aws_durable_execution_sdk_rust as durable;
+/// use std::time::Duration;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<(), durable::BoxError> {
+///     ctx.wait(Duration::from_secs(30))
+///         .name("pause")
+///         .await?;
+///     Ok(())
+/// }
+/// ```
+#[must_use = "builders do nothing unless awaited or spawned"]
+pub struct WaitBuilder {
+    ctx: DurableContext,
+    op_id: OperationId,
+    name: Option<String>,
+    duration_secs: i32,
+}
+
+impl std::fmt::Debug for WaitBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitBuilder")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WaitBuilder {
+    /// Creates a new wait builder (internal).
+    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, duration_secs: i32) -> Self {
+        Self {
+            ctx,
+            op_id,
+            name: None,
+            duration_secs,
+        }
+    }
+
+    /// Sets a human-readable name for this wait.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Converts this builder into a [`DurableFuture`] explicitly.
+    pub fn future(self) -> DurableFuture<()> {
+        self.into_future()
+    }
+
+    /// Eagerly spawns the wait on a tokio task.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk_rust as durable;
+    /// use std::time::Duration;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<(), durable::BoxError> {
+    ///     let handle = ctx.wait(Duration::from_secs(10)).spawn();
+    ///     // do other work while timer runs
+    ///     handle.await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn spawn(self) -> DurableFuture<()> {
+        spawn_terminal!(self)
+    }
+}
+
+impl IntoFuture for WaitBuilder {
+    type Output = Result<(), OperationError>;
+    type IntoFuture = DurableFuture<()>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        use crate::wait::WaitExecution;
+
+        preflight_identity!(self, "Wait", crate::wait::WAIT_SUB_TYPE);
+
+        let execution = WaitExecution {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            duration_secs: self.duration_secs,
+        };
+
+        DurableFuture::from_async(async move { execution.execute().await })
+    }
+}

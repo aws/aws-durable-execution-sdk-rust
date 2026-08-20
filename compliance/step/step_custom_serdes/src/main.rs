@@ -1,7 +1,8 @@
 //! Conformance requirement 1-6: step with custom serdes (uppercase).
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{Serdes, SerdesContext};
+use durable::Serdes;
+use durable::serdes::SerdesContext;
 
 /// Custom serdes that uppercases the serialized form.
 #[derive(Debug)]

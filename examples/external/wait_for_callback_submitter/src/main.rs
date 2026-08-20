@@ -2,7 +2,7 @@
 //!
 //! The submitter is where you hand the callback id to the outside world. It
 //! runs as a durable step, so a submitter retry policy
-//! ([`WaitForCallbackBuilder::submitter_retry`](aws_durable_execution_sdk_rust::WaitForCallbackBuilder::submitter_retry))
+//! ([`WaitForCallbackBuilder::submitter_retry`](aws_durable_execution_sdk_rust::builders::WaitForCallbackBuilder::submitter_retry))
 //! governs transient delivery failures independently of how long the external
 //! system then takes to respond. This submitter logs the id (standing in for a
 //! queue put or API call) and succeeds; the execution suspends until the

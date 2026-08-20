@@ -2,7 +2,8 @@
 //! branches run).
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{Branch, CompletionConfig, DurableContext};
+use durable::{Branch, DurableContext};
+use durable::builders::map_parallel::CompletionConfig;
 
 /// Handler: parallel with min-successful=3 but one branch fails.
 async fn handler(

@@ -2,7 +2,8 @@
 //! serializer round-trips each iteration result.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{DurableContext, Serdes, SerdesContext};
+use durable::{DurableContext, Serdes};
+use durable::serdes::SerdesContext;
 
 /// Custom serdes that wraps with "wrapped:" prefix.
 ///
@@ -61,7 +62,8 @@ async fn main() -> Result<(), lambda_runtime::Error> {
 #[allow(clippy::expect_used)] // reason: test assertions with descriptive messages
 mod tests {
     use super::WrapSerdes;
-    use aws_durable_execution_sdk_rust::{Serdes, SerdesContext};
+    use aws_durable_execution_sdk_rust::Serdes;
+    use aws_durable_execution_sdk_rust::serdes::SerdesContext;
 
     /// The SDK hands the serdes the item value as a `serde_json::Value`, so for
     /// item `"X"` the handler sees `Value::String("X")` and produces

@@ -40,7 +40,7 @@ impl Serdes for TimestampSerdes {
     fn deserialize(
         &self,
         data: &str,
-        _context: &durable::SerdesContext,
+        _context: &durable::serdes::SerdesContext,
     ) -> Result<serde_json::Value, BoxError> {
         let raw: CallbackPayload = serde_json::from_str(data)?;
         let timestamp = parse_iso_timestamp(&raw.timestamp)?;

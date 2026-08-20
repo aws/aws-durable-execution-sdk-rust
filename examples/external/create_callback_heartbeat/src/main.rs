@@ -4,7 +4,7 @@
 //! callback alive: the worker calls `SendDurableExecutionCallbackHeartbeat`
 //! before each interval elapses, and the callback only times out if a heartbeat
 //! is missed. Configure it with
-//! [`CreateCallbackBuilder::heartbeat`](aws_durable_execution_sdk_rust::CreateCallbackBuilder::heartbeat).
+//! [`CreateCallbackBuilder::heartbeat`](aws_durable_execution_sdk_rust::builders::CreateCallbackBuilder::heartbeat).
 //! Otherwise this behaves exactly like the basic create-callback example.
 
 use std::time::Duration;

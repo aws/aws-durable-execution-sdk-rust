@@ -17,15 +17,14 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::Instrument;
 
+use crate::builders::{JitterStrategy, RetryStrategyConfig};
 use crate::client::ClientError;
 use crate::context::{DurableContext, StepContext};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
+use crate::serdes::SerdesContext;
 use crate::tracing_layer;
-use crate::{
-    BoxError, JitterStrategy, RetryDecision, RetryStrategy, RetryStrategyConfig, Serdes,
-    SerdesContext,
-};
+use crate::{BoxError, RetryDecision, RetryStrategy, Serdes};
 
 /// The default retry strategy: 6 total attempts, 5s initial delay, 60s max
 /// delay, 2x backoff rate, FULL jitter.
@@ -1499,7 +1498,7 @@ mod tests {
 
     // ── RetryStrategyConfig delay shaping ───────────────────────────────
 
-    use crate::{JitterStrategy, RetryStrategyConfig};
+    use crate::builders::{JitterStrategy, RetryStrategyConfig};
 
     fn sample_error() -> StepError {
         StepError::from_kind(StepErrorKind::ExecutionFailed {

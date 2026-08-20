@@ -10,7 +10,8 @@
 //! [`Options`]: aws_durable_execution_sdk_rust::Options
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{Serdes, SerdesContext};
+use durable::Serdes;
+use durable::serdes::SerdesContext;
 
 /// A serdes that uppercases the JSON wire form (illustrative).
 #[derive(Debug)]

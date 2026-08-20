@@ -625,7 +625,7 @@ does not persist across invocations. Mount EFS or S3 Files and point
 `FileSystemSerdes` at the mount path.
 
 ```rust
-use durable::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
+use durable::serdes::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
 
 let serdes = FileSystemSerdes::with_config(
     "/mnt/efs",

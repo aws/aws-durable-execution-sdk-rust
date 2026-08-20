@@ -5,7 +5,8 @@
 //! `"OPSERDE:X,Y"` for the whole map result payload.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{DurableContext, Serdes, SerdesContext};
+use durable::{DurableContext, Serdes};
+use durable::serdes::SerdesContext;
 
 /// Custom operation-level serializer that emits `OPSERDE:<comma-joined results>`.
 #[derive(Debug)]

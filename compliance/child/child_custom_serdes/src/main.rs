@@ -10,7 +10,7 @@ impl durable::Serdes for UppercaseSerdes {
     fn serialize(
         &self,
         value: &serde_json::Value,
-        _context: &durable::SerdesContext,
+        _context: &durable::serdes::SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // The value arrives typed, so the raw string needs no quote-stripping.
         Ok(value.as_str().unwrap_or_default().to_uppercase())
@@ -19,7 +19,7 @@ impl durable::Serdes for UppercaseSerdes {
     fn deserialize(
         &self,
         data: &str,
-        _context: &durable::SerdesContext,
+        _context: &durable::serdes::SerdesContext,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         // Reverse: the raw payload is the string value itself.
         Ok(serde_json::Value::String(data.to_owned()))

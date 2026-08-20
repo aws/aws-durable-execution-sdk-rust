@@ -1,7 +1,7 @@
 //! Chained invoke scoped to a tenant.
 //!
 //! For a multi-tenant callee,
-//! [`InvokeBuilder::tenant_id`](aws_durable_execution_sdk_rust::InvokeBuilder::tenant_id)
+//! [`InvokeBuilder::tenant_id`](aws_durable_execution_sdk_rust::builders::InvokeBuilder::tenant_id)
 //! routes the invocation to a specific tenant's partition. The callee must be
 //! deployed with tenant isolation enabled (see the companion
 //! `invoke_target_tenant` and its `TenancyConfig`). The tenant id and payload

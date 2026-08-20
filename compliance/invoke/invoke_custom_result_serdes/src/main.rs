@@ -18,7 +18,7 @@ impl durable::Serdes for UppercaseResultSerdes {
     fn deserialize(
         &self,
         data: &str,
-        _context: &durable::SerdesContext,
+        _context: &durable::serdes::SerdesContext,
     ) -> Result<serde_json::Value, durable::BoxError> {
         Ok(serde_json::Value::String(data.to_uppercase()))
     }

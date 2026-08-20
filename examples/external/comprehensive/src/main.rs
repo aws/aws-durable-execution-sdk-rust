@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::WaitDecision;
+use durable::builders::wait_for_condition::WaitDecision;
 
 /// Runs one of each core operation and returns a JSON summary.
 async fn handler(

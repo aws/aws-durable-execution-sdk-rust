@@ -2,7 +2,8 @@
 //! boundary (exactly 25% with one failure in four branches).
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{Branch, CompletionConfig, DurableContext};
+use durable::{Branch, DurableContext};
+use durable::builders::map_parallel::CompletionConfig;
 
 /// Handler: 4 branches, one fails, boundary pct=25.
 async fn handler(

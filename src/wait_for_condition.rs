@@ -28,7 +28,8 @@ use crate::engine::OperationId;
 use crate::error::{
     OperationError, OperationErrorKind, WaitForConditionError, WaitForConditionErrorKind,
 };
-use crate::{BoxError, Serdes, SerdesContext};
+use crate::serdes::SerdesContext;
+use crate::{BoxError, Serdes};
 
 /// Wire sub-type for wait-for-condition operations.
 pub(crate) const WFC_SUB_TYPE: &str = "WaitForCondition";
@@ -41,7 +42,7 @@ pub(crate) const WFC_SUB_TYPE: &str = "WaitForCondition";
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::WaitDecision;
+/// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitDecision;
 /// use std::time::Duration;
 ///
 /// // Condition met — stop polling.

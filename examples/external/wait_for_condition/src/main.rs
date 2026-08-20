@@ -5,9 +5,9 @@
 //! delay between polls so it does not hold the invocation open. The state
 //! (here a counter starting at 0) is checkpointed each attempt and survives
 //! across resumes. The strategy returns
-//! [`WaitDecision::complete`](aws_durable_execution_sdk_rust::WaitDecision::complete)
+//! [`WaitDecision::complete`](aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitDecision::complete)
 //! once the counter reaches the requested threshold, or
-//! [`WaitDecision::continue_with`](aws_durable_execution_sdk_rust::WaitDecision::continue_with)
+//! [`WaitDecision::continue_with`](aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitDecision::continue_with)
 //! to poll again after a delay.
 //!
 //! The threshold comes from the event and is small, so the loop is bounded to
@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::WaitDecision;
+use durable::builders::wait_for_condition::WaitDecision;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {

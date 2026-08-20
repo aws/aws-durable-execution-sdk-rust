@@ -315,7 +315,7 @@ async fn retry_strategy_config_shapes_block_retries() {
                         })
                         .name("configured")
                         .retry_strategy_config(
-                            durable::RetryStrategyConfig::builder()
+                            durable::builders::RetryStrategyConfig::builder()
                                 .max_attempts(2)
                                 .initial_delay(Duration::from_secs(1))
                                 .build(),

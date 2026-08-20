@@ -2145,7 +2145,8 @@ fn operation_status_str(s: &OperationStatus) -> &'static str {
 #[allow(clippy::indexing_slicing)] // reason: test assertions index known-length op vectors
 mod tests {
     use super::*;
-    use crate::{CompletionConfig, RetryDecision, StepError};
+    use crate::builders::map_parallel::CompletionConfig;
+    use crate::{RetryDecision, StepError};
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2215,11 +2216,11 @@ mod tests {
                     let attempts_seen = Arc::clone(&attempts_seen);
                     async move {
                         let attempts_seen = Arc::clone(&attempts_seen);
-                        let config = crate::RetryStrategyConfig::builder()
+                        let config = crate::builders::RetryStrategyConfig::builder()
                             .max_attempts(3)
                             .initial_delay(std::time::Duration::from_secs(1))
                             .max_delay(std::time::Duration::from_secs(1))
-                            .jitter(crate::JitterStrategy::None)
+                            .jitter(crate::builders::JitterStrategy::None)
                             .build();
                         let v: i32 = ctx
                             .step(move |sc| {
@@ -2263,10 +2264,10 @@ mod tests {
                     let attempts_seen = Arc::clone(&attempts_seen);
                     async move {
                         let attempts_seen = Arc::clone(&attempts_seen);
-                        let config = crate::RetryStrategyConfig::builder()
+                        let config = crate::builders::RetryStrategyConfig::builder()
                             .max_attempts(2)
                             .initial_delay(std::time::Duration::from_secs(1))
-                            .jitter(crate::JitterStrategy::None)
+                            .jitter(crate::builders::JitterStrategy::None)
                             .build();
                         let v: i32 = ctx
                             .step(move |_| {
@@ -2406,9 +2407,11 @@ mod tests {
                 |(), ctx: DurableContext| async move {
                     let strategy = |state: Counter, _attempt: u32| {
                         if state.count >= 3 {
-                            crate::WaitDecision::complete()
+                            crate::builders::wait_for_condition::WaitDecision::complete()
                         } else {
-                            crate::WaitDecision::continue_with(std::time::Duration::from_secs(1))
+                            crate::builders::wait_for_condition::WaitDecision::continue_with(
+                                std::time::Duration::from_secs(1),
+                            )
                         }
                     };
                     let final_state = ctx

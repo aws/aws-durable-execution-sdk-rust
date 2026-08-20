@@ -14,7 +14,7 @@
 //!
 //! [`map`]: aws_durable_execution_sdk_rust::DurableContext::map
 //! [`parallel`]: aws_durable_execution_sdk_rust::DurableContext::parallel
-//! [`item_namer`]: aws_durable_execution_sdk_rust::MapBuilder::item_namer
+//! [`item_namer`]: aws_durable_execution_sdk_rust::builders::MapBuilder::item_namer
 
 use aws_durable_execution_sdk_rust as durable;
 

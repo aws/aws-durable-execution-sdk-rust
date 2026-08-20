@@ -31,13 +31,13 @@ use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
 use crate::Serdes;
-use crate::SerdesContext;
 use crate::context::DurableContext;
 use crate::driver::{ScopeOutcome, drive_scope};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     ChildContextError, ChildContextErrorKind, ChildFnError, OperationError, OperationErrorKind,
 };
+use crate::serdes::SerdesContext;
 
 /// Wire sub-type for map operations.
 pub(crate) const MAP_SUB_TYPE: &str = "Map";
@@ -83,7 +83,7 @@ pub enum BatchItemStatus {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{BatchItemStatus, BatchItem};
+/// use aws_durable_execution_sdk_rust::builders::map_parallel::{BatchItemStatus, BatchItem};
 ///
 /// let item: BatchItem<i32> = BatchItem::new(
 ///     0,
@@ -148,7 +148,7 @@ impl<O> BatchItem<O> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::BatchStatus;
+/// use aws_durable_execution_sdk_rust::builders::map_parallel::BatchStatus;
 ///
 /// assert_eq!(BatchStatus::Succeeded.as_str(), "SUCCEEDED");
 /// assert_eq!(BatchStatus::Failed.to_string(), "FAILED");
@@ -193,7 +193,7 @@ impl std::fmt::Display for BatchStatus {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{BatchResult, BatchItem, BatchItemStatus, CompletionReason};
+/// use aws_durable_execution_sdk_rust::builders::map_parallel::{BatchResult, BatchItem, BatchItemStatus, CompletionReason};
 ///
 /// let result: BatchResult<i32> = BatchResult::new(
 ///     vec![BatchItem::new(
@@ -238,7 +238,7 @@ pub struct BatchError<'a> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::CompletionReason;
+/// use aws_durable_execution_sdk_rust::builders::map_parallel::CompletionReason;
 ///
 /// let reason = CompletionReason::AllCompleted;
 /// assert_eq!(reason.as_str(), "ALL_COMPLETED");
@@ -255,8 +255,8 @@ pub enum CompletionReason {
     /// The custom completion predicate returned `true`.
     ///
     /// Set when a batch ends early because the predicate configured through
-    /// [`crate::CompletionConfig::with_completion_predicate`] or
-    /// [`crate::CompletionConfigBuilder::completion_predicate`] fired. Like
+    /// [`crate::builders::map_parallel::CompletionConfig::with_completion_predicate`] or
+    /// [`crate::builders::map_parallel::CompletionConfigBuilder::completion_predicate`] fired. Like
     /// [`CompletionReason::MinSuccessfulReached`], a batch completed this
     /// way is a successful early completion: item failures inside it are
     /// tolerated rather than propagated as errors.
@@ -312,7 +312,7 @@ impl CompletionReason {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{BatchItemStatus, SettledOutcome};
+/// use aws_durable_execution_sdk_rust::builders::map_parallel::{BatchItemStatus, SettledOutcome};
 ///
 /// let outcome = SettledOutcome::new(3, BatchItemStatus::Failed);
 /// assert_eq!(outcome.index(), 3);
@@ -359,7 +359,7 @@ impl SettledOutcome {
 /// predicate that is a pure function of these statistics sees the
 /// identical sequence of snapshots on the original run and on every
 /// replay — see the determinism requirement on
-/// [`CompletionConfigBuilder::completion_predicate`](crate::CompletionConfigBuilder::completion_predicate).
+/// [`CompletionConfigBuilder::completion_predicate`](crate::builders::map_parallel::CompletionConfigBuilder::completion_predicate).
 ///
 /// The public constructor exists so a completion predicate can be unit
 /// tested against hand-built statistics without running a batch.
@@ -367,7 +367,7 @@ impl SettledOutcome {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{BatchItemStatus, BatchStats, SettledOutcome};
+/// use aws_durable_execution_sdk_rust::builders::map_parallel::{BatchItemStatus, BatchStats, SettledOutcome};
 ///
 /// let outcomes = [
 ///     SettledOutcome::new(0, BatchItemStatus::Failed),
@@ -459,7 +459,7 @@ impl<'a> BatchStats<'a> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{
+/// use aws_durable_execution_sdk_rust::builders::map_parallel::{
 ///     BatchResult, BatchItem, BatchItemStatus, BatchStatus, CompletionReason,
 /// };
 ///
@@ -591,7 +591,7 @@ impl<O> BatchResult<O> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::NestingMode;
+/// use aws_durable_execution_sdk_rust::builders::map_parallel::NestingMode;
 ///
 /// let mode = NestingMode::Flat;
 /// assert_ne!(mode, NestingMode::Normal);
@@ -630,7 +630,7 @@ pub(crate) struct MapExecution<I, O> {
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) max_concurrency: Option<usize>,
-    pub(crate) completion: Option<crate::CompletionConfig>,
+    pub(crate) completion: Option<crate::builders::map_parallel::CompletionConfig>,
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
     pub(crate) result_serdes: Option<Arc<dyn Serdes>>,
     pub(crate) nesting: NestingMode,
@@ -758,7 +758,7 @@ pub(crate) struct ParallelExecution<O> {
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) max_concurrency: Option<usize>,
-    pub(crate) completion: Option<crate::CompletionConfig>,
+    pub(crate) completion: Option<crate::builders::map_parallel::CompletionConfig>,
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
     pub(crate) result_serdes: Option<Arc<dyn Serdes>>,
     pub(crate) nesting: NestingMode,
@@ -915,7 +915,7 @@ async fn execute_batch<O, F, Fut>(
     parent_op_id: OperationId,
     parent_name: Option<String>,
     max_concurrency: Option<usize>,
-    completion: Option<crate::CompletionConfig>,
+    completion: Option<crate::builders::map_parallel::CompletionConfig>,
     serdes: Option<Arc<dyn Serdes>>,
     result_serdes: Option<Arc<dyn Serdes>>,
     nesting: NestingMode,
@@ -2082,7 +2082,7 @@ impl CompletionTracker {
     /// the precedence the fixed thresholds always had.
     fn settle(
         &mut self,
-        cfg: &crate::CompletionConfig,
+        cfg: &crate::builders::map_parallel::CompletionConfig,
         total_items: usize,
         index: usize,
         status: BatchItemStatus,
@@ -2136,7 +2136,7 @@ impl CompletionTracker {
 /// precedence the thresholds always had. The custom predicate is evaluated
 /// separately, on the committed prefix (see [`CompletionTracker`]).
 fn evaluate_thresholds(
-    cfg: &crate::CompletionConfig,
+    cfg: &crate::builders::map_parallel::CompletionConfig,
     success_count: usize,
     failure_count: usize,
     total_items: usize,
@@ -2151,8 +2151,11 @@ fn evaluate_thresholds(
 }
 
 /// Checks if the `min_successful` threshold has been met.
-fn should_stop_min(cfg: &crate::CompletionConfig, success_count: usize) -> bool {
-    match cfg.min_successful {
+fn should_stop_min(
+    cfg: &crate::builders::map_parallel::CompletionConfig,
+    success_count: usize,
+) -> bool {
+    match cfg.min_successful() {
         Some(min) if min > 0 => success_count >= min,
         _ => false,
     }
@@ -2160,12 +2163,12 @@ fn should_stop_min(cfg: &crate::CompletionConfig, success_count: usize) -> bool 
 
 /// Checks if the failure tolerance has been exceeded.
 fn should_stop_failure(
-    cfg: &crate::CompletionConfig,
+    cfg: &crate::builders::map_parallel::CompletionConfig,
     failure_count: usize,
     total_items: usize,
 ) -> bool {
     // Count-based tolerance.
-    if let Some(tolerated) = cfg.tolerated_failure_count
+    if let Some(tolerated) = cfg.tolerated_failure_count()
         && failure_count > tolerated
     {
         return true;
@@ -2176,7 +2179,7 @@ fn should_stop_failure(
     // avoid integer-division truncation.  This means a true failure rate of
     // 33.3% correctly exceeds a 33% threshold (1*100=100 > 33*3=99).
     // When pct == 0, any failure exceeds the threshold (fail-fast).
-    if let Some(pct) = cfg.tolerated_failure_percentage
+    if let Some(pct) = cfg.tolerated_failure_percentage()
         && total_items > 0
         && failure_count * 100 > pct * total_items
     {
@@ -2651,7 +2654,9 @@ mod tests {
                 Branch::new("boom", |_ctx| async move { Err("intentional".into()) }),
                 Branch::new("ok-2", |_ctx| async move { Ok(3_i32) }),
             ])
-            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
             .await_batch()
             .await
             .expect("a tolerated branch failure must not become an operation error");
@@ -2734,7 +2739,9 @@ mod tests {
                 // replay.
                 Branch::new("steady", |_ctx| async move { Ok(999_i32) }),
             ])
-            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
             .await_batch()
             .await
             .expect("a tolerated replayed failure must not become an operation error");
@@ -2790,7 +2797,7 @@ mod tests {
                 Err::<i32, _>("intentional".into())
             })])
             .completion(
-                crate::CompletionConfig::builder()
+                crate::builders::map_parallel::CompletionConfig::builder()
                     .tolerated_failure_count(0)
                     .build()
                     .expect("valid completion config"),
@@ -2822,7 +2829,9 @@ mod tests {
                 Branch::new("boom", |_ctx| async move { Err("intentional".into()) }),
                 Branch::new("ok-2", |_ctx| async move { Ok(3_i32) }),
             ])
-            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
             .await
             .expect("a tolerated branch failure must not fail the parallel operation");
 
@@ -2842,7 +2851,9 @@ mod tests {
                     Ok(item)
                 }
             })
-            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
             .await
             .expect("map must tolerate the failure");
         assert_eq!(
@@ -2869,7 +2880,9 @@ mod tests {
                     Ok(item * 10)
                 }
             })
-            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
             .await_batch()
             .await
             .expect("map await_batch must tolerate the failure");
@@ -2885,7 +2898,9 @@ mod tests {
                     }
                 })
             }))
-            .completion(crate::CompletionConfig::with_tolerated_failure_count(1))
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
             .await_batch()
             .await
             .expect("parallel await_batch must tolerate the failure");
@@ -3007,7 +3022,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_config_min_successful() {
-        let cfg = crate::CompletionConfig::builder()
+        let cfg = crate::builders::map_parallel::CompletionConfig::builder()
             .min_successful(2)
             .build()
             .expect("valid completion config");
@@ -3018,7 +3033,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_config_tolerated_failure_count() {
-        let cfg = crate::CompletionConfig::builder()
+        let cfg = crate::builders::map_parallel::CompletionConfig::builder()
             .tolerated_failure_count(0)
             .build()
             .expect("valid completion config");
@@ -3029,7 +3044,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_config_tolerated_failure_percentage() {
-        let cfg = crate::CompletionConfig::builder()
+        let cfg = crate::builders::map_parallel::CompletionConfig::builder()
             .tolerated_failure_percentage(20)
             .build()
             .expect("valid completion config");
@@ -3045,7 +3060,7 @@ mod tests {
         // pct=33.  True rate is 33.3% which exceeds 33%, but old code
         // computed (1*100)/3 == 33, and 33 > 33 is false.
         // Cross-multiplication: 1*100=100 > 33*3=99 → true (correctly stops).
-        let cfg = crate::CompletionConfig::builder()
+        let cfg = crate::builders::map_parallel::CompletionConfig::builder()
             .tolerated_failure_percentage(33)
             .build()
             .expect("valid completion config");
@@ -3062,7 +3077,7 @@ mod tests {
 
         // Exactly at threshold when the division is exact: 1/3 with pct=34
         // means 33.3% < 34%, should NOT stop.
-        let cfg34 = crate::CompletionConfig::builder()
+        let cfg34 = crate::builders::map_parallel::CompletionConfig::builder()
             .tolerated_failure_percentage(34)
             .build()
             .expect("valid completion config");
@@ -3075,7 +3090,7 @@ mod tests {
     #[tokio::test]
     async fn tolerated_failure_percentage_zero_means_fail_fast() {
         // pct=0 means fail on first failure (fail-fast).
-        let cfg = crate::CompletionConfig::builder()
+        let cfg = crate::builders::map_parallel::CompletionConfig::builder()
             .tolerated_failure_percentage(0)
             .build()
             .expect("valid completion config");
@@ -3156,7 +3171,7 @@ mod tests {
     async fn never_started_branches_omitted_from_results() {
         // A batch with min_successful=1 should omit branches that never started.
         // We test the completion logic directly.
-        let cfg = crate::CompletionConfig::builder()
+        let cfg = crate::builders::map_parallel::CompletionConfig::builder()
             .min_successful(1)
             .build()
             .expect("valid completion config");
@@ -3168,7 +3183,7 @@ mod tests {
     async fn completion_config_validate_mutual_exclusivity() {
         // Having both min_successful and tolerated_failure_count is valid
         // (Go/JS allow it — first threshold fires). No error.
-        let cfg = crate::CompletionConfig::builder()
+        let cfg = crate::builders::map_parallel::CompletionConfig::builder()
             .min_successful(2)
             .tolerated_failure_count(1)
             .build()
@@ -3184,7 +3199,9 @@ mod tests {
     fn completion_tracker_orders_triggers_within_one_event() {
         /// Drives a fresh tracker through one success (item 0) and one
         /// failure (item 1) out of 4 items, returning the first trigger.
-        fn first_trigger(cfg: &crate::CompletionConfig) -> Option<CompletionReason> {
+        fn first_trigger(
+            cfg: &crate::builders::map_parallel::CompletionConfig,
+        ) -> Option<CompletionReason> {
             let mut tracker = CompletionTracker::new(4);
             tracker.settle(cfg, 4, 0, BatchItemStatus::Succeeded);
             tracker.settle(cfg, 4, 1, BatchItemStatus::Failed);
@@ -3192,7 +3209,7 @@ mod tests {
         }
 
         // All three triggers satisfied at once: min_successful wins.
-        let all = crate::CompletionConfig::builder()
+        let all = crate::builders::map_parallel::CompletionConfig::builder()
             .min_successful(1)
             .tolerated_failure_count(0)
             .completion_predicate(|_| true)
@@ -3205,7 +3222,7 @@ mod tests {
 
         // Failure tolerance and predicate satisfied at the same settle
         // event (item 1's failure): failure tolerance wins.
-        let failure_and_predicate = crate::CompletionConfig::builder()
+        let failure_and_predicate = crate::builders::map_parallel::CompletionConfig::builder()
             .tolerated_failure_count(0)
             .completion_predicate(|stats| stats.settled() >= 2)
             .build()
@@ -3216,7 +3233,7 @@ mod tests {
         );
 
         // Only the predicate fires.
-        let predicate_only = crate::CompletionConfig::builder()
+        let predicate_only = crate::builders::map_parallel::CompletionConfig::builder()
             .min_successful(10)
             .completion_predicate(|stats| stats.settled() >= 2)
             .build()
@@ -3227,7 +3244,7 @@ mod tests {
         );
 
         // Nothing fires.
-        let none = crate::CompletionConfig::builder()
+        let none = crate::builders::map_parallel::CompletionConfig::builder()
             .min_successful(10)
             .completion_predicate(|stats| stats.settled() >= 3)
             .build()
@@ -3249,7 +3266,7 @@ mod tests {
         let observed: std::sync::Arc<std::sync::Mutex<ObservedPrefixes>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_handle = std::sync::Arc::clone(&observed);
-        let cfg = crate::CompletionConfig::builder()
+        let cfg = crate::builders::map_parallel::CompletionConfig::builder()
             .completion_predicate(move |stats| {
                 if let Ok(mut log) = observed_handle.lock() {
                     log.push(
@@ -3313,7 +3330,7 @@ mod tests {
             .name("predicated")
             .max_concurrency(1)
             .completion(
-                crate::CompletionConfig::builder()
+                crate::builders::map_parallel::CompletionConfig::builder()
                     .completion_predicate(|stats| stats.settled() >= 2)
                     .build()
                     .expect("valid completion config"),
@@ -3363,7 +3380,7 @@ mod tests {
             })
             .max_concurrency(1)
             .completion(
-                crate::CompletionConfig::builder()
+                crate::builders::map_parallel::CompletionConfig::builder()
                     .tolerated_failure_count(10)
                     .completion_predicate(|stats| {
                         stats.outcomes().iter().any(|outcome| {
@@ -3402,7 +3419,7 @@ mod tests {
             })
             .max_concurrency(1)
             .completion(
-                crate::CompletionConfig::builder()
+                crate::builders::map_parallel::CompletionConfig::builder()
                     .min_successful(2)
                     .completion_predicate(|stats| stats.settled() >= 2)
                     .build()
@@ -3423,7 +3440,7 @@ mod tests {
             })
             .max_concurrency(1)
             .completion(
-                crate::CompletionConfig::builder()
+                crate::builders::map_parallel::CompletionConfig::builder()
                     .min_successful(3)
                     .completion_predicate(|stats| stats.settled() >= 1)
                     .build()
@@ -3453,7 +3470,7 @@ mod tests {
                 |_child, item, _idx| async move { Ok(item) },
             )
             .completion(
-                crate::CompletionConfig::builder()
+                crate::builders::map_parallel::CompletionConfig::builder()
                     .min_successful(0)
                     .completion_predicate(|_| true)
                     .build()
@@ -4196,7 +4213,7 @@ mod tests {
                 crate::future::Branch::new("ok-2", |_ctx| Box::pin(async { Ok(2) })),
             ])
             .completion(
-                crate::CompletionConfig::builder()
+                crate::builders::map_parallel::CompletionConfig::builder()
                     .tolerated_failure_count(0)
                     .build()
                     .expect("valid completion config"),
@@ -4252,7 +4269,7 @@ mod tests {
                 panic!("boom in map branch")
             })
             .completion(
-                crate::CompletionConfig::builder()
+                crate::builders::map_parallel::CompletionConfig::builder()
                     .tolerated_failure_count(0)
                     .build()
                     .expect("valid completion config"),
@@ -4293,7 +4310,7 @@ mod tests {
                 Box::pin(async { panic!("boom in parallel branch") })
             })])
             .completion(
-                crate::CompletionConfig::builder()
+                crate::builders::map_parallel::CompletionConfig::builder()
                     .tolerated_failure_count(0)
                     .build()
                     .expect("valid completion config"),
@@ -4744,7 +4761,7 @@ mod tests {
             .map(vec![1_i32, 2, 3], |_child, item, _idx| async move {
                 Ok(format!("item-{item}"))
             })
-            .serdes(crate::FileSystemSerdes::new(
+            .serdes(crate::serdes::FileSystemSerdes::new(
                 tmp.to_string_lossy().to_string(),
             ))
             .await

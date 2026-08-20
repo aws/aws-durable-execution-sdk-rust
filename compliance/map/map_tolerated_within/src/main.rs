@@ -2,7 +2,8 @@
 //! one failure, all items complete.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{CompletionConfig, DurableContext};
+use durable::DurableContext;
+use durable::builders::map_parallel::CompletionConfig;
 
 /// Handler: map tolerating one failure.
 async fn handler(

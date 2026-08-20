@@ -15,8 +15,9 @@
 use std::time::Duration;
 
 use aws_durable_execution_sdk_rust as durable;
+use durable::Serdes;
+use durable::serdes::{FileSystemSerdes, SerdesContext};
 use durable::test_util::LocalRunner;
-use durable::{FileSystemSerdes, Serdes, SerdesContext};
 
 /// Fresh temp dir per test, cleaned up on drop even when the test fails.
 struct TempBase(std::path::PathBuf);

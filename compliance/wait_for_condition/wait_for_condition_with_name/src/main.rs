@@ -2,7 +2,7 @@
 //! Explicit operation name "poll-status".
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::WaitDecision;
+use durable::builders::wait_for_condition::WaitDecision;
 use std::time::Duration;
 
 #[tokio::main]

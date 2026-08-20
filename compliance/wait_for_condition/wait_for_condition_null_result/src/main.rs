@@ -2,7 +2,7 @@
 //! Check returns null, strategy stops immediately.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::WaitDecision;
+use durable::builders::wait_for_condition::WaitDecision;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {

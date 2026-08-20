@@ -2,7 +2,8 @@
 //! tolerance).
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{Branch, CompletionConfig, DurableContext};
+use durable::{Branch, DurableContext};
+use durable::builders::map_parallel::CompletionConfig;
 
 /// Handler: all three branches fail, tolerance is 3.
 async fn handler(

@@ -216,7 +216,7 @@ async fn map_branch_pre_wait_logs_emitted_exactly_once() {
 }
 
 /// A replayed TERMINAL flat batch must leave the caller's replay flag
-/// correct for the code after it. In [`durable::NestingMode::Flat`] the
+/// correct for the code after it. In [`durable::builders::map_parallel::NestingMode::Flat`] the
 /// synthetic child positions carry no checkpoint records, so minting the
 /// terminal batch parent flips the namespace span to `isReplay=false`;
 /// skipping those positions must re-derive the flag from the next logical
@@ -245,7 +245,7 @@ async fn post_flat_batch_marker_emitted_exactly_once_on_terminal_replay() {
                         |_child, item, _idx| async move { Ok(item * 10) },
                     )
                     .name("flat-fan-out")
-                    .nesting(durable::NestingMode::Flat)
+                    .nesting(durable::builders::map_parallel::NestingMode::Flat)
                     .await?;
                 tracing::info!("handler-after-flat-batch");
                 // The outer wait suspends the first invocation, forcing a

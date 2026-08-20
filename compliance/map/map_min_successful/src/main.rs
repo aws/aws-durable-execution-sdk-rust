@@ -2,7 +2,8 @@
 //! stops early once enough items succeed.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{CompletionConfig, DurableContext};
+use durable::DurableContext;
+use durable::builders::map_parallel::CompletionConfig;
 
 /// Handler: map with min-successful=2 over 4 items.
 async fn handler(

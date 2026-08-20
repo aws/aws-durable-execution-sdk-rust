@@ -37,7 +37,7 @@ use std::fmt::Debug;
 /// trait behaves identically wherever it is attached.
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{Serdes, SerdesContext};
+/// use aws_durable_execution_sdk_rust::serdes::{Serdes, SerdesContext};
 /// use serde_json::Value;
 ///
 /// #[derive(Debug)]
@@ -83,7 +83,7 @@ use std::fmt::Debug;
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{Serdes, SerdesContext};
+/// use aws_durable_execution_sdk_rust::serdes::{Serdes, SerdesContext};
 ///
 /// struct UppercaseSerdes;
 ///
@@ -268,7 +268,7 @@ impl PreparedValue<'_> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::SerdesContext;
+/// use aws_durable_execution_sdk_rust::serdes::SerdesContext;
 ///
 /// let ctx = SerdesContext::new("step-1", "arn:aws:lambda:us-east-1:123:function:my-fn:1/durable-execution/exec-1/inv-1");
 /// assert_eq!(ctx.operation_id(), "step-1");
@@ -315,7 +315,7 @@ impl SerdesContext {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::FileSystemSerdesMode;
+/// use aws_durable_execution_sdk_rust::serdes::FileSystemSerdesMode;
 ///
 /// let mode = FileSystemSerdesMode::Overflow;
 /// assert!(matches!(mode, FileSystemSerdesMode::Overflow));
@@ -339,7 +339,7 @@ pub enum FileSystemSerdesMode {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::FileSystemPathEncoding;
+/// use aws_durable_execution_sdk_rust::serdes::FileSystemPathEncoding;
 ///
 /// let enc = FileSystemPathEncoding::Hash;
 /// assert!(matches!(enc, FileSystemPathEncoding::Hash));
@@ -361,7 +361,7 @@ pub enum FileSystemPathEncoding {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{FileSystemSerdesConfig, FileSystemSerdesMode, FileSystemPathEncoding};
+/// use aws_durable_execution_sdk_rust::serdes::{FileSystemSerdesConfig, FileSystemSerdesMode, FileSystemPathEncoding};
 ///
 /// let config = FileSystemSerdesConfig::builder()
 ///     .storage_mode(FileSystemSerdesMode::Overflow)
@@ -404,7 +404,7 @@ impl FileSystemSerdesConfig {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{FileSystemSerdesConfig, FileSystemSerdesMode};
+/// use aws_durable_execution_sdk_rust::serdes::{FileSystemSerdesConfig, FileSystemSerdesMode};
 ///
 /// let config = FileSystemSerdesConfig::builder()
 ///     .storage_mode(FileSystemSerdesMode::Overflow)
@@ -488,7 +488,7 @@ impl FileSystemSerdesConfigBuilder {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
+/// use aws_durable_execution_sdk_rust::serdes::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
 ///
 /// // Always write to filesystem (default)
 /// let serdes = FileSystemSerdes::new("/mnt/efs");
@@ -515,7 +515,7 @@ impl FileSystemSerdes {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::FileSystemSerdes;
+    /// use aws_durable_execution_sdk_rust::serdes::FileSystemSerdes;
     ///
     /// let serdes = FileSystemSerdes::new("/mnt/efs");
     /// # drop(serdes);
@@ -533,7 +533,7 @@ impl FileSystemSerdes {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
+    /// use aws_durable_execution_sdk_rust::serdes::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
     ///
     /// let serdes = FileSystemSerdes::with_config(
     ///     "/mnt/s3",
@@ -812,7 +812,7 @@ impl Serdes for FileSystemSerdes {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::FileSystemSerdesError;
+/// use aws_durable_execution_sdk_rust::serdes::FileSystemSerdesError;
 ///
 /// let err = FileSystemSerdesError::new("file not found: /mnt/data.json");
 /// assert!(err.to_string().contains("file not found"));

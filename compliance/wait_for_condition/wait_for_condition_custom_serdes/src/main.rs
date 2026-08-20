@@ -2,7 +2,9 @@
 //! Custom serializer adds "ENC:" prefix; custom deserializer strips it.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{BoxError, Serdes, SerdesContext, WaitDecision};
+use durable::{BoxError, Serdes};
+use durable::builders::wait_for_condition::WaitDecision;
+use durable::serdes::SerdesContext;
 use std::time::Duration;
 
 /// Custom serdes that adds/strips an "ENC:" prefix for string state.

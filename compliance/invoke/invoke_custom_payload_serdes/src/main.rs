@@ -13,7 +13,7 @@ impl durable::Serdes for UppercasePayloadSerdes {
     fn serialize(
         &self,
         value: &serde_json::Value,
-        _context: &durable::SerdesContext,
+        _context: &durable::serdes::SerdesContext,
     ) -> Result<String, durable::BoxError> {
         // Uppercase the JSON rendering of the payload value.
         Ok(value.to_string().to_uppercase())
@@ -22,7 +22,7 @@ impl durable::Serdes for UppercasePayloadSerdes {
     fn deserialize(
         &self,
         data: &str,
-        _context: &durable::SerdesContext,
+        _context: &durable::serdes::SerdesContext,
     ) -> Result<serde_json::Value, durable::BoxError> {
         Ok(serde_json::from_str(data)?)
     }

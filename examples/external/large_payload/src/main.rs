@@ -2,7 +2,7 @@
 //!
 //! Checkpoint payloads have a size limit (~256 KB). A result that would exceed
 //! it inline fails the checkpoint. [`FileSystemSerdes`] in
-//! [`Overflow`](aws_durable_execution_sdk_rust::FileSystemSerdesMode::Overflow)
+//! [`Overflow`](aws_durable_execution_sdk_rust::serdes::FileSystemSerdesMode::Overflow)
 //! mode stores small values inline but spills anything over the threshold to a
 //! file, checkpointing only a lightweight `{"file":...}` pointer — so a large
 //! result round-trips where an inline one would fail.
@@ -15,12 +15,10 @@
 //! invocation without suspending, so `/tmp` is adequate purely for the
 //! demonstration; do not copy that choice into replayable code.
 //!
-//! [`FileSystemSerdes`]: aws_durable_execution_sdk_rust::FileSystemSerdes
+//! [`FileSystemSerdes`]: aws_durable_execution_sdk_rust::serdes::FileSystemSerdes
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{
-    FileSystemPathEncoding, FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode,
-};
+use durable::serdes::{FileSystemPathEncoding, FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
 
 /// Produces a ~300 KB result through the overflow serdes and returns its size.
 async fn handler(

@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 6-9: complex object state.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::WaitDecision;
+use durable::builders::wait_for_condition::WaitDecision;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

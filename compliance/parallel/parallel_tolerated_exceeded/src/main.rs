@@ -2,7 +2,8 @@
 //! exceeds the tolerated-failure-count.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{Branch, CompletionConfig, DurableContext};
+use durable::{Branch, DurableContext};
+use durable::builders::map_parallel::CompletionConfig;
 
 /// Handler: parallel with tolerated-failure-count=1, two failures exceed it.
 async fn handler(

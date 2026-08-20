@@ -14,7 +14,8 @@
 //! [`Serdes`]: aws_durable_execution_sdk_rust::Serdes
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{Serdes, SerdesContext};
+use durable::Serdes;
+use durable::serdes::SerdesContext;
 
 /// A serdes that uppercases the JSON wire form. Illustrative of the transform
 /// seam; production code would compress or encrypt here.

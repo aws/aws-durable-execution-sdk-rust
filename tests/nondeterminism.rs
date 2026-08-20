@@ -559,7 +559,7 @@ async fn tolerated_map_branch_mismatch_fails_execution() {
                             Ok(v)
                         })
                         .name("batch")
-                        .completion(durable::CompletionConfig::with_tolerated_failure_count(2))
+                        .completion(durable::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(2))
                         .await_batch()
                         .await?;
                     let _ = batch; // tolerated failures — batch reports success

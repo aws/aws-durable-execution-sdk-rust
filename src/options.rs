@@ -169,7 +169,7 @@ impl OptionsBuilder {
     /// #     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }
     /// # }
     /// # impl Serdes for MySerdes {
-    /// #     fn serialize(&self, v: &serde_json::Value, _c: &aws_durable_execution_sdk_rust::SerdesContext) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { Ok(v.to_string().to_uppercase()) }
+    /// #     fn serialize(&self, v: &serde_json::Value, _c: &aws_durable_execution_sdk_rust::serdes::SerdesContext) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { Ok(v.to_string().to_uppercase()) }
     /// # }
     /// let opts = Options::builder()
     ///     .serdes(MySerdes)

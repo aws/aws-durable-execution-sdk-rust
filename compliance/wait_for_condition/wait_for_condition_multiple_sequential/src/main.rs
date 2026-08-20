@@ -2,7 +2,7 @@
 //! Two sequential wait_for_condition ops, first result seeds the second.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::WaitDecision;
+use durable::builders::wait_for_condition::WaitDecision;
 use std::time::Duration;
 
 fn make_strategy(threshold: i32) -> impl Fn(i32, u32) -> WaitDecision + Send + Sync {

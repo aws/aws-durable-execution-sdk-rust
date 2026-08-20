@@ -1,6 +1,6 @@
 //! Create a callback with a timeout and handle the timeout gracefully.
 //!
-//! [`CreateCallbackBuilder::timeout`](aws_durable_execution_sdk_rust::CreateCallbackBuilder::timeout)
+//! [`CreateCallbackBuilder::timeout`](aws_durable_execution_sdk_rust::builders::CreateCallbackBuilder::timeout)
 //! bounds how long the execution waits for external completion. If no result
 //! arrives in time, awaiting the callback yields a
 //! [`CallbackError`](aws_durable_execution_sdk_rust::CallbackError). This

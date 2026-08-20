@@ -10,7 +10,7 @@
 //! This example squares eight numbers with a concurrency cap of three and sums
 //! the results, standing in for a larger high-concurrency workload.
 //!
-//! [`max_concurrency`]: aws_durable_execution_sdk_rust::MapBuilder::max_concurrency
+//! [`max_concurrency`]: aws_durable_execution_sdk_rust::builders::MapBuilder::max_concurrency
 
 use aws_durable_execution_sdk_rust as durable;
 

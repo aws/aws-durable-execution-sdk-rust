@@ -1,7 +1,8 @@
 //! Conformance requirement 8-15: Parallel with a custom per-branch serde.
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{Branch, DurableContext, Serdes, SerdesContext};
+use durable::{Branch, DurableContext, Serdes};
+use durable::serdes::SerdesContext;
 
 /// Custom serdes that wraps strings as `{"wrapped": "value"}`.
 #[derive(Debug)]

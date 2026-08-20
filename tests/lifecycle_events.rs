@@ -485,9 +485,11 @@ async fn replayed_events_cover_child_condition_and_callback() {
                     .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)
                     .wait_strategy_fn(|state: i32, _attempt| {
                         if state >= 1 {
-                            durable::WaitDecision::complete()
+                            durable::builders::wait_for_condition::WaitDecision::complete()
                         } else {
-                            durable::WaitDecision::continue_with(Duration::from_secs(1))
+                            durable::builders::wait_for_condition::WaitDecision::continue_with(
+                                Duration::from_secs(1),
+                            )
                         }
                     })
                     .name("poll")
@@ -618,7 +620,7 @@ impl durable::Serdes for FailOnReplayDeserializeSerdes {
     fn deserialize(
         &self,
         data: &str,
-        _context: &durable::SerdesContext,
+        _context: &durable::serdes::SerdesContext,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if call == 0 {

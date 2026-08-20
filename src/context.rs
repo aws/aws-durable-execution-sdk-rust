@@ -1515,7 +1515,7 @@ impl DurableContext {
 
     /// Creates a callback token for external completion.
     ///
-    /// The returned [`Callback`](crate::Callback) provides an ID that
+    /// The returned [`Callback`](crate::builders::callback::Callback) provides an ID that
     /// external systems use to complete the operation, plus a
     /// [`DurableFuture`] that resolves when the callback arrives.
     ///

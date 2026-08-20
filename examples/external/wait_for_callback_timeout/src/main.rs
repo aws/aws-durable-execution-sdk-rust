@@ -1,6 +1,6 @@
 //! Wait for a callback with a timeout, and handle the timeout.
 //!
-//! [`WaitForCallbackBuilder::timeout`](aws_durable_execution_sdk_rust::WaitForCallbackBuilder::timeout)
+//! [`WaitForCallbackBuilder::timeout`](aws_durable_execution_sdk_rust::builders::WaitForCallbackBuilder::timeout)
 //! bounds the wait. No external completion is arranged here, so the callback
 //! always times out; the handler catches the error and returns a fallback
 //! rather than failing the execution.

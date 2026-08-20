@@ -3,7 +3,7 @@
 //!
 //! [`DurableContext::create_callback`](aws_durable_execution_sdk_rust::DurableContext::create_callback)
 //! mints a durable callback and returns a
-//! [`Callback`](aws_durable_execution_sdk_rust::Callback) immediately. The
+//! [`Callback`](aws_durable_execution_sdk_rust::builders::callback::Callback) immediately. The
 //! callback id is what you deliver to the outside world (a webhook target, a
 //! queue message, an approval email). The execution then suspends on
 //! `cb.result()` until an external caller completes the callback with

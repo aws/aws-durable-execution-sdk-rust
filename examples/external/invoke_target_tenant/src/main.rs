@@ -4,7 +4,7 @@
 //! The handler is identical to `invoke_target`; tenant isolation is configured
 //! on the deployed function (`TenancyConfig` in the SAM template), not in
 //! handler code. The caller passes a tenant id through
-//! [`InvokeBuilder::tenant_id`](aws_durable_execution_sdk_rust::InvokeBuilder::tenant_id),
+//! [`InvokeBuilder::tenant_id`](aws_durable_execution_sdk_rust::builders::InvokeBuilder::tenant_id),
 //! and the platform routes the invocation to the matching tenant partition.
 
 use std::time::Duration;

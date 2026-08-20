@@ -12,11 +12,11 @@ use aws_sdk_lambda::types::{
 use std::sync::Arc;
 
 use crate::Serdes;
-use crate::SerdesContext;
 use crate::client::ClientError;
 use crate::context::DurableContext;
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{InvokeError, InvokeErrorKind, OperationError, OperationErrorKind};
+use crate::serdes::SerdesContext;
 
 #[cfg(test)]
 use serde::Serialize;

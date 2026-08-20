@@ -999,7 +999,7 @@ const _: () = {
         assert_send_sync_static::<NonDeterministicExecutionError>();
         assert_send_sync_static::<NonDeterministicExecutionErrorKind>();
         assert_send_sync_static::<ChildFnError>();
-        assert_send_sync_static::<crate::FileSystemSerdesError>();
+        assert_send_sync_static::<crate::serdes::FileSystemSerdesError>();
     }
 };
 

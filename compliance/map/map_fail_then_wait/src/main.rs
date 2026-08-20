@@ -5,7 +5,8 @@
 use std::time::Duration;
 
 use aws_durable_execution_sdk_rust as durable;
-use durable::{CompletionConfig, DurableContext};
+use durable::DurableContext;
+use durable::builders::map_parallel::CompletionConfig;
 
 /// Handler: map with one failure (tolerated), then a wait.
 async fn handler(
