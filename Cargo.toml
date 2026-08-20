@@ -61,8 +61,22 @@ workspace = true
 [dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 lambda_runtime = "1"
-aws-config = "1"
-aws-sdk-lambda = "1"
+# Both AWS crates disable default features so the legacy hyper-0.14 /
+# rustls-0.21 / ring chain never enters the graph. `default-https-client`
+# selects the modern hyper-1 + rustls-0.23 (aws-lc-rs) client and
+# `rt-tokio` supplies the async sleep/timeout implementation the default
+# credentials chain and retry timers need. `behavior-version-latest` on
+# aws-sdk-lambda lets `Client::new` accept a caller-supplied `SdkConfig`
+# that carries no behavior version instead of panicking.
+aws-config = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-lambda = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

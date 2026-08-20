@@ -34,7 +34,10 @@ exclude-dev = true
 # [bans] — dependency ban configuration
 # ============================================================
 [bans]
-multiple-versions = "allow"
+# Warn on duplicate versions so regressions surface in `cargo deny` output
+# without failing the gate — the AWS SDK tree still carries a few
+# unavoidable duplicates (e.g. windows-sys) that upstream must converge.
+multiple-versions = "warn"
 wildcards = "allow"
 # NOTE: cargo-deny's [bans.allow] checks the ENTIRE dependency graph
 # (including all transitive crates). With the aws-sdk tree pulling ~400
@@ -73,27 +76,14 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-[[licenses.clarify]]
-name = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
-
 # ============================================================
 # [advisories] — RustSec advisory database checking
 # ============================================================
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-# Transitive dependency advisories we cannot fix directly —
-# awaiting upstream updates in aws-sdk-rust's dependency tree.
-ignore = [
-    "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints
-    "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints
-    "RUSTSEC-2026-0104", # rustls-webpki: CRL parsing panic
-    # h2: unbounded empty DATA frames (low severity). Patched only in
-    # h2 >= 0.4.16 (our 0.4 line is updated past it); the 0.3 line has no
-    # patched release and rides in via aws-smithy-http-client's legacy
-    # hyper-0.14 support. Remove when smithy drops the hyper-0.14 chain
-    # or upstream ships a patched h2 0.3.
-    "RUSTSEC-2026-0258",
-]
+# No exceptions: the legacy hyper-0.14 / rustls-0.21 / ring chain that
+# required them left the graph when aws-config and aws-sdk-lambda dropped
+# their default features. Any new entry needs a comment naming the
+# advisory and the reason.
+ignore = []
