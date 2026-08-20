@@ -1,9 +1,11 @@
 //! The retrying child-context operation: [`WithRetryBuilder`], returned by
 //! [`DurableContext::with_retry`](crate::DurableContext::with_retry).
 
-use std::future::IntoFuture;
+use std::future::{Future, IntoFuture};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
+use crate::BoxError;
 use crate::RetryStrategy;
 use crate::Serdes;
 use crate::context::DurableContext;
@@ -37,6 +39,12 @@ use crate::future::DurableFuture;
 /// [`ChildContextError`](crate::ChildContextError) whose message carries
 /// the attempt count and the last attempt's error.
 ///
+/// The builder is generic over the block closure `F` and its future `Fut`
+/// so the body is stored **without type erasure**; both parameters are
+/// inferred at the call site and never written by users. The single
+/// erasure point is `.future()` / `.await`, which produces the one
+/// [`DurableFuture`] box.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -66,16 +74,17 @@ use crate::future::DurableFuture;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct WithRetryBuilder<O> {
+pub struct WithRetryBuilder<O, F, Fut> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     retry_strategy: Option<RetryStrategy>,
     serdes: Option<Arc<dyn Serdes>>,
-    closure: crate::with_retry::WithRetryClosure<O>,
+    closure: F,
+    _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
-impl<O> std::fmt::Debug for WithRetryBuilder<O> {
+impl<O, F, Fut> std::fmt::Debug for WithRetryBuilder<O, F, Fut> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WithRetryBuilder")
             .field("name", &self.name)
@@ -83,14 +92,15 @@ impl<O> std::fmt::Debug for WithRetryBuilder<O> {
     }
 }
 
-impl<O: Send + 'static> WithRetryBuilder<O> {
+impl<O, F, Fut> WithRetryBuilder<O, F, Fut>
+where
+    O: Send + 'static,
+    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+{
     /// Creates a new builder (internal). Taking the closure here keeps the
     /// field non-optional: a builder without a body is unrepresentable.
-    pub(crate) fn new(
-        ctx: DurableContext,
-        op_id: OperationId,
-        closure: crate::with_retry::WithRetryClosure<O>,
-    ) -> Self {
+    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, closure: F) -> Self {
         Self {
             ctx,
             op_id,
@@ -98,6 +108,7 @@ impl<O: Send + 'static> WithRetryBuilder<O> {
             retry_strategy: None,
             serdes: None,
             closure,
+            _marker: PhantomData,
         }
     }
 
@@ -145,9 +156,9 @@ impl<O: Send + 'static> WithRetryBuilder<O> {
     ///     Ok(result)
     /// }
     /// ```
-    pub fn retry_strategy<F>(mut self, strategy: F) -> Self
+    pub fn retry_strategy<R>(mut self, strategy: R) -> Self
     where
-        F: Fn(&crate::StepError, u32) -> crate::RetryDecision + Send + Sync + 'static,
+        R: Fn(&crate::StepError, u32) -> crate::RetryDecision + Send + Sync + 'static,
     {
         self.retry_strategy = Some(Box::new(strategy));
         self
@@ -240,8 +251,11 @@ impl<O: Send + 'static> WithRetryBuilder<O> {
     }
 }
 
-impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFuture
-    for WithRetryBuilder<O>
+impl<O, F, Fut> IntoFuture for WithRetryBuilder<O, F, Fut>
+where
+    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
@@ -253,7 +267,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
         // recorded identity exactly as `run_in_child_context` does.
         preflight_identity!(self, "Context", crate::child::CHILD_SUB_TYPE);
 
-        let closure = self.closure;
+        let closure = Arc::new(self.closure);
         let strategy: Arc<RetryStrategy> = Arc::new(
             self.retry_strategy
                 .unwrap_or_else(crate::step::default_retry_strategy),
@@ -264,9 +278,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             op_id: self.op_id,
             name: self.name,
             serdes: self.serdes,
-            closure: Box::new(move |outer_ctx| {
-                Box::pin(crate::with_retry::retry_loop(outer_ctx, closure, strategy))
-            }),
+            // A concrete closure returning the concrete retry-loop future:
+            // no erasure here — the one box is the DurableFuture below.
+            closure: move |outer_ctx| crate::with_retry::retry_loop(outer_ctx, closure, strategy),
+            _marker: PhantomData,
         };
 
         DurableFuture::from_async(async move { execution.execute().await })

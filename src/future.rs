@@ -337,7 +337,43 @@ pub enum Settled<O> {
 /// ```
 pub struct Branch<O> {
     name: String,
-    factory: crate::child::BoxedChildBody<O>,
+    body: BranchBody<O>,
+}
+
+/// The erased body of one parallel branch (crate-internal).
+///
+/// Branch bodies are inherently heterogeneous — every `Branch::new` call
+/// site captures a different closure and future type, and they are all
+/// collected into one `Vec` — so exactly ONE erasure per branch is
+/// unavoidable. This type keeps it to exactly one: the user's closure and
+/// its future live UNERASED inside a single boxed future built at
+/// [`Branch::new`]. The child [`DurableContext`] is not known until the
+/// batch coordinator dispatches the branch, so it is delivered through a
+/// oneshot channel the body awaits on first poll. There is no nested
+/// closure-box-returning-future-box layering: polling a running branch goes
+/// through one vtable hop.
+pub(crate) struct BranchBody<O> {
+    /// Delivers the child context to the body. The coordinator sends the
+    /// context BEFORE first polling `future`, so the body's receive
+    /// resolves immediately on first poll.
+    ctx_tx: tokio::sync::oneshot::Sender<DurableContext>,
+    /// The single erased branch future: awaits the child context, then runs
+    /// the user's factory closure and its future in place.
+    future: Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>,
+}
+
+impl<O> BranchBody<O> {
+    /// Injects the child context and returns the branch future, ready to
+    /// poll. Called exactly once by the batch coordinator at dispatch time.
+    pub(crate) fn start(
+        self,
+        ctx: DurableContext,
+    ) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>> {
+        // Send cannot fail: the receiver lives inside `self.future`, which
+        // we hold. Ignore the impossible error rather than panicking.
+        let _ = self.ctx_tx.send(ctx);
+        self.future
+    }
 }
 
 impl<O> std::fmt::Debug for Branch<O> {
@@ -352,7 +388,8 @@ impl<O: Send + 'static> Branch<O> {
     /// Creates a new named branch.
     ///
     /// The factory function receives a child [`DurableContext`] and returns
-    /// a pinned future producing the branch result.
+    /// a future producing the branch result. The factory is not invoked
+    /// here — it runs when the parallel operation dispatches the branch.
     ///
     /// # Examples
     ///
@@ -369,17 +406,26 @@ impl<O: Send + 'static> Branch<O> {
         F: FnOnce(DurableContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     {
+        let (ctx_tx, ctx_rx) = tokio::sync::oneshot::channel::<DurableContext>();
         Self {
             name: name.into(),
-            // The SDK does the pinning and BoxError -> internal-carrier type
-            // erasure so callers write a plain `async move` body with `?`.
-            factory: Box::new(move |ctx| {
-                Box::pin(async move {
+            body: BranchBody {
+                ctx_tx,
+                // The SDK does the pinning and BoxError -> internal-carrier
+                // type erasure so callers write a plain `async move` body
+                // with `?`. This is the branch's ONE erasure: the factory
+                // closure and its concrete future both live inside this box
+                // — there is no separate closure box producing a second
+                // future box.
+                future: Box::pin(async move {
+                    let ctx = ctx_rx.await.map_err(|_| {
+                        ChildFnError::new("branch context was never delivered (coordinator gone)")
+                    })?;
                     factory(ctx)
                         .await
                         .map_err(|e| ChildFnError::new(e.to_string()))
-                })
-            }),
+                }),
+            },
         }
     }
 
@@ -389,9 +435,9 @@ impl<O: Send + 'static> Branch<O> {
         &self.name
     }
 
-    /// Consumes the branch and returns the factory closure (internal).
-    pub(crate) fn into_factory(self) -> crate::child::BoxedChildBody<O> {
-        self.factory
+    /// Consumes the branch and returns its name and erased body (internal).
+    pub(crate) fn into_parts(self) -> (String, BranchBody<O>) {
+        (self.name, self.body)
     }
 }
 

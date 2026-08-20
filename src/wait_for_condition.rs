@@ -14,7 +14,6 @@
 //! - Wait strategy exhaustion raises `WaitForConditionError::MaxChecksExceeded`.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,33 +103,120 @@ impl WaitDecision {
 /// takes a generic closure and boxes it here.
 pub(crate) type WaitStrategyFn<S> = Box<dyn Fn(S, u32) -> WaitDecision + Send + Sync>;
 
-/// Boxed, pinned condition-check closure: the user's check function after
-/// [`crate::DurableContext::wait_for_condition`] erases it for storage on
-/// the builder.
-///
-/// Crate-internal: the public API takes a generic closure and boxes it into
-/// this.
-pub(crate) type BoxedCheckFn<S> = Box<
-    dyn Fn(StepContext, S) -> Pin<Box<dyn Future<Output = Result<S, BoxError>> + Send>>
-        + Send
-        + Sync,
->;
-
 /// Internal state for wait-for-condition execution.
-pub(crate) struct WaitForConditionExecution<S> {
+///
+/// Generic over the check closure `F` (and, through `F`'s output, its
+/// future), so each poll produces a concrete future with no per-check box.
+/// The one erasure point is the builder's `.future()` / `into_future`,
+/// which boxes the whole execution future once inside
+/// [`DurableFuture`](crate::DurableFuture).
+pub(crate) struct WaitForConditionExecution<S, F> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) initial_state: S,
     pub(crate) wait_strategy: Option<WaitStrategyFn<S>>,
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
-    pub(crate) check: BoxedCheckFn<S>,
+    pub(crate) check: F,
 }
 
-impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForConditionExecution<S> {
+impl<S, F, Fut> WaitForConditionExecution<S, F>
+where
+    S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
+{
     /// Executes the wait-for-condition operation.
-    #[allow(clippy::too_many_lines)] // reason: checkpoint-state-strategy flow is a single logical unit; splitting would obscure the protocol
+    ///
+    /// Thin generic wrapper — the ONLY code monomorphized per call site.
+    /// The checkpoint-state-strategy machine lives in the non-generic
+    /// [`WfcCore`] / [`WfcAfter`] halves (generic over the state type `S`
+    /// only); this wrapper just polls the user's concrete check future
+    /// between them.
     pub(crate) async fn execute(self) -> Result<S, OperationError> {
+        let Self {
+            ctx,
+            op_id,
+            name,
+            initial_state,
+            wait_strategy,
+            serdes,
+            check,
+        } = self;
+        let core = WfcCore {
+            ctx,
+            op_id,
+            name,
+            initial_state,
+            wait_strategy,
+            serdes,
+        };
+        match core.before().await? {
+            WfcPrelude::Done(result) => result,
+            WfcPrelude::Run {
+                attempt,
+                state,
+                after,
+            } => {
+                // Execute the check function.
+                let step_ctx = StepContext::new(attempt);
+                let check_result = (check)(step_ctx, state).await;
+                after.settle(attempt, check_result).await
+            }
+        }
+    }
+}
+
+/// The pre-check half of `wait_for_condition`: task-ownership check, replay
+/// resolution, carried-state derivation, and the START checkpoint. Generic
+/// only over the state type `S` — no user closure reaches this state
+/// machine, so its substantial replay/checkpoint logic compiles once per
+/// state type instead of once per call site.
+struct WfcCore<S> {
+    ctx: DurableContext,
+    op_id: OperationId,
+    name: Option<String>,
+    initial_state: S,
+    wait_strategy: Option<WaitStrategyFn<S>>,
+    serdes: Option<Arc<dyn Serdes>>,
+}
+
+/// What [`WfcCore::before`] decided: the operation is already resolved from
+/// the checkpoint log (or suspended), or one check-attempt cycle must run.
+enum WfcPrelude<S> {
+    /// Resolved without running the check (replay or suspension).
+    Done(Result<S, OperationError>),
+    /// The check must run at `attempt` against the carried `state`; `after`
+    /// settles the decision cycle.
+    Run {
+        /// 1-based attempt number for this check cycle.
+        attempt: u32,
+        /// The carried state the check receives.
+        state: S,
+        /// The post-check half that runs the strategy/decision protocol.
+        after: WfcAfter<S>,
+    },
+}
+
+/// The post-check half of `wait_for_condition`: state serialization, wait
+/// strategy consultation, and the Succeed/Retry/Fail checkpoint protocol.
+/// Generic only over the state type.
+struct WfcAfter<S> {
+    ctx: DurableContext,
+    wire_id: String,
+    name: Option<String>,
+    wait_strategy: Option<WaitStrategyFn<S>>,
+    serdes: Option<Arc<dyn Serdes>>,
+}
+
+impl<S> WfcCore<S>
+where
+    S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    /// Runs everything that precedes the check closure: replay path, or
+    /// the live-path preamble (carried-state derivation + START checkpoint).
+    #[allow(clippy::too_many_lines)] // reason: replay-status protocol is a single logical unit; splitting would obscure it
+    async fn before(self) -> Result<WfcPrelude<S>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
 
@@ -170,7 +256,7 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                         Some(WFC_SUB_TYPE),
                         view.attempt,
                     );
-                    return Ok(value);
+                    return Ok(WfcPrelude::Done(Ok(value)));
                 }
                 CheckpointStatus::Failed => {
                     // Terminal failure: reconstruct error from checkpoint.
@@ -185,14 +271,14 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                         .ctx
                         .checkpoint_error_parts(&positional_id)
                         .unwrap_or_default();
-                    return Err(replay_terminal_failure(
+                    return Ok(WfcPrelude::Done(Err(replay_terminal_failure(
                         error_type.as_deref(),
                         error_message.as_deref(),
-                    ));
+                    ))));
                 }
                 CheckpointStatus::Pending => {
                     // Retry timer hasn't fired yet — suspend.
-                    return self.ctx.suspend_now().await;
+                    return Ok(WfcPrelude::Done(self.ctx.suspend_now().await));
                 }
                 CheckpointStatus::Started => {
                     // This invocation already checkpointed START — skip it.
@@ -249,10 +335,40 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                 .map_err(|e| wfc_client_error(&e))?;
         }
 
-        // Execute the check function.
-        let step_ctx = StepContext::new(attempt);
-        let check_result = (self.check)(step_ctx, current_state).await;
+        let Self {
+            ctx,
+            name,
+            wait_strategy,
+            serdes,
+            ..
+        } = self;
 
+        Ok(WfcPrelude::Run {
+            attempt,
+            state: current_state,
+            after: WfcAfter {
+                ctx,
+                wire_id,
+                name,
+                wait_strategy,
+                serdes,
+            },
+        })
+    }
+}
+
+impl<S> WfcAfter<S>
+where
+    S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    /// Settles one check cycle: serializes the new state, consults the wait
+    /// strategy, and runs the Succeed/Retry/Fail checkpoint protocol.
+    async fn settle(
+        self,
+        attempt: u32,
+        check_result: Result<S, BoxError>,
+    ) -> Result<S, OperationError> {
+        let serdes_ctx = SerdesContext::new(&self.wire_id, self.ctx.execution_arn());
         match check_result {
             Ok(new_state) => {
                 // Serialize the new state.
@@ -283,7 +399,7 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                     WaitDecision::Complete => {
                         // Condition met: checkpoint terminal SUCCEED.
                         let update = build_wfc_update(
-                            &wire_id,
+                            &self.wire_id,
                             self.name.as_deref(),
                             self.ctx.parent_wire_id(),
                             OperationAction::Succeed,
@@ -306,7 +422,7 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                             .clamp(1, i64::from(i32::MAX))
                             as i32;
                         let update = build_wfc_update(
-                            &wire_id,
+                            &self.wire_id,
                             self.name.as_deref(),
                             self.ctx.parent_wire_id(),
                             OperationAction::Retry,
@@ -324,7 +440,7 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                         // Strategy exhaustion: checkpoint FAIL, raise
                         // WaitForConditionError (Python #530 fix).
                         let update = build_wfc_fail_update(
-                            &wire_id,
+                            &self.wire_id,
                             self.name.as_deref(),
                             self.ctx.parent_wire_id(),
                             &reason,
@@ -344,7 +460,7 @@ impl<S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> WaitForCon
                 // Check function error: checkpoint FAIL immediately (no retry
                 // for check errors).
                 let update = build_wfc_fail_update(
-                    &wire_id,
+                    &self.wire_id,
                     self.name.as_deref(),
                     self.ctx.parent_wire_id(),
                     &check_err.to_string(),
@@ -660,12 +776,12 @@ mod tests {
                 }
             })),
             serdes: None,
-            check: Box::new(move |_ctx, state| {
+            check: move |_ctx, state: i32| {
                 *seen_check
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state);
-                Box::pin(async move { Ok(state + 1) })
-            }),
+                async move { Ok::<i32, BoxError>(state + 1) }
+            },
         };
 
         // Continues (state 1 -> 2, still < 3) and suspends (parks). Drive
@@ -705,7 +821,7 @@ mod tests {
                 }
             })),
             serdes: None,
-            check: Box::new(|_ctx, state| Box::pin(async move { Ok(state) })),
+            check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state) },
         };
 
         let result = exec.execute().await;
@@ -751,7 +867,7 @@ mod tests {
                 }
             })),
             serdes: None,
-            check: Box::new(|_ctx, state| Box::pin(async move { Ok(state + 1) })),
+            check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state + 1) },
         };
 
         // State was 1 (from checkpoint), check fn produces 2, strategy says
@@ -781,7 +897,7 @@ mod tests {
                 }
             })),
             serdes: None,
-            check: Box::new(|_ctx, state| Box::pin(async move { Ok(state + 1) })),
+            check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state + 1) },
         };
 
         let result = exec.execute().await;
@@ -827,16 +943,20 @@ mod tests {
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
 
-        let exec = WaitForConditionExecution::<i32> {
+        let exec = WaitForConditionExecution::<i32, _> {
             ctx,
             op_id,
             name: Some("regression".to_owned()),
             initial_state: 0,
             wait_strategy: Some(Box::new(|_state: i32, _attempt| WaitDecision::complete())),
             serdes: None,
-            check: Box::new(|_ctx, _state| {
-                Box::pin(async move { panic!("check must NOT execute during replay") })
-            }),
+            check: |_ctx, _state: i32| async move {
+                #[allow(unreachable_code)] // reason: type anchor for the diverging body
+                {
+                    panic!("check must NOT execute during replay");
+                    Ok::<i32, BoxError>(0)
+                }
+            },
         };
 
         let result = exec.execute().await;
@@ -866,14 +986,16 @@ mod tests {
         let ctx = make_ctx_with_client();
         let op_id = ctx.mint_id();
 
-        let exec = WaitForConditionExecution::<i32> {
+        let exec = WaitForConditionExecution::<i32, _> {
             ctx,
             op_id,
             name: None,
             initial_state: 0,
             wait_strategy: Some(Box::new(|_state: i32, _attempt| WaitDecision::complete())),
             serdes: None,
-            check: Box::new(|_ctx, _state| Box::pin(async { Err("check function failed".into()) })),
+            check: |_ctx, _state: i32| async {
+                Err::<i32, BoxError>("check function failed".into())
+            },
         };
 
         let result = exec.execute().await;
@@ -905,16 +1027,20 @@ mod tests {
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
 
-        let exec = WaitForConditionExecution::<i32> {
+        let exec = WaitForConditionExecution::<i32, _> {
             ctx,
             op_id,
             name: None,
             initial_state: 0,
             wait_strategy: None,
             serdes: None,
-            check: Box::new(|_ctx, _state| {
-                Box::pin(async { panic!("check must NOT execute during replay") })
-            }),
+            check: |_ctx, _state: i32| async move {
+                #[allow(unreachable_code)] // reason: type anchor for the diverging body
+                {
+                    panic!("check must NOT execute during replay");
+                    Ok::<i32, BoxError>(0)
+                }
+            },
         };
 
         let result = exec.execute().await;
@@ -944,16 +1070,20 @@ mod tests {
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
 
-        let exec = WaitForConditionExecution::<i32> {
+        let exec = WaitForConditionExecution::<i32, _> {
             ctx,
             op_id,
             name: None,
             initial_state: 0,
             wait_strategy: None,
             serdes: None,
-            check: Box::new(|_ctx, _state| {
-                Box::pin(async { panic!("check must NOT execute during replay") })
-            }),
+            check: |_ctx, _state: i32| async move {
+                #[allow(unreachable_code)] // reason: type anchor for the diverging body
+                {
+                    panic!("check must NOT execute during replay");
+                    Ok::<i32, BoxError>(0)
+                }
+            },
         };
 
         let result = exec.execute().await;

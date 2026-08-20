@@ -12,7 +12,6 @@
 //! - `CallbackDetails { callback_id, result }`
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,15 +35,6 @@ pub(crate) const CALLBACK_SUB_TYPE: &str = "Callback";
 
 /// Wire sub-type for wait-for-callback context operations.
 pub(crate) const WFCB_SUB_TYPE: &str = "WaitForCallback";
-
-/// Boxed submitter closure type used by `WaitForCallbackExecution` and
-/// `run_wfcb_body`. Receives a step context and the owned callback ID
-/// string, and returns a future that delivers the callback ID to an
-/// external system.
-pub(crate) type BoxedSubmitter = Box<
-    dyn FnOnce(StepContext, String) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>
-        + Send,
->;
 
 // ────────────────────────────────────────────────────────────────────────────
 // CreateCallbackExecution
@@ -210,31 +200,129 @@ impl<O: DeserializeOwned + Send + 'static> CreateCallbackExecution<O> {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Internal state for `wait_for_callback` execution passed from the builder.
-pub(crate) struct WaitForCallbackExecution<O> {
+///
+/// Generic over the submitter closure `F` (and, through `F`'s output, its
+/// future), so the submitter runs **without type erasure**. The one
+/// erasure point is the builder's `.future()` / `into_future`, which boxes
+/// the whole execution future once inside
+/// [`DurableFuture`](crate::DurableFuture).
+pub(crate) struct WaitForCallbackExecution<O, F> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) heartbeat: Option<Duration>,
-    pub(crate) submitter: BoxedSubmitter,
+    pub(crate) submitter: F,
     pub(crate) submitter_retry: Option<crate::RetryStrategy>,
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
     pub(crate) _marker: std::marker::PhantomData<O>,
 }
 
-impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<O> {
+impl<O, F, Fut> WaitForCallbackExecution<O, F>
+where
+    O: DeserializeOwned + Serialize + Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+{
     /// Executes the wait-for-callback operation: replay or live path.
-    #[allow(clippy::too_many_lines)] // reason: child context execution has distinct replay/live paths that read better as one flow
+    ///
+    /// Thin generic wrapper — the ONLY code monomorphized per call site.
+    /// The replay/checkpoint state machine lives in the non-generic
+    /// [`WfcbCore`] / [`WfcbAfter`] halves (generic over the result type
+    /// `O` only); this wrapper just runs the inner body (whose own
+    /// checkpoint plumbing — callback creation and the submitter step —
+    /// is likewise non-generic) between them.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
+        let Self {
+            ctx,
+            op_id,
+            name,
+            timeout,
+            heartbeat,
+            submitter,
+            submitter_retry,
+            serdes,
+            ..
+        } = self;
+        let core = WfcbCore {
+            ctx,
+            op_id,
+            name,
+            _marker: std::marker::PhantomData,
+        };
+        match core.before().await? {
+            WfcbPrelude::Done(result) => result,
+            WfcbPrelude::Run { child_ctx, after } => {
+                // Run inner body: create_callback + submitter step + await
+                // result. Instrumented with the child namespace's
+                // replay-aware span so a resumed body's log lines are
+                // suppressed while its nested operations replay.
+                let child_span = child_ctx.replay_span();
+                let body_result = run_wfcb_body::<O, _, _>(
+                    child_ctx,
+                    timeout,
+                    heartbeat,
+                    submitter,
+                    submitter_retry,
+                    serdes,
+                )
+                .instrument(child_span)
+                .await;
+                after.settle(body_result).await
+            }
+        }
+    }
+}
+
+/// The pre-body half of `wait_for_callback`: task-ownership check, replay
+/// resolution, and the START checkpoint. Generic only over the result type
+/// `O` — no user closure reaches this state machine, so its replay and
+/// checkpoint logic compiles once per result type instead of once per call
+/// site.
+struct WfcbCore<O> {
+    ctx: DurableContext,
+    op_id: OperationId,
+    name: Option<String>,
+    _marker: std::marker::PhantomData<fn() -> O>,
+}
+
+/// What [`WfcbCore::before`] decided: the operation is already resolved
+/// from the checkpoint log, or the inner body must run in the prepared
+/// child context.
+enum WfcbPrelude<O> {
+    /// Resolved without running the body (replayed success or failure).
+    Done(Result<O, OperationError>),
+    /// The body must run in `child_ctx`; `after` settles the outcome.
+    Run {
+        /// The fresh child context (chained prefix) the body runs in.
+        child_ctx: DurableContext,
+        /// The post-body half that checkpoints the outcome.
+        after: WfcbAfter<O>,
+    },
+}
+
+/// The post-body half of `wait_for_callback`: outcome checkpointing
+/// (`ContextSucceeded` / `ContextFailed`). Generic only over the result type.
+struct WfcbAfter<O> {
+    ctx: DurableContext,
+    wire_id: String,
+    name: Option<String>,
+    _marker: std::marker::PhantomData<fn() -> O>,
+}
+
+impl<O> WfcbCore<O>
+where
+    O: DeserializeOwned + Serialize + Send + 'static,
+{
+    /// Runs everything that precedes the inner body: replay path, or the
+    /// live-path preamble ending at the START checkpoint.
+    async fn before(self) -> Result<WfcbPrelude<O>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
 
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
-
-        // Clone ctx/op_id/name BEFORE consuming self.
-        let ctx = self.ctx.clone();
-        let name = self.name.clone();
+        let Self { ctx, name, .. } = self;
 
         // 2. Check checkpoint log for replay (context-level terminal). The
         // validated view covers the non-terminal branches without cloning.
@@ -262,7 +350,7 @@ impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<
                         Some(WFCB_SUB_TYPE),
                         view.attempt,
                     );
-                    return Ok(value);
+                    return Ok(WfcbPrelude::Done(Ok(value)));
                 }
                 CheckpointStatus::Failed => {
                     // Context failed — classify the error.
@@ -276,10 +364,10 @@ impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<
                     let (error_type, error_message) = ctx
                         .checkpoint_error_parts(&positional_id)
                         .unwrap_or_default();
-                    return Err(wfcb_failed_error(
+                    return Ok(WfcbPrelude::Done(Err(wfcb_failed_error(
                         error_type.as_deref(),
                         error_message.as_deref(),
-                    ));
+                    ))));
                 }
                 // Started/Pending/Ready: fall through to execute/resume.
                 _ => {}
@@ -295,25 +383,31 @@ impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<
         // 4. Create child context with chained prefix.
         let child_ctx = ctx.new_child(&positional_id);
 
-        // 5. Run inner body: create_callback + submitter step + await result.
-        // Instrumented with the child namespace's replay-aware span so a
-        // resumed body's log lines are suppressed while its nested
-        // operations replay.
-        let child_span = child_ctx.replay_span();
-        let body_result = run_wfcb_body::<O>(
+        Ok(WfcbPrelude::Run {
             child_ctx,
-            self.timeout,
-            self.heartbeat,
-            self.submitter,
-            self.submitter_retry,
-            self.serdes,
-        )
-        .instrument(child_span)
-        .await;
+            after: WfcbAfter {
+                ctx,
+                wire_id,
+                name,
+                _marker: std::marker::PhantomData,
+            },
+        })
+    }
+}
 
+impl<O> WfcbAfter<O>
+where
+    O: DeserializeOwned + Serialize + Send + 'static,
+{
+    /// Settles the inner body's outcome: checkpoints `ContextSucceeded` with
+    /// the serialized result, or `ContextFailed` with the classified error.
+    async fn settle(self, body_result: Result<O, OperationError>) -> Result<O, OperationError> {
+        let Self {
+            ctx, wire_id, name, ..
+        } = self;
         match body_result {
             Ok(value) => {
-                // 6a. Success — serialize and checkpoint ContextSucceeded.
+                // Success — serialize and checkpoint ContextSucceeded.
                 let serialized = serde_json::to_string(&value)
                     .map_err(|e| wfcb_internal_error(&format!("serialize result: {e}")))?;
                 let mut builder = OperationUpdate::builder()
@@ -343,7 +437,7 @@ impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<
                 Ok(out)
             }
             Err(err) => {
-                // 6b. Failure — checkpoint ContextFailed.
+                // Failure — checkpoint ContextFailed.
                 let (err_type, err_msg) = extract_error_info(&err);
                 let mut builder = OperationUpdate::builder()
                     .id(wire_id.clone())
@@ -380,14 +474,19 @@ impl<O: DeserializeOwned + Serialize + Send + 'static> WaitForCallbackExecution<
 ///
 /// The submitter is executed as a proper step operation (producing
 /// `StepStarted`/`StepSucceeded`/`StepFailed` checkpoint events).
-async fn run_wfcb_body<O: DeserializeOwned + Send + 'static>(
+async fn run_wfcb_body<O, F, Fut>(
     child_ctx: DurableContext,
     timeout: Option<Duration>,
     heartbeat: Option<Duration>,
-    submitter: BoxedSubmitter,
+    submitter: F,
     submitter_retry: Option<crate::RetryStrategy>,
     serdes: Option<Arc<dyn Serdes>>,
-) -> Result<O, OperationError> {
+) -> Result<O, OperationError>
+where
+    O: DeserializeOwned + Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+{
     // Step 1: create the inner callback (no name, per wire spec). The per-op
     // serdes flows through to the inner callback's decode so a serdes set on
     // wait_for_callback actually reaches the delivered payload.
@@ -407,21 +506,18 @@ async fn run_wfcb_body<O: DeserializeOwned + Send + 'static>(
     // checkpoint log, matching the wire protocol expectation. The step is
     // unnamed (empty-string equivalent).
     let callback_id = cb.id().to_owned();
-    let step_exec: crate::step::StepExecution<()> = crate::step::StepExecution {
+    let step_exec = crate::step::StepExecution {
         ctx: child_ctx.clone(),
         op_id: child_ctx.mint_id(),
         name: None,
         retry_strategy: submitter_retry,
         serdes: None,
         semantics: crate::step::StepSemantics::default(),
-        closure: Box::new(move |step_ctx| {
-            Box::pin(async move {
-                (submitter)(step_ctx, callback_id)
-                    .await
-                    .map_err(|e| -> BoxError { e })?;
-                Ok(())
-            })
-        }),
+        closure: move |step_ctx: StepContext| async move {
+            (submitter)(step_ctx, callback_id).await?;
+            Ok(())
+        },
+        _marker: std::marker::PhantomData,
     };
     let step_result = step_exec.execute().await;
     if let Err(e) = step_result {
@@ -905,13 +1001,13 @@ mod tests {
             None,
         )]);
         let op_id = ctx.mint_id();
-        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+        let exec = WaitForCallbackExecution::<String, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("wfcb-test".to_owned()),
             timeout: None,
             heartbeat: None,
-            submitter: Box::new(|_sc, _id| Box::pin(async { Ok(()) })),
+            submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
             submitter_retry: None,
             serdes: None,
             _marker: std::marker::PhantomData,
@@ -932,13 +1028,13 @@ mod tests {
             None,
         )]);
         let op_id = ctx.mint_id();
-        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+        let exec = WaitForCallbackExecution::<String, _> {
             ctx: ctx.clone(),
             op_id,
             name: None,
             timeout: None,
             heartbeat: None,
-            submitter: Box::new(|_sc, _id| Box::pin(async { Ok(()) })),
+            submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
             submitter_retry: None,
             serdes: None,
             _marker: std::marker::PhantomData,
@@ -963,13 +1059,13 @@ mod tests {
             None,
         )]);
         let op_id = ctx.mint_id();
-        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+        let exec = WaitForCallbackExecution::<String, _> {
             ctx: ctx.clone(),
             op_id,
             name: None,
             timeout: None,
             heartbeat: None,
-            submitter: Box::new(|_sc, _id| Box::pin(async { Ok(()) })),
+            submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
             submitter_retry: None,
             serdes: None,
             _marker: std::marker::PhantomData,
@@ -997,13 +1093,15 @@ mod tests {
             "token-1".to_owned(),
         );
         let op_id = ctx.mint_id();
-        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+        let exec = WaitForCallbackExecution::<String, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("sub-fail-test".to_owned()),
             timeout: None,
             heartbeat: None,
-            submitter: Box::new(|_sc, _id| Box::pin(async { Err("submitter exploded".into()) })),
+            submitter: |_sc: StepContext, _id: String| async {
+                Err::<(), BoxError>("submitter exploded".into())
+            },
             submitter_retry: None,
             serdes: None,
             _marker: std::marker::PhantomData,
@@ -1105,16 +1203,16 @@ mod tests {
         let submitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let submitted_clone = Arc::clone(&submitted);
 
-        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+        let exec = WaitForCallbackExecution::<String, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("step-check".to_owned()),
             timeout: None,
             heartbeat: None,
-            submitter: Box::new(move |_sc, _id| {
+            submitter: move |_sc: StepContext, _id: String| {
                 submitted_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                Box::pin(async { Ok(()) })
-            }),
+                async { Ok::<(), BoxError>(()) }
+            },
             submitter_retry: None,
             serdes: None,
             _marker: std::marker::PhantomData,
@@ -1233,16 +1331,16 @@ mod tests {
         let submitter_called_clone = Arc::clone(&submitter_called);
 
         let op_id = ctx.mint_id();
-        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+        let exec = WaitForCallbackExecution::<String, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("replay-test".to_owned()),
             timeout: None,
             heartbeat: None,
-            submitter: Box::new(move |_sc, _id| {
+            submitter: move |_sc: StepContext, _id: String| {
                 submitter_called_clone.store(true, Ordering::SeqCst);
-                Box::pin(async { Ok(()) })
-            }),
+                async { Ok::<(), BoxError>(()) }
+            },
             submitter_retry: None,
             serdes: None,
             _marker: std::marker::PhantomData,
@@ -1278,13 +1376,15 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+        let exec = WaitForCallbackExecution::<String, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("fail-check".to_owned()),
             timeout: None,
             heartbeat: None,
-            submitter: Box::new(|_sc, _id| Box::pin(async { Err("submission failed".into()) })),
+            submitter: |_sc: StepContext, _id: String| async {
+                Err::<(), BoxError>("submission failed".into())
+            },
             submitter_retry: None,
             serdes: None,
             _marker: std::marker::PhantomData,
@@ -1330,16 +1430,16 @@ mod tests {
         let received_attempt = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let received_attempt_clone = Arc::clone(&received_attempt);
 
-        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+        let exec = WaitForCallbackExecution::<String, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("attempt-check".to_owned()),
             timeout: None,
             heartbeat: None,
-            submitter: Box::new(move |sc, _id| {
+            submitter: move |sc: StepContext, _id: String| {
                 received_attempt_clone.store(sc.attempt(), std::sync::atomic::Ordering::SeqCst);
-                Box::pin(async { Ok(()) })
-            }),
+                async { Ok::<(), BoxError>(()) }
+            },
             submitter_retry: None,
             serdes: None,
             _marker: std::marker::PhantomData,
@@ -1571,13 +1671,13 @@ mod tests {
             ),
         ]);
         let op_id = ctx.mint_id();
-        let exec: WaitForCallbackExecution<String> = WaitForCallbackExecution {
+        let exec = WaitForCallbackExecution::<String, _> {
             ctx: ctx.clone(),
             op_id,
             name: Some("wfcb-serdes".to_owned()),
             timeout: None,
             heartbeat: None,
-            submitter: Box::new(|_sc, _id| Box::pin(async { Ok(()) })),
+            submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
             submitter_retry: None,
             serdes: Some(Arc::new(MarkerSerdes)),
             _marker: std::marker::PhantomData,

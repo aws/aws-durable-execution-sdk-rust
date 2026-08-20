@@ -28,8 +28,8 @@ use crate::engine::{
     TerminalReplaySnapshot,
 };
 use crate::error::{
-    ChildFnError, NonDeterministicExecutionError, NonDeterministicExecutionErrorKind,
-    OperationError, OperationErrorKind, StepError, StepErrorKind,
+    NonDeterministicExecutionError, NonDeterministicExecutionErrorKind, OperationError,
+    OperationErrorKind, StepError, StepErrorKind,
 };
 use crate::future::{Branch, DurableFuture};
 
@@ -1279,15 +1279,16 @@ impl DurableContext {
     ///     Ok(result)
     /// }
     /// ```
-    pub fn step<O, F, Fut>(&self, f: F) -> StepBuilder<O>
+    pub fn step<O, F, Fut>(&self, f: F) -> StepBuilder<O, F, Fut>
     where
         F: FnOnce(StepContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        let closure: crate::step::BoxedStepBody<O> = Box::new(move |ctx| Box::pin(f(ctx)));
-        StepBuilder::new(self.clone(), op_id, closure)
+        // The closure is stored unerased; the single erasure point is the
+        // builder's `.future()` / `.await`, producing one DurableFuture box.
+        StepBuilder::new(self.clone(), op_id, f)
     }
 
     /// Creates a durable wait (timer) operation.
@@ -1384,19 +1385,18 @@ impl DurableContext {
     ///     Ok(result)
     /// }
     /// ```
-    pub fn run_in_child_context<O, F, Fut>(&self, f: F) -> ChildBuilder<O>
+    pub fn run_in_child_context<O, F, Fut>(&self, f: F) -> ChildBuilder<O, F, Fut>
     where
         F: FnOnce(DurableContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        // The SDK pins the future and erases the BoxError into the internal
-        // child-error carrier, so the caller writes a plain `async move` body.
-        let closure: crate::child::BoxedChildBody<O> = Box::new(move |ctx| {
-            Box::pin(async move { f(ctx).await.map_err(|e| ChildFnError::new(e.to_string())) })
-        });
-        ChildBuilder::new(self.clone(), op_id, closure)
+        // The closure is stored unerased; the child execution converts the
+        // BoxError into the internal child-error carrier at the boundary,
+        // and the single erasure point is the builder's `.future()` /
+        // `.await`, producing one DurableFuture box.
+        ChildBuilder::new(self.clone(), op_id, f)
     }
 
     /// Runs a closure against a child context and retries the closure's
@@ -1457,14 +1457,14 @@ impl DurableContext {
     ///     Ok(result)
     /// }
     /// ```
-    pub fn with_retry<O, F, Fut>(&self, f: F) -> WithRetryBuilder<O>
+    pub fn with_retry<O, F, Fut>(&self, f: F) -> WithRetryBuilder<O, F, Fut>
     where
         F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        WithRetryBuilder::new(self.clone(), op_id, Arc::new(move |ctx| Box::pin(f(ctx))))
+        WithRetryBuilder::new(self.clone(), op_id, f)
     }
 
     /// Creates a wait-for-condition operation that polls until a predicate
@@ -1501,16 +1501,14 @@ impl DurableContext {
         &self,
         check: F,
         initial_state: S,
-    ) -> WaitForConditionBuilder<S>
+    ) -> WaitForConditionBuilder<S, F, Fut>
     where
         F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
         S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     {
         let op_id = self.mint_id();
-        let boxed_check: crate::wait_for_condition::BoxedCheckFn<S> =
-            Box::new(move |ctx, state| Box::pin(check(ctx, state)));
-        WaitForConditionBuilder::new(self.clone(), op_id, initial_state, boxed_check)
+        WaitForConditionBuilder::new(self.clone(), op_id, initial_state, check)
     }
 
     /// Creates a callback token for external completion.
@@ -1578,17 +1576,14 @@ impl DurableContext {
     ///     Ok(approval.ok)
     /// }
     /// ```
-    pub fn wait_for_callback<O, F, Fut>(&self, submitter: F) -> WaitForCallbackBuilder<O>
+    pub fn wait_for_callback<O, F, Fut>(&self, submitter: F) -> WaitForCallbackBuilder<O, F, Fut>
     where
         F: FnOnce(StepContext, String) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
         O: DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        // Box the submitter so the builder can store it without generics.
-        let boxed_submitter: crate::callback::BoxedSubmitter =
-            Box::new(move |ctx, id| Box::pin(submitter(ctx, id)));
-        WaitForCallbackBuilder::new(self.clone(), op_id, boxed_submitter)
+        WaitForCallbackBuilder::new(self.clone(), op_id, submitter)
     }
 
     /// Creates a map operation that applies a function to each item in a
@@ -1625,7 +1620,7 @@ impl DurableContext {
     ///     Ok(())
     /// }
     /// ```
-    pub fn map<Items, I, O, F, Fut>(&self, items: Items, f: F) -> MapBuilder<I, O>
+    pub fn map<Items, I, O, F, Fut>(&self, items: Items, f: F) -> MapBuilder<I, O, F, Fut>
     where
         Items: IntoIterator<Item = I>,
         F: Fn(DurableContext, I, usize) -> Fut + Send + Sync + 'static,
@@ -1634,20 +1629,13 @@ impl DurableContext {
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        // Wrap the user closure once; each per-item invocation pins its future
-        // and erases the BoxError into the internal child-error carrier.
-        let f = Arc::new(f);
-        let closure = Arc::new(move |ctx: DurableContext, item: I, idx: usize| {
-            let f = Arc::clone(&f);
-            Box::pin(async move {
-                f(ctx, item, idx)
-                    .await
-                    .map_err(|e| ChildFnError::new(e.to_string()))
-            })
-                as std::pin::Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
-        });
+        // The closure is stored unerased; at execution it is shared as
+        // `Arc<F>` and every item produces a concrete future, so the
+        // internal JoinSet holds unboxed futures. The single erasure point
+        // is the builder's `.future()` / `.await`, producing one
+        // DurableFuture box.
         let items: Vec<I> = items.into_iter().collect();
-        MapBuilder::new(self.clone(), op_id, items, closure)
+        MapBuilder::new(self.clone(), op_id, items, f)
     }
 
     /// Creates a parallel operation that executes named branches
@@ -1680,14 +1668,7 @@ impl DurableContext {
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        let branch_tuples: Vec<_> = branches
-            .into_iter()
-            .map(|b| {
-                let name = b.name().to_owned();
-                let factory = b.into_factory();
-                (name, factory)
-            })
-            .collect();
+        let branch_tuples: Vec<_> = branches.into_iter().map(Branch::into_parts).collect();
         ParallelBuilder::new(self.clone(), op_id, branch_tuples)
     }
 

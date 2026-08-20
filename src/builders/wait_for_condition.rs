@@ -3,12 +3,14 @@
 //! plus its configuration ([`WaitStrategy`]) and the per-check decision
 //! type ([`WaitDecision`]).
 
-use std::future::IntoFuture;
+use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::BoxError;
 use crate::Serdes;
 use crate::context::DurableContext;
+use crate::context::StepContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
@@ -23,6 +25,12 @@ pub use crate::wait_for_condition::WaitDecision;
 ///
 /// Created by [`DurableContext::wait_for_condition`]. Configure the polling
 /// strategy with `.wait_strategy_fn()`.
+///
+/// The builder is generic over the check closure `F` and its future `Fut`
+/// so the check is stored **without type erasure**; both parameters are
+/// inferred at the call site and never written by users. The single
+/// erasure point is `.future()` / `.await`, which produces the one
+/// [`DurableFuture`] box.
 ///
 /// # Examples
 ///
@@ -55,17 +63,18 @@ pub use crate::wait_for_condition::WaitDecision;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct WaitForConditionBuilder<S> {
+pub struct WaitForConditionBuilder<S, F, Fut> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     initial_state: S,
     wait_strategy: Option<crate::wait_for_condition::WaitStrategyFn<S>>,
     serdes: Option<Arc<dyn Serdes>>,
-    check: crate::wait_for_condition::BoxedCheckFn<S>,
+    check: F,
+    _marker: std::marker::PhantomData<fn() -> Fut>,
 }
 
-impl<S> std::fmt::Debug for WaitForConditionBuilder<S> {
+impl<S, F, Fut> std::fmt::Debug for WaitForConditionBuilder<S, F, Fut> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WaitForConditionBuilder")
             .field("name", &self.name)
@@ -73,18 +82,16 @@ impl<S> std::fmt::Debug for WaitForConditionBuilder<S> {
     }
 }
 
-impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static>
-    WaitForConditionBuilder<S>
+impl<S, F, Fut> WaitForConditionBuilder<S, F, Fut>
+where
+    S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
+    F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
 {
     /// Creates a new builder (internal). Taking the check closure here
     /// keeps the field non-optional: a builder without a check is
     /// unrepresentable.
-    pub(crate) fn new(
-        ctx: DurableContext,
-        op_id: OperationId,
-        initial_state: S,
-        check: crate::wait_for_condition::BoxedCheckFn<S>,
-    ) -> Self {
+    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, initial_state: S, check: F) -> Self {
         Self {
             ctx,
             op_id,
@@ -93,6 +100,7 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
             wait_strategy: None,
             serdes: None,
             check,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -184,9 +192,9 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
     ///     Ok(done)
     /// }
     /// ```
-    pub fn wait_strategy_fn<F>(mut self, strategy: F) -> Self
+    pub fn wait_strategy_fn<W>(mut self, strategy: W) -> Self
     where
-        F: Fn(S, u32) -> WaitDecision + Send + Sync + 'static,
+        W: Fn(S, u32) -> WaitDecision + Send + Sync + 'static,
     {
         self.wait_strategy = Some(Box::new(strategy));
         self
@@ -209,8 +217,11 @@ impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + '
     }
 }
 
-impl<S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static> IntoFuture
-    for WaitForConditionBuilder<S>
+impl<S, F, Fut> IntoFuture for WaitForConditionBuilder<S, F, Fut>
+where
+    S: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
+    F: Fn(StepContext, S) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
 {
     type Output = Result<S, OperationError>;
     type IntoFuture = DurableFuture<S>;

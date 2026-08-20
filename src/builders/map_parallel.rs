@@ -4,10 +4,11 @@
 //! their shared completion configuration ([`CompletionConfig`]) and the
 //! batch result types.
 
-use std::future::IntoFuture;
+use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use crate::BoxError;
 use crate::Serdes;
 use crate::context::DurableContext;
 use crate::engine::OperationId;
@@ -27,6 +28,14 @@ pub use crate::map_parallel::{
 ///
 /// Created by [`DurableContext::map`]. Applies a function to each item
 /// with configurable concurrency and completion behavior.
+///
+/// The builder is generic over the item closure `F` and its future `Fut`
+/// so the closure is stored **without type erasure**; both parameters are
+/// inferred at the call site and never written by users. At execution the
+/// closure is shared as `Arc<F>` and every item produces a concrete
+/// future, so the internal `JoinSet` holds unboxed futures. The single
+/// erasure point is `.future()` / `.await`, which produces the one
+/// [`DurableFuture`] box.
 ///
 /// # Examples
 ///
@@ -54,7 +63,7 @@ pub use crate::map_parallel::{
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct MapBuilder<I, O> {
+pub struct MapBuilder<I, O, F, Fut> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
@@ -65,11 +74,11 @@ pub struct MapBuilder<I, O> {
     nesting: NestingMode,
     item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
     items: Vec<I>,
-    closure: crate::map_parallel::BoxedItemBody<I, O>,
-    _marker: PhantomData<(I, O)>,
+    closure: F,
+    _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
-impl<I, O> std::fmt::Debug for MapBuilder<I, O> {
+impl<I, O, F, Fut> std::fmt::Debug for MapBuilder<I, O, F, Fut> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MapBuilder")
             .field("name", &self.name)
@@ -78,16 +87,17 @@ impl<I, O> std::fmt::Debug for MapBuilder<I, O> {
     }
 }
 
-impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
+impl<I, O, F, Fut> MapBuilder<I, O, F, Fut>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: Fn(DurableContext, I, usize) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+{
     /// Creates a new builder (internal). Taking the items and closure here
     /// keeps the closure field non-optional: a builder without a body is
     /// unrepresentable.
-    pub(crate) fn new(
-        ctx: DurableContext,
-        op_id: OperationId,
-        items: Vec<I>,
-        closure: crate::map_parallel::BoxedItemBody<I, O>,
-    ) -> Self {
+    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, items: Vec<I>, closure: F) -> Self {
         Self {
             ctx,
             op_id,
@@ -241,7 +251,8 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
             nesting: self.nesting,
             item_namer: self.item_namer,
             items: self.items,
-            closure: self.closure,
+            closure: Arc::new(self.closure),
+            _marker: PhantomData,
         };
 
         execution.execute_batch_result().await
@@ -266,10 +277,12 @@ impl<I: Send + 'static, O: Send + 'static> MapBuilder<I, O> {
     }
 }
 
-impl<
+impl<I, O, F, Fut> IntoFuture for MapBuilder<I, O, F, Fut>
+where
     I: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
     O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
-> IntoFuture for MapBuilder<I, O>
+    F: Fn(DurableContext, I, usize) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;
@@ -290,7 +303,8 @@ impl<
             nesting: self.nesting,
             item_namer: self.item_namer,
             items: self.items,
-            closure: self.closure,
+            closure: Arc::new(self.closure),
+            _marker: PhantomData,
         };
 
         DurableFuture::from_async(async move { execution.execute().await })
@@ -336,7 +350,7 @@ pub struct ParallelBuilder<O> {
     serdes: Option<Arc<dyn Serdes>>,
     result_serdes: Option<Arc<dyn Serdes>>,
     nesting: NestingMode,
-    branches: Vec<(String, crate::child::BoxedChildBody<O>)>,
+    branches: Vec<(String, crate::future::BranchBody<O>)>,
     _marker: PhantomData<O>,
 }
 
@@ -355,7 +369,7 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     pub(crate) fn new(
         ctx: DurableContext,
         op_id: OperationId,
-        branches: Vec<(String, crate::child::BoxedChildBody<O>)>,
+        branches: Vec<(String, crate::future::BranchBody<O>)>,
     ) -> Self {
         Self {
             ctx,

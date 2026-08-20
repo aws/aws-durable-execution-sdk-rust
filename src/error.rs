@@ -973,6 +973,20 @@ impl From<OperationError> for ChildFnError {
     }
 }
 
+impl From<crate::BoxError> for ChildFnError {
+    /// Converts a user-facing [`crate::BoxError`] into the internal carrier.
+    ///
+    /// This is the boundary conversion the generic child-context execution
+    /// applies to a user closure's error, replacing the per-closure
+    /// `map_err(|e| ChildFnError::new(e.to_string()))` wrapper that used to
+    /// live inside the boxed body — the rendered message is identical.
+    fn from(err: crate::BoxError) -> Self {
+        Self {
+            message: err.to_string(),
+        }
+    }
+}
+
 // Static assertions: all public error types must be Send + Sync + 'static.
 // These compile-time checks prevent accidental regressions.
 const _: () = {

@@ -5,14 +5,16 @@
 //! [`DurableContext::wait_for_callback`](crate::DurableContext::wait_for_callback),
 //! plus the [`Callback`] handle the create-callback operation resolves to.
 
-use std::future::IntoFuture;
+use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::BoxError;
 use crate::RetryStrategy;
 use crate::Serdes;
 use crate::context::DurableContext;
+use crate::context::StepContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
@@ -158,6 +160,12 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> IntoFuture for CreateCallb
 /// Created by [`DurableContext::wait_for_callback`]. Registers the callback
 /// and waits for completion in one step.
 ///
+/// The builder is generic over the submitter closure `F` and its future
+/// `Fut` so the submitter is stored **without type erasure**; both
+/// parameters are inferred at the call site and never written by users.
+/// The single erasure point is `.future()` / `.await`, which produces the
+/// one [`DurableFuture`] box.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -182,19 +190,19 @@ impl<O: serde::de::DeserializeOwned + Send + 'static> IntoFuture for CreateCallb
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct WaitForCallbackBuilder<O> {
+pub struct WaitForCallbackBuilder<O, F, Fut> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     timeout: Option<Duration>,
     heartbeat: Option<Duration>,
-    submitter: crate::callback::BoxedSubmitter,
+    submitter: F,
     submitter_retry: Option<RetryStrategy>,
     serdes: Option<Arc<dyn Serdes>>,
-    _marker: PhantomData<O>,
+    _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
-impl<O> std::fmt::Debug for WaitForCallbackBuilder<O> {
+impl<O, F, Fut> std::fmt::Debug for WaitForCallbackBuilder<O, F, Fut> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WaitForCallbackBuilder")
             .field("name", &self.name)
@@ -202,15 +210,16 @@ impl<O> std::fmt::Debug for WaitForCallbackBuilder<O> {
     }
 }
 
-impl<O: Send + 'static> WaitForCallbackBuilder<O> {
+impl<O, F, Fut> WaitForCallbackBuilder<O, F, Fut>
+where
+    O: Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+{
     /// Creates a new builder (internal). Taking the submitter here keeps
     /// the field non-optional: a builder without a submitter is
     /// unrepresentable.
-    pub(crate) fn new(
-        ctx: DurableContext,
-        op_id: OperationId,
-        submitter: crate::callback::BoxedSubmitter,
-    ) -> Self {
+    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, submitter: F) -> Self {
         Self {
             ctx,
             op_id,
@@ -261,9 +270,9 @@ impl<O: Send + 'static> WaitForCallbackBuilder<O> {
     ///     Ok(result)
     /// }
     /// ```
-    pub fn submitter_retry<F>(mut self, strategy: F) -> Self
+    pub fn submitter_retry<R>(mut self, strategy: R) -> Self
     where
-        F: Fn(&crate::StepError, u32) -> crate::RetryDecision + Send + Sync + 'static,
+        R: Fn(&crate::StepError, u32) -> crate::RetryDecision + Send + Sync + 'static,
     {
         self.submitter_retry = Some(Box::new(strategy));
         self
@@ -336,7 +345,12 @@ impl<O: Send + 'static> WaitForCallbackBuilder<O> {
     }
 }
 
-impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> WaitForCallbackBuilder<O> {
+impl<O, F, Fut> WaitForCallbackBuilder<O, F, Fut>
+where
+    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+{
     /// Converts this builder into a [`DurableFuture`] explicitly.
     pub fn future(self) -> DurableFuture<O> {
         self.into_future()
@@ -348,8 +362,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> WaitFor
     }
 }
 
-impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFuture
-    for WaitForCallbackBuilder<O>
+impl<O, F, Fut> IntoFuture for WaitForCallbackBuilder<O, F, Fut>
+where
+    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
 {
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;

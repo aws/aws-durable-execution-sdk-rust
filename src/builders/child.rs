@@ -1,9 +1,11 @@
 //! The child-context operation: [`ChildBuilder`], returned by
 //! [`DurableContext::run_in_child_context`](crate::DurableContext::run_in_child_context).
 
-use std::future::IntoFuture;
+use std::future::{Future, IntoFuture};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
+use crate::BoxError;
 use crate::Serdes;
 use crate::context::DurableContext;
 use crate::engine::OperationId;
@@ -18,6 +20,12 @@ use crate::future::DurableFuture;
 ///
 /// Created by [`DurableContext::run_in_child_context`]. Use `.spawn()` for
 /// eager fan-out execution.
+///
+/// The builder is generic over the body closure `F` and its future `Fut`
+/// so the body is stored **without type erasure**; both parameters are
+/// inferred at the call site and never written by users. The single
+/// erasure point is `.future()` / `.await`, which produces the one
+/// [`DurableFuture`] box.
 ///
 /// # Examples
 ///
@@ -36,15 +44,16 @@ use crate::future::DurableFuture;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct ChildBuilder<O> {
+pub struct ChildBuilder<O, F, Fut> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     serdes: Option<Arc<dyn Serdes>>,
-    closure: crate::child::BoxedChildBody<O>,
+    closure: F,
+    _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
-impl<O> std::fmt::Debug for ChildBuilder<O> {
+impl<O, F, Fut> std::fmt::Debug for ChildBuilder<O, F, Fut> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChildBuilder")
             .field("name", &self.name)
@@ -52,20 +61,22 @@ impl<O> std::fmt::Debug for ChildBuilder<O> {
     }
 }
 
-impl<O: Send + 'static> ChildBuilder<O> {
+impl<O, F, Fut> ChildBuilder<O, F, Fut>
+where
+    O: Send + 'static,
+    F: FnOnce(DurableContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+{
     /// Creates a new builder (internal). Taking the closure here keeps the
     /// field non-optional: a builder without a body is unrepresentable.
-    pub(crate) fn new(
-        ctx: DurableContext,
-        op_id: OperationId,
-        closure: crate::child::BoxedChildBody<O>,
-    ) -> Self {
+    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, closure: F) -> Self {
         Self {
             ctx,
             op_id,
             name: None,
             serdes: None,
             closure,
+            _marker: PhantomData,
         }
     }
 
@@ -126,8 +137,11 @@ impl<O: Send + 'static> ChildBuilder<O> {
     }
 }
 
-impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFuture
-    for ChildBuilder<O>
+impl<O, F, Fut> IntoFuture for ChildBuilder<O, F, Fut>
+where
+    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(DurableContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
@@ -143,6 +157,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             name: self.name,
             serdes: self.serdes,
             closure: self.closure,
+            _marker: PhantomData,
         };
 
         DurableFuture::from_async(async move { execution.execute().await })

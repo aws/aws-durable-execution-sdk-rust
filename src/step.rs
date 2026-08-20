@@ -8,7 +8,6 @@
 //! function suspends; the backend owns the timer.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -178,32 +177,126 @@ pub enum StepSemantics {
 /// Wire sub-type for step operations.
 pub(crate) const STEP_SUB_TYPE: &str = "Step";
 
-/// Boxed, pinned step body: the user's step closure after
-/// [`crate::DurableContext::step`] erases it for storage on the builder.
-///
-/// Crate-internal: the public API takes a generic closure and boxes it into
-/// this. The alias exists so the builder, the execution state, and the
-/// context each name the type once instead of repeating the nested
-/// `Box<dyn FnOnce ... Pin<Box<dyn Future ...>>>` spelling.
-pub(crate) type BoxedStepBody<O> = Box<
-    dyn FnOnce(StepContext) -> Pin<Box<dyn Future<Output = Result<O, BoxError>> + Send>> + Send,
->;
-
 /// Internal state for step execution passed from the builder.
-pub(crate) struct StepExecution<O> {
+///
+/// Generic over the user's closure `F` (and, through `F`'s output, its
+/// future): the closure is stored and run **without type erasure**. The one
+/// erasure point for a step is `.future()` / `into_future` on the builder,
+/// which boxes the whole execution future once inside
+/// [`DurableFuture`](crate::DurableFuture).
+pub(crate) struct StepExecution<O, F> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) retry_strategy: Option<RetryStrategy>,
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
     pub(crate) semantics: StepSemantics,
-    pub(crate) closure: BoxedStepBody<O>,
+    pub(crate) closure: F,
+    pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
 }
 
-impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
+impl<O, F, Fut> StepExecution<O, F>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+    F: FnOnce(StepContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+{
     /// Executes the step operation: replay path or live path with retry.
-    #[allow(clippy::too_many_lines)] // reason: validation adds lines but splitting would obscure flow
+    ///
+    /// Thin generic wrapper — the ONLY code monomorphized per step call
+    /// site. The replay/checkpoint state machine lives in the non-generic
+    /// [`StepCore`] / [`StepLive`] halves (generic over the result type `O`
+    /// only); this wrapper just polls the user's concrete future between
+    /// them.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
+        let Self {
+            ctx,
+            op_id,
+            name,
+            retry_strategy,
+            serdes,
+            semantics,
+            closure,
+            _marker,
+        } = self;
+        let core = StepCore {
+            ctx,
+            op_id,
+            name,
+            retry_strategy,
+            serdes,
+            semantics,
+            _marker: std::marker::PhantomData,
+        };
+        match core.before().await? {
+            StepPrelude::Done(result) => result,
+            StepPrelude::Run {
+                attempt,
+                span,
+                live,
+            } => {
+                // Execute the step body inside a tracing span carrying the
+                // structured-log field contract.
+                let step_ctx = StepContext::new(attempt);
+                let result = async { (closure)(step_ctx).await }.instrument(span).await;
+                live.settle(attempt, result).await
+            }
+        }
+    }
+}
+
+/// The pre-closure half of a step: task-ownership check, replay resolution,
+/// attempt derivation, and the START checkpoint. Generic only over the
+/// result type `O` — no user closure reaches this state machine, so its
+/// substantial replay/checkpoint logic compiles once per result type
+/// instead of once per step call site.
+struct StepCore<O> {
+    ctx: DurableContext,
+    op_id: OperationId,
+    name: Option<String>,
+    retry_strategy: Option<RetryStrategy>,
+    serdes: Option<Arc<dyn Serdes>>,
+    semantics: StepSemantics,
+    _marker: std::marker::PhantomData<fn() -> O>,
+}
+
+/// What [`StepCore::before`] decided: the step is already resolved from the
+/// checkpoint log (or suspended), or the body must run live.
+enum StepPrelude<O> {
+    /// Resolved without running the body (replay, suspension, or an
+    /// `AtMostOncePerRetry` interruption verdict).
+    Done(Result<O, OperationError>),
+    /// The body must run at `attempt`, instrumented with `span`; `live`
+    /// settles the outcome afterwards.
+    Run {
+        /// 1-based attempt number for this live execution.
+        attempt: u32,
+        /// The operation span the body runs under.
+        span: tracing::Span,
+        /// The post-closure half that checkpoints the outcome.
+        live: StepLive<O>,
+    },
+}
+
+/// The post-closure half of a step: outcome checkpointing (success payload
+/// or retry-strategy failure handling). Generic only over the result type.
+struct StepLive<O> {
+    ctx: DurableContext,
+    wire_id: String,
+    name: Option<String>,
+    retry_strategy: Option<RetryStrategy>,
+    serdes: Option<Arc<dyn Serdes>>,
+    _marker: std::marker::PhantomData<fn() -> O>,
+}
+
+impl<O> StepCore<O>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+{
+    /// Runs everything that precedes the user closure: replay path, or the
+    /// live-path preamble ending at the START checkpoint.
+    #[allow(clippy::too_many_lines)] // reason: validation adds lines but splitting would obscure flow
+    async fn before(self) -> Result<StepPrelude<O>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
 
@@ -242,7 +335,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
                         Some(STEP_SUB_TYPE),
                         view.attempt,
                     );
-                    return Ok(value);
+                    return Ok(StepPrelude::Done(Ok(value)));
                 }
                 CheckpointStatus::Failed => {
                     self.ctx.emit_operation_replayed(
@@ -256,14 +349,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
                         .ctx
                         .checkpoint_error_parts(&positional_id)
                         .unwrap_or_default();
-                    return Err(replay_failure(
+                    return Ok(StepPrelude::Done(Err(replay_failure(
                         error_type.as_deref(),
                         error_message.as_deref(),
-                    ));
+                    ))));
                 }
                 CheckpointStatus::Pending => {
                     // Retry timer hasn't fired yet — suspend.
-                    return self.ctx.suspend_now().await;
+                    return Ok(StepPrelude::Done(self.ctx.suspend_now().await));
                 }
                 CheckpointStatus::Started => {
                     // Already started — behavior depends on semantics.
@@ -275,15 +368,17 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
                         let attempt = self.ctx.get_attempt(&self.op_id).saturating_add(1);
                         let interrupted_err: BoxError =
                             "step interrupted (AtMostOncePerRetry)".into();
-                        return handle_failure::<O>(
-                            &self.ctx,
-                            &wire_id,
-                            self.name.as_deref(),
-                            self.retry_strategy.as_ref(),
-                            interrupted_err,
-                            attempt,
-                        )
-                        .await;
+                        return Ok(StepPrelude::Done(
+                            handle_failure::<O>(
+                                &self.ctx,
+                                &wire_id,
+                                self.name.as_deref(),
+                                self.retry_strategy.as_ref(),
+                                interrupted_err,
+                                attempt,
+                            )
+                            .await,
+                        ));
                     }
                     // AtLeastOncePerRetry (default): skip re-checkpointing
                     // START but re-execute the body.
@@ -303,12 +398,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
         // recorded operation with step details, attempt = recorded + 1.
         let attempt = self.ctx.get_attempt(&self.op_id).saturating_add(1);
 
-        // Destructure self to avoid partial-move issues with the FnOnce closure.
-        let ctx = self.ctx;
-        let name = self.name;
-        let retry_strategy = self.retry_strategy;
-        let serdes = self.serdes;
-        let closure = self.closure;
+        // Destructure self so the live half owns exactly what it needs.
+        let Self {
+            ctx,
+            name,
+            retry_strategy,
+            serdes,
+            ..
+        } = self;
 
         // Checkpoint START (skip if step was already in Started state).
         if !already_started {
@@ -318,8 +415,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
                 .map_err(|e| client_error_to_op_error(&e))?;
         }
 
-        // Execute the step body inside a tracing span carrying the
-        // structured-log field contract.
+        // The body runs inside a tracing span carrying the structured-log
+        // field contract.
         let is_replay = false; // Live execution is never replay.
         let span = tracing_layer::operation_span(
             ctx.execution_arn(),
@@ -328,26 +425,46 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> StepExecution<O> {
             attempt,
             is_replay,
         );
-        let step_ctx = StepContext::new(attempt);
-        let result = async { (closure)(step_ctx).await }.instrument(span).await;
 
+        Ok(StepPrelude::Run {
+            attempt,
+            span,
+            live: StepLive {
+                ctx,
+                wire_id,
+                name,
+                retry_strategy,
+                serdes,
+                _marker: std::marker::PhantomData,
+            },
+        })
+    }
+}
+
+impl<O> StepLive<O>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+{
+    /// Settles a live step outcome: checkpoints success or consults the
+    /// retry strategy on failure.
+    async fn settle(self, attempt: u32, result: Result<O, BoxError>) -> Result<O, OperationError> {
         match result {
             Ok(value) => {
                 handle_success::<O>(
-                    &ctx,
-                    &wire_id,
-                    name.as_deref(),
-                    serdes.as_ref().or_else(|| ctx.default_serdes()),
+                    &self.ctx,
+                    &self.wire_id,
+                    self.name.as_deref(),
+                    self.serdes.as_ref().or_else(|| self.ctx.default_serdes()),
                     value,
                 )
                 .await
             }
             Err(err) => {
                 handle_failure::<O>(
-                    &ctx,
-                    &wire_id,
-                    name.as_deref(),
-                    retry_strategy.as_ref(),
+                    &self.ctx,
+                    &self.wire_id,
+                    self.name.as_deref(),
+                    self.retry_strategy.as_ref(),
                     err,
                     attempt,
                 )
@@ -879,7 +996,7 @@ mod tests {
             "token0".to_owned(),
         );
         let op_id = ctx.mint_id();
-        let closure: BoxedStepBody<i32> = Box::new(|_| Box::pin(async { Ok(42) }));
+        let closure = |_: StepContext| async { Ok::<i32, BoxError>(42) };
 
         let exec = StepExecution {
             ctx,
@@ -889,6 +1006,7 @@ mod tests {
             serdes: None,
             semantics: StepSemantics::default(),
             closure,
+            _marker: std::marker::PhantomData,
         };
 
         let result = exec.execute().await;
@@ -936,8 +1054,7 @@ mod tests {
             None,
         );
         let op_id = ctx.mint_id();
-        let closure: BoxedStepBody<String> =
-            Box::new(|_| Box::pin(async { Ok("hello".to_owned()) }));
+        let closure = |_: StepContext| async { Ok::<String, BoxError>("hello".to_owned()) };
 
         let exec = StepExecution {
             ctx,
@@ -947,6 +1064,7 @@ mod tests {
             serdes: None, // no per-op serdes -> must fall back to the default
             semantics: StepSemantics::default(),
             closure,
+            _marker: std::marker::PhantomData,
         };
 
         // The step returns the round-tripped value.
@@ -1004,10 +1122,10 @@ mod tests {
         );
         let op_id = ctx.mint_id(); // This mints "1"
 
-        let closure: BoxedStepBody<i32> = Box::new(move |_| {
+        let closure = move |_: StepContext| {
             executed_clone.store(true, Ordering::SeqCst);
-            Box::pin(async { Ok(0) })
-        });
+            async { Ok::<i32, BoxError>(0) }
+        };
 
         let exec = StepExecution {
             ctx,
@@ -1017,6 +1135,7 @@ mod tests {
             serdes: None,
             semantics: StepSemantics::default(),
             closure,
+            _marker: std::marker::PhantomData,
         };
 
         let result = exec.execute().await;
@@ -1060,12 +1179,12 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let closure: BoxedStepBody<String> = Box::new(move |_| {
+        let closure = move |_: StepContext| {
             executed_clone.store(true, Ordering::SeqCst);
-            Box::pin(async { Ok("should not run".to_owned()) })
-        });
+            async { Ok::<String, BoxError>("should not run".to_owned()) }
+        };
 
-        let exec = StepExecution::<String> {
+        let exec = StepExecution {
             ctx,
             op_id,
             name: None,
@@ -1073,6 +1192,7 @@ mod tests {
             serdes: None,
             semantics: StepSemantics::default(),
             closure,
+            _marker: std::marker::PhantomData,
         };
 
         let result = exec.execute().await;
@@ -1105,8 +1225,7 @@ mod tests {
         let no_retry: RetryStrategy =
             Box::new(|_err: &StepError, _attempt: u32| RetryDecision::Stop);
 
-        let closure: BoxedStepBody<i32> =
-            Box::new(|_| Box::pin(async { Err("always fails".into()) }));
+        let closure = |_: StepContext| async { Err::<i32, BoxError>("always fails".into()) };
 
         let exec = StepExecution {
             ctx,
@@ -1116,6 +1235,7 @@ mod tests {
             serdes: None,
             semantics: StepSemantics::default(),
             closure,
+            _marker: std::marker::PhantomData,
         };
 
         let result = exec.execute().await;
@@ -1148,7 +1268,7 @@ mod tests {
                 delay: Duration::from_secs(1),
             });
 
-        let closure: BoxedStepBody<i32> = Box::new(|_| Box::pin(async { Err("transient".into()) }));
+        let closure = |_: StepContext| async { Err::<i32, BoxError>("transient".into()) };
 
         let exec = StepExecution {
             ctx: ctx.clone(),
@@ -1158,6 +1278,7 @@ mod tests {
             serdes: None,
             semantics: StepSemantics::default(),
             closure,
+            _marker: std::marker::PhantomData,
         };
 
         let signal = Arc::clone(ctx.suspension_signal());
@@ -1190,7 +1311,7 @@ mod tests {
                 delay: Duration::from_millis(1900),
             });
 
-        let closure: BoxedStepBody<i32> = Box::new(|_| Box::pin(async { Err("transient".into()) }));
+        let closure = |_: StepContext| async { Err::<i32, BoxError>("transient".into()) };
 
         let exec = StepExecution {
             ctx: ctx.clone(),
@@ -1200,6 +1321,7 @@ mod tests {
             serdes: None,
             semantics: StepSemantics::default(),
             closure,
+            _marker: std::marker::PhantomData,
         };
 
         let signal = Arc::clone(ctx.suspension_signal());
@@ -1261,7 +1383,7 @@ mod tests {
             let ctx_clone = ctx.clone();
             let handle = tokio::spawn(async move {
                 let op_id = ctx_clone.mint_id();
-                let closure: BoxedStepBody<i32> = Box::new(|_| Box::pin(async { Ok(1) }));
+                let closure = |_: StepContext| async { Ok::<i32, BoxError>(1) };
 
                 let exec = StepExecution {
                     ctx: ctx_clone,
@@ -1271,6 +1393,7 @@ mod tests {
                     serdes: None,
                     semantics: StepSemantics::default(),
                     closure,
+                    _marker: std::marker::PhantomData,
                 };
                 exec.execute().await
             });
@@ -1335,10 +1458,10 @@ mod tests {
         let no_retry: RetryStrategy =
             Box::new(|_err: &StepError, _attempt: u32| RetryDecision::Stop);
 
-        let closure: BoxedStepBody<i32> = Box::new(move |_| {
+        let closure = move |_: StepContext| {
             executed_clone.store(true, Ordering::SeqCst);
-            Box::pin(async { Ok(42) })
-        });
+            async { Ok::<i32, BoxError>(42) }
+        };
 
         let exec = StepExecution {
             ctx,
@@ -1348,6 +1471,7 @@ mod tests {
             serdes: None,
             semantics: StepSemantics::AtMostOncePerRetry,
             closure,
+            _marker: std::marker::PhantomData,
         };
 
         let result = exec.execute().await;
@@ -1409,10 +1533,10 @@ mod tests {
                 delay: Duration::from_secs(1),
             });
 
-        let closure: BoxedStepBody<i32> = Box::new(move |_| {
+        let closure = move |_: StepContext| {
             executed_clone.store(true, Ordering::SeqCst);
-            Box::pin(async { Ok(42) })
-        });
+            async { Ok::<i32, BoxError>(42) }
+        };
 
         let exec = StepExecution {
             ctx: ctx.clone(),
@@ -1422,6 +1546,7 @@ mod tests {
             serdes: None,
             semantics: StepSemantics::AtMostOncePerRetry,
             closure,
+            _marker: std::marker::PhantomData,
         };
 
         let signal = Arc::clone(ctx.suspension_signal());
@@ -1473,10 +1598,10 @@ mod tests {
         );
         let op_id = ctx.mint_id();
 
-        let closure: BoxedStepBody<i32> = Box::new(move |_| {
+        let closure = move |_: StepContext| {
             executed_clone.store(true, Ordering::SeqCst);
-            Box::pin(async { Ok(77) })
-        });
+            async { Ok::<i32, BoxError>(77) }
+        };
 
         let exec = StepExecution {
             ctx,
@@ -1486,6 +1611,7 @@ mod tests {
             serdes: None,
             semantics: StepSemantics::AtLeastOncePerRetry,
             closure,
+            _marker: std::marker::PhantomData,
         };
 
         let result = exec.execute().await;

@@ -28,7 +28,6 @@
 //! state therefore survives suspension by construction.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,17 +38,6 @@ use crate::context::DurableContext;
 use crate::error::{ChildFnError, StepError, StepErrorKind};
 use crate::{BoxError, RetryDecision, RetryStrategy};
 
-/// The shared, re-invokable closure a `with_retry` block runs per attempt.
-///
-/// Unlike `run_in_child_context` (whose closure is `FnOnce`), a retry block
-/// must be able to call the closure once per attempt, so it is stored as a
-/// shared `Fn`.
-pub(crate) type WithRetryClosure<O> = Arc<
-    dyn Fn(DurableContext) -> Pin<Box<dyn Future<Output = Result<O, BoxError>> + Send>>
-        + Send
-        + Sync,
->;
-
 /// Runs the retry loop inside the outer `with_retry` child context.
 ///
 /// `outer` is the child context whose namespace the loop owns; the loop
@@ -58,13 +46,20 @@ pub(crate) type WithRetryClosure<O> = Arc<
 /// `ChildFnError` describing exhaustion (carrying the last attempt's
 /// error), which the enclosing child-context protocol checkpoints as the
 /// operation's permanent failure.
-pub(crate) async fn retry_loop<O>(
+/// The closure is generic (`Arc<F>` rather than a boxed `dyn Fn`): each
+/// attempt produces a concrete future that flows into
+/// `run_in_child_context` without its own box — the single erasure point
+/// stays at the enclosing builder's [`DurableFuture`](crate::DurableFuture).
+/// `Arc` because the block runs the closure once per attempt.
+pub(crate) async fn retry_loop<O, F, Fut>(
     outer: DurableContext,
-    closure: WithRetryClosure<O>,
+    closure: Arc<F>,
     strategy: Arc<RetryStrategy>,
 ) -> Result<O, ChildFnError>
 where
     O: Serialize + DeserializeOwned + Send + 'static,
+    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     let mut attempt: u32 = 1;
     loop {

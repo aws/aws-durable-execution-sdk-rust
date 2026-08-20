@@ -21,7 +21,6 @@
 //! - Fail-fast when `min_successful` can no longer be met
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
@@ -30,6 +29,7 @@ use serde::de::DeserializeOwned;
 use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
+use crate::BoxError;
 use crate::Serdes;
 use crate::context::DurableContext;
 use crate::driver::{ScopeOutcome, drive_scope};
@@ -608,24 +608,15 @@ pub enum NestingMode {
 }
 
 /// Internal state for a map execution passed from the builder.
-/// Shared, pinned per-item map body: the user's map closure after
-/// [`crate::DurableContext::map`] erases it. `Arc` rather than `Box`
-/// because the same closure runs once per item, concurrently.
 ///
-/// Crate-internal: the public API takes a generic closure and wraps it
-/// into this.
-pub(crate) type BoxedItemBody<I, O> = Arc<
-    dyn Fn(
-            DurableContext,
-            I,
-            usize,
-        ) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Internal state for a map execution passed from the builder.
-pub(crate) struct MapExecution<I, O> {
+/// Holds the user's map closure as `Arc<F>` — shared rather than boxed,
+/// because the same closure runs once per item, concurrently. Each item
+/// call produces a **concrete** future from `Arc<F>`, so the
+/// [`JoinSet`](tokio::task::JoinSet) inside [`execute_batch`] holds
+/// concrete futures with no per-item box; the one erasure point is the
+/// builder's `.future()` / `into_future`, which boxes the whole execution
+/// future once inside [`DurableFuture`](crate::DurableFuture).
+pub(crate) struct MapExecution<I, O, F> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
@@ -636,94 +627,47 @@ pub(crate) struct MapExecution<I, O> {
     pub(crate) nesting: NestingMode,
     pub(crate) item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
     pub(crate) items: Vec<I>,
-    pub(crate) closure: BoxedItemBody<I, O>,
+    pub(crate) closure: Arc<F>,
+    pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
 }
 
-impl<
+impl<I, O, F, Fut> MapExecution<I, O, F>
+where
     I: Serialize + DeserializeOwned + Send + Sync + 'static,
     O: Serialize + DeserializeOwned + Send + 'static,
-> MapExecution<I, O>
+    F: Fn(DurableContext, I, usize) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     /// Executes the map operation.
     pub(crate) async fn execute(self) -> Result<Vec<O>, OperationError> {
-        let total_items = self.items.len();
-        let items = into_item_slots(self.items);
-        let closure = self.closure;
-        let items_ref = Arc::clone(&items);
-
-        let batch_result = execute_batch(
-            self.ctx,
-            self.op_id,
-            self.name,
-            self.max_concurrency,
-            self.completion,
-            self.serdes,
-            self.result_serdes,
-            self.nesting,
-            self.item_namer,
-            total_items,
-            MAP_SUB_TYPE,
-            MAP_ITERATION_SUB_TYPE,
-            move |child_ctx, index| {
-                let items = Arc::clone(&items_ref);
-                let closure = Arc::clone(&closure);
-                async move {
-                    let item =
-                        take_item(&items, index).map_err(|e| ChildFnError::new(e.to_string()))?;
-                    (closure)(child_ctx, item, index).await
-                }
-            },
-        )
-        .await?;
-
-        // Extract successful results in order; errors are embedded in the
-        // batch result structure. For the simple Vec<O> return, we only
-        // include successful items (never-started are omitted — invariant).
-        let mut results = Vec::with_capacity(batch_result.items.len());
-        for item in batch_result.items {
-            match item.status {
-                BatchItemStatus::Succeeded => {
-                    if let Some(value) = item.result {
-                        results.push(value);
-                    }
-                }
-                BatchItemStatus::Failed => {
-                    // If the batch completed within tolerance (AllCompleted)
-                    // or ended early on a success trigger (min_successful or
-                    // a custom predicate), failed items are expected and NOT
-                    // propagated as errors. Only propagate as Err when the
-                    // batch ended because the failure tolerance was exceeded
-                    // (including the default fail-fast case).
-                    if batch_result.reason == CompletionReason::FailureToleranceExceeded {
-                        let msg = item
-                            .error_message
-                            .unwrap_or_else(|| "branch failed".to_owned());
-                        return Err(batch_error(&msg));
-                    }
-                    // Within tolerance: skip this item in the Vec<O> output.
-                }
-            }
-        }
-        // Check if the batch itself failed due to tolerance exceeded.
-        if batch_result.reason == CompletionReason::FailureToleranceExceeded {
-            return Err(batch_error("failure tolerance exceeded"));
-        }
-        Ok(results)
+        collect_successful(self.execute_batch_result().await?)
     }
 
     /// Executes the map operation and returns the full `BatchResult`.
     ///
-    /// Unlike `execute()` — which returns `Vec<O>` holding only successful
-    /// items and turns a tolerance-exceeded batch into an error — this
-    /// returns the raw `BatchResult` including per-item status, completion
-    /// reason, and error messages, without converting tolerated failures
-    /// into errors. Used by handlers that need batch metadata (e.g.,
-    /// success/failure counts for projection results).
+    /// The user closure enters the batch engine only through the
+    /// [`ItemDispatch`] object, so [`execute_batch`] — the checkpoint state
+    /// machine — compiles once per result type while every item still runs
+    /// as a concrete, unboxed future. Used directly by `await_batch` and by
+    /// [`Self::execute`], whose `Vec<O>` view is projected by
+    /// [`collect_successful`].
     pub(crate) async fn execute_batch_result(self) -> Result<BatchResult<O>, OperationError> {
         let total_items = self.items.len();
         let items = into_item_slots(self.items);
         let closure = self.closure;
         let items_ref = Arc::clone(&items);
+
+        let dispatch = MapDispatch {
+            run_item: Arc::new(move |child_ctx: DurableContext, index: usize| {
+                let items = Arc::clone(&items_ref);
+                let closure = Arc::clone(&closure);
+                async move {
+                    let item =
+                        take_item(&items, index).map_err(|e| ChildFnError::new(e.to_string()))?;
+                    (closure)(child_ctx, item, index).await.map_err(Into::into)
+                }
+            }),
+        };
 
         execute_batch(
             self.ctx,
@@ -738,15 +682,7 @@ impl<
             total_items,
             MAP_SUB_TYPE,
             MAP_ITERATION_SUB_TYPE,
-            move |child_ctx, index| {
-                let items = Arc::clone(&items_ref);
-                let closure = Arc::clone(&closure);
-                async move {
-                    let item =
-                        take_item(&items, index).map_err(|e| ChildFnError::new(e.to_string()))?;
-                    (closure)(child_ctx, item, index).await
-                }
-            },
+            &dispatch,
         )
         .await
     }
@@ -762,72 +698,45 @@ pub(crate) struct ParallelExecution<O> {
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
     pub(crate) result_serdes: Option<Arc<dyn Serdes>>,
     pub(crate) nesting: NestingMode,
-    pub(crate) branches: Vec<(String, crate::child::BoxedChildBody<O>)>,
+    pub(crate) branches: Vec<(String, crate::future::BranchBody<O>)>,
 }
 
 impl<O: Serialize + DeserializeOwned + Send + 'static> ParallelExecution<O> {
     /// Executes the parallel operation.
     pub(crate) async fn execute(self) -> Result<Vec<O>, OperationError> {
-        let batch_result = self.execute_batch_result().await?;
-
-        let mut results = Vec::with_capacity(batch_result.items.len());
-        for item in batch_result.items {
-            match item.status {
-                BatchItemStatus::Succeeded => {
-                    if let Some(value) = item.result {
-                        results.push(value);
-                    }
-                }
-                BatchItemStatus::Failed => {
-                    // Mirrors map's tolerance handling (issue #27): if the
-                    // batch completed within tolerance (AllCompleted) or
-                    // ended early on a success trigger (MinSuccessfulReached
-                    // or PredicateMatched), failed branches are expected and
-                    // NOT propagated as errors. Only propagate as Err when
-                    // the batch ended because the failure tolerance was
-                    // exceeded (including the fail-fast case).
-                    if batch_result.reason == CompletionReason::FailureToleranceExceeded {
-                        let msg = item
-                            .error_message
-                            .unwrap_or_else(|| "branch failed".to_owned());
-                        return Err(batch_error(&msg));
-                    }
-                    // Within tolerance: skip this branch in the Vec<O> output.
-                }
-            }
-        }
-        if batch_result.reason == CompletionReason::FailureToleranceExceeded {
-            return Err(batch_error("failure tolerance exceeded"));
-        }
-        Ok(results)
+        // Mirrors map's tolerance handling (issue #27) via the shared
+        // [`collect_successful`] projection: failed branches within
+        // tolerance are skipped; only a tolerance-exceeded batch errors.
+        collect_successful(self.execute_batch_result().await?)
     }
 
     /// Executes the parallel operation and returns the full `BatchResult`.
     ///
-    /// Unlike `execute()` — which returns `Vec<O>` holding only successful
-    /// branches and turns a tolerance-exceeded batch into an error — this
-    /// returns the raw `BatchResult` including per-branch status, completion
-    /// reason, and error messages, without converting tolerated failures
-    /// into errors. Used by handlers that need batch metadata (e.g.,
-    /// success/failure counts for projection results).
+    /// Branch bodies are heterogeneous, so each carries exactly one erased
+    /// future ([`crate::future::BranchBody`], built at `Branch::new`); the
+    /// batch engine and its per-item state machine are shared, non-generic
+    /// code. Used directly by `await_batch` and by [`Self::execute`], whose
+    /// `Vec<O>` view is projected by [`collect_successful`].
     pub(crate) async fn execute_batch_result(self) -> Result<BatchResult<O>, OperationError> {
         let total = self.branches.len();
         // Split each branch into its display name (threaded to the
         // coordinator as the item namer so it reaches child checkpoint
-        // updates) and its factory (kept in a take-once slot since it's
-        // FnOnce).
+        // updates) and its erased body (kept in a take-once slot since it
+        // runs at most once).
         let mut names: Vec<String> = Vec::with_capacity(total);
-        let mut slots: Vec<std::sync::Mutex<Option<crate::child::BoxedChildBody<O>>>> =
+        let mut slots: Vec<std::sync::Mutex<Option<crate::future::BranchBody<O>>>> =
             Vec::with_capacity(total);
-        for (name, factory) in self.branches {
+        for (name, body) in self.branches {
             names.push(name);
-            slots.push(std::sync::Mutex::new(Some(factory)));
+            slots.push(std::sync::Mutex::new(Some(body)));
         }
-        let branch_slots = Arc::new(slots);
         let branch_namer: Arc<dyn Fn(usize) -> String + Send + Sync> =
             Arc::new(move |index| names.get(index).cloned().unwrap_or_default());
 
-        let branch_slots_ref = Arc::clone(&branch_slots);
+        let dispatch = BranchDispatch {
+            slots: Arc::new(slots),
+        };
+
         execute_batch(
             self.ctx,
             self.op_id,
@@ -841,26 +750,46 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ParallelExecution<O> {
             total,
             PARALLEL_SUB_TYPE,
             PARALLEL_BRANCH_SUB_TYPE,
-            move |child_ctx, index| {
-                let slots = Arc::clone(&branch_slots_ref);
-                async move {
-                    let factory = {
-                        let guard = slots
-                            .get(index)
-                            .ok_or_else(|| ChildFnError::new("branch index out of bounds"))?;
-                        let mut lock = guard
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        lock.take().ok_or_else(|| {
-                            ChildFnError::new("branch already consumed (concurrent access bug)")
-                        })?
-                    };
-                    (factory)(child_ctx).await
-                }
-            },
+            &dispatch,
         )
         .await
     }
+}
+
+/// Projects a full [`BatchResult`] onto the plain `Vec<O>` success view
+/// shared by `map` and `parallel` `.await`.
+///
+/// If the batch completed within tolerance (`AllCompleted`) or ended early
+/// on a success trigger (`MinSuccessfulReached` or `PredicateMatched`),
+/// failed items are expected and NOT propagated as errors — they are simply
+/// skipped. Only a batch that ended because the failure tolerance was
+/// exceeded (including the default fail-fast case) becomes an `Err`,
+/// carrying the first failed item's message.
+fn collect_successful<O>(batch_result: BatchResult<O>) -> Result<Vec<O>, OperationError> {
+    let mut results = Vec::with_capacity(batch_result.items.len());
+    for item in batch_result.items {
+        match item.status {
+            BatchItemStatus::Succeeded => {
+                if let Some(value) = item.result {
+                    results.push(value);
+                }
+            }
+            BatchItemStatus::Failed => {
+                if batch_result.reason == CompletionReason::FailureToleranceExceeded {
+                    let msg = item
+                        .error_message
+                        .unwrap_or_else(|| "branch failed".to_owned());
+                    return Err(batch_error(&msg));
+                }
+                // Within tolerance: skip this item in the Vec<O> output.
+            }
+        }
+    }
+    // Check if the batch itself failed due to tolerance exceeded.
+    if batch_result.reason == CompletionReason::FailureToleranceExceeded {
+        return Err(batch_error("failure tolerance exceeded"));
+    }
+    Ok(results)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -905,12 +834,686 @@ enum ItemOutcome<O> {
     Suspended,
 }
 
+/// The payload a branch task delivers through the coordinator's `JoinSet`:
+/// the item index plus how the item resolved.
+type ItemJoin<O> = (usize, Result<ItemOutcome<O>, OperationError>);
+
+/// Everything one item body needs, owned and free of generic parameters.
+///
+/// A dispatcher moves one of these into each spawned task, which is what
+/// lets the whole checkpoint state machine around the user closure
+/// ([`item_before`], [`item_after`], [`execute_batch`]) compile once per
+/// result type instead of once per user call site.
+struct ItemRequest {
+    ctx: DurableContext,
+    child_op_id: OperationId,
+    index: usize,
+    is_terminal: bool,
+    start_checkpointed: bool,
+    parent_wire: String,
+    child_sub_type: String,
+    item_name: String,
+    nesting: NestingMode,
+    serdes: Option<Arc<dyn Serdes>>,
+}
+
+/// What [`item_before`] decided: the item is already resolved from the
+/// checkpoint log, or the body must run in the prepared child context.
+enum ItemPrelude<O> {
+    /// Recorded terminal outcome decoded from the checkpoint log.
+    Done(BatchItem<O>),
+    /// The body must run; the child context (with its own suspension
+    /// scope) is ready.
+    Run {
+        /// The child context the item body receives.
+        child_ctx: DurableContext,
+    },
+}
+
+/// Pre-closure half of one batch item: replay decode, child START
+/// checkpoint, child-context creation. Generic only over the result type
+/// `O` — no user closure reaches this code.
+async fn item_before<O>(req: &ItemRequest) -> Result<ItemPrelude<O>, OperationError>
+where
+    O: DeserializeOwned + Send + 'static,
+{
+    let child_positional = req.child_op_id.positional().to_owned();
+    let child_wire = req.child_op_id.wire().to_owned();
+    // Per-item serdes context: the child's wire ID is stable across replays,
+    // so a context-sensitive serdes resolves the same location every time.
+    let serdes_ctx = SerdesContext::new(child_wire.clone(), req.ctx.execution_arn());
+
+    // Replay path: child already terminal.
+    if req.is_terminal {
+        match replay_terminal_child::<O>(
+            &req.ctx,
+            &child_positional,
+            req.index,
+            &req.item_name,
+            req.serdes.as_ref(),
+            &serdes_ctx,
+        )
+        .await
+        {
+            Ok(item) => return Ok(ItemPrelude::Done(item)),
+            Err(e) => {
+                // ReplayChildren sentinel: fall through to re-execution.
+                let is_replay_children = e.to_string().contains(REPLAY_CHILDREN_SENTINEL);
+                if !is_replay_children {
+                    return Err(e);
+                }
+                // Fall through: re-execute the child to reconstruct result.
+            }
+        }
+    }
+
+    // FLAT nesting: skip child context events; run item directly under
+    // parent. Operations inside the flat branch checkpoint with ParentId
+    // pointing to the batch parent (not the virtual child).
+    if req.nesting == NestingMode::Flat {
+        let child_ctx = req
+            .ctx
+            .new_scoped_flat_child(&child_positional, &req.parent_wire);
+        return Ok(ItemPrelude::Run { child_ctx });
+    }
+
+    // Check if we need to checkpoint START for this child.
+    // Skip if the caller already checkpointed START synchronously (for
+    // concurrency safety).
+    if !req.start_checkpointed && !req.ctx.has_checkpoint_record(&child_positional) {
+        let update = build_child_update(
+            &child_wire,
+            &req.item_name,
+            &req.child_sub_type,
+            &req.parent_wire,
+            OperationAction::Start,
+        );
+        req.ctx
+            .checkpoint_updates(vec![update])
+            .await
+            .map_err(|e| batch_error(&format!("checkpoint child start: {e}")))?;
+    }
+
+    // Create child context with its OWN suspension scope so a park inside
+    // the body is caught locally as Suspended instead of tearing down the
+    // whole invocation.
+    Ok(ItemPrelude::Run {
+        child_ctx: req.ctx.new_scoped_child(&child_positional),
+    })
+}
+
+/// Post-closure half of one batch item: outcome checkpointing and
+/// [`BatchItem`] assembly. Generic only over the result type `O` — no user
+/// closure reaches this code.
+#[allow(clippy::too_many_lines)] // reason: FLAT/NORMAL outcome checkpointing reads better in one flow
+async fn item_after<O>(
+    req: &ItemRequest,
+    scope: &Arc<crate::driver::SuspensionSignal>,
+    outcome: ScopeOutcome<Result<O, ChildFnError>>,
+) -> Result<ItemOutcome<O>, OperationError>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+{
+    let child_wire = req.child_op_id.wire().to_owned();
+    let serdes_ctx = SerdesContext::new(child_wire.clone(), req.ctx.execution_arn());
+    let serdes = req.serdes.as_ref();
+
+    // FLAT nesting emits no child-context events: only the value transform
+    // (round-trip for live == replay consistency) happens here.
+    if req.nesting == NestingMode::Flat {
+        return match outcome {
+            ScopeOutcome::Suspended => Ok(ItemOutcome::Suspended),
+            ScopeOutcome::Completed(Ok(value)) => {
+                let serialized = serialize_value(&value, serdes, &serdes_ctx).await?;
+                let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx).await?;
+                Ok(ItemOutcome::Terminal(BatchItem {
+                    index: req.index,
+                    name: req.item_name.clone(),
+                    status: BatchItemStatus::Succeeded,
+                    result: Some(deserialized),
+                    error_message: None,
+                    error_type: None,
+                }))
+            }
+            ScopeOutcome::Completed(Err(child_err)) => Ok(ItemOutcome::Terminal(BatchItem {
+                index: req.index,
+                name: req.item_name.clone(),
+                status: BatchItemStatus::Failed,
+                result: None,
+                error_message: Some(child_err.to_string()),
+                error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
+            })),
+        };
+    }
+
+    match outcome {
+        ScopeOutcome::Suspended => {
+            // Branch parked: do NOT checkpoint a terminal state. The child
+            // context stays Started-not-terminal in the log; on resume it is
+            // re-entered and its now-completed durable op replays. The branch
+            // keeps its concurrency slot until it terminally completes.
+            Ok(ItemOutcome::Suspended)
+        }
+        ScopeOutcome::Completed(Ok(value)) => {
+            // Serialize and checkpoint success.
+            let serialized = serialize_value(&value, serdes, &serdes_ctx).await?;
+            let mut builder = OperationUpdate::builder()
+                .id(child_wire)
+                .r#type(OperationType::Context)
+                .sub_type(req.child_sub_type.clone())
+                .action(OperationAction::Succeed)
+                .parent_id(req.parent_wire.clone());
+
+            if serialized.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
+                builder = builder.context_options(
+                    aws_sdk_lambda::types::ContextOptions::builder()
+                        .replay_children(true)
+                        .build(),
+                );
+            } else {
+                builder = builder.payload(serialized.clone());
+            }
+
+            #[allow(clippy::expect_used)] // reason: all required fields are set above
+            let update = builder
+                .build()
+                .expect("all required OperationUpdate fields set");
+
+            req.ctx
+                .checkpoint_updates(vec![update])
+                .await
+                .map_err(|e| batch_error(&format!("checkpoint child succeed: {e}")))?;
+
+            // Round-trip deserialize for live == replay consistency.
+            let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx).await?;
+
+            Ok(ItemOutcome::Terminal(BatchItem {
+                index: req.index,
+                name: req.item_name.clone(),
+                status: BatchItemStatus::Succeeded,
+                result: Some(deserialized),
+                error_message: None,
+                error_type: None,
+            }))
+        }
+        ScopeOutcome::Completed(Err(child_err)) => {
+            // Defensive: a durable op that set its suspend flag and then
+            // returned Err (rather than parking) is a suspension, not a
+            // failure — mirror the invocation driver's precedence rule.
+            if scope.is_suspend_requested() {
+                return Ok(ItemOutcome::Suspended);
+            }
+
+            // Checkpoint failure.
+            let err_message = child_err.to_string();
+            let builder = OperationUpdate::builder()
+                .id(child_wire)
+                .r#type(OperationType::Context)
+                .sub_type(req.child_sub_type.clone())
+                .action(OperationAction::Fail)
+                .parent_id(req.parent_wire.clone())
+                .error(
+                    aws_sdk_lambda::types::ErrorObject::builder()
+                        .error_type(CHILD_FN_ERROR_TYPE)
+                        .error_message(err_message.clone())
+                        .build(),
+                );
+
+            #[allow(clippy::expect_used)] // reason: all required fields are set above
+            let update = builder
+                .build()
+                .expect("all required OperationUpdate fields set");
+
+            // Best-effort checkpoint.
+            let _ = req.ctx.checkpoint_updates(vec![update]).await;
+
+            Ok(ItemOutcome::Terminal(BatchItem {
+                index: req.index,
+                name: req.item_name.clone(),
+                status: BatchItemStatus::Failed,
+                result: None,
+                error_message: Some(err_message),
+                error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
+            }))
+        }
+    }
+}
+
+/// Thin generic wrapper around one map item — the ONLY code monomorphized
+/// per map call site. Everything before and after the user closure is the
+/// non-generic [`item_before`] / [`item_after`] pair; this wrapper just
+/// polls the user's concrete future between them under the branch driver.
+async fn run_single_item<O, F, Fut>(
+    req: ItemRequest,
+    run_item: Arc<F>,
+) -> Result<ItemOutcome<O>, OperationError>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+    F: Fn(DurableContext, usize) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, ChildFnError>> + Send + 'static,
+{
+    match item_before::<O>(&req).await? {
+        ItemPrelude::Done(item) => Ok(ItemOutcome::Terminal(item)),
+        ItemPrelude::Run { child_ctx } => {
+            // Instrument the branch body with the branch namespace's
+            // replay-aware span: a resumed branch's pre-wait log lines are
+            // suppressed while its own operations replay, independently of
+            // the root handler span and of sibling branches.
+            let scope = Arc::clone(child_ctx.suspension_signal());
+            let span = child_ctx.replay_span();
+            let index = req.index;
+            let outcome = drive_scope(
+                run_item(child_ctx, index).instrument(span),
+                Arc::clone(&scope),
+            )
+            .await;
+            item_after::<O>(&req, &scope, outcome).await
+        }
+    }
+}
+
+/// Non-generic branch runner for `parallel`: the branch body is already the
+/// single erased future carried by [`crate::future::BranchBody`], so
+/// nothing here monomorphizes per user call site.
+async fn run_branch_item<O>(
+    req: ItemRequest,
+    slots: Arc<Vec<std::sync::Mutex<Option<crate::future::BranchBody<O>>>>>,
+) -> Result<ItemOutcome<O>, OperationError>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+{
+    match item_before::<O>(&req).await? {
+        ItemPrelude::Done(item) => Ok(ItemOutcome::Terminal(item)),
+        ItemPrelude::Run { child_ctx } => {
+            let scope = Arc::clone(child_ctx.suspension_signal());
+            let span = child_ctx.replay_span();
+            let outcome = match take_branch_body(&slots, req.index) {
+                Ok(body) => {
+                    // `start` injects the child context and returns the
+                    // branch's single erased future, polled here under the
+                    // branch driver exactly like a map item's body.
+                    drive_scope(body.start(child_ctx).instrument(span), Arc::clone(&scope)).await
+                }
+                Err(err) => ScopeOutcome::Completed(Err(err)),
+            };
+            item_after::<O>(&req, &scope, outcome).await
+        }
+    }
+}
+
+/// Takes one branch body out of its take-once slot.
+fn take_branch_body<O>(
+    slots: &[std::sync::Mutex<Option<crate::future::BranchBody<O>>>],
+    index: usize,
+) -> Result<crate::future::BranchBody<O>, ChildFnError> {
+    let guard = slots
+        .get(index)
+        .ok_or_else(|| ChildFnError::new("branch index out of bounds"))?;
+    let mut lock = guard
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    lock.take()
+        .ok_or_else(|| ChildFnError::new("branch already consumed (concurrent access bug)"))
+}
+
+/// Object-safe item dispatcher: spawns one item body onto the coordinator's
+/// [`JoinSet`] as a CONCRETE (unboxed) future.
+///
+/// This boundary is what keeps [`execute_batch`] — the batch checkpoint
+/// state machine — non-generic over the user's closure: only the dispatcher
+/// and the thin wrapper it spawns ([`run_single_item`]) monomorphize per
+/// call site, while the futures inside the `JoinSet` stay unboxed.
+trait ItemDispatch<O>: Send + Sync {
+    /// Spawns the item body for `req` and returns the task's abort handle.
+    fn spawn_item(
+        &self,
+        set: &mut JoinSet<ItemJoin<O>>,
+        req: ItemRequest,
+    ) -> tokio::task::AbortHandle;
+}
+
+/// Map dispatcher: shares the user closure as `Arc<F>` and produces one
+/// concrete future per item — the `JoinSet` holds no per-item box.
+struct MapDispatch<F> {
+    run_item: Arc<F>,
+}
+
+impl<O, F, Fut> ItemDispatch<O> for MapDispatch<F>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+    F: Fn(DurableContext, usize) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, ChildFnError>> + Send + 'static,
+{
+    fn spawn_item(
+        &self,
+        set: &mut JoinSet<ItemJoin<O>>,
+        req: ItemRequest,
+    ) -> tokio::task::AbortHandle {
+        let run_item = Arc::clone(&self.run_item);
+        set.spawn(async move {
+            // Bless this task for task-ownership checks.
+            let task_ownership = req.ctx.task_ownership().clone();
+            crate::combinator::bless_current_task(&task_ownership);
+            let index = req.index;
+            (index, run_single_item(req, run_item).await)
+        })
+    }
+}
+
+/// Parallel dispatcher: hands each spawned task the shared take-once slots
+/// holding the single-erasure branch bodies. Non-generic — the erased
+/// branch body already carries the user's closure and future.
+struct BranchDispatch<O> {
+    slots: Arc<Vec<std::sync::Mutex<Option<crate::future::BranchBody<O>>>>>,
+}
+
+impl<O> ItemDispatch<O> for BranchDispatch<O>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+{
+    fn spawn_item(
+        &self,
+        set: &mut JoinSet<ItemJoin<O>>,
+        req: ItemRequest,
+    ) -> tokio::task::AbortHandle {
+        let slots = Arc::clone(&self.slots);
+        set.spawn(async move {
+            // Bless this task for task-ownership checks.
+            let task_ownership = req.ctx.task_ownership().clone();
+            crate::combinator::bless_current_task(&task_ownership);
+            let index = req.index;
+            (index, run_branch_item(req, slots).await)
+        })
+    }
+}
+
+/// Mutable coordinator bookkeeping shared by the join-drain paths.
+struct BatchProgress<O> {
+    /// Running completion statistics plus the first trigger to fire.
+    tracker: CompletionTracker,
+    /// Terminal outcomes, positional by item index.
+    results: Vec<Option<BatchItem<O>>>,
+    /// Parked branches — they RETAIN their concurrency slots.
+    suspended_count: usize,
+    /// Whether ANY branch parked this invocation.
+    any_suspended: bool,
+}
+
+impl<O> BatchProgress<O> {
+    fn new(total_items: usize) -> Self {
+        Self {
+            tracker: CompletionTracker::new(total_items),
+            results: (0..total_items).map(|_| None).collect(),
+            suspended_count: 0,
+            any_suspended: false,
+        }
+    }
+
+    /// Records one item outcome: a terminal item feeds the completion
+    /// statistics and its result slot; a suspended item keeps its slot.
+    fn settle_outcome(
+        &mut self,
+        completion_cfg: &crate::builders::map_parallel::CompletionConfig,
+        total_items: usize,
+        index: usize,
+        outcome: ItemOutcome<O>,
+    ) {
+        match outcome {
+            ItemOutcome::Terminal(item) => {
+                self.tracker
+                    .settle(completion_cfg, total_items, index, item.status);
+                if let Some(slot) = self.results.get_mut(index) {
+                    *slot = Some(item);
+                }
+            }
+            ItemOutcome::Suspended => {
+                self.suspended_count += 1;
+                self.any_suspended = true;
+            }
+        }
+    }
+}
+
+/// Borrowed coordinator context shared by the join-drain helpers, so the
+/// helpers stay non-generic functions with manageable signatures.
+struct BatchEnv<'a, O> {
+    ctx: &'a DurableContext,
+    dispatch: &'a dyn ItemDispatch<O>,
+    completion_cfg: &'a crate::builders::map_parallel::CompletionConfig,
+    total_items: usize,
+    nesting: NestingMode,
+    parent_wire: &'a str,
+    child_sub_type: &'a str,
+    serdes: Option<&'a Arc<dyn Serdes>>,
+}
+
+impl<O> BatchEnv<'_, O>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+{
+    /// Processes one joined branch task: a produced outcome feeds the
+    /// progress accounting; a `JoinError` (a panic in user branch code, or a
+    /// cancellation) is recorded as a controlled BRANCH FAILURE — mirroring
+    /// the failure a normal branch would have produced so accounting and the
+    /// completion threshold treat it identically — with a best-effort child
+    /// FAIL checkpoint so a retry does not repeat already-started work.
+    ///
+    /// The `JoinError` arm applies to LIVE branches only. A `ReplayChildren`
+    /// reconstruction task never reaches it: [`Self::resolve_terminal_inline`]
+    /// handles its own join event, because a panic while reconstructing a
+    /// recorded terminal SUCCESS must unwind the coordinator — not
+    /// checkpoint `Fail` over durable success history.
+    async fn settle_joined(
+        &self,
+        joined: Result<(tokio::task::Id, ItemJoin<O>), tokio::task::JoinError>,
+        branch_meta: &mut std::collections::HashMap<tokio::task::Id, BranchMeta>,
+        progress: &mut BatchProgress<O>,
+    ) -> Result<(), OperationError> {
+        match joined {
+            Ok((task_id, (index, outcome))) => {
+                branch_meta.remove(&task_id);
+                match outcome {
+                    Ok(outcome) => {
+                        progress.settle_outcome(
+                            self.completion_cfg,
+                            self.total_items,
+                            index,
+                            outcome,
+                        );
+                        Ok(())
+                    }
+                    // Coordinator-level failure (e.g. a checkpoint call
+                    // failed): surface; the caller's JoinSet drop aborts
+                    // remaining branches.
+                    Err(e) => Err(e),
+                }
+            }
+            Err(join_err) => {
+                // The branch task terminated without producing an outcome.
+                let Some(meta) = branch_meta.remove(&join_err.id()) else {
+                    return Err(batch_error(
+                        "branch task terminated with an unrecognized task id",
+                    ));
+                };
+                let message = match join_err.try_into_panic() {
+                    Ok(payload) => panic_message(payload.as_ref()),
+                    Err(_) => "branch task was cancelled".to_owned(),
+                };
+
+                // Best-effort child FAIL checkpoint. Skipped in FLAT mode,
+                // which emits no child-context events (mirrors the normal
+                // fail path).
+                if self.nesting != NestingMode::Flat {
+                    let update = OperationUpdate::builder()
+                        .id(meta.child_wire.clone())
+                        .r#type(OperationType::Context)
+                        .sub_type(self.child_sub_type.to_owned())
+                        .action(OperationAction::Fail)
+                        .parent_id(self.parent_wire.to_owned())
+                        .error(
+                            aws_sdk_lambda::types::ErrorObject::builder()
+                                .error_type(CHILD_FN_ERROR_TYPE)
+                                .error_message(message.clone())
+                                .build(),
+                        );
+                    if let Ok(update) = update.build() {
+                        let _ = self.ctx.checkpoint_updates(vec![update]).await;
+                    }
+                }
+
+                progress.settle_outcome(
+                    self.completion_cfg,
+                    self.total_items,
+                    meta.index,
+                    ItemOutcome::Terminal(BatchItem {
+                        index: meta.index,
+                        name: meta.item_name,
+                        status: BatchItemStatus::Failed,
+                        result: None,
+                        error_message: Some(message),
+                        error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
+                    }),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolves a recorded-terminal child inline on the coordinator, in
+    /// input order. The common case decodes the recorded outcome without
+    /// touching the item body; a `ReplayChildren` child (result too large to
+    /// checkpoint) is re-executed through the dispatcher and drained
+    /// immediately, so input order is preserved and the `JoinSet` still
+    /// holds only concrete futures.
+    ///
+    /// A panic during that re-execution is rethrown (unwinding the
+    /// coordinator) rather than graded as a branch failure: the child's
+    /// durable record is a terminal SUCCESS, and checkpointing `Fail` over
+    /// it would permanently fail the batch over a transient reconstruction
+    /// crash. See the `JoinError` arm below.
+    async fn resolve_terminal_inline(
+        &self,
+        op_id: &OperationId,
+        index: usize,
+        item_name: &str,
+        join_set: &mut JoinSet<ItemJoin<O>>,
+        branch_meta: &mut std::collections::HashMap<tokio::task::Id, BranchMeta>,
+        progress: &mut BatchProgress<O>,
+    ) -> Result<(), OperationError> {
+        let child_positional = op_id.positional().to_owned();
+        let serdes_ctx = SerdesContext::new(op_id.wire().to_owned(), self.ctx.execution_arn());
+        match replay_terminal_child::<O>(
+            self.ctx,
+            &child_positional,
+            index,
+            item_name,
+            self.serdes,
+            &serdes_ctx,
+        )
+        .await
+        {
+            Ok(item) => {
+                progress.settle_outcome(
+                    self.completion_cfg,
+                    self.total_items,
+                    index,
+                    ItemOutcome::Terminal(item),
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let is_replay_children = e.to_string().contains(REPLAY_CHILDREN_SENTINEL);
+                if !is_replay_children {
+                    return Err(e);
+                }
+                // ReplayChildren: re-execute the body to reconstruct the
+                // oversized result. The join set is quiescent at every
+                // inline call site (the replay pass runs before live
+                // dispatch; the sequential cursor has nothing in flight), so
+                // the immediate drain below joins exactly this item.
+                let req = ItemRequest {
+                    ctx: self.ctx.clone(),
+                    child_op_id: op_id.clone(),
+                    index,
+                    is_terminal: true,
+                    start_checkpointed: false,
+                    parent_wire: self.parent_wire.to_owned(),
+                    child_sub_type: self.child_sub_type.to_owned(),
+                    item_name: item_name.to_owned(),
+                    nesting: self.nesting,
+                    serdes: self.serdes.cloned(),
+                };
+                let abort = self.dispatch.spawn_item(join_set, req);
+                let reconstruction_id = abort.id();
+                branch_meta.insert(
+                    reconstruction_id,
+                    BranchMeta {
+                        index,
+                        child_wire: op_id.wire().to_owned(),
+                        item_name: item_name.to_owned(),
+                    },
+                );
+                let Some(joined) = join_set.join_next_with_id().await else {
+                    return Err(batch_error(
+                        "re-executed replay child produced no join event",
+                    ));
+                };
+                // Verify (rather than assume) the quiescence invariant: the
+                // join event must belong to the reconstruction task spawned
+                // above, because the JoinError arm below applies
+                // reconstruction-specific panic semantics.
+                let joined_id = match &joined {
+                    Ok((task_id, _)) => *task_id,
+                    Err(join_err) => join_err.id(),
+                };
+                if joined_id != reconstruction_id {
+                    return Err(batch_error(
+                        "re-executed replay child joined an unexpected task",
+                    ));
+                }
+                match joined {
+                    Ok(ok) => self.settle_joined(Ok(ok), branch_meta, progress).await,
+                    Err(join_err) => {
+                        branch_meta.remove(&join_err.id());
+                        // This child's durable record is a terminal SUCCESS
+                        // (`replay_children = true`); the task that ended
+                        // without an outcome was merely RECONSTRUCTING that
+                        // recorded result. Grading this as a branch failure
+                        // (as `settle_joined` does for live branches) would
+                        // checkpoint `Fail` over recorded success history
+                        // and permanently fail the batch because of a
+                        // transient reconstruction crash. Mirror the
+                        // pre-JoinSet inline await instead: rethrow the
+                        // panic payload so the coordinator unwinds with the
+                        // original panic, no failure is checkpointed, and
+                        // the recorded terminal state stays untouched for
+                        // the next attempt to reconstruct.
+                        match join_err.try_into_panic() {
+                            Ok(payload) => std::panic::resume_unwind(payload),
+                            // A cancelled task carries no payload to
+                            // rethrow: surface a coordinator error, still
+                            // without checkpointing failure.
+                            Err(join_err) => Err(batch_error(&format!(
+                                "replay child reconstruction task was cancelled: {join_err}"
+                            ))),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Core batch execution: schedule items with bounded concurrency and
 /// completion checking.
+///
+/// Non-generic over the user closure: item bodies enter only through the
+/// [`ItemDispatch`] object, so this coordinator — the batch's checkpoint
+/// state machine — monomorphizes once per result type `O`.
 #[allow(clippy::too_many_lines)]
 // reason: batch coordination has distinct phases (claim, schedule, collect, checkpoint) that read better as one flow
 #[allow(clippy::too_many_arguments)] // reason: batch execution requires all these parameters
-async fn execute_batch<O, F, Fut>(
+async fn execute_batch<O>(
     ctx: DurableContext,
     parent_op_id: OperationId,
     parent_name: Option<String>,
@@ -923,12 +1526,10 @@ async fn execute_batch<O, F, Fut>(
     total_items: usize,
     parent_sub_type: &str,
     child_sub_type: &str,
-    run_item: F,
+    dispatch: &dyn ItemDispatch<O>,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Serialize + DeserializeOwned + Send + 'static,
-    F: Fn(DurableContext, usize) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<O, ChildFnError>> + Send + 'static,
 {
     // 1. Task-ownership check.
     ctx.enforce_task_ownership()?;
@@ -1104,7 +1705,6 @@ where
 
     // 7. Execute items with bounded concurrency, branch-local suspension, and
     // slot-holding accounting.
-    let run_item = Arc::new(run_item);
 
     // 7a. For concurrent mode: checkpoint ALL child STARTs synchronously
     // BEFORE dispatching any tasks. This prevents token rotation races
@@ -1139,9 +1739,9 @@ where
     // completion frees one — the slot-holding invariant), so
     // `suspended_count` counts against the cap and new branches only start
     // when capacity remains after terminal completions. Each branch runs
-    // through `execute_single_item`, which drives the branch body under its
-    // own scope so a park resolves to `ItemOutcome::Suspended` locally rather
-    // than tearing down the whole invocation.
+    // through the dispatcher's thin wrapper, which drives the branch body
+    // under its own scope so a park resolves to `ItemOutcome::Suspended`
+    // locally rather than tearing down the whole invocation.
     let child_sub_type_owned = child_sub_type.to_owned();
     // Coordinator-owned, observable task set. Dropping the `JoinSet` (on error
     // return OR when the driver drops this coordinator on invocation teardown)
@@ -1152,31 +1752,36 @@ where
     // user branch code, or a cancellation), so the coordinator accounts for
     // every terminated task rather than waiting forever for a value a panicked
     // task will never deliver.
-    let mut join_set: JoinSet<(usize, Result<ItemOutcome<O>, OperationError>)> = JoinSet::new();
+    let mut join_set: JoinSet<ItemJoin<O>> = JoinSet::new();
     // Maps a branch task's id to the metadata needed to record a controlled
     // failure if that task ends via a `JoinError`. Removed on both the value
     // and the error arm, so it never outgrows the in-flight set.
     let mut branch_meta: std::collections::HashMap<tokio::task::Id, BranchMeta> =
         std::collections::HashMap::with_capacity(total_items);
 
-    let mut results: Vec<Option<BatchItem<O>>> = (0..total_items).map(|_| None).collect();
-    let mut suspended_count: usize = 0;
+    let mut progress = BatchProgress::<O>::new(total_items);
     let mut running: usize = 0;
     let mut next_index: usize = 0;
-    // Running completion statistics plus the first trigger to fire (first
-    // trigger wins). A fired trigger halts new dispatch; already-running
-    // branches are still drained.
-    let mut tracker = CompletionTracker::new(total_items);
-    let mut any_suspended = false;
+
+    let env = BatchEnv {
+        ctx: &ctx,
+        dispatch,
+        completion_cfg: &completion_cfg,
+        total_items,
+        nesting,
+        parent_wire: &parent_wire,
+        child_sub_type: &child_sub_type_owned,
+        serdes: serdes.as_ref(),
+    };
 
     // 7b. Replay pass (concurrent mode): resolve every recorded-terminal
     // child inline on the coordinator, in input order, BEFORE dispatching
-    // any live work — never through the `JoinSet`. This is what keeps
-    // completion triggers deterministic under replay: outcomes already in
-    // the checkpoint log feed the statistics in canonical input order
-    // before any live settlement joins, so identical recorded state yields
-    // identical trigger decisions no matter how the scheduler orders the
-    // join events of resumed live branches. Recorded terminals are
+    // any live work — never through the live `JoinSet` schedule. This is
+    // what keeps completion triggers deterministic under replay: outcomes
+    // already in the checkpoint log feed the statistics in canonical input
+    // order before any live settlement joins, so identical recorded state
+    // yields identical trigger decisions no matter how the scheduler orders
+    // the join events of resumed live branches. Recorded terminals are
     // completed history — real work whose outcome the service persisted —
     // so they are applied unconditionally: a trigger firing mid-pass halts
     // future live dispatch but never drops an already-recorded outcome
@@ -1196,37 +1801,15 @@ where
             let item_name = item_namer
                 .as_ref()
                 .map_or_else(String::new, |namer| namer(i));
-            let outcome = execute_single_item(
-                &ctx,
+            env.resolve_terminal_inline(
                 &pre.op_id,
                 i,
-                true,
-                false,
-                &parent_wire,
-                child_sub_type,
                 &item_name,
-                nesting,
-                &*run_item,
-                serdes.as_ref(),
+                &mut join_set,
+                &mut branch_meta,
+                &mut progress,
             )
             .await?;
-            match outcome {
-                ItemOutcome::Terminal(item) => {
-                    tracker.settle(&completion_cfg, total_items, i, item.status);
-                    if let Some(slot) = results.get_mut(i) {
-                        *slot = Some(item);
-                    }
-                }
-                ItemOutcome::Suspended => {
-                    // Defensive: a recorded-terminal child re-executing in
-                    // ReplayChildren mode replays recorded operations and
-                    // should not park; if it does, treat it like any
-                    // suspended branch (it keeps a slot and the batch
-                    // suspends unless a trigger fires).
-                    suspended_count += 1;
-                    any_suspended = true;
-                }
-            }
         }
     }
 
@@ -1235,9 +1818,9 @@ where
         // A completion trigger (`tracker.stop_reason`) halts new dispatch;
         // already-running branches are still drained below (in-flight
         // branches always complete).
-        while tracker.stop_reason.is_none()
+        while progress.tracker.stop_reason.is_none()
             && next_index < total_items
-            && running + suspended_count < concurrency
+            && running + progress.suspended_count < concurrency
         {
             let i = next_index;
             next_index += 1;
@@ -1286,58 +1869,28 @@ where
             // Recorded-terminal child (sequential path only — the
             // concurrent path applied its recorded terminals in the replay
             // pass above): resolve it inline on the coordinator, at the
-            // dispatch cursor, in input order — never through the
-            // `JoinSet`. With one item in flight at a time, settlement
-            // order and input order coincide, so completion triggers see
-            // the same canonical sequence here as everywhere else.
+            // dispatch cursor, in input order. With one item in flight at a
+            // time, settlement order and input order coincide, so
+            // completion triggers see the same canonical sequence here as
+            // everywhere else.
             if pc.is_terminal {
                 let item_name = item_namer
                     .as_ref()
                     .map_or_else(String::new, |namer| namer(pc.index));
-                let outcome = execute_single_item(
-                    &ctx,
+                env.resolve_terminal_inline(
                     &pc.op_id,
                     pc.index,
-                    true,
-                    false,
-                    &parent_wire,
-                    child_sub_type,
                     &item_name,
-                    nesting,
-                    &*run_item,
-                    serdes.as_ref(),
+                    &mut join_set,
+                    &mut branch_meta,
+                    &mut progress,
                 )
                 .await?;
-                match outcome {
-                    ItemOutcome::Terminal(item) => {
-                        tracker.settle(&completion_cfg, total_items, pc.index, item.status);
-                        if let Some(slot) = results.get_mut(pc.index) {
-                            *slot = Some(item);
-                        }
-                    }
-                    ItemOutcome::Suspended => {
-                        // Defensive: a recorded-terminal child re-executing
-                        // in ReplayChildren mode replays recorded operations
-                        // and should not park; if it does, treat it like any
-                        // suspended branch (it keeps a slot and the batch
-                        // suspends unless a trigger fires).
-                        suspended_count += 1;
-                        any_suspended = true;
-                    }
-                }
                 continue;
             }
 
             let start_checkpointed =
                 concurrency > 1 && !pc.is_terminal && nesting != NestingMode::Flat;
-
-            let ctx_task = ctx.clone();
-            let parent_wire_task = parent_wire.clone();
-            let child_sub_type_task = child_sub_type_owned.clone();
-            let run_item_task = Arc::clone(&run_item);
-            let serdes_task = serdes.clone();
-            let item_nesting = nesting;
-            let task_ownership = ctx.task_ownership().clone();
 
             // Compute the item name in the coordinator so it is available both
             // for the branch body and for a controlled-failure checkpoint if
@@ -1345,31 +1898,22 @@ where
             let item_name = item_namer
                 .as_ref()
                 .map_or_else(String::new, |namer| namer(pc.index));
-            let item_name_task = item_name.clone();
             let branch_index = pc.index;
             let branch_wire = pc.op_id.wire().to_owned();
 
-            let abort = join_set.spawn(async move {
-                // Bless this task for task-ownership checks.
-                crate::combinator::bless_current_task(&task_ownership);
-
-                let outcome = execute_single_item(
-                    &ctx_task,
-                    &pc.op_id,
-                    pc.index,
-                    pc.is_terminal,
-                    start_checkpointed,
-                    &parent_wire_task,
-                    &child_sub_type_task,
-                    &item_name_task,
-                    item_nesting,
-                    &*run_item_task,
-                    serdes_task.as_ref(),
-                )
-                .await;
-
-                (pc.index, outcome)
-            });
+            let req = ItemRequest {
+                ctx: ctx.clone(),
+                child_op_id: pc.op_id,
+                index: branch_index,
+                is_terminal: pc.is_terminal,
+                start_checkpointed,
+                parent_wire: parent_wire.clone(),
+                child_sub_type: child_sub_type_owned.clone(),
+                item_name: item_name.clone(),
+                nesting,
+                serdes: serdes.clone(),
+            };
+            let abort = dispatch.spawn_item(&mut join_set, req);
             branch_meta.insert(
                 abort.id(),
                 BranchMeta {
@@ -1396,88 +1940,16 @@ where
             break; // set is empty — unreachable while running > 0
         };
         running -= 1;
-
-        match joined {
-            Ok((task_id, (index, outcome))) => {
-                branch_meta.remove(&task_id);
-                match outcome {
-                    Ok(ItemOutcome::Terminal(item)) => {
-                        tracker.settle(&completion_cfg, total_items, index, item.status);
-                        if let Some(slot) = results.get_mut(index) {
-                            *slot = Some(item);
-                        }
-                    }
-                    Ok(ItemOutcome::Suspended) => {
-                        // Branch parked: keep its slot (suspended_count counts
-                        // against `concurrency`), let siblings continue.
-                        suspended_count += 1;
-                        any_suspended = true;
-                    }
-                    Err(e) => {
-                        // Coordinator-level failure (e.g. a checkpoint call
-                        // failed): abort remaining branches (JoinSet drops on
-                        // return) and surface.
-                        return Err(e);
-                    }
-                }
-            }
-            Err(join_err) => {
-                // The branch task terminated without producing an outcome.
-                // Record a controlled BRANCH FAILURE: mirror the failure a
-                // normal branch would have produced so accounting and the
-                // completion threshold treat it identically, and checkpoint the
-                // child FAIL so a retry does not repeat already-started work.
-                // A panicking branch surfaces as a failed batch item rather
-                // than failing or hanging the whole batch.
-                let Some(meta) = branch_meta.remove(&join_err.id()) else {
-                    return Err(batch_error(
-                        "branch task terminated with an unrecognized task id",
-                    ));
-                };
-                let message = match join_err.try_into_panic() {
-                    Ok(payload) => panic_message(payload.as_ref()),
-                    Err(_) => "branch task was cancelled".to_owned(),
-                };
-
-                // Best-effort child FAIL checkpoint. Skipped in FLAT mode, which
-                // emits no child-context events (mirrors the normal fail path).
-                if nesting != NestingMode::Flat {
-                    let update = OperationUpdate::builder()
-                        .id(meta.child_wire.clone())
-                        .r#type(OperationType::Context)
-                        .sub_type(child_sub_type_owned.clone())
-                        .action(OperationAction::Fail)
-                        .parent_id(parent_wire.clone())
-                        .error(
-                            aws_sdk_lambda::types::ErrorObject::builder()
-                                .error_type(CHILD_FN_ERROR_TYPE)
-                                .error_message(message.clone())
-                                .build(),
-                        );
-                    if let Ok(update) = update.build() {
-                        let _ = ctx.checkpoint_updates(vec![update]).await;
-                    }
-                }
-
-                tracker.settle(
-                    &completion_cfg,
-                    total_items,
-                    meta.index,
-                    BatchItemStatus::Failed,
-                );
-                if let Some(slot) = results.get_mut(meta.index) {
-                    *slot = Some(BatchItem {
-                        index: meta.index,
-                        name: meta.item_name,
-                        status: BatchItemStatus::Failed,
-                        result: None,
-                        error_message: Some(message),
-                        error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
-                    });
-                }
-            }
-        }
+        env.settle_joined(joined, &mut branch_meta, &mut progress)
+            .await?;
     }
+
+    let BatchProgress {
+        tracker,
+        results,
+        any_suspended,
+        ..
+    } = progress;
 
     // Quiescent. If a branch is parked and no completion trigger fired, the
     // batch cannot finish this invocation: suspend the coordinator's OWN
@@ -1560,224 +2032,6 @@ where
     .await?;
 
     Ok(batch_result)
-}
-
-/// Executes a single item (child context) within the batch.
-///
-/// Returns [`ItemOutcome::Suspended`] if the item's own scope parked on a
-/// durable operation (the branch keeps its slot; the coordinator lets
-/// siblings keep running). Returns [`ItemOutcome::Terminal`] on success or
-/// failure. `Err` is reserved for coordinator-level failures (e.g. a
-/// checkpoint call failing).
-#[allow(clippy::too_many_arguments)] // reason: single-item execution needs full context
-#[allow(clippy::too_many_lines)] // reason: FLAT/NORMAL branches + replay/live paths read better in one flow
-async fn execute_single_item<O, F, Fut>(
-    ctx: &DurableContext,
-    child_op_id: &OperationId,
-    index: usize,
-    is_terminal: bool,
-    start_checkpointed: bool,
-    parent_wire: &str,
-    child_sub_type: &str,
-    item_name: &str,
-    nesting: NestingMode,
-    run_item: &F,
-    serdes: Option<&Arc<dyn Serdes>>,
-) -> Result<ItemOutcome<O>, OperationError>
-where
-    O: Serialize + DeserializeOwned + Send + 'static,
-    F: Fn(DurableContext, usize) -> Fut + Send + Sync,
-    Fut: Future<Output = Result<O, ChildFnError>> + Send,
-{
-    let child_positional = child_op_id.positional().to_owned();
-    let child_wire = child_op_id.wire().to_owned();
-    // Per-item serdes context: the child's wire ID is stable across replays,
-    // so a context-sensitive serdes resolves the same location every time.
-    let serdes_ctx = SerdesContext::new(child_wire.clone(), ctx.execution_arn());
-
-    // Replay path: child already terminal.
-    if is_terminal {
-        match replay_terminal_child::<O>(
-            ctx,
-            &child_positional,
-            index,
-            item_name,
-            serdes,
-            &serdes_ctx,
-        )
-        .await
-        {
-            Ok(item) => return Ok(ItemOutcome::Terminal(item)),
-            Err(e) => {
-                // ReplayChildren sentinel: fall through to re-execution.
-                let is_replay_children = e.to_string().contains(REPLAY_CHILDREN_SENTINEL);
-                if !is_replay_children {
-                    return Err(e);
-                }
-                // Fall through: re-execute the child to reconstruct result.
-            }
-        }
-    }
-
-    // FLAT nesting: skip child context events; run item directly under parent.
-    // Operations inside the flat branch checkpoint with ParentId pointing to
-    // the batch parent (not the virtual child).
-    if nesting == NestingMode::Flat {
-        let child_ctx = ctx.new_scoped_flat_child(&child_positional, parent_wire);
-        let scope = Arc::clone(child_ctx.suspension_signal());
-        // Instrument the branch body with the branch namespace's
-        // replay-aware span: a resumed branch's pre-wait log lines are
-        // suppressed while its own operations replay, independently of the
-        // root handler span and of sibling branches.
-        let branch_span = child_ctx.replay_span();
-        let outcome = drive_scope(run_item(child_ctx, index).instrument(branch_span), scope).await;
-        return match outcome {
-            ScopeOutcome::Suspended => Ok(ItemOutcome::Suspended),
-            ScopeOutcome::Completed(Ok(value)) => {
-                let serialized = serialize_value(&value, serdes, &serdes_ctx).await?;
-                let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx).await?;
-                Ok(ItemOutcome::Terminal(BatchItem {
-                    index,
-                    name: item_name.to_owned(),
-                    status: BatchItemStatus::Succeeded,
-                    result: Some(deserialized),
-                    error_message: None,
-                    error_type: None,
-                }))
-            }
-            ScopeOutcome::Completed(Err(child_err)) => Ok(ItemOutcome::Terminal(BatchItem {
-                index,
-                name: item_name.to_owned(),
-                status: BatchItemStatus::Failed,
-                result: None,
-                error_message: Some(child_err.to_string()),
-                error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
-            })),
-        };
-    }
-
-    // Check if we need to checkpoint START for this child.
-    // Skip if the caller already checkpointed START synchronously (for
-    // concurrency safety).
-    if !start_checkpointed && !ctx.has_checkpoint_record(&child_positional) {
-        let update = build_child_update(
-            &child_wire,
-            item_name,
-            child_sub_type,
-            parent_wire,
-            OperationAction::Start,
-        );
-        ctx.checkpoint_updates(vec![update])
-            .await
-            .map_err(|e| batch_error(&format!("checkpoint child start: {e}")))?;
-    }
-
-    // Create child context (with its OWN suspension scope) and run the item
-    // through the branch driver so a park is caught locally as Suspended
-    // instead of tearing down the whole invocation. The branch body is
-    // instrumented with the branch namespace's replay-aware span so a
-    // resumed branch's pre-wait log lines are suppressed while its own
-    // operations replay, independently of the root handler span and of
-    // sibling branches.
-    let child_ctx = ctx.new_scoped_child(&child_positional);
-    let scope = Arc::clone(child_ctx.suspension_signal());
-    let branch_span = child_ctx.replay_span();
-    let outcome = drive_scope(
-        run_item(child_ctx, index).instrument(branch_span),
-        Arc::clone(&scope),
-    )
-    .await;
-
-    match outcome {
-        ScopeOutcome::Suspended => {
-            // Branch parked: do NOT checkpoint a terminal state. The child
-            // context stays Started-not-terminal in the log; on resume it is
-            // re-entered and its now-completed durable op replays. The branch
-            // keeps its concurrency slot until it terminally completes.
-            Ok(ItemOutcome::Suspended)
-        }
-        ScopeOutcome::Completed(Ok(value)) => {
-            // Serialize and checkpoint success.
-            let serialized = serialize_value(&value, serdes, &serdes_ctx).await?;
-            let mut builder = OperationUpdate::builder()
-                .id(child_wire)
-                .r#type(OperationType::Context)
-                .sub_type(child_sub_type.to_owned())
-                .action(OperationAction::Succeed)
-                .parent_id(parent_wire.to_owned());
-
-            if serialized.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
-                builder = builder.context_options(
-                    aws_sdk_lambda::types::ContextOptions::builder()
-                        .replay_children(true)
-                        .build(),
-                );
-            } else {
-                builder = builder.payload(serialized.clone());
-            }
-
-            #[allow(clippy::expect_used)] // reason: all required fields are set above
-            let update = builder
-                .build()
-                .expect("all required OperationUpdate fields set");
-
-            ctx.checkpoint_updates(vec![update])
-                .await
-                .map_err(|e| batch_error(&format!("checkpoint child succeed: {e}")))?;
-
-            // Round-trip deserialize for live == replay consistency.
-            let deserialized: O = deserialize_value(&serialized, serdes, &serdes_ctx).await?;
-
-            Ok(ItemOutcome::Terminal(BatchItem {
-                index,
-                name: item_name.to_owned(),
-                status: BatchItemStatus::Succeeded,
-                result: Some(deserialized),
-                error_message: None,
-                error_type: None,
-            }))
-        }
-        ScopeOutcome::Completed(Err(child_err)) => {
-            // Defensive: a durable op that set its suspend flag and then
-            // returned Err (rather than parking) is a suspension, not a
-            // failure — mirror the invocation driver's precedence rule.
-            if scope.is_suspend_requested() {
-                return Ok(ItemOutcome::Suspended);
-            }
-
-            // Checkpoint failure.
-            let err_message = child_err.to_string();
-            let builder = OperationUpdate::builder()
-                .id(child_wire)
-                .r#type(OperationType::Context)
-                .sub_type(child_sub_type.to_owned())
-                .action(OperationAction::Fail)
-                .parent_id(parent_wire.to_owned())
-                .error(
-                    aws_sdk_lambda::types::ErrorObject::builder()
-                        .error_type(CHILD_FN_ERROR_TYPE)
-                        .error_message(err_message.clone())
-                        .build(),
-                );
-
-            #[allow(clippy::expect_used)] // reason: all required fields are set above
-            let update = builder
-                .build()
-                .expect("all required OperationUpdate fields set");
-
-            // Best-effort checkpoint.
-            let _ = ctx.checkpoint_updates(vec![update]).await;
-
-            Ok(ItemOutcome::Terminal(BatchItem {
-                index,
-                name: item_name.to_owned(),
-                status: BatchItemStatus::Failed,
-                result: None,
-                error_message: Some(err_message),
-                error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
-            }))
-        }
-    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2451,6 +2705,7 @@ mod tests {
     use super::*;
     use crate::context::DurableContext;
     use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
@@ -2604,6 +2859,32 @@ mod tests {
                 invoke_error_type: None,
                 invoke_error_message: None,
                 replay_children: false,
+                callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
+            },
+        )
+    }
+
+    /// A child recorded as terminal SUCCESS whose result was too large to
+    /// checkpoint inline: `replay_children = true`, no payload. Replaying it
+    /// requires re-executing the child body to reconstruct the result.
+    fn replay_children_success_record(positional_id: &str) -> (String, CheckpointRecord) {
+        let wire_id = crate::engine::compute_wire_id_public(positional_id);
+        (
+            wire_id.clone(),
+            CheckpointRecord {
+                id: wire_id,
+                status: CheckpointStatus::Succeeded,
+                result: None,
+                error_type: None,
+                error_message: None,
+                attempt: 0,
+                invoke_result: None,
+                invoke_error_type: None,
+                invoke_error_message: None,
+                replay_children: true,
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
@@ -4326,6 +4607,132 @@ mod tests {
         assert!(
             err.to_string().contains("boom in parallel branch"),
             "batch failure should carry the branch panic message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::panic)] // reason: the reconstruction panic under test is the behavior being asserted
+    async fn map_replay_children_reconstruction_panic_unwinds_without_fail_checkpoint() {
+        // A child recorded as terminal SUCCESS with `replay_children = true`
+        // is re-executed on replay to reconstruct its oversized result. If
+        // that reconstruction panics, the panic must unwind the coordinator
+        // with the original payload — preserving the recorded success
+        // history for the next attempt — NOT be graded as a branch failure
+        // with a child FAIL checkpoint, which would overwrite durable
+        // success and permanently fail the batch over a transient crash.
+        let log = CheckpointLog::from_records(vec![replay_children_success_record("2")]);
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let task_client = Arc::clone(&client);
+
+        // The context is created INSIDE the spawned task so the task owns
+        // it: the unwind of that task is the observable coordinator unwind.
+        let handle = tokio::spawn(async move {
+            let ctx = DurableContext::new_root_with_client(
+                "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(log),
+                task_client as Arc<dyn crate::client::ExecutionClient>,
+                "token0".to_owned(),
+            );
+            let result: Result<Vec<i32>, OperationError> = ctx
+                .map(vec![1_i32], |_child, _item: i32, _idx| async move {
+                    panic!("boom in map reconstruction")
+                })
+                .await;
+            result
+        });
+
+        let join_err = handle
+            .await
+            .expect_err("a reconstruction panic must unwind the coordinator, not settle");
+        assert!(
+            join_err.is_panic(),
+            "the coordinator must rethrow the original panic payload"
+        );
+        let payload = join_err.into_panic();
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned());
+        assert_eq!(
+            message.as_deref(),
+            Some("boom in map reconstruction"),
+            "the rethrown payload must be the reconstruction panic's own"
+        );
+
+        // The recorded terminal success stays authoritative: nothing may be
+        // checkpointed as FAILED on this path.
+        assert!(
+            client
+                .recorded_updates()
+                .iter()
+                .all(|u| !matches!(u.action(), OperationAction::Fail)),
+            "a reconstruction panic must not checkpoint any failure"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::panic)] // reason: the reconstruction panic under test is the behavior being asserted
+    async fn parallel_replay_children_reconstruction_panic_unwinds_without_fail_checkpoint() {
+        use crate::future::Branch;
+
+        // Same guarantee for parallel, through the concurrent replay pass:
+        // branch 0 replays from a normal recorded success; branch 1 is
+        // recorded ReplayChildren and its reconstruction panics. The panic
+        // must unwind the coordinator without checkpointing failure.
+        let log = CheckpointLog::from_records(vec![
+            succeeded_record("2", "7"),
+            replay_children_success_record("3"),
+        ]);
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let task_client = Arc::clone(&client);
+
+        // The context is created INSIDE the spawned task so the task owns
+        // it: the unwind of that task is the observable coordinator unwind.
+        let handle = tokio::spawn(async move {
+            let ctx = DurableContext::new_root_with_client(
+                "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(log),
+                task_client as Arc<dyn crate::client::ExecutionClient>,
+                "token0".to_owned(),
+            );
+            let result: Result<Vec<i32>, OperationError> = ctx
+                .parallel(vec![
+                    // Replayed from the record; never re-executed.
+                    Branch::new("steady", |_ctx| async move { Ok(999_i32) }),
+                    Branch::new("boom", |_ctx| async move {
+                        panic!("boom in parallel reconstruction")
+                    }),
+                ])
+                .await;
+            result
+        });
+
+        let join_err = handle
+            .await
+            .expect_err("a reconstruction panic must unwind the coordinator, not settle");
+        assert!(
+            join_err.is_panic(),
+            "the coordinator must rethrow the original panic payload"
+        );
+        let payload = join_err.into_panic();
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned());
+        assert_eq!(
+            message.as_deref(),
+            Some("boom in parallel reconstruction"),
+            "the rethrown payload must be the reconstruction panic's own"
+        );
+
+        assert!(
+            client
+                .recorded_updates()
+                .iter()
+                .all(|u| !matches!(u.action(), OperationAction::Fail)),
+            "a reconstruction panic must not checkpoint any failure"
         );
     }
 

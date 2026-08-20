@@ -1,7 +1,7 @@
 //! The step operation: [`StepBuilder`], returned by
 //! [`DurableContext::step`](crate::DurableContext::step).
 
-use std::future::IntoFuture;
+use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -11,6 +11,7 @@ use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
+use crate::{BoxError, context::StepContext};
 
 // ============================================================
 // StepBuilder
@@ -20,6 +21,12 @@ use crate::future::DurableFuture;
 ///
 /// Created by [`DurableContext::step`]. Chain optional configuration
 /// methods, then `.await` or `.spawn()`.
+///
+/// The builder is generic over the step closure `F` and its future `Fut`
+/// so the body is stored **without type erasure**; both parameters are
+/// inferred at the call site and never written by users. The single
+/// erasure point is `.future()` / `.await`, which produces the one
+/// [`DurableFuture`] box.
 ///
 /// # Examples
 ///
@@ -46,18 +53,18 @@ use crate::future::DurableFuture;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
-pub struct StepBuilder<O> {
+pub struct StepBuilder<O, F, Fut> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     retry_strategy: Option<RetryStrategy>,
     serdes: Option<Arc<dyn Serdes>>,
     semantics: crate::step::StepSemantics,
-    closure: crate::step::BoxedStepBody<O>,
-    _marker: PhantomData<O>,
+    closure: F,
+    _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
-impl<O> std::fmt::Debug for StepBuilder<O> {
+impl<O, F, Fut> std::fmt::Debug for StepBuilder<O, F, Fut> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StepBuilder")
             .field("name", &self.name)
@@ -65,14 +72,15 @@ impl<O> std::fmt::Debug for StepBuilder<O> {
     }
 }
 
-impl<O: Send + 'static> StepBuilder<O> {
+impl<O, F, Fut> StepBuilder<O, F, Fut>
+where
+    O: Send + 'static,
+    F: FnOnce(StepContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+{
     /// Creates a new step builder (internal). Taking the closure here keeps
     /// the field non-optional: a builder without a body is unrepresentable.
-    pub(crate) fn new(
-        ctx: DurableContext,
-        op_id: OperationId,
-        closure: crate::step::BoxedStepBody<O>,
-    ) -> Self {
+    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, closure: F) -> Self {
         Self {
             ctx,
             op_id,
@@ -122,9 +130,9 @@ impl<O: Send + 'static> StepBuilder<O> {
     ///     Ok(result)
     /// }
     /// ```
-    pub fn retry_strategy<F>(mut self, strategy: F) -> Self
+    pub fn retry_strategy<R>(mut self, strategy: R) -> Self
     where
-        F: Fn(&crate::StepError, u32) -> crate::RetryDecision + Send + Sync + 'static,
+        R: Fn(&crate::StepError, u32) -> crate::RetryDecision + Send + Sync + 'static,
     {
         self.retry_strategy = Some(Box::new(strategy));
         self
@@ -208,7 +216,12 @@ impl<O: Send + 'static> StepBuilder<O> {
     }
 }
 
-impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> StepBuilder<O> {
+impl<O, F, Fut> StepBuilder<O, F, Fut>
+where
+    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(StepContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+{
     /// Converts this builder into a [`DurableFuture`] explicitly.
     pub fn future(self) -> DurableFuture<O> {
         <Self as IntoFuture>::into_future(self)
@@ -239,8 +252,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> StepBui
     }
 }
 
-impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFuture
-    for StepBuilder<O>
+impl<O, F, Fut> IntoFuture for StepBuilder<O, F, Fut>
+where
+    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(StepContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
@@ -258,6 +274,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             serdes: self.serdes,
             semantics: self.semantics,
             closure: self.closure,
+            _marker: PhantomData,
         };
 
         DurableFuture::from_async(async move { execution.execute().await })

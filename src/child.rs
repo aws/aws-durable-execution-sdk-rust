@@ -13,7 +13,6 @@
 //! - `ParentId`: wire ID of the parent context's prefix (if child of child)
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
@@ -37,38 +36,142 @@ pub(crate) const CHILD_SUB_TYPE: &str = "RunInChildContext";
 /// the checkpoint; instead the child body is re-executed on replay.
 const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 
-/// Boxed, pinned child-context body: a factory that receives the child
-/// [`DurableContext`] and returns the pinned future producing the child's
-/// result.
-///
-/// Crate-internal: the public API takes a generic closure and boxes it into
-/// this. Shared by [`ChildExecution`], the child/parallel builders, and
-/// [`crate::Branch`], so the nested `Box<dyn FnOnce ... Pin<Box<dyn Future
-/// ...>>>` spelling is written once.
-pub(crate) type BoxedChildBody<O> = Box<
-    dyn FnOnce(DurableContext) -> Pin<Box<dyn Future<Output = Result<O, ChildFnError>> + Send>>
-        + Send,
->;
-
 /// Internal state for child context execution passed from the builder.
-pub(crate) struct ChildExecution<O> {
+///
+/// Generic over the body closure `F` and — through its future's output —
+/// the body's error type `E`, so the body runs **without type erasure**:
+/// `run_in_child_context` instantiates it with the user closure directly
+/// (`E = BoxError`), and `with_retry` with the concrete retry-loop future
+/// (`E = ChildFnError`). The one erasure point is the builder's
+/// `.future()` / `into_future`, which boxes the whole execution future
+/// once inside [`DurableFuture`](crate::DurableFuture).
+pub(crate) struct ChildExecution<O, F> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
     pub(crate) serdes: Option<Arc<dyn Serdes>>,
-    pub(crate) closure: BoxedChildBody<O>,
+    pub(crate) closure: F,
+    pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
 }
 
-impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
+impl<O, F, Fut, E> ChildExecution<O, F>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+    F: FnOnce(DurableContext) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<O, E>> + Send + 'static,
+    E: Into<ChildFnError>,
+{
     /// Executes the child context operation.
     ///
-    /// This is the dispatcher: it validates task ownership and replay
-    /// identity, then hands off to the named path functions — replay
-    /// ([`Self::replay_succeeded`], [`Self::replay_failed`],
-    /// [`Self::reexecute_for_replay_children`]) or live
-    /// ([`Self::run_live`], whose success path routes large payloads
-    /// through [`build_succeed_update`]).
+    /// Thin generic wrapper — the ONLY code monomorphized per call site.
+    /// The replay/checkpoint state machine lives in the non-generic
+    /// [`ChildCore`] / [`ChildAfter`] halves (generic over the result type
+    /// `O` only); this wrapper just polls the user's concrete future
+    /// between them, in a fresh child context under the child namespace's
+    /// replay-aware span.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
+        let Self {
+            ctx,
+            op_id,
+            name,
+            serdes,
+            closure,
+            _marker,
+        } = self;
+        let core = ChildCore {
+            ctx,
+            op_id,
+            name,
+            serdes,
+            _marker: std::marker::PhantomData,
+        };
+        match core.before().await? {
+            ChildPrelude::Done(result) => result,
+            ChildPrelude::Run {
+                child_ctx,
+                mode,
+                after,
+            } => {
+                // Run the child closure, instrumented with the child
+                // namespace's replay-aware span: on a resume, nested
+                // operations can still be replaying while the parent is
+                // live, and the child span's isReplay flag (kept current by
+                // the child's own mints) is what lets a filter suppress the
+                // body's pre-wait log lines exactly once.
+                let child_span = child_ctx.replay_span();
+                let result = (closure)(child_ctx)
+                    .instrument(child_span)
+                    .await
+                    .map_err(Into::into);
+                after.settle(mode, result).await
+            }
+        }
+    }
+}
+
+/// The pre-closure half of a child context: task-ownership check, replay
+/// resolution, and the START checkpoint. Generic only over the result type
+/// `O` — no user closure reaches this state machine, so its substantial
+/// replay/checkpoint logic compiles once per result type instead of once
+/// per call site.
+struct ChildCore<O> {
+    ctx: DurableContext,
+    op_id: OperationId,
+    name: Option<String>,
+    serdes: Option<Arc<dyn Serdes>>,
+    _marker: std::marker::PhantomData<fn() -> O>,
+}
+
+/// Why the child body must run: a fresh live execution, or a re-execution
+/// reconstructing a result too large to checkpoint (`ReplayChildren`).
+enum ChildRunMode {
+    /// Live path: checkpoint the outcome afterwards.
+    Live,
+    /// `ReplayChildren` path: round-trip the result, checkpoint nothing.
+    Reconstruct,
+}
+
+/// What [`ChildCore::before`] decided: the operation is already resolved
+/// from the checkpoint log, or the body must run in the prepared child
+/// context.
+enum ChildPrelude<O> {
+    /// Resolved without running the body (replayed success or failure).
+    Done(Result<O, OperationError>),
+    /// The body must run in `child_ctx`; `after` settles the outcome under
+    /// the semantics of `mode`.
+    Run {
+        /// The fresh child context (chained prefix) the body receives.
+        child_ctx: DurableContext,
+        /// Live execution vs `ReplayChildren` reconstruction.
+        mode: ChildRunMode,
+        /// The post-closure half that settles the outcome.
+        after: ChildAfter<O>,
+    },
+}
+
+/// The post-closure half of a child context: outcome checkpointing (live)
+/// or result round-tripping (`ReplayChildren`). Generic only over the
+/// result type.
+struct ChildAfter<O> {
+    ctx: DurableContext,
+    wire_id: String,
+    name: Option<String>,
+    serdes: Option<Arc<dyn Serdes>>,
+    _marker: std::marker::PhantomData<fn() -> O>,
+}
+
+impl<O> ChildCore<O>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+{
+    /// Runs everything that precedes the child closure: replay resolution
+    /// or the live-path preamble ending at the START checkpoint.
+    ///
+    /// This is the dispatcher: it validates task ownership and replay
+    /// identity, then resolves recorded outcomes ([`Self::replay_succeeded`],
+    /// [`Self::replay_failed`]) or prepares the child context for the body
+    /// to run (live, or `ReplayChildren` reconstruction).
+    async fn before(self) -> Result<ChildPrelude<O>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
 
@@ -79,6 +182,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
         // 2. Check checkpoint log for replay. The validated view carries
         // status and `replay_children` without cloning; the terminal
         // branches fetch only the fields they consume.
+        let mut mode = ChildRunMode::Live;
         if let Some(view) = self.ctx.checkpoint_view_validated(
             &positional_id,
             &wire_id,
@@ -88,17 +192,22 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
         )? {
             match view.status {
                 CheckpointStatus::Succeeded if view.replay_children => {
-                    return self
-                        .reexecute_for_replay_children(&positional_id, &serdes_ctx)
-                        .await;
+                    // Recorded success whose result was too large to
+                    // checkpoint: re-execute the body to reconstruct it.
+                    mode = ChildRunMode::Reconstruct;
                 }
                 CheckpointStatus::Succeeded => {
-                    return self
-                        .replay_succeeded(&positional_id, &wire_id, view.attempt, &serdes_ctx)
-                        .await;
+                    return Ok(ChildPrelude::Done(
+                        self.replay_succeeded(&positional_id, &wire_id, view.attempt, &serdes_ctx)
+                            .await,
+                    ));
                 }
                 CheckpointStatus::Failed => {
-                    return self.replay_failed(&positional_id, &wire_id, view.attempt);
+                    return Ok(ChildPrelude::Done(self.replay_failed(
+                        &positional_id,
+                        &wire_id,
+                        view.attempt,
+                    )));
                 }
                 // Started/Pending/Ready: re-enter child body (resume path).
                 _ => {}
@@ -118,34 +227,23 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
                 .map_err(|e| child_internal_error(&format!("checkpoint start: {e}")))?;
         }
 
-        self.run_live(&positional_id, &wire_id, &serdes_ctx).await
-    }
+        // 4. Create child context with chained prefix.
+        let Self {
+            ctx, name, serdes, ..
+        } = self;
+        let child_ctx = ctx.new_child(&positional_id);
 
-    /// Replay path for a recorded success whose result was too large to
-    /// checkpoint (`ReplayChildren` mode): re-executes the child body to
-    /// reconstruct the result, round-tripping it through serialization for
-    /// consistency with the checkpointed path.
-    async fn reexecute_for_replay_children(
-        self,
-        positional_id: &str,
-        serdes_ctx: &SerdesContext,
-    ) -> Result<O, OperationError> {
-        let child_ctx = self.ctx.new_child(positional_id);
-        let child_span = child_ctx.replay_span();
-        let result = (self.closure)(child_ctx).instrument(child_span).await;
-        match result {
-            Ok(value) => {
-                let serdes = self.serdes.as_ref().or_else(|| self.ctx.default_serdes());
-                // Round-trip through serialization for consistency.
-                let serialized = serialize_value(&value, serdes, serdes_ctx).await?;
-                deserialize_value::<O>(&serialized, serdes, serdes_ctx).await
-            }
-            Err(child_err) => Err(OperationError::from_kind(OperationErrorKind::ChildContext(
-                ChildContextError::from_kind(ChildContextErrorKind::ChildFailed {
-                    message: child_err.to_string(),
-                }),
-            ))),
-        }
+        Ok(ChildPrelude::Run {
+            child_ctx,
+            mode,
+            after: ChildAfter {
+                ctx,
+                wire_id,
+                name,
+                serdes,
+                _marker: std::marker::PhantomData,
+            },
+        })
     }
 
     /// Replay path for a recorded success: returns the frozen result from
@@ -202,52 +300,62 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> ChildExecution<O> {
             error_message.as_deref(),
         ))
     }
+}
 
-    /// Live path: runs the child closure in a fresh child context, then
-    /// checkpoints the outcome — success through [`build_succeed_update`]
+impl<O> ChildAfter<O>
+where
+    O: Serialize + DeserializeOwned + Send + 'static,
+{
+    /// Settles the child body's outcome.
+    ///
+    /// Live mode checkpoints it — success through [`build_succeed_update`]
     /// (which routes large payloads to `ReplayChildren` mode), failure
-    /// through [`checkpoint_live_failure`].
-    async fn run_live(
+    /// through [`checkpoint_live_failure`]. Reconstruct mode
+    /// (`ReplayChildren` replay) round-trips the result through
+    /// serialization for consistency with the checkpointed path and
+    /// checkpoints nothing.
+    async fn settle(
         self,
-        positional_id: &str,
-        wire_id: &str,
-        serdes_ctx: &SerdesContext,
+        mode: ChildRunMode,
+        result: Result<O, ChildFnError>,
     ) -> Result<O, OperationError> {
         let Self {
             ctx,
+            wire_id,
             name,
             serdes,
-            closure,
             ..
         } = self;
+        let serdes_ctx = SerdesContext::new(&wire_id, ctx.execution_arn());
+        let effective_serdes = serdes.as_ref().or_else(|| ctx.default_serdes());
 
-        // 4. Create child context with chained prefix.
-        let child_ctx = ctx.new_child(positional_id);
-
-        // 5. Run the child closure, instrumented with the child namespace's
-        // replay-aware span: on a resume, nested operations can still be
-        // replaying while the parent is live, and the child span's isReplay
-        // flag (kept current by the child's own mints) is what lets a
-        // filter suppress the body's pre-wait log lines exactly once.
-        let child_span = child_ctx.replay_span();
-        let result = closure(child_ctx).instrument(child_span).await;
-
-        match result {
-            Ok(value) => {
-                // 6a. Success: serialize and checkpoint.
-                let effective_serdes = serdes.as_ref().or_else(|| ctx.default_serdes());
-                let serialized = serialize_value(&value, effective_serdes, serdes_ctx).await?;
-                let update = build_succeed_update(wire_id, name.as_deref(), &ctx, &serialized);
+        match (mode, result) {
+            (ChildRunMode::Reconstruct, Ok(value)) => {
+                // Round-trip through serialization for consistency.
+                let serialized = serialize_value(&value, effective_serdes, &serdes_ctx).await?;
+                deserialize_value::<O>(&serialized, effective_serdes, &serdes_ctx).await
+            }
+            (ChildRunMode::Reconstruct, Err(child_err)) => {
+                Err(OperationError::from_kind(OperationErrorKind::ChildContext(
+                    ChildContextError::from_kind(ChildContextErrorKind::ChildFailed {
+                        message: child_err.to_string(),
+                    }),
+                )))
+            }
+            (ChildRunMode::Live, Ok(value)) => {
+                // Success: serialize and checkpoint.
+                let serialized = serialize_value(&value, effective_serdes, &serdes_ctx).await?;
+                let update = build_succeed_update(&wire_id, name.as_deref(), &ctx, &serialized);
                 ctx.checkpoint_updates(vec![update])
                     .await
                     .map_err(|e| child_internal_error(&format!("checkpoint succeed: {e}")))?;
 
                 // Round-trip deserialize for consistency (first-run == replay).
-                deserialize_value::<O>(&serialized, effective_serdes, serdes_ctx).await
+                deserialize_value::<O>(&serialized, effective_serdes, &serdes_ctx).await
             }
-            Err(child_err) => {
-                // 6b. Failure: checkpoint FAIL with error details.
-                Err(checkpoint_live_failure(&ctx, name.as_deref(), wire_id, &child_err).await)
+            (ChildRunMode::Live, Err(child_err)) => {
+                // Failure: checkpoint FAIL with error details.
+                Err(checkpoint_live_failure(&ctx, name.as_deref(), &wire_id, &child_err).await)
             }
         }
     }
