@@ -14,7 +14,7 @@ use crate::client::ClientError;
 use crate::context::DurableContext;
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{InvokeError, InvokeErrorKind, OperationError, OperationErrorKind};
-use crate::serdes::SerdesContext;
+use crate::serdes::{PayloadOrigin, SerdesContext};
 
 /// Wire sub-type for chained invoke operations.
 pub(crate) const CHAINED_INVOKE_SUB_TYPE: &str = "ChainedInvoke";
@@ -183,13 +183,19 @@ async fn serialize_invoke_input<I, PS: Serdes<I>>(
 }
 
 /// Deserializes the invoke result payload through the configured serdes.
+///
+/// The payload is returned by the external target function — it never
+/// passed through this SDK's serialize path. The context is marked
+/// [`PayloadOrigin::External`] here, at the boundary, so a serdes with
+/// storage indirection (e.g. `FileSystemSerdes`) never honors a file
+/// reference the target function's output happens to contain.
 async fn deserialize_invoke_result<O, RS: Serdes<O>>(
     result_serdes: &RS,
     payload: String,
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
     result_serdes
-        .deserialize(payload, serdes_ctx)
+        .deserialize(payload, serdes_ctx.with_origin(PayloadOrigin::External))
         .await
         .map_err(|e| invoke_serialization_error(&format!("result serdes: {e}")))
 }
@@ -325,6 +331,102 @@ mod tests {
         assert_eq!(result.unwrap(), "hello from target");
     }
 
+    /// ISSUE #46: a target function's result payload must never be honored
+    /// as a `FileSystemSerdes` file reference. The result is produced by
+    /// the external target function, not this SDK's serialize path, so a
+    /// payload shaped like a legacy or versioned file pointer — even one
+    /// naming a real, readable file under `base_path` — decodes as plain
+    /// data, and a realistic inline payload containing a `file` key is not
+    /// misparsed.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // reason: test assertions with descriptive messages
+    async fn invoke_result_never_resolves_file_references() {
+        use crate::serdes::FileSystemSerdes;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "invoke_no_file_refs_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create temp base");
+        std::fs::write(tmp.join("secret.json"), r#""stolen contents""#).expect("plant file");
+
+        // Two attack shapes: the legacy file pointer and the versioned
+        // file envelope, both naming the planted file.
+        let legacy = format!(
+            r#"{{"file":"{}","data":{{"status":"ready"}}}}"#,
+            tmp.join("secret.json").to_string_lossy()
+        );
+        let versioned =
+            r#"{"__aws_durable_serdes":{"version":1,"kind":"file"},"file":"secret.json"}"#
+                .to_owned();
+
+        for (label, payload) in [("legacy", legacy), ("versioned", versioned)] {
+            let wire_key = crate::engine::compute_wire_id_public("1");
+            let record = CheckpointRecord {
+                id: wire_key.clone(),
+                status: CheckpointStatus::Succeeded,
+                result: None,
+                error_type: None,
+                error_message: None,
+                attempt: 0,
+                invoke_result: Some(payload),
+                invoke_error_type: None,
+                invoke_error_message: None,
+                replay_children: false,
+                callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
+            };
+            let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
+            let ctx = DurableContext::new_root(
+                "arn:test".to_owned(),
+                lambda_runtime::Context::default(),
+                log,
+            );
+            let op_id = ctx.mint_id();
+
+            let exec = InvokeExecution::<serde_json::Value, _, _, _> {
+                ctx,
+                op_id,
+                name: None,
+                function_id: "target-fn".to_owned(),
+                input: serde_json::json!("input"),
+                payload_serdes: crate::serdes::JsonSerdes,
+                result_serdes: FileSystemSerdes::new(tmp.to_string_lossy().into_owned()),
+                tenant_id: None,
+                _marker: PhantomData,
+            };
+
+            let value = exec
+                .execute()
+                .await
+                .expect("external result decodes as data");
+            assert_ne!(
+                value,
+                serde_json::json!("stolen contents"),
+                "{label}: an invoke result must never trigger a local file read"
+            );
+            assert!(
+                value.get("file").is_some(),
+                "{label}: the 'file' key is plain data"
+            );
+            if label == "legacy" {
+                assert_eq!(
+                    value["data"],
+                    serde_json::json!({"status": "ready"}),
+                    "inline payload with a 'file' key must not be misparsed"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[tokio::test]
     async fn invoke_replay_failed_returns_invoke_error() {
         let wire_key = crate::engine::compute_wire_id_public("1");
@@ -456,6 +558,8 @@ mod tests {
         // lowercases the wire payload before parsing on deserialization.
         struct Upper;
         impl Serdes<String> for Upper {
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -463,6 +567,8 @@ mod tests {
             ) -> Result<String, crate::BoxError> {
                 Ok(serde_json::to_string(&value)?.to_uppercase())
             }
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -642,6 +748,8 @@ mod tests {
         // Custom payload serdes uppercases the input on serialization.
         struct UpperPayload;
         impl Serdes<String> for UpperPayload {
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -649,6 +757,8 @@ mod tests {
             ) -> Result<String, crate::BoxError> {
                 Ok(serde_json::to_string(&value)?.to_uppercase())
             }
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -704,6 +814,8 @@ mod tests {
         // Custom result serdes lowercases output on deserialization.
         struct LowerResult;
         impl Serdes<String> for LowerResult {
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -711,6 +823,8 @@ mod tests {
             ) -> Result<String, crate::BoxError> {
                 Ok(serde_json::to_string(&value)?)
             }
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,

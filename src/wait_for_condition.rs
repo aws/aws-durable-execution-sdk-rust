@@ -744,6 +744,106 @@ mod tests {
         );
     }
 
+    /// ISSUE #46 REPRODUCER: a failed Retry checkpoint must not change
+    /// state referenced by the previously accepted checkpoint.
+    ///
+    /// The prior attempt's accepted checkpoint references a
+    /// `FileSystemSerdes` payload file. The new attempt serializes fresh
+    /// state and its Retry checkpoint FAILS. Replaying the accepted
+    /// envelope must still read the original bytes — the failed attempt's
+    /// write must have gone to a new file, never over the committed one.
+    #[tokio::test]
+    async fn failed_retry_checkpoint_does_not_mutate_prior_filesystem_state() {
+        use crate::client::TestResponse;
+        use crate::serdes::{FileSystemSerdes, Serdes, SerdesContext};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!(
+            "wfc_failed_retry_checkpoint_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let filesystem_serdes = FileSystemSerdes::new(tmp.to_string_lossy().into_owned());
+
+        let wire_key = crate::engine::compute_wire_id_public("1");
+        let serdes_ctx = SerdesContext::new(&wire_key, "arn:test");
+
+        // Model an accepted Retry checkpoint from the prior attempt. Keep its
+        // exact envelope so the assertion below observes what replay would see.
+        let accepted_envelope = filesystem_serdes
+            .serialize(1_i32, serdes_ctx.clone())
+            .await
+            .unwrap();
+        let record = CheckpointRecord {
+            id: wire_key.clone(),
+            status: CheckpointStatus::Ready,
+            result: Some(accepted_envelope.clone()),
+            error_type: None,
+            error_message: None,
+            attempt: 1,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        };
+
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        client.enqueue_checkpoint_response(TestResponse::Success(Vec::new()));
+        client.enqueue_checkpoint_response(TestResponse::NonRetryableError(
+            "injected Retry checkpoint failure".to_owned(),
+        ));
+
+        let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+            client,
+            "token0".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+
+        let exec = WaitForConditionExecution {
+            ctx,
+            op_id,
+            name: None,
+            initial_state: 0i32,
+            wait_strategy: Some(Box::new(|_state: i32, _attempt| {
+                WaitDecision::continue_with(Duration::from_secs(1))
+            })),
+            serdes: filesystem_serdes.clone(),
+            check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state + 1) },
+        };
+
+        let error = exec.execute().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected Retry checkpoint failure"),
+            "unexpected checkpoint error: {error}"
+        );
+
+        let restored: i32 = filesystem_serdes
+            .deserialize(accepted_envelope, serdes_ctx)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            restored, 1,
+            "a failed Retry checkpoint must not mutate the state referenced \
+             by the prior accepted checkpoint"
+        );
+    }
+
     /// Test: condition met on first try (immediate completion).
     #[tokio::test]
     async fn condition_met_first_try() {

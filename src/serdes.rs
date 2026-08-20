@@ -299,11 +299,46 @@ where
 // SerdesContext
 // ============================================================
 
+/// Where the wire string handed to [`Serdes::deserialize`] came from.
+///
+/// An SDK-written record is a payload a previous [`Serdes::serialize`]
+/// call produced and the SDK checkpointed. An external payload was
+/// delivered by a caller outside the execution (a callback completion)
+/// and never went through the SDK's serialize path, so storage
+/// indirection recorded in it — such as a [`FileSystemSerdes`] file
+/// reference — must not be honored.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk_rust::serdes::{PayloadOrigin, SerdesContext};
+///
+/// let ctx = SerdesContext::new("step-1", "arn:test");
+/// assert_eq!(ctx.origin(), PayloadOrigin::SdkRecord);
+///
+/// let external = ctx.with_origin(PayloadOrigin::External);
+/// assert_eq!(external.origin(), PayloadOrigin::External);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PayloadOrigin {
+    /// The wire string was written by this SDK's serialize path and read
+    /// back from a checkpoint record. Envelope metadata in it (including
+    /// file references) is trusted.
+    SdkRecord,
+    /// The wire string was delivered by an external caller (a callback
+    /// completion). It is opaque application data: [`FileSystemSerdes`]
+    /// deserializes it directly as the value and never resolves file
+    /// references from it.
+    External,
+}
+
 /// Context information passed to [`FileSystemSerdes`] for file path
 /// resolution.
 ///
-/// Provides the operation identity and execution ARN so that file paths
-/// are deterministic across replays.
+/// Provides the operation identity and execution ARN so that on-disk
+/// directories are deterministic across replays, plus the
+/// [`PayloadOrigin`] of the wire string being deserialized.
 ///
 /// # Examples
 ///
@@ -321,15 +356,18 @@ pub struct SerdesContext {
     /// ARN of the durable execution (stable across replays of the same
     /// execution).
     durable_execution_arn: String,
+    /// Where the payload being deserialized came from.
+    origin: PayloadOrigin,
 }
 
 impl SerdesContext {
-    /// Creates a new serdes context.
+    /// Creates a new serdes context with [`PayloadOrigin::SdkRecord`].
     #[must_use]
     pub fn new(operation_id: impl Into<String>, durable_execution_arn: impl Into<String>) -> Self {
         Self {
             operation_id: operation_id.into(),
             durable_execution_arn: durable_execution_arn.into(),
+            origin: PayloadOrigin::SdkRecord,
         }
     }
 
@@ -343,6 +381,23 @@ impl SerdesContext {
     #[must_use]
     pub fn durable_execution_arn(&self) -> &str {
         &self.durable_execution_arn
+    }
+
+    /// Returns where the payload being deserialized came from.
+    #[must_use]
+    pub fn origin(&self) -> PayloadOrigin {
+        self.origin
+    }
+
+    /// Returns this context with the payload origin replaced.
+    ///
+    /// The SDK marks callback payloads [`PayloadOrigin::External`] before
+    /// handing them to [`Serdes::deserialize`]; custom serdes tests can
+    /// use this to exercise the same path.
+    #[must_use]
+    pub fn with_origin(mut self, origin: PayloadOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 }
 
@@ -529,9 +584,34 @@ impl FileSystemSerdesConfigBuilder {
 ///
 /// # Envelope format
 ///
-/// The checkpoint stores one of:
-/// - `{"data":<inline JSON value>}` — value stored inline (OVERFLOW mode, under threshold)
-/// - `{"file":"<path>"}` — value stored in a file
+/// The checkpoint stores a versioned envelope carrying a
+/// `"__aws_durable_serdes"` marker, one of:
+///
+/// - `{"__aws_durable_serdes":{"version":1,"kind":"inline"},"value":<JSON>}`
+///   — value stored inline (OVERFLOW mode, under threshold)
+/// - `{"__aws_durable_serdes":{"version":1,"kind":"file"},"file":"<relative path>"}`
+///   — value stored in a file under `base_path`
+///
+/// The marker key is reserved, so an inline value that itself contains a
+/// `"file"` key can never be misread as a file reference. Envelopes
+/// written by earlier versions (`{"file":...}`, `{"data":...}`,
+/// `{"raw":...}`) remain readable.
+///
+/// # Write and read guarantees
+///
+/// Every `serialize` call writes a **new, unique** file (staged to a
+/// temporary name and atomically renamed into place), so a retried
+/// attempt never mutates a file that an already-accepted checkpoint
+/// references — committed history stays immutable, and a failed
+/// checkpoint leaves prior files untouched. The checkpoint repoints to
+/// the new file only when the checkpoint itself succeeds.
+///
+/// File references are honored only for payloads the SDK itself wrote
+/// ([`PayloadOrigin::SdkRecord`]) and are resolved strictly under
+/// `base_path` (symlinks followed and containment re-verified). An
+/// externally delivered payload ([`PayloadOrigin::External`], e.g. a
+/// callback completion) is deserialized directly as the value: it can
+/// never name a local file to read.
 ///
 /// # Examples
 ///
@@ -617,22 +697,22 @@ impl FileSystemSerdes {
         })?;
         match self.config.storage_mode {
             FileSystemSerdesMode::Always => {
-                let file_path = self.write_to_file(&json_str, context)?;
-                let escaped_path = json_escape_string(&file_path);
-                Ok(format!(r#"{{"file":"{escaped_path}"}}"#))
+                let relative_path = self.write_to_file(&json_str, context)?;
+                Ok(file_envelope(&relative_path))
             }
             FileSystemSerdesMode::Overflow => {
                 // `json_str` is valid JSON (it came straight from
-                // `serde_json::to_string`), so it can be embedded directly in
-                // the `{"data":...}` envelope. No sniffing, and no
-                // `{"raw":...}` variant to fall back to.
-                let inline_envelope = format!(r#"{{"data":{json_str}}}"#);
-                if inline_envelope.len() > self.config.overflow_threshold_bytes {
-                    let file_path = self.write_to_file(&json_str, context)?;
-                    let escaped_path = json_escape_string(&file_path);
-                    Ok(format!(r#"{{"file":"{escaped_path}"}}"#))
+                // `serde_json::to_string`), so it can be embedded directly
+                // under the envelope's `"value"` key. The reserved
+                // `"__aws_durable_serdes"` marker is what distinguishes the
+                // envelope from the value, so inline data containing a
+                // `"file"` key cannot collide with a file reference.
+                let inline = inline_envelope(&json_str);
+                if inline.len() > self.config.overflow_threshold_bytes {
+                    let relative_path = self.write_to_file(&json_str, context)?;
+                    Ok(file_envelope(&relative_path))
                 } else {
-                    Ok(inline_envelope)
+                    Ok(inline)
                 }
             }
         }
@@ -643,23 +723,56 @@ impl FileSystemSerdes {
     /// This is the complete deserialization path — envelope parsing, the
     /// file read, and JSON parsing into `T`. The [`Serdes`] implementation
     /// runs it inside one [`tokio::task::spawn_blocking`] task.
-    #[allow(clippy::unused_self)] // reason: kept as a method for parity with serialize_sync
+    ///
+    /// An externally delivered payload ([`PayloadOrigin::External`]) is
+    /// parsed directly as `T` — it never went through
+    /// [`serialize_sync`](Self::serialize_sync), so it carries no envelope
+    /// and can never name a file to read. SDK-written records are parsed
+    /// as envelopes; their file references are resolved strictly under
+    /// `base_path`.
     fn deserialize_sync<T: DeserializeOwned>(
         &self,
         envelope: &str,
-        _context: &SerdesContext,
+        context: &SerdesContext,
     ) -> Result<T, BoxError> {
-        /// Envelope shape: `{"file":"<path>"}`, `{"data":<json>}`, or the
-        /// legacy `{"raw":"<string>"}`. `RawValue` keeps the inline data as
-        /// unparsed JSON text so `T` is parsed straight from the wire bytes
-        /// with no intermediate DOM.
+        /// The versioned envelope marker: `{"version":1,"kind":"inline"|"file"}`.
+        #[derive(serde::Deserialize)]
+        struct EnvelopeMarker {
+            version: u64,
+            kind: String,
+        }
+
+        /// Envelope shape. Versioned envelopes carry the
+        /// `"__aws_durable_serdes"` marker with `value` (inline) or `file`
+        /// (relative path). Records written by earlier SDK versions carry
+        /// `{"file":"<path>"}`, `{"data":<json>}`, or `{"raw":"<string>"}`
+        /// with no marker. `RawValue` keeps inline data as unparsed JSON
+        /// text so `T` is parsed straight from the wire bytes with no
+        /// intermediate DOM.
         #[derive(serde::Deserialize)]
         struct Envelope<'a> {
+            #[serde(rename = "__aws_durable_serdes")]
+            marker: Option<EnvelopeMarker>,
+            #[serde(borrow)]
+            value: Option<&'a serde_json::value::RawValue>,
             #[serde(borrow)]
             file: Option<std::borrow::Cow<'a, str>>,
             #[serde(borrow)]
             data: Option<&'a serde_json::value::RawValue>,
             raw: Option<String>,
+        }
+
+        // External payloads (callback completions) are opaque application
+        // data: parse them directly as the value. Honoring envelope
+        // metadata from them would let an external caller name arbitrary
+        // local files, and a realistic inline payload containing a "file"
+        // key would be misparsed as a file reference.
+        if context.origin() == PayloadOrigin::External {
+            return serde_json::from_str(envelope).map_err(|e| -> BoxError {
+                Box::new(FileSystemSerdesError::new(format!(
+                    "invalid external payload JSON: {e}"
+                )))
+            });
         }
 
         let parsed: Envelope<'_> = serde_json::from_str(envelope).map_err(|e| -> BoxError {
@@ -668,20 +781,50 @@ impl FileSystemSerdes {
             )))
         })?;
 
+        if let Some(marker) = parsed.marker {
+            // Versioned envelope.
+            if marker.version != ENVELOPE_VERSION {
+                return Err(Box::new(FileSystemSerdesError::new(format!(
+                    "unsupported envelope version {} (this SDK reads version {ENVELOPE_VERSION})",
+                    marker.version
+                ))));
+            }
+            return match marker.kind.as_str() {
+                "inline" => {
+                    let value = parsed.value.ok_or_else(|| -> BoxError {
+                        Box::new(FileSystemSerdesError::new(
+                            "inline envelope is missing its 'value' field".to_owned(),
+                        ))
+                    })?;
+                    serde_json::from_str(value.get()).map_err(|e| -> BoxError {
+                        Box::new(FileSystemSerdesError::new(format!(
+                            "invalid inline data in envelope: {e}"
+                        )))
+                    })
+                }
+                "file" => {
+                    let relative = parsed.file.ok_or_else(|| -> BoxError {
+                        Box::new(FileSystemSerdesError::new(
+                            "file envelope is missing its 'file' field".to_owned(),
+                        ))
+                    })?;
+                    self.read_relative_file(&relative)
+                }
+                other => Err(Box::new(FileSystemSerdesError::new(format!(
+                    "unsupported envelope kind '{other}'"
+                )))),
+            };
+        }
+
+        // No marker: a record written by an earlier SDK version.
         if let Some(file_path) = parsed.file.as_deref() {
-            // File pointer: read from file.
-            let contents = std::fs::read_to_string(file_path).map_err(|e| -> BoxError {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "failed to read file '{file_path}': {e}"
-                )))
-            })?;
-            serde_json::from_str(&contents).map_err(|e| -> BoxError {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "invalid JSON in file '{file_path}': {e}"
-                )))
-            })
+            // Legacy file pointer (stored as the resolved path). It came
+            // from an SDK-written record, but resolution is still strict:
+            // the file must physically live under `base_path`.
+            self.read_contained_file(std::path::Path::new(file_path), file_path)
         } else if let Some(data) = parsed.data {
-            // Inline data: the "data" field holds the value's JSON verbatim.
+            // Legacy inline data: the "data" field holds the value's JSON
+            // verbatim.
             serde_json::from_str(data.get()).map_err(|e| -> BoxError {
                 Box::new(FileSystemSerdesError::new(format!(
                     "invalid inline data in envelope: {e}"
@@ -705,18 +848,99 @@ impl FileSystemSerdes {
             })
         } else {
             Err(Box::new(FileSystemSerdesError::new(
-                "envelope contains neither 'file' nor 'data' field".to_owned(),
+                "envelope carries no '__aws_durable_serdes' marker and no legacy 'file' or 'data' field"
+                    .to_owned(),
             )))
         }
     }
 
-    /// Writes the JSON string to a file and returns the absolute file path.
+    /// Reads a payload file named by a **relative** path from a versioned
+    /// envelope, resolving it strictly under `base_path`.
+    ///
+    /// Rejects absolute paths and any path that lexically escapes the base
+    /// directory, then follows symlinks (canonicalization of the full file
+    /// path) and re-verifies physical containment before reading.
+    fn read_relative_file<T: DeserializeOwned>(&self, relative: &str) -> Result<T, BoxError> {
+        let rel = std::path::Path::new(relative);
+        if rel.is_absolute() {
+            return Err(Box::new(FileSystemSerdesError::new(format!(
+                "file reference '{relative}' must be relative to base_path"
+            ))));
+        }
+        let joined = format!("{}/{relative}", self.base_path);
+        // Lexical containment first: a ".." component must not climb out of
+        // the base directory even before the filesystem is consulted.
+        let cleaned_base = path_clean(&self.base_path);
+        let cleaned_joined = path_clean(&joined);
+        if !std::path::Path::new(&cleaned_joined).starts_with(std::path::Path::new(&cleaned_base)) {
+            return Err(Box::new(FileSystemSerdesError::new(format!(
+                "file reference '{relative}' escapes base_path '{}'",
+                self.base_path
+            ))));
+        }
+        self.read_contained_file(std::path::Path::new(&joined), relative)
+    }
+
+    /// Reads a payload file after verifying it physically resolves under
+    /// `base_path` (symlinks followed on both sides), then parses `T` from
+    /// its contents. `display_path` is the path to name in errors.
+    fn read_contained_file<T: DeserializeOwned>(
+        &self,
+        path: &std::path::Path,
+        display_path: &str,
+    ) -> Result<T, BoxError> {
+        let canonical_base = std::fs::canonicalize(&self.base_path).map_err(|e| -> BoxError {
+            Box::new(FileSystemSerdesError::new(format!(
+                "failed to canonicalize base_path '{}': {e}",
+                self.base_path
+            )))
+        })?;
+        // Canonicalizing the full file path resolves every symlink,
+        // including one at the final component, so the containment check
+        // below judges the file's real location.
+        let canonical_file = std::fs::canonicalize(path).map_err(|e| -> BoxError {
+            Box::new(FileSystemSerdesError::new(format!(
+                "failed to resolve file '{display_path}': {e}"
+            )))
+        })?;
+        if !canonical_file.starts_with(&canonical_base) {
+            return Err(Box::new(FileSystemSerdesError::new(format!(
+                "file reference '{display_path}' escapes base_path '{}'",
+                self.base_path
+            ))));
+        }
+        let contents = std::fs::read_to_string(&canonical_file).map_err(|e| -> BoxError {
+            Box::new(FileSystemSerdesError::new(format!(
+                "failed to read file '{display_path}': {e}"
+            )))
+        })?;
+        serde_json::from_str(&contents).map_err(|e| -> BoxError {
+            Box::new(FileSystemSerdesError::new(format!(
+                "invalid JSON in file '{display_path}': {e}"
+            )))
+        })
+    }
+
+    /// Writes the JSON string to a new, unique payload file and returns
+    /// its path **relative to `base_path`**.
+    ///
+    /// The payload is staged to a temporary name in the destination
+    /// directory and atomically published into place with no-clobber
+    /// semantics, so no reader ever observes a partially written file and
+    /// no writer ever replaces an existing one. Every call produces a
+    /// distinct file name — even across Lambda execution environments
+    /// sharing the same EFS or S3 Files mount, where PIDs, counters, and
+    /// clock readings can coincide — so a retried attempt never overwrites
+    /// a file that an already-accepted checkpoint references. The
+    /// checkpoint repoints to the new file only if the checkpoint itself
+    /// succeeds, and a failed checkpoint leaves prior files untouched.
     fn write_to_file(
         &self,
         json_str: &str,
         context: &SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let dir_path = self.resolve_execution_dir(context)?;
+        let relative_dir = self.resolve_execution_dir(context)?;
+        let dir_path = format!("{}/{relative_dir}", self.base_path);
         std::fs::create_dir_all(&dir_path).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(FileSystemSerdesError::new(format!(
@@ -732,57 +956,45 @@ impl FileSystemSerdes {
         // containment before writing anything.
         self.assert_canonical_containment(&dir_path)?;
 
-        let file_name = format!(
-            "{}.json",
-            encode_segment(&context.operation_id, self.config.path_encoding)
-        );
-        let file_path = format!("{dir_path}/{file_name}");
+        let encoded_op = encode_segment(&context.operation_id, self.config.path_encoding);
+        let file_name =
+            publish_unique_payload_file(&dir_path, &encoded_op, json_str, unique_file_suffix)?;
 
-        std::fs::write(&file_path, json_str).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "failed to write file '{file_path}': {e}"
-                )))
-            },
-        )?;
-
-        Ok(file_path)
+        Ok(format!("{relative_dir}/{file_name}"))
     }
 
-    /// Resolves the per-execution directory under the base path.
+    /// Resolves the per-execution directory as a path **relative to
+    /// `base_path`**.
     ///
     /// # Errors
     ///
-    /// Returns an error if the resolved path escapes `base_path` (defense-in-depth).
+    /// Returns an error if the directory joined onto `base_path` lexically
+    /// escapes it (defense-in-depth).
     fn resolve_execution_dir(
         &self,
         context: &SerdesContext,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let dir = match self.config.path_encoding {
+        let relative_dir = match self.config.path_encoding {
             FileSystemPathEncoding::Uri => {
                 // Try to parse as a durable execution ARN for human-readable paths.
                 if let Some(parts) = parse_durable_execution_arn(&context.durable_execution_arn) {
                     let enc_fn = encode_segment(&parts.function_name, self.config.path_encoding);
                     let enc_exec = encode_segment(&parts.execution_name, self.config.path_encoding);
                     let enc_inv = encode_segment(&parts.invocation_id, self.config.path_encoding);
-                    format!("{}/{enc_fn}/{enc_exec}/{enc_inv}", self.base_path)
+                    format!("{enc_fn}/{enc_exec}/{enc_inv}")
                 } else {
                     // Fallback: percent-encode the whole ARN.
-                    let encoded = percent_encode(&context.durable_execution_arn);
-                    format!("{}/{encoded}", self.base_path)
+                    percent_encode(&context.durable_execution_arn)
                 }
             }
-            FileSystemPathEncoding::Hash => {
-                let hash = sha256_hex(&context.durable_execution_arn);
-                format!("{}/{hash}", self.base_path)
-            }
+            FileSystemPathEncoding::Hash => sha256_hex(&context.durable_execution_arn),
         };
 
-        // Defense-in-depth: verify the resolved path is within base_path.
+        // Defense-in-depth: verify the joined path is within base_path.
         // Compare lexically-cleaned paths using Path::starts_with (which checks
         // component-by-component, not as a string prefix).
         let cleaned_base = path_clean(&self.base_path);
-        let cleaned_dir = path_clean(&dir);
+        let cleaned_dir = path_clean(&format!("{}/{relative_dir}", self.base_path));
         if !std::path::Path::new(&cleaned_dir).starts_with(std::path::Path::new(&cleaned_base)) {
             return Err(Box::new(FileSystemSerdesError::new(format!(
                 "resolved path '{}' escapes base_path '{}'",
@@ -790,7 +1002,7 @@ impl FileSystemSerdes {
             ))));
         }
 
-        Ok(dir)
+        Ok(relative_dir)
     }
 
     /// Verifies that `dir_path` physically resolves to a location inside
@@ -925,6 +1137,124 @@ impl std::error::Error for FileSystemSerdesError {}
 // ============================================================
 // Helper functions
 // ============================================================
+
+/// The envelope version this SDK writes and reads.
+const ENVELOPE_VERSION: u64 = 1;
+
+/// Builds the versioned inline envelope. `json_str` must be valid JSON
+/// (it comes straight from `serde_json::to_string`).
+fn inline_envelope(json_str: &str) -> String {
+    format!(
+        r#"{{"__aws_durable_serdes":{{"version":{ENVELOPE_VERSION},"kind":"inline"}},"value":{json_str}}}"#
+    )
+}
+
+/// Builds the versioned file envelope around a path relative to
+/// `base_path`.
+fn file_envelope(relative_path: &str) -> String {
+    let escaped = json_escape_string(relative_path);
+    format!(
+        r#"{{"__aws_durable_serdes":{{"version":{ENVELOPE_VERSION},"kind":"file"}},"file":"{escaped}"}}"#
+    )
+}
+
+/// Returns a filename suffix unique across concurrent writers: wall-clock
+/// nanoseconds, the process ID, and a per-process counter.
+///
+/// Uniqueness of the payload file name is what makes committed files
+/// immutable — no later `serialize` call can target the same path.
+/// Upper bound on candidate-name collisions tolerated when publishing a
+/// payload file. Each retry draws a fresh candidate name, so in practice
+/// one retry resolves a collision; the bound only guards against a broken
+/// suffix source producing the same name forever.
+const MAX_PUBLISH_ATTEMPTS: u32 = 16;
+
+/// Publishes `json_str` under `dir_path` as a new, unique, immutable file
+/// and returns its file name.
+///
+/// [`unique_file_suffix`] alone cannot guarantee uniqueness across Lambda
+/// execution environments sharing one EFS or S3 Files mount: distinct
+/// processes can share a PID and counter value and can observe the same
+/// clock reading. Uniqueness is therefore *enforced* by the filesystem,
+/// not assumed from the name:
+///
+/// - the staging file is opened with `create_new`, so a colliding staging
+///   path fails instead of truncating another writer's bytes in flight;
+/// - the finished staging file is published via [`std::fs::hard_link`],
+///   which — unlike `rename` — fails with `AlreadyExists` rather than
+///   replacing an existing destination.
+///
+/// On either collision the attempt is discarded and retried with a fresh
+/// candidate name, so a file an accepted checkpoint references is never
+/// corrupted or overwritten.
+fn publish_unique_payload_file(
+    dir_path: &str,
+    encoded_op: &str,
+    json_str: &str,
+    mut candidate_suffix: impl FnMut() -> String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::Write as _;
+
+    for _ in 0..MAX_PUBLISH_ATTEMPTS {
+        let file_name = format!("{encoded_op}-{}.json", candidate_suffix());
+        let file_path = format!("{dir_path}/{file_name}");
+        // The staging name carries its own independent suffix so writers
+        // that collide on the candidate name still stage separately;
+        // `create_new` backstops even that.
+        let staging_path = format!("{file_path}.{}.tmp", unique_file_suffix());
+
+        let mut staging = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(Box::new(FileSystemSerdesError::new(format!(
+                    "failed to write file '{staging_path}': {e}"
+                ))));
+            }
+        };
+        if let Err(e) = staging.write_all(json_str.as_bytes()) {
+            drop(staging);
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(Box::new(FileSystemSerdesError::new(format!(
+                "failed to write file '{staging_path}': {e}"
+            ))));
+        }
+        drop(staging);
+
+        // No-clobber atomic publish. Whatever the outcome, the staging
+        // file is no longer needed: the envelope never referenced it, so
+        // leaving it behind is only clutter.
+        let linked = std::fs::hard_link(&staging_path, &file_path);
+        let _ = std::fs::remove_file(&staging_path);
+        match linked {
+            Ok(()) => return Ok(file_name),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(Box::new(FileSystemSerdesError::new(format!(
+                    "failed to move file into place at '{file_path}': {e}"
+                ))));
+            }
+        }
+    }
+
+    Err(Box::new(FileSystemSerdesError::new(format!(
+        "failed to publish a unique payload file under '{dir_path}' after {MAX_PUBLISH_ATTEMPTS} attempts"
+    ))))
+}
+
+fn unique_file_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{:x}-{count:x}", std::process::id())
+}
 
 /// Parsed components of a durable execution ARN.
 struct DurableExecutionArnParts {
@@ -1100,10 +1430,14 @@ pub(crate) mod test_support {
     where
         T: Serialize + DeserializeOwned + Send + 'static,
     {
+        // reason: exercises the async-fn impl form user code writes
+        #[allow(clippy::unused_async_trait_impl)]
         async fn serialize(&self, value: T, _context: SerdesContext) -> Result<String, BoxError> {
             Ok(hex_envelope(&serde_json::to_string(&value)?))
         }
 
+        // reason: exercises the async-fn impl form user code writes
+        #[allow(clippy::unused_async_trait_impl)]
         async fn deserialize(&self, wire: String, _context: SerdesContext) -> Result<T, BoxError> {
             Ok(serde_json::from_str(&hex_decode(&wire)?)?)
         }
@@ -1200,6 +1534,8 @@ pub(crate) mod test_support {
     where
         T: Serialize + DeserializeOwned + Send + 'static,
     {
+        // reason: exercises the async-fn impl form user code writes
+        #[allow(clippy::unused_async_trait_impl)]
         async fn serialize(&self, value: T, _context: SerdesContext) -> Result<String, BoxError> {
             let json = serde_json::to_string(&value)?;
             if let Ok(mut seen) = self.serialize_inputs.lock() {
@@ -1208,6 +1544,8 @@ pub(crate) mod test_support {
             Ok(hex_envelope(&json))
         }
 
+        // reason: exercises the async-fn impl form user code writes
+        #[allow(clippy::unused_async_trait_impl)]
         async fn deserialize(&self, wire: String, _context: SerdesContext) -> Result<T, BoxError> {
             let json = hex_decode(&wire)?;
             if let Ok(mut seen) = self.deserialize_outputs.lock() {
@@ -1264,12 +1602,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
-        let ctx = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn:
-                "arn:aws:lambda:us-east-1:123:function:my-fn:1/durable-execution/exec-1/inv-1"
-                    .to_owned(),
-        };
+        let ctx = SerdesContext::new(
+            "step-1".to_owned(),
+            "arn:aws:lambda:us-east-1:123:function:my-fn:1/durable-execution/exec-1/inv-1"
+                .to_owned(),
+        );
 
         let input = serde_json::json!({"value": 42, "name": "test"});
         let envelope = serdes
@@ -1290,6 +1627,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// ISSUE #46: candidate file names are not trusted to be unique —
+    /// across Lambda environments sharing EFS/S3 Files, two writers can
+    /// draw the same PID, counter, and clock reading. When their candidate
+    /// names collide, publication must not clobber the already-published
+    /// file (which an accepted checkpoint may reference); the loser must
+    /// retry under a fresh name.
+    #[test]
+    fn publish_never_clobbers_on_candidate_name_collision() {
+        let tmp = std::env::temp_dir().join(format!(
+            "fs_serdes_publish_collision_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        let dir = tmp.to_string_lossy().into_owned();
+
+        // Writer A publishes under candidate suffix "dup".
+        let name_a = publish_unique_payload_file(&dir, "op", r#""writer-a""#, || "dup".to_owned())
+            .expect("writer A publishes");
+        assert_eq!(name_a, "op-dup.json");
+
+        // Writer B draws the SAME candidate suffix first, then a fresh one.
+        let mut draws = vec!["fresh".to_owned(), "dup".to_owned()];
+        let name_b = publish_unique_payload_file(&dir, "op", r#""writer-b""#, move || {
+            draws.pop().expect("enough draws")
+        })
+        .expect("writer B retries under a fresh name");
+        assert_eq!(name_b, "op-fresh.json");
+
+        // The collision did not corrupt or replace writer A's file.
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("op-dup.json")).expect("read A"),
+            r#""writer-a""#,
+            "an existing published file must never be overwritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("op-fresh.json")).expect("read B"),
+            r#""writer-b""#
+        );
+
+        // A suffix source stuck on a taken name errors out instead of
+        // clobbering, and leaves the published file untouched.
+        let err = publish_unique_payload_file(&dir, "op", r#""writer-c""#, || "dup".to_owned())
+            .expect_err("exhausted retries must fail");
+        assert!(err.to_string().contains("attempts"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("op-dup.json")).expect("read A again"),
+            r#""writer-a""#
+        );
+
+        // No staging litter left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&tmp)
+            .expect("list dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging files leaked: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn filesystem_serdes_overflow_mode_small_inline() {
         let tmp = std::env::temp_dir().join("fs_serdes_test_overflow_small");
@@ -1300,19 +1701,22 @@ mod tests {
             .overflow_threshold_bytes(1024)
             .build();
         let serdes = FileSystemSerdes::with_config(tmp.to_string_lossy().to_string(), config);
-        let ctx = SerdesContext {
-            operation_id: "step-2".to_owned(),
-            durable_execution_arn:
-                "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e/i".to_owned(),
-        };
+        let ctx = SerdesContext::new(
+            "step-2".to_owned(),
+            "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e/i".to_owned(),
+        );
 
         let small = serde_json::json!({"x": 1});
         let envelope = serdes
             .serialize_sync(&small, &ctx)
             .expect("serialize should succeed");
 
-        // Small value should be inline
-        assert!(envelope.contains(r#""data""#), "envelope: {envelope}");
+        // Small value should be inline, under the versioned marker
+        assert!(
+            envelope.contains(r#""__aws_durable_serdes""#),
+            "envelope: {envelope}"
+        );
+        assert!(envelope.contains(r#""value""#), "envelope: {envelope}");
         assert!(!envelope.contains(r#""file""#), "envelope: {envelope}");
 
         // Deserialize returns the original
@@ -1334,11 +1738,10 @@ mod tests {
             .overflow_threshold_bytes(50) // Low threshold for testing
             .build();
         let serdes = FileSystemSerdes::with_config(tmp.to_string_lossy().to_string(), config);
-        let ctx = SerdesContext {
-            operation_id: "step-3".to_owned(),
-            durable_execution_arn:
-                "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e/i".to_owned(),
-        };
+        let ctx = SerdesContext::new(
+            "step-3".to_owned(),
+            "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e/i".to_owned(),
+        );
 
         // This will exceed the 50-byte threshold once wrapped in {"data":...}
         let large =
@@ -1368,10 +1771,10 @@ mod tests {
             .path_encoding(FileSystemPathEncoding::Hash)
             .build();
         let serdes = FileSystemSerdes::with_config(tmp.to_string_lossy().to_string(), config);
-        let ctx = SerdesContext {
-            operation_id: "step/with:special".to_owned(),
-            durable_execution_arn: "some-weird-arn/with/slashes".to_owned(),
-        };
+        let ctx = SerdesContext::new(
+            "step/with:special".to_owned(),
+            "some-weird-arn/with/slashes".to_owned(),
+        );
 
         let value = serde_json::json!("hello");
         let envelope = serdes
@@ -1397,17 +1800,31 @@ mod tests {
 
     #[test]
     fn filesystem_serdes_error_on_missing_file() {
-        let serdes = FileSystemSerdes::new("/nonexistent/path");
-        let ctx = SerdesContext {
-            operation_id: "x".to_owned(),
-            durable_execution_arn: "y".to_owned(),
-        };
+        let tmp = std::env::temp_dir().join("fs_serdes_test_missing_file");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
 
-        let envelope = r#"{"file":"/nonexistent/path/does-not-exist.json"}"#;
-        let result = serdes.deserialize_sync::<serde_json::Value>(envelope, &ctx);
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let ctx = SerdesContext::new("x".to_owned(), "y".to_owned());
+
+        // Versioned envelope naming a file that does not exist under base.
+        let envelope = file_envelope("does-not-exist.json");
+        let result = serdes.deserialize_sync::<serde_json::Value>(&envelope, &ctx);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("failed to read file"), "err: {err_msg}");
+        assert!(err_msg.contains("failed to resolve file"), "err: {err_msg}");
+
+        // Legacy envelope naming a missing file under base fails the same way.
+        let legacy = format!(
+            r#"{{"file":"{}/does-not-exist.json"}}"#,
+            tmp.to_string_lossy()
+        );
+        let result = serdes.deserialize_sync::<serde_json::Value>(&legacy, &ctx);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("failed to resolve file"), "err: {err_msg}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1417,11 +1834,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
-        let ctx = SerdesContext {
-            operation_id: "op-1".to_owned(),
-            durable_execution_arn:
-                "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/exec/inv".to_owned(),
-        };
+        let ctx = SerdesContext::new(
+            "op-1".to_owned(),
+            "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/exec/inv".to_owned(),
+        );
 
         let envelope = serdes
             .serialize_sync(&serde_json::json!(42), &ctx)
@@ -1448,12 +1864,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
-        let ctx = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn:
-                "arn:aws:lambda:us-west-2:999:function:my-function:42/durable-execution/my-exec/my-inv"
-                    .to_owned(),
-        };
+        let ctx = SerdesContext::new(
+            "step-1".to_owned(),
+            "arn:aws:lambda:us-west-2:999:function:my-function:42/durable-execution/my-exec/my-inv"
+                .to_owned(),
+        );
 
         let envelope = serdes
             .serialize_sync(&serde_json::json!("data"), &ctx)
@@ -1461,14 +1876,23 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
         let path = parsed.get("file").and_then(|v| v.as_str()).unwrap();
 
-        // URI mode: base/functionName/executionName/invocationId/opId.json
-        assert!(path.contains("my-function"), "path: {path}");
+        // URI mode: functionName/executionName/invocationId/opId-<unique>.json,
+        // relative to base_path.
+        assert!(
+            !std::path::Path::new(path).is_absolute(),
+            "path must be relative to base_path: {path}"
+        );
+        assert!(path.starts_with("my-function/"), "path: {path}");
         assert!(path.contains("my-exec"), "path: {path}");
         assert!(path.contains("my-inv"), "path: {path}");
+        // The file name keeps the operation ID prefix but carries a unique
+        // suffix, so a retried attempt never reuses the same path.
+        let file_name = path.rsplit('/').next().unwrap();
+        assert!(file_name.starts_with("step-1-"), "file name: {file_name}");
         #[allow(clippy::case_sensitive_file_extension_comparisons)]
         // reason: we generate the extension; always lowercase
-        let correct_suffix = path.ends_with("step-1.json");
-        assert!(correct_suffix, "path: {path}");
+        let correct_suffix = file_name.ends_with(".json");
+        assert!(correct_suffix, "file name: {file_name}");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1535,7 +1959,10 @@ mod tests {
         // A bare string is the case that previously took the {"raw":...} arm.
         let value = serde_json::json!("plain text");
         let envelope = serdes.serialize_sync(&value, &ctx).expect("serialize");
-        assert_eq!(envelope, r#"{"data":"plain text"}"#);
+        assert_eq!(
+            envelope,
+            r#"{"__aws_durable_serdes":{"version":1,"kind":"inline"},"value":"plain text"}"#
+        );
         assert_eq!(
             serdes
                 .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
@@ -1554,11 +1981,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let base = tmp.to_string_lossy().to_string();
 
-        let ctx = SerdesContext {
-            operation_id: "replay-op".to_owned(),
-            durable_execution_arn:
-                "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e1/i1".to_owned(),
-        };
+        let ctx = SerdesContext::new(
+            "replay-op".to_owned(),
+            "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e1/i1".to_owned(),
+        );
 
         // First invocation: serialize
         let serdes1 = FileSystemSerdes::new(base.clone());
@@ -1596,11 +2022,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
-        let ctx = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn:
-                "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/exec/inv".to_owned(),
-        };
+        let ctx = SerdesContext::new(
+            "step-1".to_owned(),
+            "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/exec/inv".to_owned(),
+        );
 
         let input = serde_json::json!({"value": "test"});
         let envelope = serdes
@@ -1755,6 +2180,8 @@ mod tests {
         struct UpperSerdes;
 
         impl Serdes<String> for UpperSerdes {
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -1763,6 +2190,8 @@ mod tests {
                 Ok(value.to_uppercase())
             }
 
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -1795,6 +2224,8 @@ mod tests {
         struct DecimalSerdes;
 
         impl Serdes<i128> for DecimalSerdes {
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: i128,
@@ -1803,6 +2234,8 @@ mod tests {
                 Ok(value.to_string())
             }
 
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -1843,6 +2276,8 @@ mod tests {
         struct PassThrough;
 
         impl Serdes<Ordered> for PassThrough {
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: Ordered,
@@ -1851,6 +2286,8 @@ mod tests {
                 Ok(serde_json::to_string(&value)?)
             }
 
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -1972,10 +2409,7 @@ mod tests {
 
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
         let arn = traversal_arn("../../etc", "exec-1", "inv-1");
-        let ctx = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn: arn,
-        };
+        let ctx = SerdesContext::new("step-1".to_owned(), arn);
 
         let input = serde_json::json!({"data": "test"});
         let result = serdes.serialize_sync(&input, &ctx);
@@ -1986,7 +2420,8 @@ mod tests {
                 // If it succeeded, the file MUST be inside base_path.
                 let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
                 let file_path = parsed["file"].as_str().unwrap();
-                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_file =
+                    std::fs::canonicalize(tmp.join(file_path)).expect("file should exist");
                 let canonical_base = std::fs::canonicalize(&tmp).unwrap();
                 assert!(
                     canonical_file.starts_with(&canonical_base),
@@ -2013,10 +2448,7 @@ mod tests {
 
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
         let arn = traversal_arn("my-fn", "../../etc", "inv-1");
-        let ctx = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn: arn,
-        };
+        let ctx = SerdesContext::new("step-1".to_owned(), arn);
 
         let input = serde_json::json!({"data": "test"});
         let result = serdes.serialize_sync(&input, &ctx);
@@ -2025,7 +2457,8 @@ mod tests {
             Ok(envelope) => {
                 let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
                 let file_path = parsed["file"].as_str().unwrap();
-                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_file =
+                    std::fs::canonicalize(tmp.join(file_path)).expect("file should exist");
                 let canonical_base = std::fs::canonicalize(&tmp).unwrap();
                 assert!(
                     canonical_file.starts_with(&canonical_base),
@@ -2051,10 +2484,7 @@ mod tests {
 
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
         let arn = traversal_arn("my-fn", "exec-1", "../../etc");
-        let ctx = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn: arn,
-        };
+        let ctx = SerdesContext::new("step-1".to_owned(), arn);
 
         let input = serde_json::json!({"data": "test"});
         let result = serdes.serialize_sync(&input, &ctx);
@@ -2063,7 +2493,8 @@ mod tests {
             Ok(envelope) => {
                 let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
                 let file_path = parsed["file"].as_str().unwrap();
-                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_file =
+                    std::fs::canonicalize(tmp.join(file_path)).expect("file should exist");
                 let canonical_base = std::fs::canonicalize(&tmp).unwrap();
                 assert!(
                     canonical_file.starts_with(&canonical_base),
@@ -2092,10 +2523,7 @@ mod tests {
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
         // Use components with special chars that WILL be percent-encoded.
         let arn = traversal_arn("fn/special:chars", "exec name+here", "inv/id");
-        let ctx = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn: arn,
-        };
+        let ctx = SerdesContext::new("step-1".to_owned(), arn);
 
         let input = serde_json::json!({"round": "trip", "value": 99});
         let envelope = serdes
@@ -2124,16 +2552,14 @@ mod tests {
 
         // Test bare ".." in function_name
         let arn_fn = traversal_arn("..", "exec-1", "inv-1");
-        let ctx_fn = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn: arn_fn,
-        };
+        let ctx_fn = SerdesContext::new("step-1".to_owned(), arn_fn);
         let input = serde_json::json!({"test": "bare_dotdot"});
         match serdes.serialize_sync(&input, &ctx_fn) {
             Ok(envelope) => {
                 let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
                 let file_path = parsed["file"].as_str().unwrap();
-                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_file =
+                    std::fs::canonicalize(tmp.join(file_path)).expect("file should exist");
                 let canonical_base = std::fs::canonicalize(&tmp).unwrap();
                 assert!(
                     canonical_file.starts_with(&canonical_base),
@@ -2150,15 +2576,13 @@ mod tests {
 
         // Test bare ".." in execution_name
         let arn_exec = traversal_arn("my-fn", "..", "inv-1");
-        let ctx_exec = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn: arn_exec,
-        };
+        let ctx_exec = SerdesContext::new("step-1".to_owned(), arn_exec);
         match serdes.serialize_sync(&input, &ctx_exec) {
             Ok(envelope) => {
                 let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
                 let file_path = parsed["file"].as_str().unwrap();
-                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_file =
+                    std::fs::canonicalize(tmp.join(file_path)).expect("file should exist");
                 let canonical_base = std::fs::canonicalize(&tmp).unwrap();
                 assert!(
                     canonical_file.starts_with(&canonical_base),
@@ -2175,15 +2599,13 @@ mod tests {
 
         // Test bare ".." in invocation_id
         let arn_inv = traversal_arn("my-fn", "exec-1", "..");
-        let ctx_inv = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn: arn_inv,
-        };
+        let ctx_inv = SerdesContext::new("step-1".to_owned(), arn_inv);
         match serdes.serialize_sync(&input, &ctx_inv) {
             Ok(envelope) => {
                 let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
                 let file_path = parsed["file"].as_str().unwrap();
-                let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+                let canonical_file =
+                    std::fs::canonicalize(tmp.join(file_path)).expect("file should exist");
                 let canonical_base = std::fs::canonicalize(&tmp).unwrap();
                 assert!(
                     canonical_file.starts_with(&canonical_base),
@@ -2219,10 +2641,10 @@ mod tests {
         std::os::unix::fs::symlink(&outside, base.join("my-fn")).unwrap();
 
         let serdes = FileSystemSerdes::new(base.to_string_lossy().to_string());
-        let ctx = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn: traversal_arn("my-fn", "exec-1", "inv-1"),
-        };
+        let ctx = SerdesContext::new(
+            "step-1".to_owned(),
+            traversal_arn("my-fn", "exec-1", "inv-1"),
+        );
 
         let result = serdes.serialize_sync(&serde_json::json!({"data": "test"}), &ctx);
         let err = result.expect_err("symlink escape must be rejected");
@@ -2264,17 +2686,18 @@ mod tests {
         std::os::unix::fs::symlink(&real_base, &link_base).unwrap();
 
         let serdes = FileSystemSerdes::new(link_base.to_string_lossy().to_string());
-        let ctx = SerdesContext {
-            operation_id: "step-1".to_owned(),
-            durable_execution_arn: traversal_arn("my-fn", "exec-1", "inv-1"),
-        };
+        let ctx = SerdesContext::new(
+            "step-1".to_owned(),
+            traversal_arn("my-fn", "exec-1", "inv-1"),
+        );
 
         let envelope = serdes
             .serialize_sync(&serde_json::json!({"data": "test"}), &ctx)
             .expect("write through a symlinked base path must succeed");
         let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
         let file_path = parsed["file"].as_str().unwrap();
-        let canonical_file = std::fs::canonicalize(file_path).expect("file should exist");
+        let canonical_file =
+            std::fs::canonicalize(link_base.join(file_path)).expect("file should exist");
         let canonical_base = std::fs::canonicalize(&real_base).unwrap();
         assert!(
             canonical_file.starts_with(&canonical_base),
@@ -2282,5 +2705,320 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ================================================================
+    // Issue #46: immutable unique files, versioned envelope, origin
+    // gating, strict resolution under base_path
+    // ================================================================
+
+    /// Every serialize call must write a NEW file: a retried attempt must
+    /// never mutate the file an already-accepted checkpoint references.
+    #[test]
+    fn serialize_writes_unique_immutable_files() {
+        let tmp = std::env::temp_dir().join("fs_serdes_unique_files");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        // Same operation, same context — models a retry of the same op.
+        let ctx = SerdesContext::new(
+            "step-1",
+            "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e/i",
+        );
+
+        let first = serdes
+            .serialize_sync(&serde_json::json!(1), &ctx)
+            .expect("first serialize");
+        let second = serdes
+            .serialize_sync(&serde_json::json!(2), &ctx)
+            .expect("second serialize");
+
+        let first_path = serde_json::from_str::<serde_json::Value>(&first).unwrap()["file"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let second_path = serde_json::from_str::<serde_json::Value>(&second).unwrap()["file"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(
+            first_path, second_path,
+            "a second serialize of the same operation must not reuse the path"
+        );
+
+        // The first envelope still reads the ORIGINAL value: the second
+        // write did not touch the file the first envelope references.
+        let replayed: serde_json::Value = serdes
+            .deserialize_sync(&first, &ctx)
+            .expect("first envelope must stay readable");
+        assert_eq!(replayed, serde_json::json!(1));
+        let second_read: serde_json::Value =
+            serdes.deserialize_sync(&second, &ctx).expect("second");
+        assert_eq!(second_read, serde_json::json!(2));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The atomic-rename staging file must not survive a successful write.
+    #[test]
+    fn serialize_leaves_no_staging_files_behind() {
+        fn assert_no_tmp(dir: &std::path::Path) {
+            for entry in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    assert_no_tmp(&path);
+                } else {
+                    assert!(
+                        path.extension().is_none_or(|ext| ext != "tmp"),
+                        "staging file left behind: {path:?}"
+                    );
+                }
+            }
+        }
+
+        let tmp = std::env::temp_dir().join("fs_serdes_no_staging");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let ctx = SerdesContext::new(
+            "step-1",
+            "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e/i",
+        );
+        serdes
+            .serialize_sync(&serde_json::json!({"k": "v"}), &ctx)
+            .expect("serialize");
+
+        assert_no_tmp(&tmp);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An externally delivered payload must NEVER be honored as a file
+    /// reference — neither in the legacy shape nor with a spoofed
+    /// versioned marker. It parses directly as the value.
+    #[test]
+    fn external_origin_never_resolves_file_references() {
+        let tmp = std::env::temp_dir().join("fs_serdes_external_no_file");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Plant a real, readable file under base_path: even a reference an
+        // SDK record COULD legitimately resolve must not resolve when the
+        // payload came from an external caller.
+        let secret = tmp.join("secret.json");
+        std::fs::write(&secret, r#""the file contents""#).unwrap();
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let ctx = SerdesContext::new("cb-1", "arn:test").with_origin(PayloadOrigin::External);
+
+        // Legacy-shaped reference.
+        let legacy = format!(r#"{{"file":"{}"}}"#, secret.to_string_lossy());
+        let out: serde_json::Value = serdes
+            .deserialize_sync(&legacy, &ctx)
+            .expect("external payload parses as its own JSON");
+        assert_eq!(
+            out,
+            serde_json::json!({"file": secret.to_string_lossy()}),
+            "the payload must come back as data, not as the file's contents"
+        );
+
+        // Spoofed versioned marker.
+        let spoofed = file_envelope("secret.json");
+        let out: serde_json::Value = serdes
+            .deserialize_sync(&spoofed, &ctx)
+            .expect("external payload parses as its own JSON");
+        assert!(
+            out.get("__aws_durable_serdes").is_some(),
+            "spoofed marker must come back as plain data: {out}"
+        );
+        assert_ne!(out, serde_json::json!("the file contents"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A realistic external payload that happens to contain a `file` key
+    /// (the misparse from the issue) deserializes as the full value.
+    #[test]
+    fn external_inline_payload_with_file_key_parses_as_value() {
+        let serdes = FileSystemSerdes::new("/unused-base");
+        let ctx = SerdesContext::new("cb-1", "arn:test").with_origin(PayloadOrigin::External);
+
+        let payload = r#"{"file": "/tmp/result.json", "data": {"status": "ready"}}"#;
+        let out: serde_json::Value = serdes
+            .deserialize_sync(payload, &ctx)
+            .expect("must parse as the value");
+        assert_eq!(
+            out,
+            serde_json::json!({"file": "/tmp/result.json", "data": {"status": "ready"}})
+        );
+    }
+
+    /// An SDK-written INLINE value containing `file`/`data` keys cannot
+    /// collide with the envelope: the reserved marker key disambiguates.
+    #[test]
+    fn inline_value_containing_file_key_round_trips() {
+        let tmp = std::env::temp_dir().join("fs_serdes_inline_file_key");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let config = FileSystemSerdesConfig::builder()
+            .storage_mode(FileSystemSerdesMode::Overflow)
+            .overflow_threshold_bytes(4096)
+            .build();
+        let serdes = FileSystemSerdes::with_config(tmp.to_string_lossy().to_string(), config);
+        let ctx = SerdesContext::new("op", "arn:test");
+
+        let value = serde_json::json!({"file": "/tmp/result.json", "data": {"status": "ready"}});
+        let envelope = serdes.serialize_sync(&value, &ctx).expect("serialize");
+        assert!(
+            envelope.contains(r#""__aws_durable_serdes""#),
+            "inline envelope must carry the marker: {envelope}"
+        );
+
+        let out: serde_json::Value = serdes
+            .deserialize_sync(&envelope, &ctx)
+            .expect("deserialize");
+        assert_eq!(
+            out, value,
+            "the value's own 'file' key must not be read as a file reference"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Versioned file references must be relative and must stay under
+    /// `base_path`: absolute paths and `..` escapes are rejected.
+    #[test]
+    fn file_reference_escaping_base_rejected() {
+        let tmp = std::env::temp_dir().join("fs_serdes_ref_escape");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let ctx = SerdesContext::new("op", "arn:test");
+
+        // Absolute path in a versioned envelope.
+        let absolute = file_envelope("/etc/hostname");
+        let err = serdes
+            .deserialize_sync::<serde_json::Value>(&absolute, &ctx)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must be relative"),
+            "unexpected error: {err}"
+        );
+
+        // Traversal escape in a versioned envelope.
+        let escape = file_envelope("../outside.json");
+        let err = serdes
+            .deserialize_sync::<serde_json::Value>(&escape, &ctx)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("escapes base_path"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Legacy (marker-less) file pointers from SDK records written by
+    /// earlier versions still read — but only from under `base_path`.
+    #[test]
+    fn legacy_file_envelope_strictly_contained() {
+        let tmp = std::env::temp_dir().join("fs_serdes_legacy_containment");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let ctx = SerdesContext::new("op", "arn:test");
+
+        // A genuine legacy record: absolute path under base_path.
+        let inside = tmp.join("legacy-op.json");
+        std::fs::write(&inside, r#"{"legacy": true}"#).unwrap();
+        let legacy_ok = format!(r#"{{"file":"{}"}}"#, inside.to_string_lossy());
+        let out: serde_json::Value = serdes
+            .deserialize_sync(&legacy_ok, &ctx)
+            .expect("legacy record under base_path must stay readable");
+        assert_eq!(out, serde_json::json!({"legacy": true}));
+
+        // A legacy-shaped record pointing outside base_path is rejected,
+        // even though the file exists and is readable.
+        let outside_dir = std::env::temp_dir().join("fs_serdes_legacy_outside");
+        let _ = std::fs::remove_dir_all(&outside_dir);
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("outside.json");
+        std::fs::write(&outside, r#""outside""#).unwrap();
+        let legacy_escape = format!(r#"{{"file":"{}"}}"#, outside.to_string_lossy());
+        let err = serdes
+            .deserialize_sync::<serde_json::Value>(&legacy_escape, &ctx)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("escapes base_path"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&outside_dir);
+    }
+
+    /// A symlink under `base_path` must not let a FILE READ escape: the
+    /// final component is canonicalized before containment is judged.
+    #[cfg(unix)]
+    #[test]
+    fn file_read_through_symlink_escape_rejected() {
+        let root = std::env::temp_dir().join("fs_serdes_read_symlink");
+        let _ = std::fs::remove_dir_all(&root);
+        let base = root.join("base");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("target.json"), r#""escaped""#).unwrap();
+        std::os::unix::fs::symlink(outside.join("target.json"), base.join("link.json")).unwrap();
+
+        let serdes = FileSystemSerdes::new(base.to_string_lossy().to_string());
+        let ctx = SerdesContext::new("op", "arn:test");
+
+        let envelope = file_envelope("link.json");
+        let err = serdes
+            .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("escapes base_path"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An envelope from a FUTURE format version fails loudly instead of
+    /// being misread.
+    #[test]
+    fn unknown_envelope_version_rejected() {
+        let serdes = FileSystemSerdes::new("/unused-base");
+        let ctx = SerdesContext::new("op", "arn:test");
+
+        let future = r#"{"__aws_durable_serdes":{"version":2,"kind":"inline"},"value":1}"#;
+        let err = serdes
+            .deserialize_sync::<serde_json::Value>(future, &ctx)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported envelope version 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An unknown envelope kind fails loudly.
+    #[test]
+    fn unknown_envelope_kind_rejected() {
+        let serdes = FileSystemSerdes::new("/unused-base");
+        let ctx = SerdesContext::new("op", "arn:test");
+
+        let chunked = r#"{"__aws_durable_serdes":{"version":1,"kind":"chunked"},"value":1}"#;
+        let err = serdes
+            .deserialize_sync::<serde_json::Value>(chunked, &ctx)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported envelope kind 'chunked'"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -647,8 +647,14 @@ operation outputs at `Send` (not `Sync`): the serdes can move the whole
 call into a `'static` blocking task without borrowing across an `.await`.
 
 `FileSystemSerdes` stores payloads on a durable shared filesystem (Amazon EFS
-or S3 Files mounted to Lambda), resolving a deterministic path from the
-`SerdesContext` so replay finds the same file. Each `serialize` or
+or S3 Files mounted to Lambda). Every write goes to a new, unique file
+(atomically renamed into place) under a directory resolved from the
+`SerdesContext`, and the checkpoint envelope records which file to read on
+replay — so a retried attempt can never overwrite a file an accepted
+checkpoint references. File references are only honored from records the SDK
+itself wrote, resolved strictly under the configured base path; externally
+delivered payloads (callback completions) are always read as plain values.
+Each `serialize` or
 `deserialize` call runs its complete implementation — JSON rendering or
 parsing, path resolution, and the file I/O — inside one
 `tokio::task::spawn_blocking` task, so the executor thread never touches

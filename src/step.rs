@@ -875,6 +875,8 @@ mod tests {
     async fn serialize_with_custom_serdes_uppercases() {
         struct Upper;
         impl Serdes<String> for Upper {
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -882,6 +884,8 @@ mod tests {
             ) -> Result<String, BoxError> {
                 Ok(serde_json::to_string(&value)?.to_uppercase())
             }
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -1012,6 +1016,8 @@ mod tests {
         // the generic trait; per-operation configuration is the only path.
         struct Upper;
         impl Serdes<String> for Upper {
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -1019,6 +1025,8 @@ mod tests {
             ) -> Result<String, BoxError> {
                 Ok(serde_json::to_string(&value)?.to_uppercase())
             }
+            // reason: exercises the async-fn impl form user code writes
+            #[allow(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,

@@ -27,7 +27,7 @@ use crate::error::{
     OperationErrorKind,
 };
 use crate::future::Callback;
-use crate::serdes::{Serdes, SerdesContext};
+use crate::serdes::{PayloadOrigin, Serdes, SerdesContext};
 
 /// Wire sub-type for callback operations.
 pub(crate) const CALLBACK_SUB_TYPE: &str = "Callback";
@@ -664,14 +664,17 @@ fn callback_deser_error_msg(message: String) -> OperationError {
 ///
 /// The payload is produced by an external caller, so only the deserialize
 /// side of the serdes is meaningful: the configured serdes turns the wire
-/// payload directly into `O`.
+/// payload directly into `O`. The context is marked
+/// [`PayloadOrigin::External`] here, at the boundary, so a serdes with
+/// storage indirection (e.g. `FileSystemSerdes`) never honors a file
+/// reference an external caller delivered.
 pub(crate) async fn deserialize_callback_result<O, S: Serdes<O>>(
     serdes: &S,
     payload: String,
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
     serdes
-        .deserialize(payload, serdes_ctx)
+        .deserialize(payload, serdes_ctx.with_origin(PayloadOrigin::External))
         .await
         .map_err(|e| callback_deser_error_msg(format!("callback serdes: {e}")))
 }
@@ -1459,10 +1462,14 @@ mod tests {
     where
         T: Serialize + DeserializeOwned + Send + 'static,
     {
+        // reason: exercises the async-fn impl form user code writes
+        #[allow(clippy::unused_async_trait_impl)]
         async fn serialize(&self, value: T, _context: SerdesContext) -> Result<String, BoxError> {
             Ok(format!("MARK:{}", serde_json::to_string(&value)?))
         }
 
+        // reason: exercises the async-fn impl form user code writes
+        #[allow(clippy::unused_async_trait_impl)]
         async fn deserialize(&self, wire: String, _context: SerdesContext) -> Result<T, BoxError> {
             let body = wire
                 .strip_prefix("MARK:")
@@ -1543,6 +1550,76 @@ mod tests {
         let cb = exec.execute().await.expect("should settle");
         let value = cb.result().await.expect("probe serdes should decode");
         assert_eq!(value, doc);
+    }
+
+    /// ISSUE #46: an externally delivered callback payload must never be
+    /// honored as a `FileSystemSerdes` file reference. A payload shaped
+    /// like a file pointer — even one naming a real, readable file under
+    /// `base_path` — decodes as plain data, and a realistic inline payload
+    /// containing a `file` key is not misparsed.
+    #[tokio::test]
+    #[allow(clippy::indexing_slicing)] // reason: test assertions on known JSON keys
+    async fn callback_payload_never_resolves_file_references() {
+        use crate::serdes::FileSystemSerdes;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "cb_no_file_refs_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create temp base");
+        std::fs::write(tmp.join("secret.json"), r#""stolen contents""#).expect("plant file");
+
+        let filesystem_serdes = FileSystemSerdes::new(tmp.to_string_lossy().into_owned());
+
+        // The external caller delivered a payload that LOOKS like a file
+        // pointer (legacy shape). It must come back as data.
+        let payload = format!(
+            r#"{{"file":"{}","data":{{"status":"ready"}}}}"#,
+            tmp.join("secret.json").to_string_lossy()
+        );
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            Some(&payload),
+            None,
+            None,
+            Some("cb-ext"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<serde_json::Value, _> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            serdes: filesystem_serdes,
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should settle");
+        let value = cb.result().await.expect("external payload decodes as data");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            value["data"],
+            serde_json::json!({"status": "ready"}),
+            "inline payload with a 'file' key must not be misparsed"
+        );
+        assert_eq!(
+            value["file"],
+            serde_json::json!(tmp.join("secret.json").to_string_lossy()),
+            "the 'file' key is plain data"
+        );
+        assert_ne!(
+            value,
+            serde_json::json!("stolen contents"),
+            "an external payload must never trigger a local file read"
+        );
     }
 
     #[tokio::test]

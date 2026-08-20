@@ -617,6 +617,8 @@ async fn rejected_checkpoint_emits_no_record_transition_event() {
 struct FailOnReplayDeserializeSerdes(Arc<std::sync::atomic::AtomicU32>);
 
 impl durable::Serdes<u32> for FailOnReplayDeserializeSerdes {
+    // reason: exercises the async-fn impl form user code writes
+    #[allow(clippy::unused_async_trait_impl)]
     async fn serialize(
         &self,
         value: u32,
@@ -625,6 +627,8 @@ impl durable::Serdes<u32> for FailOnReplayDeserializeSerdes {
         Ok(serde_json::to_string(&value)?)
     }
 
+    // reason: exercises the async-fn impl form user code writes
+    #[allow(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         wire: String,

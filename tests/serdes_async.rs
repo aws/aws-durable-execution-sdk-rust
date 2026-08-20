@@ -100,7 +100,12 @@ async fn step_round_trips_through_filesystem_across_replay() {
         .get("file")
         .and_then(serde_json::Value::as_str)
         .expect("Always mode must store a file pointer");
-    let on_disk = std::fs::read_to_string(file_path).expect("pointed-at file must exist");
+    assert!(
+        !std::path::Path::new(file_path).is_absolute(),
+        "the pointer must be relative to base_path: {file_path}"
+    );
+    let on_disk = std::fs::read_to_string(std::path::Path::new(&base.path()).join(file_path))
+        .expect("pointed-at file must exist");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&on_disk).expect("file holds JSON"),
         serde_json::json!("stored on the filesystem"),
@@ -145,6 +150,8 @@ impl Serdes<u32> for ExecutorProbeSerdes {
         .map_err(|e| -> durable::BoxError { format!("join error: {e}").into() })?
     }
 
+    // reason: exercises the async-fn impl form user code writes
+    #[allow(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         wire: String,
@@ -204,6 +211,8 @@ async fn serdes_call_does_not_block_the_executor() {
 struct PrefixSerdes;
 
 impl Serdes<u32> for PrefixSerdes {
+    // reason: exercises the async-fn impl form user code writes
+    #[allow(clippy::unused_async_trait_impl)]
     async fn serialize(
         &self,
         value: u32,
@@ -212,6 +221,8 @@ impl Serdes<u32> for PrefixSerdes {
         Ok(format!("N:{value}"))
     }
 
+    // reason: exercises the async-fn impl form user code writes
+    #[allow(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         wire: String,
@@ -348,6 +359,8 @@ struct NoSerde {
 struct NoSerdeSerdes;
 
 impl Serdes<NoSerde> for NoSerdeSerdes {
+    // reason: exercises the async-fn impl form user code writes
+    #[allow(clippy::unused_async_trait_impl)]
     async fn serialize(
         &self,
         value: NoSerde,
@@ -356,6 +369,8 @@ impl Serdes<NoSerde> for NoSerdeSerdes {
         Ok(value.text)
     }
 
+    // reason: exercises the async-fn impl form user code writes
+    #[allow(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         wire: String,
