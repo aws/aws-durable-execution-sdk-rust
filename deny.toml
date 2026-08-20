@@ -90,4 +90,10 @@ ignore = [
     "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints
     "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints
     "RUSTSEC-2026-0104", # rustls-webpki: CRL parsing panic
+    # h2: unbounded empty DATA frames (low severity). Patched only in
+    # h2 >= 0.4.16 (our 0.4 line is updated past it); the 0.3 line has no
+    # patched release and rides in via aws-smithy-http-client's legacy
+    # hyper-0.14 support. Remove when smithy drops the hyper-0.14 chain
+    # or upstream ships a patched h2 0.3.
+    "RUSTSEC-2026-0258",
 ]
