@@ -660,7 +660,7 @@ impl<O: Send + 'static> Callback<O> {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // reason: test assertions
+#[expect(clippy::panic)] // reason: test assertions
 mod tests {
     use super::*;
     use crate::engine::CheckpointLog;

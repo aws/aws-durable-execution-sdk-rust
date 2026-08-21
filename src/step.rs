@@ -91,8 +91,8 @@ pub(crate) fn quantize_delay_secs(jittered: f64, jitter: JitterStrategy) -> u64 
         JitterStrategy::Full => jittered.round(),
         JitterStrategy::None | JitterStrategy::Half => jittered.ceil(),
     };
-    #[allow(clippy::cast_possible_truncation)] // reason: delays are far below u64::MAX seconds
-    #[allow(clippy::cast_sign_loss)] // reason: quantized ≥ 0
+    #[expect(clippy::cast_possible_truncation)] // reason: delays are far below u64::MAX seconds
+    #[expect(clippy::cast_sign_loss)] // reason: quantized ≥ 0
     {
         quantized.max(1.0) as u64
     }
@@ -118,7 +118,7 @@ pub(crate) fn rand_full_jitter(max_secs: f64) -> f64 {
         .hash(&mut hasher);
     let bits = hasher.finish();
     // Map u64 to [0.0, 1.0)
-    #[allow(clippy::cast_precision_loss)] // reason: approximation is fine for jitter
+    #[expect(clippy::cast_precision_loss)] // reason: approximation is fine for jitter
     let fraction = (bits as f64) / (u64::MAX as f64);
     fraction * max_secs
 }
@@ -293,7 +293,7 @@ where
 {
     /// Runs everything that precedes the user closure: replay path, or the
     /// live-path preamble ending at the START checkpoint.
-    #[allow(clippy::too_many_lines)] // reason: validation adds lines but splitting would obscure flow
+    #[expect(clippy::too_many_lines)] // reason: validation adds lines but splitting would obscure flow
     async fn before(self) -> Result<StepPrelude<O, S>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -653,7 +653,7 @@ fn build_start_update(
     }
 
     // build() is infallible here — all required fields (id, type, action) set.
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -680,7 +680,7 @@ fn build_succeed_update(
         builder = builder.parent_id(parent);
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -713,7 +713,7 @@ fn build_retry_update(
         builder = builder.parent_id(parent);
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -740,7 +740,7 @@ fn build_fail_update(
         builder = builder.parent_id(parent);
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -836,9 +836,7 @@ fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationErro
 const STEP_FALLBACK_ERROR_TYPE: &str = "Error";
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
-#[allow(clippy::expect_used)] // reason: test assertions
-#[allow(clippy::panic)] // reason: test assertions with descriptive messages
+#[expect(clippy::panic)] // reason: test assertions with descriptive messages
 mod tests {
     use super::*;
     use crate::context::DurableContext;
@@ -926,7 +924,7 @@ mod tests {
         struct Upper;
         impl Serdes<String> for Upper {
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -935,7 +933,7 @@ mod tests {
                 Ok(serde_json::to_string(&value)?.to_uppercase())
             }
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -1037,7 +1035,7 @@ mod tests {
         struct Upper;
         impl Serdes<String> for Upper {
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -1046,7 +1044,7 @@ mod tests {
                 Ok(serde_json::to_string(&value)?.to_uppercase())
             }
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -1470,7 +1468,6 @@ mod tests {
 
         // Must create the context inside a spawned task where try_id()
         // returns Some — #[tokio::test] root runs in block_on with no task ID.
-        #[allow(clippy::unwrap_used)] // reason: test code
         let result = tokio::spawn(async {
             let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
             let log = Arc::new(CheckpointLog::empty());
@@ -1505,10 +1502,8 @@ mod tests {
         })
         .await;
 
-        #[allow(clippy::unwrap_used)] // reason: test code
         let inner_result = result.unwrap();
         assert!(inner_result.is_err());
-        #[allow(clippy::unwrap_used)] // reason: test — verified Err above
         let err_msg = format!("{:#}", inner_result.unwrap_err());
         assert!(
             err_msg.contains("task") || err_msg.contains("ownership"),

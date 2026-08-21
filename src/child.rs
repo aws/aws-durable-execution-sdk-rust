@@ -424,7 +424,7 @@ fn build_update(
     }
 
     // build() is infallible here — all required fields (id, type, action) set.
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -463,7 +463,7 @@ fn build_succeed_update(
     } else {
         succeed_builder = succeed_builder.payload(serialized.to_owned());
     }
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     succeed_builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -526,7 +526,7 @@ fn build_child_fail_update(
     if let Some(parent_wire) = ctx.parent_wire_id_computed() {
         fail_builder = fail_builder.parent_id(parent_wire);
     }
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     fail_builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -610,7 +610,6 @@ fn child_internal_error(message: &str) -> OperationError {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)] // reason: test assertions
 mod tests {
     use super::*;
     use crate::context::DurableContext;
@@ -709,7 +708,6 @@ mod tests {
                 Ok(step_result)
             })
             .await;
-        #[allow(clippy::unwrap_used)] // reason: test assertion
         let value = result.unwrap();
         assert_eq!(value, 42);
     }
@@ -727,7 +725,6 @@ mod tests {
             })
             .await;
 
-        #[allow(clippy::unwrap_used)] // reason: test assertion
         let value = result.unwrap();
         assert_eq!(value, "hello");
     }
@@ -767,7 +764,6 @@ mod tests {
             })
             .await;
 
-        #[allow(clippy::unwrap_used)] // reason: test assertion
         let value = result.unwrap();
         assert_eq!(value, "outer");
     }

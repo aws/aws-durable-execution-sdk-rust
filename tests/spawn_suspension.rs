@@ -12,7 +12,7 @@
 //! its own suspension scope, so a losing park stays isolated.
 
 #![cfg(feature = "test-util")]
-#![allow(clippy::expect_used)] // reason: test assertions
+#![expect(clippy::expect_used)] // reason: test assertions
 
 use std::time::Duration;
 

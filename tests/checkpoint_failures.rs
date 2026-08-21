@@ -15,7 +15,7 @@
 //! service re-invokes, and the execution converges on the re-run.
 
 #![cfg(feature = "test-util")]
-#![allow(clippy::expect_used, clippy::indexing_slicing)] // reason: test assertions
+#![expect(clippy::expect_used, clippy::indexing_slicing)] // reason: test assertions
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -168,7 +168,7 @@ struct AlwaysFailSerialize;
 
 impl durable::Serdes<String> for AlwaysFailSerialize {
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn serialize(
         &self,
         _value: String,
@@ -178,7 +178,7 @@ impl durable::Serdes<String> for AlwaysFailSerialize {
     }
 
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         wire: String,
@@ -361,7 +361,7 @@ struct FailSerialize;
 
 impl<T: Send + 'static> durable::Serdes<T> for FailSerialize {
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn serialize(
         &self,
         _value: T,
@@ -371,7 +371,7 @@ impl<T: Send + 'static> durable::Serdes<T> for FailSerialize {
     }
 
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         _wire: String,

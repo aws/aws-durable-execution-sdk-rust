@@ -759,7 +759,6 @@ impl LocalRunner {
     /// assert_eq!(result.output(), Some(&42));
     /// # }
     /// ```
-    #[allow(clippy::too_many_lines)] // reason: the invoke → drive → advance loop reads better as one flow
     pub async fn run<E, O, F, Fut>(&self, handler: F, event: E) -> TestResult<O>
     where
         E: Serialize + DeserializeOwned + Send + 'static,
@@ -790,7 +789,7 @@ impl LocalRunner {
     /// backend. Internal seam: unit tests inject a backend they retain a
     /// handle to, so they can assert on transport-level facts (e.g. how
     /// many `get_state` fetches pagination forced).
-    #[allow(clippy::too_many_lines)] // reason: the invoke → drive → advance loop reads better as one flow
+    #[expect(clippy::too_many_lines)] // reason: the invoke → drive → advance loop reads better as one flow
     async fn run_on_backend<E, O, F, Fut>(
         &self,
         backend: Arc<Backend>,
@@ -1219,7 +1218,7 @@ impl CloudRunner {
     /// assert!(result.is_success() || result.is_failure() || result.is_suspended());
     /// # }
     /// ```
-    #[allow(clippy::too_many_lines)] // reason: the invoke → poll → history → fold flow reads better as one sequence
+    #[expect(clippy::too_many_lines)] // reason: the invoke → poll → history → fold flow reads better as one sequence
     pub async fn run<E, O>(&self, event: E) -> TestResult<O>
     where
         E: Serialize,
@@ -2356,9 +2355,7 @@ fn operation_status_wire_str(s: &OperationStatus) -> &'static str {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
-#[allow(clippy::expect_used)] // reason: test assertions
-#[allow(clippy::indexing_slicing)] // reason: test assertions index known-length op vectors
+#[expect(clippy::indexing_slicing)] // reason: test assertions index known-length op vectors
 mod tests {
     use super::*;
     use crate::builders::map_parallel::CompletionConfig;

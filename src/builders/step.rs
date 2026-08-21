@@ -317,8 +317,6 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
-#[allow(clippy::expect_used)] // reason: test assertions
 mod tests {
     use std::time::Duration;
 

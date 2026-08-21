@@ -463,7 +463,6 @@ impl ExecutionClient for InMemoryExecutionClient {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *counter += 1;
-                #[allow(clippy::expect_used)] // reason: test double — valid builder input
                 Operation::builder()
                     .id(u.id())
                     .r#type(OperationType::Callback)
@@ -583,7 +582,7 @@ impl ExecutionClient for InMemoryExecutionClient {
 /// Converts a single SDK `Operation` into a `(wire_id, CheckpointRecord)` pair.
 fn operation_to_record(op: &Operation) -> (String, CheckpointRecord) {
     let attempt = op.step_details.as_ref().map_or(0, |s| {
-        #[allow(clippy::cast_sign_loss)] // reason: attempt is non-negative from backend
+        #[expect(clippy::cast_sign_loss)] // reason: attempt is non-negative from backend
         {
             s.attempt.max(0) as u32
         }
@@ -847,7 +846,6 @@ mod tests {
     use aws_smithy_mocks::{RuleMode, mock, mock_client};
 
     /// Builds a minimal `OperationUpdate` for request-mapping assertions.
-    #[allow(clippy::expect_used)] // reason: test helper — all required fields are set
     fn make_update(id: &str, action: OperationAction) -> OperationUpdate {
         OperationUpdate::builder()
             .id(id)
@@ -861,7 +859,6 @@ mod tests {
     /// request — ARN, token, and every update — and maps the response's
     /// token, updated operations, and pagination marker back out.
     #[tokio::test]
-    #[allow(clippy::expect_used)] // reason: test assertions
     async fn checkpoint_maps_request_and_response() {
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
             .match_requests(|req| {
@@ -907,7 +904,6 @@ mod tests {
     /// A checkpoint response without a token is a protocol violation and
     /// maps to a non-retryable `ClientError`.
     #[tokio::test]
-    #[allow(clippy::expect_used)] // reason: test assertions
     async fn checkpoint_without_token_is_non_retryable() {
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
             .then_output(|| CheckpointDurableExecutionOutput::builder().build());
@@ -928,7 +924,6 @@ mod tests {
     /// rejection, so the recovery is a terminal `FAIL` write followed by
     /// failing the execution, not another lap.
     #[tokio::test]
-    #[allow(clippy::expect_used)] // reason: test assertions
     async fn checkpoint_final_error_maps_to_non_retryable_client_error() {
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution).then_error(|| {
             CheckpointDurableExecutionError::InvalidParameterValueException(
@@ -952,7 +947,6 @@ mod tests {
     /// used to multiply it to — and the exhausted call maps to a retryable
     /// `ClientError`.
     #[tokio::test]
-    #[allow(clippy::expect_used)] // reason: test assertions
     async fn checkpoint_retry_is_the_sdk_standard_retry_alone() {
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
             .sequence()
@@ -978,7 +972,6 @@ mod tests {
     /// the first page, echoes the response's `next_marker` as the next
     /// request's `marker`, and concatenates the pages in order.
     #[tokio::test]
-    #[allow(clippy::expect_used)] // reason: test assertions
     async fn get_state_paginates_with_marker() {
         let first_page = mock!(aws_sdk_lambda::Client::get_durable_execution_state)
             .match_requests(|req| {
@@ -1023,7 +1016,6 @@ mod tests {
     /// A `get_state` failure maps into a retryable `ClientError` exactly
     /// like a checkpoint failure.
     #[tokio::test]
-    #[allow(clippy::expect_used)] // reason: test assertions
     async fn get_state_final_error_maps_to_retryable_client_error() {
         let rule = mock!(aws_sdk_lambda::Client::get_durable_execution_state).then_error(|| {
             GetDurableExecutionStateError::InvalidParameterValueException(
@@ -1050,12 +1042,10 @@ mod tests {
         client.enqueue_checkpoint_response(TestResponse::Success(Vec::new()));
 
         let first = client.checkpoint("arn:test", "token-0", Vec::new()).await;
-        #[allow(clippy::unwrap_used)] // reason: test assertion — err verified above
         let first_err = first.unwrap_err();
         assert!(first_err.is_retryable());
 
         let second = client.checkpoint("arn:test", "token-0", Vec::new()).await;
-        #[allow(clippy::unwrap_used)] // reason: test assertion — err verified above
         let second_err = second.unwrap_err();
         assert!(!second_err.is_retryable());
 
@@ -1075,7 +1065,6 @@ mod tests {
         let result = client.checkpoint("arn:test", "token-0", Vec::new()).await;
 
         assert!(result.is_ok());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — ok verified above
         let output = result.unwrap();
         assert!(output.checkpoint_token.starts_with("token-"));
     }
@@ -1084,7 +1073,6 @@ mod tests {
 
     #[test]
     fn checkpoint_log_from_operations_maps_statuses() {
-        #[allow(clippy::unwrap_used)] // reason: test — builder is infallible for valid input
         let ops = vec![
             Operation::builder()
                 .id("op-1")
@@ -1123,7 +1111,6 @@ mod tests {
 
         let r1 = log.get("op-1");
         assert!(r1.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let r1 = r1.unwrap();
         assert_eq!(r1.status, CheckpointStatus::Succeeded);
         assert_eq!(r1.result.as_deref(), Some(r#""hello""#));
@@ -1131,7 +1118,6 @@ mod tests {
 
         let r2 = log.get("op-2");
         assert!(r2.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let r2 = r2.unwrap();
         assert_eq!(r2.status, CheckpointStatus::Failed);
         assert_eq!(r2.error_type.as_deref(), Some("StepError"));
@@ -1146,7 +1132,6 @@ mod tests {
     /// the generic `result` / `error_*` fields.
     #[test]
     fn chained_invoke_maps_to_invoke_specific_fields() {
-        #[allow(clippy::unwrap_used)] // reason: test — builder is infallible for valid input
         let ops = vec![
             Operation::builder()
                 .id("invoke-ok")
@@ -1183,7 +1168,6 @@ mod tests {
 
         let ok = log.get("invoke-ok");
         assert!(ok.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let ok = ok.unwrap();
         assert_eq!(ok.invoke_result.as_deref(), Some(r#""invoke-payload""#));
         assert_eq!(
@@ -1193,7 +1177,6 @@ mod tests {
 
         let err = log.get("invoke-err");
         assert!(err.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let err = err.unwrap();
         assert_eq!(err.invoke_error_type.as_deref(), Some("InvokeError"));
         assert_eq!(
@@ -1212,7 +1195,6 @@ mod tests {
     /// for correct replay — matching the inline JSON conversion.
     #[test]
     fn context_replay_children_is_preserved() {
-        #[allow(clippy::unwrap_used)] // reason: test — builder is infallible for valid input
         let ops = vec![
             Operation::builder()
                 .id("child-replay")
@@ -1244,7 +1226,6 @@ mod tests {
 
         let replayed = log.get("child-replay");
         assert!(replayed.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let replayed = replayed.unwrap();
         assert!(
             replayed.replay_children,
@@ -1253,7 +1234,6 @@ mod tests {
 
         let inline = log.get("child-inline");
         assert!(inline.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let inline = inline.unwrap();
         assert!(!inline.replay_children);
         assert_eq!(inline.result.as_deref(), Some(r#""child-result""#));
@@ -1263,7 +1243,6 @@ mod tests {
     /// conversion, matching `parse_inline_operations` in the JSON path.
     #[test]
     fn execution_operations_are_filtered_from_log() {
-        #[allow(clippy::unwrap_used)] // reason: test — builder is infallible for valid input
         let ops = vec![
             Operation::builder()
                 .id("exec-0")
@@ -1294,7 +1273,6 @@ mod tests {
 
     #[tokio::test]
     async fn get_state_returns_preloaded_operations() {
-        #[allow(clippy::unwrap_used)] // reason: test — builder is infallible for valid input
         let ops = vec![
             Operation::builder()
                 .id("op-1")
@@ -1309,7 +1287,6 @@ mod tests {
         let result = client.get_state("arn:test", "token-0").await;
 
         assert!(result.is_ok());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — ok verified above
         let output = result.unwrap();
         assert_eq!(output.operations.len(), 1);
         assert_eq!(output.operations.first().map(Operation::id), Some("op-1"));
@@ -1345,7 +1322,6 @@ mod tests {
         )]);
 
         // Backend returns the operation with callback_id assigned.
-        #[allow(clippy::unwrap_used)] // reason: test — builder is infallible for valid input
         let updated_ops = vec![
             Operation::builder()
                 .id("op-cb")
@@ -1365,7 +1341,6 @@ mod tests {
 
         let record = log.get("op-cb");
         assert!(record.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let record = record.unwrap();
         assert_eq!(record.callback_id.as_deref(), Some("assigned-cb-id-42"));
         assert_eq!(record.status, CheckpointStatus::Pending);
@@ -1376,7 +1351,6 @@ mod tests {
         let log = CheckpointLog::empty();
 
         // Backend returns a new operation not previously in the log.
-        #[allow(clippy::unwrap_used)] // reason: test — builder is infallible for valid input
         let updated_ops = vec![
             Operation::builder()
                 .id("new-op")
@@ -1396,7 +1370,6 @@ mod tests {
 
         let record = log.get("new-op");
         assert!(record.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let record = record.unwrap();
         assert_eq!(record.status, CheckpointStatus::Succeeded);
         assert_eq!(record.result.as_deref(), Some(r#""merged result""#));
@@ -1405,7 +1378,6 @@ mod tests {
     // ── Pagination tests ────────────────────────────────────────────────
 
     /// Helper: builds a Step operation with a result for pagination tests.
-    #[allow(clippy::unwrap_used)] // reason: test helper
     fn make_step_op(id: &str, result: &str) -> Operation {
         Operation::builder()
             .id(id)
@@ -1434,7 +1406,6 @@ mod tests {
 
         let state = client.get_state("arn:test", "token-0").await;
         assert!(state.is_ok());
-        #[allow(clippy::unwrap_used)]
         let state = state.unwrap();
         assert_eq!(state.operations.len(), 3);
     }
@@ -1460,7 +1431,6 @@ mod tests {
 
         let result = client.checkpoint("arn:test", "token-0", vec![]).await;
         assert!(result.is_ok());
-        #[allow(clippy::unwrap_used)]
         let output = result.unwrap();
         assert_eq!(output.updated_operations.len(), 1);
         assert_eq!(output.next_marker, Some("marker-page-2".to_owned()));
@@ -1468,7 +1438,6 @@ mod tests {
         // Caller should then call get_state to get all operations.
         let full_state = client.get_state("arn:test", &output.checkpoint_token).await;
         assert!(full_state.is_ok());
-        #[allow(clippy::unwrap_used)]
         let full_state = full_state.unwrap();
         assert_eq!(full_state.operations.len(), 3);
     }
@@ -1490,12 +1459,10 @@ mod tests {
         assert!(log.get("step-2").is_some());
         assert!(log.get("step-3").is_some());
 
-        #[allow(clippy::unwrap_used)]
         let r1 = log.get("step-1").unwrap();
         assert_eq!(r1.result.as_deref(), Some("\"result-1\""));
         assert_eq!(r1.status, CheckpointStatus::Succeeded);
 
-        #[allow(clippy::unwrap_used)]
         let r3 = log.get("step-3").unwrap();
         assert_eq!(r3.result.as_deref(), Some("\"result-3\""));
     }
@@ -1637,7 +1604,7 @@ mod tests {
     /// explicitly instead of shipping through the fallback. The pinned
     /// lists include the generated enums' own `Unknown` carrier variant.
     #[test]
-    #[allow(clippy::too_many_lines)] // reason: table-driven canary pins five enums' variant lists
+    #[expect(clippy::too_many_lines)] // reason: table-driven canary pins five enums' variant lists
     fn upstream_type_enum_variant_canary() {
         struct Pin {
             file: &'static str,
@@ -1792,7 +1759,6 @@ mod tests {
     /// Reads a source file out of the aws-sdk-lambda version Cargo.lock
     /// pins, from the local cargo registry (already extracted — the test
     /// binary that runs this compiled against it).
-    #[allow(clippy::expect_used)] // reason: test helper assertions
     fn read_sdk_source(relative: &str) -> String {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let lockfile = std::fs::read_to_string(manifest_dir.join("Cargo.lock"))
@@ -1831,7 +1797,7 @@ mod tests {
     /// generated SDK source. The generated layout is stable: variants sit
     /// at one indentation level, as `Identifier(...)` or bare
     /// `Identifier,`.
-    #[allow(clippy::panic, clippy::indexing_slicing, clippy::map_unwrap_or)]
+    #[expect(clippy::panic, clippy::map_unwrap_or)]
     // reason: test helper assertions over generated-source text
     fn extract_enum_variants(source: &str, enum_name: &str) -> Vec<String> {
         let header = format!("pub enum {enum_name} {{");

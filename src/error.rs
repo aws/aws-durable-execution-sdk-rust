@@ -1204,7 +1204,7 @@ impl FunctionNotFound {
     /// No production path constructs this variant today (the invoke
     /// replay path cannot distinguish a missing function from a failed
     /// one on the wire); tests and future classification use it.
-    #[allow(dead_code)] // reason: constructed by tests; kept for future invoke classification
+    #[cfg_attr(not(test), expect(dead_code))] // reason: constructed only by tests today; kept for future invoke classification
     pub(crate) fn new(function_id: impl Into<String>) -> Self {
         Self {
             function_id: function_id.into(),
@@ -1975,48 +1975,44 @@ impl From<crate::BoxError> for ChildFnError {
 
 // Static assertions: all public error types must be Send + Sync + 'static.
 // These compile-time checks prevent accidental regressions — the `source`
-// fields' `Send + Sync` bounds are what keep them true.
+// fields' `Send + Sync` bounds are what keep them true. The helper is
+// genuinely called during const evaluation, so no dead-code override is
+// needed (and `#[expect(dead_code)]` here diverges across toolchains).
 const _: () = {
-    #[allow(dead_code)] // reason: compile-time assertion, never called at runtime
-    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
-    #[allow(dead_code)] // reason: compile-time assertion, existence proves bounds hold
-    fn assert_bounds() {
-        assert_send_sync_static::<OperationError>();
-        assert_send_sync_static::<OperationErrorKind>();
-        assert_send_sync_static::<StepError>();
-        assert_send_sync_static::<StepErrorKind>();
-        assert_send_sync_static::<RetriesExhausted>();
-        assert_send_sync_static::<WaitError>();
-        assert_send_sync_static::<WaitErrorKind>();
-        assert_send_sync_static::<UnexpectedStatus>();
-        assert_send_sync_static::<InvokeError>();
-        assert_send_sync_static::<InvokeErrorKind>();
-        assert_send_sync_static::<FunctionNotFound>();
-        assert_send_sync_static::<CallbackError>();
-        assert_send_sync_static::<CallbackErrorKind>();
-        assert_send_sync_static::<WaitForConditionError>();
-        assert_send_sync_static::<WaitForConditionErrorKind>();
-        assert_send_sync_static::<MaxChecksExceeded>();
-        assert_send_sync_static::<ChildContextError>();
-        assert_send_sync_static::<ChildContextErrorKind>();
-        assert_send_sync_static::<CombinatorError>();
-        assert_send_sync_static::<CombinatorErrorKind>();
-        assert_send_sync_static::<JoinFailed>();
-        assert_send_sync_static::<NonDeterministicExecutionError>();
-        assert_send_sync_static::<NonDeterministicExecutionErrorKind>();
-        assert_send_sync_static::<OperationMismatch>();
-        assert_send_sync_static::<WireError>();
-        assert_send_sync_static::<TypedError>();
-        assert_send_sync_static::<ReplayedFailure>();
-        assert_send_sync_static::<ContextualError>();
-        assert_send_sync_static::<ChildFnError>();
-        assert_send_sync_static::<crate::serdes::FileSystemSerdesError>();
-    }
+    const fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    assert_send_sync_static::<OperationError>();
+    assert_send_sync_static::<OperationErrorKind>();
+    assert_send_sync_static::<StepError>();
+    assert_send_sync_static::<StepErrorKind>();
+    assert_send_sync_static::<RetriesExhausted>();
+    assert_send_sync_static::<WaitError>();
+    assert_send_sync_static::<WaitErrorKind>();
+    assert_send_sync_static::<UnexpectedStatus>();
+    assert_send_sync_static::<InvokeError>();
+    assert_send_sync_static::<InvokeErrorKind>();
+    assert_send_sync_static::<FunctionNotFound>();
+    assert_send_sync_static::<CallbackError>();
+    assert_send_sync_static::<CallbackErrorKind>();
+    assert_send_sync_static::<WaitForConditionError>();
+    assert_send_sync_static::<WaitForConditionErrorKind>();
+    assert_send_sync_static::<MaxChecksExceeded>();
+    assert_send_sync_static::<ChildContextError>();
+    assert_send_sync_static::<ChildContextErrorKind>();
+    assert_send_sync_static::<CombinatorError>();
+    assert_send_sync_static::<CombinatorErrorKind>();
+    assert_send_sync_static::<JoinFailed>();
+    assert_send_sync_static::<NonDeterministicExecutionError>();
+    assert_send_sync_static::<NonDeterministicExecutionErrorKind>();
+    assert_send_sync_static::<OperationMismatch>();
+    assert_send_sync_static::<WireError>();
+    assert_send_sync_static::<TypedError>();
+    assert_send_sync_static::<ReplayedFailure>();
+    assert_send_sync_static::<ContextualError>();
+    assert_send_sync_static::<ChildFnError>();
+    assert_send_sync_static::<crate::serdes::FileSystemSerdesError>();
 };
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
-#[allow(clippy::expect_used)] // reason: test assertions with descriptive messages
 mod tests {
     use super::*;
     /// A concrete user error type for downcast tests.

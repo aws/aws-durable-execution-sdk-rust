@@ -52,6 +52,13 @@
 //! documented, stable contract — including how to bridge it to
 //! OpenTelemetry — in the [`observability`] module.
 
+// Test code asserts with `unwrap`/`expect` pervasively; hoisting the
+// override here keeps the panic-policy lints (deny in workspace lints)
+// focused on production code without repeating the allow at every test
+// module.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(test, allow(clippy::expect_used))]
+
 pub mod builders;
 pub(crate) mod callback;
 pub(crate) mod checkpoint_coalescer;
@@ -489,7 +496,7 @@ fn parse_inline_operations(payload: &serde_json::Value) -> (engine::CheckpointLo
 }
 
 /// Parses a single operation JSON object into a checkpoint record.
-#[allow(clippy::too_many_lines)] // reason: sequential detail extraction reads better as one flow
+#[expect(clippy::too_many_lines)] // reason: sequential detail extraction reads better as one flow
 fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::CheckpointRecord)> {
     let id = op.get("Id").and_then(serde_json::Value::as_str)?;
     let op_type = op.get("Type").and_then(serde_json::Value::as_str)?;
@@ -538,8 +545,8 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
         .and_then(serde_json::Value::as_str)
         .map(String::from);
     let stack_trace = error.and_then(parse_stack_trace);
-    #[allow(clippy::cast_possible_truncation)] // reason: attempt ≤ MAX_ATTEMPTS (small)
-    #[allow(clippy::cast_sign_loss)] // reason: clamped to non-negative
+    #[expect(clippy::cast_possible_truncation)] // reason: attempt ≤ MAX_ATTEMPTS (small)
+    #[expect(clippy::cast_sign_loss)] // reason: clamped to non-negative
     let attempt = step_details
         .and_then(|d| d.get("Attempt"))
         .and_then(serde_json::Value::as_i64)
@@ -1184,8 +1191,6 @@ impl ClientProvider {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
-#[allow(clippy::expect_used)] // reason: test assertions
 mod tests {
     use std::future::IntoFuture;
 
@@ -1196,7 +1201,6 @@ mod tests {
     /// Since tokio 1.23+, `tokio::join!` desugars through `.await` which
     /// uses `IntoFuture`. This means operation builders can be passed
     /// directly to `tokio::join!` without calling `.future()` first.
-    #[allow(clippy::unwrap_used)] // reason: test code
     #[tokio::test]
     async fn tokio_join_accepts_into_future() {
         // Verify compilation: IntoFuture is accepted by tokio::join!
@@ -1310,7 +1314,6 @@ mod tests {
         );
     }
 
-    #[allow(clippy::unwrap_used, clippy::expect_used)] // reason: test assertions
     #[tokio::test]
     async fn wrap_service_valid_envelope_succeeds() {
         let payload = serde_json::json!({
@@ -1353,7 +1356,6 @@ mod tests {
 
     #[test]
     fn parse_status_timed_out_wire_value_maps_to_timed_out() {
-        #[allow(clippy::unwrap_used)] // reason: test assertion — minimal op parses
         let (_, record) = parse_single_operation(&step_op_with_status("TIMED_OUT")).unwrap();
         assert_eq!(record.status, engine::CheckpointStatus::TimedOut);
     }
@@ -1363,7 +1365,6 @@ mod tests {
     /// (the removed pre-#45 arm did).
     #[test]
     fn parse_status_timedout_without_underscore_is_unrecognized() {
-        #[allow(clippy::unwrap_used)] // reason: test assertion — minimal op parses
         let (_, record) = parse_single_operation(&step_op_with_status("TIMEDOUT")).unwrap();
         assert_eq!(
             record.status,
@@ -1375,7 +1376,6 @@ mod tests {
     /// received (original casing), never to a guessed known status.
     #[test]
     fn parse_unknown_status_carries_raw_value() {
-        #[allow(clippy::unwrap_used)] // reason: test assertion — minimal op parses
         let (_, record) = parse_single_operation(&step_op_with_status("Paused")).unwrap();
         assert_eq!(
             record.status,
@@ -1399,7 +1399,6 @@ mod tests {
             ("Succeeded", engine::CheckpointStatus::Succeeded),
         ];
         for (wire, expected) in cases {
-            #[allow(clippy::unwrap_used)] // reason: test assertion — minimal op parses
             let (_, record) = parse_single_operation(&step_op_with_status(wire)).unwrap();
             assert_eq!(record.status, expected, "wire status {wire:?}");
         }
@@ -1421,7 +1420,6 @@ mod tests {
 
         let parsed = parse_single_operation(&op);
         assert!(parsed.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let (id, record) = parsed.unwrap();
         assert_eq!(id, "abc123");
         assert_eq!(record.status, engine::CheckpointStatus::Succeeded);
@@ -1446,7 +1444,6 @@ mod tests {
 
         let parsed = parse_single_operation(&op);
         assert!(parsed.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let (id, record) = parsed.unwrap();
         assert_eq!(id, "abc456");
         assert_eq!(record.status, engine::CheckpointStatus::Failed);
@@ -1474,7 +1471,6 @@ mod tests {
 
         let parsed = parse_single_operation(&op);
         assert!(parsed.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let (_, record) = parsed.unwrap();
         assert_eq!(record.result.as_deref(), Some("\"from step\""));
     }
@@ -1506,7 +1502,6 @@ mod tests {
         assert!(marker.is_none());
         let record = log.get("wire-id-1");
         assert!(record.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let record = record.unwrap();
         assert_eq!(record.callback_id.as_deref(), Some("cb-id-123"));
         assert_eq!(record.result.as_deref(), Some("\"payload\""));
@@ -1587,7 +1582,6 @@ mod tests {
     }
 
     /// Helper to build a Step operation for `resolve_bootstrap_log` tests.
-    #[allow(clippy::unwrap_used)]
     fn make_test_step_op(id: &str, result: &str) -> aws_sdk_lambda::types::Operation {
         aws_sdk_lambda::types::Operation::builder()
             .id(id)
@@ -1607,7 +1601,6 @@ mod tests {
     /// `get_state` (count == 1) and returns a log built from the full
     /// paginated state.
     #[tokio::test]
-    #[allow(clippy::unwrap_used)] // reason: test assertions
     async fn resolve_bootstrap_log_paginates_when_marker_present() {
         let all_ops = vec![
             make_test_step_op("step-1", "\"r1\""),
@@ -1647,7 +1640,6 @@ mod tests {
     /// When `initial_marker` is `None`, `resolve_bootstrap_log` does NOT
     /// call `get_state` (count == 0) and returns the inline log as-is.
     #[tokio::test]
-    #[allow(clippy::unwrap_used)] // reason: test assertions
     async fn resolve_bootstrap_log_skips_pagination_when_no_marker() {
         let client = client::InMemoryExecutionClient::new(Vec::new());
 
@@ -1701,7 +1693,6 @@ mod tests {
     /// A supplied `sdk_config` measurably alters client construction: the
     /// resolved Lambda client carries the region from that config.
     #[test]
-    #[allow(clippy::expect_used)] // reason: test assertion
     fn sdk_config_measurably_alters_client_construction() {
         let sdk_config = SdkConfig::builder()
             .behavior_version(aws_config::BehaviorVersion::latest())
@@ -1719,7 +1710,6 @@ mod tests {
     /// A supplied `lambda_client` is the one used (not a default-constructed
     /// one): the resolved client preserves the supplied client's region.
     #[test]
-    #[allow(clippy::expect_used)] // reason: test assertion
     fn supplied_lambda_client_is_the_one_used() {
         let conf = aws_sdk_lambda::config::Config::builder()
             .behavior_version(aws_sdk_lambda::config::BehaviorVersion::latest())
@@ -1768,7 +1758,6 @@ mod tests {
 
     // ── Envelope validation tests ────────────────────────────────────────
 
-    #[allow(clippy::unwrap_used, clippy::expect_used)] // reason: test assertions
     #[test]
     fn parse_envelope_valid_payload() {
         let payload = serde_json::json!({
@@ -1888,7 +1877,6 @@ mod tests {
         );
     }
 
-    #[allow(clippy::unwrap_used)] // reason: test assertions
     #[test]
     fn extract_customer_input_no_envelope_errors() {
         // A payload with no envelope shape at all is an error: there is no

@@ -24,7 +24,7 @@ struct UppercaseSerdes;
 
 impl Serdes<String> for UppercaseSerdes {
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn serialize(
         &self,
         value: String,
@@ -36,7 +36,7 @@ impl Serdes<String> for UppercaseSerdes {
     }
 
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         wire: String,

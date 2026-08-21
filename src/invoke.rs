@@ -44,7 +44,7 @@ where
     RS: Serdes<O>,
 {
     /// Executes the invoke operation: replay path or live path.
-    #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
+    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -274,7 +274,7 @@ fn build_chained_invoke_start(
     if let Some(tid) = tenant_id {
         invoke_opts_builder = invoke_opts_builder.tenant_id(tid);
     }
-    #[allow(clippy::expect_used)] // reason: function_name is always set
+    #[expect(clippy::expect_used)] // reason: function_name is always set
     let invoke_opts = invoke_opts_builder
         .build()
         .expect("ChainedInvokeOptions: function_name is set");
@@ -295,16 +295,15 @@ fn build_chained_invoke_start(
         builder = builder.parent_id(parent);
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
-#[allow(clippy::panic)] // reason: test assertions with descriptive messages
-#[allow(clippy::indexing_slicing)] // reason: test assertions on known-populated vectors
+#[expect(clippy::panic)] // reason: test assertions with descriptive messages
+#[expect(clippy::indexing_slicing)] // reason: test assertions on known-populated vectors
 mod tests {
     use super::*;
     use crate::context::DurableContext;
@@ -369,7 +368,6 @@ mod tests {
     /// data, and a realistic inline payload containing a `file` key is not
     /// misparsed.
     #[tokio::test]
-    #[allow(clippy::expect_used)] // reason: test assertions with descriptive messages
     async fn invoke_result_never_resolves_file_references() {
         use crate::serdes::FileSystemSerdes;
 
@@ -621,7 +619,7 @@ mod tests {
         struct Upper;
         impl Serdes<String> for Upper {
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -630,7 +628,7 @@ mod tests {
                 Ok(serde_json::to_string(&value)?.to_uppercase())
             }
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -815,7 +813,7 @@ mod tests {
         struct UpperPayload;
         impl Serdes<String> for UpperPayload {
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -824,7 +822,7 @@ mod tests {
                 Ok(serde_json::to_string(&value)?.to_uppercase())
             }
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -881,7 +879,7 @@ mod tests {
         struct LowerResult;
         impl Serdes<String> for LowerResult {
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -890,7 +888,7 @@ mod tests {
                 Ok(serde_json::to_string(&value)?)
             }
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,

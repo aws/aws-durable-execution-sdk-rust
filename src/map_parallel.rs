@@ -975,7 +975,7 @@ where
 /// Post-closure half of one batch item: outcome checkpointing and
 /// [`BatchItem`] assembly. Generic only over the result type `O` — no user
 /// closure reaches this code.
-#[allow(clippy::too_many_lines)] // reason: FLAT/NORMAL outcome checkpointing reads better in one flow
+#[expect(clippy::too_many_lines)] // reason: FLAT/NORMAL outcome checkpointing reads better in one flow
 async fn item_after<O, IS>(
     req: &ItemRequest<IS>,
     scope: &Arc<crate::driver::SuspensionSignal>,
@@ -1124,7 +1124,7 @@ where
                 builder = builder.payload(serialized.clone());
             }
 
-            #[allow(clippy::expect_used)] // reason: all required fields are set above
+            #[expect(clippy::expect_used)] // reason: all required fields are set above
             let update = builder
                 .build()
                 .expect("all required OperationUpdate fields set");
@@ -1182,7 +1182,7 @@ where
                 .parent_id(req.parent_wire.clone())
                 .error(wire.to_error_object());
 
-            #[allow(clippy::expect_used)] // reason: all required fields are set above
+            #[expect(clippy::expect_used)] // reason: all required fields are set above
             let update = builder
                 .build()
                 .expect("all required OperationUpdate fields set");
@@ -1692,9 +1692,9 @@ where
 /// Non-generic over the user closure: item bodies enter only through the
 /// [`ItemDispatch`] object, so this coordinator — the batch's checkpoint
 /// state machine — monomorphizes once per result type `O`.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 // reason: batch coordination has distinct phases (claim, schedule, collect, checkpoint) that read better as one flow
-#[allow(clippy::too_many_arguments)] // reason: batch execution requires all these parameters
+#[expect(clippy::too_many_arguments)] // reason: batch execution requires all these parameters
 async fn execute_batch<O, IS, RS>(
     ctx: DurableContext,
     parent_op_id: OperationId,
@@ -2882,7 +2882,7 @@ async fn checkpoint_batch_success_serialized(
         builder = builder.payload(serialized_payload.to_owned());
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     let update = builder
         .build()
         .expect("all required OperationUpdate fields set");
@@ -2924,7 +2924,7 @@ fn build_parent_update(
         builder = builder.parent_id(parent_wire);
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -2951,7 +2951,7 @@ fn build_child_update(
         builder = builder.name(child_name.to_owned());
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -2977,7 +2977,7 @@ fn build_child_fail_update(
     if !child_name.is_empty() {
         builder = builder.name(child_name.to_owned());
     }
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -3005,7 +3005,7 @@ fn build_parent_fail_update(
     if let Some(parent_wire) = ctx.parent_wire_id_computed() {
         builder = builder.parent_id(parent_wire);
     }
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -3486,7 +3486,7 @@ fn take_item<I>(items: &[std::sync::Mutex<Option<I>>], index: usize) -> Result<I
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[expect(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::context::DurableContext;
@@ -5460,7 +5460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::panic)] // reason: the branch panic under test is the behavior being asserted
+    #[expect(clippy::panic)] // reason: the branch panic under test is the behavior being asserted
     async fn map_branch_panic_fails_batch_without_hanging() {
         // A panic in a user map-branch closure must surface as a controlled
         // batch failure promptly, not hang the coordinator to its Lambda
@@ -5502,7 +5502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::panic)] // reason: the branch panic under test is the behavior being asserted
+    #[expect(clippy::panic)] // reason: the branch panic under test is the behavior being asserted
     async fn parallel_branch_panic_fails_batch_without_hanging() {
         use crate::future::Branch;
 
@@ -5543,7 +5543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::panic)] // reason: the reconstruction panic under test is the behavior being asserted
+    #[expect(clippy::panic)] // reason: the reconstruction panic under test is the behavior being asserted
     async fn map_replay_children_reconstruction_panic_unwinds_without_fail_checkpoint() {
         // A child recorded as terminal SUCCESS with `replay_children = true`
         // is re-executed on replay to reconstruct its oversized result. If
@@ -5604,7 +5604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::panic)] // reason: the reconstruction panic under test is the behavior being asserted
+    #[expect(clippy::panic)] // reason: the reconstruction panic under test is the behavior being asserted
     async fn parallel_replay_children_reconstruction_panic_unwinds_without_fail_checkpoint() {
         use crate::future::Branch;
 
@@ -5790,7 +5790,7 @@ mod tests {
     /// was visible — and the fixture's wire form is deliberately NOT JSON, so
     /// a path that bypassed the serdes would fail rather than quietly pass.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // reason: one test per path is the point — splitting it would let the paths drift apart again
+    #[expect(clippy::too_many_lines)] // reason: one test per path is the point — splitting it would let the paths drift apart again
     async fn custom_serdes_receives_the_same_value_shape_on_every_path() {
         use crate::future::Branch;
         use crate::serdes::test_support::{RecordingSerdes, hex_envelope_of};

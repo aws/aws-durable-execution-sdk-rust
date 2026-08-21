@@ -345,8 +345,6 @@ impl OptionsBuilder {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
-#[allow(clippy::expect_used)] // reason: test assertions
 mod tests {
     use super::*;
 
@@ -371,7 +369,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)] // reason: test assertion — extracting expected error
     fn sdk_config_and_lambda_client_conflict() {
         let result = Options::builder()
             .sdk_config(dummy_sdk_config())

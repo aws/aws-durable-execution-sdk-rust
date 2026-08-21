@@ -90,7 +90,7 @@ fn events_with_field<'a>(
 /// A step (live + replayed) and a wait: the documented events fire with the
 /// documented fields, exactly once each across the whole execution.
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // reason: one end-to-end walkthrough of the whole contract
+#[expect(clippy::too_many_lines)] // reason: one end-to-end walkthrough of the whole contract
 async fn step_and_wait_lifecycle_events_follow_the_contract() {
     let (buffer, _guard) = capture_subscriber();
 
@@ -619,7 +619,7 @@ struct FailOnReplayDeserializeSerdes(Arc<std::sync::atomic::AtomicU32>);
 
 impl durable::Serdes<u32> for FailOnReplayDeserializeSerdes {
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn serialize(
         &self,
         value: u32,
@@ -629,7 +629,7 @@ impl durable::Serdes<u32> for FailOnReplayDeserializeSerdes {
     }
 
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         wire: String,

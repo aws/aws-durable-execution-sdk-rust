@@ -132,14 +132,13 @@ fn build_wait_start_update(
         builder = builder.parent_id(parent);
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
 mod tests {
     use super::*;
     use crate::engine::{CheckpointLog, CheckpointRecord};
@@ -377,7 +376,6 @@ mod tests {
         use crate::client::InMemoryExecutionClient;
 
         // Must create ctx inside a spawned task where try_id() returns Some.
-        #[allow(clippy::unwrap_used)] // reason: test code
         let result = tokio::spawn(async {
             let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
             let log = Arc::new(CheckpointLog::empty());

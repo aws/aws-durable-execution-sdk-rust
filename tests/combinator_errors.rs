@@ -6,7 +6,7 @@
 //! `CombinatorErrorKind::EmptyInput` for empty input.
 
 #![cfg(feature = "test-util")]
-#![allow(clippy::expect_used, clippy::indexing_slicing)] // reason: test assertions
+#![expect(clippy::expect_used, clippy::indexing_slicing)] // reason: test assertions
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

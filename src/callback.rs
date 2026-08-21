@@ -56,7 +56,7 @@ where
     S: Serdes<O>,
 {
     /// Executes the create-callback operation: replay or live path.
-    #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
+    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<Callback<O>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -174,7 +174,7 @@ where
             builder = builder.callback_options(opts);
         }
 
-        #[allow(clippy::expect_used)] // reason: all required fields set above
+        #[expect(clippy::expect_used)] // reason: all required fields set above
         let update = builder
             .build()
             .expect("all required OperationUpdate fields set");
@@ -443,7 +443,7 @@ where
                 if let Some(parent_wire) = ctx.parent_wire_id_computed() {
                     builder = builder.parent_id(parent_wire);
                 }
-                #[allow(clippy::expect_used)] // reason: all required fields set above
+                #[expect(clippy::expect_used)] // reason: all required fields set above
                 let update = builder
                     .build()
                     .expect("all required OperationUpdate fields set");
@@ -481,7 +481,7 @@ where
                     builder = builder.parent_id(parent_wire);
                 }
                 builder = builder.error(wire.to_error_object());
-                #[allow(clippy::expect_used)] // reason: all required fields set above
+                #[expect(clippy::expect_used)] // reason: all required fields set above
                 let update = builder
                     .build()
                     .expect("all required OperationUpdate fields set");
@@ -584,13 +584,11 @@ fn build_callback_options(
     timeout: Option<Duration>,
     heartbeat: Option<Duration>,
 ) -> Option<aws_sdk_lambda::types::CallbackOptions> {
-    #[allow(clippy::cast_possible_truncation)] // reason: duration ≤ i32::MAX for practical timers
-    #[allow(clippy::cast_sign_loss)] // reason: ceil is non-negative
+    #[expect(clippy::cast_possible_truncation)] // reason: duration ≤ i32::MAX for practical timers
     let timeout_secs = timeout.map_or(0, |d| {
         (d.as_secs_f64().ceil() as i64).min(i64::from(i32::MAX)) as i32
     });
-    #[allow(clippy::cast_possible_truncation)] // reason: duration ≤ i32::MAX for practical timers
-    #[allow(clippy::cast_sign_loss)] // reason: ceil is non-negative
+    #[expect(clippy::cast_possible_truncation)] // reason: duration ≤ i32::MAX for practical timers
     let heartbeat_secs = heartbeat.map_or(0, |d| {
         (d.as_secs_f64().ceil() as i64).min(i64::from(i32::MAX)) as i32
     });
@@ -625,7 +623,7 @@ fn build_wfcb_update(
     if let Some(parent_wire) = ctx.parent_wire_id_computed() {
         builder = builder.parent_id(parent_wire);
     }
-    #[allow(clippy::expect_used)] // reason: all required fields set above
+    #[expect(clippy::expect_used)] // reason: all required fields set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -651,7 +649,7 @@ fn build_wfcb_fail_update(
     if let Some(parent_wire) = ctx.parent_wire_id_computed() {
         builder = builder.parent_id(parent_wire);
     }
-    #[allow(clippy::expect_used)] // reason: all required fields set above
+    #[expect(clippy::expect_used)] // reason: all required fields set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -811,9 +809,6 @@ fn wfcb_internal_error(msg: &str) -> OperationError {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
-#[allow(clippy::expect_used)] // reason: test assertions
-#[allow(clippy::panic)] // reason: test assertions with descriptive messages
 mod tests {
     use super::*;
     use crate::client::InMemoryExecutionClient;
@@ -1483,7 +1478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // reason: three full checkpoint-record literals read better inline
+    #[expect(clippy::too_many_lines)] // reason: three full checkpoint-record literals read better inline
     async fn wfcb_submitter_replay_skips_re_execution() {
         // When the submitter step is already checkpointed as Succeeded,
         // replay should NOT re-invoke the submitter closure.
@@ -1770,13 +1765,13 @@ mod tests {
         T: Serialize + DeserializeOwned + Send + 'static,
     {
         // reason: exercises the async-fn impl form user code writes
-        #[allow(clippy::unused_async_trait_impl)]
+        #[expect(clippy::unused_async_trait_impl)]
         async fn serialize(&self, value: T, _context: SerdesContext) -> Result<String, BoxError> {
             Ok(format!("MARK:{}", serde_json::to_string(&value)?))
         }
 
         // reason: exercises the async-fn impl form user code writes
-        #[allow(clippy::unused_async_trait_impl)]
+        #[expect(clippy::unused_async_trait_impl)]
         async fn deserialize(&self, wire: String, _context: SerdesContext) -> Result<T, BoxError> {
             let body = wire
                 .strip_prefix("MARK:")
@@ -1865,7 +1860,7 @@ mod tests {
     /// `base_path` — decodes as plain data, and a realistic inline payload
     /// containing a `file` key is not misparsed.
     #[tokio::test]
-    #[allow(clippy::indexing_slicing)] // reason: test assertions on known JSON keys
+    #[expect(clippy::indexing_slicing)] // reason: test assertions on known JSON keys
     async fn callback_payload_never_resolves_file_references() {
         use crate::serdes::FileSystemSerdes;
 

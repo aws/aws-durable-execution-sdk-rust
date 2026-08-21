@@ -11,7 +11,7 @@
 //! the real filesystem.
 
 #![cfg(feature = "test-util")]
-#![allow(clippy::expect_used)] // reason: test assertions with descriptive messages
+#![expect(clippy::expect_used)] // reason: test assertions with descriptive messages
 
 use std::time::Duration;
 
@@ -151,7 +151,7 @@ impl Serdes<u32> for ExecutorProbeSerdes {
     }
 
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         wire: String,
@@ -212,7 +212,7 @@ struct PrefixSerdes;
 
 impl Serdes<u32> for PrefixSerdes {
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn serialize(
         &self,
         value: u32,
@@ -222,7 +222,7 @@ impl Serdes<u32> for PrefixSerdes {
     }
 
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         wire: String,
@@ -303,7 +303,7 @@ async fn send_not_sync_output_round_trips_through_operation() {
     struct NotSync {
         value: String,
         #[serde(skip)]
-        #[allow(dead_code)] // reason: exists only to make the type non-Sync
+        #[expect(dead_code)] // reason: exists only to make the type non-Sync
         cell: std::cell::Cell<u8>,
     }
 
@@ -360,7 +360,7 @@ struct NoSerdeSerdes;
 
 impl Serdes<NoSerde> for NoSerdeSerdes {
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn serialize(
         &self,
         value: NoSerde,
@@ -370,7 +370,7 @@ impl Serdes<NoSerde> for NoSerdeSerdes {
     }
 
     // reason: exercises the async-fn impl form user code writes
-    #[allow(clippy::unused_async_trait_impl)]
+    #[expect(clippy::unused_async_trait_impl)]
     async fn deserialize(
         &self,
         wire: String,
@@ -384,7 +384,7 @@ impl Serdes<NoSerde> for NoSerdeSerdes {
 /// `future`/`spawn` conversions and `IntoFuture`) resolve for an output
 /// type with no serde implementations at all. The bounds resolving IS the
 /// assertion, so the function is never called.
-#[allow(dead_code)] // reason: compile-only bound coverage, never invoked
+#[expect(dead_code)] // reason: compile-only bound coverage, never invoked
 fn non_serde_output_builders_compile(ctx: &durable::DurableContext) {
     // create_callback: no `DeserializeOwned` on the payload type.
     let _cb: durable::DurableFuture<durable::builders::callback::Callback<NoSerde>> = ctx

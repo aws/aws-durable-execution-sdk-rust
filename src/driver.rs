@@ -1007,7 +1007,6 @@ mod tests {
             // Replay path: return frozen result without executing.
             let wire = crate::engine::compute_wire_id_public(op_id.positional());
             let record = log.get(&wire);
-            #[allow(clippy::unwrap_used)] // reason: test — verified present above
             record.unwrap().result.clone()
         } else {
             // Live path: execute the body (should NOT happen here).
@@ -1037,15 +1036,12 @@ mod tests {
             // Spawn a DIFFERENT task and try the ownership check there.
             let handle = tokio::spawn(async move { ownership_clone.check_current_task() });
 
-            #[allow(clippy::unwrap_used)] // reason: test — join handle will not panic
             handle.await.unwrap()
         })
         .await;
 
-        #[allow(clippy::unwrap_used)] // reason: test — outer spawn will not panic
         let inner_result = result.unwrap();
         assert!(inner_result.is_err());
-        #[allow(clippy::unwrap_used)] // reason: test — verified Err above
         let msg = inner_result.unwrap_err();
         assert!(
             msg.contains("Use .spawn()"),
@@ -1064,7 +1060,6 @@ mod tests {
         })
         .await;
 
-        #[allow(clippy::unwrap_used)] // reason: test — spawn will not panic
         let inner = result.unwrap();
         assert!(inner.is_ok(), "owning task should pass: {inner:?}");
     }
@@ -1085,12 +1080,10 @@ mod tests {
                 ownership_clone.check_current_task()
             });
 
-            #[allow(clippy::unwrap_used)] // reason: test — join handle will not panic
             handle.await.unwrap()
         })
         .await;
 
-        #[allow(clippy::unwrap_used)] // reason: test — outer spawn will not panic
         let inner = result.unwrap();
         assert!(
             inner.is_ok(),
@@ -1134,13 +1127,11 @@ mod tests {
         // User tokio::spawn — NOT blessed.
         let handle = tokio::spawn(async move { ownership_clone.check_current_task() });
 
-        #[allow(clippy::unwrap_used)] // reason: test — join handle will not panic
         let inner = handle.await.unwrap();
         assert!(
             inner.is_err(),
             "unblessed spawned task must be rejected in root-context mode"
         );
-        #[allow(clippy::unwrap_used)] // reason: test — verified Err above
         let msg = inner.unwrap_err();
         assert!(
             msg.contains("Use .spawn()"),
@@ -1167,7 +1158,6 @@ mod tests {
             ownership_clone.check_current_task()
         });
 
-        #[allow(clippy::unwrap_used)] // reason: test — join handle will not panic
         let inner = handle.await.unwrap();
         assert!(
             inner.is_ok(),
@@ -1239,7 +1229,7 @@ mod tests {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // reason: test module
+#[expect(clippy::panic)] // reason: test module
 mod suspension_containment_and_task_ownership {
     use super::{InvocationOutcome, drive_invocation};
     use crate::client::{ExecutionClient, InMemoryExecutionClient, TestResponse};
@@ -1755,7 +1745,6 @@ mod suspension_containment_and_task_ownership {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)] // reason: test module
 mod scoped_suspension {
     use super::{InvocationOutcome, ScopeOutcome, SuspensionSignal, drive_invocation, drive_scope};
     use crate::client::{ExecutionClient, InMemoryExecutionClient};
@@ -2118,7 +2107,6 @@ mod scoped_suspension {
 // These tests encode the CORRECT behaviour and run as part of `make check`.
 // See .agents/scratchpad/s2a-diagnosis.md for the root-cause analysis.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // reason: test assertions
 mod spawn_scope_regressions {
     use super::{InvocationOutcome, drive_invocation};
     use crate::client::{ExecutionClient, InMemoryExecutionClient};

@@ -1717,8 +1717,8 @@ impl DurableContext {
     /// ```
     pub fn wait(&self, duration: Duration) -> WaitBuilder {
         // Round up to whole seconds. Zero duration passes 0 (no min guard).
-        #[allow(clippy::cast_possible_truncation)] // reason: duration ≤ i32::MAX for practical timers
-        #[allow(clippy::cast_sign_loss)] // reason: ceil is non-negative
+        #[expect(clippy::cast_possible_truncation)]
+        // reason: duration ≤ i32::MAX for practical timers
         let secs = (duration.as_secs_f64().ceil() as i64).min(i64::from(i32::MAX)) as i32;
         let op_id = self.mint_id();
         WaitBuilder::new(self.clone(), op_id, secs)
@@ -2411,8 +2411,6 @@ fn format_op_identity(op_type: &str, sub_type: Option<&str>, name: Option<&str>)
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)] // reason: test assertions — panics are acceptable
-#[allow(clippy::unwrap_used)] // reason: test assertions
 mod tests {
     use super::*;
     use crate::client::{
@@ -2423,7 +2421,6 @@ mod tests {
     use std::sync::Arc;
 
     /// Helper: builds a Step operation.
-    #[allow(clippy::unwrap_used)]
     fn make_step_op(id: &str, result: &str) -> Operation {
         Operation::builder()
             .id(id)
@@ -2485,7 +2482,6 @@ mod tests {
         );
 
         // get_state should have been called once for pagination.
-        #[allow(clippy::unwrap_used)]
         let get_state_count = *client.get_state_call_count.lock().unwrap();
         assert_eq!(
             get_state_count, 1,
@@ -2665,7 +2661,6 @@ mod tests {
         let result = ctx.checkpoint_updates(Vec::new()).await;
         assert!(result.is_ok());
 
-        #[allow(clippy::unwrap_used)]
         let get_state_count = *client.get_state_call_count.lock().unwrap();
         assert_eq!(
             get_state_count, 0,
@@ -2690,7 +2685,6 @@ mod tests {
         // The full log comes from get_state when the initial state is paginated.
         let full_state = client.get_state("arn:test", "token").await;
         assert!(full_state.is_ok());
-        #[allow(clippy::unwrap_used)]
         let full_state = full_state.unwrap();
 
         let log = operations_to_checkpoint_log(&full_state.operations);
@@ -2699,7 +2693,6 @@ mod tests {
         assert!(log.get("step-3").is_some());
 
         // Verify that the results are correct.
-        #[allow(clippy::unwrap_used)]
         let r2 = log.get("step-2").unwrap();
         assert_eq!(r2.result.as_deref(), Some("\"result-2\""));
         assert_eq!(r2.status, CheckpointStatus::Succeeded);
@@ -2781,10 +2774,8 @@ mod tests {
         let result =
             ctx.checkpoint_view_validated("1", "wire-1", "Step", Some("Step"), Some("my-step"));
         assert!(result.is_ok());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Ok above
         let view = result.unwrap();
         assert!(view.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let view = view.unwrap();
         assert_eq!(view.status, CheckpointStatus::Succeeded);
         assert_eq!(view.attempt, 2);
@@ -2822,7 +2813,6 @@ mod tests {
         // NonDeterministicExecution error `validate_replay_identity` builds.
         let result = ctx.checkpoint_view_validated("1", "wire-1", "Wait", Some("Wait"), None);
         assert!(result.is_err());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Err above
         let err = result.unwrap_err();
         assert!(matches!(
             err.kind(),
@@ -2839,7 +2829,7 @@ mod tests {
     /// recognize must fail the execution naming the raw status (issue
     /// #45) — never return the view for the operation to act on.
     #[test]
-    #[allow(clippy::panic)] // reason: test assertions over non_exhaustive kinds
+    #[expect(clippy::panic)] // reason: test assertions over non_exhaustive kinds
     fn checkpoint_view_validated_fails_execution_on_unrecognized_status() {
         let ctx = ctx_with_record_at_1(CheckpointRecord {
             id: "wire-1".to_owned(),
@@ -2870,7 +2860,6 @@ mod tests {
         // Identity matches — the failure is the status, not the identity.
         let result = ctx.checkpoint_view_validated("1", "wire-1", "Step", Some("Step"), None);
         assert!(result.is_err());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Err above
         let err = result.unwrap_err();
         let OperationErrorKind::NonDeterministicExecution(nde) = err.kind() else {
             panic!("expected NonDeterministicExecution, got {:?}", err.kind());
@@ -2972,7 +2961,6 @@ mod tests {
 
         let view = ctx.checkpoint_status_view("1");
         assert!(view.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Some above
         let view = view.unwrap();
         assert_eq!(view.status, CheckpointStatus::Failed);
         assert_eq!(view.attempt, 5);
@@ -3603,7 +3591,6 @@ mod tests {
     }
 
     /// Helper: builds a bare step START update with the given wire ID.
-    #[allow(clippy::expect_used)]
     fn make_update(id: &str) -> OperationUpdate {
         OperationUpdate::builder()
             .id(id.to_owned())
@@ -3627,7 +3614,6 @@ mod tests {
         assert!(a.is_ok(), "first coalesced caller succeeds");
         assert!(b.is_ok(), "second coalesced caller succeeds");
 
-        #[allow(clippy::unwrap_used)]
         let call_count = *client.checkpoint_call_count.lock().unwrap();
         assert_eq!(call_count, 1, "both updates must share one API call");
 
@@ -3663,7 +3649,6 @@ mod tests {
             Duration::ZERO,
             "urgent flush must not wait for the coalescing window"
         );
-        #[allow(clippy::unwrap_used)]
         let call_count = *client.checkpoint_call_count.lock().unwrap();
         assert_eq!(call_count, 1);
     }
@@ -3697,7 +3682,6 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "flush must not wait for the one-hour window"
         );
-        #[allow(clippy::unwrap_used)]
         let call_count = *client.checkpoint_call_count.lock().unwrap();
         assert_eq!(call_count, 1);
     }
@@ -3724,7 +3708,6 @@ mod tests {
             .expect("second write succeeds");
 
         assert_eq!(start.elapsed(), Duration::ZERO);
-        #[allow(clippy::unwrap_used)]
         let call_count = *client.checkpoint_call_count.lock().unwrap();
         assert_eq!(call_count, 2, "no coalescing without a configured delay");
     }
@@ -4054,7 +4037,6 @@ mod tests {
             assert!(outcome.is_ok(), "every contributor observes success");
         }
 
-        #[allow(clippy::unwrap_used)]
         let call_count = *client.checkpoint_call_count.lock().unwrap();
         assert_eq!(
             call_count, 3,

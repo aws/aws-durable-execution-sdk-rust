@@ -58,7 +58,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)] // reason: test assertions with descriptive messages
+#[expect(clippy::expect_used)] // reason: test assertions with descriptive messages
 mod tests {
     use super::WrapSerdes;
     use aws_durable_execution_sdk_rust::Serdes;

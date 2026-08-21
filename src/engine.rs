@@ -66,7 +66,7 @@ mod hex {
         for &b in bytes {
             // SAFETY argument: (b >> 4) is in [0, 15] and (b & 0x0f) is in
             // [0, 15], both within HEX_CHARS' length of 16.
-            #[allow(clippy::indexing_slicing)] // reason: index ≤ 15 for any u8 half-byte
+            #[expect(clippy::indexing_slicing)] // reason: index ≤ 15 for any u8 half-byte
             {
                 out.push(HEX_CHARS[(b >> 4) as usize] as char);
                 out.push(HEX_CHARS[(b & 0x0f) as usize] as char);
@@ -254,7 +254,7 @@ pub(crate) struct CheckpointRecord {
     /// The log keys records by this same ID, so no code path needs to read
     /// it back off the record; it is kept on the record so `Debug` output
     /// of a record identifies the operation it belongs to.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     // reason: never read back — the log keys records by this ID; retained for Debug diagnostics
     pub(crate) id: String,
     /// The operation's status.
@@ -762,7 +762,6 @@ mod tests {
 
         let record = log.get("1");
         assert!(record.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — value verified present above
         let record = record.unwrap();
         assert_eq!(record.status, CheckpointStatus::Succeeded);
         assert_eq!(record.result.as_deref(), Some(r#""hello""#));
@@ -839,7 +838,6 @@ mod tests {
 
         let view = log.status_view("1");
         assert!(view.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified present above
         let view = view.unwrap();
         assert_eq!(view.status, CheckpointStatus::Failed);
         assert_eq!(view.attempt, 3);
@@ -883,7 +881,6 @@ mod tests {
         let log = CheckpointLog::from_records(vec![("1".to_owned(), full_record())]);
         let record = log.get("1");
         assert!(record.is_some());
-        #[allow(clippy::unwrap_used)] // reason: test assertion — verified present above
         let record = record.unwrap();
         assert_eq!(record.result.as_deref(), Some(r#""payload""#));
         assert_eq!(record.invoke_error_message.as_deref(), Some("invoke broke"));

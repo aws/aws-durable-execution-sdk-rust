@@ -13,7 +13,7 @@ async fn handler(
 
     let results: Vec<i64> = ctx
         .map(items, |_child, item, idx| async move {
-            #[allow(clippy::cast_possible_wrap)]
+            #[expect(clippy::cast_possible_wrap)]
             Ok(item + idx as i64)
         })
         .name("indexed")

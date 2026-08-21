@@ -24,7 +24,7 @@ async fn handler(
             // Allow log flush.
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             std::process::exit(1);
-            #[allow(unreachable_code)]
+            #[expect(unreachable_code)]
             Ok("unreachable".to_owned())
         })
         .name("at_most_once_flaky_step")

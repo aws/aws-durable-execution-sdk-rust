@@ -84,7 +84,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
     /// Live path: awaits all futures concurrently, fails fast on first error,
     /// checkpoints the combined `Vec<O>` result.
     /// Replay path: returns the frozen result from the checkpoint log.
-    #[allow(clippy::too_many_lines)] // reason: validation adds lines but the flow reads better flat
+    #[expect(clippy::too_many_lines)] // reason: validation adds lines but the flow reads better flat
     pub(crate) async fn execute(self) -> Result<Vec<O>, OperationError> {
         // Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -280,7 +280,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
     /// as `Settled::Fulfilled(O)` or `Settled::Rejected(OperationError)`.
     /// Checkpoints with error-aware serdes so Err values survive round-trip.
     /// Replay path: returns frozen `Vec<Settled<O>>`.
-    #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
+    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<Vec<Settled<O>>, OperationError> {
         // Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -448,7 +448,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
     /// If all fail, returns `CombinatorError::AllFailed` with all error messages.
     /// Losers are dropped (cancelled) on first success.
     /// Replay path: returns the frozen winner.
-    #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
+    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         self.ctx.enforce_task_ownership()?;
 
@@ -626,7 +626,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
     /// Live path: races all futures; returns the first settled (success OR
     /// failure). Losers are dropped (cancelled).
     /// Replay path: returns the frozen result.
-    #[allow(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
+    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         self.ctx.enforce_task_ownership()?;
 
@@ -879,7 +879,7 @@ async fn checkpoint_start(
         builder = builder.parent_id(parent_wire);
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     let update = builder
         .build()
         .expect("all required OperationUpdate fields set");
@@ -922,7 +922,7 @@ async fn checkpoint_succeed(
         builder = builder.parent_id(parent_wire);
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     let update = builder
         .build()
         .expect("all required OperationUpdate fields set");
@@ -970,7 +970,7 @@ async fn checkpoint_fail(
         builder = builder.parent_id(parent_wire);
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     let update = builder
         .build()
         .expect("all required OperationUpdate fields set");
@@ -1011,7 +1011,7 @@ fn build_combinator_fail_update(
     if let Some(parent_wire) = ctx.parent_wire_id_computed() {
         builder = builder.parent_id(parent_wire);
     }
-    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -1127,9 +1127,7 @@ fn replay_combinator_failure(wire: crate::error::WireError, wire_id: &str) -> Op
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
+#[expect(
     clippy::panic,
     clippy::indexing_slicing,
     clippy::items_after_statements

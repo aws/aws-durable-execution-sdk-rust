@@ -1487,13 +1487,13 @@ pub(crate) mod test_support {
         T: Serialize + DeserializeOwned + Send + 'static,
     {
         // reason: exercises the async-fn impl form user code writes
-        #[allow(clippy::unused_async_trait_impl)]
+        #[expect(clippy::unused_async_trait_impl)]
         async fn serialize(&self, value: T, _context: SerdesContext) -> Result<String, BoxError> {
             Ok(hex_envelope(&serde_json::to_string(&value)?))
         }
 
         // reason: exercises the async-fn impl form user code writes
-        #[allow(clippy::unused_async_trait_impl)]
+        #[expect(clippy::unused_async_trait_impl)]
         async fn deserialize(&self, wire: String, _context: SerdesContext) -> Result<T, BoxError> {
             Ok(serde_json::from_str(&hex_decode(&wire)?)?)
         }
@@ -1591,7 +1591,7 @@ pub(crate) mod test_support {
         T: Serialize + DeserializeOwned + Send + 'static,
     {
         // reason: exercises the async-fn impl form user code writes
-        #[allow(clippy::unused_async_trait_impl)]
+        #[expect(clippy::unused_async_trait_impl)]
         async fn serialize(&self, value: T, _context: SerdesContext) -> Result<String, BoxError> {
             let json = serde_json::to_string(&value)?;
             if let Ok(mut seen) = self.serialize_inputs.lock() {
@@ -1601,7 +1601,7 @@ pub(crate) mod test_support {
         }
 
         // reason: exercises the async-fn impl form user code writes
-        #[allow(clippy::unused_async_trait_impl)]
+        #[expect(clippy::unused_async_trait_impl)]
         async fn deserialize(&self, wire: String, _context: SerdesContext) -> Result<T, BoxError> {
             let json = hex_decode(&wire)?;
             if let Ok(mut seen) = self.deserialize_outputs.lock() {
@@ -1613,9 +1613,7 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
-#[allow(clippy::expect_used)] // reason: test assertions with descriptive messages
-#[allow(clippy::indexing_slicing)] // reason: test code with known-good structures
+#[expect(clippy::indexing_slicing)] // reason: test code with known-good structures
 mod tests {
     use super::*;
 
@@ -1906,7 +1904,7 @@ mod tests {
         assert!(parsed.get("file").unwrap().is_string());
         // Path should end with .json (we control the extension, always lowercase)
         let path = parsed.get("file").and_then(|v| v.as_str()).unwrap();
-        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        #[expect(clippy::case_sensitive_file_extension_comparisons)]
         // reason: we generate the extension; always lowercase
         let has_json_ext = path.ends_with(".json");
         assert!(has_json_ext, "path: {path}");
@@ -1945,7 +1943,7 @@ mod tests {
         // suffix, so a retried attempt never reuses the same path.
         let file_name = path.rsplit('/').next().unwrap();
         assert!(file_name.starts_with("step-1-"), "file name: {file_name}");
-        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        #[expect(clippy::case_sensitive_file_extension_comparisons)]
         // reason: we generate the extension; always lowercase
         let correct_suffix = file_name.ends_with(".json");
         assert!(correct_suffix, "file name: {file_name}");
@@ -2237,7 +2235,7 @@ mod tests {
 
         impl Serdes<String> for UpperSerdes {
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: String,
@@ -2247,7 +2245,7 @@ mod tests {
             }
 
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -2281,7 +2279,7 @@ mod tests {
 
         impl Serdes<i128> for DecimalSerdes {
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: i128,
@@ -2291,7 +2289,7 @@ mod tests {
             }
 
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,
@@ -2333,7 +2331,7 @@ mod tests {
 
         impl Serdes<Ordered> for PassThrough {
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn serialize(
                 &self,
                 value: Ordered,
@@ -2343,7 +2341,7 @@ mod tests {
             }
 
             // reason: exercises the async-fn impl form user code writes
-            #[allow(clippy::unused_async_trait_impl)]
+            #[expect(clippy::unused_async_trait_impl)]
             async fn deserialize(
                 &self,
                 wire: String,

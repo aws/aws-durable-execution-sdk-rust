@@ -216,7 +216,7 @@ where
 {
     /// Runs everything that precedes the check closure: replay path, or
     /// the live-path preamble (carried-state derivation + START checkpoint).
-    #[allow(clippy::too_many_lines)] // reason: replay-status protocol is a single logical unit; splitting would obscure it
+    #[expect(clippy::too_many_lines)] // reason: replay-status protocol is a single logical unit; splitting would obscure it
     async fn before(self) -> Result<WfcPrelude<S, SD>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -369,7 +369,7 @@ where
 {
     /// Settles one check cycle: serializes the new state, consults the wait
     /// strategy, and runs the Succeed/Retry/Fail checkpoint protocol.
-    #[allow(clippy::too_many_lines)] // reason: the settle protocol (serialize, strategy, checkpoint) is a single logical unit; splitting would obscure it
+    #[expect(clippy::too_many_lines)] // reason: the settle protocol (serialize, strategy, checkpoint) is a single logical unit; splitting would obscure it
     async fn settle(
         self,
         attempt: u32,
@@ -451,9 +451,7 @@ where
                     }
                     WaitDecision::Continue { delay } => {
                         // Not met: checkpoint RETRY with state + delay, then suspend.
-                        #[allow(clippy::cast_possible_truncation)] // reason: delay clamped to i32
-                        #[allow(clippy::cast_sign_loss)]
-                        // reason: ceil is non-negative
+                        #[expect(clippy::cast_possible_truncation)] // reason: delay clamped to i32
                         let delay_secs = (delay.as_secs_f64().ceil() as i64)
                             .clamp(1, i64::from(i32::MAX))
                             as i32;
@@ -681,7 +679,7 @@ fn build_wfc_update(
         );
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields (id, type, action) are set above
+    #[expect(clippy::expect_used)] // reason: all required fields (id, type, action) are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -707,7 +705,7 @@ fn build_wfc_fail_update(
         builder = builder.parent_id(parent);
     }
 
-    #[allow(clippy::expect_used)] // reason: all required fields (id, type, action) are set above
+    #[expect(clippy::expect_used)] // reason: all required fields (id, type, action) are set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
@@ -729,8 +727,7 @@ fn wfc_op_error_with_source(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)] // reason: test assertions
-#[allow(clippy::panic)] // reason: test assertions with descriptive messages
+#[expect(clippy::panic)] // reason: test assertions with descriptive messages
 mod tests {
     use super::*;
     use crate::client::InMemoryExecutionClient;
@@ -809,7 +806,6 @@ mod tests {
         // STARTED attempt with NO result — the shape that clobbers the
         // carried state when merged back into the log.
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        #[allow(clippy::expect_used)] // reason: test fixture — all required fields set
         let start_response_op = Operation::builder()
             .id(wire_key.clone())
             .r#type(OperationType::Step)
@@ -1162,7 +1158,7 @@ mod tests {
             wait_strategy: Some(Box::new(|_state: i32, _attempt| WaitDecision::complete())),
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
-                #[allow(unreachable_code)] // reason: type anchor for the diverging body
+                #[expect(unreachable_code)] // reason: type anchor for the diverging body
                 {
                     panic!("check must NOT execute during replay");
                     Ok::<i32, BoxError>(0)
@@ -1251,7 +1247,7 @@ mod tests {
             wait_strategy: None,
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
-                #[allow(unreachable_code)] // reason: type anchor for the diverging body
+                #[expect(unreachable_code)] // reason: type anchor for the diverging body
                 {
                     panic!("check must NOT execute during replay");
                     Ok::<i32, BoxError>(0)
@@ -1298,7 +1294,7 @@ mod tests {
             wait_strategy: None,
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
-                #[allow(unreachable_code)] // reason: type anchor for the diverging body
+                #[expect(unreachable_code)] // reason: type anchor for the diverging body
                 {
                     panic!("check must NOT execute during replay");
                     Ok::<i32, BoxError>(0)
@@ -1355,7 +1351,7 @@ mod tests {
             wait_strategy: None,
             serdes: crate::serdes::JsonSerdes,
             check: |_ctx, _state: i32| async move {
-                #[allow(unreachable_code)] // reason: type anchor for the diverging body
+                #[expect(unreachable_code)] // reason: type anchor for the diverging body
                 {
                     panic!("check must NOT execute during replay");
                     Ok::<i32, BoxError>(0)
