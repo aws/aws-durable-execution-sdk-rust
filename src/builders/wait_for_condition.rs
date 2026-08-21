@@ -2,6 +2,9 @@
 //! [`DurableContext::wait_for_condition`](crate::DurableContext::wait_for_condition),
 //! plus its configuration ([`WaitStrategy`]) and the per-check decision
 //! type ([`WaitDecision`]).
+//!
+//! The [wait-for-condition operation guide](https://docs.aws.amazon.com/durable-execution/sdk-reference/operations/wait-for-condition/)
+//! describes this operation independently of any language SDK.
 
 use std::future::{Future, IntoFuture};
 use std::time::Duration;
@@ -17,10 +20,6 @@ use crate::serdes::JsonSerdes;
 
 pub use crate::wait_for_condition::WaitDecision;
 
-// ============================================================
-// WaitForConditionBuilder
-// ============================================================
-
 /// Builder for a wait-for-condition operation.
 ///
 /// Created by [`DurableContext::wait_for_condition`]. Configure the polling
@@ -29,14 +28,12 @@ pub use crate::wait_for_condition::WaitDecision;
 /// [`wait_strategy_fn`](Self::wait_strategy_fn) (a custom closure).
 ///
 /// With **no strategy set**, the check runs exactly once and the operation
-/// completes with that check's state — it does not poll. Set a strategy to
+/// completes with that check's state: it does not poll. Set a strategy to
 /// poll.
 ///
-/// The builder is generic over the check closure `F` and its future `Fut`
-/// so the check is stored **without type erasure**; both parameters are
-/// inferred at the call site and never written by users. The single
-/// erasure point is `.future()` / `.await`, which produces the one
-/// [`DurableFuture`] box.
+/// The builder is generic over the check closure `F` and its future
+/// `Fut`; both parameters are inferred at the call site and never written
+/// by users.
 ///
 /// # Examples
 ///
@@ -170,15 +167,14 @@ where
     /// Sets a custom wait strategy closure.
     ///
     /// The strategy receives the current (deserialized) state and the
-    /// 1-based attempt number, and returns a [`WaitDecision`].
-    /// The SDK boxes the closure internally — no `Box::new` at the call site.
+    /// attempt number (starting at 1), and returns a [`WaitDecision`].
     ///
     /// The closure is responsible for termination: return
     /// [`WaitDecision::complete`] when the condition is met, and bound the
     /// polling with [`WaitDecision::exhausted`] (for example once `attempt`
     /// reaches a cap) so the operation cannot poll until the execution
     /// times out. Prefer [`wait_strategy`](Self::wait_strategy) when a
-    /// predicate plus attempt cap expresses the condition — it makes the
+    /// predicate plus attempt cap expresses the condition: it makes the
     /// bound impossible to forget. With no strategy set at all, the check
     /// runs exactly once and the operation completes with that state.
     ///
@@ -218,7 +214,7 @@ where
     ///
     /// Replaces the builder's serdes type parameter with `SD2`, which must
     /// implement [`Serdes<S>`](crate::Serdes) for this operation's state
-    /// type — attaching a serdes for a different type fails at compile
+    /// type: attaching a serdes for a different type fails at compile
     /// time. To share one instance across operations, wrap it in an
     /// [`Arc`](std::sync::Arc) and clone the `Arc` handle into each builder.
     pub fn serdes<SD2>(self, serdes: SD2) -> WaitForConditionBuilder<S, F, Fut, SD2>
@@ -237,7 +233,14 @@ where
         }
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
+    ///
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<S>
     where
         SD: Serdes<S>,
@@ -246,6 +249,14 @@ where
     }
 
     /// Eagerly spawns the operation on a tokio task.
+    ///
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     pub fn spawn(self) -> DurableFuture<S>
     where
         SD: Serdes<S>,
@@ -290,14 +301,14 @@ where
 ///
 /// Carries the three things a bounded poll needs: a **completion
 /// predicate** over the state (the operation completes when it returns
-/// `true`), an attempt cap (**`max_attempts`** — reaching it without the
+/// `true`), an attempt cap (**`max_attempts`**: reaching it without the
 /// predicate matching fails the operation with a `MaxChecksExceeded`
 /// error), and exponential-backoff **delay shaping** (`initial_delay`,
 /// `max_delay`, `backoff_rate`, `jitter`) for the suspension between
 /// checks.
 ///
-/// The predicate is required at construction — [`WaitStrategy::builder`]
-/// takes it as its argument — so a strategy that polls forever cannot be
+/// The predicate is required at construction: [`WaitStrategy::builder`]
+/// takes it as its argument, so a strategy that polls forever cannot be
 /// constructed. The remaining knobs default to 60 attempts, a 5 second
 /// initial delay, a 5 minute maximum delay, a 1.5 backoff rate, and
 /// [`JitterStrategy::Full`](crate::builders::JitterStrategy), matching the
@@ -307,11 +318,10 @@ where
 /// capped at `max_delay`, jittered per
 /// [`JitterStrategy`](crate::builders::JitterStrategy), and quantized
 /// to whole seconds with a one-second minimum, always rounding **up**
-/// (`max(1, ceil(delay))`) — a sampled delay never fires earlier than
+/// (`max(1, ceil(delay))`): a sampled delay never fires earlier than
 /// sampled, for every jitter strategy.
 ///
-/// Fields are private per C-STRUCT-PRIVATE; read values back through the
-/// accessors.
+/// Read values back through the accessors.
 ///
 /// # Examples
 ///
@@ -329,6 +339,9 @@ where
 /// assert!((strategy.backoff_rate() - 1.5).abs() < f64::EPSILON);
 /// ```
 #[non_exhaustive]
+// Fields are private so the struct can grow without breaking callers;
+// see the Rust API Guidelines on structs with private fields:
+// https://rust-lang.github.io/api-guidelines/future-proofing.html#c-struct-private
 pub struct WaitStrategy<S> {
     /// Predicate over the state; `true` completes the operation.
     completion_predicate: std::sync::Arc<dyn Fn(&S) -> bool + Send + Sync>,
@@ -384,7 +397,7 @@ impl<S> WaitStrategy<S> {
     ///
     /// The predicate receives the state each check produced and returns
     /// `true` when the condition is met, which completes the operation.
-    /// Taking it here — rather than through an optional setter — makes an
+    /// Taking it here, rather than through an optional setter, makes an
     /// unbounded strategy unrepresentable. Knobs left unset keep the
     /// JS/Python-aligned defaults (60 attempts, 5s initial delay, 5min
     /// maximum delay, 1.5 backoff rate, full jitter).
@@ -466,7 +479,7 @@ impl<S> WaitStrategy<S> {
 
         // Exponential backoff: initial * rate^(attempt-1), capped at max,
         // jittered, then quantized with the round-up-min-1s policy
-        // (`max(1, ceil(delay))`) — see [`quantize_wait_delay`].
+        // (`max(1, ceil(delay))`): see [`quantize_wait_delay`].
         let exponent = i32::try_from(attempt).unwrap_or(1) - 1;
         let base = (self.initial_delay.as_secs_f64() * self.backoff_rate.powi(exponent))
             .min(self.max_delay.as_secs_f64());
@@ -488,7 +501,7 @@ impl<S> WaitStrategy<S> {
 /// Quantizes a fractional delay in seconds to a whole-second [`Duration`]
 /// with a one-second minimum, always rounding **up**: `max(1, ceil(delay))`,
 /// the policy issue #35 requires (Python does the same). A sampled delay is
-/// therefore never scheduled earlier than sampled — `4.4s` becomes `5s`.
+/// therefore never scheduled earlier than sampled: `4.4s` becomes `5s`.
 ///
 /// This is deliberately independent of the retry path's
 /// `step::quantize_delay_secs`, whose `Full`-jitter arm rounds to the
@@ -649,7 +662,7 @@ mod tests {
         assert_eq!(full.jitter(), JitterStrategy::Half);
     }
 
-    /// A state satisfying the completion predicate yields `Complete` — and
+    /// A state satisfying the completion predicate yields `Complete`, and
     /// the predicate wins over exhaustion, so a condition satisfied on the
     /// final allowed check completes rather than exhausting.
     #[test]
@@ -830,7 +843,7 @@ mod tests {
 
     /// The wait-strategy quantizer implements the round-up-min-1s policy
     /// issue #35 requires (`max(1, ceil(delay))`): a fractional sample is
-    /// never scheduled earlier than sampled — `4.4s` rounds **up** to `5s`,
+    /// never scheduled earlier than sampled: `4.4s` rounds **up** to `5s`,
     /// unlike the retry path's legacy Full-jitter nearest-rounding, which
     /// would schedule it at `4s`.
     #[test]
@@ -852,7 +865,7 @@ mod tests {
 
     /// End-to-end through `decide`: with `Full` jitter the sample lands in
     /// `[0, base]`, so after round-up quantization every delay is a whole
-    /// second in `[1s, ceil(base)]` — never rounded below the sample.
+    /// second in `[1s, ceil(base)]`, never rounded below the sample.
     #[test]
     fn full_jitter_decide_never_rounds_below_one_second() {
         let strategy = WaitStrategy::builder(|state: &i32| *state >= 100)

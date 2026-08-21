@@ -3,7 +3,7 @@
 use aws_durable_execution_sdk_rust as durable;
 use std::time::Duration;
 
-/// Handler: invoke then wait — on replay the invoke returns cached result.
+/// Handler: invoke then wait: on replay the invoke returns cached result.
 async fn handler(
     event: serde_json::Value,
     ctx: durable::DurableContext,

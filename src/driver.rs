@@ -7,7 +7,7 @@
 //!   or pending operation whose result is not yet available), the driver
 //!   STOPS polling and DROPS the user future at its current await point.
 //!   The invocation completes with a `PENDING` outcome. Suspension is
-//!   structurally unswallowable — there is no catchable error; the future
+//!   structurally unswallowable: there is no catchable error; the future
 //!   is simply dropped (Rust cancellation semantics).
 //!
 //! - **Resume**: On a subsequent invocation with existing checkpoint state,
@@ -30,14 +30,14 @@
 //! return from the top-level future: if set, it drops the future
 //! immediately (no further polls) and returns `InvocationOutcome::Pending`.
 //!
-//! This design keeps suspension signaling entirely internal — no public
+//! This design keeps suspension signaling entirely internal, no public
 //! type or error surfaces to user code.
 //!
 //! ## Scope quiescence
 //!
 //! The flag is per-SCOPE, and a scope suspends only when it is QUIESCENT:
 //! every operation eagerly spawned into it has settled (completed, durably
-//! parked, or aborted) and at least one of them — or its owner — needs to
+//! parked, or aborted) and at least one of them, or its owner, needs to
 //! suspend. [`ScopeQuiescence`] holds that accounting, so a `.spawn()`ed wait
 //! that parks cannot end the invocation while a spawned sibling step is still
 //! runnable. It is the same rule the batch coordinator applies to branches
@@ -49,21 +49,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
-// Imports used by tests — suppress dead-code warnings for the engine types
+// Imports used by tests: suppress dead-code warnings for the engine types
 // which are consumed by operation execution.
 #[cfg(test)]
 use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus, EngineState};
-
-// ────────────────────────────────────────────────────────────────────────────
-// Invocation Outcome
-// ────────────────────────────────────────────────────────────────────────────
 
 /// The outcome of driving a single invocation of the user's handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InvocationOutcome {
     /// The handler completed successfully with a serialized result.
     Complete(String),
-    /// The handler suspended — an operation requires an external event
+    /// The handler suspended: an operation requires an external event
     /// before it can proceed. The engine drops the handler future and
     /// reports PENDING to the runtime.
     Pending,
@@ -73,8 +69,8 @@ pub(crate) enum InvocationOutcome {
         /// trace) reported in the response envelope.
         error: crate::error::WireError,
     },
-    /// The INVOCATION itself must fail — a Lambda runtime error rather
-    /// than a `FAILED` envelope — so the durable service re-invokes, the
+    /// The INVOCATION itself must fail, a Lambda runtime error rather
+    /// than a `FAILED` envelope, so the durable service re-invokes, the
     /// same recovery as an interruption. Produced by a retryable
     /// checkpoint write failure that exhausted transport-level retries:
     /// the write channel is down, so nothing more is written and the
@@ -85,16 +81,12 @@ pub(crate) enum InvocationOutcome {
     },
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Suspension Signal (shared state between operations and the driver)
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Tracks the settle state of the operations spawned INTO this scope, so the
 /// scope's owner parks only once every runnable sibling has settled.
 ///
 /// This is the same accounting the batch coordinator performs for branches
 /// (`running`/`any_suspended` in [`crate::map_parallel`]): a scope suspends
-/// only when it is quiescent — nothing runnable is left — and at least one
+/// only when it is quiescent, nothing runnable is left, and at least one
 /// child parked. The coordinator can keep that state in local variables
 /// because it owns the loop that joins its branches; a scope with `.spawn()`ed
 /// children has no such loop (the owner is user code), so the same counters
@@ -133,7 +125,7 @@ pub(crate) enum SpawnSettlement {
     Aborted,
 }
 
-/// A per-scope suspension signal — one node in the invocation's scope tree.
+/// A per-scope suspension signal: one node in the invocation's scope tree.
 ///
 /// Suspension is SCOPED: a `wait` (or any parking operation) requests only
 /// the scope of the context it runs on. The root handler runs in the root
@@ -156,13 +148,13 @@ pub(crate) enum SpawnSettlement {
 /// siblings keep running. A scope owner that becomes quiescent with parked
 /// work suspends its OWN scope, which the level above observes.
 ///
-/// This is an internal engine concern — it is never exposed publicly.
+/// This is an internal engine concern: it is never exposed publicly.
 #[derive(Debug)]
 pub(crate) struct SuspensionSignal {
     /// Set to `true` by an operation in this scope that must suspend.
     requested: AtomicBool,
     /// Waker of the scope driver ([`drive_scope`]) polling THIS scope, if
-    /// any. The root scope has no scope driver — its driver is the
+    /// any. The root scope has no scope driver: its driver is the
     /// invocation driver, which registers through `invocation_waker`.
     scope_waker: std::sync::Mutex<Option<Waker>>,
     /// Shared invocation (root) poll-loop waker. Every scope in the tree
@@ -191,7 +183,7 @@ pub(crate) struct SuspensionSignal {
 /// - non-determinism detection
 ///   ([`crate::context::DurableContext::validate_replay_identity`]): a
 ///   replay identity mismatch means no amount of re-invocation can make
-///   progress — [`FatalSeverity::FailExecution`];
+///   progress: [`FatalSeverity::FailExecution`];
 /// - checkpoint write failures
 ///   ([`crate::context::DurableContext::checkpoint_failure_unrecoverable`]):
 ///   a retryable failure fails the invocation so the service re-invokes
@@ -219,7 +211,7 @@ pub(crate) enum FatalSeverity {
     /// error, which the service records as the execution result.
     FailExecution,
     /// Only this invocation dies: report a Lambda runtime error (no
-    /// envelope), and the service re-invokes — the interruption recovery
+    /// envelope), and the service re-invokes: the interruption recovery
     /// path.
     FailInvocation,
 }
@@ -323,7 +315,7 @@ impl SuspensionSignal {
     ///
     /// Sets this scope's flag and wakes both this scope's scope driver (if
     /// registered) and the invocation driver (fallback), so the responsible
-    /// driver re-polls and observes the flag — even when the request comes
+    /// driver re-polls and observes the flag: even when the request comes
     /// from a task other than the one that driver is polling.
     pub(crate) fn request_suspend(&self) {
         self.requested.store(true, Ordering::Release);
@@ -387,8 +379,8 @@ impl SuspensionSignal {
     /// Requests suspension immediately when the scope is already quiescent.
     /// Otherwise the request is DEFERRED: runnable spawned siblings keep going
     /// and the last one to settle fires the suspension
-    /// ([`Self::settle_spawn`]). Every parking path funnels through here — see
-    /// [`DurableContext::request_suspend`](crate::context::DurableContext) —
+    /// ([`Self::settle_spawn`]). Every parking path funnels through here: see
+    /// [`DurableContext::request_suspend`](crate::context::DurableContext),
     /// so no suspension can bypass the accounting.
     pub(crate) fn park_owner(&self) {
         self.quiescence.owner_parked.store(true, Ordering::SeqCst);
@@ -441,14 +433,10 @@ fn set_slot(slot: &std::sync::Mutex<Option<Waker>>, waker: &Waker) {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Task Ownership
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Identifies the owning task and tracks blessed (engine-spawned) task IDs.
 ///
 /// Each `DurableContext` records the `tokio::task::Id` of the task that
-/// created it. Durable operations check ownership before proceeding —
+/// created it. Durable operations check ownership before proceeding:
 /// operations from a foreign task fail fast.
 ///
 /// **Production topology**: `lambda_runtime` awaits the handler future
@@ -465,11 +453,11 @@ fn set_slot(slot: &std::sync::Mutex<Option<Waker>>, waker: &Waker) {
 #[derive(Debug)]
 pub(crate) struct TaskOwnership {
     /// The task ID that owns this context. `None` if created outside a
-    /// spawned task (e.g. in `block_on` — the production path). A `None`
+    /// spawned task (e.g. in `block_on`: the production path). A `None`
     /// owner acts as a root-context marker: inline callers (also `None`)
     /// pass, but unblessed spawned tasks are rejected.
     owner_task_id: Option<tokio::task::Id>,
-    /// Task IDs blessed by `.spawn()` — these are exempt from the check.
+    /// Task IDs blessed by `.spawn()`: these are exempt from the check.
     /// We use a Mutex<Vec> because spawn registrations are rare relative
     /// to ownership checks, and the set is small: the list grows by one
     /// entry per `.spawn()` call per invocation and is never larger than
@@ -482,7 +470,7 @@ impl TaskOwnership {
     /// Creates ownership tracking anchored to the current task.
     ///
     /// If called outside a tokio spawned task (e.g. directly in
-    /// `block_on`), the owner is recorded as `None` — the "root-context"
+    /// `block_on`), the owner is recorded as `None`: the "root-context"
     /// marker. This is the production path: `lambda_runtime` awaits the
     /// handler inline under `block_on`, so `try_id()` returns `None`.
     /// The guard still activates: operations invoked from unblessed
@@ -512,12 +500,12 @@ impl TaskOwnership {
     /// Returns `Ok(())` if the caller is the owner or a blessed task.
     /// Returns `Err` with a descriptive message if unauthorized.
     ///
-    /// **Root-context mode** (owner is `None` — production path): callers
+    /// **Root-context mode** (owner is `None`: production path): callers
     /// with `try_id() == None` (inline under the same `block_on`) pass.
     /// Callers with a task ID must be blessed; otherwise they are foreign
     /// spawned tasks and the operation is rejected.
     ///
-    /// **Task-context mode** (owner is `Some`) — callers must be the same
+    /// **Task-context mode** (owner is `Some`): callers must be the same
     /// task or a blessed task; otherwise rejected.
     pub(crate) fn check_current_task(&self) -> Result<(), String> {
         match self.owner_task_id {
@@ -525,10 +513,10 @@ impl TaskOwnership {
                 // Root-context mode: owner was created inline under block_on
                 // (the production lambda_runtime topology).
                 let Some(current_id) = tokio::task::try_id() else {
-                    // Caller is also inline (no task ID) — same context.
+                    // Caller is also inline (no task ID): same context.
                     return Ok(());
                 };
-                // Caller has a task ID — must be blessed to proceed.
+                // Caller has a task ID: must be blessed to proceed.
                 let blessed = self
                     .blessed_tasks
                     .lock()
@@ -566,17 +554,13 @@ impl TaskOwnership {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Structured task ownership: abort-on-drop handle
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Retains a spawned tokio task's `JoinHandle` and aborts the task when
 /// dropped.
 ///
 /// Holding this alongside (or inside) the future that owns a spawned
 /// durable task makes the owner responsible for the task's lifetime:
 /// dropping the owner aborts the task. This prevents spawned durable work
-/// from outliving the invocation that created it — a dropped oneshot
+/// from outliving the invocation that created it: a dropped oneshot
 /// receiver alone does NOT cancel a tokio task, so without this the task
 /// would survive the invocation boundary and could resume on a later warm
 /// invocation.
@@ -597,10 +581,6 @@ impl Drop for AbortOnDrop {
         self.handle.abort();
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Driver: polls the user future with suspension awareness
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Drives a single invocation of the user's handler future.
 ///
@@ -645,7 +625,7 @@ where
         if suspension_signal.is_suspend_requested() {
             // Drop the future by letting its stack-pinned storage go out
             // of scope when this driver returns. Return Ready(Pending) to
-            // the outer async — we're done.
+            // the outer async: we're done.
             return Poll::Ready(InvocationOutcome::Pending);
         }
 
@@ -655,7 +635,7 @@ where
                 // A fatal error recorded DURING this poll (e.g. a replay
                 // identity mismatch swallowed by a combinator or a tolerant
                 // batch before the handler resolved) must fail the
-                // execution — a successful completion would erase it.
+                // execution: a successful completion would erase it.
                 if let Some(fatal) = suspension_signal.fatal_error() {
                     return Poll::Ready(fatal.into_outcome());
                 }
@@ -691,7 +671,7 @@ where
                 if let Some(fatal) = suspension_signal.fatal_error() {
                     return Poll::Ready(fatal.into_outcome());
                 }
-                // The future yielded — check if an operation requested
+                // The future yielded: check if an operation requested
                 // suspension during this poll cycle.
                 if suspension_signal.is_suspend_requested() {
                     // Suspension requested: drop the future (its
@@ -699,7 +679,7 @@ where
                     // driver returns) and report PENDING.
                     Poll::Ready(InvocationOutcome::Pending)
                 } else {
-                    // Normal async yield — the future is waiting for some
+                    // Normal async yield: the future is waiting for some
                     // other wakeup (e.g., I/O). Continue polling.
                     Poll::Pending
                 }
@@ -708,10 +688,6 @@ where
     })
     .await
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Branch driver: converts a locally-suspended branch future into an outcome
-// ────────────────────────────────────────────────────────────────────────────
 
 /// The outcome of driving a single branch future within one scope.
 ///
@@ -736,7 +712,7 @@ pub(crate) enum ScopeOutcome<T> {
 /// dropped and [`ScopeOutcome::Suspended`] is returned so the coordinator can
 /// keep sibling branches running. Otherwise the future's own output is
 /// returned as [`ScopeOutcome::Completed`]. Suspension takes precedence over
-/// a same-poll `Ready`, mirroring the invocation driver's precedence rule —
+/// a same-poll `Ready`, mirroring the invocation driver's precedence rule,
 /// including the case where the future resolved but an operation `.spawn()`ed
 /// into this scope is durably parked.
 pub(crate) async fn drive_scope<F>(
@@ -778,10 +754,6 @@ where
     .await
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{InvocationOutcome, SuspensionSignal, drive_invocation};
@@ -821,9 +793,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
-    // ── Suspension drops the future at the await point ──────────────────
+    // Suspension drops the future at the await point
 
-    /// A guard that sets a flag when dropped — proves the future was
+    /// A guard that sets a flag when dropped: proves the future was
     /// dropped at the await point.
     struct DropGuard {
         dropped: Arc<AtomicBool>,
@@ -853,11 +825,11 @@ mod tests {
 
                 // Simulate an operation that requests suspension and yields.
                 signal_clone.request_suspend();
-                // Yield to the driver — the driver will see the signal and
+                // Yield to the driver: the driver will see the signal and
                 // drop this future.
                 tokio::task::yield_now().await;
 
-                // This code must NEVER run — the future is dropped above.
+                // This code must NEVER run: the future is dropped above.
                 after_clone.store(true, Ordering::SeqCst);
                 Ok("should not reach".to_owned())
             },
@@ -876,7 +848,7 @@ mod tests {
         );
     }
 
-    // ── Suspension is unswallowable (no catchable error) ────────────────
+    // Suspension is unswallowable (no catchable error)
 
     #[tokio::test]
     async fn suspension_unswallowable_by_catch_all() {
@@ -888,7 +860,7 @@ mod tests {
 
         let outcome = drive_invocation(
             async move {
-                // User tries a "catch-all" pattern — wrapping in a closure
+                // User tries a "catch-all" pattern: wrapping in a closure
                 // that catches panics. This cannot catch future-drop.
                 let result: Result<String, crate::error::WireError> = async {
                     signal_clone.request_suspend();
@@ -912,7 +884,7 @@ mod tests {
         );
     }
 
-    // ── PENDING outcome surfaces to the driver caller ───────────────────
+    // PENDING outcome surfaces to the driver caller
 
     #[tokio::test]
     async fn pending_outcome_surfaces_to_caller() {
@@ -932,7 +904,7 @@ mod tests {
         assert_eq!(outcome, InvocationOutcome::Pending);
     }
 
-    // ── Normal completion ───────────────────────────────────────────────
+    // Normal completion
 
     #[tokio::test]
     async fn driver_returns_complete_on_success() {
@@ -969,7 +941,7 @@ mod tests {
         assert_eq!(error.error_message(), Some("boom"));
     }
 
-    // ── Resume: replayed operations return frozen results ────────────────
+    // Resume: replayed operations return frozen results
 
     #[tokio::test]
     async fn resume_replays_frozen_results_without_re_executing() {
@@ -1030,12 +1002,12 @@ mod tests {
         );
     }
 
-    // ── Task ownership: foreign task fails fast ─────────────────────────
+    // Task ownership: foreign task fails fast
 
     #[tokio::test]
     async fn ownership_check_rejects_foreign_task() {
         // Must create ownership inside a spawned task where try_id()
-        // returns Some — the #[tokio::test] root runs in block_on which
+        // returns Some: the #[tokio::test] root runs in block_on which
         // has no task ID.
         let result = tokio::spawn(async {
             let ownership = Arc::new(TaskOwnership::new_current());
@@ -1057,7 +1029,7 @@ mod tests {
         );
     }
 
-    // ── Task ownership: owning task succeeds ────────────────────────────
+    // Task ownership: owning task succeeds
 
     #[tokio::test]
     async fn ownership_check_allows_owning_task() {
@@ -1072,7 +1044,7 @@ mod tests {
         assert!(inner.is_ok(), "owning task should pass: {inner:?}");
     }
 
-    // ── Task ownership: .spawn() exemption (blessed tasks) ──────────────
+    // Task ownership: .spawn() exemption (blessed tasks)
 
     #[tokio::test]
     async fn ownership_spawn_exemption_blesses_task() {
@@ -1099,20 +1071,20 @@ mod tests {
         );
     }
 
-    // ── Task ownership: production topology (inline under block_on) ─────
+    // Task ownership: production topology (inline under block_on)
 
     /// Reproduces the REAL production topology: handler awaited inline
     /// under `block_on` (NOT inside `tokio::spawn`). `#[tokio::test]`
-    /// runs in `block_on`, so `try_id()` is `None` — matching production.
+    /// runs in `block_on`, so `try_id()` is `None`: matching production.
     #[tokio::test]
     async fn ownership_root_context_allows_inline_operations() {
-        // Context created inline (try_id() == None) — production path.
+        // Context created inline (try_id() == None): production path.
         let ownership = TaskOwnership::new_current();
         assert!(
             ownership.owner_task_id.is_none(),
             "sanity: #[tokio::test] root runs in block_on with no task ID"
         );
-        // Operation invoked inline — should pass.
+        // Operation invoked inline: should pass.
         let result = ownership.check_current_task();
         assert!(
             result.is_ok(),
@@ -1124,7 +1096,7 @@ mod tests {
     /// `tokio::spawn` (NOT blessed) MUST be rejected.
     #[tokio::test]
     async fn ownership_root_context_rejects_unblessed_spawn() {
-        // Context created inline (try_id() == None) — production path.
+        // Context created inline (try_id() == None): production path.
         let ownership = Arc::new(TaskOwnership::new_current());
         assert!(
             ownership.owner_task_id.is_none(),
@@ -1132,7 +1104,7 @@ mod tests {
         );
         let ownership_clone = Arc::clone(&ownership);
 
-        // User tokio::spawn — NOT blessed.
+        // User tokio::spawn, NOT blessed.
         let handle = tokio::spawn(async move { ownership_clone.check_current_task() });
 
         let inner = handle.await.unwrap();
@@ -1151,7 +1123,7 @@ mod tests {
     /// still work in root-context mode.
     #[tokio::test]
     async fn ownership_root_context_allows_blessed_spawn() {
-        // Context created inline (try_id() == None) — production path.
+        // Context created inline (try_id() == None): production path.
         let ownership = Arc::new(TaskOwnership::new_current());
         assert!(
             ownership.owner_task_id.is_none(),
@@ -1173,7 +1145,7 @@ mod tests {
         );
     }
 
-    // ── Signal mechanics ────────────────────────────────────────────────
+    // Signal mechanics
 
     #[test]
     fn suspension_signal_starts_inactive() {
@@ -1188,11 +1160,11 @@ mod tests {
         assert!(signal.is_suspend_requested());
     }
 
-    // ── Scope independence + branch driver ──────────────────────────────
+    // Scope independence + branch driver
 
     #[test]
     fn child_scope_suspend_does_not_trip_root_scope() {
-        // A branch scope's suspension must NOT set the root scope's flag —
+        // A branch scope's suspension must NOT set the root scope's flag:
         // this is exactly what lets a parked branch leave the invocation
         // running.
         let root = SuspensionSignal::new();
@@ -1230,11 +1202,6 @@ mod tests {
         assert!(matches!(outcome, ScopeOutcome::Suspended));
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Regression tests: suspension never returns to user code; spawned tasks
-// are owned and cancelled on drop.
-// ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[expect(clippy::panic)] // reason: test module
@@ -1281,7 +1248,7 @@ mod suspension_containment_and_task_ownership {
         }
     }
 
-    // ── 1. Suspension never lets following user code run ────────────────
+    // 1. Suspension never lets following user code run
     // Each op is awaited and its (never-produced) result ignored; the side
     // effect after the await MUST NOT run and the invocation MUST be Pending.
 
@@ -1421,7 +1388,7 @@ mod suspension_containment_and_task_ownership {
         );
     }
 
-    // ── 2. A replayed completed wait returns Ok and following code runs ──
+    // 2. A replayed completed wait returns Ok and following code runs
 
     #[tokio::test]
     async fn replayed_completed_wait_returns_ok_and_continues() {
@@ -1458,7 +1425,7 @@ mod suspension_containment_and_task_ownership {
         );
     }
 
-    // ── 3. Validation errors remain catchable; checkpoint failures do not ─
+    // 3. Validation errors remain catchable; checkpoint failures do not
 
     #[tokio::test]
     async fn validation_error_is_catchable_err() {
@@ -1542,7 +1509,7 @@ mod suspension_containment_and_task_ownership {
 
     /// The retryable counterpart: a checkpoint failure that exhausted the
     /// client's internal retries fails the INVOCATION (a Lambda runtime
-    /// error, so the service re-invokes — the interruption recovery path)
+    /// error, so the service re-invokes: the interruption recovery path)
     /// rather than the execution, and is equally unobservable by a catch.
     #[tokio::test]
     async fn retryable_checkpoint_failure_uncatchable_fails_invocation() {
@@ -1579,7 +1546,7 @@ mod suspension_containment_and_task_ownership {
         }
     }
 
-    // ── 5. Dropping a .spawn() handle cancels its task ──────────────────
+    // 5. Dropping a .spawn() handle cancels its task
 
     #[tokio::test]
     async fn dropping_spawn_handle_cancels_task() {
@@ -1636,12 +1603,12 @@ mod suspension_containment_and_task_ownership {
         );
     }
 
-    // ── 4 + 6. A spawned straggler (non-durable `pending()` body) holds the
+    // 4 + 6. A spawned straggler (non-durable `pending()` body) holds the
     // invocation until the Lambda timeout fires. The timeout DROPS the handler
     // future, which drops the AbortOnDrop guard, aborting the straggler. No
     // SUCCEED checkpoint is made for the aborted straggler. This is Case G
-    // from the S2a diagnosis — the bounded timeout simulates the Lambda
-    // platform's execution timeout backstop. ──
+    // from the S2a diagnosis: the bounded timeout simulates the Lambda
+    // platform's execution timeout backstop.
 
     #[tokio::test]
     async fn straggler_is_aborted_by_timeout_no_succeed_checkpoint() {
@@ -1708,7 +1675,7 @@ mod suspension_containment_and_task_ownership {
         )
         .await;
 
-        // The timeout fired — the invocation never completed on its own
+        // The timeout fired: the invocation never completed on its own
         // because the straggler prevented quiescence.
         assert!(
             result.is_err(),
@@ -1745,12 +1712,6 @@ mod suspension_containment_and_task_ownership {
         );
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Regression tests: branch-local suspension scopes + slot-holding
-// accounting. Driven end-to-end through the real invocation
-// driver over an in-memory client — no AWS.
-// ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod scoped_suspension {
@@ -1973,7 +1934,7 @@ mod scoped_suspension {
                 let outer = vec![Branch::new("outer", |cc: DurableContext| {
                     Box::pin(async move {
                         // A child context whose step feeds a nested map whose
-                        // single item waits — exercises child + coordinator
+                        // single item waits: exercises child + coordinator
                         // scope propagation in one branch.
                         let inner = vec![Branch::new("inner-wait", |icc: DurableContext| {
                             Box::pin(async move {
@@ -2078,7 +2039,7 @@ mod scoped_suspension {
     }
 
     // drive_scope directly: a scope-flagged park yields Suspended, while a
-    // ready future yields Completed — with an independent scope Arc.
+    // ready future yields Completed: with an independent scope Arc.
     #[tokio::test]
     async fn drive_scope_isolates_suspension_from_completion() {
         let scope = Arc::new(SuspensionSignal::new());
@@ -2099,15 +2060,12 @@ mod scoped_suspension {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Regression tests (S2a): `.spawn()` must not park the ROOT scope
-// ────────────────────────────────────────────────────────────────────────────
 //
 // `.spawn()` used to hand the operation future to `DurableFuture::spawn_blessed`
 // WITHOUT creating a child suspension scope, so a parking operation inside a
 // top-level `.spawn()` set the ROOT flag. `drive_invocation` then returned
 // `Poll::Ready(Pending)` on its next poll and dropped the handler future, which
-// fired `AbortOnDrop` on every sibling spawned task — including one mid-flight
+// fired `AbortOnDrop` on every sibling spawned task, including one mid-flight
 // that had already checkpointed STARTED. This was fixed by scope-quiescence
 // accounting: each `.spawn()` now runs in its own child scope, and the owner
 // parks only at quiescence.
@@ -2269,7 +2227,7 @@ mod spawn_scope_regressions {
             BOUND,
             drive_invocation(
                 async move {
-                    // Spawn a wait — it parks immediately (no timer result on
+                    // Spawn a wait: it parks immediately (no timer result on
                     // first invocation). Hold the handle so its AbortOnDrop
                     // doesn't fire, but never await it.
                     let _wait = ctx_h.wait(Duration::from_secs(10)).spawn();
@@ -2317,7 +2275,7 @@ mod spawn_scope_regressions {
     /// A spawned `try_join_all` containing a parking wait input beside a
     /// runnable step sibling. The combinator is itself spawned onto the root
     /// scope. Without park-redirect, the parking input calls `park_owner` on
-    /// root — the same scope that counts the combinator as outstanding —
+    /// root, the same scope that counts the combinator as outstanding,
     /// creating a deadlock: root waits for the combinator to settle, but the
     /// combinator's `JoinSet` hangs on the parked constituent.
     ///

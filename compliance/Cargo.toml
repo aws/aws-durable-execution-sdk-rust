@@ -38,10 +38,10 @@ indexing_slicing = "deny"
 missing_docs = "deny"
 unsafe_code = "forbid"
 
-# Fast-build conformance profile — SCOPED TO THIS WORKSPACE ONLY. The SDK's
+# Fast-build conformance profile: SCOPED TO THIS WORKSPACE ONLY. The SDK's
 # own root Cargo.toml has no [profile] tables and is not touched here.
 # Handler crates are thin glue that never runs hot, so their own code compiles
-# at opt-level 1 (fast). Dependencies — the SDK, tokio, aws-sdk, serde — are
+# at opt-level 1 (fast). Dependencies, the SDK, tokio, aws-sdk, serde, are
 # built at opt-level 3 via the package."*" override (Cargo applies `*` to all
 # dependencies but NOT to workspace members). debug info off, no LTO, and many
 # codegen units keep the per-crate compile fast and parallel.

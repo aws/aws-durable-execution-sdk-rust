@@ -2,7 +2,7 @@
 //!
 //! In order it runs a [`step`], a durable [`wait`], a
 //! [`run_in_child_context`], a [`map`] fan-out, a chained [`invoke`] of the
-//! companion `invoke_target`, and a [`wait_for_condition`] poll — then returns
+//! companion `invoke_target`, and a [`wait_for_condition`] poll, then returns
 //! a summary of all of them. It is the end-to-end reference for how the pieces
 //! compose in one handler. The target function is named through the
 //! `TARGET_FUNCTION_NAME` environment variable.

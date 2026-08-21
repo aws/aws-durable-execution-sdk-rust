@@ -3,7 +3,7 @@
 //! [`ctx.step`](aws_durable_execution_sdk_rust::DurableContext::step) runs a
 //! closure and records its result. The first time the function runs, the
 //! closure executes and the return value is checkpointed. If the execution is
-//! later interrupted and replayed, the closure is NOT run again — the recorded
+//! later interrupted and replayed, the closure is NOT run again: the recorded
 //! value is returned in its place. This is the core durable-execution
 //! guarantee: work inside a completed step happens exactly once across all
 //! replays.
@@ -12,7 +12,7 @@
 //! the recorded result participates in replay. Note that the step closure
 //! receives a
 //! [`StepContext`](aws_durable_execution_sdk_rust::StepContext), which
-//! deliberately exposes no durable operations — nesting durable operations
+//! deliberately exposes no durable operations: nesting durable operations
 //! inside a step is a compile error, not a runtime surprise.
 
 use aws_durable_execution_sdk_rust as durable;

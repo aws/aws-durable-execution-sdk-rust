@@ -1,14 +1,14 @@
 //! Eager fan-out with `.spawn()`.
 //!
 //! Operation builders are lazy: a builder that is only held does no work until
-//! it is awaited. `.spawn()` opts into eager execution — it starts the
+//! it is awaited. `.spawn()` opts into eager execution: it starts the
 //! operation immediately on its own task and returns a running
 //! [`DurableFuture`](aws_durable_execution_sdk_rust::DurableFuture) you await
 //! later. Several `.spawn()`ed operations therefore make progress
 //! concurrently while you set up more work.
 //!
-//! Because each operation's identity is claimed when its builder is created —
-//! before `.spawn()` starts it — identities stay deterministic no matter which
+//! Because each operation's identity is claimed when its builder is created,
+//! before `.spawn()` starts it, identities stay deterministic no matter which
 //! task runs first. `.spawn()` is the replay-safe alternative to a bare
 //! `tokio::spawn` of durable work, which the SDK rejects because it would
 //! escape the deterministic-identity guarantee.

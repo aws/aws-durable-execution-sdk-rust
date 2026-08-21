@@ -1,4 +1,4 @@
-//! Conformance requirement 9-20: Map with an operation-level serdes —
+//! Conformance requirement 9-20: Map with an operation-level serdes:
 //! deserialize on replay (wait after the map).
 //!
 //! Uses `.result_serdes()` with the same `OpSerdes` as 9-19. The wait after
@@ -40,7 +40,7 @@ where
                         item.get("result")
                             .and_then(serde_json::Value::as_str)
                             .map(|s| {
-                                // Each item carries its own wire string — a
+                                // Each item carries its own wire string: a
                                 // JSON-encoded string here, so strip the quotes.
                                 s.trim_matches('"').to_owned()
                             })

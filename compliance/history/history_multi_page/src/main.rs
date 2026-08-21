@@ -28,7 +28,7 @@ async fn handler(
         let step_arn = arn.clone();
         let value = ctx
             .step(move |_| async move {
-                // Executes exactly once per step — a truncated replay
+                // Executes exactly once per step: a truncated replay
                 // re-executes steps and inflates this log count. The
                 // executionArn field (top-level via the flattened JSON
                 // subscriber) enables the validator's per-execution filter.

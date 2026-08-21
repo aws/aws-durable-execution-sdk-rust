@@ -129,7 +129,7 @@ pub(crate) fn rand_full_jitter(max_secs: f64) -> f64 {
 /// the checkpoint log records a `Started` status without an outcome. On the
 /// next invocation, the SDK must decide whether to re-execute the step body.
 ///
-/// This is a **client-side only** configuration — it is not sent on the wire.
+/// This is a **client-side only** configuration: it is not sent on the wire.
 /// The checkpoint `Start` action is identical regardless of semantics; the
 /// difference is purely in the replay decision when `Started` status is
 /// encountered.
@@ -200,7 +200,7 @@ where
 {
     /// Executes the step operation: replay path or live path with retry.
     ///
-    /// Thin generic wrapper — the ONLY code monomorphized per step call
+    /// Thin generic wrapper: the ONLY code monomorphized per step call
     /// site. The replay/checkpoint state machine lives in the non-generic
     /// [`StepCore`] / [`StepLive`] halves (generic over the result type `O`
     /// only); this wrapper just polls the user's concrete future between
@@ -244,7 +244,7 @@ where
 
 /// The pre-closure half of a step: task-ownership check, replay resolution,
 /// attempt derivation, and the START checkpoint. Generic only over the
-/// result type `O` — no user closure reaches this state machine, so its
+/// result type `O`, no user closure reaches this state machine, so its
 /// substantial replay/checkpoint logic compiles once per result type
 /// instead of once per step call site.
 struct StepCore<O, S> {
@@ -345,11 +345,11 @@ where
                     return Ok(StepPrelude::Done(Err(replay_failure(wire, &wire_id))));
                 }
                 CheckpointStatus::Pending => {
-                    // Retry timer hasn't fired yet — suspend.
+                    // Retry timer hasn't fired yet: suspend.
                     return Ok(StepPrelude::Done(self.ctx.suspend_now().await));
                 }
                 CheckpointStatus::Started => {
-                    // Already started — behavior depends on semantics.
+                    // Already started: behavior depends on semantics.
                     if self.semantics == StepSemantics::AtMostOncePerRetry {
                         // The previous attempt was interrupted before
                         // recording an outcome. Do NOT re-execute; treat as
@@ -381,7 +381,7 @@ where
                     // Fall through to live execution.
                 }
                 CheckpointStatus::Unknown(ref raw) => {
-                    // Unreachable in production — `checkpoint_view_validated`
+                    // Unreachable in production: `checkpoint_view_validated`
                     // already failed the execution (issue #45). Kept as a
                     // typed arm so a future bypass cannot fall through to
                     // live execution and re-run a possibly-terminal step.
@@ -408,7 +408,7 @@ where
         if !already_started {
             let start_update = build_start_update(&wire_id, name.as_deref(), ctx.parent_wire_id());
             if let Err(err) = ctx.checkpoint_updates(vec![start_update]).await {
-                // Audit (#43) — step START: no user code has run for this
+                // Audit (#43): step START: no user code has run for this
                 // attempt, so there is no side effect needing a recorded
                 // outcome. No terminal FAIL: the invocation dies, the
                 // service re-invokes, and replay reaches this point and
@@ -479,11 +479,11 @@ where
     }
 }
 
-// ── Free functions for post-closure operations ──────────────────────────
+// Free functions for post-closure operations
 
 /// Handles a successful step execution: serialize, checkpoint, return.
 ///
-/// The value round-trips through the configured wire format — ownership
+/// The value round-trips through the configured wire format: ownership
 /// transfers to `serialize`, and the returned value is what `deserialize`
 /// produced from the stored wire string (round-trip parity).
 async fn handle_success<O, S: Serdes<O>>(
@@ -498,7 +498,7 @@ async fn handle_success<O, S: Serdes<O>>(
     // Serialize the result (ownership transfers to the serdes).
     //
     // A serialization failure is a LOCAL, deterministic, user-facing
-    // failure, so it stays catchable — but the terminal FAIL is persisted
+    // failure, so it stays catchable, but the terminal FAIL is persisted
     // FIRST (issue #43). With the failure recorded, replay yields the
     // recorded FAIL instead of re-running the body: the body executes
     // exactly once, and a handler that catches the error branches on a
@@ -513,9 +513,9 @@ async fn handle_success<O, S: Serdes<O>>(
             let wire = crate::error::serialization_failure_wire(&op_err);
             let update = build_fail_update(wire_id, name, ctx.parent_wire_id(), &wire);
             if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43) — step FAIL (serialization): the body ran,
+                // Audit (#43): step FAIL (serialization): the body ran,
                 // so the failed FAIL write routes unrecoverable with a
-                // minimal retry — the record just attempted was already
+                // minimal retry: the record just attempted was already
                 // small, but a checkpoint-failure-derived one is the
                 // uniform terminal shape.
                 let cwire = crate::error::checkpoint_failure_wire(&client_err);
@@ -533,7 +533,7 @@ async fn handle_success<O, S: Serdes<O>>(
     // Checkpoint SUCCEED with payload.
     let update = build_succeed_update(wire_id, name, ctx.parent_wire_id(), &serialized);
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43) — step SUCCEED: the body ran and its side effects
+        // Audit (#43): step SUCCEED: the body ran and its side effects
         // need a recorded outcome, so a permanent rejection persists a
         // small terminal FAIL (it goes through on a channel that rejected
         // only the payload) before the execution fails. Yielding the
@@ -586,7 +586,7 @@ async fn handle_failure<O>(
             let delay_secs = i32::try_from(whole_secs.max(1)).unwrap_or(i32::MAX);
             let update = build_retry_update(wire_id, name, ctx.parent_wire_id(), &wire, delay_secs);
             if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43) — step RETRY: the body ran (and failed), so
+                // Audit (#43): step RETRY: the body ran (and failed), so
                 // its side effects need a recorded outcome. A permanent
                 // rejection persists a small terminal FAIL before the
                 // execution fails; recorded retries replay, but a retry
@@ -598,14 +598,14 @@ async fn handle_failure<O>(
                     .await;
             }
 
-            // Suspend — the backend owns the retry timer.
+            // Suspend: the backend owns the retry timer.
             ctx.suspend_now().await
         }
         RetryDecision::Stop => {
             // Checkpoint FAIL (permanent).
             let update = build_fail_update(wire_id, name, ctx.parent_wire_id(), &wire);
             if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43) — step FAIL: the body ran, so the failed
+                // Audit (#43): step FAIL: the body ran, so the failed
                 // FAIL write routes unrecoverable with a minimal terminal
                 // FAIL retry (the original may have been rejected for its
                 // error payload's size; the checkpoint-failure-derived
@@ -631,7 +631,7 @@ async fn handle_failure<O>(
     }
 }
 
-// ── Update builders ─────────────────────────────────────────────────────
+// Update builders
 
 fn build_start_update(
     wire_id: &str,
@@ -652,7 +652,7 @@ fn build_start_update(
         builder = builder.parent_id(parent);
     }
 
-    // build() is infallible here — all required fields (id, type, action) set.
+    // build() is infallible here: all required fields (id, type, action) set.
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
@@ -746,7 +746,7 @@ fn build_fail_update(
         .expect("all required OperationUpdate fields set")
 }
 
-// ── Serialization helpers ───────────────────────────────────────────────
+// Serialization helpers
 
 /// Serializes a step value through the configured serdes.
 ///
@@ -805,8 +805,8 @@ async fn replay_success<O, S: Serdes<O>>(
 ///
 /// A record whose `error_type` is the serialization discriminator
 /// ([`crate::error::SERIALIZATION_FAILED_ERROR_TYPE`]) reconstructs
-/// `StepErrorKind::SerializationFailed` — the kind the live path yielded
-/// after persisting that record — so replay reproduces the recorded
+/// `StepErrorKind::SerializationFailed`, the kind the live path yielded
+/// after persisting that record, so replay reproduces the recorded
 /// failure's classification, not just its message (issue #43).
 fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
     let kind = if wire.error_type() == Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) {
@@ -826,12 +826,12 @@ fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationErro
 /// carries no structured identity.
 ///
 /// A step body returns `Result<O, BoxError>`, so the concrete error type
-/// is erased *by the caller* before the SDK ever sees it — `?` boxes the
+/// is erased *by the caller* before the SDK ever sees it: `?` boxes the
 /// error at the user's call site, and Rust offers no runtime name for a
 /// `dyn Error`. Rather than guessing one from a `Debug` rendering, the
 /// SDK records this explicit generic name. An error that *does* carry
-/// structured identity — an [`OperationError`], or a
-/// [`crate::error::ReplayedFailure`] — records its registry name or its
+/// structured identity: an [`OperationError`], or a
+/// [`crate::error::ReplayedFailure`]: records its registry name or its
 /// original recorded type instead (see [`crate::error::wire_error_for`]).
 const STEP_FALLBACK_ERROR_TYPE: &str = "Error";
 
@@ -847,7 +847,7 @@ mod tests {
     use crate::engine::CheckpointLog;
     use std::sync::Arc;
 
-    // ── Replay tests ────────────────────────────────────────────────────
+    // Replay tests
 
     #[tokio::test]
     async fn replay_success_deserializes_json() {
@@ -891,7 +891,7 @@ mod tests {
             err.wire().and_then(crate::error::WireError::error_type),
             Some("TypeError")
         );
-        // The chain renders the recorded message via the alternate form —
+        // The chain renders the recorded message via the alternate form:
         // without folding the type into the text.
         let chain = format!("{err:#}");
         assert!(chain.contains("bad input"), "got: {chain}");
@@ -908,7 +908,7 @@ mod tests {
         assert!(chain.contains("unknown error"), "got: {chain}");
     }
 
-    // ── Serialization tests ─────────────────────────────────────────────
+    // Serialization tests
 
     #[tokio::test]
     async fn serialize_deserialize_round_trip() {
@@ -953,7 +953,7 @@ mod tests {
         assert_eq!(result, "\"HELLO\"");
     }
 
-    // ── Default retry strategy tests ────────────────────────────────────
+    // Default retry strategy tests
 
     #[test]
     fn default_retry_stops_at_max_attempts() {
@@ -996,7 +996,7 @@ mod tests {
         }
     }
 
-    // ── Live execution tests (with mock client) ─────────────────────────
+    // Live execution tests (with mock client)
 
     #[tokio::test]
     async fn step_live_success_checkpoints_and_returns() {
@@ -1277,7 +1277,7 @@ mod tests {
 
     /// Acceptance (issue #41): on the live path, an operation failure
     /// exposes the caller's concrete error type through a `source()`
-    /// downcast — the escaping error is carried, not stringified.
+    /// downcast: the escaping error is carried, not stringified.
     #[tokio::test]
     async fn step_live_failure_source_downcasts_to_concrete_user_type() {
         use crate::client::InMemoryExecutionClient;
@@ -1471,7 +1471,7 @@ mod tests {
         use crate::client::InMemoryExecutionClient;
 
         // Must create the context inside a spawned task where try_id()
-        // returns Some — #[tokio::test] root runs in block_on with no task ID.
+        // returns Some: #[tokio::test] root runs in block_on with no task ID.
         let result = tokio::spawn(async {
             let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
             let log = Arc::new(CheckpointLog::empty());
@@ -1515,7 +1515,7 @@ mod tests {
         );
     }
 
-    // ── AtMostOncePerRetry tests ────────────────────────────────────────
+    // AtMostOncePerRetry tests
 
     #[tokio::test]
     async fn step_at_most_once_replay_started_no_retry_fails_permanently() {
@@ -1736,7 +1736,7 @@ mod tests {
         );
     }
 
-    // ── RetryStrategyConfig delay shaping ───────────────────────────────
+    // RetryStrategyConfig delay shaping
 
     use crate::builders::{JitterStrategy, RetryStrategyConfig};
 
@@ -1815,7 +1815,7 @@ mod tests {
             .build();
 
         for attempt in 1u32..=3 {
-            // base: 8, 16, 32 — half-jitter bounds [4, 8], [8, 16], [16, 32].
+            // base: 8, 16, 32: half-jitter bounds [4, 8], [8, 16], [16, 32].
             let base = 8u64 << (attempt - 1);
             for _ in 0..100 {
                 let secs = retry_secs(&config.decide(attempt));
@@ -1889,7 +1889,7 @@ mod tests {
     /// keeps the SDK's legacy nearest-integer rounding
     /// (`round().max(1.0)`), because issue #12 requires
     /// `RetryStrategyConfig::default()` to reproduce the pre-config
-    /// behavior exactly — including how fractional jitter samples map to
+    /// behavior exactly, including how fractional jitter samples map to
     /// whole seconds. A ceiling here would shift the delay distribution
     /// for nearly every fractional sample.
     #[test]

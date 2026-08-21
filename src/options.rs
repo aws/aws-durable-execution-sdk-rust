@@ -5,7 +5,7 @@ use std::time::Duration;
 /// Error returned when [`OptionsBuilder::build()`] detects an invalid
 /// configuration combination.
 ///
-/// This error fires at construction time — never mid-execution — matching
+/// This error fires at construction time, never mid-execution, matching
 /// the spec's construction-time-only validation rule.
 ///
 /// # Examples
@@ -42,8 +42,8 @@ impl std::error::Error for OptionsValidationError {}
 ///
 /// The SDK calls the durable execution service through an
 /// `aws_sdk_lambda::Client` and relies on that client's own standard,
-/// jittered retry for transient failures. To customize transport behavior —
-/// retry policy, timeouts, endpoint, credentials — build the client (or an
+/// jittered retry for transient failures. To customize transport behavior,
+/// retry policy, timeouts, endpoint, credentials, build the client (or an
 /// `aws_config::SdkConfig`) yourself and supply it via
 /// [`lambda_client`](OptionsBuilder::lambda_client) (or
 /// [`sdk_config`](OptionsBuilder::sdk_config)); the SDK uses it as-is.
@@ -144,6 +144,11 @@ impl OptionsBuilder {
     /// Use this to provide custom endpoint configuration, credentials, or
     /// HTTP client settings.
     ///
+    /// By default, when neither this nor
+    /// [`lambda_client`](Self::lambda_client) is set, the SDK loads the
+    /// ambient environment configuration
+    /// (`aws_config::load_defaults`) and builds a client from it.
+    ///
     /// The parameter type is re-exported at the crate root as
     /// [`SdkConfig`](crate::SdkConfig), so callers can name it without
     /// depending on `aws-config` directly.
@@ -170,7 +175,10 @@ impl OptionsBuilder {
     /// Sets a pre-built Lambda client.
     ///
     /// When provided, the SDK uses this client instead of building one
-    /// from the SDK config.
+    /// from the SDK config. By default, when neither this nor
+    /// [`sdk_config`](Self::sdk_config) is set, the SDK builds a client
+    /// from the ambient environment configuration
+    /// (`aws_config::load_defaults`).
     ///
     /// This is the supported path for customizing how the SDK talks to the
     /// durable execution service: configure retry, timeouts, endpoint, or
@@ -225,12 +233,12 @@ impl OptionsBuilder {
     /// is never held back by the window. Pending checkpoints are flushed
     /// unconditionally at these points:
     ///
-    /// - **Suspension** — before an invocation reports `PENDING` to the
+    /// - **Suspension**: before an invocation reports `PENDING` to the
     ///   service, every buffered checkpoint is written, so no recorded
     ///   progress is lost across the suspend/resume boundary.
-    /// - **Execution completion** — before an invocation reports its
+    /// - **Execution completion**: before an invocation reports its
     ///   terminal `SUCCEEDED`/`FAILED` envelope, the buffer is drained.
-    /// - **Callback creation** — creating a callback flushes immediately,
+    /// - **Callback creation**: creating a callback flushes immediately,
     ///   because the service assigns the callback ID in the checkpoint
     ///   response and the handler needs that ID right away.
     ///
@@ -276,15 +284,15 @@ impl OptionsBuilder {
     ///
     /// A checkpoint that must land before the execution can make progress
     /// is never held back by batching. Pending checkpoints are flushed
-    /// unconditionally — and any in-flight batched write is awaited — at
+    /// unconditionally, and any in-flight batched write is awaited, at
     /// these points:
     ///
-    /// - **Suspension** — before an invocation reports `PENDING` to the
+    /// - **Suspension**: before an invocation reports `PENDING` to the
     ///   service, every buffered checkpoint is written, so no recorded
     ///   progress is lost across the suspend/resume boundary.
-    /// - **Execution completion** — before an invocation reports its
+    /// - **Execution completion**: before an invocation reports its
     ///   terminal `SUCCEEDED`/`FAILED` envelope, the buffer is drained.
-    /// - **Callback creation** — creating a callback flushes immediately,
+    /// - **Callback creation**: creating a callback flushes immediately,
     ///   because the service assigns the callback ID in the checkpoint
     ///   response and the handler needs that ID right away.
     ///
@@ -313,7 +321,7 @@ impl OptionsBuilder {
     ///
     /// Returns an error if the configuration contains invalid combinations:
     /// - Setting both `sdk_config` and `lambda_client` is invalid (the
-    ///   client supersedes the config — provide one or the other).
+    ///   client supersedes the config: provide one or the other).
     ///
     /// # Examples
     ///

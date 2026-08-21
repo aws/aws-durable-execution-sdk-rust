@@ -2,7 +2,7 @@
 //!
 //! When the SDK's [`ReplayFilterLayer`] is installed, user log events emitted
 //! while replaying already-checkpointed work are suppressed, so a log line is
-//! written once — on the invocation that first executed it — not again on every
+//! written once, on the invocation that first executed it, not again on every
 //! resume. This example logs before a durable wait, then after it resumes: the
 //! "before" line is emitted on the first invocation, and the "after" line on
 //! the resumed invocation, each exactly once across the whole execution.

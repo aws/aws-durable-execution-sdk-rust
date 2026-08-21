@@ -2,7 +2,7 @@
 //! lifecycle-event emitters.
 //!
 //! This module implements the instrumentation whose public, documented
-//! contract lives in [`crate::observability`] — span names, lifecycle event
+//! contract lives in [`crate::observability`]: span names, lifecycle event
 //! names, and field names are all specified there.
 //!
 //! The SDK creates two kinds of [`tracing::Span`]:
@@ -21,7 +21,7 @@
 //!
 //! When these spans are rendered by a JSON subscriber (e.g.,
 //! `lambda_runtime`'s `init_default_subscriber()` with
-//! `AWS_LAMBDA_LOG_FORMAT=JSON`), the fields appear as top-level JSON keys —
+//! `AWS_LAMBDA_LOG_FORMAT=JSON`), the fields appear as top-level JSON keys:
 //! matching the `CloudWatch` Logs Insights query:
 //!
 //! ```text
@@ -137,15 +137,15 @@ pub(crate) fn execution_span(
     )
 }
 
-/// Creates a DETACHED `durable_execution` span for a child namespace — a
+/// Creates a DETACHED `durable_execution` span for a child namespace: a
 /// `run_in_child_context` body, a map/parallel branch, or a
 /// `wait_for_callback` body.
 ///
 /// Each child context owns an [`crate::engine::EngineState`] with its own ID
 /// counter and therefore its own replay high-water mark: nested operations
 /// can still be replaying while the parent namespace is already live (or
-/// vice versa). Giving each namespace its own span — whose `isReplay` flag
-/// that namespace's mints keep current — is what lets a per-layer filter
+/// vice versa). Giving each namespace its own span, whose `isReplay` flag
+/// that namespace's mints keep current, is what lets a per-layer filter
 /// suppress a branch's pre-wait log lines on resume without consulting (or
 /// clobbering) the parent's state.
 ///
@@ -168,10 +168,6 @@ pub(crate) fn scoped_execution_span(
         { fields::IS_REPLAY } = is_replay,
     )
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Lifecycle events (see `crate::observability` for the documented contract)
-// ────────────────────────────────────────────────────────────────────────────
 
 use crate::observability::{TARGET, event_names};
 
@@ -231,7 +227,7 @@ fn operation_type_str(op_type: &aws_sdk_lambda::types::OperationType) -> &'stati
 ///
 /// The event travels **with its update** into the write path (see
 /// `crate::checkpoint_coalescer::TrackedUpdate`): when checkpoint buffering
-/// is configured, the flush task — not the contributor future — owns and
+/// is configured, the flush task, not the contributor future, owns and
 /// emits it, so a contributor dropped after joining a batch (a lost `race`
 /// or `select_ok` branch) cannot suppress the telemetry for a transition
 /// the flush still persists. The capture also snapshots
@@ -390,7 +386,7 @@ fn operation_retry_scheduled_event(op: &OperationIdentity<'_>, delay_seconds: i3
     );
 }
 
-/// Emits [`event_names::OPERATION_REPLAYED`] — a recorded terminal outcome
+/// Emits [`event_names::OPERATION_REPLAYED`]: a recorded terminal outcome
 /// was returned without re-running the operation.
 pub(crate) fn operation_replayed_event(op: &OperationIdentity<'_>) {
     tracing::event!(
@@ -499,10 +495,6 @@ fn replay_flag_in_record(values: &tracing::span::Record<'_>) -> Option<bool> {
     visitor.is_replay
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Replay-aware subscriber wrapper (for use in test infrastructure)
-// ────────────────────────────────────────────────────────────────────────────
-
 /// A subscriber wrapper that tracks which spans have `isReplay = true` and
 /// provides a method to check if events should be suppressed.
 ///
@@ -533,18 +525,13 @@ impl ReplayTracker {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Replay filter layer (public under the `replay-filter` feature;
-// `tracing-subscriber` is an optional dependency)
-// ────────────────────────────────────────────────────────────────────────────
-
 /// A per-layer filter that suppresses events describing replayed work:
 /// events carrying their own `isReplay = true` field (the SDK's lifecycle
-/// events — see [`crate::observability`]) and events emitted inside spans
+/// events: see [`crate::observability`]) and events emitted inside spans
 /// marked `isReplay = true` (application log lines during replay).
 ///
 /// When an execution resumes, the handler re-runs from the top and replays
-/// recorded results, so handler code between operations executes — and logs —
+/// recorded results, so handler code between operations executes, and logs,
 /// again. The SDK wraps each invocation in a span whose `isReplay` flag
 /// tracks the live replay status; this filter drops events while that flag
 /// is `true`, so a log line is written once, on the invocation that first
@@ -583,7 +570,7 @@ impl ReplayTracker {
 /// // In a Lambda binary, install it globally instead:
 /// // `tracing_subscriber::util::SubscriberInitExt::init(subscriber)`.
 /// tracing::subscriber::with_default(subscriber, || {
-///     tracing::info!("emitted normally — not inside a replay span");
+///     tracing::info!("emitted normally, not inside a replay span");
 /// });
 /// ```
 #[cfg(any(test, feature = "replay-filter"))]
@@ -614,7 +601,7 @@ where
         _meta: &tracing::Metadata<'_>,
         _ctx: &tracing_subscriber::layer::Context<'_, S>,
     ) -> bool {
-        // Always allow span creation — we only filter events.
+        // Always allow span creation: we only filter events.
         true
     }
 
@@ -624,7 +611,7 @@ where
         ctx: &tracing_subscriber::layer::Context<'_, S>,
     ) -> bool {
         // An event carrying its own `isReplay` field (every SDK lifecycle
-        // event does — see `crate::observability`) is authoritative: the
+        // event does: see `crate::observability`) is authoritative: the
         // execution span's flag tracks the NEXT operation claim, so at the
         // replay high-water boundary the final `operation_replayed` event
         // can fire under a span already flipped to `isReplay = false`.
@@ -695,10 +682,6 @@ where
 struct ReplaySpanFields {
     is_replay: bool,
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -824,7 +807,7 @@ mod tests {
     }
 
     /// Verifies that events inside a replay span are emitted with
-    /// `isReplay = true` — enabling downstream filters to suppress them.
+    /// `isReplay = true`: enabling downstream filters to suppress them.
     #[test]
     fn replay_span_marks_events_with_is_replay_true() {
         use std::sync::{Arc, Mutex};
@@ -926,14 +909,14 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        // Event in a live span — should pass through.
+        // Event in a live span: should pass through.
         {
             let span = operation_span("arn:test", "req-1", "op-1", 1, false);
             let _entered = span.enter();
             tracing::info!("live event");
         }
 
-        // Event in a replay span — should be suppressed.
+        // Event in a replay span: should be suppressed.
         {
             let span = operation_span("arn:test", "req-1", "op-2", 1, true);
             let _entered = span.enter();
@@ -958,8 +941,8 @@ mod tests {
     /// REGRESSION (replay high-water boundary): the execution span's
     /// `isReplay` flag tracks the NEXT operation claim (`mint_id` re-records
     /// it before the claimed operation resolves), so the final replay hit
-    /// fires its `operation_replayed` event — which carries `isReplay =
-    /// true` — under a span already flipped to `isReplay = false`. The
+    /// fires its `operation_replayed` event, which carries `isReplay =
+    /// true`, under a span already flipped to `isReplay = false`. The
     /// filter must trust the event's own field, not just the span scope,
     /// so that event is still suppressed; and conversely an event carrying
     /// an explicit `isReplay = false` must pass even under a span still
@@ -1017,7 +1000,7 @@ mod tests {
         }
 
         // The converse: a live-work event under a span still marked as
-        // replaying must pass — its own field is authoritative.
+        // replaying must pass: its own field is authoritative.
         {
             let span = execution_span("arn:test", "req-1", true);
             let _entered = span.enter();
@@ -1125,7 +1108,7 @@ mod tests {
 
     /// Verifies that the filter follows `span.record()` updates to
     /// `isReplay`: events are suppressed while the flag is `true` and
-    /// emitted again once it is re-recorded as `false` — the mechanism the
+    /// emitted again once it is re-recorded as `false`: the mechanism the
     /// SDK uses on the handler span as the invocation crosses the replay
     /// high-water mark.
     #[test]

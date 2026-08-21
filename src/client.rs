@@ -12,10 +12,6 @@ use aws_sdk_lambda::types::{Operation, OperationType, OperationUpdate};
 
 use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
 
-// ────────────────────────────────────────────────────────────────────────────
-// `ExecutionClient` Trait
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Checkpoint client error type wrapping the underlying cause.
 ///
 /// `Clone` because a coalesced checkpoint batch publishes one result to
@@ -29,8 +25,8 @@ pub(crate) struct ClientError {
     /// the time an error carries this flag the SDK has already exhausted
     /// its transport-level attempts. The flag decides the *recovery scope*
     /// (see [`classify_checkpoint_error`]): a retryable failure fails the
-    /// invocation — the durable service re-invokes, which is the same
-    /// recovery as an interruption — while a non-retryable failure is a
+    /// invocation, the durable service re-invokes, which is the same
+    /// recovery as an interruption, while a non-retryable failure is a
     /// permanent rejection that persists a terminal `FAIL` for the
     /// operation and then fails the execution
     /// ([`DurableContext::checkpoint_failure_unrecoverable`](crate::context::DurableContext::checkpoint_failure_unrecoverable)).
@@ -46,7 +42,7 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 impl ClientError {
-    /// Whether this error was classified retryable — the invocation fails
+    /// Whether this error was classified retryable: the invocation fails
     /// and the durable service re-invokes. `false` means a permanent
     /// rejection: the terminal-`FAIL`-then-fail-the-execution path.
     pub(crate) fn is_retryable(&self) -> bool {
@@ -83,7 +79,7 @@ pub(crate) struct CheckpointOutput {
     pub(crate) checkpoint_token: String,
     /// Updated operations from the backend (may be empty).
     pub(crate) updated_operations: Vec<Operation>,
-    /// Pagination marker — if present, more operations are available via
+    /// Pagination marker: if present, more operations are available via
     /// `get_state` and the caller must paginate.
     pub(crate) next_marker: Option<String>,
 }
@@ -125,10 +121,6 @@ pub(crate) trait ExecutionClient: Send + Sync + std::fmt::Debug {
     ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Production Implementation (`aws-sdk-lambda`)
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Production `ExecutionClient` backed by `aws_sdk_lambda::Client`.
 ///
 /// Retry is delegated entirely to the wrapped SDK client's own retry
@@ -136,7 +128,7 @@ pub(crate) trait ExecutionClient: Send + Sync + std::fmt::Debug {
 /// attempts). This matches the sibling JS and Python SDKs, which rely on
 /// their AWS SDKs' built-in retry. A call that exhausts the SDK's retries
 /// fails the invocation; the durable execution service re-invokes the
-/// handler, which is the recovery path — longer in-process retry would
+/// handler, which is the recovery path: longer in-process retry would
 /// only delay it. Callers who need a different retry policy supply a
 /// preconfigured client via [`Options`](crate::Options)'s `lambda_client`.
 #[derive(Debug, Clone)]
@@ -193,7 +185,7 @@ impl ExecutionClient for LambdaExecutionClient {
                 }
                 // The SDK's standard retry has already retried everything
                 // transient; the final error is classified into a recovery
-                // scope (invocation vs execution) — see
+                // scope (invocation vs execution): see
                 // `classify_checkpoint_error`.
                 Err(err) => Err(classify_checkpoint_error(&err)),
             }
@@ -247,15 +239,11 @@ impl ExecutionClient for LambdaExecutionClient {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Checkpoint error classification
-// ────────────────────────────────────────────────────────────────────────────
-
 /// The message prefix the service puts on an `InvalidParameterValueException`
 /// that rejects a stale checkpoint token.
 ///
 /// A stale token resolves on re-invocation (the service issues a fresh one),
-/// so this specific rejection is classified retryable — the carve-out the
+/// so this specific rejection is classified retryable: the carve-out the
 /// Java SDK's `DurableApiErrorClassifier` applies.
 const STALE_TOKEN_MESSAGE_PREFIX: &str = "Invalid Checkpoint Token";
 
@@ -266,19 +254,19 @@ const STALE_TOKEN_MESSAGE_PREFIX: &str = "Invalid Checkpoint Token";
 /// transport-level attempts, so the question is no longer "try again now"
 /// but *which recovery converges*:
 ///
-/// - **Retryable** — fail the invocation; the durable service re-invokes
+/// - **Retryable**: fail the invocation; the durable service re-invokes
 ///   and replay resumes from the recorded state. This is the same recovery
 ///   as an interruption. Applied to transport-level failures (dispatch,
 ///   timeout, malformed response), throttling, 5xx, and the stale-token
 ///   carve-out ([`STALE_TOKEN_MESSAGE_PREFIX`]).
-/// - **Non-retryable** — the service permanently rejected this write (for
+/// - **Non-retryable**: the service permanently rejected this write (for
 ///   example an oversized payload). Re-invoking re-runs the body and hits
 ///   the same rejection, so the caller persists a small terminal `FAIL`
 ///   for the operation and fails the execution instead.
 ///
 /// **Unknown errors default to retryable.** The original classification
-/// (pre-#43) defaulted unknown to non-retryable, with the rationale — from
-/// the r3726032098 review thread — that the surfaced error only failed the
+/// (pre-#43) defaulted unknown to non-retryable, with the rationale, from
+/// the r3726032098 review thread, that the surfaced error only failed the
 /// invocation and the service re-invoked anyway, so the default was
 /// harmless. That rationale belongs to the old model: under this model a
 /// non-retryable classification fails the *execution*, so a novel
@@ -313,8 +301,8 @@ fn classify_checkpoint_error<R: std::fmt::Debug>(
         E::TooManyRequestsException(_) | E::ServiceException(_) => {
             ClientError::from_retryable(message)
         }
-        // A parameter rejection is deterministic — the same write fails the
-        // same way on every lap — EXCEPT the stale-token rejection, which a
+        // A parameter rejection is deterministic, the same write fails the
+        // same way on every lap, EXCEPT the stale-token rejection, which a
         // re-invocation resolves with a fresh token.
         E::InvalidParameterValueException(inner) => {
             if inner
@@ -332,17 +320,13 @@ fn classify_checkpoint_error<R: std::fmt::Debug>(
         | E::KmsDisabledException(_)
         | E::KmsInvalidStateException(_)
         | E::KmsNotFoundException(_) => ClientError::non_retryable(message),
-        // Unknown errors are RETRYABLE — see the function docs for why the
+        // Unknown errors are RETRYABLE: see the function docs for why the
         // pre-#43 non-retryable default (r3726032098) no longer applies.
         // The variant canary test keeps this arm from silently absorbing
         // new modeled variants.
         _ => ClientError::from_retryable(message),
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// In-Memory Test Double
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Injection point for controlling test double behavior per call.
 #[cfg(test)]
@@ -362,7 +346,7 @@ pub(crate) enum TestResponse {
 /// In-memory test double for `ExecutionClient`.
 ///
 /// Supports injecting failures and recording calls for assertions.
-/// Sufficient for unit tests — not the full `test-util` `LocalRunner`.
+/// Sufficient for unit tests, not the full `test-util` `LocalRunner`.
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct InMemoryExecutionClient {
@@ -575,10 +559,6 @@ impl ExecutionClient for InMemoryExecutionClient {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Checkpoint Log Population Helper
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Converts a single SDK `Operation` into a `(wire_id, CheckpointRecord)` pair.
 fn operation_to_record(op: &Operation) -> (String, CheckpointRecord) {
     let attempt = op.step_details.as_ref().map_or(0, |s| {
@@ -598,7 +578,7 @@ fn operation_to_record(op: &Operation) -> (String, CheckpointRecord) {
             (!e.stack_trace().is_empty()).then(|| e.stack_trace().to_vec())
         }),
         attempt,
-        // ChainedInvoke payloads live in their own record fields — mirroring
+        // ChainedInvoke payloads live in their own record fields: mirroring
         // parse_single_operation in lib.rs, which is the JSON-path reference
         // for this mapping. invoke.rs replays exclusively from these.
         invoke_result: op
@@ -708,9 +688,9 @@ pub(crate) async fn resolve_bootstrap_log(
 
 /// Maps SDK `OperationStatus` to internal `CheckpointStatus`.
 ///
-/// Every modeled variant maps explicitly; anything else — the generated
+/// Every modeled variant maps explicitly; anything else, the generated
 /// enum's unknown-variant carrier, or a variant added by an
-/// aws-sdk-lambda upgrade before this list is revisited — maps to
+/// aws-sdk-lambda upgrade before this list is revisited, maps to
 /// [`CheckpointStatus::Unknown`] carrying the raw wire value, which replay
 /// refuses to interpret (issue #45). The `operation_status_variant_canary`
 /// test pins the modeled variant set, so a new upstream variant fails CI
@@ -821,15 +801,11 @@ fn extract_wire_error_field<T>(
         })
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── Request mapping (aws-smithy-mocks) ──────────────────────────────
+    // Request mapping (aws-smithy-mocks)
     //
     // These tests mock the Lambda SDK client at the HTTP layer and pin the
     // per-operation request mapping of `LambdaExecutionClient`: what the
@@ -856,7 +832,7 @@ mod tests {
     }
 
     /// `checkpoint` maps its arguments onto the `CheckpointDurableExecution`
-    /// request — ARN, token, and every update — and maps the response's
+    /// request, ARN, token, and every update, and maps the response's
     /// token, updated operations, and pagination marker back out.
     #[tokio::test]
     async fn checkpoint_maps_request_and_response() {
@@ -919,7 +895,7 @@ mod tests {
     }
 
     /// A checkpoint call whose final outcome is a modeled parameter
-    /// rejection — a deterministic client fault the SDK does not retry —
+    /// rejection, a deterministic client fault the SDK does not retry,
     /// classifies NON-retryable: re-invoking replays into the same
     /// rejection, so the recovery is a terminal `FAIL` write followed by
     /// failing the execution, not another lap.
@@ -943,8 +919,8 @@ mod tests {
 
     /// Transient-failure retry belongs to the aws-sdk's standard retry and
     /// nothing else: a persistent 503 is attempted exactly the SDK's
-    /// default 3 times — not 9, which the deleted hand-rolled outer loop
-    /// used to multiply it to — and the exhausted call maps to a retryable
+    /// default 3 times, not 9, which the deleted hand-rolled outer loop
+    /// used to multiply it to, and the exhausted call maps to a retryable
     /// `ClientError`.
     #[tokio::test]
     async fn checkpoint_retry_is_the_sdk_standard_retry_alone() {
@@ -1032,7 +1008,7 @@ mod tests {
         assert!(err.is_retryable());
     }
 
-    // ── Test double behavior ────────────────────────────────────────────
+    // Test double behavior
 
     #[tokio::test]
     async fn in_memory_client_returns_queued_responses_in_order() {
@@ -1069,7 +1045,7 @@ mod tests {
         assert!(output.checkpoint_token.starts_with("token-"));
     }
 
-    // ── Checkpoint log population ───────────────────────────────────────
+    // Checkpoint log population
 
     #[test]
     fn checkpoint_log_from_operations_maps_statuses() {
@@ -1127,8 +1103,8 @@ mod tests {
 
     /// A paginated `ChainedInvoke` operation converts into the
     /// invoke-specific record fields (`invoke_result` /
-    /// `invoke_error_*`) that invoke replay reads — matching the inline
-    /// JSON conversion in `parse_single_operation` — and never leaks into
+    /// `invoke_error_*`) that invoke replay reads, matching the inline
+    /// JSON conversion in `parse_single_operation`, and never leaks into
     /// the generic `result` / `error_*` fields.
     #[test]
     fn chained_invoke_maps_to_invoke_specific_fields() {
@@ -1192,7 +1168,7 @@ mod tests {
 
     /// A paginated child-context operation preserves
     /// `ContextDetails.ReplayChildren`, which large child contexts require
-    /// for correct replay — matching the inline JSON conversion.
+    /// for correct replay: matching the inline JSON conversion.
     #[test]
     fn context_replay_children_is_preserved() {
         let ops = vec![
@@ -1269,7 +1245,7 @@ mod tests {
         assert!(log.get("step-1").is_some());
     }
 
-    // ── Get state ───────────────────────────────────────────────────────
+    // Get state
 
     #[tokio::test]
     async fn get_state_returns_preloaded_operations() {
@@ -1292,7 +1268,7 @@ mod tests {
         assert_eq!(output.operations.first().map(Operation::id), Some("op-1"));
     }
 
-    // ── Merge updated operations into log ───────────────────────────────
+    // Merge updated operations into log
 
     #[test]
     fn merge_operations_inserts_callback_id_into_existing_log() {
@@ -1375,7 +1351,7 @@ mod tests {
         assert_eq!(record.result.as_deref(), Some(r#""merged result""#));
     }
 
-    // ── Pagination tests ────────────────────────────────────────────────
+    // Pagination tests
 
     /// Helper: builds a Step operation with a result for pagination tests.
     fn make_step_op(id: &str, result: &str) -> Operation {
@@ -1467,7 +1443,7 @@ mod tests {
         assert_eq!(r3.result.as_deref(), Some("\"result-3\""));
     }
 
-    // ── Checkpoint error classification ─────────────────────────────────
+    // Checkpoint error classification
 
     use aws_sdk_lambda::error::SdkError;
     use aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError as CkptErr;
@@ -1507,7 +1483,7 @@ mod tests {
     /// The stale-token carve-out: `InvalidParameterValueException` whose
     /// message starts with `Invalid Checkpoint Token` resolves on
     /// re-invocation (the service issues a fresh token), so it is
-    /// retryable. Prefix match only — a stale-token mention elsewhere in
+    /// retryable. Prefix match only: a stale-token mention elsewhere in
     /// the message does not qualify.
     #[test]
     fn stale_token_rejection_classifies_retryable() {
@@ -1534,7 +1510,7 @@ mod tests {
     /// model a non-retryable classification fails the execution, so a
     /// novel transient error variant must not kill executions by default
     /// (the pre-#43 non-retryable default relied on the old model, where
-    /// the surfaced error only failed the invocation — r3726032098).
+    /// the surfaced error only failed the invocation: r3726032098).
     #[test]
     fn unknown_error_classifies_retryable() {
         let unknown = classify(CkptErr::unhandled("some new service error"));
@@ -1552,7 +1528,7 @@ mod tests {
     /// wildcard arm.
     ///
     /// The enum is `#[non_exhaustive]`, so the classifier's `match` cannot
-    /// reject new variants at compile time — a variant added by an
+    /// reject new variants at compile time: a variant added by an
     /// aws-sdk-lambda upgrade would silently take the unknown→retryable
     /// default. This test parses the enum out of the dependency's own
     /// source (the exact version Cargo.lock pins, in the local cargo
@@ -1592,13 +1568,13 @@ mod tests {
     }
 
     /// Canary: pins the variant set of every upstream `types` enum the SDK
-    /// matches with a wildcard arm — `OperationStatus`, `OperationType`,
+    /// matches with a wildcard arm: `OperationStatus`, `OperationType`,
     /// `OperationAction`, `ExecutionStatus`, and `EventType` (issue #45,
     /// extending the #43 pattern above).
     ///
     /// All five enums are `#[non_exhaustive]`, so a variant added by an
     /// aws-sdk-lambda upgrade would silently take each match's wildcard
-    /// default — for `OperationStatus` that now means
+    /// default: for `OperationStatus` that now means
     /// `CheckpointStatus::Unknown`, which fails replay rather than
     /// misclassifying, but the canary still forces the variant to be mapped
     /// explicitly instead of shipping through the fallback. The pinned
@@ -1757,7 +1733,7 @@ mod tests {
     }
 
     /// Reads a source file out of the aws-sdk-lambda version Cargo.lock
-    /// pins, from the local cargo registry (already extracted — the test
+    /// pins, from the local cargo registry (already extracted: the test
     /// binary that runs this compiled against it).
     fn read_sdk_source(relative: &str) -> String {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

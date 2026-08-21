@@ -2,7 +2,7 @@
 //!
 //! [`DurableContext`] provides access to all durable operations.
 //! [`StepContext`] is passed to step bodies and deliberately omits durable
-//! operations — the type system enforces the "no nesting" rule at compile
+//! operations: the type system enforces the "no nesting" rule at compile
 //! time.
 
 use std::future::Future;
@@ -42,12 +42,12 @@ struct Inner {
     /// Engine state (ID counter + checkpoint log) for this context's
     /// namespace. Shared behind an `Arc` so a context can be rebound onto a
     /// different suspension scope (see
-    /// [`DurableContext::spawn_scope`]) without duplicating the ID counter —
+    /// [`DurableContext::spawn_scope`]) without duplicating the ID counter:
     /// two contexts minting from separate counters would diverge on replay.
     engine: Arc<EngineState>,
     /// Suspension signal shared with the driver.
     suspension_signal: Arc<SuspensionSignal>,
-    /// Task-ownership detector — catches user `tokio::spawn` misuse.
+    /// Task-ownership detector: catches user `tokio::spawn` misuse.
     task_ownership: Arc<TaskOwnership>,
     /// Execution client for checkpointing (None in test contexts without a client).
     execution_client: Option<Arc<dyn ExecutionClient>>,
@@ -62,7 +62,7 @@ struct Inner {
     /// from all namespaces coalesce into the same batches. `None` means
     /// every checkpoint writes immediately (the default).
     coalescer: Option<Arc<CheckpointCoalescer>>,
-    /// Cached parent wire ID — the SHA-256 hash of this context's prefix
+    /// Cached parent wire ID: the SHA-256 hash of this context's prefix
     /// (positional ID of the parent operation). `None` for root contexts.
     parent_wire_id: Option<String>,
     /// This namespace's `durable_execution` span. For a root context it is
@@ -73,13 +73,13 @@ struct Inner {
     /// through this context, so replay-aware filters (see
     /// `tracing_layer::ReplayFilterLayer`) can suppress log events emitted
     /// while THIS namespace is replaying. Per-namespace spans are what keep
-    /// concurrent branches — each with its own replay high-water mark — from
+    /// concurrent branches, each with its own replay high-water mark, from
     /// clobbering each other's flag.
     replay_span: tracing::Span,
 }
 
 impl std::fmt::Debug for Inner {
-    /// Hand-written to keep `checkpoint_token` — a credential-like value —
+    /// Hand-written to keep `checkpoint_token`, a credential-like value,
     /// out of log output, and to skip the engine/client/signal internals
     /// that make a derived impl unreadable. See issue #30.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -92,12 +92,12 @@ impl std::fmt::Debug for Inner {
     }
 }
 
-/// The durable execution context — a cheap-to-clone handle providing access
+/// The durable execution context: a cheap-to-clone handle providing access
 /// to all durable operations.
 ///
 /// `DurableContext` is `Clone + Send + Sync` (backed by an `Arc`). Clone it
 /// freely to share across async boundaries. Every durable operation method
-/// claims its operation ID synchronously at the call site — polling order
+/// claims its operation ID synchronously at the call site: polling order
 /// never affects identity.
 ///
 /// # Examples
@@ -184,7 +184,7 @@ impl FlushFailure {
 impl DurableContext {
     /// Returns a new context for testing purposes.
     ///
-    /// This is NOT part of the public API — used only in doctests.
+    /// This is NOT part of the public API: used only in doctests.
     #[doc(hidden)]
     #[must_use]
     pub fn __test_context() -> Self {
@@ -433,7 +433,7 @@ impl DurableContext {
     /// Unlike [`Self::new_child`] (which shares the parent's scope so a
     /// sequential child's suspension propagates directly upward), this gives
     /// the child an independent scope. Used for each map/parallel BRANCH so
-    /// that a `wait` inside one branch suspends only that branch — sibling
+    /// that a `wait` inside one branch suspends only that branch: sibling
     /// branches keep running, and the coordinator's branch driver observes
     /// the branch scope. Everything else (checkpoint log, token, ownership,
     /// ARN) is shared with the parent, exactly like `new_child`.
@@ -505,9 +505,9 @@ impl DurableContext {
     /// Creates a clone of this context bound to a FRESH child suspension
     /// scope, for an eagerly spawned (`.spawn()`ed) operation.
     ///
-    /// Returns the rebound context and the new scope. Everything else —
+    /// Returns the rebound context and the new scope. Everything else,
     /// engine state (so the ID counter and checkpoint log stay shared, and
-    /// replay identity is unaffected), client, token, ownership, ARN — is the
+    /// replay identity is unaffected), client, token, ownership, ARN, is the
     /// same as this context: only the suspension scope differs. A parking
     /// operation inside the spawned task therefore suspends ITS OWN scope
     /// (observed by the spawned task's [`drive_scope`](crate::driver::drive_scope))
@@ -638,7 +638,7 @@ impl DurableContext {
     /// cloning only that one string.
     ///
     /// `None` means either no record exists or the record carries no
-    /// result — callers that need to distinguish should use
+    /// result: callers that need to distinguish should use
     /// [`Self::with_checkpoint_record`].
     pub(crate) fn checkpoint_result_payload(&self, positional_id: &str) -> Option<String> {
         self.with_checkpoint_record(positional_id, |record| record.result.clone())
@@ -689,12 +689,12 @@ impl DurableContext {
 
     /// Validates the claimed operation identity against the checkpoint
     /// record and returns the compact status view, in a single read-guard
-    /// pass — the common preamble of every operation's replay check.
+    /// pass: the common preamble of every operation's replay check.
     ///
     /// Returns `Ok(None)` when no record exists (live position, nothing to
     /// validate), `Ok(Some(view))` when the identity matches, and the
     /// `NonDeterministicExecution` error (also recorded on the fatal slot,
-    /// exactly as [`Self::validate_replay_identity`] does) on mismatch —
+    /// exactly as [`Self::validate_replay_identity`] does) on mismatch,
     /// or when the record carries a [`CheckpointStatus::Unknown`] status
     /// this SDK version cannot interpret, in which case the error names
     /// the raw status. Nothing is cloned on the match path beyond the
@@ -754,7 +754,7 @@ impl DurableContext {
     /// matter which sibling settles first.
     ///
     /// A position with no checkpoint record is live (nothing to validate),
-    /// and a matching identity is a no-op — an unchanged handler behaves
+    /// and a matching identity is a no-op: an unchanged handler behaves
     /// identically.
     pub(crate) fn preflight_replay_identity(
         &self,
@@ -817,7 +817,7 @@ impl DurableContext {
     /// A replay identity mismatch is execution-fatal: recording it on the
     /// shared slot makes the invocation driver fail the execution with the
     /// dedicated error even if the returned `Err` is swallowed on its way
-    /// up — stored as a rejected outcome by `join_all`, out-raced by a
+    /// up: stored as a rejected outcome by `join_all`, out-raced by a
     /// sibling's success in `select_ok`, stringified through a
     /// child-context boundary, or tolerated by a map/parallel completion
     /// config.
@@ -872,7 +872,7 @@ impl DurableContext {
     }
 
     /// Requests suspension of THIS context's scope (used by operations that
-    /// cannot proceed — e.g. a pending retry timer).
+    /// cannot proceed, e.g. a pending retry timer).
     ///
     /// Routes through the scope's quiescence gate: if operations were
     /// `.spawn()`ed into this scope and have not settled yet, the request is
@@ -887,7 +887,7 @@ impl DurableContext {
     /// Suspends the invocation and never returns control to the caller.
     ///
     /// Requests suspension of this context's scope (through the scope's
-    /// quiescence gate — see [`Self::request_suspend`]), then awaits a future
+    /// quiescence gate: see [`Self::request_suspend`]), then awaits a future
     /// that never resolves and never registers a waker. The driver observes
     /// the signal on the next `Poll::Pending` from the handler and drops the
     /// handler future at this await point, completing the invocation as
@@ -917,23 +917,23 @@ impl DurableContext {
     /// - **Retryable** (exhausted transient failure, stale token): the
     ///   write channel is down, so a follow-up write would fail the same
     ///   way. Nothing more is written; the invocation fails with a Lambda
-    ///   runtime error and the service re-invokes — the same recovery as
+    ///   runtime error and the service re-invokes: the same recovery as
     ///   an interruption.
     /// - **Non-retryable** (permanent rejection, e.g. oversized payload):
     ///   re-invoking would re-run the body into the same rejection, an
     ///   infinite loop with side effects firing once per lap. When the
-    ///   caller supplies `terminal_fail` — required at every site where
+    ///   caller supplies `terminal_fail`, required at every site where
     ///   user code already ran, so its side effects get a recorded
-    ///   outcome — that small terminal `FAIL` is written first (it goes
+    ///   outcome, that small terminal `FAIL` is written first (it goes
     ///   through on a channel that rejected only the payload; a failure
     ///   here is logged, not propagated, because the execution dies
     ///   either way). Then the execution fails with
     ///   [`CHECKPOINT_FAILED_ERROR_TYPE`](crate::error::CHECKPOINT_FAILED_ERROR_TYPE).
     ///
     /// Like [`Self::suspend_now`], the returned future never resolves: the
-    /// fatal slot is recorded and the invocation driver — which checks it
+    /// fatal slot is recorded and the invocation driver, which checks it
     /// with priority over completion and suspension, from any scope in the
-    /// tree — drops the handler at its current await point, so user code
+    /// tree, drops the handler at its current await point, so user code
     /// can neither catch nor ignore the failure.
     pub(crate) async fn checkpoint_failure_unrecoverable<T>(
         &self,
@@ -1001,8 +1001,8 @@ impl DurableContext {
     /// This is the "callback creation" flush point of the
     /// [`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay)
     /// contract: the caller needs the backend's response right away (the
-    /// service assigns the callback ID in it), so the batch — including any
-    /// previously buffered updates, which keeps write order intact — is
+    /// service assigns the callback ID in it), so the batch, including any
+    /// previously buffered updates, which keeps write order intact, is
     /// written now. Identical to [`Self::checkpoint_updates`] when no
     /// delay is configured.
     pub(crate) async fn checkpoint_updates_urgent(
@@ -1030,8 +1030,8 @@ impl DurableContext {
         // and the updates themselves are consumed by it; the capture also
         // snapshots this call's span so the event keeps its originating
         // context). Ownership then travels WITH the update into the write
-        // path — the buffered flush task, not this possibly-cancelled
-        // future, emits the event — so a contributor dropped after joining
+        // path, the buffered flush task, not this possibly-cancelled
+        // future, emits the event, so a contributor dropped after joining
         // a batch (a lost `race`/`select_ok` branch) cannot suppress
         // telemetry for a transition the flush still persists, and events
         // are emitted per persisted chunk rather than per batch. A rejected
@@ -1058,9 +1058,9 @@ impl DurableContext {
     /// Dispatches a checkpoint write: joins the coalescing batch when one
     /// is configured, otherwise writes directly. A non-urgent contributor
     /// under a non-zero delay arms the delay timer and requests the flush
-    /// itself when the window elapses; an urgent contributor — or any
+    /// itself when the window elapses; an urgent contributor, or any
     /// contributor under a zero-delay coalescer (pure `checkpoint_batching`
-    /// mode) — requests the flush right away. Either way the flush task
+    /// mode), requests the flush right away. Either way the flush task
     /// claims and writes the batch under the coalescer's writer lock, so
     /// batching still emerges while an earlier write is in flight.
     ///
@@ -1104,15 +1104,15 @@ impl DurableContext {
         }
     }
 
-    /// Writes one request's worth of tracked updates immediately and, if —
-    /// and only if — the checkpoint call that persists them succeeds, emits
+    /// Writes one request's worth of tracked updates immediately and, if,
+    /// and only if, the checkpoint call that persists them succeeds, emits
     /// each update's lifecycle event (inside the span captured with it).
     /// This is the single site that pairs "the transition was persisted"
     /// with "its telemetry was emitted": both the unbuffered path and every
     /// chunk of a batched write funnel through it. The emission happens
     /// inside [`Self::checkpoint_direct_with_events`], immediately after
-    /// the service accepts the write — before the fallible pagination
-    /// hydration that follows it — so a transition the service recorded
+    /// the service accepts the write, before the fallible pagination
+    /// hydration that follows it, so a transition the service recorded
     /// always emits its event even when hydrating the paginated state
     /// fails afterwards.
     async fn write_tracked_direct(
@@ -1154,7 +1154,7 @@ impl DurableContext {
             if let Some(updates) = coalescer.take_batch(&batch) {
                 // Failure latch (issue #43): once any buffered write has
                 // failed, the channel is down for the rest of the
-                // invocation — "no further writes". A flusher that queued
+                // invocation: "no further writes". A flusher that queued
                 // on the writer lock behind the failing write must not
                 // perform another checkpoint call: doing so could persist
                 // replay-visible transitions after the invocation is
@@ -1195,13 +1195,13 @@ impl DurableContext {
     /// Writes a sealed batch, splitting it into request-sized chunks that
     /// respect the coalescer's [`BatchLimits`] (operation count and
     /// estimated payload bytes) while preserving join order. Returns the
-    /// last chunk's output on success — backend-assigned fields from every
+    /// last chunk's output on success: backend-assigned fields from every
     /// chunk are already merged into the checkpoint log by
-    /// [`Self::checkpoint_updates_direct`] — or the first chunk error,
+    /// [`Self::checkpoint_updates_direct`], or the first chunk error,
     /// which aborts the remaining chunks so contributors observe it. The
-    /// error carries the updates the write did NOT persist — the rejected
+    /// error carries the updates the write did NOT persist, the rejected
     /// chunk plus every chunk after it, never a chunk that already
-    /// succeeded — so the #43 flush point can write terminal `FAIL`
+    /// succeeded, so the #43 flush point can write terminal `FAIL`
     /// records for exactly the operations whose outcomes were lost.
     ///
     /// Each chunk's lifecycle events are emitted immediately after that
@@ -1256,8 +1256,8 @@ impl DurableContext {
     /// This is the "suspension" and "execution completion" flush point of
     /// the [`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay) /
     /// [`checkpoint_batching`](crate::OptionsBuilder::checkpoint_batching)
-    /// contract: the invocation wrapper calls it after the driver settles —
-    /// before reporting `PENDING`, `SUCCEEDED`, or `FAILED` to the service —
+    /// contract: the invocation wrapper calls it after the driver settles,
+    /// before reporting `PENDING`, `SUCCEEDED`, or `FAILED` to the service,
     /// so a checkpoint that must land before the invocation ends is never
     /// held back by the buffer. Because every claimed batch is written while
     /// holding the coalescer's writer lock, acquiring that lock here makes
@@ -1266,10 +1266,10 @@ impl DurableContext {
     /// configured or the buffer is idle.
     ///
     /// A failure is returned as a [`FlushFailure`] carrying every write
-    /// failure this invocation's buffered checkpoints suffered — the one
+    /// failure this invocation's buffered checkpoints suffered, the one
     /// hit here directly, the remaining drained-but-unwritten batches, and
     /// any failure a spawned batch flush retained because its contributors
-    /// were all dropped — together with the updates that were not
+    /// were all dropped, together with the updates that were not
     /// persisted, so the caller can apply the issue #43 classification
     /// (retryable fails the invocation with no further writes;
     /// non-retryable persists terminal `FAIL` records for the affected
@@ -1283,7 +1283,7 @@ impl DurableContext {
         // across the drain keeps this flush ordered after those writes.
         let _writer = coalescer.writer_lock().lock().await;
         // Failure latch (issue #43): a buffered write that already failed
-        // — in a spawned flush this drain never contributed to — poisons
+        // (in a spawned flush this drain never contributed to) poisons
         // the channel for the rest of the invocation. Seed the drain's
         // "already failed" state from it, so pending batches are published
         // the prior error and retained as unwritten instead of written.
@@ -1334,14 +1334,14 @@ impl DurableContext {
     /// This is the `Fault`-outcome counterpart of
     /// [`Self::flush_pending_checkpoints`] (issue #43): when a retryable
     /// checkpoint failure is already failing the invocation, the "no
-    /// further writes" contract forbids flushing the buffer — a follow-up
+    /// further writes" contract forbids flushing the buffer: a follow-up
     /// write would fail the same way, and re-invocation re-runs the
     /// buffered operations under the interruption contract. But a failure
     /// a spawned flush retained on behalf of dropped contributors (a lost
     /// `race`/`select_ok` branch, a dropped [`crate::DurableFuture`]) has
     /// already happened and must still be classified: silently discarding
     /// a NON-retryable one would leave its operations' records claiming
-    /// less than what executed on every future invocation — the very loop
+    /// less than what executed on every future invocation: the very loop
     /// the #43 terminalization exists to end.
     ///
     /// Acquiring the coalescer's writer lock first waits out any batch
@@ -1367,8 +1367,8 @@ impl DurableContext {
     ///
     /// Per operation (first-appearance order across the failures):
     /// - An operation with an unwritten outcome update (`Succeed`, `Fail`,
-    ///   or `Retry`) gets a terminal `FAIL` derived from the flush failure
-    ///   — user code ran, so its side effects need a recorded outcome. An
+    ///   or `Retry`) gets a terminal `FAIL` derived from the flush failure:
+    ///   user code ran, so its side effects need a recorded outcome. An
     ///   unwritten `Start` for the same operation is written first so the
     ///   `FAIL` has a record to terminate.
     /// - An operation whose only unwritten update is its `Start` gets
@@ -1381,7 +1381,7 @@ impl DurableContext {
     ///
     /// Writes go one operation per request so one rejected record cannot
     /// take its siblings' terminal `FAIL`s down with it; individual
-    /// failures are logged, not propagated — the execution dies either way.
+    /// failures are logged, not propagated: the execution dies either way.
     pub(crate) async fn terminalize_unwritten_outcomes(&self, flush: &FlushFailure) {
         use aws_sdk_lambda::types::OperationAction;
 
@@ -1478,8 +1478,8 @@ impl DurableContext {
     ///
     /// Serializes all concurrent callers through a single critical section:
     /// the lock is held across the full read-token → API-call →
-    /// rotate-token sequence, and — when the response carries a pagination
-    /// marker — through the follow-up `get_state` fetch as well, so no
+    /// rotate-token sequence, and, when the response carries a pagination
+    /// marker, through the follow-up `get_state` fetch as well, so no
     /// concurrent branch can rotate the token out from under the paginated
     /// state read.
     pub(crate) async fn checkpoint_updates_direct(
@@ -1491,8 +1491,8 @@ impl DurableContext {
 
     /// Body of [`Self::checkpoint_updates_direct`] that additionally owns
     /// the lifecycle events paired with the updates. Each event is emitted
-    /// the moment `client.checkpoint` returns success — the point at which
-    /// the service has durably recorded the transitions — and **before**
+    /// the moment `client.checkpoint` returns success, the point at which
+    /// the service has durably recorded the transitions, and **before**
     /// the pagination hydration below, which can fail after the write
     /// already persisted. Emitting first keeps telemetry faithful to what
     /// was recorded: a rejected write emits nothing, and a persisted write
@@ -1635,7 +1635,7 @@ impl DurableContext {
     ///
     /// During replay, previously-checkpointed operation results are returned
     /// without re-execution. Replay mode lasts while the next operation to
-    /// be claimed was already claimed by a prior invocation — including a
+    /// be claimed was already claimed by a prior invocation, including a
     /// started-but-unfinished child context, map, or parallel parent that
     /// the resumed invocation re-enters to replay its nested operations.
     /// User code can use this flag to suppress duplicate side effects
@@ -1651,7 +1651,7 @@ impl DurableContext {
     ///     ctx: durable::DurableContext,
     /// ) -> Result<(), durable::BoxError> {
     ///     if !ctx.is_replaying() {
-    ///         tracing::info!("first execution — not replay");
+    ///         tracing::info!("first execution, not replay");
     ///     }
     ///     Ok(())
     /// }
@@ -1811,7 +1811,7 @@ impl DurableContext {
     /// closure returns an error), the retry strategy decides whether to run
     /// the entire block again. Each attempt receives a **fresh child
     /// operation namespace**, so operations recorded by a failed attempt
-    /// are never replayed into the next one — every operation in the block
+    /// are never replayed into the next one: every operation in the block
     /// re-runs on retry. The delay between attempts suspends the execution
     /// (the backend owns the timer, exactly as step retries do), and the
     /// retry progress is derived from checkpointed results, so it survives
@@ -2122,7 +2122,7 @@ impl DurableContext {
 
     /// Joins all futures, collecting every outcome as [`Settled`](crate::Settled).
     ///
-    /// Never fails fast — all futures run to completion regardless of
+    /// Never fails fast: all futures run to completion regardless of
     /// individual errors.
     ///
     /// # Empty input
@@ -2168,7 +2168,7 @@ impl DurableContext {
     /// # Empty input
     ///
     /// Called with no futures, fails with
-    /// [`CombinatorErrorKind::EmptyInput`](crate::CombinatorErrorKind::EmptyInput) —
+    /// [`CombinatorErrorKind::EmptyInput`](crate::CombinatorErrorKind::EmptyInput):
     /// there is no future that could succeed.
     ///
     /// # Examples
@@ -2211,7 +2211,7 @@ impl DurableContext {
     /// # Empty input
     ///
     /// Called with no futures, fails with
-    /// [`CombinatorErrorKind::EmptyInput`](crate::CombinatorErrorKind::EmptyInput) —
+    /// [`CombinatorErrorKind::EmptyInput`](crate::CombinatorErrorKind::EmptyInput):
     /// there is no future that could settle.
     ///
     /// # Examples
@@ -2244,10 +2244,10 @@ impl DurableContext {
 ///
 /// `StepContext` deliberately does **not** expose any durable operations.
 /// This provides compile-time enforcement of the rule that durable
-/// operations cannot be nested inside step bodies — attempting to call
+/// operations cannot be nested inside step bodies: attempting to call
 /// a durable operation method inside a step body is a type error.
 ///
-/// Use `tracing` macros for logging inside steps — the SDK-created
+/// Use `tracing` macros for logging inside steps: the SDK-created
 /// operation span automatically attaches execution context fields.
 ///
 /// # Examples
@@ -2260,7 +2260,7 @@ impl DurableContext {
 ///     ctx: durable::DurableContext,
 /// ) -> Result<String, durable::BoxError> {
 ///     let result = ctx.step(|step_ctx: durable::StepContext| async move {
-///         // step_ctx has no durable operations — type-system enforced
+///         // step_ctx has no durable operations: type-system enforced
 ///         tracing::info!("inside step");
 ///         Ok("done".to_owned())
 ///     }).await?;
@@ -2283,7 +2283,8 @@ impl StepContext {
         }
     }
 
-    /// Returns the current attempt number (1-based).
+    /// Returns the current attempt number, starting at 1 for the first
+    /// attempt.
     #[must_use]
     pub fn attempt(&self) -> u32 {
         self.attempt
@@ -2324,8 +2325,8 @@ fn canonical_op_type(raw: &str) -> String {
 /// Compares a checkpoint record's stored identity against a claimed one.
 ///
 /// Returns `None` when the identities match (or the record predates
-/// identity recording), and `Some(expected)` — the stored identity
-/// formatted for the mismatch error — when they differ. The comparisons
+/// identity recording), and `Some(expected)`, the stored identity
+/// formatted for the mismatch error, when they differ. The comparisons
 /// borrow the record, so the match path clones nothing; only the cold
 /// mismatch path allocates. This is the shared core behind
 /// `DurableContext::validate_replay_identity` and
@@ -2337,7 +2338,7 @@ fn replay_identity_mismatch(
     claimed_name: Option<&str>,
 ) -> Option<String> {
     // A record without a stored operation type predates identity
-    // recording (legacy checkpoint) — there is genuinely nothing to
+    // recording (legacy checkpoint): there is genuinely nothing to
     // validate against, so skip. This is the ONLY lenient path; once a
     // record carries identity, every field is compared in full.
     let expected_type = record.op_type.as_deref()?;
@@ -2379,7 +2380,7 @@ fn replay_identity_mismatch(
     // comparison: the checkpoint builders deliberately omit the `Name`
     // field when the string is empty (see `build_child_update` in
     // `map_parallel`), so the record stores `None` where the claim
-    // computes `Some("")` — e.g. a map `item_namer` or a parallel
+    // computes `Some("")`, e.g. a map `item_namer` or a parallel
     // `Branch` whose name is the empty string. Without normalization an
     // UNCHANGED handler would be rejected on resume.
     let claimed_name = claimed_name.filter(|n| !n.is_empty());
@@ -2443,7 +2444,7 @@ mod tests {
     }
 
     /// Tests that `checkpoint_updates` paginates when the checkpoint response
-    /// has a `next_marker` — calling `get_state` to fetch all remaining
+    /// has a `next_marker`: calling `get_state` to fetch all remaining
     /// operations and merging them into the checkpoint log.
     #[tokio::test]
     async fn checkpoint_updates_paginates_on_marker() {
@@ -2553,7 +2554,7 @@ mod tests {
                 Ok(CheckpointOutput {
                     checkpoint_token: next,
                     updated_operations: Vec::new(),
-                    // Every response paginated — forces the marker-triggered
+                    // Every response paginated: forces the marker-triggered
                     // get_state on every checkpoint.
                     next_marker: Some("more-pages".to_owned()),
                 })
@@ -2704,7 +2705,7 @@ mod tests {
         assert_eq!(r2.status, CheckpointStatus::Succeeded);
     }
 
-    // ── Non-determinism detection tests ─────────────────────────────────
+    // Non-determinism detection tests
 
     #[test]
     fn validate_replay_identity_passes_when_types_match() {
@@ -2740,7 +2741,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── Targeted checkpoint accessors ────────────────────────────────────
+    // Targeted checkpoint accessors
 
     /// Builds a context whose checkpoint log holds one record at positional
     /// ID `"1"` (keyed by its wire ID, matching the production log shape).
@@ -2833,7 +2834,7 @@ mod tests {
 
     /// Replay reaching a record whose status this SDK version does not
     /// recognize must fail the execution naming the raw status (issue
-    /// #45) — never return the view for the operation to act on.
+    /// #45), never return the view for the operation to act on.
     #[test]
     #[expect(clippy::panic)] // reason: test assertions over non_exhaustive kinds
     fn checkpoint_view_validated_fails_execution_on_unrecognized_status() {
@@ -2863,7 +2864,7 @@ mod tests {
             "no fatal recorded before the replay check"
         );
 
-        // Identity matches — the failure is the status, not the identity.
+        // Identity matches: the failure is the status, not the identity.
         let result = ctx.checkpoint_view_validated("1", "wire-1", "Step", Some("Step"), None);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2896,7 +2897,7 @@ mod tests {
     }
 
     /// A record with a recognized status and matching identity records no
-    /// fatal and returns the view — the #45 guard fires only on `Unknown`.
+    /// fatal and returns the view: the #45 guard fires only on `Unknown`.
     #[test]
     fn checkpoint_view_validated_known_status_records_no_fatal() {
         let ctx = ctx_with_record_at_1(CheckpointRecord {
@@ -3214,7 +3215,7 @@ mod tests {
             op_name: None,
         };
 
-        // Wire format uses UPPER_CASE — validation is case-insensitive.
+        // Wire format uses UPPER_CASE: validation is case-insensitive.
         let result = ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), None);
         assert!(result.is_ok());
     }
@@ -3448,7 +3449,7 @@ mod tests {
     #[test]
     fn validate_replay_identity_empty_claimed_name_matches_stored_none() {
         // The checkpoint builders omit `Name` when the string is empty, so
-        // the record stores `None` where the claim computes `Some("")` — a
+        // the record stores `None` where the claim computes `Some("")`: a
         // map `item_namer` or parallel `Branch` with an empty name. An
         // unchanged handler must NOT be rejected on resume.
         let ctx = test_ctx();
@@ -3545,7 +3546,7 @@ mod tests {
         );
     }
 
-    // ── Debug redaction tests ───────────────────────────────────────────
+    // Debug redaction tests
 
     #[test]
     fn debug_output_redacts_checkpoint_token() {
@@ -3581,7 +3582,7 @@ mod tests {
         );
     }
 
-    // ── Checkpoint coalescing tests ─────────────────────────────────────
+    // Checkpoint coalescing tests
 
     /// Builds a root context with a checkpoint-coalescing delay, backed by
     /// the in-memory client.
@@ -3692,8 +3693,8 @@ mod tests {
         assert_eq!(call_count, 1);
     }
 
-    /// Without a configured delay, `checkpoint_updates` writes immediately
-    /// — one call per checkpoint, exactly the pre-knob behavior.
+    /// Without a configured delay, `checkpoint_updates` writes immediately:
+    /// one call per checkpoint, exactly the pre-knob behavior.
     #[tokio::test(start_paused = true)]
     async fn no_delay_checkpoints_write_immediately() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
@@ -3792,7 +3793,7 @@ mod tests {
 
     /// REGRESSION (flush contract): once a delay timer claims a batch and
     /// its write is in flight, `flush_pending_checkpoints` must NOT return
-    /// until that write finishes — the wrapper reports
+    /// until that write finishes: the wrapper reports
     /// PENDING/SUCCEEDED/FAILED right after the flush, and an unawaited
     /// in-flight checkpoint would cross that boundary.
     #[tokio::test(start_paused = true)]
@@ -3940,7 +3941,7 @@ mod tests {
     /// "Retryable exhaustion fails the invocation with no further
     /// writes": B's flusher must observe the failure latch under the
     /// writer lock, publish the prior error to its contributors, and
-    /// retain its updates as unwritten — without calling the backend.
+    /// retain its updates as unwritten: without calling the backend.
     /// Before the latch, B's flusher acquired the lock after A's failure
     /// and performed another write, persisting replay-visible transitions
     /// after the invocation was already doomed.
@@ -4112,7 +4113,7 @@ mod tests {
         );
     }
 
-    // ── Lifecycle-event ownership regression tests ──────────────────────
+    // Lifecycle-event ownership regression tests
     //
     // The documented contract (`crate::observability`) guarantees that
     // every transition the service records emits its lifecycle event.
@@ -4184,8 +4185,8 @@ mod tests {
     }
 
     /// REGRESSION (event ownership, dropped contributor): a buffered
-    /// contributor dropped after joining a batch — explicitly supported for
-    /// `race`/`select_ok` losers — must not take its lifecycle events with
+    /// contributor dropped after joining a batch, explicitly supported for
+    /// `race`/`select_ok` losers, must not take its lifecycle events with
     /// it. The flush task persists the update, so the write path must emit
     /// the event, inside the span the contributor captured.
     ///
@@ -4206,8 +4207,8 @@ mod tests {
             let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
             let ctx = coalescing_ctx(client.clone(), Duration::from_hours(1));
 
-            // The contributor polls once inside its own span — far enough
-            // to capture its events and join the coalescing batch — then is
+            // The contributor polls once inside its own span, far enough
+            // to capture its events and join the coalescing batch, then is
             // dropped, exactly like a lost `race` branch.
             {
                 let span = tracing::info_span!("contributor-span");
@@ -4332,7 +4333,7 @@ mod tests {
 
     /// REGRESSION (event ownership, split batch): when a sealed batch splits
     /// into several requests and an earlier request persists before a later
-    /// one fails, the persisted chunk's events must be emitted — the
+    /// one fails, the persisted chunk's events must be emitted: the
     /// aggregate batch error published to contributors must not suppress
     /// telemetry for transitions the service actually recorded.
     ///
@@ -4427,9 +4428,9 @@ mod tests {
     /// REGRESSION (event ownership, failed pagination hydration): the
     /// checkpoint call can persist the transitions and *then* fail while
     /// hydrating paginated state through `get_state`. The persisted
-    /// transitions' events must already be emitted by then — emission
+    /// transitions' events must already be emitted by then, emission
     /// happens immediately after the service accepts the write, before the
-    /// fallible pagination fetch — even though the caller observes an error.
+    /// fallible pagination fetch, even though the caller observes an error.
     ///
     /// Retries for the same reason as
     /// [`dropped_buffered_contributor_still_emits_events_for_persisted_updates`]:

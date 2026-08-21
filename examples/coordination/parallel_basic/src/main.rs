@@ -8,8 +8,8 @@
 //! branch results in input order.
 //!
 //! A branch body is ordinary durable code: it can run steps, waits, or nested
-//! operations. This example fans out two branches — one that computes a value
-//! and one that waits before returning — showing that heterogeneous work with
+//! operations. This example fans out two branches, one that computes a value
+//! and one that waits before returning, showing that heterogeneous work with
 //! the same result type composes cleanly.
 //!
 //! [`parallel`]: aws_durable_execution_sdk_rust::DurableContext::parallel

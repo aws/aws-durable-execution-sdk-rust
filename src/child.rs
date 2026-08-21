@@ -35,7 +35,7 @@ const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 
 /// Internal state for child context execution passed from the builder.
 ///
-/// Generic over the body closure `F` and — through its future's output —
+/// Generic over the body closure `F` and, through its future's output,
 /// the body's error type `E`, so the body runs **without type erasure**:
 /// `run_in_child_context` instantiates it with the user closure directly
 /// (`E = BoxError`), and `with_retry` with the concrete retry-loop future
@@ -61,7 +61,7 @@ where
 {
     /// Executes the child context operation.
     ///
-    /// Thin generic wrapper — the ONLY code monomorphized per call site.
+    /// Thin generic wrapper: the ONLY code monomorphized per call site.
     /// The replay/checkpoint state machine lives in the non-generic
     /// [`ChildCore`] / [`ChildAfter`] halves (generic over the result type
     /// `O` only); this wrapper just polls the user's concrete future
@@ -109,7 +109,7 @@ where
 
 /// The pre-closure half of a child context: task-ownership check, replay
 /// resolution, and the START checkpoint. Generic only over the result type
-/// `O` — no user closure reaches this state machine, so its substantial
+/// `O`, no user closure reaches this state machine, so its substantial
 /// replay/checkpoint logic compiles once per result type instead of once
 /// per call site.
 struct ChildCore<O, S> {
@@ -212,7 +212,7 @@ where
                 _ => {}
             }
         } else {
-            // 3. No checkpoint record: first invocation — checkpoint START.
+            // 3. No checkpoint record: first invocation: checkpoint START.
             let update = build_update(
                 &wire_id,
                 self.name.as_deref(),
@@ -220,7 +220,7 @@ where
                 &self.ctx,
             );
             if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43) — child-context START: no user code ran (the
+                // Audit (#43): child-context START: no user code ran (the
                 // closure has not been called), so no terminal FAIL is
                 // needed; re-invocation reconverges on the same write.
                 return self
@@ -304,7 +304,7 @@ where
 {
     /// Settles the child body's outcome.
     ///
-    /// Live mode checkpoints it — success through [`build_succeed_update`]
+    /// Live mode checkpoints it: success through [`build_succeed_update`]
     /// (which routes large payloads to `ReplayChildren` mode), failure
     /// through [`checkpoint_live_failure`]. Reconstruct mode
     /// (`ReplayChildren` replay) round-trips the result through
@@ -340,7 +340,7 @@ where
                 // Success: serialize and checkpoint.
                 //
                 // A result serialization failure is a LOCAL, deterministic,
-                // user-facing failure, so it stays catchable — but the
+                // user-facing failure, so it stays catchable, but the
                 // terminal FAIL is persisted FIRST (issue #43). The closure
                 // already ran, so its side effects need a recorded outcome:
                 // with the FAIL recorded, replay yields it instead of
@@ -353,7 +353,7 @@ where
                         let update =
                             build_child_fail_update(&wire_id, name.as_deref(), &ctx, &wire);
                         if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-                            // Audit (#43) — child FAIL (serialization): the
+                            // Audit (#43): child FAIL (serialization): the
                             // closure ran, so the failed FAIL write routes
                             // unrecoverable with a minimal terminal FAIL
                             // retry.
@@ -375,7 +375,7 @@ where
                 };
                 let update = build_succeed_update(&wire_id, name.as_deref(), &ctx, &serialized);
                 if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43) — child-context SUCCEED: the closure
+                    // Audit (#43): child-context SUCCEED: the closure
                     // ran, so its side effects need a recorded outcome. A
                     // permanent rejection persists a small terminal FAIL
                     // before the execution fails.
@@ -396,10 +396,6 @@ where
         }
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Builds an `OperationUpdate` for child context operations.
 fn build_update(
@@ -423,7 +419,7 @@ fn build_update(
         builder = builder.parent_id(parent_wire);
     }
 
-    // build() is infallible here — all required fields (id, type, action) set.
+    // build() is infallible here: all required fields (id, type, action) set.
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
@@ -459,7 +455,7 @@ fn build_succeed_update(
                 .replay_children(true)
                 .build(),
         );
-        // Don't include the payload — backend preserves child ops.
+        // Don't include the payload: backend preserves child ops.
     } else {
         succeed_builder = succeed_builder.payload(serialized.to_owned());
     }
@@ -485,10 +481,10 @@ async fn checkpoint_live_failure(
     let wire = crate::error::wire_error_for(&child_err, "ChildFnError");
     let update = build_child_fail_update(wire_id, name, ctx, &wire);
 
-    // A rejected FAIL write routes unrecoverable — discarding it would
+    // A rejected FAIL write routes unrecoverable: discarding it would
     // leave the record claiming less than what executed (#43).
     if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43) — child-context FAIL: the closure ran and failed;
+        // Audit (#43): child-context FAIL: the closure ran and failed;
         // the failed FAIL write routes unrecoverable with a minimal
         // terminal FAIL retry (the original carried the child error's
         // payload).
@@ -552,8 +548,8 @@ async fn replay_success<O, S: Serdes<O>>(
 ///
 /// A record whose `error_type` is the serialization discriminator
 /// ([`crate::error::SERIALIZATION_FAILED_ERROR_TYPE`]) reconstructs
-/// `ChildContextErrorKind::Internal` — the kind the live serialization
-/// path yielded after persisting that record — so replay reproduces the
+/// `ChildContextErrorKind::Internal`, the kind the live serialization
+/// path yielded after persisting that record, so replay reproduces the
 /// recorded failure's classification (issue #43). Every other record is
 /// a closure failure and reconstructs `ChildFailed`.
 fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
@@ -604,10 +600,6 @@ fn child_internal_error(message: &str) -> OperationError {
         Some(message.to_owned().into()),
     )))
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -805,7 +797,7 @@ mod tests {
 
         // A working in-memory client: the child's START checkpoint must
         // succeed for the body to run. (Pre-#43 this test used a
-        // client-less context and passed vacuously — the rejected START
+        // client-less context and passed vacuously: the rejected START
         // write dropped the sender, which settled `rx` without the body
         // ever running. A rejected write now parks the child future for
         // the driver instead of yielding, so the body needs a live
@@ -864,7 +856,7 @@ mod tests {
             })
             .spawn();
 
-        // Await in reverse order — IDs were already claimed.
+        // Await in reverse order: IDs were already claimed.
         let result_b: String = handle_b.await.expect("b should succeed");
         let result_a: String = handle_a.await.expect("a should succeed");
 
@@ -875,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn ownership_check_in_child_context() {
         // Verify that the child context inherits task ownership from
-        // the parent — operations in the child from a foreign task fail.
+        // the parent: operations in the child from a foreign task fail.
         // This is tested via the replay path (no client needed).
         // The child's checkpoint_record lookup uses its own prefix.
         let log = CheckpointLog::from_records(vec![succeeded_record("1", "42")]);
@@ -887,7 +879,7 @@ mod tests {
             })
             .await;
 
-        // Replay succeeds — ownership check passes (same task).
+        // Replay succeeds: ownership check passes (same task).
         assert_eq!(result.expect("should succeed"), 42);
     }
 }

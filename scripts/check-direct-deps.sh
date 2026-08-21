@@ -1,5 +1,5 @@
 #!/bin/sh
-# check-direct-deps.sh — Mechanical gate for the closed production dependency allowlist.
+# check-direct-deps.sh: Mechanical gate for the closed production dependency allowlist.
 #
 # cargo-deny's [bans] allow list checks the ENTIRE dependency graph (including
 # transitives), which is impractical with the aws-sdk tree (~400 crates).
@@ -10,16 +10,16 @@
 # Two graphs are checked, because an optional dependency hides from the
 # default-feature graph:
 #
-#   1. Default features — only the ALWAYS_ON allowlist may appear. This is
+#   1. Default features: only the ALWAYS_ON allowlist may appear. This is
 #      the graph every consumer gets, so an optional crate leaking into it
 #      (e.g. via a stray non-optional feature edge) fails here.
-#   2. --all-features — ALWAYS_ON plus OPTIONAL_ALLOWLIST may appear. This
+#   2. --all-features: ALWAYS_ON plus OPTIONAL_ALLOWLIST may appear. This
 #      closes the loophole where an unapproved crate rides in behind a
 #      feature flag and never shows up in pass 1.
 #
 # Wired into `make check`. See also deny.toml for the rationale comment.
 #
-# POSIX sh — no bashisms.
+# POSIX sh, no bashisms.
 
 set -e
 
@@ -36,7 +36,7 @@ ALWAYS_ON="aws-config aws-sdk-lambda lambda_runtime serde serde_json sha2 tokio 
 # Optional, feature-gated production dependencies. Each entry needs the same
 # policy approval as ALWAYS_ON (see CONTRIBUTING.md, "Dependency policy") and
 # a note here naming the feature that gates it:
-#   tracing-subscriber — gated by the `replay-filter` feature; provides the
+#   tracing-subscriber: gated by the `replay-filter` feature; provides the
 #     Filter/Layer traits ReplayFilterLayer implements. Absent from every
 #     default-feature build.
 OPTIONAL_ALLOWLIST="tracing-subscriber"
@@ -57,7 +57,7 @@ check_graph() {
     # that both passes trivially. Fail closed instead.
     if ! cargo tree --workspace --depth 1 -e normal --prefix none "$@" \
         > "$TREE_FILE" 2> "$TREE_ERR_FILE"; then
-        echo "direct-dep-allowlist FAILED ($label) — 'cargo tree' itself failed; cannot verify the dependency graph:" >&2
+        echo "direct-dep-allowlist FAILED ($label): 'cargo tree' itself failed; cannot verify the dependency graph:" >&2
         cat "$TREE_ERR_FILE" >&2
         return 1
     fi
@@ -65,7 +65,7 @@ check_graph() {
     # An empty graph means cargo told us nothing to check, which is never
     # true for this workspace. Treat it as a failure rather than a pass.
     if [ ! -s "$TREE_FILE" ]; then
-        echo "direct-dep-allowlist FAILED ($label) — 'cargo tree' produced no output; cannot verify the dependency graph." >&2
+        echo "direct-dep-allowlist FAILED ($label): 'cargo tree' produced no output; cannot verify the dependency graph." >&2
         return 1
     fi
 
@@ -88,9 +88,9 @@ check_graph() {
             case "$line" in
                 *"(*)"*) continue ;;
                 *"(/"*")"*)
-                    # This is a workspace member line — extract name (first field).
+                    # This is a workspace member line: extract name (first field).
                     current_member=$(echo "$line" | awk '{print $1}')
-                    # Skip the compliance crate — it's test infrastructure, not production.
+                    # Skip the compliance crate: it's test infrastructure, not production.
                     case "$current_member" in
                         compliance) current_member=""; continue ;;
                     esac
@@ -125,7 +125,7 @@ check_graph() {
     } < "$TREE_FILE" > "$VIOLATIONS_FILE"
 
     if [ -s "$VIOLATIONS_FILE" ]; then
-        echo "direct-dep-allowlist FAILED ($label) — unapproved direct production dependencies detected:"
+        echo "direct-dep-allowlist FAILED ($label): unapproved direct production dependencies detected:"
         echo ""
         while IFS=: read -r _ member dep; do
             echo "  ERROR: crate '$dep' is a direct dependency of workspace member '$member' but is NOT in the allowlist for this graph."
@@ -148,5 +148,5 @@ check_graph "$ALWAYS_ON" "default features"
 # crates may appear.
 check_graph "$ALWAYS_ON $OPTIONAL_ALLOWLIST" "--all-features" --all-features
 
-echo "direct-dep-allowlist OK — default-feature graph limited to the always-on allowlist;"
+echo "direct-dep-allowlist OK: default-feature graph limited to the always-on allowlist;"
 echo "all-features graph adds only approved optional crates ($OPTIONAL_ALLOWLIST)."

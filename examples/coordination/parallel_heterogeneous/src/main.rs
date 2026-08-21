@@ -9,7 +9,7 @@
 //!
 //! This is the Rust analogue of a variadic, mixed-type `Promise.all`. The
 //! variadic-tuple sugar is not expressible in Rust's type system, but the
-//! capability — concurrent, heterogeneous durable operations — is fully
+//! capability, concurrent, heterogeneous durable operations, is fully
 //! preserved through `tokio::join!` over held builders.
 //!
 //! This example joins a numeric step and a string step, then combines them.

@@ -5,7 +5,7 @@
 # We use [bans.deny] to block ALL crates by default for non-dev,
 # non-build dependencies, then [bans.allow] to permit exactly the
 # production allowlist. cargo-deny's `deny` list with wildcards is not
-# the right tool — instead we use the `multiple-versions` and
+# the right tool: instead we use the `multiple-versions` and
 # `external-types` approach:
 #
 # Actually, cargo-deny does not support "deny all except allowlist" in
@@ -30,12 +30,10 @@
 # Dev deps (like tracing-subscriber for tests) are unrestricted.
 exclude-dev = true
 
-# ============================================================
-# [bans] — dependency ban configuration
-# ============================================================
+# [bans], dependency ban configuration
 [bans]
 # Warn on duplicate versions so regressions surface in `cargo deny` output
-# without failing the gate — the AWS SDK tree still carries a few
+# without failing the gate, the AWS SDK tree still carries a few
 # unavoidable duplicates (e.g. windows-sys) that upstream must converge.
 multiple-versions = "warn"
 wildcards = "allow"
@@ -55,9 +53,7 @@ wildcards = "allow"
 allow = []
 deny = []
 
-# ============================================================
-# [licenses] — Apache-2.0/MIT ecosystem allowances
-# ============================================================
+# [licenses]: Apache-2.0/MIT ecosystem allowances
 [licenses]
 allow = [
     "Apache-2.0",
@@ -76,9 +72,7 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# ============================================================
-# [advisories] — RustSec advisory database checking
-# ============================================================
+# [advisories]: RustSec advisory database checking
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]

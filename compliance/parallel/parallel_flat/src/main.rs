@@ -7,7 +7,7 @@ use aws_durable_execution_sdk_rust as durable;
 use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::NestingMode;
 
-/// Handler: parallel flat nesting — branches run steps in virtual contexts.
+/// Handler: parallel flat nesting: branches run steps in virtual contexts.
 async fn handler(
     _event: serde_json::Value,
     ctx: DurableContext,

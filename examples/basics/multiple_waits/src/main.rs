@@ -4,7 +4,7 @@
 //! invocations of the function: the execution suspends at the first wait,
 //! resumes and replays past it, suspends again at the second, then resumes to
 //! completion. Because each wait is a distinct operation minted in call order,
-//! replay pairs each resumption with the correct wait — the ordering is
+//! replay pairs each resumption with the correct wait: the ordering is
 //! deterministic regardless of timing.
 //!
 //! Returning a small typed struct shows that a durable function's output is

@@ -2,7 +2,7 @@
 //! retry strategy to the closure's OVERALL outcome, so a multi-operation
 //! block retries as a unit.
 //!
-//! Structure on the wire — everything is expressed through the existing,
+//! Structure on the wire: everything is expressed through the existing,
 //! backend-proven child-context and wait protocols; no new operation types
 //! are introduced:
 //!
@@ -20,7 +20,7 @@
 //!
 //! Retry-state checkpointing: the loop carries no in-process state that
 //! matters across a suspension. The current attempt number is re-derived on
-//! every (re)entry purely from recorded checkpoint results — a finished
+//! every (re)entry purely from recorded checkpoint results: a finished
 //! attempt replays its frozen outcome (a failed attempt replays its `Fail`
 //! record without re-running its body), the strategy decision is a
 //! deterministic function of that recorded error and the attempt number,
@@ -46,13 +46,13 @@ use crate::{BoxError, RetryDecision, RetryStrategy};
 /// operation's permanent failure.
 /// The closure is generic (`Arc<F>` rather than a boxed `dyn Fn`): each
 /// attempt produces a concrete future that flows into
-/// `run_in_child_context` without its own box — the single erasure point
+/// `run_in_child_context` without its own box: the single erasure point
 /// stays at the enclosing builder's [`DurableFuture`](crate::DurableFuture).
 /// `Arc` because the block runs the closure once per attempt.
 /// The builder's configured serdes is shared into every attempt's nested
 /// child context (through the forwarding `impl Serdes<T> for Arc<S>`), so
 /// each attempt round-trips `O` through the SAME wire format as the block
-/// itself — which is also what lets a custom serdes carry an `O` without
+/// itself, which is also what lets a custom serdes carry an `O` without
 /// `Serialize`/`DeserializeOwned` implementations.
 pub(crate) async fn retry_loop<O, F, Fut, S>(
     outer: DurableContext,

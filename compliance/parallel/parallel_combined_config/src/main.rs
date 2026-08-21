@@ -5,7 +5,7 @@ use aws_durable_execution_sdk_rust as durable;
 use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
 
-/// Handler: combined config — tolerated-failure-count=1, min-successful=3.
+/// Handler: combined config: tolerated-failure-count=1, min-successful=3.
 async fn handler(
     _event: serde_json::Value,
     ctx: DurableContext,

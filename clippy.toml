@@ -2,7 +2,7 @@
 # suspension-scope accounting: a future spawned outside the spawn
 # abstraction in src/future.rs runs on a task whose ID the ownership
 # detector has not blessed, so any durable operation it creates is
-# rejected at run time — and a task the accounting cannot see can strand a
+# rejected at run time, and a task the accounting cannot see can strand a
 # suspension scope. The lint makes every bare spawn a compile-time
 # decision: production code carries exactly one `#[expect]`, on the
 # `spawn_raw` helper in src/future.rs that both `spawn_blessed` (owned,

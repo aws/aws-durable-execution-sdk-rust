@@ -2,7 +2,7 @@
 //!
 //! Implements the coordinator loop for bounded-concurrency fan-out with
 //! completion-threshold semantics. Both `map` and `parallel` share the
-//! same underlying batch engine — they differ only in how items are
+//! same underlying batch engine: they differ only in how items are
 //! produced (from a `Vec<I>` + closure, or from named `Branch<O>` values).
 //!
 //! Wire shape:
@@ -326,7 +326,7 @@ impl CompletionReason {
 /// scheduler-timed and is not recorded in the checkpoint log, so it cannot
 /// be reproduced on replay; the input-order prefix can always be derived
 /// from recorded state alone. That canonical ordering is what keeps an
-/// order-sensitive predicate deterministic across replay — identical
+/// order-sensitive predicate deterministic across replay: identical
 /// recorded state always produces the identical outcome sequence.
 ///
 /// The public constructor exists so a completion predicate can be unit
@@ -375,14 +375,14 @@ impl SettledOutcome {
 ///
 /// A snapshot of the batch's *committed prefix*: the settled outcomes of
 /// items `0..settled()`, in input order, plus the total item count. An
-/// item's outcome is committed — and the predicate re-evaluated — only
+/// item's outcome is committed, and the predicate re-evaluated, only
 /// once every earlier item's outcome is known, so a still-running (or
 /// suspended) item holds later items' outcomes out of the statistics until
 /// it settles. Live settlement order is scheduler-timed and unrecorded;
 /// the committed prefix derives from recorded checkpoint state alone, so a
 /// predicate that is a pure function of these statistics sees the
 /// identical sequence of snapshots on the original run and on every
-/// replay — see the determinism requirement on
+/// replay: see the determinism requirement on
 /// [`CompletionConfigBuilder::completion_predicate`](crate::builders::map_parallel::CompletionConfigBuilder::completion_predicate).
 ///
 /// The public constructor exists so a completion predicate can be unit
@@ -478,7 +478,7 @@ impl<'a> BatchStats<'a> {
 /// Contains per-item outcomes and the reason the batch completed. Provides
 /// accessor methods for building conformance projections.
 ///
-/// Only items that were actually started are included — items that never
+/// Only items that were actually started are included: items that never
 /// started due to early completion are omitted.
 ///
 /// # Examples
@@ -627,14 +627,14 @@ pub enum NestingMode {
     /// Each item runs in its own child context with full context events.
     #[default]
     Normal,
-    /// Items run in a virtual context under the parent — no per-item
+    /// Items run in a virtual context under the parent, no per-item
     /// context events are emitted.
     Flat,
 }
 
 /// Internal state for a map execution passed from the builder.
 ///
-/// Holds the user's map closure as `Arc<F>` — shared rather than boxed,
+/// Holds the user's map closure as `Arc<F>`: shared rather than boxed,
 /// because the same closure runs once per item, concurrently. Each item
 /// call produces a **concrete** future from `Arc<F>`, so the
 /// [`JoinSet`](tokio::task::JoinSet) inside [`execute_batch`] holds
@@ -673,8 +673,8 @@ where
     /// Executes the map operation and returns the full `BatchResult`.
     ///
     /// The user closure enters the batch engine only through the
-    /// [`ItemDispatch`] object, so [`execute_batch`] — the checkpoint state
-    /// machine — compiles once per result type while every item still runs
+    /// [`ItemDispatch`] object, so [`execute_batch`], the checkpoint state
+    /// machine, compiles once per result type while every item still runs
     /// as a concrete, unboxed future. Used directly by `await_batch` and by
     /// [`Self::execute`], whose `Vec<O>` view is projected by
     /// [`collect_successful`].
@@ -792,7 +792,7 @@ where
 ///
 /// If the batch completed within tolerance (`AllCompleted`) or ended early
 /// on a success trigger (`MinSuccessfulReached` or `PredicateMatched`),
-/// failed items are expected and NOT propagated as errors — they are simply
+/// failed items are expected and NOT propagated as errors: they are simply
 /// skipped. Only a batch that ended because the failure tolerance was
 /// exceeded (including the default fail-fast case) becomes an `Err`,
 /// carrying the first failed item's message.
@@ -827,16 +827,12 @@ fn collect_successful<O>(batch_result: BatchResult<O>) -> Result<Vec<O>, Operati
     Ok(results)
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Core batch engine
-// ────────────────────────────────────────────────────────────────────────────
-
 /// A pre-claimed child operation with its metadata.
 struct PreClaimed {
     index: usize,
     op_id: OperationId,
     is_terminal: bool,
-    /// Whether the checkpoint log holds ANY record for this child — a
+    /// Whether the checkpoint log holds ANY record for this child: a
     /// terminal record or a `Started` one from a prior invocation. Drives
     /// two decisions at dispatch: a child with a record never gets a second
     /// `Start` write, and a recorded child counts as "ever started" in the
@@ -871,7 +867,7 @@ fn panic_message(payload: &dyn std::any::Any) -> String {
 enum ItemOutcome<O> {
     /// The branch reached a terminal state this invocation.
     Terminal(BatchItem<O>),
-    /// The branch suspended (parked) — its slot stays held.
+    /// The branch suspended (parked): its slot stays held.
     Suspended,
 }
 
@@ -915,7 +911,7 @@ enum ItemPrelude<O> {
 
 /// Pre-closure half of one batch item: replay decode, child START
 /// checkpoint, child-context creation. Generic only over the result type
-/// `O` — no user closure reaches this code.
+/// `O`, no user closure reaches this code.
 async fn item_before<O, IS>(req: &ItemRequest<IS>) -> Result<ItemPrelude<O>, OperationError>
 where
     O: Send + 'static,
@@ -973,7 +969,7 @@ where
 }
 
 /// Post-closure half of one batch item: outcome checkpointing and
-/// [`BatchItem`] assembly. Generic only over the result type `O` — no user
+/// [`BatchItem`] assembly. Generic only over the result type `O`, no user
 /// closure reaches this code.
 #[expect(clippy::too_many_lines)] // reason: FLAT/NORMAL outcome checkpointing reads better in one flow
 async fn item_after<O, IS>(
@@ -999,7 +995,7 @@ where
                 // deterministic: the item closure already ran, so the item
                 // settles as a failed `BatchItem` instead of yielding a
                 // catchable coordinator error with no record (issue #43).
-                // FLAT items have no per-child record — the failure is
+                // FLAT items have no per-child record: the failure is
                 // recorded inside the parent batch's summary payload when
                 // the parent checkpoints, and replay reconstructs the same
                 // failed item from it, so live and replayed batches agree.
@@ -1076,7 +1072,7 @@ where
                         &wire,
                     );
                     if let Err(client_err) = req.ctx.checkpoint_updates(vec![update]).await {
-                        // Audit (#43) — batch child FAIL (serialization):
+                        // Audit (#43): batch child FAIL (serialization):
                         // the item closure ran; the failed FAIL write
                         // routes unrecoverable with a minimal terminal
                         // FAIL retry.
@@ -1130,7 +1126,7 @@ where
                 .expect("all required OperationUpdate fields set");
 
             if let Err(err) = req.ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43) — batch child SUCCEED: the item closure
+                // Audit (#43): batch child SUCCEED: the item closure
                 // ran, so its side effects need a recorded outcome. A
                 // permanent rejection persists a small terminal FAIL
                 // before the execution fails. Routing unrecoverable (not
@@ -1165,7 +1161,7 @@ where
         ScopeOutcome::Completed(Err(child_err)) => {
             // Defensive: a durable op that set its suspend flag and then
             // returned Err (rather than parking) is a suspension, not a
-            // failure — mirror the invocation driver's precedence rule.
+            // failure: mirror the invocation driver's precedence rule.
             if scope.is_suspend_requested() {
                 return Ok(ItemOutcome::Suspended);
             }
@@ -1188,7 +1184,7 @@ where
                 .expect("all required OperationUpdate fields set");
 
             if let Err(client_err) = req.ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43) — batch child FAIL: the item closure ran
+                // Audit (#43): batch child FAIL: the item closure ran
                 // and failed; the failed FAIL write routes unrecoverable
                 // with a minimal terminal FAIL retry (the original
                 // carried the item error's payload). Discarding it would
@@ -1220,7 +1216,7 @@ where
     }
 }
 
-/// Thin generic wrapper around one map item — the ONLY code monomorphized
+/// Thin generic wrapper around one map item: the ONLY code monomorphized
 /// per map call site. Everything before and after the user closure is the
 /// non-generic [`item_before`] / [`item_after`] pair; this wrapper just
 /// polls the user's concrete future between them under the branch driver.
@@ -1302,8 +1298,8 @@ fn take_branch_body<O>(
 /// Object-safe item dispatcher: spawns one item body onto the coordinator's
 /// [`JoinSet`] as a CONCRETE (unboxed) future.
 ///
-/// This boundary is what keeps [`execute_batch`] — the batch checkpoint
-/// state machine — non-generic over the user's closure: only the dispatcher
+/// This boundary is what keeps [`execute_batch`], the batch checkpoint
+/// state machine, non-generic over the user's closure: only the dispatcher
 /// and the thin wrapper it spawns ([`run_single_item`]) monomorphize per
 /// call site, while the futures inside the `JoinSet` stay unboxed.
 trait ItemDispatch<O, IS>: Send + Sync {
@@ -1316,7 +1312,7 @@ trait ItemDispatch<O, IS>: Send + Sync {
 }
 
 /// Map dispatcher: shares the user closure as `Arc<F>` and produces one
-/// concrete future per item — the `JoinSet` holds no per-item box.
+/// concrete future per item: the `JoinSet` holds no per-item box.
 struct MapDispatch<F> {
     run_item: Arc<F>,
 }
@@ -1345,7 +1341,7 @@ where
 }
 
 /// Parallel dispatcher: hands each spawned task the shared take-once slots
-/// holding the single-erasure branch bodies. Non-generic — the erased
+/// holding the single-erasure branch bodies. Non-generic: the erased
 /// branch body already carries the user's closure and future.
 struct BranchDispatch<O> {
     slots: Arc<Vec<std::sync::Mutex<Option<crate::future::BranchBody<O>>>>>,
@@ -1378,11 +1374,11 @@ struct BatchProgress<O> {
     tracker: CompletionTracker,
     /// Terminal outcomes, positional by item index.
     results: Vec<Option<BatchItem<O>>>,
-    /// Parked branches — they RETAIN their concurrency slots.
+    /// Parked branches: they RETAIN their concurrency slots.
     suspended_count: usize,
     /// Whether ANY branch parked this invocation.
     any_suspended: bool,
-    /// Which items were EVER admitted — dispatched live this invocation, or
+    /// Which items were EVER admitted: dispatched live this invocation, or
     /// holding a checkpoint record from a prior one. Ordered admission makes
     /// this a contiguous prefix of the input, and its length is the
     /// `totalCount` the batch decision record carries: the number of items
@@ -1453,15 +1449,15 @@ where
 {
     /// Processes one joined branch task: a produced outcome feeds the
     /// progress accounting; a `JoinError` (a panic in user branch code, or a
-    /// cancellation) is recorded as a controlled BRANCH FAILURE — mirroring
+    /// cancellation) is recorded as a controlled BRANCH FAILURE, mirroring
     /// the failure a normal branch would have produced so accounting and the
-    /// completion threshold treat it identically — with a best-effort child
+    /// completion threshold treat it identically, with a best-effort child
     /// FAIL checkpoint so a retry does not repeat already-started work.
     ///
     /// The `JoinError` arm applies to LIVE branches only. A `ReplayChildren`
     /// reconstruction task never reaches it: [`Self::resolve_terminal_inline`]
     /// handles its own join event, because a panic while reconstructing a
-    /// recorded terminal SUCCESS must unwind the coordinator — not
+    /// recorded terminal SUCCESS must unwind the coordinator: not
     /// checkpoint `Fail` over durable success history.
     async fn settle_joined(
         &self,
@@ -1520,7 +1516,7 @@ where
                     if let Ok(update) = update.build()
                         && let Err(client_err) = self.ctx.checkpoint_updates(vec![update]).await
                     {
-                        // Audit (#43) — batch child FAIL (panicked
+                        // Audit (#43): batch child FAIL (panicked
                         // branch): the item closure ran; the failed FAIL
                         // write routes unrecoverable with a minimal
                         // terminal FAIL retry.
@@ -1690,8 +1686,8 @@ where
 /// completion checking.
 ///
 /// Non-generic over the user closure: item bodies enter only through the
-/// [`ItemDispatch`] object, so this coordinator — the batch's checkpoint
-/// state machine — monomorphizes once per result type `O`.
+/// [`ItemDispatch`] object, so this coordinator, the batch's checkpoint
+/// state machine, monomorphizes once per result type `O`.
 #[expect(clippy::too_many_lines)]
 // reason: batch coordination has distinct phases (claim, schedule, collect, checkpoint) that read better as one flow
 #[expect(clippy::too_many_arguments)] // reason: batch execution requires all these parameters
@@ -1715,7 +1711,7 @@ where
     IS: Serdes<O>,
     RS: Serdes<BatchSummary>,
 {
-    // Share the item serdes across items behind one `Arc` — the forwarding
+    // Share the item serdes across items behind one `Arc`: the forwarding
     // `impl Serdes for Arc<S>` makes the handle itself a serdes, so no
     // `Clone` bound is required of the user's implementation.
     let serdes = Arc::new(serdes);
@@ -1724,7 +1720,7 @@ where
     ctx.enforce_task_ownership()?;
 
     // 1b. Validate max_concurrency BEFORE any checkpointing.
-    // Zero is invalid — must be positive or unset (None = unlimited).
+    // Zero is invalid: must be positive or unset (None = unlimited).
     if max_concurrency == Some(0) {
         return Err(batch_error(
             "max concurrency must be positive or unset for unlimited",
@@ -1760,7 +1756,7 @@ where
             // A successful batch too large to checkpoint inline recorded a
             // decision record (`totalCount`, `completionReason`, index set)
             // instead of its payload. A record-less `replay_children`
-            // payload — written by an older SDK — falls through to the
+            // payload, written by an older SDK, falls through to the
             // unconstrained re-execution, exactly as before; a non-empty
             // payload that fails to parse is corrupt and fails the replay
             // instead of falling back.
@@ -1903,7 +1899,7 @@ where
             &ctx,
         );
         if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-            // Audit (#43) — batch parent START: no item closure has run,
+            // Audit (#43): batch parent START: no item closure has run,
             // so no terminal FAIL is needed; re-invocation reconverges
             // on the same write.
             return ctx
@@ -1954,8 +1950,8 @@ where
 
     // 6. Pre-claim child IDs.
     // For concurrency > 1 (concurrent path): claim ALL child IDs upfront
-    // on the owning task (determinism rule 4 — deterministic ID ordering
-    // regardless of completion order). Claiming is LOCAL — no `Start` is
+    // on the owning task (determinism rule 4: deterministic ID ordering
+    // regardless of completion order). Claiming is LOCAL, no `Start` is
     // checkpointed here; the coordinator writes each child's `Start` at
     // dispatch, so a child is admitted (and recorded) only when a
     // concurrency slot is actually free for it.
@@ -2006,7 +2002,7 @@ where
 
     // 7. Execute items with bounded concurrency, branch-local suspension, and
     // slot-holding accounting. Admission is ordered and LAZY: the
-    // coordinator — the sole writer of child starts — checkpoints each
+    // coordinator, the sole writer of child starts, checkpoints each
     // child's `Start` at the moment it dispatches that child, in index
     // order, as concurrency slots free up. No child `Start` is written
     // before its item is about to run, so an early completion trigger or a
@@ -2015,7 +2011,7 @@ where
 
     // Coordinator loop. In-flight = running + suspended, bounded by
     // `concurrency`: a SUSPENDED branch KEEPS its slot (only terminal
-    // completion frees one — the slot-holding invariant), so
+    // completion frees one: the slot-holding invariant), so
     // `suspended_count` counts against the cap and new branches only start
     // when capacity remains after terminal completions. Each branch runs
     // through the dispatcher's thin wrapper, which drives the branch body
@@ -2025,7 +2021,7 @@ where
     // Coordinator-owned, observable task set. Dropping the `JoinSet` (on error
     // return OR when the driver drops this coordinator on invocation teardown)
     // aborts every still-running branch task, so no branch task outlives the
-    // invocation — the same abort-on-drop ownership as the `.spawn()` path.
+    // invocation: the same abort-on-drop ownership as the `.spawn()` path.
     // Unlike a plain result channel, `join_next_with_id` also surfaces a
     // `JoinError` when a task ends WITHOUT producing an outcome (a panic in
     // user branch code, or a cancellation), so the coordinator accounts for
@@ -2043,7 +2039,7 @@ where
     let mut next_index: usize = 0;
 
     // A child holding ANY checkpoint record was admitted by a prior
-    // invocation — it counts toward the "ever started" prefix the decision
+    // invocation: it counts toward the "ever started" prefix the decision
     // record carries even if a completion trigger keeps this invocation
     // from re-dispatching it.
     for pre in &pre_claimed {
@@ -2065,13 +2061,13 @@ where
 
     // 7b. Replay pass (concurrent mode): resolve every recorded-terminal
     // child inline on the coordinator, in input order, BEFORE dispatching
-    // any live work — never through the live `JoinSet` schedule. This is
+    // any live work, never through the live `JoinSet` schedule. This is
     // what keeps completion triggers deterministic under replay: outcomes
     // already in the checkpoint log feed the statistics in canonical input
     // order before any live settlement joins, so identical recorded state
     // yields identical trigger decisions no matter how the scheduler orders
     // the join events of resumed live branches. Recorded terminals are
-    // completed history — real work whose outcome the service persisted —
+    // completed history, real work whose outcome the service persisted,
     // so they are applied unconditionally: a trigger firing mid-pass halts
     // future live dispatch but never drops an already-recorded outcome
     // from the result.
@@ -2131,7 +2127,7 @@ where
             // admission set is resolved from the record alone: an index at
             // or beyond `totalCount` never started and is omitted; an
             // index in the started set was non-terminal when the batch
-            // completed and is reported as STARTED — with no result and no
+            // completed and is reported as STARTED: with no result and no
             // error, its child checkpoints never consulted. A started-set
             // item still consumed an ID on the live sequential path, so
             // its counter position is skipped rather than reused.
@@ -2160,7 +2156,7 @@ where
             }
 
             // Concurrent mode: recorded-terminal children were already
-            // applied by the replay pass above — skip them here.
+            // applied by the replay pass above: skip them here.
             if concurrency > 1 && pre_claimed.get(i).is_some_and(|pre| pre.is_terminal) {
                 continue;
             }
@@ -2207,7 +2203,7 @@ where
             // started by the invocation that recorded them).
             progress.mark_started(i);
 
-            // Recorded-terminal child (sequential path only — the
+            // Recorded-terminal child (sequential path only: the
             // concurrent path applied its recorded terminals in the replay
             // pass above): resolve it inline on the coordinator, at the
             // dispatch cursor, in input order. With one item in flight at a
@@ -2239,8 +2235,8 @@ where
             let branch_index = pc.index;
             let branch_wire = pc.op_id.wire().to_owned();
 
-            // Ordered lazy admission: the coordinator — the sole writer of
-            // child starts — checkpoints this child's `Start` NOW, at
+            // Ordered lazy admission: the coordinator, the sole writer of
+            // child starts, checkpoints this child's `Start` NOW, at
             // dispatch, just before spawning its body. Writing on the
             // owning task (never inside the spawned task) keeps every
             // start committed before the child's own writes, and no start
@@ -2255,7 +2251,7 @@ where
                     OperationAction::Start,
                 );
                 if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43) — batch child START: the item closure has
+                    // Audit (#43): batch child START: the item closure has
                     // not run, so no terminal FAIL is needed; re-invocation
                     // reconverges on the same write. Routing unrecoverable
                     // (not as an item failure) matters doubly here: a
@@ -2299,10 +2295,10 @@ where
 
         // Await the next branch task to terminate. `join_next_with_id` yields a
         // produced outcome (`Ok`) OR a `JoinError` (`Err`) for a task that ended
-        // without one — a panic in user branch code (library code forbids
+        // without one: a panic in user branch code (library code forbids
         // panics), or, defensively, a cancellation.
         let Some(joined) = join_set.join_next_with_id().await else {
-            break; // set is empty — unreachable while running > 0
+            break; // set is empty: unreachable while running > 0
         };
         running -= 1;
         env.settle_joined(joined, &mut branch_meta, &mut progress)
@@ -2334,13 +2330,13 @@ where
     }
 
     // 9. Assemble results in input order (terminal items; suspended and
-    // never-started branches are omitted — except under a replay plan,
+    // never-started branches are omitted: except under a replay plan,
     // where the record's started set appears as STARTED items).
     let final_items: Vec<BatchItem<O>> = results.into_iter().flatten().collect();
 
     // 8b. Under a replay plan, the batch outcome is already durably
     // recorded: the reason is taken verbatim from the decision record and
-    // NOTHING is re-checkpointed — the record being obeyed is the parent's
+    // NOTHING is re-checkpointed: the record being obeyed is the parent's
     // terminal state. `final_items` holds the recorded admission set's
     // reconstructed outcomes.
     if let Some(plan) = replay_plan {
@@ -2351,7 +2347,7 @@ where
     }
 
     // 10. Determine completion reason: the first trigger to fire during the
-    // run (recorded at the settle event that fired it — first trigger wins),
+    // run (recorded at the settle event that fired it: first trigger wins),
     // or `AllCompleted` when no trigger fired. Capturing the reason at
     // trigger time keeps a non-monotonic predicate stable: the reason
     // reflects the statistics the trigger actually saw, not a re-evaluation
@@ -2381,7 +2377,7 @@ where
 
     // Ordered admission makes the ever-started set the contiguous prefix
     // `[0, ever_started)`: its length is the `totalCount` the decision
-    // record carries — the number of items ever started, NOT the input
+    // record carries: the number of items ever started, NOT the input
     // length.
     let ever_started = started.iter().rposition(|s| *s).map_or(0, |i| i + 1);
 
@@ -2428,14 +2424,10 @@ where
     Ok(batch_result)
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Replay helpers
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Replays a terminal batch (parent already succeeded/failed in the log).
 ///
 /// Takes the targeted [`crate::engine::TerminalReplaySnapshot`] projection
-/// rather than the full checkpoint record — the status, `replay_children`,
+/// rather than the full checkpoint record: the status, `replay_children`,
 /// and payload/error strings are all this helper reads.
 async fn replay_terminal_batch<O, IS, RS>(
     _ctx: &DurableContext,
@@ -2455,7 +2447,7 @@ where
         CheckpointStatus::Succeeded => {
             if snapshot.replay_children {
                 // ReplayChildren mode: cannot reconstruct from the payload
-                // alone — the caller must fall through to re-execution.
+                // alone: the caller must fall through to re-execution.
                 // Signal this by returning a sentinel error that the caller
                 // catches to continue normal execution.
                 return Err(batch_error(REPLAY_CHILDREN_SENTINEL));
@@ -2465,7 +2457,7 @@ where
                 .result
                 .clone()
                 .ok_or_else(|| batch_error("terminal batch has no result payload"))?;
-            // Reverse the result serdes transform — through the same helper
+            // Reverse the result serdes transform: through the same helper
             // every other path uses.
             let payload: BatchSummary =
                 deserialize_value(payload_str, result_serdes, serdes_ctx.clone()).await?;
@@ -2485,7 +2477,7 @@ where
             Err(batch_error(msg))
         }
         _ => {
-            // Shouldn't happen — we checked is_terminal() above.
+            // Shouldn't happen: we checked is_terminal() above.
             Err(batch_error("unexpected non-terminal status in replay"))
         }
     }
@@ -2550,16 +2542,12 @@ where
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Batch decision record (large-result path)
-// ────────────────────────────────────────────────────────────────────────────
-
 /// The SDK-owned decision record a batch checkpoints in place of a result
 /// payload too large to store inline.
 ///
 /// Mirrors the Python SDK's summary envelope: `totalCount` is the number of
-/// items EVER STARTED — not the input length; ordered admission makes the
-/// started set the contiguous prefix `[0, totalCount)` — `completionReason`
+/// items EVER STARTED, not the input length; ordered admission makes the
+/// started set the contiguous prefix `[0, totalCount)`: `completionReason`
 /// is the wire form of [`CompletionReason`], and one of `startedIndexes` /
 /// `completedIndexes` (whichever is shorter) names the partition of that
 /// prefix: `startedIndexes` lists items that began but were not terminal
@@ -2571,7 +2559,7 @@ where
 /// matching Python: it is the SDK's own bookkeeping, carries no user-typed
 /// values, and must stay readable even when the configured serdes is the
 /// reason the real payload outgrew the checkpoint limit. `replay_children`
-/// on the parent record is the discriminator — a `replay_children` payload
+/// on the parent record is the discriminator: a `replay_children` payload
 /// is a decision record; a plain payload is the serdes-transformed batch
 /// summary.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -2640,7 +2628,7 @@ fn build_decision_record<O>(
 }
 
 /// Serializes a decision record as plain JSON (never through
-/// `result_serdes` — see [`BatchDecisionRecord`]).
+/// `result_serdes`: see [`BatchDecisionRecord`]).
 fn serialize_decision_record(record: &BatchDecisionRecord) -> Result<String, OperationError> {
     serde_json::to_string(record)
         .map_err(|e| batch_error(&format!("serialize batch decision record: {e}")))
@@ -2649,7 +2637,7 @@ fn serialize_decision_record(record: &BatchDecisionRecord) -> Result<String, Ope
 /// Parses a terminal batch's `replay_children` payload as a decision
 /// record.
 ///
-/// `Ok(None)` — an absent or empty payload — means the record predates
+/// `Ok(None)`, an absent or empty payload, means the record predates
 /// decision records (a record-less `replay_children` write from an older
 /// SDK), and the caller falls back to the pre-record re-execution
 /// behaviour. A NON-EMPTY payload on a `replay_children` batch parent can
@@ -2690,7 +2678,7 @@ impl ReplayPlan {
     /// this SDK's writer could not have produced. The writer emits exactly
     /// one index form (the shorter set), every index inside
     /// `[0, totalCount)`, a `totalCount` no larger than the input it ran
-    /// over, and a known completion-reason wire value — so a record that
+    /// over, and a known completion-reason wire value, so a record that
     /// violates any of those is corrupt bookkeeping. Silently repairing it
     /// (clamping, ignoring, defaulting) would convert recorded outcomes
     /// into different ones; failing keeps replay deterministic and safe.
@@ -2758,9 +2746,9 @@ impl ReplayPlan {
 /// batch result directly from the decision record and the child checkpoint
 /// records, without re-running any item body.
 ///
-/// Child IDs are PEEKED, never minted, so a fall-back to re-execution — an
+/// Child IDs are PEEKED, never minted, so a fall-back to re-execution, an
 /// admitted child whose own result was too large to checkpoint inline
-/// surfaces as the `ReplayChildren` sentinel — leaves the parent counter
+/// surfaces as the `ReplayChildren` sentinel, leaves the parent counter
 /// untouched for the re-execution path; the caller advances the counter
 /// only after a successful reconstruction. Items in the started set are
 /// reported as [`BatchItemStatus::Started`] without consulting their child
@@ -2770,7 +2758,7 @@ impl ReplayPlan {
 /// validated against its checkpoint record before its terminal payload is
 /// read, so a handler change that renames or retypes a child raises
 /// `NonDeterministicExecution` here exactly as it does on the re-execution
-/// path. Started-set children are exempt — their records are never
+/// path. Started-set children are exempt: their records are never
 /// consulted at all.
 async fn replay_batch_from_record<O, IS>(
     ctx: &DurableContext,
@@ -2823,15 +2811,11 @@ where
     })
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Checkpoint helpers
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Checkpoints the parent batch as SUCCEEDED with the pre-serialized result.
 ///
 /// When the serialized payload exceeds [`CHECKPOINT_SIZE_LIMIT_BYTES`], the
-/// record is written with `replay_children(true)` and `decision_json` — the
-/// batch decision record — as its payload, so replay can obey the recorded
+/// record is written with `replay_children(true)` and `decision_json`, the
+/// batch decision record, as its payload, so replay can obey the recorded
 /// outcome (`totalCount`, `completionReason`, index set) instead of
 /// re-deriving it by re-execution. A modern terminal batch is NEVER written
 /// without its decision record: should the record itself exceed the limit
@@ -2839,8 +2823,8 @@ where
 /// checkpoint is refused with an error rather than written record-less,
 /// because a record-less write would replay through the unconstrained
 /// re-execution path and could resurrect items the live batch never
-/// started. The refusal is deterministic — replay reaches the same state
-/// and fails the same way — so no false outcome is ever recorded.
+/// started. The refusal is deterministic, replay reaches the same state
+/// and fails the same way, so no false outcome is ever recorded.
 async fn checkpoint_batch_success_serialized(
     ctx: &DurableContext,
     parent_wire: &str,
@@ -2888,7 +2872,7 @@ async fn checkpoint_batch_success_serialized(
         .expect("all required OperationUpdate fields set");
 
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43) — batch parent SUCCEED: the batch's items ran, so
+        // Audit (#43): batch parent SUCCEED: the batch's items ran, so
         // the batch outcome needs a recorded terminal. A permanent
         // rejection persists a small terminal FAIL before the execution
         // fails.
@@ -2957,7 +2941,7 @@ fn build_child_update(
         .expect("all required OperationUpdate fields set")
 }
 
-/// Builds a child-level `FAIL` update carrying `wire` as its error — the
+/// Builds a child-level `FAIL` update carrying `wire` as its error: the
 /// terminal record persisted when the child's own outcome write was
 /// permanently rejected (issue #43).
 fn build_child_fail_update(
@@ -2983,7 +2967,7 @@ fn build_child_fail_update(
         .expect("all required OperationUpdate fields set")
 }
 
-/// Builds a parent-level `FAIL` update carrying `wire` as its error — the
+/// Builds a parent-level `FAIL` update carrying `wire` as its error: the
 /// terminal record persisted when the batch parent's own outcome write
 /// was permanently rejected (issue #43).
 fn build_parent_fail_update(
@@ -3011,16 +2995,12 @@ fn build_parent_fail_update(
         .expect("all required OperationUpdate fields set")
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Completion logic
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Running completion state of one batch coordinator: the settled counts,
 /// the canonical committed prefix the predicate observes, and the first
 /// completion trigger to fire.
 ///
-/// Every settlement — a recorded-terminal child applied inline in input
-/// order, a live join, or a controlled `JoinError` failure — flows through
+/// Every settlement, a recorded-terminal child applied inline in input
+/// order, a live join, or a controlled `JoinError` failure, flows through
 /// [`settle`](Self::settle), so the statistics a completion trigger sees are
 /// updated and evaluated in exactly one place.
 ///
@@ -3032,7 +3012,7 @@ fn build_parent_fail_update(
 /// * **Fixed thresholds** (`min_successful`, the failure tolerances) are
 ///   evaluated on the raw settlement counts, immediately at every settle
 ///   event. They are monotonic in those counts, so whether they fire is a
-///   function of the settled *set*, never of the settlement *order* — a
+///   function of the settled *set*, never of the settlement *order*: a
 ///   threshold that did not fire before a suspension cannot fire while
 ///   replay re-applies the same recorded set. Immediate evaluation
 ///   preserves the pre-predicate semantics: the batch stops the moment the
@@ -3044,8 +3024,8 @@ fn build_parent_fail_update(
 ///   commits only after items `0..i` have all committed). Live settlement
 ///   order is scheduler-timed and is not recorded anywhere, so it cannot be
 ///   reproduced on replay; the committed prefix is derivable from recorded
-///   state alone, which makes the sequence of predicate evaluations — and
-///   therefore its decisions — identical on the original run and on every
+///   state alone, which makes the sequence of predicate evaluations, and
+///   therefore its decisions, identical on the original run and on every
 ///   replay.
 struct CompletionTracker {
     /// Count of items that have succeeded so far (settlement order).
@@ -3092,10 +3072,10 @@ impl CompletionTracker {
 
     /// Applies one settled outcome to the running statistics and, while no
     /// trigger has fired yet, evaluates the completion triggers (first
-    /// trigger wins — once `stop_reason` is set it never changes).
+    /// trigger wins: once `stop_reason` is set it never changes).
     ///
-    /// Within one settle event the check order is fixed — `min_successful`,
-    /// then the failure tolerances, then the custom predicate — matching
+    /// Within one settle event the check order is fixed, `min_successful`,
+    /// then the failure tolerances, then the custom predicate, matching
     /// the precedence the fixed thresholds always had.
     fn settle(
         &mut self,
@@ -3156,7 +3136,7 @@ impl CompletionTracker {
 /// counts, returning the first that fires (or `None`).
 ///
 /// Called after each settled item. Within one settle event the check order
-/// is fixed — `min_successful`, then the failure tolerances — matching the
+/// is fixed, `min_successful`, then the failure tolerances, matching the
 /// precedence the thresholds always had. The custom predicate is evaluated
 /// separately, on the committed prefix (see [`CompletionTracker`]).
 fn evaluate_thresholds(
@@ -3192,7 +3172,7 @@ fn should_stop_failure(
     total_items: usize,
 ) -> bool {
     // Empty config: fail fast. When NO completion criterion is configured
-    // (no thresholds and no predicate — which is also what an absent
+    // (no thresholds and no predicate, which is also what an absent
     // config becomes), a single failure exceeds tolerance, matching the
     // Python and JS SDKs (issue #52). Configuring any criterion opts out
     // of this implicit fail-fast and hands the decision to that criterion.
@@ -3222,16 +3202,12 @@ fn should_stop_failure(
     false
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Serialization helpers
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Serializes a value through the configured serdes (ownership transfers;
 /// the serdes decides where its work runs).
 ///
 /// This is the same boundary every other operation (step, invoke, callback,
-/// child, batch result) uses, and — since the item paths call this helper
-/// too — the same one map/parallel ITEM results use. There is no separate
+/// child, batch result) uses, and, since the item paths call this helper
+/// too, the same one map/parallel ITEM results use. There is no separate
 /// item rule.
 async fn serialize_value<T, S: Serdes<T>>(
     value: T,
@@ -3247,7 +3223,7 @@ async fn serialize_value<T, S: Serdes<T>>(
 /// Deserializes a value through the configured serdes.
 ///
 /// Reverses [`serialize_value`]: the serdes turns the wire payload directly
-/// back into the typed value — no intermediate representation and no
+/// back into the typed value, no intermediate representation and no
 /// runtime downcast.
 async fn deserialize_value<T, S: Serdes<T>>(
     payload: String,
@@ -3314,7 +3290,7 @@ struct BatchCheckpointItem {
 /// The batch result is consumed: each successful item's value transfers by
 /// ownership to `Serdes::serialize` (which lets the serdes move it into a
 /// blocking task without requiring `O: Sync`), and the returned
-/// `BatchResult` carries the values reconstructed from their wire form —
+/// `BatchResult` carries the values reconstructed from their wire form,
 /// so live and replay observe identical values.
 async fn from_batch_result<O, IS>(
     result: BatchResult<O>,
@@ -3443,10 +3419,6 @@ where
     Ok(BatchResult { items, reason })
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Error helper
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Constructs a batch operation error.
 fn batch_error(message: &str) -> OperationError {
     OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
@@ -3456,7 +3428,7 @@ fn batch_error(message: &str) -> OperationError {
 }
 
 /// Wraps owned map inputs in indexed take-once slots shareable across
-/// branch tasks. Each item is MOVED out exactly once by [`take_item`] —
+/// branch tasks. Each item is MOVED out exactly once by [`take_item`],
 /// no `Clone` bound and no serde round-trip (which would reject or mutate
 /// valid serde types that are not JSON-round-trippable).
 fn into_item_slots<I>(items: Vec<I>) -> Arc<Vec<std::sync::Mutex<Option<I>>>> {
@@ -3480,10 +3452,6 @@ fn take_item<I>(items: &[std::sync::Mutex<Option<I>>], index: usize) -> Result<I
     lock.take()
         .ok_or_else(|| batch_error("map item already consumed (concurrent access bug)"))
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[expect(clippy::indexing_slicing)]
@@ -3585,7 +3553,7 @@ mod tests {
     }
 
     /// Parallel branch names must appear on the child START history
-    /// records — the public naming API must not be silently discarded.
+    /// records: the public naming API must not be silently discarded.
     #[tokio::test]
     async fn parallel_branch_names_reach_child_start_updates() {
         use crate::future::Branch;
@@ -3795,7 +3763,7 @@ mod tests {
     /// terminal state on a previous invocation (e.g. it failed while a
     /// sibling suspended), the next invocation reconstructs it from the
     /// checkpoint log via `replay_terminal_child`, and the resulting
-    /// [`BatchItem`] — and the structured error view — must still carry the
+    /// [`BatchItem`], and the structured error view, must still carry the
     /// producing branch's name. The live branch bodies here return values
     /// that CONTRADICT the recorded outcomes, proving the items came from
     /// replay rather than re-execution.
@@ -3814,10 +3782,10 @@ mod tests {
 
         let batch = ctx
             .parallel(vec![
-                // Would SUCCEED if re-executed — the failure below proves
+                // Would SUCCEED if re-executed: the failure below proves
                 // the item was reconstructed from the checkpoint record.
                 Branch::new("boom", |_ctx| async move { Ok(999_i32) }),
-                // Would return 999 if re-executed — the 7 below proves
+                // Would return 999 if re-executed: the 7 below proves
                 // replay.
                 Branch::new("steady", |_ctx| async move { Ok(999_i32) }),
             ])
@@ -3981,8 +3949,8 @@ mod tests {
         );
     }
 
-    /// Issue #52: an EMPTY `CompletionConfig` behaves exactly as no config —
-    /// fail-fast — and `await_batch` reports the batch as ended by
+    /// Issue #52: an EMPTY `CompletionConfig` behaves exactly as no config,
+    /// fail-fast, and `await_batch` reports the batch as ended by
     /// `FAILURE_TOLERANCE_EXCEEDED`, the same reason an explicit
     /// `with_tolerated_failure_count(0)` records.
     #[tokio::test]
@@ -4021,7 +3989,7 @@ mod tests {
     }
 
     /// Parity: `map` and `parallel` `await_batch` must agree on the batch
-    /// shape for equivalent workloads — same completion reason, same
+    /// shape for equivalent workloads: same completion reason, same
     /// per-index statuses, values, counts, and overall status string.
     #[tokio::test]
     async fn map_and_parallel_await_batch_agree_on_shape() {
@@ -4087,7 +4055,7 @@ mod tests {
 
     // Compile-level proof that map items and parallel branches accept any
     // `IntoIterator` (array, Vec, lazy iterator) and that closures are plain
-    // `async move` bodies using `?` — no manual `Box::pin`, no error
+    // `async move` bodies using `?`, no manual `Box::pin`, no error
     // conversion. Builders are constructed (type-checking the closures) then
     // dropped without awaiting, so no execution client is required.
     #[tokio::test]
@@ -4268,7 +4236,7 @@ mod tests {
         );
     }
 
-    /// Issue #52: an EMPTY config (no threshold, no predicate — which is
+    /// Issue #52: an EMPTY config (no threshold, no predicate, which is
     /// also what an absent config becomes) fails fast on the first failure,
     /// matching the Python and JS SDKs.
     #[tokio::test]
@@ -4285,11 +4253,11 @@ mod tests {
     }
 
     /// Issue #52: configuring ANY criterion opts out of the implicit
-    /// fail-fast — a min_successful-only or predicate-only config tolerates
+    /// fail-fast: a min_successful-only or predicate-only config tolerates
     /// failures and lets its own criterion drive completion.
     #[tokio::test]
     async fn any_configured_criterion_disables_implicit_fail_fast() {
-        // min_successful only: failures are tolerated (Python parity —
+        // min_successful only: failures are tolerated (Python parity:
         // has_criteria is true, and no failure tolerance is configured).
         let min_only = crate::builders::map_parallel::CompletionConfig::with_min_successful(2);
         assert!(
@@ -4308,7 +4276,7 @@ mod tests {
             "a predicate-only config must tolerate failures"
         );
 
-        // pct=100: the tolerate-all recipe — the failure rate can never
+        // pct=100: the tolerate-all recipe: the failure rate can never
         // strictly exceed 100%.
         let tolerate_all =
             crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(100);
@@ -4394,7 +4362,7 @@ mod tests {
     #[tokio::test]
     async fn completion_config_validate_mutual_exclusivity() {
         // Having both min_successful and tolerated_failure_count is valid
-        // (Go/JS allow it — first threshold fires). No error.
+        // (Go/JS allow it: first threshold fires). No error.
         let cfg = crate::builders::map_parallel::CompletionConfig::builder()
             .min_successful(2)
             .tolerated_failure_count(1)
@@ -4404,8 +4372,8 @@ mod tests {
     }
 
     /// Within one settle event the tracker checks the triggers in a fixed
-    /// order — `min_successful`, then the failure tolerances, then the
-    /// custom predicate — so when several would fire at once the fixed
+    /// order, `min_successful`, then the failure tolerances, then the
+    /// custom predicate, so when several would fire at once the fixed
     /// thresholds keep the precedence they always had.
     #[test]
     fn completion_tracker_orders_triggers_within_one_event() {
@@ -4467,7 +4435,7 @@ mod tests {
     /// The custom predicate observes only the committed prefix: outcomes
     /// commit strictly in input order, so an item that settles ahead of an
     /// earlier, still-unsettled item stays out of the statistics until the
-    /// earlier item settles — whatever the live settlement order was. This
+    /// earlier item settles: whatever the live settlement order was. This
     /// is the property that makes predicate decisions reproducible from
     /// recorded state alone.
     #[test]
@@ -4575,7 +4543,7 @@ mod tests {
     }
 
     /// The predicate receives the per-item settled outcomes, so it can key
-    /// off WHICH item settled and how — not just the counts.
+    /// off WHICH item settled and how, not just the counts.
     #[tokio::test]
     async fn completion_predicate_observes_settled_outcomes() {
         let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
@@ -4668,8 +4636,8 @@ mod tests {
     /// Zero-item batches keep their pre-predicate behavior: the empty
     /// collection short-circuits before the coordinator loop and records
     /// `ALL_COMPLETED`, whatever completion thresholds or predicate are
-    /// configured. (`min_successful(0)` means "no minimum" — the trigger
-    /// only arms for `min > 0` — so it never rewrote the reason before the
+    /// configured. (`min_successful(0)` means "no minimum", the trigger
+    /// only arms for `min > 0`, so it never rewrote the reason before the
     /// predicate feature either, and the predicate is never consulted when
     /// nothing settles.)
     #[tokio::test]
@@ -4705,7 +4673,7 @@ mod tests {
         );
     }
 
-    // ── Gap 1: BatchResult/BatchItem public API tests ───────────────────
+    // Gap 1: BatchResult/BatchItem public API tests
 
     #[test]
     fn batch_item_new_constructs_correctly() {
@@ -5063,7 +5031,7 @@ mod tests {
         assert_eq!(errors[0].error_type, Some(CHILD_FN_ERROR_TYPE));
     }
 
-    // ── Gap 3: NestingMode tests ────────────────────────────────────────
+    // Gap 3: NestingMode tests
 
     #[test]
     fn nesting_mode_default_is_normal() {
@@ -5075,7 +5043,7 @@ mod tests {
         assert_ne!(NestingMode::Flat, NestingMode::Normal);
     }
 
-    // ── Gap 5: Completion reason wire strings ───────────────────────────
+    // Gap 5: Completion reason wire strings
 
     #[test]
     fn completion_reason_as_str_values() {
@@ -5090,7 +5058,7 @@ mod tests {
         );
     }
 
-    // ── Bug 1: Early-stopping race — stopped re-check after acquire ────
+    // Bug 1: Early-stopping race: stopped re-check after acquire
 
     #[tokio::test]
     async fn early_stop_recheck_after_semaphore_acquire() {
@@ -5135,7 +5103,7 @@ mod tests {
         );
     }
 
-    // ── Bug 3: FLAT nesting ParentId points to batch parent ────────────
+    // Bug 3: FLAT nesting ParentId points to batch parent
 
     #[test]
     fn flat_child_context_reports_batch_parent_wire_id() {
@@ -5157,7 +5125,7 @@ mod tests {
         );
     }
 
-    // ── Bug 4: Suspension propagation (no ContextFailed checkpoint) ─────
+    // Bug 4: Suspension propagation (no ContextFailed checkpoint)
 
     #[test]
     fn suspension_signal_detected_prevents_false_failure() {
@@ -5180,7 +5148,7 @@ mod tests {
         );
     }
 
-    // ── Bug 5: max_concurrency=0 validation error ──────────────────────
+    // Bug 5: max_concurrency=0 validation error
 
     #[tokio::test]
     async fn max_concurrency_zero_returns_validation_error() {
@@ -5217,10 +5185,10 @@ mod tests {
         );
     }
 
-    // ── Checkpoint serialization tests ──────────────────────────────────
+    // Checkpoint serialization tests
 
     /// A token-validating execution client that rejects checkpoint calls
-    /// with stale tokens — simulating the service's actual behavior.
+    /// with stale tokens: simulating the service's actual behavior.
     /// Used to verify that concurrent callers are properly serialized.
     #[derive(Debug)]
     struct TokenValidatingClient {
@@ -5287,7 +5255,7 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
 
                 if *current != submitted_token {
-                    // Stale token — the real service would return an error.
+                    // Stale token: the real service would return an error.
                     let mut stale = self
                         .stale_token_count
                         .lock()
@@ -5404,7 +5372,7 @@ mod tests {
         //
         // With serialization, the parent's succeed checkpoint waits for
         // any in-flight child checkpoints to complete, then uses the
-        // latest token — ensuring it succeeds.
+        // latest token: ensuring it succeeds.
         let client = Arc::new(TokenValidatingClient::new("initial-token"));
         let log = Arc::new(CheckpointLog::empty());
         let ctx = DurableContext::new_root_with_client(
@@ -5436,7 +5404,7 @@ mod tests {
             )
             .await;
 
-        // The public API propagates failures as errors — that's correct
+        // The public API propagates failures as errors: that's correct
         // behavior. The key assertion is that no stale-token conflicts
         // occurred during the batch execution.
         assert!(
@@ -5551,8 +5519,8 @@ mod tests {
         // A child recorded as terminal SUCCESS with `replay_children = true`
         // is re-executed on replay to reconstruct its oversized result. If
         // that reconstruction panics, the panic must unwind the coordinator
-        // with the original payload — preserving the recorded success
-        // history for the next attempt — NOT be graded as a branch failure
+        // with the original payload, preserving the recorded success
+        // history for the next attempt, NOT be graded as a branch failure
         // with a child FAIL checkpoint, which would overwrite durable
         // success and permanently fail the batch over a transient crash.
         let log = CheckpointLog::from_records(vec![replay_children_success_record("2")]);
@@ -5671,11 +5639,11 @@ mod tests {
         );
     }
 
-    // ── Serialization-model equivalence tests ───────────────────────────
+    // Serialization-model equivalence tests
     //
     // These prove the point of the normalization: ONE `Serdes`
-    // implementation — one that implements only the JSON-string transform
-    // methods — behaves identically as a map item serdes, a parallel item
+    // implementation, one that implements only the JSON-string transform
+    // methods, behaves identically as a map item serdes, a parallel item
     // serdes, and a step serdes. Before the normalization, map/parallel item
     // results went through a separate mandatory byte API plus a runtime
     // downcast, so a serdes like this one could not even be written.
@@ -5724,7 +5692,7 @@ mod tests {
             "the probe wire form must be unparseable by plain serde_json"
         );
 
-        // ── step ──
+        // step
         let (step_ctx, step_client) = test_ctx_with_client(CheckpointLog::empty());
         let step_doc = doc.clone();
         let step_out: Doc = step_ctx
@@ -5744,7 +5712,7 @@ mod tests {
             .collect();
         assert_eq!(step_wire, vec![expected_wire.clone()]);
 
-        // ── map items ──
+        // map items
         let (map_ctx, map_client) = test_ctx_with_client(CheckpointLog::empty());
         let map_doc = doc.clone();
         let map_out: Vec<Doc> = map_ctx
@@ -5762,7 +5730,7 @@ mod tests {
             "a map item must produce the same wire form as a step"
         );
 
-        // ── parallel branches ──
+        // parallel branches
         let (par_ctx, par_client) = test_ctx_with_client(CheckpointLog::empty());
         let par_doc = doc.clone();
         let par_out: Vec<Doc> = par_ctx
@@ -5789,11 +5757,11 @@ mod tests {
     /// quoting divergence between items (`X`) and everything else (`"X"`)
     /// survived all the way to conformance case 9-14.
     ///
-    /// The probe payload is a bare `String` — the one case where the old split
-    /// was visible — and the fixture's wire form is deliberately NOT JSON, so
+    /// The probe payload is a bare `String`, the one case where the old split
+    /// was visible, and the fixture's wire form is deliberately NOT JSON, so
     /// a path that bypassed the serdes would fail rather than quietly pass.
     #[tokio::test]
-    #[expect(clippy::too_many_lines)] // reason: one test per path is the point — splitting it would let the paths drift apart again
+    #[expect(clippy::too_many_lines)] // reason: one test per path is the point; splitting it would let the paths drift apart again
     async fn custom_serdes_receives_the_same_value_shape_on_every_path() {
         use crate::future::Branch;
         use crate::serdes::test_support::{RecordingSerdes, hex_envelope_of};
@@ -5812,7 +5780,7 @@ mod tests {
              path that skipped the transform cannot pass by accident"
         );
 
-        // ── step ──
+        // step
         let step_rec = RecordingSerdes::new();
         let (step_ctx, step_client) = test_ctx_with_client(CheckpointLog::empty());
         let step_value = value.clone();
@@ -5838,7 +5806,7 @@ mod tests {
             .collect();
         assert_eq!(step_wire, vec![wire.clone()]);
 
-        // ── invoke payload ──
+        // invoke payload
         let invoke_rec = RecordingSerdes::new();
         let (invoke_ctx, _invoke_client) = test_ctx_with_client(CheckpointLog::empty());
         let signal = Arc::clone(invoke_ctx.suspension_signal());
@@ -5853,10 +5821,10 @@ mod tests {
             "an invoke payload serdes must be handed the same value shape as a step"
         );
 
-        // ── callback (deserialize-only path) ──
+        // callback (deserialize-only path)
         //
         // Callbacks have no serialize side (an external caller writes the
-        // payload), and `deserialize_callback_result` IS the whole boundary —
+        // payload), and `deserialize_callback_result` IS the whole boundary:
         // it is the only place the callback replay path consults a serdes. It
         // is fed the EXACT wire form the step path wrote above, so this asserts
         // the two paths agree on the reconstructed shape.
@@ -5877,7 +5845,7 @@ mod tests {
              path handed the serdes"
         );
 
-        // ── map items ──
+        // map items
         //
         // The item serdes is consulted twice per item: once for the child's own
         // checkpoint and once when the item is embedded in the batch summary.
@@ -5907,7 +5875,7 @@ mod tests {
              shape, got {map_inputs:?}"
         );
 
-        // ── parallel branches ──
+        // parallel branches
         let par_rec = RecordingSerdes::new();
         let (par_ctx, _par_client) = test_ctx_with_client(CheckpointLog::empty());
         let par_value = value.clone();
@@ -5926,10 +5894,10 @@ mod tests {
             "a parallel branch serdes must be handed the same value shape"
         );
 
-        // ── whole batch result ──
+        // whole batch result
         //
         // The batch-result serdes is handed the batch summary, so its value
-        // differs by nature — but it must arrive through the SAME boundary: a
+        // differs by nature, but it must arrive through the SAME boundary: a
         // `serde_json::Value`, not pre-rendered text.
         let batch_rec = RecordingSerdes::new();
         let (batch_ctx, _batch_client) = test_ctx_with_client(CheckpointLog::empty());
@@ -5958,7 +5926,7 @@ mod tests {
         );
         // Each item is embedded in the summary as its own wire string (here the
         // plain-`serde_json` default, since no item serdes is attached), so the
-        // batch serdes sees structure — not one flat pre-rendered blob.
+        // batch serdes sees structure, not one flat pre-rendered blob.
         assert_eq!(
             summary
                 .get("results")
@@ -6142,7 +6110,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // ── Issue #36: ordered lazy admission + batch decision record ──────────
+    // Issue #36: ordered lazy admission + batch decision record
 
     /// Splits the recorded updates into child starts seen BEFORE the first
     /// child terminal write and the total child start count. A child update
@@ -6174,7 +6142,7 @@ mod tests {
     /// Acceptance (issue #36): a batch larger than the concurrency limit
     /// issues no child `Start` checkpoint before its first item runs.
     /// Ordered lazy admission writes each `Start` at dispatch, so at most
-    /// `concurrency` starts can exist before the first item outcome — never
+    /// `concurrency` starts can exist before the first item outcome: never
     /// the whole batch.
     #[tokio::test]
     async fn batch_larger_than_concurrency_issues_no_start_before_first_item_runs() {
@@ -6213,8 +6181,8 @@ mod tests {
     }
 
     /// A batch whose serialized result exceeds the checkpoint size limit
-    /// records the decision record — `totalCount`, `completionReason`, and
-    /// the shorter index set — as the `replay_children` payload, instead of
+    /// records the decision record, `totalCount`, `completionReason`, and
+    /// the shorter index set, as the `replay_children` payload, instead of
     /// no payload at all.
     #[tokio::test]
     async fn large_batch_result_checkpoints_decision_record() {
@@ -6347,7 +6315,7 @@ mod tests {
     /// Acceptance (issue #36): a batch that stopped on a completion
     /// threshold, replayed on the large-result path, reproduces the live
     /// item statuses and reason from the decision record without re-running
-    /// unstarted items (or any item body at all — completed items decode
+    /// unstarted items (or any item body at all: completed items decode
     /// from their child records).
     #[tokio::test]
     async fn replay_of_threshold_stopped_large_batch_obeys_decision_record() {
@@ -6469,7 +6437,7 @@ mod tests {
     /// COMPLETED. Started-set and never-started indexes here hold records
     /// with a hostile identity (`op_type: Step`) that would raise
     /// `NonDeterministicExecution` if the concurrent pre-claim loop read
-    /// them — as it did before this fix.
+    /// them: as it did before this fix.
     #[tokio::test]
     async fn plan_constrained_fallback_reads_only_admitted_child_checkpoints() {
         // A record whose stored identity can never match a batch child's
@@ -6542,8 +6510,8 @@ mod tests {
         assert_eq!(batch.results(), vec!["a", "c"]);
     }
 
-    /// A record-less `replay_children` payload — written before decision
-    /// records existed — falls back to today's behaviour: re-execution,
+    /// A record-less `replay_children` payload, written before decision
+    /// records existed, falls back to today's behaviour: re-execution,
     /// which replays each recorded-terminal child from its own record.
     #[tokio::test]
     async fn record_less_replay_children_payload_falls_back_to_reexecution() {
@@ -6576,7 +6544,7 @@ mod tests {
             succeeded_record("3", "\"world\""),
         ]);
         // Re-execution re-checkpoints the parent, so a live client is
-        // needed — exactly as before decision records existed.
+        // needed, exactly as before decision records existed.
         let (ctx, _client) = test_ctx_with_client(log);
 
         let result: Vec<String> = ctx
@@ -6754,7 +6722,7 @@ mod tests {
         let err = ReplayPlan::from_record(&record, 10).expect_err("neither index form");
         assert!(crate::error::chain_string(&err).contains("neither startedIndexes"));
 
-        // Index outside [0, totalCount) — in either form.
+        // Index outside [0, totalCount): in either form.
         let mut record = base();
         record.started_indexes = Some(vec![3]);
         let err = ReplayPlan::from_record(&record, 10).expect_err("started index out of range");

@@ -4,7 +4,7 @@
 //! it inline fails the checkpoint. [`FileSystemSerdes`] in
 //! [`Overflow`](aws_durable_execution_sdk_rust::serdes::FileSystemSerdesMode::Overflow)
 //! mode stores small values inline but spills anything over the threshold to a
-//! file, checkpointing only a lightweight file-pointer envelope — so a large
+//! file, checkpointing only a lightweight file-pointer envelope, so a large
 //! result round-trips where an inline one would fail.
 //!
 //! # Durable storage requirement

@@ -17,7 +17,7 @@ async fn handler(
 
     // Catch the error.
     if let Err(_e) = step_result {
-        // Error caught — continue with fallback.
+        // Error caught: continue with fallback.
     }
 
     // Second step: fallback.

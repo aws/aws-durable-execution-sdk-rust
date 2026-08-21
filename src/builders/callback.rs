@@ -4,6 +4,9 @@
 //! and
 //! [`DurableContext::wait_for_callback`](crate::DurableContext::wait_for_callback),
 //! plus the [`Callback`] handle the create-callback operation resolves to.
+//!
+//! The [callback operation guide](https://docs.aws.amazon.com/durable-execution/sdk-reference/operations/callback/)
+//! describes these operations independently of any language SDK.
 
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
@@ -20,10 +23,6 @@ use crate::future::DurableFuture;
 use crate::serdes::JsonSerdes;
 
 pub use crate::future::Callback;
-
-// ============================================================
-// CreateCallbackBuilder
-// ============================================================
 
 /// Builder for creating a callback token.
 ///
@@ -111,9 +110,9 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     ///
     /// The callback payload is produced by an external caller through the
     /// callback-completion API, so the SDK never serializes a value on the
-    /// way out — only the deserialize half of this serdes acts on the
+    /// way out: only the deserialize half of this serdes acts on the
     /// delivered payload when the result is read. The serdes must implement
-    /// [`Serdes<O>`](crate::Serdes) for this callback's payload type —
+    /// [`Serdes<O>`](crate::Serdes) for this callback's payload type:
     /// attaching a serdes for a different type fails at compile time. The
     /// default is [`JsonSerdes`].
     pub fn serdes<S2>(self, serdes: S2) -> CreateCallbackBuilder<O, S2>
@@ -131,7 +130,14 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
         }
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
+    ///
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<Callback<O>>
     where
         S: Serdes<O>,
@@ -140,6 +146,14 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     }
 
     /// Eagerly spawns the callback creation on a tokio task.
+    ///
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     pub fn spawn(self) -> DurableFuture<Callback<O>>
     where
         S: Serdes<O>,
@@ -163,7 +177,7 @@ where
 
         // Deliberately NOT rebound onto a fresh scope (no `rebind_lazy_scope!`
         // here, unlike every other lazy terminal): registering a callback
-        // never parks, so there is nothing to isolate — and the returned
+        // never parks, so there is nothing to isolate, and the returned
         // [`Callback`](crate::builders::callback::Callback) stores this
         // context for its `result()` future, which must park a scope that is
         // still being driven when it is awaited. `Callback::result()` does
@@ -182,20 +196,14 @@ where
     }
 }
 
-// ============================================================
-// WaitForCallbackBuilder
-// ============================================================
-
 /// Builder for a combined callback creation + wait operation.
 ///
 /// Created by [`DurableContext::wait_for_callback`]. Registers the callback
 /// and waits for completion in one step.
 ///
 /// The builder is generic over the submitter closure `F` and its future
-/// `Fut` so the submitter is stored **without type erasure**; both
-/// parameters are inferred at the call site and never written by users.
-/// The single erasure point is `.future()` / `.await`, which produces the
-/// one [`DurableFuture`] box.
+/// `Fut`; both parameters are inferred at the call site and never written
+/// by users.
 ///
 /// # Examples
 ///
@@ -280,10 +288,11 @@ where
 
     /// Sets the retry strategy for the submitter step.
     ///
-    /// Controls how many times the submitter is retried on failure before
-    /// the operation is abandoned. If not set, the SDK default retry
-    /// strategy is used (exponential backoff, 6 attempts). The SDK boxes the
-    /// closure internally — no `Box::new` at the call site.
+    /// On each failure the strategy receives the
+    /// [`StepError`](crate::StepError) and the attempt number that just
+    /// failed (attempt numbers start at 1), and returns a
+    /// [`RetryDecision`](crate::RetryDecision). If not set, the SDK default
+    /// retry strategy is used (exponential backoff, 6 attempts).
     ///
     /// # Examples
     ///
@@ -320,8 +329,8 @@ where
     /// Sets the submitter retry strategy from a
     /// [`RetryStrategyConfig`](crate::builders::RetryStrategyConfig).
     ///
-    /// Use this for the common case — shaping retry delays (attempt count,
-    /// initial delay, cap, backoff rate, jitter) — without hand-writing a
+    /// Use this for the common case, shaping retry delays (attempt count,
+    /// initial delay, cap, backoff rate, jitter), without hand-writing a
     /// closure. For decisions a delay schedule cannot express, such as
     /// inspecting the error, use [`submitter_retry`](Self::submitter_retry)
     /// instead.
@@ -374,9 +383,9 @@ where
     ///
     /// The callback payload is produced by an external caller through the
     /// callback-completion API, so the SDK never serializes a value on the
-    /// way out — only the deserialize half of this serdes acts on the
+    /// way out: only the deserialize half of this serdes acts on the
     /// delivered payload. The serdes must implement
-    /// [`Serdes<O>`](crate::Serdes) for this callback's payload type —
+    /// [`Serdes<O>`](crate::Serdes) for this callback's payload type:
     /// attaching a serdes for a different type fails at compile time. The
     /// default is [`JsonSerdes`].
     pub fn serdes<S2>(self, serdes: S2) -> WaitForCallbackBuilder<O, F, Fut, S2>
@@ -404,12 +413,27 @@ where
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
+    ///
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<O> {
         self.into_future()
     }
 
     /// Eagerly spawns the operation on a tokio task.
+    ///
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     pub fn spawn(self) -> DurableFuture<O> {
         spawn_terminal!(self)
     }

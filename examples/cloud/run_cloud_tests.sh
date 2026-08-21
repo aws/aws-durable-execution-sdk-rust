@@ -51,7 +51,7 @@ CALLBACK_INVOKE_TIMEOUT=180
 DEFAULT_PAYLOAD='"cloud-test"'
 CALLBACK_RESULT='"approved by cloud test"'
 
-# ---- expectations table -------------------------------------------------
+# Expectations table
 #
 # family|example|expected_terminal_status|payload_override|drive|allowed_results
 #
@@ -124,7 +124,7 @@ external|wait_for_callback_timeout|SUCCEEDED|||
 external|wait_for_condition|SUCCEEDED|2||
 '
 
-# ---- helpers ------------------------------------------------------------
+# Helpers
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
@@ -258,7 +258,7 @@ discover_execution_arn() {
     done
 }
 
-# ---- phase 1: invoke every example (and drive its callback if needed) ----
+# Phase 1: invoke every example (and drive its callback if needed)
 #
 # An invoke returns once the execution reaches a terminal state or parks on a
 # timer, so most examples are started here and polled to their terminal state
@@ -338,7 +338,7 @@ echo "$EXPECTATIONS" | grep -v '^[[:space:]]*$' | while IFS='|' read -r family e
     log "$example: started ($arn)"
 done
 
-# ---- phase 2: poll every execution to its terminal state -----------------
+# Phase 2: poll every execution to its terminal state
 
 if [ -f "$WORK_DIR/pending" ]; then
     while IFS='|' read -r example expected arn allowed_results; do
@@ -379,7 +379,7 @@ if [ -f "$WORK_DIR/pending" ]; then
     done < "$WORK_DIR/pending"
 fi
 
-# ---- report ---------------------------------------------------------------
+# Report
 
 total=$(echo "$EXPECTATIONS" | grep -c '|' || true)
 if [ -f "$WORK_DIR/failures" ]; then

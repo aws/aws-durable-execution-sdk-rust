@@ -10,7 +10,7 @@
 //! Serdes are configured **per operation**: every serdes-bearing builder
 //! carries its serdes implementation as a generic type parameter defaulting
 //! to [`JsonSerdes`], and its `.serdes(...)` method swaps that parameter.
-//! There is no execution-wide serdes slot — a single trait-object slot
+//! There is no execution-wide serdes slot: a single trait-object slot
 //! cannot represent `Serdes<T>` for every operation output type without
 //! erasing the value again. To share one instance across a handler, create
 //! an `Arc<S>` and clone it into each operation; `Arc<S>` forwards to `S`
@@ -19,7 +19,7 @@
 //! # Scheduling contract
 //!
 //! The SDK awaits the future a serdes returns **directly on the executor
-//! thread** — it never wraps the call in another blocking task. Each
+//! thread**: it never wraps the call in another blocking task. Each
 //! implementation therefore decides where its work runs:
 //!
 //! - [`JsonSerdes`] (and other cheap in-memory codecs) perform their work
@@ -30,7 +30,7 @@
 //!
 //! Custom implementations must follow the same rule: do not perform
 //! blocking filesystem calls or long-running synchronous work on the
-//! executor thread — move that work into a blocking task instead.
+//! executor thread: move that work into a blocking task instead.
 //!
 //! [`FileSystemSerdes`] stores values on a durable filesystem (EFS or S3
 //! Files mounted to Lambda), keeping checkpoint payloads small regardless
@@ -48,7 +48,7 @@ use crate::BoxError;
 /// Implement this trait to provide custom serialization formats for
 /// operation values. The trait is generic over `T`, the operation's actual
 /// Rust type: `serialize` receives the owned value and `deserialize`
-/// returns it, so a custom format sees the real type — struct field
+/// returns it, so a custom format sees the real type: struct field
 /// declaration order, `i128` values outside the `i64`/`u64` ranges, and
 /// anything else a lossy intermediate representation would drop.
 ///
@@ -74,7 +74,7 @@ use crate::BoxError;
 /// # Type pairing
 ///
 /// A type-specific format implements `Serdes<ConcreteType>` directly and
-/// can only be attached to an operation producing that type — attaching it
+/// can only be attached to an operation producing that type: attaching it
 /// elsewhere fails at compile time. A type-agnostic format (a wire-format
 /// swap such as CBOR, or storage indirection such as
 /// [`FileSystemSerdes`]) implements `Serdes<T>` for all supported `T`
@@ -242,10 +242,6 @@ where
     }
 }
 
-// ============================================================
-// JsonSerdes
-// ============================================================
-
 /// The default serdes: compact JSON via `serde_json`.
 ///
 /// Implements [`Serdes<T>`] for every `T` that is `Serialize +
@@ -253,7 +249,7 @@ where
 /// `.serdes(...)` needs no configuration and no type annotation.
 ///
 /// Serialization and deserialization run **inline** in the returned
-/// future — an in-memory JSON transform is cheap, so it pays no
+/// future: an in-memory JSON transform is cheap, so it pays no
 /// `spawn_blocking` scheduling hop.
 ///
 /// # Examples
@@ -275,7 +271,7 @@ where
 // user code (`JsonSerdes.serialize(...)`, `.serdes(JsonSerdes)`) and the
 // default for every builder's serdes type parameter. The attribute would
 // remove that bare-name construction path, and the type's whole contract is
-// to carry no configuration — a configurable JSON serdes would be a new
+// to carry no configuration: a configurable JSON serdes would be a new
 // type, not a field here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JsonSerdes;
@@ -301,18 +297,14 @@ where
     }
 }
 
-// ============================================================
-// SerdesContext
-// ============================================================
-
 /// Where the wire string handed to [`Serdes::deserialize`] came from.
 ///
 /// An SDK-written record is a payload a previous [`Serdes::serialize`]
 /// call produced and the SDK checkpointed. An external payload was
 /// delivered by a caller outside the execution (a callback completion)
 /// and never went through the SDK's serialize path, so storage
-/// indirection recorded in it — such as a [`FileSystemSerdes`] file
-/// reference — must not be honored.
+/// indirection recorded in it, such as a [`FileSystemSerdes`] file
+/// reference, must not be honored.
 ///
 /// # Examples
 ///
@@ -406,10 +398,6 @@ impl SerdesContext {
         self
     }
 }
-
-// ============================================================
-// FileSystemSerdes
-// ============================================================
 
 /// Controls when data is written to the filesystem.
 ///
@@ -574,9 +562,9 @@ impl FileSystemSerdesConfigBuilder {
 /// # Blocking I/O and Tokio runtime requirement
 ///
 /// Each [`serialize`](Serdes::serialize) or [`deserialize`](Serdes::deserialize)
-/// call moves its **entire** implementation — JSON rendering or parsing,
+/// call moves its **entire** implementation, JSON rendering or parsing,
 /// hashing, path validation and canonicalization, directory creation, and
-/// the file read or write — into one [`tokio::task::spawn_blocking`] task,
+/// the file read or write, into one [`tokio::task::spawn_blocking`] task,
 /// so no blocking filesystem operation ever runs on the executor thread
 /// and each call pays exactly one blocking-pool hop. Related filesystem
 /// operations are deliberately batched into that single task rather than
@@ -595,9 +583,9 @@ impl FileSystemSerdesConfigBuilder {
 /// `"__aws_durable_serdes"` marker, one of:
 ///
 /// - `{"__aws_durable_serdes":{"version":1,"kind":"inline"},"value":<JSON>}`
-///   — value stored inline (OVERFLOW mode, under threshold)
+///   stores the value inline (OVERFLOW mode, under threshold)
 /// - `{"__aws_durable_serdes":{"version":1,"kind":"file"},"file":"<relative path>"}`
-///   — value stored in a file under `base_path`
+///   stores the value in a file under `base_path`
 ///
 /// The marker key is reserved, so an inline value that itself contains a
 /// `"file"` key can never be misread as a file reference. Envelopes
@@ -609,7 +597,7 @@ impl FileSystemSerdesConfigBuilder {
 /// Every `serialize` call writes a **new, unique** file (staged to a
 /// temporary name and atomically renamed into place), so a retried
 /// attempt never mutates a file that an already-accepted checkpoint
-/// references — committed history stays immutable, and a failed
+/// references: committed history stays immutable, and a failed
 /// checkpoint leaves prior files untouched. The checkpoint repoints to
 /// the new file only when the checkpoint itself succeeds.
 ///
@@ -689,7 +677,7 @@ impl FileSystemSerdes {
 
     /// Serializes a value to the filesystem envelope format (synchronous).
     ///
-    /// This is the complete serialization path — JSON rendering, path
+    /// This is the complete serialization path: JSON rendering, path
     /// resolution, directory creation, and the file write. The
     /// [`Serdes`] implementation runs it inside one
     /// [`tokio::task::spawn_blocking`] task.
@@ -729,12 +717,12 @@ impl FileSystemSerdes {
 
     /// Deserializes from the filesystem envelope format (synchronous).
     ///
-    /// This is the complete deserialization path — envelope parsing, the
+    /// This is the complete deserialization path: envelope parsing, the
     /// file read, and JSON parsing into `T`. The [`Serdes`] implementation
     /// runs it inside one [`tokio::task::spawn_blocking`] task.
     ///
     /// An externally delivered payload ([`PayloadOrigin::External`]) is
-    /// parsed directly as `T` — it never went through
+    /// parsed directly as `T`: it never went through
     /// [`serialize_sync`](Self::serialize_sync), so it carries no envelope
     /// and can never name a file to read. SDK-written records are parsed
     /// as envelopes; their file references are resolved strictly under
@@ -946,9 +934,9 @@ impl FileSystemSerdes {
     /// directory and atomically published into place with no-clobber
     /// semantics, so no reader ever observes a partially written file and
     /// no writer ever replaces an existing one. Every call produces a
-    /// distinct file name — even across Lambda execution environments
+    /// distinct file name, even across Lambda execution environments
     /// sharing the same EFS or S3 Files mount, where PIDs, counters, and
-    /// clock readings can coincide — so a retried attempt never overwrites
+    /// clock readings can coincide, so a retried attempt never overwrites
     /// a file that an already-accepted checkpoint references. The
     /// checkpoint repoints to the new file only if the checkpoint itself
     /// succeeds, and a failed checkpoint leaves prior files untouched.
@@ -1072,8 +1060,8 @@ impl FileSystemSerdes {
 /// The engine calls [`Serdes::serialize`] and [`Serdes::deserialize`] at
 /// every serialization point, passing a [`SerdesContext`] with the
 /// operation's wire ID and execution ARN for deterministic file-path
-/// resolution. Each call moves the complete synchronous path — including
-/// JSON rendering or parsing — into a single
+/// resolution. Each call moves the complete synchronous path, including
+/// JSON rendering or parsing, into a single
 /// [`tokio::task::spawn_blocking`] task, so the executor thread never
 /// touches the filesystem. Blocking-task join failures are mapped to
 /// [`BoxError`].
@@ -1115,10 +1103,6 @@ where
         }
     }
 }
-
-// ============================================================
-// Error type for FileSystemSerdes
-// ============================================================
 
 /// Error from filesystem serialization/deserialization operations.
 ///
@@ -1187,10 +1171,6 @@ impl std::error::Error for FileSystemSerdesError {
     }
 }
 
-// ============================================================
-// Helper functions
-// ============================================================
-
 /// The envelope version this SDK writes and reads.
 const ENVELOPE_VERSION: u64 = 1;
 
@@ -1215,7 +1195,7 @@ fn file_envelope(relative_path: &str) -> String {
 /// nanoseconds, the process ID, and a per-process counter.
 ///
 /// Uniqueness of the payload file name is what makes committed files
-/// immutable — no later `serialize` call can target the same path.
+/// immutable, no later `serialize` call can target the same path.
 /// Upper bound on candidate-name collisions tolerated when publishing a
 /// payload file. Each retry draws a fresh candidate name, so in practice
 /// one retry resolves a collision; the bound only guards against a broken
@@ -1234,7 +1214,7 @@ const MAX_PUBLISH_ATTEMPTS: u32 = 16;
 /// - the staging file is opened with `create_new`, so a colliding staging
 ///   path fails instead of truncating another writer's bytes in flight;
 /// - the finished staging file is published via [`std::fs::hard_link`],
-///   which — unlike `rename` — fails with `AlreadyExists` rather than
+///   which, unlike `rename`, fails with `AlreadyExists` rather than
 ///   replacing an existing destination.
 ///
 /// On either collision the attempt is discarded and retried with a fresh
@@ -1362,7 +1342,7 @@ fn percent_encode(input: &str) -> String {
 /// Encodes a path segment using the specified encoding.
 ///
 /// For [`FileSystemPathEncoding::Uri`], this additionally ensures that the
-/// result is never `.` or `..` — those survive standard percent-encoding
+/// result is never `.` or `..`: those survive standard percent-encoding
 /// because `.` is in the unreserved set, but they form traversal components
 /// when used as path segments.
 fn encode_segment(value: &str, encoding: FileSystemPathEncoding) -> String {
@@ -1371,7 +1351,7 @@ fn encode_segment(value: &str, encoding: FileSystemPathEncoding) -> String {
         FileSystemPathEncoding::Uri => {
             let encoded = percent_encode(value);
             // A segment that resolves to "." or ".." is unsafe as a directory
-            // component — encode the leading dot to neutralize it.
+            // component: encode the leading dot to neutralize it.
             if encoded == "." || encoded == ".." {
                 format!("%2E{}", &encoded[1..])
             } else {
@@ -1434,7 +1414,7 @@ fn path_clean(path: &str) -> String {
                 components.push(c);
             }
             Component::Prefix(prefix) => {
-                // Windows prefix handling — unlikely but safe.
+                // Windows prefix handling: unlikely but safe.
                 components.clear();
                 components.push(prefix.as_os_str());
             }
@@ -1448,16 +1428,12 @@ fn path_clean(path: &str) -> String {
     }
 }
 
-// ============================================================
-// Shared test support
-// ============================================================
-
 /// Test-only serdes shared by the operation-path equivalence tests in
 /// `step`, `callback`, and `map_parallel`.
 ///
 /// The point of the shared types is that ONE `Serdes` implementation must
-/// behave identically on every operation path — step results, invoke payloads,
-/// callback payloads, child results, and map/parallel item and batch results —
+/// behave identically on every operation path, step results, invoke payloads,
+/// callback payloads, child results, and map/parallel item and batch results,
 /// now that all of them hand the serdes the operation's typed value directly.
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -1681,7 +1657,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// ISSUE #46: candidate file names are not trusted to be unique —
+    /// ISSUE #46: candidate file names are not trusted to be unique:
     /// across Lambda environments sharing EFS/S3 Files, two writers can
     /// draw the same PID, counter, and clock reading. When their candidate
     /// names collide, publication must not clobber the already-published
@@ -1980,8 +1956,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The writer no longer emits `{"raw":...}` — a `Value` is always
-    /// embeddable under `"data"` — but executions checkpointed before the
+    /// The writer no longer emits `{"raw":...}`, a `Value` is always
+    /// embeddable under `"data"`, but executions checkpointed before the
     /// value-based boundary may still contain one, so the READ path must keep
     /// handling it. Deleting the reader alongside the writer would strand
     /// in-flight executions.
@@ -2100,7 +2076,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // ── Engine-wiring tests: the generic async trait drives the file path ──
+    // Engine-wiring tests: the generic async trait drives the file path
 
     /// `Serdes::serialize` on `FileSystemSerdes` activates the context-aware
     /// file-writing path (the engine code path) through one blocking task.
@@ -2189,7 +2165,7 @@ mod tests {
             .await
             .expect("serialize");
         assert_eq!(wire, hex_envelope_of(&value));
-        // The wire form must not be parseable as JSON — that is what makes it
+        // The wire form must not be parseable as JSON; that is what makes it
         // a useful probe for "was the transform actually applied?".
         assert!(serde_json::from_str::<serde_json::Value>(&wire).is_err());
 
@@ -2227,7 +2203,7 @@ mod tests {
         assert_eq!(back, value);
     }
 
-    /// A custom `Serdes` receives the operation's actual typed value — a
+    /// A custom `Serdes` receives the operation's actual typed value: a
     /// `String` value arrives as `String`, with no JSON quoting to strip.
     #[tokio::test]
     async fn custom_serdes_receives_the_typed_value() {
@@ -2444,10 +2420,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // ================================================================
-    // Path traversal / containment tests (issue #9)
-    // ================================================================
-
     /// Helper to build an ARN with custom components for traversal tests.
     fn traversal_arn(function_name: &str, execution_name: &str, invocation_id: &str) -> String {
         format!(
@@ -2483,7 +2455,7 @@ mod tests {
                 );
             }
             Err(e) => {
-                // Error is acceptable — the traversal was rejected.
+                // Error is acceptable: the traversal was rejected.
                 assert!(
                     e.to_string().contains("escapes base_path"),
                     "unexpected error: {e}"
@@ -2569,7 +2541,7 @@ mod tests {
     #[test]
     fn encoded_components_round_trip() {
         // Prove that after encoding, deserialize can still find what serialize
-        // wrote — the envelope carries the resolved path, not the raw ARN.
+        // wrote: the envelope carries the resolved path, not the raw ARN.
         let tmp = std::env::temp_dir().join("fs_serdes_encoded_rt");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
@@ -2761,11 +2733,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ================================================================
-    // Issue #46: immutable unique files, versioned envelope, origin
-    // gating, strict resolution under base_path
-    // ================================================================
-
     /// Every serialize call must write a NEW file: a retried attempt must
     /// never mutate the file an already-accepted checkpoint references.
     #[test]
@@ -2774,7 +2741,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
-        // Same operation, same context — models a retry of the same op.
+        // Same operation, same context: models a retry of the same op.
         let ctx = SerdesContext::new(
             "step-1",
             "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e/i",
@@ -2848,7 +2815,7 @@ mod tests {
     }
 
     /// An externally delivered payload must NEVER be honored as a file
-    /// reference — neither in the legacy shape nor with a spoofed
+    /// reference: neither in the legacy shape nor with a spoofed
     /// versioned marker. It parses directly as the value.
     #[test]
     fn external_origin_never_resolves_file_references() {
@@ -2974,7 +2941,7 @@ mod tests {
     }
 
     /// Legacy (marker-less) file pointers from SDK records written by
-    /// earlier versions still read — but only from under `base_path`.
+    /// earlier versions still read, but only from under `base_path`.
     #[test]
     fn legacy_file_envelope_strictly_contained() {
         let tmp = std::env::temp_dir().join("fs_serdes_legacy_containment");

@@ -1,5 +1,8 @@
 //! The chained-invoke operation: [`InvokeBuilder`], returned by
 //! [`DurableContext::invoke`](crate::DurableContext::invoke).
+//!
+//! The [invoke operation guide](https://docs.aws.amazon.com/durable-execution/sdk-reference/operations/invoke/)
+//! describes this operation independently of any language SDK.
 
 use std::future::IntoFuture;
 use std::marker::PhantomData;
@@ -11,10 +14,6 @@ use crate::error::OperationError;
 use crate::future::DurableFuture;
 use crate::serdes::JsonSerdes;
 
-// ============================================================
-// InvokeBuilder
-// ============================================================
-
 /// Builder for a durable invoke operation.
 ///
 /// Created by [`DurableContext::invoke`]. Configure with `.name()` and
@@ -25,8 +24,7 @@ use crate::serdes::JsonSerdes;
 /// [`JsonSerdes`]: `PS` serializes the input
 /// payload ([`payload_serdes`](Self::payload_serdes)) and `RS`
 /// deserializes the target function's result ([`serdes`](Self::serdes)).
-/// The single erasure point is `.future()` / `.await`, which produces the
-/// one [`DurableFuture<O>`] box regardless of the serdes types.
+/// Whatever the serdes types, the finalized future is [`DurableFuture<O>`].
 ///
 /// # Examples
 ///
@@ -115,7 +113,7 @@ where
     ///
     /// The serdes is applied when deserializing the invoke result payload
     /// returned by the target function. It must implement
-    /// [`Serdes<O>`](crate::Serdes) for this invoke's output type —
+    /// [`Serdes<O>`](crate::Serdes) for this invoke's output type:
     /// attaching a serdes for a different type fails at compile time. This
     /// is independent of the payload serdes set via
     /// [`payload_serdes`](Self::payload_serdes).
@@ -201,12 +199,27 @@ where
     PS: Serdes<I>,
     RS: Serdes<O>,
 {
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
+    ///
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<O> {
         <Self as IntoFuture>::into_future(self)
     }
 
     /// Eagerly spawns the invoke on a tokio task.
+    ///
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     ///
     /// # Examples
     ///

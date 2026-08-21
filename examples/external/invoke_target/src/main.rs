@@ -5,7 +5,7 @@
 //! [`DurableContext::invoke`](aws_durable_execution_sdk_rust::DurableContext::invoke).
 //! It is deployed in the same stack as the callers, which name it through the
 //! `TARGET_FUNCTION_NAME` environment variable. A chained callee is itself an
-//! ordinary durable function — nothing special marks it as a target.
+//! ordinary durable function: nothing special marks it as a target.
 
 use std::time::Duration;
 

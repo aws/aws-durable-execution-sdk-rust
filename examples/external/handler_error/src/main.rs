@@ -9,7 +9,7 @@
 //! This example runs one durable step that succeeds and is checkpointed, then
 //! returns an error from the handler. On replay the step's recorded result is
 //! restored, the handler runs again to the same point, and the execution ends
-//! failed with the same error every time — the failure is deterministic. This
+//! failed with the same error every time: the failure is deterministic. This
 //! is the intended terminal state for this example, not a defect.
 
 use aws_durable_execution_sdk_rust as durable;

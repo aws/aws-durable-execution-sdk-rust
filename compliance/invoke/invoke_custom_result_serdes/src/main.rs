@@ -9,7 +9,7 @@ use aws_durable_execution_sdk_rust as durable;
 /// The Go SDK equivalent does `*s = strings.ToUpper(string(data))`, which
 /// assigns the uppercased raw bytes (JSON quotes included) as the final
 /// string value. Returning the uppercased wire string directly reproduces
-/// that exactly — the serdes produces the typed `String`, so no re-encoding
+/// that exactly: the serdes produces the typed `String`, so no re-encoding
 /// step is needed.
 #[derive(Debug)]
 struct UppercaseResultSerdes;

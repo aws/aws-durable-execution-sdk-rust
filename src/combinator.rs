@@ -7,10 +7,10 @@
 //! operations.
 //!
 //! Semantics:
-//! - `try_join_all` — await all; fail fast on the first error.
-//! - `join_all` — await all; collect each outcome as `Settled` (never short-circuits).
-//! - `select_ok` — return the first success; fail only if all branches fail.
-//! - `race` — return the first settled outcome (success or failure). A
+//! - `try_join_all`: await all; fail fast on the first error.
+//! - `join_all`: await all; collect each outcome as `Settled` (never short-circuits).
+//! - `select_ok`: return the first success; fail only if all branches fail.
+//! - `race`: return the first settled outcome (success or failure). A
 //!   failure winner surfaces as `CombinatorErrorKind::FirstSettledFailed`.
 //!
 //! Empty input: `try_join_all` and `join_all` resolve to an empty
@@ -22,8 +22,8 @@
 //! checkpointed atomically.
 //!
 //! Suspension is isolated per input: each constituent runs in its own
-//! suspension scope ([`spawn_constituent`]), so a parked input — a pending
-//! wait, an unresolved callback — never suspends the caller's scope. The
+//! suspension scope ([`spawn_constituent`]), so a parked input, a pending
+//! wait, an unresolved callback, never suspends the caller's scope. The
 //! combined outcome is recorded the moment the completion condition is met
 //! (a winner for `race`/`select_ok`, a first error for `try_join_all`),
 //! whatever the losing inputs are doing. The combinator itself suspends
@@ -65,10 +65,6 @@ const FIRST_SETTLED_FAILED_ERROR_TYPE: &str = "CombinatorError.FirstSettledFaile
 /// [`CombinatorErrorKind::EmptyInput`], so the live and replay paths
 /// surface the same variant.
 const EMPTY_INPUT_ERROR_TYPE: &str = "CombinatorError.EmptyInput";
-
-// ────────────────────────────────────────────────────────────────────────────
-// TryJoinAll (fail-fast concurrent join)
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Internal execution state for `try_join_all`.
 pub(crate) struct TryJoinAllExecution<O> {
@@ -218,13 +214,13 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         // here can make progress, so the combinator itself suspends. The
         // settled inputs recorded their own checkpoints, so a later
         // invocation replays them instantly and resumes only the parked
-        // ones. No combined outcome is recorded — the completion condition
+        // ones. No combined outcome is recorded: the completion condition
         // was not met.
         if parked > 0 {
             return Ok(self.ctx.suspend_now().await);
         }
 
-        // All succeeded — collect results in order.
+        // All succeeded: collect results in order.
         let mut collected: Vec<O> = Vec::with_capacity(count);
         for (idx, opt) in results.into_iter().enumerate() {
             match opt {
@@ -245,10 +241,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         Ok(collected)
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// JoinAll (settled collection — never short-circuits)
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Internal execution state for `join_all`.
 pub(crate) struct JoinAllExecution<O> {
@@ -366,13 +358,13 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
                 }
                 Ok((task_id, (_idx, ConstituentOutcome::Parked))) => {
                     // The input parked its own scope; its slot stays empty.
-                    // Siblings keep running — a parked input never blocks
-                    // them — and the decision is made after the drain.
+                    // Siblings keep running, a parked input never blocks
+                    // them, and the decision is made after the drain.
                     task_index.remove(&task_id);
                     parked += 1;
                 }
                 Err(join_err) => {
-                    // Task panicked or was cancelled — record as rejected at
+                    // Task panicked or was cancelled: record as rejected at
                     // ITS OWN index, recovered from the task id.
                     let msg = format!("task join failed: {join_err}");
                     let Some(idx) = task_index.remove(&join_err.id()) else {
@@ -391,7 +383,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
         // complete this invocation. Everything runnable already settled
         // (and checkpointed its own outcome), so suspend and let a later
         // invocation resume only the parked inputs. No combined outcome is
-        // recorded — `join_all` completes only when every input settles.
+        // recorded: `join_all` completes only when every input settles.
         if parked > 0 {
             return Ok(self.ctx.suspend_now().await);
         }
@@ -407,7 +399,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             .collect();
 
         // Serialize with error-aware serdes. A rejected slot's error is
-        // flattened into the payload here — the checkpoint stores text,
+        // flattened into the payload here: the checkpoint stores text,
         // and replay rebuilds a synthetic source from it.
         let serialized = {
             let serializable: Vec<SerializedSettled<&O>> = collected
@@ -428,10 +420,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
         Ok(collected)
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// SelectOk (first success wins)
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Internal execution state for `select_ok`.
 pub(crate) struct SelectOkExecution<O> {
@@ -499,7 +487,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
             checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
         }
 
-        // Empty input — there is no future that could succeed. Fail
+        // Empty input: there is no future that could succeed. Fail
         // explicitly with `EmptyInput` (matching `race`) rather than an
         // `AllFailed` carrying zero errors.
         if self.futures.is_empty() {
@@ -537,7 +525,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         while let Some(task_result) = join_set.join_next_with_id().await {
             match task_result {
                 Ok((_task_id, (_idx, ConstituentOutcome::Settled(Ok(value))))) => {
-                    // First success — cancel losers (drop via abort_all).
+                    // First success: cancel losers (drop via abort_all).
                     // Parked losers only ever parked their own constituent
                     // scopes, so recording the winner is not blocked by them.
                     join_set.abort_all();
@@ -586,7 +574,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
             return Ok(self.ctx.suspend_now().await);
         }
 
-        // All failed — build the aggregate error keeping every loser (in
+        // All failed: build the aggregate error keeping every loser (in
         // input order) as an error rather than a flattened string.
         errors.sort_by_key(|(idx, _)| *idx);
         let losers: Vec<crate::error::Source> = errors.into_iter().map(|(_, err)| err).collect();
@@ -607,10 +595,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         )
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Race (first settled wins, success or failure)
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Internal execution state for `race`.
 pub(crate) struct RaceExecution<O> {
@@ -677,7 +661,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
             checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
         }
 
-        // Empty input — there is no future that could settle. Fail
+        // Empty input: there is no future that could settle. Fail
         // explicitly with `EmptyInput` (matching `select_ok`).
         if self.futures.is_empty() {
             let wire = crate::error::wire_error_manual(
@@ -695,7 +679,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
         // Live path: race all futures, first settled wins. Each constituent
         // runs under its own suspension scope (see `drive_constituent`), so
         // a losing input's park surfaces as `Parked` here instead of
-        // suspending the caller after the winner already settled — the
+        // suspending the caller after the winner already settled: the
         // defect that let replay pick a different winner (issue #49).
         let mut join_set = tokio::task::JoinSet::new();
 
@@ -730,7 +714,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                     return Ok(value);
                 }
                 Ok(Err(op_err)) => {
-                    // Winner is a failure — race propagates it. The losing
+                    // Winner is a failure: race propagates it. The losing
                     // error is preserved as the combinator error's source;
                     // the wire `error_type` carries the discriminator so
                     // replay reproduces the same variant, while the message,
@@ -776,14 +760,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
 
         // Every input parked without settling: no winner can be decided
         // this invocation, so the race itself suspends. Nothing is
-        // recorded — the winner is frozen only once an input settles.
+        // recorded: the winner is frozen only once an input settles.
         Ok(self.ctx.suspend_now().await)
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Shared helpers
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Blesses the current task for task-ownership checks.
 ///
@@ -842,9 +822,9 @@ fn spawn_constituent<O: Send + 'static>(
 ///
 /// Called at the top of [`checkpoint_succeed`] and [`checkpoint_fail`], which
 /// every combinator's live path funnels through. A replay identity mismatch
-/// is recorded on the shared fatal slot eagerly — when the mismatching
+/// is recorded on the shared fatal slot eagerly: when the mismatching
 /// constituent [`DurableFuture`] was finalized (see `preflight_identity!` in
-/// `builders`) — so by the time a short-circuiting combinator (`select_ok`,
+/// `builders`), so by the time a short-circuiting combinator (`select_ok`,
 /// `race`, `try_join_all`) is ready to record a winner, the slot already
 /// says the recorded history contradicts the handler. Writing a SUCCEED (or
 /// an unrelated FAIL) checkpoint at that point would store an outcome the
@@ -885,7 +865,7 @@ async fn checkpoint_start(
         .expect("all required OperationUpdate fields set");
 
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43) — combinator START: no user code ran for the
+        // Audit (#43): combinator START: no user code ran for the
         // combined operation itself, so no terminal FAIL is needed;
         // re-invocation reconverges on the same write.
         return ctx
@@ -928,7 +908,7 @@ async fn checkpoint_succeed(
         .expect("all required OperationUpdate fields set");
 
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43) — combinator SUCCEED: the winning branch(es) ran,
+        // Audit (#43): combinator SUCCEED: the winning branch(es) ran,
         // so their side effects need a recorded outcome. A permanent
         // rejection persists a small terminal FAIL before the execution
         // fails.
@@ -976,7 +956,7 @@ async fn checkpoint_fail(
         .expect("all required OperationUpdate fields set");
 
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43) — combinator FAIL: branch bodies ran; the failed
+        // Audit (#43): combinator FAIL: branch bodies ran; the failed
         // FAIL write routes unrecoverable with a minimal terminal FAIL
         // retry (the original carried the branch error's payload).
         let cwire = crate::error::checkpoint_failure_wire(&err);
@@ -988,7 +968,7 @@ async fn checkpoint_fail(
     Ok(())
 }
 
-/// Builds a combinator `FAIL` update carrying `wire` as its error — the
+/// Builds a combinator `FAIL` update carrying `wire` as its error: the
 /// terminal record persisted when the combinator's own outcome write was
 /// permanently rejected (issue #43).
 fn build_combinator_fail_update(
@@ -1071,7 +1051,7 @@ fn replay_settled_success<O: DeserializeOwned>(
     let serialized: Vec<SerializedSettled<O>> = serde_json::from_str(payload)
         .map_err(|e| combinator_internal_error(&format!("replay deserialization failed: {e}")))?;
 
-    // Restore into Settled<O> — Rejected items become OperationErrors
+    // Restore into Settled<O>: Rejected items become OperationErrors
     // carrying the original message.
     let settled = serialized
         .into_iter()
@@ -1121,10 +1101,6 @@ fn replay_combinator_failure(wire: crate::error::WireError, wire_id: &str) -> Op
     .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
     .with_wire(wire)
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[expect(
@@ -1317,7 +1293,7 @@ mod tests {
             ctx,
             op_id,
             name: None,
-            futures: vec![], // No futures needed — replay returns stored result.
+            futures: vec![], // No futures needed: replay returns stored result.
         };
         let result = exec.execute().await.unwrap();
         assert_eq!(result, vec![10, 20, 30]);
@@ -1384,7 +1360,7 @@ mod tests {
     async fn join_all_panic_lands_in_its_own_slot() {
         let ctx = test_ctx_with_client(CheckpointLog::empty());
         // Index 0 is slow and succeeds; index 1 panics BEFORE index 0
-        // completes — the rejection must land in slot 1, not slot 0.
+        // completes: the rejection must land in slot 1, not slot 0.
         let a = DurableFuture::from_async(async {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             Ok(1)
@@ -1515,7 +1491,7 @@ mod tests {
     #[tokio::test]
     async fn select_ok_first_success() {
         let ctx = test_ctx_with_client(CheckpointLog::empty());
-        // b fails, a succeeds — a should win.
+        // b fails, a succeeds: a should win.
         let a = DurableFuture::from_async(async { Ok("winner".to_owned()) });
         let b: DurableFuture<String> = DurableFuture::from_async(async {
             Err(OperationError::from_kind(OperationErrorKind::Combinator(
@@ -1726,7 +1702,7 @@ mod tests {
             }
             other => panic!("expected Combinator, got: {other:?}"),
         }
-        // The live error carries the checkpointed context — the same
+        // The live error carries the checkpointed context: the same
         // operation id, status, and wire record a replay reconstructs.
         assert!(err.operation_id().is_some(), "live EmptyInput has op id");
         assert_eq!(err.status(), Some("FAILED"));
@@ -1770,8 +1746,8 @@ mod tests {
 
     #[tokio::test]
     async fn empty_input_replay_reproduces_empty_input() {
-        // A recorded empty-input failure replays as EmptyInput — the same
-        // variant the live path produced — for both race and select_ok.
+        // A recorded empty-input failure replays as EmptyInput, the same
+        // variant the live path produced, for both race and select_ok.
         let (wire_id, record) = failed_record(
             "1",
             "CombinatorError.EmptyInput",
@@ -1842,7 +1818,7 @@ mod tests {
             ctx,
             op_id,
             name: None,
-            futures: vec![], // Replay — no futures run.
+            futures: vec![], // Replay: no futures run.
         };
         let result = exec.execute().await.unwrap();
         assert_eq!(result, "replay-winner");
@@ -1967,7 +1943,7 @@ mod tests {
     // do NOT trigger ownership errors when the guard is active (context
     // created inside tokio::spawn where try_id() returns Some).
     //
-    // Each branch calls `ctx.enforce_task_ownership()` — the same check
+    // Each branch calls `ctx.enforce_task_ownership()`: the same check
     // that every durable operation (step, invoke, etc.) performs at entry.
     // Without the bless_current_task() call in the combinator spawn sites,
     // these tests FAIL with ownership errors.
@@ -2002,7 +1978,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Must succeed — no ownership errors.
+        // Must succeed, no ownership errors.
         let values = result.unwrap();
         assert_eq!(values, vec![1, 2]);
     }
@@ -2013,7 +1989,7 @@ mod tests {
         let result = tokio::spawn(async {
             let ctx = test_ctx_with_client(CheckpointLog::empty());
 
-            // Each branch calls enforce_task_ownership — without blessing,
+            // Each branch calls enforce_task_ownership: without blessing,
             // every branch would be Rejected with an ownership error.
             let ctx_a = ctx.clone();
             let a = DurableFuture::from_async(async move {
@@ -2043,7 +2019,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Must succeed with all branches fulfilled — none rejected due to ownership.
+        // Must succeed with all branches fulfilled: none rejected due to ownership.
         let settled = result.unwrap();
         assert_eq!(settled.len(), 3);
         for (i, s) in settled.iter().enumerate() {
@@ -2086,7 +2062,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Must succeed — no ownership errors.
+        // Must succeed, no ownership errors.
         let value = result.unwrap();
         assert_eq!(value, "winner");
     }
@@ -2120,7 +2096,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Must succeed — no ownership errors.
+        // Must succeed, no ownership errors.
         let value = result.unwrap();
         assert_eq!(value, "fast");
     }

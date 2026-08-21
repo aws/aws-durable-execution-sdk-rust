@@ -16,7 +16,7 @@ async fn handler(
     ctx: durable::DurableContext,
 ) -> Result<String, durable::BoxError> {
     // Nondeterministic input, but captured inside the step: checkpointed once,
-    // replayed thereafter — so replay sees the same token.
+    // replayed thereafter, so replay sees the same token.
     let token = ctx
         .step(|_| async {
             let nanos = std::time::SystemTime::now()

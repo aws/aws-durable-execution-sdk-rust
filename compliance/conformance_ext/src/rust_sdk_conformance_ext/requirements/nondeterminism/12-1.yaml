@@ -1,5 +1,5 @@
 ---
-# 12-1: Non-determinism detection — reordered operations (issue #6)
+# 12-1: Non-determinism detection: reordered operations (issue #6)
 description: Reordered operations on replay fail with a non-determinism error
 handler: |
   On the first execution, runs step "alpha" then step "beta", then a
@@ -18,7 +18,7 @@ Input:
 ExpectedResult:
   ExecutionStatus: FAILED
 ExpectedExecutionHistory:
-  # First invocation recorded the original order — pin the first step's
+  # First invocation recorded the original order: pin the first step's
   # identity so the mismatch on replay is attributable.
   - EventType: StepStarted
     SubType: Step

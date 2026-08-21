@@ -35,10 +35,6 @@ pub(crate) const CALLBACK_SUB_TYPE: &str = "Callback";
 /// Wire sub-type for wait-for-callback context operations.
 pub(crate) const WFCB_SUB_TYPE: &str = "WaitForCallback";
 
-// ────────────────────────────────────────────────────────────────────────────
-// CreateCallbackExecution
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Internal state for `create_callback` execution passed from the builder.
 pub(crate) struct CreateCallbackExecution<O, S> {
     pub(crate) ctx: DurableContext,
@@ -76,7 +72,7 @@ where
         )? {
             // The backend assigns the callback ID in the START response, so
             // every checkpointed callback record must carry one. A record
-            // without it is an invariant violation — fail at the fault
+            // without it is an invariant violation: fail at the fault
             // instead of continuing with an empty ID (issue #47; the JS and
             // Python SDKs fail the same way).
             let callback_id = self
@@ -98,7 +94,7 @@ where
             match view.status {
                 CheckpointStatus::Succeeded => {
                     // Callback completed successfully during a previous
-                    // invocation — return settled Callback with the result.
+                    // invocation: return settled Callback with the result.
                     // The payload was written by an external caller, so only
                     // the deserialize side of the serdes acts on it. Decode
                     // FIRST, then emit `operation_replayed`: a corrupt
@@ -140,12 +136,12 @@ where
                     return Ok(Callback::new_settled(callback_id, Err(err)));
                 }
                 CheckpointStatus::Started | CheckpointStatus::Pending => {
-                    // Callback is in flight — return pending (will suspend on
+                    // Callback is in flight: return pending (will suspend on
                     // .result()).
                     return Ok(Callback::new_pending(callback_id, self.ctx.clone()));
                 }
                 _ => {
-                    // Unexpected status — treat as internal error.
+                    // Unexpected status: treat as internal error.
                     return Err(callback_internal_error(&format!(
                         "unexpected checkpointed status: {:?}",
                         view.status
@@ -154,7 +150,7 @@ where
             }
         }
 
-        // 3. First invocation — checkpoint START with callback options.
+        // 3. First invocation: checkpoint START with callback options.
         let mut builder = OperationUpdate::builder()
             .id(wire_id.clone())
             .r#type(OperationType::Callback)
@@ -183,7 +179,7 @@ where
         // contract: the backend assigns the callback_id in this response,
         // so the write cannot wait out a coalescing window.
         if let Err(err) = self.ctx.checkpoint_updates_urgent(vec![update]).await {
-            // Audit (#43) — callback-creation START: no user code ran (the
+            // Audit (#43): callback-creation START: no user code ran (the
             // callback ID does not exist yet), so no terminal FAIL is
             // needed; re-invocation reconverges on the same write.
             return self
@@ -194,7 +190,7 @@ where
 
         // After checkpointing START, the backend assigns a callback_id.
         // Read it from the (now-updated) checkpoint log. A record without
-        // one is an invariant violation — fail at the fault instead of
+        // one is an invariant violation: fail at the fault instead of
         // handing the caller an empty ID (issue #47).
         let callback_id = self
             .ctx
@@ -204,14 +200,10 @@ where
                 missing_callback_id_error(&wire_id, CheckpointStatus::Started.wire_str())
             })?;
 
-        // Return pending — Result() will fire suspend.
+        // Return pending: Result() will fire suspend.
         Ok(Callback::new_pending(callback_id, self.ctx.clone()))
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// WaitForCallbackExecution
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Internal state for `wait_for_callback` execution passed from the builder.
 ///
@@ -241,11 +233,11 @@ where
 {
     /// Executes the wait-for-callback operation: replay or live path.
     ///
-    /// Thin generic wrapper — the ONLY code monomorphized per call site.
+    /// Thin generic wrapper: the ONLY code monomorphized per call site.
     /// The replay/checkpoint state machine lives in the non-generic
     /// [`WfcbCore`] / [`WfcbAfter`] halves (generic over the result type
     /// `O` only); this wrapper just runs the inner body (whose own
-    /// checkpoint plumbing — callback creation and the submitter step —
+    /// checkpoint plumbing, callback creation and the submitter step,
     /// is likewise non-generic) between them.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         let Self {
@@ -291,7 +283,7 @@ where
 
 /// The pre-body half of `wait_for_callback`: task-ownership check, replay
 /// resolution, and the START checkpoint. Generic only over the result type
-/// `O` — no user closure reaches this state machine, so its replay and
+/// `O`, no user closure reaches this state machine, so its replay and
 /// checkpoint logic compiles once per result type instead of once per call
 /// site.
 struct WfcbCore<O> {
@@ -350,7 +342,7 @@ where
         )? {
             match view.status {
                 CheckpointStatus::Succeeded => {
-                    // WaitForCallback context completed — deserialize the
+                    // WaitForCallback context completed: deserialize the
                     // result FIRST, then emit `operation_replayed`: a corrupt
                     // payload surfaces as an error without claiming a
                     // recorded outcome was returned.
@@ -368,7 +360,7 @@ where
                     return Ok(WfcbPrelude::Done(Ok(value)));
                 }
                 CheckpointStatus::Failed => {
-                    // Context failed — classify the error.
+                    // Context failed: classify the error.
                     ctx.emit_operation_replayed(
                         &wire_id,
                         name.as_deref(),
@@ -389,10 +381,10 @@ where
                 _ => {}
             }
         } else {
-            // 3. First invocation — checkpoint ContextStarted.
+            // 3. First invocation: checkpoint ContextStarted.
             let update = build_wfcb_update(&wire_id, name.as_deref(), OperationAction::Start, &ctx);
             if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43) — wait-for-callback context START: no user
+                // Audit (#43): wait-for-callback context START: no user
                 // code ran (the submitter has not been called), so no
                 // terminal FAIL is needed; re-invocation reconverges.
                 return ctx
@@ -428,7 +420,7 @@ where
         } = self;
         match body_result {
             Ok(value) => {
-                // Success — serialize and checkpoint ContextSucceeded.
+                // Success: serialize and checkpoint ContextSucceeded.
                 let serialized = serde_json::to_string(&value)
                     .map_err(|e| wfcb_internal_error(&format!("serialize result: {e}")))?;
                 let mut builder = OperationUpdate::builder()
@@ -449,7 +441,7 @@ where
                     .expect("all required OperationUpdate fields set");
 
                 if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43) — wait-for-callback SUCCEED: the
+                    // Audit (#43): wait-for-callback SUCCEED: the
                     // submitter ran and the external system completed the
                     // callback, so those side effects need a recorded
                     // outcome. A permanent rejection persists a small
@@ -467,7 +459,7 @@ where
                 Ok(out)
             }
             Err(err) => {
-                // Failure — checkpoint ContextFailed.
+                // Failure: checkpoint ContextFailed.
                 let wire = extract_wire_error(&err);
                 let mut builder = OperationUpdate::builder()
                     .id(wire_id.clone())
@@ -489,10 +481,10 @@ where
                 // Checkpoint the failure so a replay of this record
                 // reconstructs the same error: operation id, status, and
                 // the wire record are present either way. A rejected
-                // write routes unrecoverable — discarding it would leave
+                // write routes unrecoverable: discarding it would leave
                 // the record claiming less than what executed (#43).
                 if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43) — wait-for-callback FAIL: the submitter
+                    // Audit (#43): wait-for-callback FAIL: the submitter
                     // (and possibly the external system) ran; the failed
                     // FAIL write routes unrecoverable with a minimal
                     // terminal FAIL retry.
@@ -573,10 +565,6 @@ where
     // Step 3: await callback result.
     cb.result().await
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Builds the wire `CallbackOptions` from timeout/heartbeat durations.
 /// Returns `None` when neither is set.
@@ -803,10 +791,6 @@ fn wfcb_internal_error(msg: &str) -> OperationError {
         Some(msg.to_owned().into()),
     )))
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
@@ -1056,7 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_returns_assigned_id() {
-        // Empty checkpoint log — first invocation.
+        // Empty checkpoint log: first invocation.
         let client = Arc::new(InMemoryExecutionClient::new(vec![]));
         let ctx = DurableContext::new_root_with_client(
             "arn:test".to_owned(),
@@ -1102,7 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn replay_started_missing_callback_id_fails() {
         // A STARTED callback record without a backend-assigned callback ID
-        // is an invariant violation — the SDK must fail loudly instead of
+        // is an invariant violation: the SDK must fail loudly instead of
         // continuing with an empty ID (issue #47).
         let wire = crate::engine::compute_wire_id_public("1");
         let ctx = ctx_with_log(vec![callback_record(
@@ -1350,7 +1334,7 @@ mod tests {
     #[tokio::test]
     async fn create_callback_spawn_executes() {
         // Verify that spawning a CreateCallbackBuilder returns a future
-        // that resolves (live path — will checkpoint then return pending).
+        // that resolves (live path: will checkpoint then return pending).
         let client = Arc::new(InMemoryExecutionClient::new(vec![]));
         let ctx = DurableContext::new_root_with_client(
             "arn:test".to_owned(),
@@ -1410,8 +1394,8 @@ mod tests {
         );
     }
 
-    // ── Submitter-as-step tests (verifies the fix for missing StepStarted/
-    //    StepSucceeded events in the WaitForCallback child context) ──────
+    // Submitter-as-step tests (verifies the fix for missing StepStarted/
+    //    StepSucceeded events in the WaitForCallback child context)
 
     #[tokio::test]
     async fn wfcb_submitter_executes_as_step_with_checkpoints() {
@@ -1493,7 +1477,7 @@ mod tests {
         //   pos "1-1" → CallbackStarted [Status: Started, callback_id set]
         //   pos "1-2" → StepSucceeded  [the submitter step]
         //   Then the callback is still pending (no terminal status) so the
-        //   execution suspends — but the submitter must NOT re-run.
+        //   execution suspends, but the submitter must NOT re-run.
         let wfcb_wire = crate::engine::compute_wire_id_public("1");
         let cb_wire = crate::engine::compute_wire_id_public("1-1");
         let step_wire = crate::engine::compute_wire_id_public("1-2");
@@ -1523,7 +1507,7 @@ mod tests {
                     op_name: None,
                 },
             ),
-            // Callback: Started (pending — will suspend on .result()).
+            // Callback: Started (pending: will suspend on .result()).
             (
                 cb_wire.clone(),
                 CheckpointRecord {
@@ -1547,7 +1531,7 @@ mod tests {
                     op_name: None,
                 },
             ),
-            // Submitter step: Succeeded (replay — should not re-invoke).
+            // Submitter step: Succeeded (replay: should not re-invoke).
             (
                 step_wire.clone(),
                 CheckpointRecord {
@@ -1663,7 +1647,7 @@ mod tests {
     async fn wfcb_live_failure_carries_checkpointed_context() {
         // A live wait-for-callback failure that reaches the terminal
         // ContextFailed checkpoint must return an error carrying the
-        // checkpointed context — the same operation id, status, and wire
+        // checkpointed context: the same operation id, status, and wire
         // record a replay of that record reconstructs.
         let client = Arc::new(InMemoryExecutionClient::new(vec![]));
         let ctx = DurableContext::new_root_with_client(
@@ -1738,7 +1722,7 @@ mod tests {
             _marker: std::marker::PhantomData,
         };
 
-        // Execute — will suspend at callback result, but submitter runs.
+        // Execute: will suspend at callback result, but submitter runs.
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.suspension_signal()),
             exec.execute(),
@@ -1754,7 +1738,7 @@ mod tests {
         );
     }
 
-    // ── Callback payload serdes tests ───────────────────────────────────
+    // Callback payload serdes tests
 
     /// Test serdes that expects a non-JSON `MARK:` prefix on the wire payload
     /// and strips it on the deserialize side. Plain `serde_json` cannot decode
@@ -1810,8 +1794,8 @@ mod tests {
         assert_eq!(value, "hello");
     }
 
-    /// The shared probe serdes — the same type the map/parallel item-serdes
-    /// equivalence test uses — must decode a callback payload too. One
+    /// The shared probe serdes, the same type the map/parallel item-serdes
+    /// equivalence test uses, must decode a callback payload too. One
     /// implementation, every operation path: that is the point of the
     /// normalized serialization model.
     #[tokio::test]
@@ -1859,8 +1843,8 @@ mod tests {
 
     /// ISSUE #46: an externally delivered callback payload must never be
     /// honored as a `FileSystemSerdes` file reference. A payload shaped
-    /// like a file pointer — even one naming a real, readable file under
-    /// `base_path` — decodes as plain data, and a realistic inline payload
+    /// like a file pointer, even one naming a real, readable file under
+    /// `base_path`, decodes as plain data, and a realistic inline payload
     /// containing a `file` key is not misparsed.
     #[tokio::test]
     #[expect(clippy::indexing_slicing)] // reason: test assertions on known JSON keys
@@ -1989,7 +1973,7 @@ mod tests {
                 None,
                 Some("cb-wfcb"),
             ),
-            // Submitter step: Succeeded (replay — not re-invoked).
+            // Submitter step: Succeeded (replay, not re-invoked).
             callback_record(
                 &step_wire,
                 CheckpointStatus::Succeeded,

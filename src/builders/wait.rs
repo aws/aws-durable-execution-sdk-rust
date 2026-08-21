@@ -1,5 +1,8 @@
 //! The wait (durable timer) operation: [`WaitBuilder`], returned by
 //! [`DurableContext::wait`](crate::DurableContext::wait).
+//!
+//! The [wait operation guide](https://docs.aws.amazon.com/durable-execution/sdk-reference/operations/wait/)
+//! describes this operation independently of any language SDK.
 
 use std::future::IntoFuture;
 
@@ -7,10 +10,6 @@ use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
-
-// ============================================================
-// WaitBuilder
-// ============================================================
 
 /// Builder for a durable wait (timer) operation.
 ///
@@ -67,12 +66,27 @@ impl WaitBuilder {
         self
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
+    ///
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<()> {
         self.into_future()
     }
 
     /// Eagerly spawns the wait on a tokio task.
+    ///
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     ///
     /// # Examples
     ///

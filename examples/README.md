@@ -7,7 +7,7 @@ test against the live service, using the same packaging story as
 under `publish/`).
 
 Examples are user-facing documentation. Every one is a single honest workload
-for one pattern — no artificial scaffolding, no option menus, no branching
+for one pattern, no artificial scaffolding, no option menus, no branching
 demo harnesses. The mapping from the JavaScript SDK's examples tree (which
 examples are ported, which are covered by a representative, and which do not
 apply to Rust) is tracked in [`docs/porting-map.md`](../docs/porting-map.md).
@@ -68,7 +68,7 @@ directly-invokable example and asserts the terminal states below.
   `aws lambda send-durable-execution-callback-success`; the execution then
   finishes SUCCEEDED.
 - **Expected-FAILED example.** `external/handler_error` returns an error from
-  the handler and finishes FAILED deterministically — a FAILED terminal state
+  the handler and finishes FAILED deterministically: a FAILED terminal state
   is its pass condition. The two callback-timeout examples catch their
   timeouts and finish SUCCEEDED.
 - **Companion callees.** `external/invoke_target` and

@@ -1,6 +1,6 @@
 //! `race`: take the first settled result, success or failure.
 //!
-//! [`race`] returns the first operation to settle — whether it succeeds or
+//! [`race`] returns the first operation to settle: whether it succeeds or
 //! fails. It is the durable analogue of `Promise.race`. The losing operations
 //! are dropped (cancelled) once the winner settles.
 //!

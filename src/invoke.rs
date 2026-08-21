@@ -20,7 +20,7 @@ pub(crate) const CHAINED_INVOKE_SUB_TYPE: &str = "ChainedInvoke";
 
 /// Internal state for invoke execution passed from the builder.
 ///
-/// Generic over the input type `I` (carried typed — the payload serdes
+/// Generic over the input type `I` (carried typed: the payload serdes
 /// receives the owned input directly, a write-only transfer) and the two
 /// serdes implementations: `PS` serializes the input payload, `RS`
 /// deserializes the target function's result.
@@ -65,7 +65,7 @@ where
         )? {
             match view.status {
                 CheckpointStatus::Succeeded => {
-                    // Invoke succeeded — deserialize the result from invoke
+                    // Invoke succeeded: deserialize the result from invoke
                     // details FIRST, then emit `operation_replayed`: a corrupt
                     // payload or failing serdes surfaces as an error without
                     // claiming a recorded outcome was returned.
@@ -93,7 +93,7 @@ where
                 CheckpointStatus::Failed
                 | CheckpointStatus::TimedOut
                 | CheckpointStatus::Stopped => {
-                    // Invoke failed — reconstruct InvokeError from details.
+                    // Invoke failed: reconstruct InvokeError from details.
                     self.ctx.emit_operation_replayed(
                         &wire_id,
                         self.name.as_deref(),
@@ -123,7 +123,7 @@ where
                     ));
                 }
                 CheckpointStatus::Started | CheckpointStatus::Pending | CheckpointStatus::Ready => {
-                    // Invoke has not settled yet — suspend.
+                    // Invoke has not settled yet: suspend.
                     return self.ctx.suspend_now().await;
                 }
                 CheckpointStatus::Cancelled => {
@@ -143,7 +143,7 @@ where
                     .with_operation(&wire_id, view.status.wire_str()));
                 }
                 CheckpointStatus::Unknown(ref raw) => {
-                    // Unreachable in production — `checkpoint_view_validated`
+                    // Unreachable in production: `checkpoint_view_validated`
                     // already failed the execution (issue #45). Kept as a
                     // typed arm so a future bypass cannot suspend forever on
                     // a status that may be terminal.
@@ -153,7 +153,7 @@ where
         }
 
         // 3. Live path: serialize the typed input through the payload
-        // serdes, then checkpoint. The input transfers by ownership — a
+        // serdes, then checkpoint. The input transfers by ownership: a
         // write-only payload has no round-trip to preserve, and owning it
         // lets the serdes move it into a blocking task when it needs one.
         let wire_payload =
@@ -169,7 +169,7 @@ where
             self.tenant_id.as_deref(),
         );
         if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-            // Audit (#43) — chained-invoke START: no user code ran (the
+            // Audit (#43): chained-invoke START: no user code ran (the
             // input was serialized, but nothing external happened), so
             // there is no side effect needing a recorded outcome. No
             // terminal FAIL: re-invocation reconverges on the same write.
@@ -179,12 +179,12 @@ where
                 .await;
         }
 
-        // Suspend — the backend owns the child invocation.
+        // Suspend: the backend owns the child invocation.
         self.ctx.suspend_now().await
     }
 }
 
-// ── Serialization helpers ───────────────────────────────────────────────
+// Serialization helpers
 
 /// Serializes the invoke input payload through the configured serdes.
 ///
@@ -204,7 +204,7 @@ async fn serialize_invoke_input<I, PS: Serdes<I>>(
 
 /// Deserializes the invoke result payload through the configured serdes.
 ///
-/// The payload is returned by the external target function — it never
+/// The payload is returned by the external target function: it never
 /// passed through this SDK's serialize path. The context is marked
 /// [`PayloadOrigin::External`] here, at the boundary, so a serdes with
 /// storage indirection (e.g. `FileSystemSerdes`) never honors a file
@@ -236,7 +236,7 @@ fn invoke_serialization_error(boundary: &str, e: crate::BoxError) -> OperationEr
 /// than being folded into a message, so `kind()` stays meaningful and
 /// the recorded `error_type` stays recoverable after a replay. All four
 /// wire fields are preserved: `error_data` and `stack_trace` pass
-/// through verbatim (store-and-expose — never captured fresh on replay),
+/// through verbatim (store-and-expose, never captured fresh on replay),
 /// so the record attached to the [`crate::error::ReplayedFailure`] is
 /// complete.
 fn invoke_error_from_record(
@@ -260,7 +260,7 @@ fn invoke_error_from_record(
     .with_wire(wire)
 }
 
-// ── Update builder ──────────────────────────────────────────────────────
+// Update builder
 
 fn build_chained_invoke_start(
     wire_id: &str,
@@ -315,7 +315,7 @@ mod tests {
     use std::marker::PhantomData;
     use std::sync::Arc;
 
-    // ── Replay tests ────────────────────────────────────────────────────
+    // Replay tests
 
     #[tokio::test]
     async fn invoke_replay_success_deserializes_result() {
@@ -367,8 +367,8 @@ mod tests {
     /// ISSUE #46: a target function's result payload must never be honored
     /// as a `FileSystemSerdes` file reference. The result is produced by
     /// the external target function, not this SDK's serialize path, so a
-    /// payload shaped like a legacy or versioned file pointer — even one
-    /// naming a real, readable file under `base_path` — decodes as plain
+    /// payload shaped like a legacy or versioned file pointer, even one
+    /// naming a real, readable file under `base_path`, decodes as plain
     /// data, and a realistic inline payload containing a `file` key is not
     /// misparsed.
     #[tokio::test]
@@ -514,7 +514,7 @@ mod tests {
         let err_msg = format!("{err:#}");
         assert!(err_msg.contains("target function error"), "got: {err_msg}");
         // All four recorded wire fields are preserved on the error's
-        // attached record — nothing is discarded on replay.
+        // attached record: nothing is discarded on replay.
         let wire = err.wire().unwrap();
         assert_eq!(wire.error_type(), Some("TargetError"));
         assert_eq!(wire.error_message(), Some("target function error"));
@@ -859,7 +859,7 @@ mod tests {
             _marker: PhantomData,
         };
 
-        // Execute — checkpoints then suspends (parks); drive through the
+        // Execute: checkpoints then suspends (parks); drive through the
         // driver so it terminates as Pending instead of parking forever.
         let signal = Arc::clone(ctx.suspension_signal());
         let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;

@@ -1,5 +1,10 @@
 //! The retrying child-context operation: [`WithRetryBuilder`], returned by
 //! [`DurableContext::with_retry`](crate::DurableContext::with_retry).
+//!
+//! `with_retry` composes the
+//! [child context operation](https://docs.aws.amazon.com/durable-execution/sdk-reference/operations/child-context/)
+//! with step-style retries; it has no separate page in the
+//! language-agnostic operation guide.
 
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
@@ -14,37 +19,27 @@ use crate::error::OperationError;
 use crate::future::DurableFuture;
 use crate::serdes::JsonSerdes;
 
-// ============================================================
-// WithRetryBuilder
-// ============================================================
-
 /// Builder for a block-level retry operation.
 ///
 /// Created by [`DurableContext::with_retry`]. Runs a closure against a
 /// child context and applies a retry strategy to the closure's **overall**
 /// outcome, so a multi-operation block retries as a unit. Each attempt
-/// receives a fresh child operation namespace: a failed attempt's recorded
-/// operations are never replayed into the next attempt, so every operation
-/// in the block re-runs on retry. Delays between attempts suspend the
-/// execution (the backend owns the timer), and the retry progress itself is
-/// derived from checkpointed results, so it survives suspension.
+/// starts clean: nothing recorded by a failed attempt is replayed into the
+/// next one, so every operation in the block re-runs on retry. Delays
+/// between attempts suspend the execution, and retry progress survives
+/// suspension.
 ///
 /// Without an explicit strategy the block uses the same default a step
 /// uses: 6 total attempts with exponential backoff (5s initial delay, 60s
 /// cap, factor 2).
 ///
-/// On the wire the block appears as a child context (sub-type
-/// `RunInChildContext`) containing one nested child context per attempt
-/// (named `attempt-N`) and one wait per retry delay (named
-/// `retry-delay-N`). When retries exhaust, the operation fails with a
+/// When retries exhaust, the operation fails with a
 /// [`ChildContextError`](crate::ChildContextError) whose message carries
 /// the attempt count and the last attempt's error.
 ///
-/// The builder is generic over the block closure `F` and its future `Fut`
-/// so the body is stored **without type erasure**; both parameters are
-/// inferred at the call site and never written by users. The single
-/// erasure point is `.future()` / `.await`, which produces the one
-/// [`DurableFuture`] box.
+/// The builder is generic over the block closure `F` and its future
+/// `Fut`; both parameters are inferred at the call site and never written
+/// by users.
 ///
 /// # Examples
 ///
@@ -176,8 +171,8 @@ where
     /// Sets the retry strategy for this block from a
     /// [`RetryStrategyConfig`](crate::builders::RetryStrategyConfig).
     ///
-    /// Use this for the common case — shaping retry delays (attempt count,
-    /// initial delay, cap, backoff rate, jitter) — without hand-writing a
+    /// Use this for the common case, shaping retry delays (attempt count,
+    /// initial delay, cap, backoff rate, jitter), without hand-writing a
     /// closure. For decisions a delay schedule cannot express, such as
     /// inspecting the error, use [`retry_strategy`](Self::retry_strategy)
     /// instead.
@@ -215,7 +210,7 @@ where
     /// Overrides the serialization strategy for the block's result.
     ///
     /// Replaces the builder's serdes type parameter with `S2`, which must
-    /// implement [`Serdes<O>`](crate::Serdes) for this block's output type —
+    /// implement [`Serdes<O>`](crate::Serdes) for this block's output type:
     /// attaching a serdes for a different type fails at compile time. To
     /// share one instance across operations, wrap it in an
     /// [`Arc`] and clone the `Arc` handle into each builder.
@@ -234,10 +229,14 @@ where
         }
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
     ///
-    /// Equivalent to `.into_future()` but more discoverable for fan-out
-    /// patterns where you need to hold multiple futures.
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<O>
     where
         S: Serdes<O>,
@@ -247,9 +246,13 @@ where
 
     /// Eagerly spawns the retry block on a tokio task.
     ///
-    /// The returned [`DurableFuture`] is already running. The operation ID
-    /// was already claimed at builder creation, so spawn order does not
-    /// affect replay.
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     ///
     /// # Examples
     ///
@@ -312,7 +315,7 @@ where
             name: self.name,
             serdes,
             // A concrete closure returning the concrete retry-loop future:
-            // no erasure here — the one box is the DurableFuture below.
+            // no erasure here: the one box is the DurableFuture below.
             closure: move |outer_ctx| {
                 crate::with_retry::retry_loop(outer_ctx, closure, strategy, loop_serdes)
             },

@@ -2,8 +2,8 @@
 //!
 //! [`try_join_all`] runs a set of durable operations concurrently and returns
 //! their results as a `Vec` in input order, failing fast the moment any one
-//! errors. It is the durable analogue of JavaScript's `Promise.all`, and — like
-//! every combinator here — is itself a checkpointed operation, so its combined
+//! errors. It is the durable analogue of JavaScript's `Promise.all`, and, like
+//! every combinator here, is itself a checkpointed operation, so its combined
 //! result is frozen and replayed deterministically.
 //!
 //! Combinators take uniform [`DurableFuture`]s. Convert a builder to one with

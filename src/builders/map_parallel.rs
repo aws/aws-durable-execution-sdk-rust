@@ -3,6 +3,10 @@
 //! [`DurableContext::parallel`](crate::DurableContext::parallel), plus
 //! their shared completion configuration ([`CompletionConfig`]) and the
 //! batch result types.
+//!
+//! The [map operation guide](https://docs.aws.amazon.com/durable-execution/sdk-reference/operations/map/) and the
+//! [parallel operation guide](https://docs.aws.amazon.com/durable-execution/sdk-reference/operations/parallel/)
+//! describe these operations independently of any language SDK.
 
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
@@ -21,22 +25,14 @@ pub use crate::map_parallel::{
     CompletionReason, NestingMode, SettledOutcome,
 };
 
-// ============================================================
-// MapBuilder
-// ============================================================
-
 /// Builder for a durable map operation.
 ///
 /// Created by [`DurableContext::map`]. Applies a function to each item
 /// with configurable concurrency and completion behavior.
 ///
-/// The builder is generic over the item closure `F` and its future `Fut`
-/// so the closure is stored **without type erasure**; both parameters are
-/// inferred at the call site and never written by users. At execution the
-/// closure is shared as `Arc<F>` and every item produces a concrete
-/// future, so the internal `JoinSet` holds unboxed futures. The single
-/// erasure point is `.future()` / `.await`, which produces the one
-/// [`DurableFuture`] box.
+/// The builder is generic over the item closure `F` and its future `Fut`;
+/// both parameters are inferred at the call site and never written by
+/// users.
 ///
 /// # Examples
 ///
@@ -138,8 +134,8 @@ where
 
     /// Sets the completion configuration.
     ///
-    /// **Default: fail fast.** Without this call — or with an empty
-    /// [`CompletionConfig`] (no threshold, no predicate) — the first item
+    /// **Default: fail fast.** Without this call, or with an empty
+    /// [`CompletionConfig`] (no threshold, no predicate), the first item
     /// failure fails the batch, matching the Python and JS SDKs.
     /// Configuring any criterion replaces that implicit fail-fast with the
     /// configured criteria:
@@ -156,7 +152,7 @@ where
     /// Sets a custom serializer/deserializer for item results.
     ///
     /// The serdes must implement [`Serdes<O>`](crate::Serdes) for this
-    /// map's item output type — attaching a serdes for a different type
+    /// map's item output type: attaching a serdes for a different type
     /// fails at compile time. It goes through the same transform boundary
     /// as every other operation, so a [`Serdes`] attached here behaves
     /// exactly as it does on a step, invoke, callback, or `result_serdes`.
@@ -184,7 +180,7 @@ where
     ///
     /// This is the operation-level serdes: it serializes and deserializes
     /// the entire batch summary ([`BatchSummary`]) rather than individual
-    /// items, so it must implement `Serdes<BatchSummary>` — typically
+    /// items, so it must implement `Serdes<BatchSummary>`: typically
     /// through a type-agnostic blanket `impl<T> Serdes<T>`.
     pub fn result_serdes<RS2>(self, serdes: RS2) -> MapBuilder<I, O, F, Fut, IS, RS2>
     where
@@ -242,7 +238,7 @@ where
     ///
     /// Returns an error if the batch execution encounters an infrastructure
     /// failure (checkpoint client error, task-ownership violation, invalid
-    /// configuration). Item-level failures are NOT errors — they appear as
+    /// configuration). Item-level failures are NOT errors: they appear as
     /// `BatchItemStatus::Failed` entries in the result, and the batch's
     /// [`CompletionReason`] records why the batch ended.
     ///
@@ -313,7 +309,14 @@ where
         execution.execute_batch_result().await
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
+    ///
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
@@ -323,6 +326,14 @@ where
     }
 
     /// Eagerly spawns the map operation on a tokio task.
+    ///
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     pub fn spawn(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
@@ -369,10 +380,6 @@ where
         DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
     }
 }
-
-// ============================================================
-// ParallelBuilder
-// ============================================================
 
 /// Builder for a parallel operation with named branches.
 ///
@@ -461,8 +468,8 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
 
     /// Sets the completion configuration.
     ///
-    /// **Default: fail fast.** Without this call — or with an empty
-    /// [`CompletionConfig`] (no threshold, no predicate) — the first branch
+    /// **Default: fail fast.** Without this call, or with an empty
+    /// [`CompletionConfig`] (no threshold, no predicate), the first branch
     /// failure fails the batch, matching the Python and JS SDKs.
     /// Configuring any criterion replaces that implicit fail-fast with the
     /// configured criteria:
@@ -479,7 +486,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// Sets a custom serializer/deserializer for branch results.
     ///
     /// The serdes must implement [`Serdes<O>`](crate::Serdes) for this
-    /// operation's branch output type — attaching a serdes for a different
+    /// operation's branch output type: attaching a serdes for a different
     /// type fails at compile time. It goes through the same transform
     /// boundary as every other operation, so a [`Serdes`] attached here
     /// behaves exactly as it does on a step, invoke, callback, or
@@ -506,7 +513,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     ///
     /// This is the operation-level serdes: it serializes and deserializes
     /// the entire batch summary ([`BatchSummary`]) rather than individual
-    /// items, so it must implement `Serdes<BatchSummary>` — typically
+    /// items, so it must implement `Serdes<BatchSummary>`: typically
     /// through a type-agnostic blanket `impl<T> Serdes<T>`.
     pub fn result_serdes<RS2>(self, serdes: RS2) -> ParallelBuilder<O, IS, RS2>
     where
@@ -555,7 +562,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     ///
     /// Returns an error if the batch execution encounters an infrastructure
     /// failure (checkpoint client error, task-ownership violation, invalid
-    /// configuration). Branch-level failures are NOT errors — they appear as
+    /// configuration). Branch-level failures are NOT errors: they appear as
     /// `BatchItemStatus::Failed` entries in the result, and the batch's
     /// [`CompletionReason`] records why the batch ended.
     ///
@@ -620,7 +627,14 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
         execution.execute_batch_result().await
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
+    ///
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
@@ -630,6 +644,14 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     }
 
     /// Eagerly spawns the parallel operation on a tokio task.
+    ///
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     pub fn spawn(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
@@ -688,14 +710,14 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 ///
 /// Controls early-completion thresholds: how many items must succeed and
 /// how many failures are tolerated before stopping. Thresholds may be
-/// combined — when multiple are set (including a
+/// combined: when multiple are set (including a
 /// [completion predicate](Self::with_completion_predicate)), the first
 /// trigger to fire wins.
 ///
 /// # Default: fail fast
 ///
-/// An **empty** config — [`CompletionConfig::default()`], with no threshold
-/// and no predicate — fails the batch on the **first item failure**, exactly
+/// An **empty** config: [`CompletionConfig::default()`], with no threshold
+/// and no predicate: fails the batch on the **first item failure**, exactly
 /// as running with no config at all does. This matches the Python and JS
 /// SDKs. Configuring any criterion opts out of that implicit fail-fast and
 /// hands the decision to the configured criteria:
@@ -705,8 +727,8 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 ///
 /// Construct with [`CompletionConfig::builder`] (which combines thresholds
 /// and validates them at [`build`](CompletionConfigBuilder::build) time) or
-/// with one of the single-threshold constructors. Fields are private per
-/// C-STRUCT-PRIVATE; read values back through the accessors.
+/// with one of the single-threshold constructors. Read values back
+/// through the accessors.
 ///
 /// # Examples
 ///
@@ -725,7 +747,7 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 /// let custom = CompletionConfig::with_completion_predicate(|stats| stats.settled() >= 2);
 /// assert!(custom.has_completion_predicate());
 ///
-/// // Combined thresholds — first to fire wins.
+/// // Combined thresholds: first to fire wins.
 /// let combined = CompletionConfig::builder()
 ///     .min_successful(2)
 ///     .tolerated_failure_count(1)
@@ -736,6 +758,9 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 /// ```
 #[derive(Clone, Default)]
 #[non_exhaustive]
+// Fields are private so the struct can grow without breaking callers;
+// see the Rust API Guidelines on structs with private fields:
+// https://rust-lang.github.io/api-guidelines/future-proofing.html#c-struct-private
 pub struct CompletionConfig {
     /// Completes the batch early once this many items succeed.
     /// `None` means no minimum-success threshold.
@@ -802,7 +827,7 @@ impl CompletionConfig {
     /// **Default when unset:** the batch runs until every item settles.
     /// Note that a config carrying only this threshold has no failure
     /// tolerance configured, so item failures are tolerated while the
-    /// batch waits to reach `min` successes — the implicit fail-fast of an
+    /// batch waits to reach `min` successes: the implicit fail-fast of an
     /// empty config no longer applies once any criterion is set.
     #[must_use]
     pub fn with_min_successful(min: usize) -> Self {
@@ -832,7 +857,7 @@ impl CompletionConfig {
     /// The batch stops once the true failure rate **strictly exceeds** the
     /// given percentage.  Internally this uses cross-multiplication
     /// (`failure_count * 100 > pct * total_items`) to avoid integer-division
-    /// truncation — so a failure rate of 33.3% (1 of 3) correctly exceeds a
+    /// truncation, so a failure rate of 33.3% (1 of 3) correctly exceeds a
     /// 33% threshold.
     ///
     /// Use `0` for explicit fail-fast behavior (stop on first failure).
@@ -854,11 +879,11 @@ impl CompletionConfig {
     ///
     /// The predicate receives the running [`BatchStats`] and returns `true`
     /// to end the batch early. A batch completed
-    /// this way records [`CompletionReason::PredicateMatched`], and — like a
-    /// [`min_successful`](Self::with_min_successful) completion — item
+    /// this way records [`CompletionReason::PredicateMatched`], and: like a
+    /// [`min_successful`](Self::with_min_successful) completion: item
     /// failures inside it are tolerated rather than propagated as errors.
     /// Setting a predicate counts as a completion criterion, so it also
-    /// replaces the implicit fail-fast of an empty config — the predicate
+    /// replaces the implicit fail-fast of an empty config: the predicate
     /// owns the completion decision.
     ///
     /// When combined with fixed thresholds (via
@@ -866,12 +891,12 @@ impl CompletionConfig {
     /// matching the existing threshold semantics: the SDK checks
     /// `min_successful`, then the failure tolerances, then this predicate.
     ///
-    /// # Determinism — read this before using
+    /// # Determinism: read this before using
     ///
     /// **The predicate MUST be a deterministic, pure function of the
     /// [`BatchStats`] it receives.** If the predicate consults anything
-    /// else — the clock, random numbers, environment state, an external
-    /// service, or mutable captured state — replays can diverge from the
+    /// else, the clock, random numbers, environment state, an external
+    /// service, or mutable captured state, replays can diverge from the
     /// original run, which corrupts the execution history. Put
     /// nondeterminism inside a step body, never inside a completion
     /// predicate.
@@ -935,7 +960,7 @@ impl CompletionConfig {
         self.completion_predicate.is_some()
     }
 
-    /// Reports whether ANY completion criterion is configured — a threshold
+    /// Reports whether ANY completion criterion is configured: a threshold
     /// or a custom predicate (crate-internal).
     ///
     /// An empty config (nothing set) fails the batch on the first item
@@ -1107,18 +1132,18 @@ impl CompletionConfigBuilder {
     /// to end the batch early with
     /// [`CompletionReason::PredicateMatched`]. It composes with the fixed
     /// thresholds: the SDK checks `min_successful`, then the failure
-    /// tolerances, then this predicate — the first trigger to fire wins,
+    /// tolerances, then this predicate: the first trigger to fire wins,
     /// matching the existing threshold semantics. Setting a predicate
     /// counts as a completion criterion, so it also replaces the implicit
-    /// fail-fast of an empty config — the predicate owns the completion
+    /// fail-fast of an empty config: the predicate owns the completion
     /// decision.
     ///
-    /// # Determinism — read this before using
+    /// # Determinism: read this before using
     ///
     /// **The predicate MUST be a deterministic, pure function of the
     /// [`BatchStats`] it receives.** If the predicate consults anything
-    /// else — the clock, random numbers, environment state, an external
-    /// service, or mutable captured state — replays can diverge from the
+    /// else, the clock, random numbers, environment state, an external
+    /// service, or mutable captured state, replays can diverge from the
     /// original run, which corrupts the execution history. Put
     /// nondeterminism inside a step body, never inside a completion
     /// predicate.
@@ -1129,7 +1154,7 @@ impl CompletionConfigBuilder {
     /// enters only after items `0..i` have all settled), whatever order
     /// the items actually finished in at run time. Live settlement order
     /// is scheduler-timed and unrecorded, so it never influences the
-    /// statistics — a pure predicate therefore sees the identical sequence
+    /// statistics: a pure predicate therefore sees the identical sequence
     /// of [`BatchStats`] snapshots on the original run and on every
     /// replay. The corollary: a slow or suspended item holds later items'
     /// outcomes out of the statistics until it settles.
@@ -1187,8 +1212,8 @@ impl CompletionConfigBuilder {
 mod tests {
     use super::*;
 
-    /// The `CompletionConfig` builder combines thresholds in one expression —
-    /// no `Default`-then-mutate — and the built config drives the same
+    /// The `CompletionConfig` builder combines thresholds in one expression,
+    /// no `Default`-then-mutate, and the built config drives the same
     /// completion decisions the single-threshold constructors do.
     #[test]
     fn completion_config_builder_combines_thresholds() {

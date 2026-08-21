@@ -7,7 +7,7 @@ name: Conformance Tests
 # pinned language-agnostic runner.
 #
 # The handlers are built EXACTLY ONCE, in build_handlers, and shipped to the
-# suite jobs as an artifact. The suite jobs deploy and test only — they carry
+# suite jobs as an artifact. The suite jobs deploy and test only: they carry
 # no Rust toolchain and never invoke cargo.
 
 on:

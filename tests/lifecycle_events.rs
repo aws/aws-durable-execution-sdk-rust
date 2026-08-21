@@ -120,7 +120,7 @@ async fn step_and_wait_lifecycle_events_follow_the_contract() {
 
     let output = captured(&buffer);
 
-    // operation_started: once for the step, once for the wait — replay on
+    // operation_started: once for the step, once for the wait: replay on
     // the resumed invocation must NOT re-emit them.
     let started = lifecycle_events(&output, event_names::OPERATION_STARTED);
     let step_started = events_with_field(&started, field_names::OPERATION_TYPE, "Step");
@@ -257,7 +257,7 @@ async fn step_and_wait_lifecycle_events_follow_the_contract() {
 
     // Span-name contract: the live step body runs inside a
     // `durable_operation` span nested in the handler's `durable_execution`
-    // span — visible on the span scope of the event logged in the body.
+    // span: visible on the span scope of the event logged in the body.
     let in_step_line = output
         .lines()
         .find(|line| line.contains("inside the step body"))
@@ -272,8 +272,8 @@ async fn step_and_wait_lifecycle_events_follow_the_contract() {
     );
 }
 
-/// A retrying step emits `operation_retry_scheduled` per scheduled retry —
-/// with the failing attempt number, the delay, and the error — then
+/// A retrying step emits `operation_retry_scheduled` per scheduled retry,
+/// with the failing attempt number, the delay, and the error, then
 /// `operation_succeeded` on the attempt that passes.
 #[tokio::test]
 async fn retrying_step_emits_retry_scheduled_events() {
@@ -418,7 +418,7 @@ async fn failing_step_emits_operation_failed() {
 /// `durable_execution` span: `execution_started` / `execution_resumed` are
 /// emitted while the span is entered before the handler runs, and
 /// `execution_suspended` while it is entered after the handler future is
-/// dropped — which is what lets the documented OpenTelemetry bridge export
+/// dropped, which is what lets the documented OpenTelemetry bridge export
 /// them on the execution span.
 #[tokio::test]
 async fn execution_events_are_span_events_of_the_execution_span() {
@@ -463,7 +463,7 @@ async fn execution_events_are_span_events_of_the_execution_span() {
 
 /// `operation_replayed` covers the terminal replay paths beyond step and
 /// wait: a child context, a `wait_for_condition`, and a callback each emit
-/// it — with the documented identity fields — when a resumed invocation
+/// it, with the documented identity fields, when a resumed invocation
 /// returns their recorded outcome without re-running them.
 #[tokio::test]
 async fn replayed_events_cover_child_condition_and_callback() {
@@ -503,9 +503,9 @@ async fn replayed_events_cover_child_condition_and_callback() {
                     .await?;
 
                 // A final suspension forces one more resume, on which every
-                // operation above — including the wait_for_callback context,
+                // operation above, including the wait_for_callback context,
                 // which only records Succeed on the invocation that consumed
-                // the callback — replays from its terminal record.
+                // the callback, replays from its terminal record.
                 ctx.wait(Duration::from_secs(1)).name("final-pause").await?;
 
                 Ok::<_, durable::BoxError>(format!("{doubled}-{polls}-{approval}"))
@@ -573,7 +573,7 @@ async fn replayed_events_cover_child_condition_and_callback() {
 /// events claim a transition was recorded, so they fire only after the
 /// checkpoint that persists it succeeds. The step whose START write is
 /// rejected unwinds the handler through the unrecoverable path (issue
-/// #43) — the execution fails, and no `operation_started` is emitted.
+/// #43): the execution fails, and no `operation_started` is emitted.
 #[tokio::test]
 async fn rejected_checkpoint_emits_no_record_transition_event() {
     let (buffer, _guard) = capture_subscriber();
@@ -611,8 +611,8 @@ async fn rejected_checkpoint_emits_no_record_transition_event() {
 }
 
 /// A serdes whose serialize side works (so the live step records normally)
-/// and whose deserialize side succeeds exactly once — covering the live
-/// path's round-trip — then always fails, simulating a payload that decodes
+/// and whose deserialize side succeeds exactly once, covering the live
+/// path's round-trip, then always fails, simulating a payload that decodes
 /// during the original invocation but is corrupt at replay time.
 #[derive(Debug)]
 struct FailOnReplayDeserializeSerdes(Arc<std::sync::atomic::AtomicU32>);
@@ -648,8 +648,8 @@ impl durable::Serdes<u32> for FailOnReplayDeserializeSerdes {
 /// REGRESSION: `operation_replayed` claims a recorded terminal outcome was
 /// returned, so it must be emitted only after the recorded payload is
 /// successfully reconstructed. A step whose recorded result fails to
-/// deserialize on replay surfaces an error and emits NO `operation_replayed`
-/// — while its live-path events from the first invocation remain intact.
+/// deserialize on replay surfaces an error and emits NO `operation_replayed`,
+/// while its live-path events from the first invocation remain intact.
 #[tokio::test]
 async fn failed_replay_decode_emits_no_operation_replayed() {
     let (buffer, _guard) = capture_subscriber();
@@ -668,7 +668,7 @@ async fn failed_replay_decode_emits_no_operation_replayed() {
                             .serdes(FailOnReplayDeserializeSerdes(decode_calls))
                             .await?;
                         // The wait suspends the execution, so the resume
-                        // replays the step — and the replay decode fails.
+                        // replays the step, and the replay decode fails.
                         ctx.wait(Duration::from_secs(1))
                             .name("force-resume")
                             .await?;

@@ -4,7 +4,7 @@
 //! the child body (via `?` converting into
 //! [`BoxError`](aws_durable_execution_sdk_rust::BoxError)) and surfaces
 //! at the parent as the child operation's error. The parent decides what to do
-//! with it: propagate further, or — as here — catch it and continue.
+//! with it: propagate further, or, as here, catch it and continue.
 //!
 //! This example runs a child whose second step deliberately fails. The parent
 //! catches the resulting error and returns a success value describing it, so

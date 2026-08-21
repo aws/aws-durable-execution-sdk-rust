@@ -3,7 +3,7 @@
 //!
 //! Issue #48: dropping a `.spawn()` handle before its task's first poll used
 //! to abort the task before its settling guard existed, leaving a phantom
-//! outstanding spawn that parked the owner scope forever — the next
+//! outstanding spawn that parked the owner scope forever: the next
 //! `ctx.wait` could never suspend and the invocation deadlocked.
 //!
 //! Issue #49: inputs of a directly awaited combinator used to park the
@@ -60,8 +60,8 @@ async fn dropping_unpolled_spawn_does_not_deadlock_next_wait() {
 
 /// Reproducer from issue #49. A directly awaited `race` must not let its
 /// losing input park the root suspension scope: the fast step settles and
-/// wins, so the losing 60 second wait — isolated in its own constituent
-/// scope — must not suspend the invocation, and the execution completes in
+/// wins, so the losing 60 second wait, isolated in its own constituent
+/// scope, must not suspend the invocation, and the execution completes in
 /// a single invocation.
 #[tokio::test(flavor = "current_thread")]
 async fn race_does_not_propagate_loser_suspension_to_root() {
@@ -99,8 +99,8 @@ async fn race_does_not_propagate_loser_suspension_to_root() {
 }
 
 /// `select_ok` counterpart of the issue #49 reproducer: the immediately
-/// successful input wins, and the losing wait — parked in its own
-/// constituent scope — must not suspend the root invocation.
+/// successful input wins, and the losing wait, parked in its own
+/// constituent scope, must not suspend the root invocation.
 #[tokio::test(flavor = "current_thread")]
 async fn select_ok_does_not_propagate_loser_suspension_to_root() {
     let result = LocalRunner::new()
@@ -137,7 +137,7 @@ async fn select_ok_does_not_propagate_loser_suspension_to_root() {
 }
 
 /// `try_join_all` counterpart: a settling error fails the join fast, and
-/// the parked wait sibling must not suspend the root invocation — the
+/// the parked wait sibling must not suspend the root invocation: the
 /// combined failure is recorded in the same (single) invocation.
 #[tokio::test(flavor = "current_thread")]
 async fn try_join_all_fail_fast_ignores_parked_sibling() {
@@ -174,7 +174,7 @@ async fn try_join_all_fail_fast_ignores_parked_sibling() {
     );
 }
 
-/// When no input can make progress, the combinator itself must suspend —
+/// When no input can make progress, the combinator itself must suspend,
 /// and resume once the backend advances. A `race` over two waits parks
 /// both inputs, suspends exactly once, and the shorter wait wins on the
 /// resumed invocation.

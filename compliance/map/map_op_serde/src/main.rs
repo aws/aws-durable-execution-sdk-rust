@@ -1,5 +1,5 @@
 //! Conformance requirement 9-19: Map with an operation-level (whole-result)
-//! serdes — serialize on a fresh operation.
+//! serdes: serialize on a fresh operation.
 //!
 //! Uses `.result_serdes()` with a custom serializer that emits
 //! `"OPSERDE:X,Y"` for the whole map result payload.
@@ -37,7 +37,7 @@ where
                         item.get("result")
                             .and_then(serde_json::Value::as_str)
                             .map(|s| {
-                                // Each item carries its own wire string — a
+                                // Each item carries its own wire string: a
                                 // JSON-encoded string here, so strip the quotes.
                                 s.trim_matches('"').to_owned()
                             })

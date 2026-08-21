@@ -42,7 +42,7 @@ impl WaitExecution {
         )? {
             match view.status {
                 CheckpointStatus::Succeeded => {
-                    // Timer completed — return immediately.
+                    // Timer completed: return immediately.
                     self.ctx.emit_operation_replayed(
                         &wire_id,
                         self.name.as_deref(),
@@ -53,7 +53,7 @@ impl WaitExecution {
                     return Ok(());
                 }
                 CheckpointStatus::Started => {
-                    // Timer started but not yet completed — suspend by
+                    // Timer started but not yet completed: suspend by
                     // parking the future; the driver drops it and reports
                     // PENDING.
                     return self.ctx.suspend_now().await;
@@ -64,7 +64,7 @@ impl WaitExecution {
                 | CheckpointStatus::Cancelled
                 | CheckpointStatus::TimedOut
                 | CheckpointStatus::Stopped => {
-                    // Unexpected status for wait — treat as error.
+                    // Unexpected status for wait: treat as error.
                     return Err(OperationError::from_kind(OperationErrorKind::Wait(
                         WaitError::new(
                             WaitErrorKind::UnexpectedStatus(crate::error::UnexpectedStatus::new(
@@ -76,7 +76,7 @@ impl WaitExecution {
                     .with_operation(&wire_id, view.status.wire_str()));
                 }
                 CheckpointStatus::Unknown(ref raw) => {
-                    // Unreachable in production — `checkpoint_view_validated`
+                    // Unreachable in production: `checkpoint_view_validated`
                     // already failed the execution (issue #45). Kept as a
                     // typed arm so a future bypass fails loudly instead of
                     // being demoted to a catchable unexpected-status error.
@@ -93,7 +93,7 @@ impl WaitExecution {
             self.duration_secs,
         );
         if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-            // Audit (#43) — wait START: no user code ran, so there is no
+            // Audit (#43): wait START: no user code ran, so there is no
             // side effect needing a recorded outcome. No terminal FAIL:
             // the invocation dies, the service re-invokes, and replay
             // reaches this point and attempts the same write, losing only
@@ -104,12 +104,12 @@ impl WaitExecution {
                 .await;
         }
 
-        // Request suspension — the backend owns the timer.
+        // Request suspension: the backend owns the timer.
         self.ctx.suspend_now().await
     }
 }
 
-// ── Update builder ──────────────────────────────────────────────────────
+// Update builder
 
 fn build_wait_start_update(
     wire_id: &str,
@@ -284,8 +284,8 @@ mod tests {
         );
         // The offending status is a structural fact behind the payload's
         // accessor, and renders in the flattened chain. (A let-chain here
-        // trips 1.94.1's irrefutable-let lint — `WaitErrorKind` has one
-        // variant — so extract through a single-arm match instead.)
+        // trips 1.94.1's irrefutable-let lint, `WaitErrorKind` has one
+        // variant, so extract through a single-arm match instead.)
         if let OperationErrorKind::Wait(e) = err.kind() {
             match e.kind() {
                 WaitErrorKind::UnexpectedStatus(details) => {
@@ -346,7 +346,7 @@ mod tests {
         let _debug = format!("{builder:?}");
         // Execute via IntoFuture
         let signal = Arc::clone(ctx.suspension_signal());
-        // Should suspend (not panic) — name was propagated successfully.
+        // Should suspend (not panic): name was propagated successfully.
         let outcome = crate::driver::test_support::outcome_of(signal, builder).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
@@ -456,9 +456,9 @@ mod tests {
             log,
         );
 
-        // Build a wait with 500ms — should round up to 1 second.
+        // Build a wait with 500ms: should round up to 1 second.
         let builder = ctx.wait(Duration::from_millis(500));
-        // The builder stores duration_secs internally — verify via execution.
+        // The builder stores duration_secs internally: verify via execution.
         // We can't inspect private fields, but the execution should not panic.
         let _debug = format!("{builder:?}");
     }

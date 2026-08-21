@@ -1,4 +1,4 @@
-//! Conformance handler for requirement 4-17: two callbacks — sequential create and wait.
+//! Conformance handler for requirement 4-17: two callbacks: sequential create and wait.
 //! Create A, wait for A, create B, wait for B, return both.
 
 use aws_durable_execution_sdk_rust as durable;

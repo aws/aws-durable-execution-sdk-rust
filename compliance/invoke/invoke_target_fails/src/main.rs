@@ -2,7 +2,7 @@
 
 use aws_durable_execution_sdk_rust as durable;
 
-/// Handler: invoke target that errors — propagates InvokeError.
+/// Handler: invoke target that errors: propagates InvokeError.
 async fn handler(
     event: serde_json::Value,
     ctx: durable::DurableContext,

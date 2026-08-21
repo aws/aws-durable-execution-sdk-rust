@@ -3,7 +3,7 @@
 //! Drives a handler that logs before and after a durable wait through
 //! [`LocalRunner`] with [`ReplayFilterLayer`] installed, and asserts each
 //! handler-level log line is emitted exactly once across the whole
-//! execution — the resumed invocation replays the code before the wait
+//! execution: the resumed invocation replays the code before the wait
 //! without re-emitting its log line.
 
 #![cfg(all(feature = "test-util", feature = "replay-filter"))]

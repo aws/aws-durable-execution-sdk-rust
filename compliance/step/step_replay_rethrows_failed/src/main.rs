@@ -23,7 +23,7 @@ async fn handler(
 
     // Catch the error and continue.
     if let Err(_e) = step_result {
-        // Error caught — continue to wait.
+        // Error caught: continue to wait.
     }
 
     ctx.wait(Duration::from_secs(1)).await?;

@@ -2,7 +2,7 @@
 //!
 //! A [`CompletionConfig`] controls when a parallel (or map) batch is considered
 //! done. Its `min_successful` threshold completes the batch as soon as that many
-//! branches succeed, without waiting for the rest — useful for quorum or
+//! branches succeed, without waiting for the rest: useful for quorum or
 //! first-N-of-M patterns. The same config also carries failure-tolerance knobs
 //! (`tolerated_failure_count`, `tolerated_failure_percentage`) for bounding how
 //! many branch failures may pass before the batch aborts. A single threshold

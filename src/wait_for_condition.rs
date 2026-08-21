@@ -2,7 +2,7 @@
 //!
 //! Implements the live path (evaluate check fn, checkpoint state per attempt,
 //! apply wait strategy → delay-suspend or complete or exhaust) and replay path
-//! (frozen terminal state; LOUD error on state deserialization failure — never
+//! (frozen terminal state; LOUD error on state deserialization failure: never
 //! silent reset to initial state).
 //!
 //! ## Key invariants
@@ -43,27 +43,27 @@ pub(crate) const WFC_SUB_TYPE: &str = "WaitForCondition";
 /// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitDecision;
 /// use std::time::Duration;
 ///
-/// // Condition met — stop polling.
+/// // Condition met: stop polling.
 /// let done = WaitDecision::complete();
 ///
-/// // Not met — poll again after 5 seconds.
+/// // Not met: poll again after 5 seconds.
 /// let cont = WaitDecision::continue_with(Duration::from_secs(5));
 ///
-/// // Exhausted — fail the operation.
+/// // Exhausted: fail the operation.
 /// let exhausted = WaitDecision::exhausted("max attempts exceeded");
 /// # drop(done); drop(cont); drop(exhausted);
 /// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum WaitDecision {
-    /// Condition met — return the final state.
+    /// Condition met: return the final state.
     Complete,
-    /// Condition not met — suspend for `delay` then re-check.
+    /// Condition not met: suspend for `delay` then re-check.
     Continue {
         /// Duration to wait before the next check attempt.
         delay: Duration,
     },
-    /// Strategy exhaustion — fail the operation with an error.
+    /// Strategy exhaustion: fail the operation with an error.
     Exhausted {
         /// Reason for exhaustion (e.g., "max attempts exceeded").
         reason: String,
@@ -128,7 +128,7 @@ where
 {
     /// Executes the wait-for-condition operation.
     ///
-    /// Thin generic wrapper — the ONLY code monomorphized per call site.
+    /// Thin generic wrapper: the ONLY code monomorphized per call site.
     /// The checkpoint-state-strategy machine lives in the non-generic
     /// [`WfcCore`] / [`WfcAfter`] halves (generic over the state type `S`
     /// only); this wrapper just polls the user's concrete check future
@@ -169,7 +169,7 @@ where
 
 /// The pre-check half of `wait_for_condition`: task-ownership check, replay
 /// resolution, carried-state derivation, and the START checkpoint. Generic
-/// only over the state type `S` — no user closure reaches this state
+/// only over the state type `S`, no user closure reaches this state
 /// machine, so its substantial replay/checkpoint logic compiles once per
 /// state type instead of once per call site.
 struct WfcCore<S, SD> {
@@ -275,22 +275,22 @@ where
                     ))));
                 }
                 CheckpointStatus::Pending => {
-                    // Retry timer hasn't fired yet — suspend.
+                    // Retry timer hasn't fired yet: suspend.
                     return Ok(WfcPrelude::Done(self.ctx.suspend_now().await));
                 }
                 CheckpointStatus::Started => {
-                    // This invocation already checkpointed START — skip it.
+                    // This invocation already checkpointed START: skip it.
                     already_started = true;
                 }
                 CheckpointStatus::Ready
                 | CheckpointStatus::Cancelled
                 | CheckpointStatus::TimedOut
                 | CheckpointStatus::Stopped => {
-                    // Only statusStarted skips START — other statuses
+                    // Only statusStarted skips START: other statuses
                     // need a fresh StepStarted for the per-attempt protocol.
                 }
                 CheckpointStatus::Unknown(ref raw) => {
-                    // Unreachable in production — `checkpoint_view_validated`
+                    // Unreachable in production: `checkpoint_view_validated`
                     // already failed the execution (issue #45). Kept as a
                     // typed arm so a future bypass cannot fall through to a
                     // fresh attempt against a possibly-terminal record.
@@ -330,7 +330,7 @@ where
                 None,
             );
             if let Err(err) = self.ctx.checkpoint_updates(vec![start_update]).await {
-                // Audit (#43) — wait-for-condition START: no user code ran
+                // Audit (#43): wait-for-condition START: no user code ran
                 // for this attempt, so no terminal FAIL is needed;
                 // re-invocation reconverges on the same write.
                 return self
@@ -383,7 +383,7 @@ where
                 //
                 // A state serialization (or round-trip) failure is a
                 // LOCAL, deterministic, user-facing failure, so it stays
-                // catchable — but the terminal FAIL is persisted FIRST
+                // catchable, but the terminal FAIL is persisted FIRST
                 // (issue #43). The check already ran, so its side effects
                 // need a recorded outcome: with the FAIL recorded, replay
                 // yields it instead of re-running the check.
@@ -406,7 +406,7 @@ where
                             &wire,
                         );
                         if let Err(client_err) = self.ctx.checkpoint_updates(vec![update]).await {
-                            // Audit (#43) — wfc FAIL (serialization): the
+                            // Audit (#43): wfc FAIL (serialization): the
                             // check ran; the failed FAIL write routes
                             // unrecoverable with a minimal terminal FAIL
                             // retry.
@@ -440,7 +440,7 @@ where
                             None,
                         );
                         if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-                            // Audit (#43) — wfc SUCCEED: the check ran, so
+                            // Audit (#43): wfc SUCCEED: the check ran, so
                             // its side effects need a recorded outcome. A
                             // permanent rejection persists a small
                             // terminal FAIL before the execution fails.
@@ -464,7 +464,7 @@ where
                             Some(delay_secs),
                         );
                         if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-                            // Audit (#43) — wfc RETRY: the check ran; a
+                            // Audit (#43): wfc RETRY: the check ran; a
                             // retry the service never recorded would not
                             // replay, so a permanent rejection persists a
                             // small terminal FAIL before the execution
@@ -492,7 +492,7 @@ where
                             &wire,
                         );
                         if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-                            // Audit (#43) — wfc FAIL (strategy exhausted):
+                            // Audit (#43): wfc FAIL (strategy exhausted):
                             // the check ran; the failed FAIL write routes
                             // unrecoverable with a minimal terminal FAIL
                             // retry.
@@ -520,7 +520,7 @@ where
                     &wire,
                 );
                 if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43) — wfc FAIL (check error): the check ran
+                    // Audit (#43): wfc FAIL (check error): the check ran
                     // and failed; the failed FAIL write routes
                     // unrecoverable with a minimal terminal FAIL retry
                     // (the original carried the check error's payload).
@@ -539,8 +539,8 @@ where
 
     /// Routes a rejected outcome write through the unrecoverable path
     /// (issue #43), never returning. The check ran at every settle site,
-    /// so each supplies a small checkpoint-failure-derived terminal `FAIL`
-    /// — the record persisted before the execution dies when the
+    /// so each supplies a small checkpoint-failure-derived terminal `FAIL`:
+    /// the record persisted before the execution dies when the
     /// rejection is permanent.
     async fn checkpoint_unrecoverable<T>(&self, err: crate::client::ClientError) -> T {
         let cwire = crate::error::checkpoint_failure_wire(&err);
@@ -556,7 +556,7 @@ where
     }
 }
 
-// ── Update builders ─────────────────────────────────────────────────────
+// Update builders
 
 /// Replays a terminal success from the checkpoint log.
 /// CRITICAL: NEVER falls back to `initial_state` (Python #574 / JS #754 fix).
@@ -583,8 +583,8 @@ async fn replay_terminal_success<S, SD: Serdes<S>>(
 ///   `WaitForConditionErrorKind::SerializationFailed`.
 /// - [`crate::error::WFC_EXHAUSTED_ERROR_TYPE`] reconstructs
 ///   `WaitForConditionErrorKind::MaxChecksExceeded`, deriving the check
-///   count from `recorded_attempt` — the checkpoint record's completed
-///   retry count — exactly as the live path derived its 1-based attempt
+///   count from `recorded_attempt`, the checkpoint record's completed
+///   retry count, exactly as the live path derived its 1-based attempt
 ///   number (`recorded + 1`), so `MaxChecksExceeded::checks()` reports
 ///   the same value live and replayed. Like the live exhaustion error,
 ///   the replayed one carries no foreign source: the kind is the whole
@@ -629,7 +629,7 @@ async fn serialize_state<S, SD: Serdes<S>>(
 }
 
 /// Deserializes state from a string payload.
-/// LOUD error on failure — never silently resets (Python #574 fix).
+/// LOUD error on failure, never silently resets (Python #574 fix).
 async fn deserialize_state_str<S, SD: Serdes<S>>(
     serdes: &SD,
     payload: String,
@@ -646,7 +646,7 @@ async fn deserialize_state_str<S, SD: Serdes<S>>(
     })
 }
 
-// ── OperationUpdate builders ────────────────────────────────────────────
+// OperationUpdate builders
 
 fn build_wfc_update(
     wire_id: &str,
@@ -711,7 +711,7 @@ fn build_wfc_fail_update(
         .expect("all required OperationUpdate fields set")
 }
 
-// ── Error helpers ───────────────────────────────────────────────────────
+// Error helpers
 
 fn wfc_op_error(kind: WaitForConditionErrorKind) -> OperationError {
     wfc_op_error_with_source(kind, None)
@@ -803,7 +803,7 @@ mod tests {
         };
 
         // The START checkpoint response echoes the operation as a fresh
-        // STARTED attempt with NO result — the shape that clobbers the
+        // STARTED attempt with NO result: the shape that clobbers the
         // carried state when merged back into the log.
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let start_response_op = Operation::builder()
@@ -877,7 +877,7 @@ mod tests {
     /// The prior attempt's accepted checkpoint references a
     /// `FileSystemSerdes` payload file. The new attempt serializes fresh
     /// state and its Retry checkpoint FAILS. Replaying the accepted
-    /// envelope must still read the original bytes — the failed attempt's
+    /// envelope must still read the original bytes: the failed attempt's
     /// write must have gone to a new file, never over the committed one.
     #[tokio::test]
     async fn failed_retry_checkpoint_does_not_mutate_prior_filesystem_state() {
@@ -1103,7 +1103,7 @@ mod tests {
             other => panic!("expected WaitForCondition error, got: {other:?}"),
         }
         // The exhaustion record is constructed at a fixed-discriminator
-        // site with no escaping error to walk — the stack is captured at
+        // site with no escaping error to walk: the stack is captured at
         // the construction site rather than left empty.
         let wire = err.wire().unwrap();
         assert_eq!(
@@ -1167,7 +1167,7 @@ mod tests {
         };
 
         let result = exec.execute().await;
-        // MUST be an error — never silently returns initial_state (0).
+        // MUST be an error, never silently returns initial_state (0).
         assert!(
             result.is_err(),
             "corrupt state MUST produce an error, not silently reset to initial_state"
@@ -1312,8 +1312,8 @@ mod tests {
     /// `MaxChecksExceeded` classification.
     ///
     /// The live path persists the fixed exhaustion discriminator on the
-    /// terminal FAIL; replay must reconstruct the same kind — not the
-    /// generic `CheckFailed` — with `checks()` derived from the record's
+    /// terminal FAIL; replay must reconstruct the same kind, not the
+    /// generic `CheckFailed`, with `checks()` derived from the record's
     /// completed-retry count (`attempt + 1`), matching what the live path
     /// reported.
     #[tokio::test]

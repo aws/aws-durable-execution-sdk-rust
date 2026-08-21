@@ -1,7 +1,7 @@
 //! Internal replay engine: positional ID minting, wire ID hashing,
 //! checkpoint-log pairing, and replay-mode detection.
 //!
-//! This module is a private engine concern — nothing here is part of the
+//! This module is a private engine concern: nothing here is part of the
 //! public API surface.
 
 use std::collections::HashMap;
@@ -11,11 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
-// ────────────────────────────────────────────────────────────────────────────
-// Operation ID
-// ────────────────────────────────────────────────────────────────────────────
-
-/// A minted operation identity — the positional path and its SHA-256 wire
+/// A minted operation identity: the positional path and its SHA-256 wire
 /// form, computed once at mint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OperationId {
@@ -44,7 +40,7 @@ fn compute_wire_id(positional: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(positional.as_bytes());
     let digest = hasher.finalize();
-    // Full 64-char hex digest — fits the 64-char OperationId wire cap exactly.
+    // Full 64-char hex digest: fits the 64-char OperationId wire cap exactly.
     hex::encode_sha256(digest.as_slice())
 }
 
@@ -57,7 +53,7 @@ pub(crate) fn compute_wire_id_public(positional: &str) -> String {
 }
 
 /// Minimal hex encoder for a SHA-256 digest (32 bytes → 64 hex chars).
-/// Avoids pulling in the `hex` crate — the encoding is trivial.
+/// Avoids pulling in the `hex` crate: the encoding is trivial.
 mod hex {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
@@ -76,15 +72,11 @@ mod hex {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// ID Counter (shared across context clones via Arc)
-// ────────────────────────────────────────────────────────────────────────────
-
 /// The per-context operation-ID counter.
 ///
 /// Wrapped in `Arc` so that `DurableContext` clones (which share the same
 /// operation namespace) share a single counter. The atomic provides interior
-/// mutability without a lock — minting is a single `fetch_add(1, SeqCst)`.
+/// mutability without a lock: minting is a single `fetch_add(1, SeqCst)`.
 ///
 /// `SeqCst` is deliberate: the spec's defining invariant is that ID
 /// assignment follows program order. `SeqCst` is the only ordering that
@@ -169,10 +161,6 @@ impl IdCounter {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Checkpoint Log (replay data structure)
-// ────────────────────────────────────────────────────────────────────────────
-
 /// The status of a checkpointed operation, as recorded by the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheckpointStatus {
@@ -198,8 +186,8 @@ pub(crate) enum CheckpointStatus {
     /// A status the SDK cannot interpret must never be *acted on*: replay
     /// reaching an `Unknown` record fails the execution naming the raw
     /// status (see `DurableContext::checkpoint_view_validated`), because
-    /// guessing — treating a possibly-terminal outcome as re-runnable, or
-    /// fabricating a terminal outcome from an unreadable record — corrupts
+    /// guessing, treating a possibly-terminal outcome as re-runnable, or
+    /// fabricating a terminal outcome from an unreadable record, corrupts
     /// the execution either way.
     Unknown(String),
 }
@@ -255,7 +243,7 @@ pub(crate) struct CheckpointRecord {
     /// it back off the record; it is kept on the record so `Debug` output
     /// of a record identifies the operation it belongs to.
     #[expect(dead_code)]
-    // reason: never read back — the log keys records by this ID; retained for Debug diagnostics
+    // reason: never read back: the log keys records by this ID; retained for Debug diagnostics
     pub(crate) id: String,
     /// The operation's status.
     pub(crate) status: CheckpointStatus,
@@ -266,7 +254,7 @@ pub(crate) struct CheckpointRecord {
     /// Error message (for failed/timed-out operations).
     pub(crate) error_message: Option<String>,
     /// Opaque error payload (for failed/timed-out operations). Written
-    /// and passed through verbatim — never deserialized.
+    /// and passed through verbatim, never deserialized.
     pub(crate) error_data: Option<String>,
     /// Recorded stack trace frames (for failed/timed-out operations).
     pub(crate) stack_trace: Option<Vec<String>>,
@@ -279,7 +267,7 @@ pub(crate) struct CheckpointRecord {
     /// Error message from a failed chained invoke.
     pub(crate) invoke_error_message: Option<String>,
     /// Opaque error payload from a failed chained invoke. Written and
-    /// passed through verbatim — never deserialized.
+    /// passed through verbatim, never deserialized.
     pub(crate) invoke_error_data: Option<String>,
     /// Recorded stack trace frames from a failed chained invoke.
     pub(crate) invoke_stack_trace: Option<Vec<String>>,
@@ -302,8 +290,8 @@ pub(crate) struct CheckpointRecord {
 /// A compact, copyable view of a checkpoint record.
 ///
 /// Carries the fields that nearly every operation reads at the start of its
-/// replay check — the status, the attempt counter, and the
-/// `replay_children` marker — without cloning any of the record's owned
+/// replay check, the status, the attempt counter, and the
+/// `replay_children` marker, without cloning any of the record's owned
 /// strings. Use `CheckpointLog::status_view` (or the context-level
 /// `checkpoint_status_view`) instead of `CheckpointLog::get` when the
 /// caller consumes only these fields.
@@ -321,8 +309,8 @@ pub(crate) struct CheckpointStatusView {
 /// The terminal-replay projection of a checkpoint record.
 ///
 /// Carries exactly the fields the map/parallel replay helpers consume when
-/// reconstructing a terminal batch or child item from the log — the status,
-/// the `replay_children` marker, and the payload/error strings — so terminal
+/// reconstructing a terminal batch or child item from the log, the status,
+/// the `replay_children` marker, and the payload/error strings, so terminal
 /// replay clones at most three optional strings instead of the whole record
 /// (which also carries invoke, callback, ID, and identity fields those
 /// helpers never read). Built via the context-level
@@ -455,10 +443,6 @@ impl CheckpointLog {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Engine State (shared inner for DurableContext)
-// ────────────────────────────────────────────────────────────────────────────
-
 /// The shared engine state carried by every `DurableContext` clone.
 ///
 /// The `Arc<EngineState>` is what makes `DurableContext` cheap to clone and
@@ -502,7 +486,7 @@ impl EngineState {
     /// positional operation ID.
     ///
     /// An operation is replaying if the checkpoint log contains a terminal
-    /// record for it — meaning the result was frozen in a prior invocation.
+    /// record for it: meaning the result was frozen in a prior invocation.
     /// Production operation paths make this check through
     /// [`crate::context::DurableContext::checkpoint_view_validated`]; this
     /// direct form is retained for engine unit tests.
@@ -518,8 +502,8 @@ impl EngineState {
     /// checkpointed records and we have not yet passed the high-water mark).
     ///
     /// The context is replaying as long as the NEXT operation to be claimed
-    /// in this namespace has a checkpoint record of ANY status: a record —
-    /// terminal or still `Started` — proves a prior invocation already
+    /// in this namespace has a checkpoint record of ANY status: a record,
+    /// terminal or still `Started`, proves a prior invocation already
     /// executed the code path leading to that claim. A `Started` composite
     /// (child context, map, or parallel parent) counts: the resumed
     /// invocation re-enters it to replay its nested operations, so the code
@@ -535,21 +519,17 @@ impl EngineState {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── CheckpointStatus (issue #45) ────────────────────────────────────
+    // CheckpointStatus (issue #45)
 
     /// `Unknown` reports terminal: a status the SDK does not recognize may
     /// be a terminal status the service added, so bookkeeping must never
     /// treat the record as re-runnable or overwrite it. (Replay paths that
     /// would interpret the record fail the execution before this answer
-    /// matters — see `checkpoint_view_validated`.)
+    /// matters: see `checkpoint_view_validated`.)
     #[test]
     fn unknown_status_is_terminal_and_keeps_raw_wire_value() {
         let unknown = CheckpointStatus::Unknown("PAUSED".to_owned());
@@ -565,7 +545,7 @@ mod tests {
         assert!(CheckpointStatus::TimedOut.is_terminal());
     }
 
-    // ── Counter basics ──────────────────────────────────────────────────
+    // Counter basics
 
     #[test]
     fn counter_starts_at_one() {
@@ -607,7 +587,7 @@ mod tests {
         assert_eq!(wait_id.positional(), "4");
     }
 
-    // ── Child prefix chaining produces full positional paths ────────────
+    // Child prefix chaining produces full positional paths
 
     #[test]
     fn child_prefix_chaining() {
@@ -631,7 +611,7 @@ mod tests {
         assert_eq!(gc_id2.positional(), "2-1-2");
     }
 
-    // ── SHA-256 wire ID: known-answer tests ─────────────────────────────
+    // SHA-256 wire ID: known-answer tests
 
     #[test]
     fn wire_id_known_answer_simple() {
@@ -697,7 +677,7 @@ mod tests {
         assert_eq!(id.wire(), compute_wire_id(id.positional()));
     }
 
-    // ── IDs minted at call site (creation order, not await order) ───────
+    // IDs minted at call site (creation order, not await order)
 
     #[tokio::test]
     async fn ids_minted_at_creation_not_await() {
@@ -732,7 +712,7 @@ mod tests {
         assert_eq!(id_b.positional(), "2");
     }
 
-    // ── Checkpoint-log pairing ──────────────────────────────────────────
+    // Checkpoint-log pairing
 
     #[test]
     fn checkpoint_log_returns_stored_result() {
@@ -804,7 +784,7 @@ mod tests {
         assert!(log.get("anything").is_none());
     }
 
-    // ── Targeted accessors (clone-free lookups) ─────────────────────────
+    // Targeted accessors (clone-free lookups)
 
     /// Builds a record with every string field populated, so the tests can
     /// assert the targeted accessors surface the right values without
@@ -867,7 +847,7 @@ mod tests {
         let callback_id = log.with_record("1", |r| r.callback_id.clone()).flatten();
         assert_eq!(callback_id.as_deref(), Some("cb-123"));
 
-        // Project a borrowed comparison — nothing cloned at all.
+        // Project a borrowed comparison: nothing cloned at all.
         let is_failed = log.with_record("1", |r| r.status == CheckpointStatus::Failed);
         assert_eq!(is_failed, Some(true));
 
@@ -887,7 +867,7 @@ mod tests {
         assert_eq!(record.op_name.as_deref(), Some("my-step"));
     }
 
-    // ── Replay-mode detection ───────────────────────────────────────────
+    // Replay-mode detection
 
     #[test]
     fn replay_mode_with_checkpointed_operations() {
@@ -977,7 +957,7 @@ mod tests {
 
     #[test]
     fn replay_mode_non_terminal_record_still_replaying() {
-        // A "Started" status is non-terminal — the operation re-executes.
+        // A "Started" status is non-terminal: the operation re-executes.
         // But its record proves a prior invocation already claimed it, so
         // the code path leading to it is a re-run: the context reports
         // replaying until the claim (a started child context, map, or
@@ -1008,7 +988,7 @@ mod tests {
         )]));
 
         let engine = EngineState::new_root(log);
-        // Non-terminal record: STILL replaying — a prior invocation reached
+        // Non-terminal record: STILL replaying: a prior invocation reached
         // this claim, so the code before it re-ran.
         assert!(engine.is_replaying());
         // The record is not terminal, so the operation itself re-executes.

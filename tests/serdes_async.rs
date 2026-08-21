@@ -5,7 +5,7 @@
 //! the IMPLEMENTATION owns its scheduling: `FileSystemSerdes` moves each
 //! complete call into one `tokio::task::spawn_blocking` task, so a slow
 //! filesystem never stalls the executor. This test drives a full
-//! execution — live run, suspension, and replay — with `FileSystemSerdes`
+//! execution, live run, suspension, and replay, with `FileSystemSerdes`
 //! attached, on a single-threaded runtime where any inline blocking would
 //! also be the quickest to misbehave, and verifies the round trip through
 //! the real filesystem.
@@ -47,7 +47,7 @@ impl Drop for TempBase {
 /// A step with `FileSystemSerdes` attached round-trips its result through
 /// the filesystem across a suspension: the live invocation serializes (file
 /// write, on the blocking pool), and the replay invocation deserializes
-/// (file read, on the blocking pool) — all from a current-thread runtime.
+/// (file read, on the blocking pool): all from a current-thread runtime.
 #[tokio::test]
 async fn step_round_trips_through_filesystem_across_replay() {
     let base = TempBase::new("step_replay");
@@ -89,7 +89,7 @@ async fn step_round_trips_through_filesystem_across_replay() {
     );
 
     // The step's checkpoint payload must be the file-pointer envelope, and
-    // the pointed-at file must hold the value — proof the serdes actually
+    // the pointed-at file must hold the value: proof the serdes actually
     // ran against the filesystem rather than being bypassed.
     let step_op = result
         .operations()
@@ -298,7 +298,7 @@ async fn mixed_serdes_futures_coexist_in_one_combinator() {
 /// A `Send` but non-`Sync` step output compiles and round-trips through a
 /// real operation with `FileSystemSerdes` attached: the owned-value serdes
 /// API moves the value into the blocking task, so `T: Send` is the only
-/// bound the operation needs — never `T: Sync`.
+/// bound the operation needs, never `T: Sync`.
 #[tokio::test]
 async fn send_not_sync_output_round_trips_through_operation() {
     // `Cell` is `Send` but not `Sync`.
@@ -344,14 +344,14 @@ async fn send_not_sync_output_round_trips_through_operation() {
     assert_eq!(result.output(), Some(&"send-not-sync".to_owned()));
 }
 
-// ── custom-serdes outputs without serde traits (issue #37) ──────────────
+// custom-serdes outputs without serde traits (issue #37)
 //
 // A type-specific serdes pairs with the operation's actual Rust type, so
 // the builders whose execution paths need only `S: Serdes<O>` must accept
 // an output type that implements NEITHER `Serialize` NOR
 // `DeserializeOwned`.
 
-/// Deliberately implements no serde traits — only the custom serdes below
+/// Deliberately implements no serde traits: only the custom serdes below
 /// knows its wire form.
 struct NoSerde {
     text: String,

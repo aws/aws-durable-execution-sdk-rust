@@ -1,11 +1,8 @@
 //! Fluent operation builders, one public submodule per operation.
 //!
-//! Every builder owns a [`DurableContext`](crate::DurableContext) clone
-//! (cheap `Arc` — no lifetimes), carries the pre-claimed operation ID
-//! (minted at the call site), implements
-//! [`IntoFuture`] for `.await` support, and
-//! provides a `.spawn()` eager terminal. Chain methods consume and return
-//! `self`.
+//! Every builder implements [`IntoFuture`], so awaiting the builder runs
+//! the operation, and provides a `.spawn()` terminal that starts it
+//! eagerly. Chain methods consume and return `self`.
 //!
 //! # Layout
 //!
@@ -38,13 +35,13 @@ use std::time::Duration;
 /// Eagerly validates the builder's claimed replay identity when the builder
 /// is finalized into a [`DurableFuture`](crate::DurableFuture).
 ///
-/// Every `into_future` runs this FIRST — and `.future()`, `.spawn()`, and
-/// `.await` all funnel through `into_future` — so a replay identity mismatch
+/// Every `into_future` runs this FIRST, and `.future()`, `.spawn()`, and
+/// `.await` all funnel through `into_future`, so a replay identity mismatch
 /// is recorded on the execution-fatal slot synchronously at finalization,
 /// before the operation future is ever polled. This is what makes fatal
 /// propagation scheduler-independent: a short-circuiting combinator
 /// (`select_ok`, `race`, `try_join_all`) aborts losers the moment a winner
-/// settles, so a mismatching constituent might never be polled — but by then
+/// settles, so a mismatching constituent might never be polled, but by then
 /// its identity was already validated here.
 ///
 /// On mismatch the returned future resolves immediately with the dedicated
@@ -71,10 +68,10 @@ macro_rules! preflight_identity {
 /// the owner's scope (for quiescence accounting) and the new scope (which the
 /// spawned task drives).
 ///
-/// This is one helper rather than thirteen copies so that no `.spawn()`
-/// terminal can drift out of the accounting: an eagerly spawned operation that
-/// kept the owner's scope would park the owner — ending the invocation — the
-/// moment it hit a durable suspension point, aborting runnable siblings.
+/// The fresh scope is what keeps the accounting correct: an eagerly spawned
+/// operation that kept the owner's scope would park the owner (ending the
+/// invocation) the moment it hit a durable suspension point, aborting
+/// runnable siblings.
 ///
 /// The builder must have a `ctx: DurableContext` field and implement
 /// [`IntoFuture`] with
@@ -108,9 +105,6 @@ macro_rules! spawn_terminal {
 /// (identical caller-visible behavior); a combinator redirects it onto a
 /// scope it controls, so a losing input's park never suspends the caller
 /// after a winner settled (issue #49).
-///
-/// This is one helper rather than thirteen copies for the same reason as
-/// [`spawn_terminal!`]: no lazy terminal can drift out of the isolation.
 ///
 /// The builder must have a `ctx: DurableContext` field.
 macro_rules! rebind_lazy_scope {
@@ -175,8 +169,8 @@ pub enum JitterStrategy {
 
 /// Builder-based configuration for retry delay shaping.
 ///
-/// The common retry customization is shaping delays — how many attempts,
-/// how the delay grows, where it caps, and how it is jittered — without
+/// The common retry customization is shaping delays, how many attempts,
+/// how the delay grows, where it caps, and how it is jittered, without
 /// hand-writing a closure over `(error, attempt)`. `RetryStrategyConfig`
 /// captures exactly those knobs. Pass it to
 /// [`StepBuilder::retry_strategy_config`] or
@@ -200,9 +194,8 @@ pub enum JitterStrategy {
 /// 6 total attempts, 5 second initial delay, 60 second maximum delay,
 /// 2.0 backoff rate, full jitter.
 ///
-/// Construct with [`RetryStrategyConfig::builder`] — unset values keep
-/// their [`Default`] value. Fields are private per C-STRUCT-PRIVATE; read
-/// values back through the accessors.
+/// Construct with [`RetryStrategyConfig::builder`]; unset values keep
+/// their [`Default`] value. Read values back through the accessors.
 ///
 /// # Examples
 ///
@@ -222,6 +215,9 @@ pub enum JitterStrategy {
 /// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+// Fields are private so the struct can grow without breaking callers;
+// see the Rust API Guidelines on structs with private fields:
+// https://rust-lang.github.io/api-guidelines/future-proofing.html#c-struct-private
 pub struct RetryStrategyConfig {
     /// Total number of attempts (initial attempt plus retries) before the
     /// error propagates.

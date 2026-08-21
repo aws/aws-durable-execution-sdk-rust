@@ -7,7 +7,7 @@
 //! to a subtree of work.
 //!
 //! This example applies an uppercasing serdes to a step inside a child. The
-//! transform is illustrative — real implementations would compress or encrypt.
+//! transform is illustrative: real implementations would compress or encrypt.
 //! The same [`Serdes`] surface applies to large payloads without change, so a
 //! serdes and a large-payload child compose directly.
 //!

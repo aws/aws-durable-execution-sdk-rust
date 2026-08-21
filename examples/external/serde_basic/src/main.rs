@@ -1,7 +1,7 @@
 //! Attach a custom [`Serdes`] to a single operation.
 //!
 //! Every operation checkpoints its result through a serializer. The default is
-//! JSON; supplying a custom [`Serdes`] lets you transform the wire form —
+//! JSON; supplying a custom [`Serdes`] lets you transform the wire form:
 //! compress it, encrypt it, or (as here, illustratively) uppercase it. The SDK
 //! calls the serdes at every serialization point and reverses it on replay, so
 //! the transform is transparent to the rest of the handler.

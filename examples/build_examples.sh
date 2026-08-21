@@ -8,7 +8,7 @@
 # publish/<example>/bootstrap for SAM deployment on the provided.al2023
 # runtime. It mirrors compliance/build_examples.sh (same layout, same
 # skip-guard, same Makefile-per-bootstrap contract); the SDK's own release
-# profile is untouched — fast-build tuning lives in examples/Cargo.toml.
+# profile is untouched: fast-build tuning lives in examples/Cargo.toml.
 #
 # Why cargo-lambda and not a plain `cargo build`: a natively linked binary
 # requires the glibc symbol versions of the machine that built it. The
@@ -18,7 +18,7 @@
 # fails with `Runtime exited with error: exit status 1`. cargo-lambda builds
 # through cargo-zigbuild, which pins the glibc version the binary links
 # against, so the SAME command produces a runtime-compatible artifact on every
-# host — a local pass and a CI pass mean the same thing. cargo-lambda is the
+# host: a local pass and a CI pass mean the same thing. cargo-lambda is the
 # route documented in the Lambda Developer Guide:
 # https://docs.aws.amazon.com/lambda/latest/dg/rust-package.html
 #
@@ -65,7 +65,7 @@ EOF
     exit 1
 fi
 
-# ---- resolve the requested families ----
+# Resolve the requested families
 if [ $# -gt 0 ]; then
     families="$*"
 else
@@ -76,7 +76,7 @@ fi
 # Stable signature (sorted, single-space-joined) for the skip stamp.
 fams_sig=$(printf '%s\n' $families | sort | tr '\n' ' ')
 
-# ---- collect the example package + directory list for these families ----
+# Collect the example package + directory list for these families
 pkgs=""
 example_dirs=""
 for fam in $families; do
@@ -89,7 +89,7 @@ for fam in $families; do
 done
 [ -n "$example_dirs" ] || { echo "Error: no examples found for: $families" >&2; exit 1; }
 
-# ---- skip-if-unchanged guard ----
+# Skip-if-unchanged guard
 sha=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || echo nogit)
 dirty=$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null || true)
 
@@ -119,7 +119,7 @@ if should_skip; then
     exit 0
 fi
 
-# ---- single shared-workspace build over just the requested members ----
+# Single shared-workspace build over just the requested members
 echo "Building families: $families"
 # cargo-lambda stages every binary it finds in the target dir into
 # target/lambda/<bin>/bootstrap, so a leftover binary from an earlier build of
@@ -131,7 +131,7 @@ rm -rf "$LAMBDA_DIR"
 # shellcheck disable=SC2086
 cargo lambda build --release --x86-64 $pkgs
 
-# ---- stage each example binary into publish/<example>/bootstrap ----
+# Stage each example binary into publish/<example>/bootstrap
 for dir in $example_dirs; do
     example=$(basename "$dir")
     fam=$(basename "$(dirname "$dir")")
@@ -161,7 +161,7 @@ MKEOF
     echo "Staged $fam/$example -> publish/$example/bootstrap"
 done
 
-# ---- record the build stamp (SHA + family signature); mtime = now ----
+# Record the build stamp (SHA + family signature); mtime = now
 mkdir -p "$PUBLISH_DIR"
 { echo "$sha"; echo "$fams_sig"; } > "$STAMP"
 

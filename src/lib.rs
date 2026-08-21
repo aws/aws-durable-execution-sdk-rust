@@ -36,12 +36,30 @@
 //!
 //! # Determinism contract
 //!
-//! 1. Operation IDs are minted at the **call site**, synchronously.
-//! 2. Never create durable operations while iterating `HashMap`/`HashSet`.
-//! 3. Use [`DurableContext::race`] or [`DurableContext::select_ok`] instead
-//!    of `tokio::select!` over durable futures.
-//! 4. On suspension, the user future is dropped — do not rely on `Drop`
-//!    ordering for correctness between durable operations.
+//! Each durable operation has an **operation ID**: the identity that ties a
+//! call site to its recorded result. The SDK mints IDs synchronously at the
+//! call site, in the order the handler creates operations, and replay hands
+//! each recorded result to the operation that claims the same ID. Replay is
+//! therefore correct only if the handler creates the same operations in the
+//! same order on every invocation:
+//!
+//! 1. Keep the control flow that decides which operations to create a pure
+//!    function of the event and of results the SDK already recorded.
+//! 2. Never create durable operations while iterating a `HashMap` or
+//!    `HashSet`; their iteration order changes between runs. Sort into a
+//!    `Vec` first, or use a collection with deterministic iteration order
+//!    such as `BTreeMap`, `BTreeSet`, or the `indexmap` crate's `IndexMap`.
+//! 3. Do not use `tokio::select!` over durable futures; use
+//!    [`DurableContext::race`] or [`DurableContext::select_ok`], which
+//!    record which branch won.
+//! 4. Do not use `tokio::spawn` to run a durable operation in the
+//!    background; use `.spawn()` on the operation's builder, which keeps
+//!    the spawned work inside the execution's replay accounting.
+//! 5. On suspension, the user future is dropped, so do not rely on `Drop`
+//!    ordering for correctness between durable operations. For example, a
+//!    guard that unlocks a resource in `Drop` runs the moment the execution
+//!    suspends on a `ctx.wait(...)`, not after the wait completes; release
+//!    resources in a step instead of a destructor.
 //!
 //! # Observability
 //!
@@ -49,8 +67,8 @@
 //! facade: spans around the handler and each live step body, and `DEBUG`
 //! events at operation start/finish/replay/retry and execution
 //! start/resume/suspend. The span names, event names, and field names are a
-//! documented, stable contract — including how to bridge it to
-//! OpenTelemetry — in the [`observability`] module.
+//! documented, stable contract, including how to bridge it to
+//! OpenTelemetry, in the [`observability`] module.
 
 // Test code asserts with `unwrap`/`expect` pervasively; hoisting the
 // override here keeps the panic-policy lints (deny in workspace lints)
@@ -58,6 +76,12 @@
 // module.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(test, allow(clippy::expect_used))]
+
+// Compiles the README's Rust examples as doctests, so a README example that
+// stops compiling fails `cargo test` instead of rotting silently.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme_doctests {}
 
 pub mod builders;
 pub(crate) mod callback;
@@ -116,11 +140,9 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tracing::Instrument as _;
 
-/// Boxed error type matching the `lambda_runtime::Error` shape.
+/// Boxed error type: `Box<dyn std::error::Error + Send + Sync>`.
 ///
-/// This is the canonical error type for handler and step closures. The `?`
-/// operator works on any error type that implements
-/// `std::error::Error + Send + Sync`, with zero conversion ceremony.
+/// This is the error type handler and step closures return.
 ///
 /// # Examples
 ///
@@ -243,8 +265,8 @@ where
 
 /// Starts the durable function runtime with the given handler and options.
 ///
-/// Like [`run`], but applies the supplied [`Options`] — for example an
-/// execution-wide default [`Serdes`] or a preconfigured Lambda client — to
+/// Like [`run`], but applies the supplied [`Options`], for example an
+/// execution-wide default [`Serdes`] or a preconfigured Lambda client, to
 /// every invocation. Equivalent to registering [`wrap`] with the Lambda
 /// runtime yourself:
 /// `lambda_runtime::run(lambda_runtime::service_fn(wrap(handler, options)))`.
@@ -323,7 +345,7 @@ fn has_envelope_shape(payload: &serde_json::Value) -> bool {
 /// silently defaulting to an empty string.
 ///
 /// When the envelope shape is absent (none of the expected keys), returns
-/// `None` — callers decide whether that's acceptable.
+/// `None`: callers decide whether that's acceptable.
 fn parse_envelope(
     payload: &serde_json::Value,
 ) -> Result<Option<InvocationEnvelope>, lambda_runtime::Error> {
@@ -402,7 +424,7 @@ where
         .and_then(serde_json::Value::as_str);
 
     if let Some(input_json) = input_str {
-        // InputPayload is a JSON string — parse the customer's event from it.
+        // InputPayload is a JSON string: parse the customer's event from it.
         serde_json::from_str(input_json)
             .map_err(|e| lambda_runtime::Error::from(format!("deserialize customer input: {e}")))
     } else {
@@ -484,7 +506,7 @@ fn parse_inline_operations(payload: &serde_json::Value) -> (engine::CheckpointLo
         .map(String::from);
 
     // A missing or non-array `Operations` field is an empty first page.
-    // Skip the first operation (Execution type — the invocation context)
+    // Skip the first operation (Execution type: the invocation context)
     // and parse remaining step/wait/etc. operations into records.
     let records: Vec<(String, engine::CheckpointRecord)> = initial_state
         .and_then(|s| s.get("Operations"))
@@ -684,7 +706,7 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
 /// Opaque by design: the payload is the durable invocation envelope the
 /// service sends, and its JSON representation is an implementation detail
 /// between the runtime and the SDK. Callers never construct or inspect
-/// one — `lambda_runtime::service_fn` deserializes it, and the service
+/// one: `lambda_runtime::service_fn` deserializes it, and the service
 /// function consumes it. Keeping the inner value private is what keeps
 /// `serde_json` out of the crate's public API.
 #[derive(Debug, serde::Deserialize)]
@@ -712,14 +734,14 @@ type BoxedInvocationFuture = std::pin::Pin<
 
 /// Creates a Lambda service function with durable execution support.
 ///
-/// Unlike [`run`], this does not start the runtime — it returns a service
+/// Unlike [`run`], this does not start the runtime: it returns a service
 /// function suitable for passing to `lambda_runtime::run`. Use this for
 /// composable setups where you need additional middleware or custom
 /// runtime configuration.
 ///
 /// The service function reports handler failures inside a *successful*
-/// Lambda invocation response — a `FAILED` status envelope the durable
-/// execution service reads — never as a Lambda invocation error. Middleware
+/// Lambda invocation response, a `FAILED` status envelope the durable
+/// execution service reads, never as a Lambda invocation error. Middleware
 /// wrapped around this service therefore sees `Ok` for failed handlers, and
 /// Lambda-level error signals (the `Errors` metric, DLQs and `OnFailure`
 /// destinations, X-Ray error status) do not fire. Monitor the durable
@@ -793,7 +815,7 @@ where
 }
 
 /// Creates a durable Lambda service function whose execution client is the
-/// supplied [`client::ExecutionClient`] — the injection point the `test-util`
+/// supplied [`client::ExecutionClient`]: the injection point the `test-util`
 /// [`LocalRunner`](test_util::LocalRunner) uses to drive the handler through
 /// the exact production entry path (envelope parsing, bootstrap pagination,
 /// driver, wire-error mapping, response envelope) against a fake transport.
@@ -938,23 +960,23 @@ where
 
             // Unconditional flush point of the checkpoint buffering
             // contract (`checkpoint_delay` / `checkpoint_batching`):
-            // whatever the outcome — suspension (PENDING), completion
-            // (SUCCEEDED), or failure (FAILED) — every buffered checkpoint
+            // whatever the outcome, suspension (PENDING), completion
+            // (SUCCEEDED), or failure (FAILED), every buffered checkpoint
             // is written, and every in-flight batched write is awaited,
             // BEFORE the envelope reports the invocation's state to the
             // service, so buffering can never hold a checkpoint past the
             // end of the invocation. A no-op without configured buffering.
             //
             // Checkpoint-failure interplay (issue #43): a `Fault` outcome
-            // skips the flush of pending writes — the write channel
+            // skips the flush of pending writes: the write channel
             // already failed retryably; a follow-up write would fail the
             // same way, and the contract is "fails the invocation with no
             // further writes". But failures already RETAINED by detached
-            // batch flushes (every contributor dropped — a lost
+            // batch flushes (every contributor dropped: a lost
             // `race`/`select_ok` branch) are still drained: a retained
             // NON-retryable failure is deterministic, so dropping it here
             // would leave its operations `Started` and re-executing on
-            // every future invocation — exactly the loop the flush point
+            // every future invocation, exactly the loop the flush point
             // exists to end. Such a failure routes through the same
             // terminalize-then-fail-the-execution path as a non-retryable
             // flush failure; retryable-only retained failures are dropped
@@ -966,7 +988,7 @@ where
             // invocation, non-retryable persists terminal `FAIL` records
             // for the affected operations and fails the execution.
             if matches!(outcome, driver::InvocationOutcome::Fault { .. }) {
-                // No flush of pending writes on a failed channel — but
+                // No flush of pending writes on a failed channel, but
                 // classify retained failures (see above).
                 if let Some(retained) = flush_ctx.take_retained_flush_failures().await
                     && retained.any_non_retryable()
@@ -979,7 +1001,7 @@ where
 
             // Convert outcome to the durable response envelope.
             //
-            // ENVELOPE CONTRACT — do not "fix" the `Ok` below. Every outcome,
+            // ENVELOPE CONTRACT: do not "fix" the `Ok` below. Every outcome,
             // including a handler failure, is reported inside a *successful*
             // Lambda invocation response: the durable execution service reads
             // the `Status` field of this envelope to record the execution
@@ -988,8 +1010,8 @@ where
             // invocation as a runtime fault and retry it, rather than marking
             // the execution FAILED with the handler's error.
             //
-            // The one deliberate exception is `Fault` — a retryable
-            // checkpoint failure — where retry-as-a-runtime-fault is
+            // The one deliberate exception is `Fault`, a retryable
+            // checkpoint failure, where retry-as-a-runtime-fault is
             // exactly the intended recovery, so it maps to `Err` inside
             // `outcome_envelope`.
             //
@@ -1006,12 +1028,12 @@ where
 }
 
 /// Applies the issue #43 checkpoint-failure classification to a failed
-/// end-of-invocation flush of buffered checkpoints — or, on the `Fault`
+/// end-of-invocation flush of buffered checkpoints, or, on the `Fault`
 /// path, to failures retained by detached batch flushes (nothing is
 /// flushed there; see the flush point in [`wrap`]).
 ///
 /// - **Retryable** (every failure transient): the invocation fails with no
-///   further writes — the channel is down, and the service re-invokes,
+///   further writes: the channel is down, and the service re-invokes,
 ///   which is the same recovery as an interruption. This applies whatever
 ///   the driver outcome was: reporting SUCCEEDED or PENDING would claim
 ///   records the service never received, and the re-invocation converges
@@ -1023,8 +1045,8 @@ where
 ///   outcome was lost (see
 ///   [`DurableContext::terminalize_unwritten_outcomes`]), and the
 ///   execution fails. A handler outcome of SUCCEEDED or PENDING is
-///   overridden — completing while an operation record claims less than
-///   what executed would violate the #43 invariant — and a `Fault`
+///   overridden, completing while an operation record claims less than
+///   what executed would violate the #43 invariant, and a `Fault`
 ///   outcome (the retained-failure drain path) likewise becomes an
 ///   execution failure carrying the retained error, while a handler that
 ///   already FAILED keeps its own error as the execution result (the
@@ -1063,7 +1085,7 @@ async fn flush_failure_response(
 /// suspension path (see [`crate::observability`]).
 ///
 /// The FAILED status deliberately travels in the envelope, not as a Lambda
-/// invocation error — see the envelope contract note at the call site. The
+/// invocation error: see the envelope contract note at the call site. The
 /// `Fault` outcome is the deliberate inverse: a retryable checkpoint
 /// failure returns `Err`, failing the Lambda invocation itself so the
 /// durable service re-invokes (issue #43).
@@ -1080,8 +1102,8 @@ fn outcome_envelope(
         }
         driver::InvocationOutcome::Pending => {
             // Emitted while the handler's `durable_execution` span is
-            // entered — the instrumented handler future has already been
-            // dropped, but the context still holds the span handle — so
+            // entered, the instrumented handler future has already been
+            // dropped, but the context still holds the span handle, so
             // the event is a span event of the execution span, matching
             // the documented OpenTelemetry bridge (see
             // `crate::observability`).
@@ -1208,7 +1230,7 @@ mod tests {
         let ctx = DurableContext::__test_context();
         check_into_future(ctx.step(|_| async { Ok(1i32) }));
         // NOTE: cannot actually tokio::join! the builders because they
-        // todo!() at runtime — but the type-level verification above
+        // todo!() at runtime, but the type-level verification above
         // plus the external rustc test confirms IntoFuture acceptance.
     }
 
@@ -1237,7 +1259,7 @@ mod tests {
         drop(service);
     }
 
-    // ── Service-level entry-point envelope tests ────────────────────────
+    // Service-level entry-point envelope tests
     //
     // These invoke the `wrap`-produced service end to end, covering the
     // entry-point envelope handling that the `parse_envelope` unit tests
@@ -1342,7 +1364,7 @@ mod tests {
         assert_eq!(echoed, serde_json::json!({ "count": 42 }));
     }
 
-    // ── Status parsing tests (issue #45) ────────────────────────────────
+    // Status parsing tests (issue #45)
 
     /// Builds a minimal step operation JSON with the given wire status.
     fn step_op_with_status(status: &str) -> serde_json::Value {
@@ -1360,8 +1382,8 @@ mod tests {
         assert_eq!(record.status, engine::CheckpointStatus::TimedOut);
     }
 
-    /// `TIMEDOUT` is not a wire value — the smithy model and the Python and
-    /// JS SDKs spell it `TIMED_OUT` only — so the parser must not accept it
+    /// `TIMEDOUT` is not a wire value, the smithy model and the Python and
+    /// JS SDKs spell it `TIMED_OUT` only, so the parser must not accept it
     /// (the removed pre-#45 arm did).
     #[test]
     fn parse_status_timedout_without_underscore_is_unrecognized() {
@@ -1404,7 +1426,7 @@ mod tests {
         }
     }
 
-    // ── CallbackDetails parsing tests ───────────────────────────────────
+    // CallbackDetails parsing tests
 
     #[test]
     fn parse_callback_details_extracts_result() {
@@ -1575,7 +1597,7 @@ mod tests {
         });
 
         let (log, marker) = parse_inline_operations(&payload);
-        // No operations yet — the first page is empty.
+        // No operations yet: the first page is empty.
         assert!(!log.has_records());
         // But the marker must survive so bootstrap pagination runs.
         assert_eq!(marker, Some("page-token-1".to_owned()));
@@ -1688,7 +1710,7 @@ mod tests {
         );
     }
 
-    // ── Options consumption: client resolution + reuse ──────────────────
+    // Options consumption: client resolution + reuse
 
     /// A supplied `sdk_config` measurably alters client construction: the
     /// resolved Lambda client carries the region from that config.
@@ -1756,7 +1778,7 @@ mod tests {
         );
     }
 
-    // ── Envelope validation tests ────────────────────────────────────────
+    // Envelope validation tests
 
     #[test]
     fn parse_envelope_valid_payload() {
@@ -1861,7 +1883,7 @@ mod tests {
     #[test]
     fn extract_customer_input_envelope_without_input_payload_errors() {
         // Envelope shape is present (has DurableExecutionArn) but the
-        // InitialExecutionState path is incomplete — should error, not
+        // InitialExecutionState path is incomplete: should error, not
         // fall back to treating the envelope as the customer event.
         let payload = serde_json::json!({
             "DurableExecutionArn": "arn:test",

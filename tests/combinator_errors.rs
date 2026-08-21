@@ -1,8 +1,8 @@
 //! Integration tests for the combinator error surface (issue #28).
 //!
 //! Verifies that `race` surfaces a losing branch's failure as
-//! `CombinatorErrorKind::FirstSettledFailed` — with the same variant and
-//! message live and on replay — and that `race` and `select_ok` agree on
+//! `CombinatorErrorKind::FirstSettledFailed`, with the same variant and
+//! message live and on replay, and that `race` and `select_ok` agree on
 //! `CombinatorErrorKind::EmptyInput` for empty input.
 
 #![cfg(feature = "test-util")]

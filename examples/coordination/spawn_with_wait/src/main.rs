@@ -4,7 +4,7 @@
 //! any other parking operation) runs in its own suspension scope, so it does
 //! not end the invocation the moment it parks: the invocation suspends only
 //! once every spawned sibling has itself completed or parked. That is what
-//! makes the "start a timer, do work alongside it" shape safe —
+//! makes the "start a timer, do work alongside it" shape safe:
 //!
 //! ```text
 //! let wait = ctx.wait(..).spawn();
@@ -12,7 +12,7 @@
 //! let (timer, result) = tokio::join!(wait, work);
 //! ```
 //!
-//! — the step reaches its terminal checkpoint before the invocation reports
+//! The step reaches its terminal checkpoint before the invocation reports
 //! PENDING on the timer, so it is not aborted mid-flight and does not
 //! re-execute (duplicating its side effects) when the timer fires and the
 //! execution resumes.

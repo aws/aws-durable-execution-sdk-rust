@@ -2,7 +2,7 @@
 //!
 //! [`LocalRunner`] drives a durable handler to completion entirely in
 //! memory: each simulated invocation goes through the **same service
-//! function production uses** — the one [`wrap`](crate::wrap) builds —
+//! function production uses**: the one [`wrap`](crate::wrap) builds:
 //! fed a synthesized invocation envelope and backed by an internal
 //! in-memory execution client instead of the Lambda checkpoint API.
 //! Envelope parsing, bootstrap pagination, the suspension driver, wire
@@ -42,7 +42,7 @@
 //! - Checkpoint responses return whole-record operation updates that the
 //!   SDK merges into its in-memory log (`client::merge_operations_into_log`
 //!   → `CheckpointLog::insert` whole-record overwrite). A `Start` update
-//!   carries no payload, so the merged record clears any carried result —
+//!   carries no payload, so the merged record clears any carried result:
 //!   the exact condition the `wait_for_condition` read-before-`Start` fix
 //!   guards against.
 //! - Timers (`wait`) and retry delays are modelled as state transitions
@@ -125,14 +125,10 @@ const DEFAULT_MAX_INVOCATIONS: usize = 100;
 /// Default page size for simulated execution-state pagination. `1` maximizes
 /// fidelity pressure: any history of two or more operations is served as 2+
 /// pages (inline first page plus a `get_state` fetch), so every non-trivial
-/// test exercises the bootstrap and checkpoint pagination paths by default —
+/// test exercises the bootstrap and checkpoint pagination paths by default:
 /// the dimension where a missing-pagination defect was previously untestable
 /// by construction.
 const DEFAULT_STATE_PAGE_SIZE: usize = 1;
-
-// ────────────────────────────────────────────────────────────────────────────
-// TestOperation
-// ────────────────────────────────────────────────────────────────────────────
 
 /// A single checkpointed operation recorded during a [`LocalRunner`] run.
 ///
@@ -251,10 +247,6 @@ impl TestOperation {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// TestResult
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Terminal disposition of a [`LocalRunner`] run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Disposition {
@@ -361,10 +353,6 @@ impl<O> TestResult<O> {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// LocalRunner
-// ────────────────────────────────────────────────────────────────────────────
-
 /// A queued external outcome for a pending callback.
 #[derive(Debug, Clone)]
 enum CallbackOutcome {
@@ -411,7 +399,7 @@ pub struct LocalRunner {
     /// Initial-state page size. When set, the synthesized invocation
     /// envelope carries at most this many history operations inline plus a
     /// pagination marker, so the context fetches the remainder via
-    /// `get_state` — the paginating service is the DEFAULT
+    /// `get_state`: the paginating service is the DEFAULT
     /// ([`DEFAULT_STATE_PAGE_SIZE`]); [`LocalRunner::single_page`] opts
     /// into the single-page special case (`None`).
     initial_page_size: Option<usize>,
@@ -485,7 +473,7 @@ impl LocalRunner {
     /// history inline and checkpoint responses never set a pagination
     /// marker.
     ///
-    /// This is the **special case** — the real service paginates, and the
+    /// This is the **special case**: the real service paginates, and the
     /// runner does too by default. Reach for this only when a test
     /// specifically targets single-page behavior.
     ///
@@ -585,7 +573,7 @@ impl LocalRunner {
     }
 
     /// Makes the simulated backend reject the next `count` checkpoint
-    /// calls with a non-retryable error, persisting nothing for them —
+    /// calls with a non-retryable error, persisting nothing for them,
     /// exactly like a permanent service-side rejection.
     ///
     /// Under the #43 model a non-retryable checkpoint failure never
@@ -636,7 +624,7 @@ impl LocalRunner {
     }
 
     /// Like [`fail_checkpoints_after`](Self::fail_checkpoints_after), but
-    /// the injected failures are RETRYABLE — simulating a transient
+    /// the injected failures are RETRYABLE: simulating a transient
     /// failure that exhausted the transport's own retries.
     ///
     /// Under the #43 model a retryable checkpoint failure fails the
@@ -731,8 +719,8 @@ impl LocalRunner {
     /// function** ([`wrap`](crate::wrap)'s body) fed a synthesized
     /// invocation envelope, so envelope parsing, bootstrap pagination, the
     /// suspension driver, and wire error mapping are the exact code
-    /// production runs. The service future is awaited inline — the same
-    /// task topology `lambda_runtime` produces under `block_on` — so
+    /// production runs. The service future is awaited inline, the same
+    /// task topology `lambda_runtime` produces under `block_on`, so
     /// task-ownership behavior matches deployment.
     ///
     /// The event is serialized once and embedded in each invocation's
@@ -805,7 +793,7 @@ impl LocalRunner {
         let client: Arc<dyn ExecutionClient> = Arc::clone(&backend) as Arc<dyn ExecutionClient>;
 
         // The handler runs behind the SAME service function production
-        // registers with the Lambda runtime — only the transport (the
+        // registers with the Lambda runtime: only the transport (the
         // execution client) is faked. The buffer window is derived from the
         // two knobs exactly as `wrap` derives it from `Options`.
         let checkpoint_buffer_window = match (self.checkpoint_delay, self.checkpoint_batching) {
@@ -872,7 +860,7 @@ impl LocalRunner {
                 lambda_runtime::Context::default(),
             );
 
-            // Await the service future INLINE — never on a spawned task.
+            // Await the service future INLINE, never on a spawned task.
             // This reproduces the production topology (`lambda_runtime`
             // awaits the handler under `block_on`), so
             // `tokio::task::try_id()` is `None` at context-creation time
@@ -881,7 +869,7 @@ impl LocalRunner {
                 Ok(envelope) => envelope.0,
                 Err(e) => {
                     // The invocation itself failed (a Lambda runtime
-                    // error) — e.g. a retryable checkpoint failure that
+                    // error), e.g. a retryable checkpoint failure that
                     // exhausted transport retries (issue #43), or a
                     // bootstrap failure. The durable service re-invokes
                     // on an invocation fault, so the runner does too;
@@ -984,7 +972,7 @@ const LOCAL_EXECUTION_ARN: &str = "arn:aws:lambda:us-west-2:000000000000:functio
 ///
 /// When `initial_page_size` is set and the recorded history exceeds it,
 /// only the first page of history rides inline and
-/// `InitialExecutionState.NextMarker` signals the truncation — the
+/// `InitialExecutionState.NextMarker` signals the truncation: the
 /// production bootstrap path then fetches the remainder via `get_state`,
 /// exactly as it does against the paginating service.
 fn build_envelope(
@@ -1024,10 +1012,6 @@ fn build_envelope(
         "InitialExecutionState": initial_state,
     })
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// CloudRunner (real-AWS runner returning the same TestResult/TestOperation)
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Default seconds between execution-status polls.
 const DEFAULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1231,7 +1215,7 @@ impl CloudRunner {
 
         let client = self.build_client().await;
 
-        // 1. Invoke (async) — start the durable execution and capture its ARN.
+        // 1. Invoke (async): start the durable execution and capture its ARN.
         let invoke_result = client
             .invoke()
             .function_name(&self.function_name)
@@ -1601,7 +1585,7 @@ fn event_family_op_type(event_type: Option<&EventType>) -> Option<&'static str> 
     }
 }
 
-/// Counts `InvocationCompleted` events — the number of times the service
+/// Counts `InvocationCompleted` events: the number of times the service
 /// invoked the function to drive the execution.
 fn invocations_from_history(events: &[Event]) -> usize {
     events
@@ -1621,10 +1605,6 @@ fn execution_status_str(status: &ExecutionStatus) -> &'static str {
         _ => "Unknown",
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// In-memory backend (internal — implements the pub(crate) ExecutionClient)
-// ────────────────────────────────────────────────────────────────────────────
 
 /// A stored operation record inside the in-memory backend.
 #[derive(Debug, Clone)]
@@ -1665,11 +1645,11 @@ struct Backend {
     /// the number of updated operations exceeds this value, simulating a
     /// paginated checkpoint response.
     checkpoint_page_size: Option<usize>,
-    /// Counts `get_state` calls — lets tests assert that pagination
+    /// Counts `get_state` calls: lets tests assert that pagination
     /// actually forced a state fetch (or, under `single_page`, that none
     /// occurred).
     get_state_calls: std::sync::atomic::AtomicUsize,
-    /// Counts `checkpoint` calls — lets tests assert that checkpoint
+    /// Counts `checkpoint` calls: lets tests assert that checkpoint
     /// coalescing (`checkpoint_delay`) actually reduced the number of
     /// writes.
     checkpoint_calls: std::sync::atomic::AtomicUsize,
@@ -1731,8 +1711,8 @@ impl Backend {
 
     /// Queues a per-call plan for upcoming `checkpoint` calls (in-crate
     /// test seam). While entries remain, each call pops and obeys the
-    /// front entry — pass, fail retryably, or fail non-retryably (with an
-    /// optional in-flight gate) — instead of the counter-based injection.
+    /// front entry, pass, fail retryably, or fail non-retryably (with an
+    /// optional in-flight gate), instead of the counter-based injection.
     /// Once the plan is exhausted, calls fall back to the counters.
     #[cfg(test)]
     fn plan_checkpoint_calls(&self, plan: Vec<PlannedCheckpoint>) {
@@ -1787,7 +1767,7 @@ impl Backend {
     }
 
     /// Renders the recorded history as envelope-wire JSON operation
-    /// objects — the exact shape `parse_inline_operations` reads from
+    /// objects: the exact shape `parse_inline_operations` reads from
     /// `InitialExecutionState.Operations`.
     fn envelope_history(&self) -> Vec<serde_json::Value> {
         let state = self.lock();
@@ -1964,7 +1944,7 @@ impl BackendState {
 
         match action {
             OperationAction::Start => {
-                // A Start carries no payload — clear any prior result so the
+                // A Start carries no payload: clear any prior result so the
                 // whole-record merge in the SDK clobbers the carried value
                 // (the wait_for_condition read-before-Start invariant).
                 op.result = None;
@@ -2032,7 +2012,7 @@ impl ExecutionClient for Backend {
                     return Box::pin(async move {
                         if let Some(gate) = gate {
                             // Hold the failing write in flight until the
-                            // test releases it — lets a test drop a
+                            // test releases it: lets a test drop a
                             // contributor deterministically BEFORE the
                             // failure publishes.
                             let permit = gate.acquire().await;
@@ -2048,7 +2028,7 @@ impl ExecutionClient for Backend {
         // Injected fault (`LocalRunner::fail_next_checkpoints` /
         // `fail_checkpoints_after[_retryable]`): after letting `skip`
         // calls through, reject BEFORE touching any state, so the
-        // rejected write persists nothing — exactly like a service-side
+        // rejected write persists nothing, exactly like a service-side
         // rejection.
         let skipped = self
             .checkpoint_failures_skip
@@ -2104,8 +2084,8 @@ impl ExecutionClient for Backend {
         // operations exceed it, simulate a genuinely paginated response:
         // return only the FIRST PAGE of the full execution state (mirroring
         // the service's NewExecutionState) and set next_marker. Operations
-        // beyond the page — including the ones this call just updated when
-        // they fall outside it — are only observable through the follow-up
+        // beyond the page, including the ones this call just updated when
+        // they fall outside it, are only observable through the follow-up
         // get_state fetch, so a caller that ignores the marker genuinely
         // misses state.
         let (response_ops, next_marker) = if let Some(page_size) = self.checkpoint_page_size {
@@ -2143,10 +2123,6 @@ impl ExecutionClient for Backend {
         Box::pin(async move { Ok(GetStateOutput { operations }) })
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// StoredOp → aws_sdk_lambda::types::Operation
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Builds an SDK `Operation` from a stored op, placing result/error in the
 /// details bucket the SDK reads for that operation type.
@@ -2350,10 +2326,6 @@ fn operation_status_wire_str(s: &OperationStatus) -> &'static str {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 #[expect(clippy::indexing_slicing)]
 // reason: test assertions index known-length op vectors
@@ -2367,7 +2339,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    // 1. step success ────────────────────────────────────────────────────
+    // 1. step success
 
     #[tokio::test]
     async fn step_success_returns_output_and_records_op() {
@@ -2392,7 +2364,7 @@ mod tests {
         assert_eq!(result.operations()[0].name(), Some("inc"));
     }
 
-    // 1. step failure ─────────────────────────────────────────────────────
+    // 1. step failure
 
     #[tokio::test]
     async fn step_failure_propagates_and_records_failed_op() {
@@ -2421,7 +2393,7 @@ mod tests {
         assert!(result.operations().iter().any(TestOperation::failed));
     }
 
-    // 1. step retry via RetryStrategyConfig ───────────────────────────────
+    // 1. step retry via RetryStrategyConfig
 
     #[tokio::test]
     async fn step_retry_config_drives_retries_to_success() {
@@ -2514,7 +2486,7 @@ mod tests {
         assert!(result.operations().iter().any(TestOperation::failed));
     }
 
-    // 1. step retry (retry strategy honored) ──────────────────────────────
+    // 1. step retry (retry strategy honored)
 
     #[tokio::test]
     async fn step_retry_succeeds_on_third_attempt() {
@@ -2575,7 +2547,7 @@ mod tests {
         assert_eq!(step.attempt(), 2, "backend recorded 2 completed retries");
     }
 
-    // 2. wait then resume across invocations ──────────────────────────────
+    // 2. wait then resume across invocations
 
     #[tokio::test]
     async fn wait_resumes_across_invocations() {
@@ -2611,7 +2583,7 @@ mod tests {
         assert!(wait_op.succeeded());
     }
 
-    // 3. wait_for_condition state carry (exercises the merge-back clobber) ─
+    // 3. wait_for_condition state carry (exercises the merge-back clobber)
 
     #[derive(Clone, Serialize, Deserialize)]
     struct Counter {
@@ -2752,7 +2724,7 @@ mod tests {
     /// The handler catches the exhaustion error and then suspends on a
     /// wait, so the next invocation replays the failed operation from its
     /// checkpoint. Both the live catch and the replayed catch must
-    /// classify as `MaxChecksExceeded` with the same `checks()` value —
+    /// classify as `MaxChecksExceeded` with the same `checks()` value:
     /// the returned output comes from the final (replaying) invocation,
     /// so a replay misclassified as `CheckFailed` fails the execution.
     #[tokio::test]
@@ -2824,7 +2796,7 @@ mod tests {
         );
     }
 
-    // 4. child contexts ───────────────────────────────────────────────────
+    // 4. child contexts
 
     #[tokio::test]
     async fn child_context_returns_nested_result() {
@@ -2857,7 +2829,7 @@ mod tests {
         assert_eq!(step_count, 2);
     }
 
-    // 5. parallel and map basics ──────────────────────────────────────────
+    // 5. parallel and map basics
 
     #[tokio::test]
     async fn parallel_runs_branches_and_collects_results() {
@@ -2997,12 +2969,12 @@ mod tests {
     /// The order-sensitive predicate `failed() > succeeded()` must never
     /// fire: on the resumed invocation the two recorded successes are
     /// applied (in input order) before item 1's live failure joins, so the
-    /// predicate always sees 2 succeeded before it sees 1 failed —
+    /// predicate always sees 2 succeeded before it sees 1 failed:
     /// regardless of how the scheduler orders the join events. Without
     /// canonical ordering, resumed item 1's failure could join before
     /// item 0's recorded success replays, the predicate would see
-    /// 1 failed / 0 succeeded and stop the batch, and item 2 — whose
-    /// success is already in the checkpoint log — would be dropped from
+    /// 1 failed / 0 succeeded and stop the batch, and item 2, whose
+    /// success is already in the checkpoint log, would be dropped from
     /// the result: a different operation history from identical recorded
     /// state.
     #[tokio::test]
@@ -3016,7 +2988,7 @@ mod tests {
                                 // Parks the branch, forcing a second
                                 // invocation where items 0 and 2 are
                                 // recorded-terminal while item 1 resumes
-                                // live — and then fails.
+                                // live, and then fails.
                                 child
                                     .wait(std::time::Duration::from_secs(1))
                                     .name("stall")
@@ -3070,11 +3042,11 @@ mod tests {
     /// `failed() > succeeded()` must make the same decision however the
     /// scheduler interleaves the live settlements: outcomes commit to the
     /// statistics strictly in input order, so the predicate's first
-    /// evaluation is on the prefix `[item 0: failed]` — one failure, zero
-    /// successes — and it fires, on the FIRST invocation, before any
+    /// evaluation is on the prefix `[item 0: failed]`, one failure, zero
+    /// successes, and it fires, on the FIRST invocation, before any
     /// suspension. Under settlement-order evaluation the fresh run would
     /// instead see `[1 succeeded]` then `[1 succeeded, 1 failed]`, never
-    /// fire, suspend on item 2 — and then the resumed invocation, replaying
+    /// fire, suspend on item 2, and then the resumed invocation, replaying
     /// recorded outcomes in input order, would fire where the original run
     /// did not: two runs of the same execution disagreeing (the exact
     /// reviewed defect).
@@ -3151,7 +3123,7 @@ mod tests {
         // The predicate fired at item 0's committed failure; items 0 and 1
         // both settled and are in the result, parked item 2 is excluded.
         assert_eq!(result.output(), Some(&"PREDICATE_MATCHED:2:1:1".to_owned()));
-        // The trigger fired on the first invocation — the batch never
+        // The trigger fired on the first invocation: the batch never
         // suspended, so the fresh run and any replay cannot disagree.
         assert_eq!(
             result.invocation_count(),
@@ -3163,9 +3135,9 @@ mod tests {
     /// Reversed live settlement order PLUS a genuine suspension: item 1
     /// succeeds before the delayed item 0 fails (both on the first
     /// invocation), item 2 parks and only succeeds after resume. The
-    /// order-sensitive predicate stays false on every committed prefix —
+    /// order-sensitive predicate stays false on every committed prefix:
     /// `[0: failed]`, `[0: failed, 1: succeeded]`, then after resume
-    /// `[.., 2: succeeded]` — and those are the SAME prefixes the resumed
+    /// `[.., 2: succeeded]`, and those are the SAME prefixes the resumed
     /// invocation derives from the recorded outcomes, so the batch runs to
     /// completion with every item's outcome in the result, on both sides
     /// of the suspension boundary.
@@ -3239,7 +3211,7 @@ mod tests {
 
         assert!(result.is_success(), "{:?}", result.error_message());
         // No trigger fired on either side of the suspension: all three
-        // outcomes — including recorded items replayed after the resume —
+        // outcomes, including recorded items replayed after the resume,
         // are in the result.
         assert_eq!(result.output(), Some(&"ALL_COMPLETED:3:2:1".to_owned()));
         // The timer forced a suspension, so the batch really did span a
@@ -3294,7 +3266,7 @@ mod tests {
         );
     }
 
-    // 6. callback success and callback timeout ────────────────────────────
+    // 6. callback success and callback timeout
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Approval {
@@ -3383,7 +3355,7 @@ mod tests {
         assert!(result.invocation_count() >= 2);
     }
 
-    // 7. replay determinism ───────────────────────────────────────────────
+    // 7. replay determinism
 
     #[tokio::test]
     async fn replay_is_deterministic() {
@@ -3429,7 +3401,7 @@ mod tests {
         assert_eq!(results_first, results_second);
     }
 
-    // ── CloudRunner pure-mapping tests (no AWS) ──────────────────────────
+    // CloudRunner pure-mapping tests (no AWS)
 
     use aws_sdk_lambda::types::{
         CallbackTimedOutDetails, EventError, EventResult, RetryDetails, StepFailedDetails,
@@ -3707,7 +3679,7 @@ mod tests {
         assert_eq!(result.output(), None);
     }
 
-    // ── Pagination tests ────────────────────────────────────────────────
+    // Pagination tests
 
     /// A two-page initial state replays all operations: the runner calls
     /// `get_state` when the history exceeds `initial_page_size`, and the
@@ -3722,7 +3694,7 @@ mod tests {
             .initial_page_size(1) // Only 1 op per "page" in initial state
             .run(
                 |_event: (), ctx: DurableContext| async move {
-                    // First step — should only execute on the first invocation.
+                    // First step: should only execute on the first invocation.
                     let a = ctx
                         .step(|_| async {
                             FIRST_STEP_EXECUTIONS.fetch_add(1, Ordering::SeqCst);
@@ -3736,7 +3708,7 @@ mod tests {
                         .name("pause")
                         .await?;
 
-                    // Second step on re-invocation — initial state now has
+                    // Second step on re-invocation: initial state now has
                     // 2+ ops, exceeding page_size=1. The runner must fetch
                     // the full state via get_state so `a` replays correctly.
                     let b = ctx
@@ -4008,7 +3980,7 @@ mod tests {
             "marker must trigger exactly one get_state fetch"
         );
 
-        // No marker: the first page is complete — no get_state call, and
+        // No marker: the first page is complete, no get_state call, and
         // the log holds only page-1 operations.
         let log = resolve_bootstrap_log(
             client.as_ref(),
@@ -4035,10 +4007,10 @@ mod tests {
         );
     }
 
-    // ── Harness fidelity: production task topology ──────────────────────
+    // Harness fidelity: production task topology
 
     /// The runner awaits the handler INLINE under the caller's `block_on`
-    /// — the production `lambda_runtime` topology — so the context is
+    /// (the production `lambda_runtime` topology), so the context is
     /// created where `tokio::task::try_id()` is `None`, not on a spawned
     /// task. This is the dimension that previously hid the ownership
     /// guard's production inertness.
@@ -4067,7 +4039,7 @@ mod tests {
 
     /// Under the production topology, a durable operation invoked from a
     /// bare user `tokio::spawn` (unblessed) is rejected by the ownership
-    /// guard — the runner must reproduce that, not mask it.
+    /// guard: the runner must reproduce that, not mask it.
     #[tokio::test]
     async fn runner_rejects_durable_ops_from_unblessed_spawned_task() {
         let result = LocalRunner::new()
@@ -4101,12 +4073,12 @@ mod tests {
         );
     }
 
-    // ── Harness fidelity: state pagination is the DEFAULT ───────────────
+    // Harness fidelity: state pagination is the DEFAULT
 
     /// By default the backend serves execution state in 2+ pages: a
     /// re-invocation with two or more recorded operations gets a truncated
     /// inline envelope page plus `NextMarker`, and checkpoint responses
-    /// paginate — both force real `get_state` fetches through the
+    /// paginate: both force real `get_state` fetches through the
     /// production pagination paths.
     #[tokio::test]
     async fn default_state_pagination_forces_get_state_fetches() {
@@ -4181,7 +4153,7 @@ mod tests {
         );
     }
 
-    // ── Checkpoint coalescing (`checkpoint_delay`) ──────────────────────
+    // Checkpoint coalescing (`checkpoint_delay`)
 
     /// A handler with two concurrently-spawned steps, a suspension, and a
     /// post-resume step. `executions` counts step-body runs so replay
@@ -4352,7 +4324,7 @@ mod tests {
     /// `checkpoint_batching` preserves handler semantics end-to-end: the
     /// same probe handler (concurrent steps, a suspension, a post-resume
     /// step) completes with the same output, and every step body runs
-    /// exactly once across the suspend/resume boundary — proving the
+    /// exactly once across the suspend/resume boundary: proving the
     /// batched checkpoints flushed (and any in-flight batched write was
     /// awaited) before the invocation reported PENDING.
     #[tokio::test(start_paused = true)]
@@ -4384,15 +4356,15 @@ mod tests {
     }
 
     /// Review regression (issue #43): a failure RETAINED by a detached
-    /// batch flush — its only contributor was dropped before the rejection
-    /// published — must not be discarded, and the orphaned operation's
+    /// batch flush, its only contributor was dropped before the rejection
+    /// published, must not be discarded, and the orphaned operation's
     /// unwritten outcome must be terminalized. The retained rejection here
     /// is NON-retryable (deterministic on every future invocation): were
     /// it dropped, the orphaned operation would stay `Started` and
     /// re-execute on every lap.
     ///
-    /// With the coalescer's failure latch, the very next buffered write —
-    /// the later live step's START — never reaches the backend: its
+    /// With the coalescer's failure latch, the very next buffered write,
+    /// the later live step's START, never reaches the backend: its
     /// flusher observes the latch under the writer lock, republishes the
     /// retained non-retryable error, and the live contributor's
     /// unrecoverable routing fails the execution. The end-of-invocation
@@ -4407,14 +4379,14 @@ mod tests {
         let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
 
         // Call plan:
-        //   1. orphan START — passes.
-        //   2. orphan SUCCEED (detached batch flush) — held at the gate
+        //   1. orphan START: passes.
+        //   2. orphan SUCCEED (detached batch flush): held at the gate
         //      until the handler releases it, then rejected non-retryably.
         //      The handler drops the contributor while the write is held,
         //      so the rejection publishes to nobody and is only RETAINED
         //      (and latched).
         // The live step's START never reaches the backend (failure
-        // latch), so the next real call is the orphan's terminal FAIL —
+        // latch), so the next real call is the orphan's terminal FAIL:
         // it falls past the exhausted plan and persists.
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         backend.plan_checkpoint_calls(vec![
@@ -4461,7 +4433,7 @@ mod tests {
                         gate.add_permits(1);
 
                         // A later LIVE operation: its START write hits the
-                        // failure latch — no backend call — and republishes
+                        // failure latch, no backend call, and republishes
                         // the retained non-retryable rejection, whose
                         // unrecoverable routing fails the execution. Before
                         // the retention + latch, the retained failure above
@@ -4515,11 +4487,11 @@ mod tests {
         );
     }
 
-    // ── Harness fidelity: production wire-error mapping ─────────────────
+    // Harness fidelity: production wire-error mapping
 
     /// The runner reports the SAME wire error message production reports.
     /// Every failure flattens through the one flattening site, so a child
-    /// failure's wire message is the full chain — one frame per layer —
+    /// failure's wire message is the full chain, one frame per layer,
     /// with the raw child message as its final frame. (The old special
     /// case that reported only the raw message was the Display/wire
     /// asymmetry the error-model redesign removed.)
@@ -4543,7 +4515,7 @@ mod tests {
         // The execution record re-records the child-context record's own
         // recorded identity ("ChildFnError", the boundary's fallback for a
         // plain boxed error) rather than degrading it to the outer kind's
-        // registry name — recorded identity passes through boundaries.
+        // registry name: recorded identity passes through boundaries.
         assert_eq!(result.error_type(), Some("ChildFnError"));
         let msg = result.error_message().unwrap_or_default();
         assert!(

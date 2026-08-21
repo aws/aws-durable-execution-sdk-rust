@@ -8,7 +8,7 @@ a glance why an example does or does not have a Rust counterpart.
 
 Ground rule: every example is a single honest workload for one pattern. Where
 the JS repo ships several near-identical variants of one pattern, the Rust
-tree ports one representative and records the rest as covered by it — that is
+tree ports one representative and records the rest as covered by it; that is
 deliberate, not a coverage gap.
 
 ## Family plan
@@ -18,54 +18,54 @@ visible per family.
 
 | Family | Scope | Status |
 | --- | --- | --- |
-| **1 — basics** | fundamental `step`, `wait`, retry, and no-op handler patterns | **implemented** |
-| **2 — coordination & fan-out** | `run_in_child_context`, `parallel`, `map`, combinators (`try_join_all`/`join_all`/`select_ok`/`race`), concurrent fan-out via `.spawn()`, determinism/replay behaviors | **implemented** |
-| **3 — external, serdes & cross-cutting** | `invoke`, `create_callback`, `wait_for_callback`, `wait_for_condition`, serdes, large payloads, `tracing` logging, and the capstone comprehensive example | **implemented** |
+| **1: basics** | fundamental `step`, `wait`, retry, and no-op handler patterns | **implemented** |
+| **2: coordination & fan-out** | `run_in_child_context`, `parallel`, `map`, combinators (`try_join_all`/`join_all`/`select_ok`/`race`), concurrent fan-out via `.spawn()`, determinism/replay behaviors | **implemented** |
+| **3: external, serdes & cross-cutting** | `invoke`, `create_callback`, `wait_for_callback`, `wait_for_condition`, serdes, large payloads, `tracing` logging, and the capstone comprehensive example | **implemented** |
 
 ## Mapping summary
 
 - **Total JS examples:** 133 (the 135 non-test `.ts` handler files under the JS
-  `examples/` tree, minus 2 shared helpers — `shared/uppercase-serdes.ts` and
-  `otel/shared/otel-test-setup.ts` — which are infra, not examples).
+  `examples/` tree, minus 2 shared helpers: `shared/uppercase-serdes.ts` and
+  `otel/shared/otel-test-setup.ts`, which are infra, not examples).
 - **Mapped (ported or port-planned):** 106.
 - **Skipped:** 27. Grouped reasons:
-  - **10** — `otel/*`: the Rust SDK has no OpenTelemetry plugin. `tracing` is
-    the logging story ; a plugin system is a
+  - **10**: `otel/*`: the Rust SDK has no OpenTelemetry plugin. `tracing` is
+    the logging story; a plugin system is a
     possible future addition.
-  - **4** — `force-checkpointing/*`: there is no force-checkpoint API in the
+  - **4**: `force-checkpointing/*`: there is no force-checkpoint API in the
     Rust SDK's public surface.
-  - **2** — `*virtual*` (`run-in-child-context/virtual`,
+  - **2**: `*virtual*` (`run-in-child-context/virtual`,
     `run-in-child-context/serdes-virtual`): the user-facing `virtualContext`
     child-context concept is not part of the Rust SDK's public API. (The
-    map/parallel `virtual-context` examples exercise a different concept — FLAT
-    nesting mode — which the Rust SDK does have; they are port-planned in the
+    map/parallel `virtual-context` examples exercise a different concept, FLAT
+    nesting mode, which the Rust SDK does have; they are port-planned in the
     coordination family via `NestingMode::Flat`.)
-  - **3** — `context-validation/*`: nesting durable ops inside a step or a
+  - **3**: `context-validation/*`: nesting durable ops inside a step or a
     `wait_for_condition` check is a **compile error** in Rust (`StepContext`
     exposes no durable operations), and using a parent context from a child is
-    caught by the runtime task-ownership guard — these are negative tests the
+    caught by the runtime task-ownership guard: these are negative tests the
     Rust type system / ownership detector prevent by construction, not runnable
     usage examples.
-  - **2** — `child-operations-invalid-depth`, `child-operations-preservation`:
+  - **2**: `child-operations-invalid-depth`, `child-operations-preservation`:
     both exercise `pluginsConfig.childOperationsDepth`, a JS plugin config with
     no analogue in the Rust SDK (a plugin system is a possible future addition).
-  - **2** — `logger-test/powertools-logger`, `logger-test/simple-powertools-logger`:
+  - **2**: `logger-test/powertools-logger`, `logger-test/simple-powertools-logger`:
     AWS Lambda Powertools is JS-specific; there is no Powertools for Rust, and
     `tracing` is the ecosystem-standard replacement.
-  - **1** — `parallel/custom-summary-generator`: no summary-generator hook in
+  - **1**: `parallel/custom-summary-generator`: no summary-generator hook in
     the Rust SDK's public surface.
-  - **1** — `map-completion-config-issue`: a JS-specific bug reproduction, not
+  - **1**: `map-completion-config-issue`: a JS-specific bug reproduction, not
     a usage example.
-  - **1** — `wait/unawaited`: relies on JS promise **eagerness** (an unawaited
+  - **1**: `wait/unawaited`: relies on JS promise **eagerness** (an unawaited
     op still makes progress). Rust builders are **lazy** by design:
     an unawaited builder does nothing. The eager analogue is `.spawn()`,
-    demonstrated in the coordination family — so this specific example does not
+    demonstrated in the coordination family, so this specific example does not
     port, but the capability it shows is not lost.
-  - **1** — `promise/unhandled-rejection`: JS-native unhandled-promise-rejection
+  - **1**: `promise/unhandled-rejection`: JS-native unhandled-promise-rejection
     semantics. Rust is `Result`-based with no floating rejections; there is no
     analogous failure mode.
 
-## Family 1 — basics
+## Family 1: basics
 
 Seven representative workloads. The "covers" rows are JS variants of the same
 pattern collapsed into a representative per the one-workload-per-pattern rule.
@@ -78,7 +78,7 @@ pattern collapsed into a representative per the one-workload-per-pattern rule.
 | `step/basic` | ✅ ported | `basics/step_basic` |
 | `step/named` | ✅ ported | `basics/step_named` |
 | `step/with-retry` | ✅ ported | `basics/step_with_retry` |
-| `step/steps-with-retry` | ✅ covered | by `basics/step_with_retry` (JS adds a DDB poll loop — scaffolding omitted per the one-workload rule) |
+| `step/steps-with-retry` | ✅ covered | by `basics/step_with_retry` (JS adds a DDB poll loop: scaffolding omitted per the one-workload rule) |
 | `step/attempt-fallback` | ✅ covered | by `basics/step_with_retry` (both key off `StepContext::attempt()`) |
 | `wait/basic` | ✅ ported | `basics/wait_basic` |
 | `wait/named` | ✅ ported | `basics/wait_named` |
@@ -86,7 +86,7 @@ pattern collapsed into a representative per the one-workload-per-pattern rule.
 | `multiple-waits` | ✅ ported | `basics/multiple_waits` |
 | `wait/unawaited` | ⊘ skip | Rust builders are lazy by design; the eager analogue is `.spawn()` (coordination family) |
 
-## Family 2 — coordination & fan-out
+## Family 2: coordination & fan-out
 
 Nineteen representative workloads under `examples/coordination/`. Per the
 one-workload-per-pattern rule, near-identical JS variants of one pattern are
@@ -94,7 +94,7 @@ collapsed into a representative and marked "covered by" it; every JS row below
 is therefore either ported or covered, none left planned. Cross-cutting notes:
 
 - The four combinators accept any [`DurableFuture`], so the JS `*-wait` variants
-  (a combinator over waits) are the same code with a wait operand — covered by
+  (a combinator over waits) are the same code with a wait operand: covered by
   the base combinator example.
 - The `.spawn()` fan-out mechanic is identical regardless of the operation
   inside, so the `concurrent/*` variants are covered by one representative;
@@ -123,7 +123,7 @@ is therefore either ported or covered, none left planned. Cross-cutting notes:
 | `parallel/empty` | ✅ ported | `coordination/parallel_empty` |
 | `parallel/wait` | ✅ covered | by `parallel_basic` (a branch performs a durable wait) |
 | `parallel/invoke` | ✅ covered | by `parallel_basic` (branch bodies are ordinary durable code; `invoke` itself is `external/invoke_*`, Family 3) |
-| `parallel/heterogeneous` | ✅ ported | `coordination/parallel_heterogeneous` — held builders + `tokio::join!` (lazy-builder composition) |
+| `parallel/heterogeneous` | ✅ ported | `coordination/parallel_heterogeneous`: held builders + `tokio::join!` (lazy-builder composition) |
 | `parallel/error-preservation` | ✅ covered | by `combinator_join_all` (each failure preserved as `Settled::Rejected`) |
 | `parallel/min-successful` | ✅ covered | by `parallel_completion` (`CompletionConfig::with_min_successful`) |
 | `parallel/min-successful-with-callback` | ✅ covered | by `parallel_completion` (min_successful; callback is Family 3) |
@@ -134,7 +134,7 @@ is therefore either ported or covered, none left planned. Cross-cutting notes:
 | `parallel/tolerated-failure-count` | ✅ covered | by `parallel_completion` (`CompletionConfig`); tolerated-failure return semantics shown in `map_completion` |
 | `parallel/tolerated-failure-percentage` | ✅ covered | by `parallel_completion` (`CompletionConfig`) |
 | `parallel/custom-summary-generator` | ⊘ skip | no summary-generator hook in the Rust SDK's public API |
-| `parallel/virtual-context` | ✅ ported | `coordination/parallel_virtual` — `.nesting(NestingMode::Flat)` |
+| `parallel/virtual-context` | ✅ ported | `coordination/parallel_virtual`: `.nesting(NestingMode::Flat)` |
 | `map/basic` | ✅ ported | `coordination/map_basic` (also demonstrates `.item_namer()`) |
 | `map/empty` | ✅ ported | `coordination/map_empty` |
 | `map/large-scale` | ✅ covered | by `map_concurrency` (bounded fan-out stands in for scale) |
@@ -146,7 +146,7 @@ is therefore either ported or covered, none left planned. Cross-cutting notes:
 | `map/failure-threshold-exceeded-percentage` | ✅ covered | by `map_completion` (`tolerated_failure_percentage` field) |
 | `map/tolerated-failure-count` | ✅ ported | `coordination/map_completion` (`CompletionConfig::with_tolerated_failure_count`) |
 | `map/tolerated-failure-percentage` | ✅ covered | by `map_completion` (same completion surface) |
-| `map/virtual-context` | ✅ ported | `coordination/map_virtual` — `.nesting(NestingMode::Flat)` |
+| `map/virtual-context` | ✅ ported | `coordination/map_virtual`: `.nesting(NestingMode::Flat)` |
 | `map-completion-config-issue` | ⊘ skip | JS-specific bug reproduction, not a usage example |
 | `promise/all` | ✅ ported | `coordination/combinator_try_join_all` (= `Promise.all`) |
 | `promise/all-settled` | ✅ ported | `coordination/combinator_join_all` (= `Promise.allSettled`) |
@@ -168,7 +168,7 @@ is therefore either ported or covered, none left planned. Cross-cutting notes:
 [`CompletionConfig`]: https://docs.rs/aws-durable-execution-sdk-rust
 [`DurableFuture`]: https://docs.rs/aws-durable-execution-sdk-rust
 
-## Family 3 — external, serdes & cross-cutting
+## Family 3: external, serdes & cross-cutting
 
 Twenty-two representative workloads under `examples/external/` (twenty
 user-facing examples plus two chained-invoke companion callees,
@@ -184,7 +184,7 @@ ported or covered, none left planned. Smoke notes:
 - **Expected-FAILED examples.** `create_callback_timeout` and
   `wait_for_callback_timeout` catch the timeout and finish SUCCEEDED;
   `handler_error` returns an error from the handler and finishes FAILED
-  deterministically — a FAILED terminal state is its PASS condition.
+  deterministically: a FAILED terminal state is its PASS condition.
 - **Companion callees.** `invoke_target` / `invoke_target_tenant` are deployed
   in the same stack; callers reach them through the `TARGET_FUNCTION_NAME`
   environment variable (`${Target.Arn}:$LATEST`).
@@ -257,5 +257,5 @@ ported or covered, none left planned. Smoke notes:
 | `force-checkpointing/callback` | ⊘ skip | no force-checkpoint API in the Rust SDK's public API |
 | `force-checkpointing/invoke` | ⊘ skip | no force-checkpoint API in the Rust SDK's public API |
 | `force-checkpointing/multiple-wait` | ⊘ skip | no force-checkpoint API in the Rust SDK's public API |
-| `child-operations-invalid-depth` | ⊘ skip | `pluginsConfig.childOperationsDepth` — plugin config not in the Rust SDK |
-| `child-operations-preservation` | ⊘ skip | `pluginsConfig.childOperationsDepth` — plugin config not in the Rust SDK |
+| `child-operations-invalid-depth` | ⊘ skip | `pluginsConfig.childOperationsDepth`: plugin config not in the Rust SDK |
+| `child-operations-preservation` | ⊘ skip | `pluginsConfig.childOperationsDepth`: plugin config not in the Rust SDK |

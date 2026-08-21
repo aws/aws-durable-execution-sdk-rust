@@ -314,7 +314,7 @@ async fn step_to_map_swap_detected() {
 ///
 /// Invocation 1 runs an UNNAMED step, then a named step, then suspends on a
 /// wait. Invocation 2 (replay) removes the unnamed step, so the named step
-/// claims position 1 — whose checkpoint belongs to the unnamed step. Type
+/// claims position 1: whose checkpoint belongs to the unnamed step. Type
 /// and sub-type are identical (both Step/Step), so only the None↔Some name
 /// comparison catches it. This is the regression test for silent checkpoint
 /// consumption after an operation is removed.
@@ -366,12 +366,6 @@ async fn removed_operation_detected() {
     );
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Fatal propagation: a mismatch must fail the execution even when the
-// per-operation error is swallowed by a combinator, a tolerant batch, or
-// user code.
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Test: a mismatch inside `join_all` fails the execution.
 ///
 /// `join_all` stores every constituent failure as `Settled::Rejected` and
@@ -417,7 +411,7 @@ async fn join_all_mismatch_fails_execution() {
                     let stable = ctx.step(|_| async { Ok(1_u32) }).name(name).future();
 
                     let settled = ctx.join_all([flaky, stable]).name("gather").await?;
-                    let _ = settled; // outcomes inspected nowhere — join_all never fails fast
+                    let _ = settled; // outcomes inspected nowhere: join_all never fails fast
                     Ok::<_, durable::BoxError>("done".to_owned())
                 }
             },
@@ -529,7 +523,7 @@ async fn select_ok_mismatch_fails_execution_despite_sibling_success() {
 /// Test: a mismatch in a tolerated map branch fails the execution.
 ///
 /// A `CompletionConfig` tolerating every failure would otherwise let the
-/// batch — and therefore the execution — succeed while a branch failed for
+/// batch, and therefore the execution, succeed while a branch failed for
 /// a replay identity mismatch (stringified through the `ChildFnError`
 /// boundary on the way).
 #[tokio::test]
@@ -562,7 +556,7 @@ async fn tolerated_map_branch_mismatch_fails_execution() {
                         .completion(durable::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(2))
                         .await_batch()
                         .await?;
-                    let _ = batch; // tolerated failures — batch reports success
+                    let _ = batch; // tolerated failures: batch reports success
                     Ok::<_, durable::BoxError>("done".to_owned())
                 }
             },
@@ -585,7 +579,7 @@ async fn tolerated_map_branch_mismatch_fails_execution() {
 
 /// Test: a mismatch swallowed by user code still fails the execution.
 ///
-/// The handler ignores the child-context error entirely and returns `Ok` —
+/// The handler ignores the child-context error entirely and returns `Ok`:
 /// the execution must still fail with the dedicated error, because replay
 /// integrity is broken however the per-operation error was handled.
 #[tokio::test]
@@ -629,14 +623,6 @@ async fn handler_swallowed_mismatch_still_fails_execution() {
     );
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Scheduler independence: the mismatch must be detected even when a
-// short-circuiting combinator settles a sibling FIRST and aborts the
-// mismatching loser before it is ever polled. Identity validation runs
-// eagerly when each constituent future is finalized (`.future()`), so
-// none of these tests slow the winner down artificially.
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Builds the retry strategy shared by the scheduler-independence tests:
 /// one 1-second retry so the combinator parks non-terminal on invocation 1,
 /// then stop.
@@ -654,7 +640,7 @@ fn park_once_retry(_err: &durable::StepError, attempt: u32) -> durable::RetryDec
 /// mismatching loser.
 ///
 /// On invocation 2 the winner succeeds on its first poll with no delay, so
-/// `select_ok` aborts the loser as fast as the scheduler allows — under
+/// `select_ok` aborts the loser as fast as the scheduler allows: under
 /// lazy (poll-time) validation the loser's mismatch could go unobserved.
 /// Eager validation at `.future()` creation records the fatal before the
 /// combinator even starts racing.
@@ -670,7 +656,7 @@ async fn select_ok_immediate_winner_still_detects_loser_mismatch() {
                 async move {
                     let call = inv.fetch_add(1, Ordering::SeqCst);
                     // Fails attempt 1 (parks the combinator), succeeds
-                    // attempt 2 IMMEDIATELY — no sleep.
+                    // attempt 2 IMMEDIATELY, no sleep.
                     let winner = ctx
                         .step(|step_ctx| async move {
                             if step_ctx.attempt() < 2 {
@@ -807,7 +793,7 @@ async fn try_join_all_sibling_failure_still_detects_mismatch() {
                     let call = inv.fetch_add(1, Ordering::SeqCst);
                     // Fails attempt 1 with a retry (parks the combinator on
                     // invocation 1), then fails attempt 2 terminally and
-                    // IMMEDIATELY — triggering fail-fast loser abort.
+                    // IMMEDIATELY: triggering fail-fast loser abort.
                     let failing = ctx
                         .step(|_| async { Err::<u32, durable::BoxError>("permanent".into()) })
                         .name("failing")
@@ -857,7 +843,7 @@ async fn try_join_all_sibling_failure_still_detects_mismatch() {
 /// combinator tests above rely on: identity is validated when the
 /// `DurableFuture` is finalized (`.future()`), not when it is first polled.
 /// A combinator's `abort_all()` cancelling an unpolled loser is exactly the
-/// "never polled" case — under lazy (poll-time) validation this handler
+/// "never polled" case: under lazy (poll-time) validation this handler
 /// would complete successfully and the mismatch would vanish.
 #[tokio::test]
 async fn unpolled_dropped_future_mismatch_still_detected() {
@@ -882,7 +868,7 @@ async fn unpolled_dropped_future_mismatch_still_detected() {
                         let renamed = ctx.step(|_| async { Ok(1_u32) }).name("renamed").future();
                         drop(renamed);
                         // The wait at position 2 replays its recorded
-                        // completion, so the handler resolves successfully —
+                        // completion, so the handler resolves successfully:
                         // only the recorded fatal can fail the execution.
                         ctx.wait(Duration::from_secs(1)).name("pause").await?;
                         Ok("done".to_owned())
@@ -910,11 +896,6 @@ async fn unpolled_dropped_future_mismatch_still_detected() {
         "error should name both identities: {msg}"
     );
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Empty names: an unchanged handler using empty item/branch names must
-// replay deterministically (regression for the Some("")↔None false positive).
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Test: a map whose `item_namer` returns empty strings suspends and
 /// resumes without a false non-determinism failure.

@@ -5,7 +5,7 @@ use aws_durable_execution_sdk_rust as durable;
 use durable::DurableContext;
 use durable::builders::map_parallel::CompletionConfig;
 
-/// Handler: map fail-fast — returns metadata projection.
+/// Handler: map fail-fast: returns metadata projection.
 async fn handler(
     _event: serde_json::Value,
     ctx: DurableContext,

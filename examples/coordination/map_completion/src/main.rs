@@ -5,8 +5,8 @@
 //! `tolerated_failure_percentage`) or complete the batch early once enough
 //! items succeed (`min_successful`). Build one with
 //! [`CompletionConfig::builder`](aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfig::builder),
-//! which combines thresholds in a single chain. Each item's error — including
-//! its type — is preserved for inspection and survives replay, so a later
+//! which combines thresholds in a single chain. Each item's error, including
+//! its type, is preserved for inspection and survives replay, so a later
 //! invocation sees the same failure it saw the first time.
 //!
 //! This example maps four items, one of which deliberately fails, tolerating a

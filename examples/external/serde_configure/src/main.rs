@@ -1,6 +1,6 @@
 //! Share one [`Serdes`] instance across operations with an `Arc`.
 //!
-//! Serdes are configured per operation — there is no execution-wide slot,
+//! Serdes are configured per operation: there is no execution-wide slot,
 //! because a single erased slot cannot represent `Serdes<T>` for every
 //! operation output type. To apply one configured instance across a
 //! handler, wrap it in an [`Arc`](std::sync::Arc) and clone the handle into

@@ -3,7 +3,7 @@
 //! [`select_ok`] returns the first operation that succeeds. Operations that
 //! fail before any success are ignored; if all fail, it returns an aggregate
 //! error. It is the durable analogue of `Promise.any`. When the first success
-//! resolves, the still-running operations are dropped (cancelled) — Rust's
+//! resolves, the still-running operations are dropped (cancelled): Rust's
 //! natural cancellation. The winning result is checkpointed, so replay returns
 //! the same winner.
 //!

@@ -129,7 +129,7 @@ impl<O: Send + 'static> DurableFuture<O> {
     /// observes that park and this wrapper forwards it: to the redirect
     /// target when [`Self::set_park_scope`] installed one (the future is a
     /// combinator constituent), otherwise to `owner_scope` (the scope the
-    /// operation was created on — a direct `.await` must still suspend the
+    /// operation was created on: a direct `.await` must still suspend the
     /// caller). After forwarding, the future pends forever: a parked
     /// operation resumes only on a later invocation, exactly like the
     /// spawned path.
@@ -171,7 +171,7 @@ impl<O: Send + 'static> DurableFuture<O> {
     ///
     /// Scope isolation means a parking operation inside the spawned task
     /// suspends only `spawn_scope`, which this task's
-    /// [`drive_scope`](crate::driver::drive_scope) observes — the owner's scope
+    /// [`drive_scope`](crate::driver::drive_scope) observes: the owner's scope
     /// is untouched, so runnable siblings keep running. The task then reports
     /// how it settled to the owner's scope-quiescence accounting, which is what
     /// lets the owner suspend exactly once everything runnable has finished or
@@ -231,8 +231,8 @@ impl<O: Send + 'static> DurableFuture<O> {
         // Construct the settling guard BEFORE spawning and move it into the
         // task. The guard must exist from the moment `register_spawn` takes
         // effect: dropping the returned future aborts the task, and an abort
-        // that lands before the task's first poll drops the task body — and
-        // this guard with it — settling `Aborted`. Constructing the guard
+        // that lands before the task's first poll drops the task body, and
+        // this guard with it, settling `Aborted`. Constructing the guard
         // inside the task body instead would leave that window unguarded,
         // permanently counting a phantom outstanding spawn that parks the
         // owner forever (issue #48).
@@ -272,7 +272,7 @@ impl<O: Send + 'static> DurableFuture<O> {
                     SpawnMessage::Parked
                 }
             };
-            // Ignore send error — receiver was dropped.
+            // Ignore send error: receiver was dropped.
             let _ = tx.send(settled);
         });
 
@@ -296,9 +296,9 @@ impl<O: Send + 'static> DurableFuture<O> {
                     }
                     // The operation parked durably: it resumes on a later
                     // invocation, so this handle can never resolve now. Park
-                    // the effective scope — either the redirect target (when
+                    // the effective scope, either the redirect target (when
                     // this future is a constituent of a spawned combinator) or
-                    // the original owner scope — then never return.
+                    // the original owner scope, then never return.
                     Ok(SpawnMessage::Parked) => {
                         let park_target = redirect_handle
                             .get()
@@ -346,7 +346,7 @@ where
 /// A detached task runs no user future and creates no durable operations,
 /// so the task-ownership blessing and scope accounting that
 /// [`DurableFuture::spawn_blessed`] provides do not apply. Nor is it
-/// abort-on-drop — that is the point: the checkpoint batch flusher must
+/// abort-on-drop; that is the point: the checkpoint batch flusher must
 /// survive a cancelled contributor (a lost `race`, a dropped
 /// `DurableFuture`) whose drop would otherwise cancel an in-flight batch
 /// write that other contributors are waiting on.
@@ -427,9 +427,9 @@ pub struct Branch<O> {
 
 /// The erased body of one parallel branch (crate-internal).
 ///
-/// Branch bodies are inherently heterogeneous — every `Branch::new` call
+/// Branch bodies are inherently heterogeneous: every `Branch::new` call
 /// site captures a different closure and future type, and they are all
-/// collected into one `Vec` — so exactly ONE erasure per branch is
+/// collected into one `Vec`, so exactly ONE erasure per branch is
 /// unavoidable. This type keeps it to exactly one: the user's closure and
 /// its future live UNERASED inside a single boxed future built at
 /// [`Branch::new`]. The child [`DurableContext`] is not known until the
@@ -474,7 +474,7 @@ impl<O: Send + 'static> Branch<O> {
     ///
     /// The factory function receives a child [`DurableContext`] and returns
     /// a future producing the branch result. The factory is not invoked
-    /// here — it runs when the parallel operation dispatches the branch.
+    /// here: it runs when the parallel operation dispatches the branch.
     ///
     /// # Examples
     ///
@@ -499,8 +499,8 @@ impl<O: Send + 'static> Branch<O> {
                 // The SDK does the pinning and BoxError -> internal-carrier
                 // type erasure so callers write a plain `async move` body
                 // with `?`. This is the branch's ONE erasure: the factory
-                // closure and its concrete future both live inside this box
-                // — there is no separate closure box producing a second
+                // closure and its concrete future both live inside this box;
+                // there is no separate closure box producing a second
                 // future box.
                 future: Box::pin(async move {
                     let ctx = ctx_rx.await.map_err(|_| {
@@ -559,12 +559,12 @@ pub struct Callback<O> {
     state: CallbackState<O>,
 }
 
-/// Internal state for a callback — either settled (replay) or pending (live).
+/// Internal state for a callback: either settled (replay) or pending (live).
 #[derive(Debug)]
 enum CallbackState<O> {
     /// The callback has a known outcome from the checkpoint log (replay).
     Settled(Option<Result<O, OperationError>>),
-    /// The callback is in flight — requesting the result triggers suspension.
+    /// The callback is in flight: requesting the result triggers suspension.
     Pending(DurableContext),
 }
 
@@ -671,7 +671,7 @@ impl<O: Send + 'static> Callback<O> {
             CallbackState::Pending(ctx) => {
                 // Live path: request suspension and park. The stored context
                 // carries the CALLER's scope (create_callback deliberately
-                // does not rebind — see `CreateCallbackBuilder::into_future`),
+                // does not rebind: see `CreateCallbackBuilder::into_future`),
                 // so rebind onto a fresh scope here: a direct `.await` still
                 // suspends the caller, while a combinator can redirect this
                 // future's park onto a scope it controls instead of parking
@@ -690,10 +690,6 @@ impl<O: Send + 'static> Callback<O> {
         }
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[expect(clippy::panic)]
@@ -720,7 +716,7 @@ mod tests {
 
     /// A panic inside a `.spawn()`ed operation body must surface to the
     /// awaiter as the ORIGINAL panic (payload intact), exactly like the lazy
-    /// path — not as a fabricated "spawned task was cancelled" step error.
+    /// path, not as a fabricated "spawned task was cancelled" step error.
     #[tokio::test]
     async fn spawned_panic_propagates_original_payload() {
         let ctx = test_ctx_with_client();
@@ -743,7 +739,7 @@ mod tests {
     }
 
     /// Dropping the handle of a `.spawn()`ed operation cancels the spawned
-    /// task (abort-on-drop) — cancellation, distinct from a panic, tears the
+    /// task (abort-on-drop): cancellation, distinct from a panic, tears the
     /// body down without unwinding anything into the caller.
     #[tokio::test]
     async fn dropped_spawned_future_cancels_task_without_panic() {

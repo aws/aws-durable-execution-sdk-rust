@@ -29,8 +29,8 @@ The exported surface follows the
 rustfmt first, then the API Guidelines, then clippy's judgment.
 
 Commit subjects follow
-[Conventional Commits](https://www.conventionalcommits.org/). No gate validates
-them, so a reviewer checks the subject line instead. Keep the subject under 50
+[Conventional Commits](https://www.conventionalcommits.org/). Nothing enforces
+this mechanically, so a reviewer checks the subject line instead. Keep the subject under 50
 characters, write it in the imperative mood, drop the trailing period, and wrap
 body text at 72 characters.
 
@@ -46,7 +46,7 @@ change must update every declaration in the same pull request: the root
 `compliance/` and `examples/` that declares `rust-version` (200+ manifests),
 the `msrv` CI job, and the README must agree with it.
 `scripts/check-msrv-consistency.sh`, wired into `make check`, enforces this
-mechanically, so a bump that misses a declaration fails the quality gate
+mechanically, so a bump that misses a declaration fails `make check`
 rather than leaving stale minimums behind. There is deliberately no
 `rust-toolchain.toml`: pinning one would override `rustup default stable` in
 every CI job (the file takes precedence over the default toolchain), quietly
@@ -71,10 +71,10 @@ carries a `///` comment and nothing leaks into the public surface by accident.
 The script closes and enforces the production dependency allowlist. The
 dependency policy section below explains what adding to it involves.
 
-## The quality gate
+## `make check`
 
 `make check` is the single entry point, and it must pass before you push. It
-runs eight commands in order, and any one of them failing fails the gate:
+runs eight commands in order, and any one of them failing fails the run:
 
 | Command | Rejects |
 | --- | --- |
@@ -85,11 +85,11 @@ runs eight commands in order, and any one of them failing fails the gate:
 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | a broken intra-doc link or malformed rustdoc markup anywhere in the documented surface, including feature-gated items |
 | `cargo deny check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source |
 | `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlists do not name, in either the default-feature or the all-features graph |
-| `sh scripts/check-msrv-consistency.sh` | a `rust-version` declaration — in any manifest, the `msrv` CI job, or the README — that disagrees with the root `Cargo.toml`'s |
+| `sh scripts/check-msrv-consistency.sh` | a `rust-version` declaration (in any manifest, the `msrv` CI job, or the README) that disagrees with the root `Cargo.toml`'s |
 
 Two of those are stricter than their defaults. Clippy normally reports warnings
 and exits zero; `-D warnings` turns every one into an error, so a `pedantic`
-suggestion blocks the gate exactly as a correctness lint does. Rustdoc likewise
+suggestion blocks `make check` exactly as a correctness lint does. Rustdoc likewise
 warns by default; `RUSTDOCFLAGS="-D warnings"` makes a broken link a build
 failure.
 
@@ -105,12 +105,12 @@ project must update all applicable `Cargo.toml` files, and the pull request shou
 say why.
 
 `make check` deliberately leaves out one thing that CI still runs: it covers
-the SDK workspace only. Both feature-gated surfaces are already inside the
-gate — `cargo test --all-features` runs the `test-util` and `replay-filter`
+the SDK workspace only. Both feature-gated surfaces are already inside it:
+`cargo test --all-features` runs the `test-util` and `replay-filter`
 tests, so there is no separate feature-testing step to remember.
 
 `compliance/` and `examples/` are separate cargo workspaces whose heavier
-dependency graph the root gate deliberately excludes so it stays fast. CI
+dependency graph `make check` deliberately excludes so it stays fast. CI
 compiles and lints both, which catches a public API change that breaks them.
 Do the same locally when you change the public surface:
 
@@ -133,7 +133,7 @@ never compiles or ships it.
 graph steps outside its allowlist: the default-feature graph may contain only
 the eight always-on crates, and the `--all-features` graph may add only the
 approved optional crates. The second pass is what closes the loophole where
-an unapproved crate rides in behind a feature flag, so the gate turns red the
+an unapproved crate rides in behind a feature flag, so `make check` fails the
 moment someone adds a dependency of either kind.
 
 Adding a crate to either list is a decision, not a routine change. The SDK
@@ -161,8 +161,8 @@ SDK tree makes impractical; the script is what closes the allowlist instead.
 ## Tests
 
 `cargo test` runs the unit tests that live beside the code in `src/` and every
-doctest in the public documentation. Both count toward the gate, so a doc example
-that stops compiling breaks the build. Mark an example `no_run` when it needs
+doctest in the public documentation. Both count toward `make check`, so a doc
+example that stops compiling breaks the build. Mark an example `no_run` when it needs
 AWS credentials or a live service, and keep it compiling rather than turning it
 into a `text` block.
 
@@ -193,7 +193,7 @@ You need a Rust toolchain,
 [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html),
 Python, an AWS account you can deploy to, and the ARN of a Lambda execution role
 in that account. The quickest way to get one is the template this repository
-ships — a one-time deploy with IAM-capable credentials; the test stacks
+ships: a one-time deploy with IAM-capable credentials; the test stacks
 themselves never create IAM resources, so day-to-day runs need no IAM
 permissions:
 
@@ -303,7 +303,7 @@ request against `alpha`. Discuss anything substantial in an issue first so you d
 not spend a weekend on a design we cannot take.
 
 Run `make check` before you push, and run the two extra workspace builds when
-you have changed the public API. A pull request that fails the gate wastes a CI
+you have changed the public API. A pull request that fails `make check` wastes a CI
 run and a reviewer's first pass.
 
 CI runs four workflows on a pull request. `ci.yml` splits `make check` into a
@@ -323,7 +323,7 @@ harness. Everything must be green before merge. The conformance and cloud
 workflows need credentials for the project's test account, which a pull request
 from a fork cannot obtain, so a maintainer runs those for you.
 
-A reviewer reads for the things a gate cannot see. Documentation on a new public
+A reviewer reads for the things no automated check can see. Documentation on a new public
 item should explain when to use it rather than restate its signature. A change
 must preserve determinism, since the SDK claims operation IDs at the call site,
 so any control flow deciding which operations to create may depend only on the

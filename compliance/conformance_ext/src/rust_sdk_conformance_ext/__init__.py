@@ -2,9 +2,9 @@
 """Conformance extension registering Rust-SDK-driven requirement suites.
 
 The language-agnostic conformance runner ships a fixed core requirement
-tree. Suites that originate from this SDK's own issue tracker —
+tree. Suites that originate from this SDK's own issue tracker,
 multi-page-history replay (issue #5), non-determinism detection
-(issue #6), and combinator task-ownership coverage (issue #7) — are
+(issue #6), and combinator task-ownership coverage (issue #7), are
 contributed through the runner's public extension entry point instead, so
 ``--suite history``, ``--suite nondeterminism``, and ``--suite combinator``
 become valid the moment this package is installed alongside the runner:

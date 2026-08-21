@@ -1,9 +1,9 @@
 ---
-# 13-2: join_all task ownership — settled outcomes are genuine (issue #7)
+# 13-2: join_all task ownership: settled outcomes are genuine (issue #7)
 description: join_all reports real per-branch outcomes, not ownership rejections
 handler: |
-  Spawns two steps as durable futures — one succeeds, one fails permanently
-  — and joins them with join_all. This is the silent-corruption case from
+  Spawns two steps as durable futures (one succeeds, one fails
+  permanently) and joins them with join_all. This is the silent-corruption case from
   issue #7: without task-ownership blessing, EVERY branch settles Rejected
   (with the ownership error) and join_all still reports overall success.
   The handler counts fulfilled and rejected outcomes and returns

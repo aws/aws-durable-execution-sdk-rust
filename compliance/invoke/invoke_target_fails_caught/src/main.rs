@@ -13,7 +13,7 @@ async fn handler(
     match result {
         Ok(v) => Ok(v),
         Err(err) => {
-            // Check if it's an InvokeError (target failed) — catch it.
+            // Check if it's an InvokeError (target failed): catch it.
             if matches!(err.kind(), durable::OperationErrorKind::Invoke(_)) {
                 Ok("fallback".to_owned())
             } else {

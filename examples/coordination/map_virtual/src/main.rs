@@ -3,7 +3,7 @@
 //! By default each mapped item runs in its own nested child context.
 //! [`NestingMode::Flat`] instead runs items in a *virtual* context, sharing the
 //! parent's operation namespace rather than nesting a per-item child. This
-//! flattens the operation history — the map counterpart to flat parallel
+//! flattens the operation history: the map counterpart to flat parallel
 //! branches.
 //!
 //! The behavior is defined by conformance requirement 9-12. This example maps

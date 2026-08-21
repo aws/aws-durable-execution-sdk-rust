@@ -14,7 +14,7 @@ without re-running the body.
 Preview. The `alpha` branch carries the current code. Steps, waits, invokes,
 callbacks, child contexts, map, parallel, and the four combinators all work
 against the live service, and the API may still change. `make check` runs the
-quality gate: formatting, clippy, tests and doctests, docs, and the
+quality checks: formatting, clippy, tests and doctests, docs, and the
 dependency policy.
 
 The crate is not on crates.io yet, so depend on the repository directly. It
@@ -34,7 +34,7 @@ Create a binary crate named `first_durable_function` with the dependencies
 above and put this in `src/main.rs`. The handler runs a step, suspends on a
 two second timer, then runs a second step that reads the first result.
 
-```rust
+```rust no_run
 use std::time::Duration;
 
 use aws_durable_execution_sdk_rust as durable;
@@ -149,7 +149,7 @@ aws lambda get-durable-execution \
 A durable handler is an async function of two arguments that returns a
 `Result`.
 
-```rust
+```rust ignore
 async fn handler(
     event: MyEvent,
     ctx: durable::DurableContext,
@@ -186,7 +186,7 @@ converts the builder into a `DurableFuture<O>` that the combinators accept.
 `DurableFuture<O>`, which lets you overlap independent work and join it with
 `tokio::join!`.
 
-```rust
+```rust ignore
 let wait = ctx.wait(Duration::from_secs(5)).name("timer").spawn();
 let work = ctx.step(|_| async { Ok(42_i32) }).name("compute").spawn();
 
@@ -250,7 +250,7 @@ than once per retry attempt if an interruption occurs in that window. Design
 step bodies to be idempotent, or use `StepSemantics::AtMostOncePerRetry` to
 treat an interrupted attempt as a failure rather than re-executing it.
 
-```rust
+```rust ignore
 let value = ctx
     .step(|_| async { Ok("step completed".to_owned()) })
     .await?;
@@ -262,7 +262,7 @@ strategy takes the error and the 1-based attempt number and returns
 suspends for the delay between attempts, so a retrying step does not hold the
 invocation open.
 
-```rust
+```rust ignore
 let result = ctx
     .step(|step_ctx| async move {
         let attempt = step_ctx.attempt();
@@ -293,7 +293,7 @@ attempt.
 
 ### wait
 
-```rust
+```rust ignore
 ctx.wait(Duration::from_secs(60)).name("cooldown").await?;
 ```
 
@@ -302,7 +302,7 @@ ctx.wait(Duration::from_secs(60)).name("cooldown").await?;
 `invoke` calls another durable function and resolves with its result. The
 output type parameter comes first so you can turbofish it.
 
-```rust
+```rust ignore
 let receipt = ctx
     .invoke::<serde_json::Value, _>(&target_function_name, event)
     .name("delegate")
@@ -316,7 +316,7 @@ between attempts, and suspends between polls. `wait_strategy_fn` receives the
 current state and the attempt number and returns `WaitDecision::complete()`
 or `WaitDecision::continue_with(delay)`.
 
-```rust
+```rust ignore
 let count = ctx
     .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)
     .wait_strategy_fn(move |state: i32, _attempt| {
@@ -338,8 +338,8 @@ exponential backoff configuration (`initial_delay`, `max_delay`,
 when the predicate matches the new state, fails it with a
 `MaxChecksExceeded` error once `max_attempts` checks have run, and
 otherwise suspends for the computed backoff delay. Build one with
-`WaitStrategy::builder(predicate)` — the predicate is the builder's
-argument, so an unbounded strategy cannot be constructed — and the
+`WaitStrategy::builder(predicate)` (the predicate is the builder's
+argument, so an unbounded strategy cannot be constructed), and the
 remaining knobs default to 60 attempts, 5 second initial delay, 5 minute
 maximum delay, 1.5 backoff rate, and full jitter, matching the JS and
 Python SDKs. With no strategy set at all, the check runs exactly once and
@@ -352,7 +352,7 @@ hand the ID to an external system and await the payload separately. An
 external caller completes it with the
 `SendDurableExecutionCallbackSuccess` API.
 
-```rust
+```rust ignore
 let cb = ctx.create_callback::<String>().name("approval").await?;
 tracing::info!(callback_id = %cb.id(), "awaiting external completion");
 let approval = cb.result().await?;
@@ -363,7 +363,7 @@ the ID, passes it to your submitter closure, and resolves with the payload.
 The submitter receives the ID as an owned `String`, so move it straight into
 the async block.
 
-```rust
+```rust ignore
 let approval: String = ctx
     .wait_for_callback::<String, _, _>(|_step_ctx, callback_id| async move {
         publish_approval_request(callback_id).await?;
@@ -382,7 +382,7 @@ submitter with the same retry strategy shape a step uses.
 A child context gets its own operation namespace, which keeps a subroutine's
 operation IDs independent of the caller's.
 
-```rust
+```rust ignore
 let greeting = ctx
     .run_in_child_context(|child| async move {
         let name = child
@@ -407,7 +407,7 @@ progress is derived from checkpointed results, so it survives suspension.
 The closure is `Fn` rather than `FnOnce` because the SDK calls it once per
 attempt.
 
-```rust
+```rust ignore
 let receipt = ctx
     .with_retry(|child| async move {
         let quote = child
@@ -442,7 +442,7 @@ attempt count and the last attempt's error.
 context. Items need `Serialize + DeserializeOwned` because the SDK records
 them.
 
-```rust
+```rust ignore
 let results = ctx
     .map(items, |child, item, idx| async move {
         let out = child
@@ -458,7 +458,7 @@ let results = ctx
 
 `parallel` runs a fixed set of named branches that share an output type.
 
-```rust
+```rust ignore
 let branches: Vec<Branch<u32>> = vec![
     Branch::new("double", |child| async move {
         let base = child.step(|_| async { Ok(21u32) }).name("compute").await?;
@@ -473,8 +473,8 @@ let branches: Vec<Branch<u32>> = vec![
 let results = ctx.parallel(branches).name("fan-out").await?;
 ```
 
-Both accept `.max_concurrency(...)` and `.completion(...)`. By default —
-with no `.completion(...)` call, or with an empty `CompletionConfig` — the
+Both accept `.max_concurrency(...)` and `.completion(...)`. By default
+(with no `.completion(...)` call, or with an empty `CompletionConfig`) the
 first item failure fails the batch, matching the Python and JS SDKs;
 configuring any criterion replaces that implicit fail-fast (use
 `with_tolerated_failure_count(0)` for explicit fail-fast, or
@@ -488,7 +488,7 @@ builder's `.completion_predicate(...)` adds a custom trigger: a function of
 the running batch statistics (succeeded count, failed count, total items,
 and the settled outcomes so far) that returns `true` to end the batch with
 the `PredicateMatched` reason. The predicate must be a deterministic, pure
-function of the statistics it receives — the SDK evaluates it only on state
+function of the statistics it receives: the SDK evaluates it only on state
 derived from recorded results, and anything else (clock, randomness, outside
 state) can make replay diverge. To keep those statistics reproducible, item
 outcomes feed them strictly in input order (item `i` enters only once items
@@ -509,7 +509,7 @@ The four combinators take `DurableFuture` values, which `.future()` and
 
 `try_join_all` collects every result, propagating the first error:
 
-```rust
+```rust ignore
 let a = ctx.step(|_| async { Ok(1u32) }).name("a").future();
 let b = ctx.step(|_| async { Ok(2u32) }).name("b").future();
 let c = ctx.step(|_| async { Ok(3u32) }).name("c").future();
@@ -520,7 +520,7 @@ let results: Vec<u32> = ctx.try_join_all([a, b, c]).name("gather").await?;
 `join_all` returns `Vec<Settled<O>>` so you can inspect failures individually
 without failing fast:
 
-```rust
+```rust ignore
 let good = ctx.step(|_| async { Ok(1u32) }).name("good").future();
 let bad = ctx
     .step(|_| async { Err::<u32, durable::BoxError>("boom".into()) })
@@ -540,7 +540,7 @@ for outcome in &settled {
 
 `select_ok` returns the first success, dropping losers:
 
-```rust
+```rust ignore
 let primary = ctx
     .step(|_| async { Err::<u32, durable::BoxError>("unavailable".into()) })
     .name("primary")
@@ -553,7 +553,7 @@ let winner: u32 = ctx.select_ok([primary, fallback]).name("first-ok").await?;
 
 `race` returns the first outcome to settle, whether it succeeded or failed:
 
-```rust
+```rust ignore
 let first = ctx.step(|_| async { Ok("first".to_owned()) }).name("first").future();
 let second = ctx.step(|_| async { Ok("second".to_owned()) }).name("second").future();
 
@@ -567,19 +567,19 @@ The SDK stores operation payloads as JSON by default. Implement
 actual Rust type and asynchronous: `serialize` receives the **owned typed
 value** and returns the `String` to store on the wire; `deserialize` takes
 that wire string back to the typed value. There is no intermediate
-representation — a custom format sees struct field declaration order,
+representation: a custom format sees struct field declaration order,
 `i128` values outside the `i64`/`u64` ranges, and everything else the real
 type carries.
 
 The SDK awaits the future a serdes returns directly on the executor
 thread. Cheap in-memory transforms (like the default `JsonSerdes`) run
-inline in the returned future; an implementation that blocks — filesystem
-I/O, long-running synchronous work — must move that work into
+inline in the returned future; an implementation that blocks (filesystem
+I/O, long-running synchronous work) must move that work into
 `tokio::task::spawn_blocking` itself, the way `FileSystemSerdes` does.
 `async fn` in the implementation satisfies the trait's `impl Future`
 return type:
 
-```rust
+```rust ignore
 struct Base64JsonSerdes;
 
 impl<T> Serdes<T> for Base64JsonSerdes
@@ -622,8 +622,8 @@ where
 
 A **type-agnostic** format like the one above uses a blanket
 `impl<T> Serdes<T>` and attaches to any operation. A **type-specific**
-format implements `Serdes<ConcreteType>` directly — `impl Serdes<Order>
-for OrderSerdes` — and gains compile-time pairing: attaching it to an
+format implements `Serdes<ConcreteType>` directly, `impl Serdes<Order>
+for OrderSerdes`, and gains compile-time pairing: attaching it to an
 operation that produces another type fails to compile.
 
 Serdes are configured **per operation**, with `.serdes(...)` on
@@ -640,9 +640,9 @@ method because their payloads are structural, not user-typed.
 There is no execution-wide serdes slot: a single trait-object slot cannot
 represent `Serdes<T>` for every operation output type without erasing the
 value again. To share one instance across a handler, create an `Arc<S>`
-and clone it into each operation — `Arc<S>` forwards to `S`:
+and clone it into each operation; `Arc<S>` forwards to `S`:
 
-```rust
+```rust ignore
 let shared = std::sync::Arc::new(Base64JsonSerdes);
 let a: String = ctx
     .step(|_| async { Ok("a".to_owned()) })
@@ -661,20 +661,20 @@ call into a `'static` blocking task without borrowing across an `.await`.
 or S3 Files mounted to Lambda). Every write goes to a new, unique file
 (atomically renamed into place) under a directory resolved from the
 `SerdesContext`, and the checkpoint envelope records which file to read on
-replay — so a retried attempt can never overwrite a file an accepted
+replay, so a retried attempt can never overwrite a file an accepted
 checkpoint references. File references are only honored from records the SDK
 itself wrote, resolved strictly under the configured base path; externally
 delivered payloads (callback completions) are always read as plain values.
 Each `serialize` or
-`deserialize` call runs its complete implementation — JSON rendering or
-parsing, path resolution, and the file I/O — inside one
+`deserialize` call runs its complete implementation (JSON rendering or
+parsing, path resolution, and the file I/O) inside one
 `tokio::task::spawn_blocking` task, so the executor thread never touches
 the filesystem. Do not use it with Lambda's ephemeral `/tmp`: that storage
 is local to a single execution environment and does not persist across
 invocations. Mount EFS or S3 Files and point `FileSystemSerdes` at the
 mount path.
 
-```rust
+```rust ignore
 use durable::serdes::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
 
 let serdes = FileSystemSerdes::with_config(
@@ -691,7 +691,7 @@ Enable the `test-util` feature to get `LocalRunner`, which drives a handler
 through as many simulated invocations as the execution needs, in process and
 without AWS.
 
-```rust
+```rust ignore
 let result = LocalRunner::new()
     .run(
         |n: u32, ctx: durable::DurableContext| async move {

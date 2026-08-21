@@ -1,7 +1,7 @@
 //! Conformance requirement 13-1: `try_join_all` task ownership (issue #7).
 //!
 //! The combinator drives its branch futures on internal `JoinSet` tasks,
-//! which must be blessed with the task-ownership guard — an unblessed
+//! which must be blessed with the task-ownership guard: an unblessed
 //! branch is rejected as a foreign task and the combinator fails.
 
 use aws_durable_execution_sdk_rust as durable;

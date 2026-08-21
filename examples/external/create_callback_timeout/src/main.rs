@@ -6,7 +6,7 @@
 //! [`CallbackError`](aws_durable_execution_sdk_rust::CallbackError). This
 //! example does not arrange any external completion, so it always times out;
 //! it catches the error and returns a fallback rather than failing the
-//! execution — the same pattern you would use for a real optional approval.
+//! execution: the same pattern you would use for a real optional approval.
 
 use std::time::Duration;
 

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Input event for the smoke handler.
 #[derive(Debug, Deserialize)]
 struct SmokeEvent {
-    /// Name to greet — defaults to "world" if absent.
+    /// Name to greet: defaults to "world" if absent.
     #[serde(default = "default_name")]
     name: String,
 }

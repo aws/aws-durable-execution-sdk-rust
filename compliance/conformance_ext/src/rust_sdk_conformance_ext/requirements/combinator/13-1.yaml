@@ -4,7 +4,7 @@ description: try_join_all runs blessed branch tasks and aggregates results
 handler: |
   Spawns two steps as durable futures and joins them with try_join_all.
   The combinator drives its branches on internal JoinSet tasks, which must
-  be registered (blessed) with the task-ownership guard — without the
+  be registered (blessed) with the task-ownership guard: without the
   blessing the branches are rejected as foreign tasks and the combinator
   fails. The handler returns the sum of both branch results.
 invocations: |

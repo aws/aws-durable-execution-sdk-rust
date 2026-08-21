@@ -5,7 +5,7 @@
 //! [`Duration`](std::time::Duration). This is not a `sleep` that blocks a
 //! running Lambda: the SDK checkpoints the wait, the invocation ends, and the
 //! service re-invokes the function when the duration elapses. A wait of two
-//! seconds and a wait of thirty days cost the same while suspended — nothing
+//! seconds and a wait of thirty days cost the same while suspended: nothing
 //! is running.
 //!
 //! On resume the code before the wait is replayed from checkpoints (not

@@ -1,5 +1,5 @@
 ---
-# 12-3: Non-determinism detection — removed operation (issue #6)
+# 12-3: Non-determinism detection: removed operation (issue #6)
 description: A removed operation on replay fails with a non-determinism error
 handler: |
   On the first execution, runs step "load-config" then step "process-data",

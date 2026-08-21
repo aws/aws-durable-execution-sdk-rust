@@ -1,5 +1,8 @@
 //! The step operation: [`StepBuilder`], returned by
 //! [`DurableContext::step`](crate::DurableContext::step).
+//!
+//! The [step operation guide](https://docs.aws.amazon.com/durable-execution/sdk-reference/operations/step/)
+//! describes this operation independently of any language SDK.
 
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
@@ -13,23 +16,16 @@ use crate::future::DurableFuture;
 use crate::serdes::JsonSerdes;
 use crate::{BoxError, context::StepContext};
 
-// ============================================================
-// StepBuilder
-// ============================================================
-
 /// Builder for a durable step operation.
 ///
 /// Created by [`DurableContext::step`]. Chain optional configuration
 /// methods, then `.await` or `.spawn()`.
 ///
-/// The builder is generic over the step closure `F` and its future `Fut`
-/// so the body is stored **without type erasure**; both parameters are
-/// inferred at the call site and never written by users. It also carries
-/// the serdes implementation `S` (defaulting to
-/// [`JsonSerdes`]); [`serdes`](Self::serdes)
-/// swaps that parameter. The single erasure point is `.future()` /
-/// `.await`, which produces the one [`DurableFuture`] box — the future is
-/// [`DurableFuture<O>`] regardless of `S`, so futures configured with
+/// The builder is generic over the step closure `F` and its future `Fut`;
+/// both are inferred at the call site and never written by users. It also
+/// carries the serdes implementation `S` (defaulting to [`JsonSerdes`]);
+/// [`serdes`](Self::serdes) swaps that parameter. Whatever `S` is, the
+/// finalized future is [`DurableFuture<O>`], so futures configured with
 /// different serdes implementations coexist in one combinator input
 /// collection.
 ///
@@ -114,9 +110,10 @@ where
 
     /// Sets the retry strategy for this step.
     ///
-    /// The strategy closure is called on each failure with the error and
-    /// attempt number to decide whether to retry. The SDK boxes the closure
-    /// internally — no `Box::new` at the call site.
+    /// On each failure the strategy receives the
+    /// [`StepError`](crate::StepError) and the attempt number that just
+    /// failed (attempt numbers start at 1), and returns a
+    /// [`RetryDecision`](crate::RetryDecision).
     ///
     /// # Examples
     ///
@@ -154,8 +151,8 @@ where
     /// Sets the retry strategy for this step from a
     /// [`RetryStrategyConfig`](crate::builders::RetryStrategyConfig).
     ///
-    /// Use this for the common case — shaping retry delays (attempt count,
-    /// initial delay, cap, backoff rate, jitter) — without hand-writing a
+    /// Use this for the common case, shaping retry delays (attempt count,
+    /// initial delay, cap, backoff rate, jitter), without hand-writing a
     /// closure. For decisions a delay schedule cannot express, such as
     /// inspecting the error, use [`retry_strategy`](Self::retry_strategy)
     /// instead.
@@ -190,7 +187,7 @@ where
     /// Sets a custom serializer/deserializer for this step's result.
     ///
     /// Replaces the builder's serdes type parameter with `S2`, which must
-    /// implement [`Serdes<O>`](crate::Serdes) for this step's output type —
+    /// implement [`Serdes<O>`](crate::Serdes) for this step's output type:
     /// attaching a serdes for a different type fails at compile time. To
     /// share one instance across operations, wrap it in an
     /// [`Arc`](std::sync::Arc) and clone the `Arc` handle into each builder.
@@ -220,7 +217,7 @@ where
     /// - [`StepSemantics::AtMostOncePerRetry`](crate::StepSemantics::AtMostOncePerRetry): treat the interruption as a
     ///   failure and consult the retry strategy without re-executing.
     ///
-    /// This is a client-side configuration only — it does not affect the
+    /// This is a client-side configuration only: it does not affect the
     /// wire protocol.
     ///
     /// # Examples
@@ -253,12 +250,23 @@ where
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
+    ///
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<O> {
         <Self as IntoFuture>::into_future(self)
     }
 
     /// Eagerly spawns the step on a tokio task.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     ///
     /// # Examples
     ///

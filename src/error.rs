@@ -7,7 +7,7 @@
 //!
 //! # `Display` convention
 //!
-//! Each layer's `Display` writes **one frame** — its own description, never
+//! Each layer's `Display` writes **one frame**: its own description, never
 //! its source's text. Walking [`source()`](std::error::Error::source)
 //! therefore never repeats text. To print the whole chain in one line, use
 //! the alternate form `{:#}`, which walks the source chain from that layer
@@ -20,7 +20,7 @@
 //! variants, and variants that retain structural facts (an attempt count,
 //! a failed index) are newtype variants wrapping a payload struct with
 //! accessors. The escaping error that caused the failure is never
-//! stringified into a kind — it is carried by the error struct and
+//! stringified into a kind: it is carried by the error struct and
 //! returned from `source()`.
 
 use std::error::Error;
@@ -42,10 +42,6 @@ const CHAIN_WALK_LIMIT: usize = 10;
 
 /// Maximum number of captured backtrace frames written to the wire.
 const STACK_TRACE_FRAME_LIMIT: usize = 64;
-
-// ────────────────────────────────────────────────────────────────────────────
-// The single flattening site
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Writes `frame` followed by every frame of `source`'s chain, separated
 /// by `": "`.
@@ -85,10 +81,6 @@ pub(crate) fn chain_string(err: &(dyn Error + 'static)) -> String {
     }
     Chain(err).to_string()
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// WireError — the named wire failure record
-// ────────────────────────────────────────────────────────────────────────────
 
 /// The failure fields of a wire `ErrorObject`, as a named record.
 ///
@@ -131,20 +123,20 @@ impl WireError {
         self
     }
 
-    /// The wire `ErrorType` — the name of the error type that failed the
+    /// The wire `ErrorType`: the name of the error type that failed the
     /// operation, as recorded in the execution history.
     #[must_use]
     pub fn error_type(&self) -> Option<&str> {
         self.error_type.as_deref()
     }
 
-    /// The wire `ErrorMessage` — the flattened, human-readable message.
+    /// The wire `ErrorMessage`: the flattened, human-readable message.
     #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         self.error_message.as_deref()
     }
 
-    /// The wire `ErrorData` — an opaque payload attached to the failure.
+    /// The wire `ErrorData`: an opaque payload attached to the failure.
     ///
     /// The SDK writes this field and passes it through boundaries, but
     /// **never deserializes it and never dispatches on it**: the wire
@@ -197,10 +189,6 @@ impl fmt::Display for WireError {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// ReplayedFailure — the synthetic source on replay
-// ────────────────────────────────────────────────────────────────────────────
-
 /// The synthetic source attached to an error rebuilt from a checkpointed
 /// failure on replay.
 ///
@@ -249,7 +237,7 @@ impl fmt::Display for ReplayedFailure {
     /// Writes the recorded message as this frame.
     ///
     /// The recorded `error_type` is deliberately NOT folded into the
-    /// text — it is data, answered by [`error_type()`](Self::error_type) —
+    /// text: it is data, answered by [`error_type()`](Self::error_type),
     /// so a failure observed live and the same failure observed on replay
     /// render identically.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -262,10 +250,6 @@ impl fmt::Display for ReplayedFailure {
 }
 
 impl Error for ReplayedFailure {}
-
-// ────────────────────────────────────────────────────────────────────────────
-// ContextualError — crate-internal frame + cause carrier
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Crate-internal error that adds one context frame on top of a cause,
 /// without stringifying the cause into the frame.
@@ -301,15 +285,11 @@ impl Error for ContextualError {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// TypedError — explicit error-type naming for the wire
-// ────────────────────────────────────────────────────────────────────────────
-
 /// An error wrapper that records its inner error's concrete type name for
 /// the wire `ErrorType`.
 ///
 /// Rust erases an error's concrete type the moment it is boxed into a
-/// [`BoxError`](crate::BoxError) — inside the SDK there is no runtime name
+/// [`BoxError`](crate::BoxError): inside the SDK there is no runtime name
 /// to recover, so an unwrapped error is recorded with the generic type
 /// `"Error"`. Wrapping the error at the one place its type is still known
 /// (its creation site) is the explicit alternative:
@@ -332,7 +312,7 @@ impl Error for ContextualError {
 ///
 /// The wrapper is one chain layer: its `Display` frame is the recorded
 /// type name, and its [`source()`](std::error::Error::source) is the
-/// wrapped error itself — so the concrete error stays reachable through
+/// wrapped error itself, so the concrete error stays reachable through
 /// the ordinary `source()` downcast walk, and a flattened chain reads
 /// `"TransientError: temporary failure"`.
 #[derive(Debug)]
@@ -414,23 +394,19 @@ fn short_type_name(full: &str) -> String {
     result
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Wire failure derivation (write path)
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Derives the wire failure record for an escaping error, explicitly —
-/// no `Debug` scraping.
+/// Derives the wire failure record for an escaping error explicitly,
+/// with no `Debug` scraping.
 ///
 /// - `error_message` is the error's flattened source chain, built by the
 ///   module's single flattening site ([`chain_string`]).
 /// - `error_type` is taken from structured identity when the error *is*
 ///   one: an [`OperationError`] re-records its attached wire record's
 ///   type when it carries one (or a [`TypedError`]'s name from its
-///   chain), falling back to its kind's registry name — so an explicitly
+///   chain), falling back to its kind's registry name, so an explicitly
 ///   supplied user type survives re-recording across child-context and
 ///   map boundaries. A [`ReplayedFailure`] re-records its original type.
-///   A plain user error has no recoverable type name in Rust — the
-///   concrete type is erased when the caller boxes it — so it records
+///   A plain user error has no recoverable type name in Rust (the
+///   concrete type is erased when the caller boxes it), so it records
 ///   `fallback_type`.
 /// - `error_data` is passed through from the first error in the source
 ///   chain (up to [`CHAIN_WALK_LIMIT`] links) that carries one, so an
@@ -455,7 +431,7 @@ pub(crate) fn wire_error_for(err: &(dyn Error + 'static), fallback_type: &str) -
         replayed.error_type().unwrap_or(fallback_type).to_owned()
     } else {
         // A `TypedError` anywhere in the chain names the user's type
-        // explicitly — the one non-erased source of a concrete name.
+        // explicitly: the one non-erased source of a concrete name.
         typed_error_name(err).unwrap_or_else(|| fallback_type.to_owned())
     };
     wire_error_with_type(err, &error_type)
@@ -516,7 +492,7 @@ pub(crate) fn wire_error_with_type(err: &(dyn Error + 'static), error_type: &str
 /// message, capturing the stack at the construction site.
 ///
 /// This is the constructor for live failure records that have no
-/// escaping error to walk — protocol-discriminator failures such as a
+/// escaping error to walk: protocol-discriminator failures such as a
 /// combinator's empty input, a wait-for-condition strategy exhaustion,
 /// or a callback timeout. A bare [`WireError::new`] at such a site would
 /// emit no `stack_trace`; routing through this helper centralizes the
@@ -525,7 +501,7 @@ pub(crate) fn wire_error_manual(error_type: &str, message: impl Into<String>) ->
     WireError::new(Some(error_type), Some(message.into())).with_stack_trace(capture_stack_trace())
 }
 
-/// The wire `ErrorType` recorded when a checkpoint write itself failed —
+/// The wire `ErrorType` recorded when a checkpoint write itself failed:
 /// on the terminal `FAIL` record a permanent rejection persists for the
 /// operation, and on the `FAILED` envelope that then ends the execution.
 /// A handler never observes this type: checkpoint failures unwind the
@@ -563,8 +539,8 @@ pub(crate) fn serialization_failure_wire(err: &(dyn Error + 'static)) -> WireErr
 /// This type is the replay discriminator for the exhaustion
 /// classification: the live path yields a
 /// [`WaitForConditionErrorKind::MaxChecksExceeded`]-kinded error after
-/// persisting this record, and replay reconstructs the SAME kind — with
-/// the check count derived from the checkpoint record's attempt field —
+/// persisting this record, and replay reconstructs the SAME kind (with
+/// the check count derived from the checkpoint record's attempt field)
 /// by matching this type, so a handler that branches on the kind (or
 /// reads [`MaxChecksExceeded::checks`]) takes the same path live and
 /// replayed. It is a protocol discriminator written via
@@ -613,15 +589,11 @@ fn capture_stack_trace() -> Vec<String> {
         .collect()
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// OperationError
-// ────────────────────────────────────────────────────────────────────────────
-
 /// The top-level error type returned by [`DurableFuture`](crate::DurableFuture).
 ///
 /// Wraps a typed per-operation cause accessible via [`kind()`](Self::kind).
 /// Match on the kind to determine the specific failure mode, and walk
-/// [`source()`](std::error::Error::source) to reach the underlying cause —
+/// [`source()`](std::error::Error::source) to reach the underlying cause:
 /// on the live path that is the escaping error itself (downcastable to its
 /// concrete type), and after a replay it is a [`ReplayedFailure`] carrying
 /// the recorded wire fields.
@@ -817,7 +789,7 @@ pub enum OperationErrorKind {
     /// A combinator operation failed.
     Combinator(CombinatorError),
     /// The handler produced operations in a different order than the
-    /// checkpointed history — the execution is non-deterministic.
+    /// checkpointed history: the execution is non-deterministic.
     NonDeterministicExecution(NonDeterministicExecutionError),
 }
 
@@ -852,10 +824,6 @@ impl fmt::Display for OperationErrorKind {
         }
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// StepError
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Error from a step operation.
 ///
@@ -984,10 +952,6 @@ impl fmt::Display for RetriesExhausted {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// WaitError
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Error from a wait operation.
 ///
 /// Use [`kind()`](Self::kind) to determine the failure mode.
@@ -1100,10 +1064,6 @@ impl fmt::Display for UnexpectedStatus {
         write!(f, "unexpected checkpointed status: {}", self.status)
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// InvokeError
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Error from an invoke operation.
 ///
@@ -1224,10 +1184,6 @@ impl fmt::Display for FunctionNotFound {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// CallbackError
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Error from a callback operation.
 ///
 /// Follows the graded external/internal split: external errors are
@@ -1344,10 +1300,6 @@ impl fmt::Display for CallbackErrorKind {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// WaitForConditionError
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Error from a wait-for-condition operation.
 ///
 /// # Examples
@@ -1458,10 +1410,6 @@ impl fmt::Display for MaxChecksExceeded {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// ChildContextError
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Error from a child context (sub-orchestration) operation.
 ///
 /// # Examples
@@ -1539,10 +1487,6 @@ impl fmt::Display for ChildContextErrorKind {
         }
     }
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// CombinatorError
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Error from a combinator operation (`try_join_all`, `join_all`,
 /// `select_ok`, `race`).
@@ -1698,12 +1642,8 @@ impl fmt::Display for JoinFailed {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// NonDeterministicExecutionError
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Error raised when replay cannot faithfully reproduce the checkpointed
-/// history — the claimed operation does not match the record at its slot
+/// history: the claimed operation does not match the record at its slot
 /// (the handler produced operations in a different order between
 /// invocations), or the record carries a status this SDK version cannot
 /// interpret.
@@ -1711,8 +1651,8 @@ impl fmt::Display for JoinFailed {
 /// This is a fatal, non-recoverable error: the execution must be failed and
 /// cannot be retried without resetting the checkpoint log.
 ///
-/// There is no foreign cause to carry — the report *is* the
-/// error — so this type has no source; its structural facts live behind
+/// There is no foreign cause to carry (the report *is* the
+/// error), so this type has no source; its structural facts live behind
 /// the kind payload's accessors (see [`OperationMismatch`] and
 /// [`UnrecognizedStatus`]).
 ///
@@ -1793,9 +1733,9 @@ pub enum NonDeterministicExecutionErrorKind {
     ///
     /// This arises when the durable execution service introduces a new
     /// operation status that predates this SDK build. Guessing is unsafe in
-    /// both directions — treating a possibly-terminal operation as
+    /// both directions, treating a possibly-terminal operation as
     /// re-runnable re-executes completed work, and fabricating a terminal
-    /// outcome returns a result that was never recorded — so the execution
+    /// outcome returns a result that was never recorded, so the execution
     /// fails naming the raw status. Upgrading the SDK to a version that
     /// understands the status is the remedy.
     UnrecognizedStatus(UnrecognizedStatus),
@@ -1908,10 +1848,6 @@ impl fmt::Display for UnrecognizedStatus {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// ChildFnError
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Crate-internal error carrier for `run_in_child_context`, `parallel`, and
 /// `map` closure bodies.
 ///
@@ -1974,7 +1910,7 @@ impl From<crate::BoxError> for ChildFnError {
 }
 
 // Static assertions: all public error types must be Send + Sync + 'static.
-// These compile-time checks prevent accidental regressions — the `source`
+// These compile-time checks prevent accidental regressions: the `source`
 // fields' `Send + Sync` bounds are what keep them true. The helper is
 // genuinely called during const evaluation, so no dead-code override is
 // needed (and `#[expect(dead_code)]` here diverges across toolchains).
@@ -2045,7 +1981,7 @@ mod tests {
         chain
     }
 
-    // ── Acceptance: live-path downcast ──────────────────────────────────
+    // Acceptance: live-path downcast
 
     #[test]
     fn live_failure_exposes_concrete_error_type_through_source_downcast() {
@@ -2064,13 +2000,13 @@ mod tests {
         assert_eq!(user.detail, "flaky");
     }
 
-    // ── Acceptance: Display frames, alternate chain, no repeats ────────
+    // Acceptance: Display frames, alternate chain, no repeats
 
     #[test]
     fn display_writes_one_frame_and_alternate_walks_chain() {
         let err = step_error_with_user_source();
 
-        // `{}` yields one frame — no cause text.
+        // `{}` yields one frame, no cause text.
         let plain = format!("{err}");
         assert_eq!(plain, "operation error: step");
 
@@ -2108,7 +2044,7 @@ mod tests {
         }
     }
 
-    // ── Replay source ────────────────────────────────────────────────────
+    // Replay source
 
     #[test]
     fn replayed_failure_carries_wire_fields() {
@@ -2133,7 +2069,7 @@ mod tests {
         assert_eq!(replayed.wire().error_data(), Some("{\"code\":42}"));
     }
 
-    // ── Wire derivation ──────────────────────────────────────────────────
+    // Wire derivation
 
     #[test]
     fn wire_error_for_flattens_chain_once_and_uses_fallback_type() {
@@ -2144,12 +2080,12 @@ mod tests {
             wire.error_message(),
             Some("operation error: step: execution failed: user boom: flaky")
         );
-        // No structured identity in the chain — falls back to the kind's
+        // No structured identity in the chain: falls back to the kind's
         // wire name because the top error is an OperationError.
         assert_eq!(wire.error_type(), Some("StepError"));
         // A fresh failure captures a stack trace.
         assert!(!wire.stack_trace().is_empty());
-        // No error_data anywhere in the chain — none synthesized.
+        // No error_data anywhere in the chain: none synthesized.
         assert_eq!(wire.error_data(), None);
     }
 
@@ -2192,7 +2128,7 @@ mod tests {
         assert_eq!(wire.error_type(), Some("MyDomainError"));
 
         // ...and an operation error wrapping it re-records its attached
-        // wire identity — the explicitly supplied type survives the
+        // wire identity: the explicitly supplied type survives the
         // boundary instead of degrading to the kind's registry name.
         let err = OperationError::from_kind(OperationErrorKind::Step(StepError::new(
             StepErrorKind::ExecutionFailed,
@@ -2216,7 +2152,7 @@ mod tests {
         assert_eq!(wire.error_type(), Some("StepError"));
     }
 
-    // ── Structural facts behind accessors ────────────────────────────────
+    // Structural facts behind accessors
 
     #[test]
     fn step_error_kind_accessor() {
@@ -2244,7 +2180,7 @@ mod tests {
         assert!(err.to_string().contains("abc123"));
     }
 
-    // ── Combinators keep every loser ─────────────────────────────────────
+    // Combinators keep every loser
 
     #[test]
     fn combinator_all_failed_keeps_every_loser() {
@@ -2280,7 +2216,7 @@ mod tests {
         assert!(source.downcast_ref::<UserBoom>().is_some());
     }
 
-    // ── ChildFnError carries the error ───────────────────────────────────
+    // ChildFnError carries the error
 
     #[test]
     fn child_fn_error_preserves_operation_error() {
@@ -2293,7 +2229,7 @@ mod tests {
         assert!(format!("{child_err:#}").contains("user boom: flaky"));
     }
 
-    // ── Display conventions across variants ──────────────────────────────
+    // Display conventions across variants
 
     #[test]
     fn every_operation_family_displays_its_frame() {
@@ -2439,7 +2375,7 @@ mod tests {
     #[test]
     fn typed_error_keeps_concrete_error_downcastable() {
         let err = TypedError::with_type("TransientError", UserBoom { detail: "x" });
-        // The wrapped error is the next chain link — downcast reaches it.
+        // The wrapped error is the next chain link: downcast reaches it.
         let source = Error::source(&err).expect("wraps the error");
         assert!(source.downcast_ref::<UserBoom>().is_some());
         // The chain names the type once, then the error's own frame.

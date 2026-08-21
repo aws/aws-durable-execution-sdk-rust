@@ -8,7 +8,7 @@ use durable::serdes::SerdesContext;
 /// Custom serdes that wraps with "wrapped:" prefix.
 ///
 /// The SDK hands the serdes the item's typed value directly, so this
-/// handler prepends the prefix to the raw string — the same shape as the
+/// handler prepends the prefix to the raw string: the same shape as the
 /// Go and Python reference handlers, with no decode step to compensate
 /// for.
 #[derive(Debug)]
@@ -65,7 +65,7 @@ mod tests {
     use aws_durable_execution_sdk_rust::serdes::SerdesContext;
 
     /// The SDK hands the serdes the item value typed, so for item `"X"` the
-    /// handler sees `String::from("X")` and produces `wrapped:X` — the wire
+    /// handler sees `String::from("X")` and produces `wrapped:X`: the wire
     /// form requirement 9-14 asserts.
     #[tokio::test]
     async fn wraps_the_item_value_and_round_trips() {

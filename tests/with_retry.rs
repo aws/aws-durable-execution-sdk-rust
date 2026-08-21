@@ -24,7 +24,7 @@ use durable::{DurableContext, RetryDecision};
 /// A failing first attempt re-runs BOTH steps of the block on the second
 /// attempt, under a fresh operation namespace.
 #[tokio::test]
-#[expect(clippy::too_many_lines)] // reason: one flow — run, assert counters, assert history
+#[expect(clippy::too_many_lines)] // reason: one flow (run, assert counters, assert history)
 async fn failed_attempt_reruns_whole_block_with_fresh_namespace() {
     let closure_runs = Arc::new(AtomicU32::new(0));
     let step_one_runs = Arc::new(AtomicU32::new(0));

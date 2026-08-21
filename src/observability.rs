@@ -1,7 +1,7 @@
 //! The SDK's observability contract: documented, stable `tracing` spans and
 //! events describing the operation lifecycle.
 //!
-//! The SDK instruments itself through the [`tracing`] facade only — it never
+//! The SDK instruments itself through the [`tracing`] facade only: it never
 //! installs a subscriber, adds no observability dependency, and works with
 //! whatever subscriber the application provides. This module documents the
 //! names and fields the SDK emits and exports them as constants, so a
@@ -41,12 +41,12 @@
 //! (`operation_started`, `operation_succeeded`, `operation_failed`,
 //! `operation_retry_scheduled`) or short-circuits one from recorded state
 //! (`operation_replayed`). The record-transition events cover **every**
-//! operation type the SDK checkpoints — steps, waits, invokes, callbacks,
+//! operation type the SDK checkpoints (steps, waits, invokes, callbacks,
 //! `wait_for_condition` polls, child contexts, and map/parallel batches and
-//! items — and each one is emitted only **after** the checkpoint write that
+//! items), and each one is emitted only **after** the checkpoint write that
 //! persists the transition succeeds: a rejected checkpoint records nothing,
 //! so it emits nothing. The converse holds too: every transition the
-//! service records emits its event — the events fire the moment the service
+//! service records emits its event: the events fire the moment the service
 //! accepts the write, before any fallible follow-up work (such as fetching
 //! paginated execution state), so a failure *after* the write still leaves
 //! the persisted transitions' events emitted. The code path that performs
@@ -56,7 +56,7 @@
 //! caller cancelled while awaiting a batched write (a dropped `race` or
 //! `select_ok` loser) does not suppress the events for updates the flush
 //! still persists, and when a large batch is split into several requests,
-//! each request's events are emitted as soon as that request succeeds —
+//! each request's events are emitted as soon as that request succeeds:
 //! even if a later request in the same batch fails.
 //!
 //! `operation_replayed` likewise covers every operation type: steps, waits,
@@ -68,7 +68,7 @@
 //! returned. One exception is deliberate: a child context or batch recorded
 //! in *replay-children* mode (its result was too large to checkpoint)
 //! re-executes its body rather than short-circuiting, so it emits no
-//! `operation_replayed` of its own — the operations inside it emit theirs.
+//! `operation_replayed` of its own: the operations inside it emit theirs.
 //!
 //! | Event name | Emitted when | Fields |
 //! |------------|--------------|--------|
@@ -84,7 +84,7 @@
 //! Exactly one of `execution_started` / `execution_resumed` is emitted per
 //! invocation, and `execution_suspended` at most once per invocation. All
 //! three are emitted while the handler's `durable_execution` span is
-//! entered, so they are span events of that span — a subscriber that
+//! entered, so they are span events of that span: a subscriber that
 //! groups events by span (including the OpenTelemetry bridge below) sees
 //! them on the execution span rather than as orphans.
 //!
@@ -130,7 +130,7 @@
 //! exports it without SDK support: `durable_execution` and
 //! `durable_operation` become OpenTelemetry spans carrying the fields above
 //! as attributes, and lifecycle events become span events. The bridge crates
-//! are the application's dependencies, not this SDK's — the SDK's dependency
+//! are the application's dependencies, not this SDK's: the SDK's dependency
 //! allowlist stays closed. A typical Lambda `main` (versions current at the
 //! time of writing; the example is illustrative, not compiled):
 //!
@@ -228,10 +228,10 @@ pub mod event_names {
 ///
 /// When rendered by a JSON subscriber (e.g. `lambda_runtime`'s
 /// `init_default_subscriber()` with `AWS_LAMBDA_LOG_FORMAT=JSON`), these
-/// appear as top-level JSON keys — matching the `CloudWatch` Logs Insights
+/// appear as top-level JSON keys, matching the `CloudWatch` Logs Insights
 /// query `filter coalesce(durableExecutionArn, executionArn) like "<arn>"`.
 pub mod field_names {
-    /// Durable execution ARN — identifies the orchestration instance.
+    /// Durable execution ARN: identifies the orchestration instance.
     pub const EXECUTION_ARN: &str = "executionArn";
 
     /// Lambda invocation request ID.

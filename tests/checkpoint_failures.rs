@@ -24,7 +24,7 @@ use std::time::Duration;
 use aws_durable_execution_sdk_rust as durable;
 use durable::test_util::LocalRunner;
 
-/// The wire error type a checkpoint-write failure records — internal to
+/// The wire error type a checkpoint-write failure records: internal to
 /// the SDK, asserted here through the public `TestResult` surface.
 const CHECKPOINT_FAILED: &str = "CheckpointFailedError";
 
@@ -35,7 +35,7 @@ const CHECKPOINT_FAILED: &str = "CheckpointFailedError";
 /// `fail_checkpoints_after(1, 1)` lets the step's START write through and
 /// permanently rejects its SUCCEED write (the oversized-result shape). The
 /// old behavior looped: body runs, write rejected, invocation errors,
-/// re-invoke finds `Started`, body re-runs — until the execution timeout,
+/// re-invoke finds `Started`, body re-runs: until the execution timeout,
 /// side effects firing once per lap. Now the SDK persists a small terminal
 /// `FAIL` for the step and fails the execution in the same invocation.
 #[tokio::test]
@@ -108,8 +108,8 @@ async fn permanently_rejected_result_fails_execution_after_one_body_run() {
 /// The step's SUCCEED write is permanently rejected. Pre-#43 the failure
 /// surfaced as a catchable `OperationError`, letting the handler branch on
 /// a decision no checkpoint records (replay divergence). Now the handler
-/// future is dropped at the await point — neither the catch branch nor any
-/// code after the step runs — and the execution fails.
+/// future is dropped at the await point, neither the catch branch nor any
+/// code after the step runs, and the execution fails.
 #[tokio::test]
 async fn catch_cannot_observe_checkpoint_api_failure() {
     let caught = Arc::new(AtomicU32::new(0));
@@ -193,7 +193,7 @@ impl durable::Serdes<String> for AlwaysFailSerialize {
 /// yields the recorded `FAIL`.
 ///
 /// A serialization failure is local and deterministic, so it stays
-/// catchable — but the SDK persists the `FAIL` checkpoint BEFORE yielding
+/// catchable, but the SDK persists the `FAIL` checkpoint BEFORE yielding
 /// it. The handler catches it, then suspends on a wait; the next
 /// invocation replays the step from the recorded `FAIL` instead of
 /// re-running the body.
@@ -350,10 +350,6 @@ async fn retryable_exhaustion_fails_invocation_and_reinvocation_converges() {
     );
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Serialization classification is replay-equivalent (review finding 1)
-// ────────────────────────────────────────────────────────────────────────────
-
 /// A serdes whose serialize side always fails, generic over the value type
 /// (the local, deterministic failure shape for any operation).
 #[derive(Debug)]
@@ -382,12 +378,12 @@ impl<T: Send + 'static> durable::Serdes<T> for FailSerialize {
 }
 
 /// The wire error type a local serialization failure records on its
-/// terminal `FAIL` — the replay discriminator that keeps the failure's
+/// terminal `FAIL`: the replay discriminator that keeps the failure's
 /// classification stable across invocations.
 const SERIALIZATION_FAILED: &str = "SerializationError";
 
 /// The kind a step error reports, as a comparable label (the enum's
-/// `Debug` rendering — its variants are `#[non_exhaustive]`, so they
+/// `Debug` rendering: its variants are `#[non_exhaustive]`, so they
 /// cannot be pattern-matched outside the crate).
 fn step_kind_label(err: &durable::OperationError) -> String {
     match err.kind() {
@@ -399,7 +395,7 @@ fn step_kind_label(err: &durable::OperationError) -> String {
 /// Review finding 1: the live path yields
 /// `StepErrorKind::SerializationFailed` after persisting the FAIL, and
 /// replay must reconstruct the SAME kind from the recorded
-/// `SerializationError` type — a handler that branches on the kind takes
+/// `SerializationError` type: a handler that branches on the kind takes
 /// the same path live and replayed.
 #[tokio::test]
 async fn step_serialization_failure_kind_is_replay_equivalent() {
@@ -451,10 +447,6 @@ async fn step_serialization_failure_kind_is_replay_equivalent() {
         .expect("the step's operation record exists");
     assert_eq!(step_op.error_type(), Some(SERIALIZATION_FAILED));
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Pre-checkpoint serialization failures outside steps (review finding 2)
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Review finding 2 (child context): a child whose result fails
 /// serialization persists a terminal FAIL BEFORE yielding, so the closure
@@ -525,8 +517,8 @@ async fn child_serialization_failure_persists_fail_and_replays_without_rerun() {
 
 /// Review finding 2 (map, normal nesting): an item whose result fails
 /// serialization persists a terminal FAIL for its child record and
-/// settles as a failed `BatchItem` — the same shape a replay of that
-/// record produces — so the item closure runs exactly once and live and
+/// settles as a failed `BatchItem`, the same shape a replay of that
+/// record produces, so the item closure runs exactly once and live and
 /// replayed batches agree.
 #[tokio::test]
 async fn map_item_serialization_failure_records_fail_and_replays_as_failed_item() {
@@ -590,7 +582,7 @@ async fn map_item_serialization_failure_records_fail_and_replays_as_failed_item(
 
 /// Review finding 2 (map, FLAT nesting): a flat item has no per-child
 /// record, so its serialization failure settles as a failed `BatchItem`
-/// recorded inside the parent batch's summary — replay reconstructs the
+/// recorded inside the parent batch's summary: replay reconstructs the
 /// same failed item from the parent record without re-running the closure.
 #[tokio::test]
 async fn flat_item_serialization_failure_is_recorded_in_batch_summary() {
@@ -725,13 +717,9 @@ async fn wfc_state_serialization_failure_persists_fail_and_replays_without_rerun
     assert_eq!(wfc_op.error_type(), Some(SERIALIZATION_FAILED));
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Coalesced (batched) checkpoint flush failures (review finding 3)
-// ────────────────────────────────────────────────────────────────────────────
-
 /// Review finding 3, non-retryable half: a buffered outcome write whose
-/// contributor was dropped — the shape of a lost `race`/`select_ok` branch
-/// or any dropped `DurableFuture` — is rejected non-retryably. The SDK
+/// contributor was dropped, the shape of a lost `race`/`select_ok` branch
+/// or any dropped `DurableFuture`, is rejected non-retryably. The SDK
 /// must write a terminal FAIL for the affected operation and fail the
 /// execution, instead of reporting completion while the operation's
 /// record claims less than what executed.
@@ -810,7 +798,7 @@ async fn nonretryable_flush_failure_terminalizes_dropped_contributor_and_fails_e
 
 /// Review finding 3, retryable half: a buffered outcome write whose
 /// contributor was dropped fails retryably. The invocation fails with no
-/// further writes — even though the handler completed — and the
+/// further writes, even though the handler completed, and the
 /// re-invocation converges under the documented `AtLeastOncePerRetry`
 /// interruption contract.
 #[tokio::test]

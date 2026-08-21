@@ -1,5 +1,5 @@
 # Default rustfmt style is deliberate.
 #
 # The Rust Style Guide (RFC 2436) is the definitional formatting reference
-# for this project. rustfmt's default output IS the style — no overrides,
+# for this project. rustfmt's default output IS the style, no overrides,
 # no arguments, no reviewer judgment calls on formatting.

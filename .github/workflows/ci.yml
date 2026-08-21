@@ -140,7 +140,7 @@ jobs:
   # against the pull request's base branch, so an accidental breaking change
   # fails CI unless the version is bumped accordingly (issue #39). The crate
   # is unpublished, so the baseline is a git rev rather than a registry
-  # release — which only exists for pull requests; a push to alpha has no
+  # release, which only exists for pull requests; a push to alpha has no
   # meaningful baseline (the PR that produced it was already checked).
   semver:
     name: public API (semver)

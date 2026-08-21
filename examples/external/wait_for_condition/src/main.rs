@@ -11,7 +11,7 @@
 //! to poll again after a delay.
 //!
 //! The threshold comes from the event and is small, so the loop is bounded to
-//! a handful of polls — a real check would test an external condition (a file
+//! a handful of polls: a real check would test an external condition (a file
 //! landed, a job finished) instead of a counter.
 
 use std::time::Duration;

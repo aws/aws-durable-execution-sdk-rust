@@ -1,5 +1,5 @@
 ---
-# 12-2: Non-determinism detection — operation changes type (issue #6)
+# 12-2: Non-determinism detection: operation changes type (issue #6)
 description: An operation that changes type on replay fails with a non-determinism error
 handler: |
   On the first execution, runs a step named "flip" and then a 1-second

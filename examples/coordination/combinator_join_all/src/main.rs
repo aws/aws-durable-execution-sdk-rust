@@ -1,9 +1,9 @@
 //! `join_all`: collect every outcome, successes and failures alike.
 //!
 //! [`join_all`] runs operations concurrently and returns a
-//! [`Settled`] per operation — [`Fulfilled`](aws_durable_execution_sdk_rust::Settled::Fulfilled)
+//! [`Settled`] per operation: [`Fulfilled`](aws_durable_execution_sdk_rust::Settled::Fulfilled)
 //! with the value or [`Rejected`](aws_durable_execution_sdk_rust::Settled::Rejected)
-//! with the error — never failing fast. It is the durable analogue of
+//! with the error, never failing fast. It is the durable analogue of
 //! `Promise.allSettled`, for when you want every result regardless of
 //! individual failures. Errors inside the settled results are preserved through
 //! checkpointing, so replay reproduces the same successes and failures.

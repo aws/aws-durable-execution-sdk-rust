@@ -1,5 +1,8 @@
 //! The child-context operation: [`ChildBuilder`], returned by
 //! [`DurableContext::run_in_child_context`](crate::DurableContext::run_in_child_context).
+//!
+//! The [child context operation guide](https://docs.aws.amazon.com/durable-execution/sdk-reference/operations/child-context/)
+//! describes this operation independently of any language SDK.
 
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
@@ -12,20 +15,14 @@ use crate::error::OperationError;
 use crate::future::DurableFuture;
 use crate::serdes::JsonSerdes;
 
-// ============================================================
-// ChildBuilder
-// ============================================================
-
 /// Builder for a child context (sub-orchestration) operation.
 ///
 /// Created by [`DurableContext::run_in_child_context`]. Use `.spawn()` for
 /// eager fan-out execution.
 ///
-/// The builder is generic over the body closure `F` and its future `Fut`
-/// so the body is stored **without type erasure**; both parameters are
-/// inferred at the call site and never written by users. The single
-/// erasure point is `.future()` / `.await`, which produces the one
-/// [`DurableFuture`] box.
+/// The builder is generic over the body closure `F` and its future
+/// `Fut`; both parameters are inferred at the call site and never written
+/// by users.
 ///
 /// # Examples
 ///
@@ -100,7 +97,7 @@ where
     /// Overrides the serialization strategy for the child result.
     ///
     /// Replaces the builder's serdes type parameter with `S2`, which must
-    /// implement [`Serdes<O>`](crate::Serdes) for this child's output type —
+    /// implement [`Serdes<O>`](crate::Serdes) for this child's output type:
     /// attaching a serdes for a different type fails at compile time. To
     /// share one instance across operations, wrap it in an
     /// [`Arc`](std::sync::Arc) and clone the `Arc` handle into each builder.
@@ -118,10 +115,14 @@ where
         }
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
     ///
-    /// Equivalent to `.into_future()` but more discoverable for
-    /// fan-out patterns where you need to hold multiple futures.
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<O>
     where
         S: Serdes<O>,
@@ -131,10 +132,13 @@ where
 
     /// Eagerly spawns the child context on a tokio task.
     ///
-    /// The returned [`DurableFuture`] is already running — this is
-    /// the replay-safe alternative to bare `tokio::spawn` for
-    /// durable operations. The operation ID was already claimed at
-    /// builder creation.
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     ///
     /// # Examples
     ///

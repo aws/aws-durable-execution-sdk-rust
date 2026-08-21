@@ -9,7 +9,7 @@
 # provided.al2023 runtime.
 #
 # Fast-build tuning lives in compliance/Cargo.toml [profile.release] (handlers
-# opt-level 1, deps opt-level 3 via package."*"), scoped to this workspace —
+# opt-level 1, deps opt-level 3 via package."*"), scoped to this workspace:
 # the SDK's own release profile is untouched.
 #
 # Why cargo-lambda and not a plain `cargo build`: a natively linked binary
@@ -20,7 +20,7 @@
 # fails with `Runtime exited with error: exit status 1`. cargo-lambda builds
 # through cargo-zigbuild, which pins the glibc version the binary links
 # against, so the SAME command produces a runtime-compatible artifact on every
-# host — a local pass and a CI pass mean the same thing. cargo-lambda is the
+# host: a local pass and a CI pass mean the same thing. cargo-lambda is the
 # route documented in the Lambda Developer Guide:
 # https://docs.aws.amazon.com/lambda/latest/dg/rust-package.html
 #
@@ -70,14 +70,14 @@ EOF
     exit 1
 fi
 
-# ---- resolve the requested operations ----
+# Resolve the requested operations
 if [ $# -gt 0 ]; then
     operations="$*"
 else
     # `build` is scratch the conformance runner leaves behind (gitignored),
     # not a suite; discovering it as an operation fails the cargo build.
     # conformance_ext is the Python runner-extension package, not a handler
-    # suite — exclude it from auto-discovery.
+    # suite: exclude it from auto-discovery.
     operations=$(find . -maxdepth 1 -mindepth 1 -type d \
         ! -name publish ! -name src ! -name target ! -name build ! -name '.*' \
         ! -name conformance_ext \
@@ -86,7 +86,7 @@ fi
 # Stable signature (sorted, single-space-joined) for the skip stamp.
 ops_sig=$(printf '%s\n' $operations | sort | tr '\n' ' ')
 
-# ---- collect the handler package + directory list for these operations ----
+# Collect the handler package + directory list for these operations
 pkgs=""
 handler_dirs=""
 for op in $operations; do
@@ -99,7 +99,7 @@ for op in $operations; do
 done
 [ -n "$handler_dirs" ] || { echo "Error: no handlers found for: $operations" >&2; exit 1; }
 
-# ---- skip-if-unchanged guard ----
+# Skip-if-unchanged guard
 sha=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || echo nogit)
 dirty=$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null || true)
 
@@ -129,7 +129,7 @@ if should_skip; then
     exit 0
 fi
 
-# ---- single shared-workspace build over just the requested members ----
+# Single shared-workspace build over just the requested members
 echo "Building operations: $operations"
 # cargo-lambda stages every binary it finds in the target dir into
 # target/lambda/<bin>/bootstrap, so a leftover binary from an earlier build of
@@ -141,7 +141,7 @@ rm -rf "$LAMBDA_DIR"
 # shellcheck disable=SC2086
 cargo lambda build --release --x86-64 $pkgs
 
-# ---- stage each handler binary into publish/<handler>/bootstrap ----
+# Stage each handler binary into publish/<handler>/bootstrap
 for dir in $handler_dirs; do
     handler=$(basename "$dir")
     op=$(basename "$(dirname "$dir")")
@@ -171,7 +171,7 @@ MKEOF
     echo "Staged $op/$handler -> publish/$handler/bootstrap"
 done
 
-# ---- record the build stamp (SHA + operation signature); mtime = now ----
+# Record the build stamp (SHA + operation signature); mtime = now
 mkdir -p "$PUBLISH_DIR"
 { echo "$sha"; echo "$ops_sig"; } > "$STAMP"
 

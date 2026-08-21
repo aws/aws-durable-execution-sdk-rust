@@ -22,10 +22,10 @@
 //! - Batches are sealed and written **only while holding the
 //!   [`CheckpointCoalescer::writer_lock`]**, which totally orders every
 //!   buffered write. A flush point that acquires the writer lock therefore
-//!   cannot proceed while any earlier claimed batch is still in flight —
+//!   cannot proceed while any earlier claimed batch is still in flight:
 //!   this is what makes `DurableContext::flush_pending_checkpoints` a true
 //!   barrier rather than a best-effort drain.
-//! - A batch is flushed by whoever gets to it first — a contributor whose
+//! - A batch is flushed by whoever gets to it first: a contributor whose
 //!   delay window elapsed, an urgent contributor (callback creation), or an
 //!   unconditional flush point (suspension / end of invocation). The
 //!   [`CheckpointCoalescer::take_batch`] pointer check makes a stale flusher
@@ -36,7 +36,7 @@
 //! - Once any buffered write fails, the **failure latch** is set (under
 //!   the writer lock, by the failing flusher) and no buffered write
 //!   reaches the backend again for the rest of the invocation: every
-//!   flusher — spawned or flush-point — checks the latch under the writer
+//!   flusher, spawned or flush-point, checks the latch under the writer
 //!   lock before writing, and on a hit publishes the latched error to its
 //!   contributors and retains its updates as unwritten (issue #43,
 //!   "retryable exhaustion fails the invocation with no further writes").
@@ -67,8 +67,8 @@ use crate::tracing_layer::PendingTransitionEvent;
 /// transition it records (see
 /// [`PendingTransitionEvent`](crate::tracing_layer::PendingTransitionEvent)).
 ///
-/// The pair travels together through the whole write path — into the
-/// coalescing buffer, across batch splits, and into the flush task — so
+/// The pair travels together through the whole write path, into the
+/// coalescing buffer, across batch splits, and into the flush task, so
 /// the code that actually persists the update also owns its event and
 /// emits it the moment that write succeeds. Keeping the event with the
 /// update (rather than in the contributor future awaiting the batch) is
@@ -119,8 +119,8 @@ impl Default for BatchLimits {
 
 /// Number of UTF-8 bytes `s` occupies once JSON string escaping is applied
 /// on the wire (excluding the surrounding quotes). Quotes, backslashes, and
-/// control characters expand under escaping — a `"` becomes the two bytes
-/// `\"` — so raw `str::len` under-estimates escape-heavy payloads and would
+/// control characters expand under escaping, a `"` becomes the two bytes
+/// `\"`, so raw `str::len` under-estimates escape-heavy payloads and would
 /// let a batch that fits the raw-byte cap serialize past the service's
 /// request limit.
 pub(crate) fn json_escaped_len(s: &str) -> usize {
@@ -229,7 +229,7 @@ struct CoalescerState {
     /// end-of-invocation flush point (issue #43).
     ///
     /// A spawned batch flush publishes its error only to the batch's
-    /// contributors — and every contributor may already be dropped (a
+    /// contributors, and every contributor may already be dropped (a
     /// lost `race`/`select_ok` branch, a dropped `DurableFuture`). Without
     /// this retention such a failure would be fully discarded, leaving
     /// the affected operations' records claiming less than what executed.
@@ -239,7 +239,7 @@ struct CoalescerState {
     /// persists terminal `FAIL` records, then fails the execution).
     failed: Vec<FailedFlush>,
     /// The FIRST write failure this invocation's buffered channel
-    /// suffered — the failure latch (issue #43).
+    /// suffered: the failure latch (issue #43).
     ///
     /// Once set, no buffered write may reach the backend again this
     /// invocation: "retryable exhaustion fails the invocation with no
@@ -252,7 +252,7 @@ struct CoalescerState {
     /// the latched error to its contributors and retains its updates as
     /// unwritten instead of calling the backend. Deliberately sticky:
     /// [`CheckpointCoalescer::take_failed_flushes`] drains the retained
-    /// failures but never clears the latch — the coalescer lives for one
+    /// failures but never clears the latch: the coalescer lives for one
     /// invocation, and its write channel does not come back within it.
     latched: Option<ClientError>,
 }
@@ -263,7 +263,7 @@ struct CoalescerState {
 pub(crate) struct FailedFlush {
     /// The client error the write failed with.
     pub(crate) error: ClientError,
-    /// The updates that were NOT persisted by the failed write — the
+    /// The updates that were NOT persisted by the failed write: the
     /// rejected chunk and everything after it, never a chunk that already
     /// succeeded (a terminal `FAIL` must not be written over a persisted
     /// outcome).
@@ -341,8 +341,8 @@ impl CheckpointCoalescer {
     /// Adds `updates` to the buffer and returns the batch they joined,
     /// opening a new batch if none is pending. The buffer takes ownership
     /// of each update's lifecycle event along with it: from this point the
-    /// flusher that persists the update — not the (cancellable)
-    /// contributor — is responsible for emitting it.
+    /// flusher that persists the update, not the (cancellable)
+    /// contributor, is responsible for emitting it.
     pub(crate) fn join(&self, updates: Vec<TrackedUpdate>) -> Arc<CheckpointBatch> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.pending.extend(updates);
@@ -376,7 +376,7 @@ impl CheckpointCoalescer {
     /// Retains a checkpoint write failure for the end-of-invocation flush
     /// point (issue #43): `unwritten` are the updates the failed write did
     /// not persist. Also latches the failure (first error wins) so no
-    /// later buffered write reaches the backend this invocation — see
+    /// later buffered write reaches the backend this invocation: see
     /// [`CoalescerState::latched`].
     pub(crate) fn record_failed_flush(&self, error: ClientError, unwritten: Vec<OperationUpdate>) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -387,7 +387,7 @@ impl CheckpointCoalescer {
     }
 
     /// The first write failure this invocation's buffered channel
-    /// suffered, if any — the failure latch (issue #43). A flusher that
+    /// suffered, if any: the failure latch (issue #43). A flusher that
     /// observes it (under the writer lock) must not call the backend: it
     /// publishes this error to its contributors and retains its updates
     /// via [`Self::record_failed_flush`] instead.
@@ -697,7 +697,7 @@ mod tests {
     }
 
     /// The failure latch (issue #43): the FIRST recorded failure latches
-    /// and stays latched — later failures do not replace it, and draining
+    /// and stays latched: later failures do not replace it, and draining
     /// the retained failures does not clear it, because the buffered
     /// write channel does not come back within an invocation.
     #[test]

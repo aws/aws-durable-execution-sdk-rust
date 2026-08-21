@@ -1,6 +1,6 @@
 //! Step with a retry strategy: recover from transient failures.
 //!
-//! A step can fail — a downstream call times out, a dependency is briefly
+//! A step can fail: a downstream call times out, a dependency is briefly
 //! unavailable. A [`retry_strategy`] turns those transient failures into
 //! automatic retries with backoff. The strategy is a function of the error and
 //! the attempt number (1-based); it returns

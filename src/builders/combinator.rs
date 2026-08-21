@@ -4,6 +4,11 @@
 //! [`DurableContext::join_all`](crate::DurableContext::join_all),
 //! [`DurableContext::select_ok`](crate::DurableContext::select_ok), and
 //! [`DurableContext::race`](crate::DurableContext::race).
+//!
+//! The combinators are this SDK's composition surface over
+//! [`DurableFuture`] values; the
+//! [operations section of the SDK reference](https://docs.aws.amazon.com/durable-execution/sdk-reference/)
+//! describes the underlying operations independently of any language SDK.
 
 use std::future::IntoFuture;
 
@@ -12,15 +17,7 @@ use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::{DurableFuture, Settled};
 
-// ============================================================
-// Combinator builders
-// ============================================================
-
-// ============================================================
-// TryJoinAllBuilder (hand-written — output is Vec<O>, not O)
-// ============================================================
-
-/// Builder for [`DurableContext::try_join_all`] — fail-fast join.
+/// Builder for [`DurableContext::try_join_all`]: fail-fast join.
 ///
 /// Awaits all futures concurrently and returns `Vec<O>` on success,
 /// or propagates the first [`OperationError`] encountered.
@@ -82,19 +79,27 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
         self
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
     ///
-    /// Equivalent to `.into_future()` but more discoverable for
-    /// fan-out patterns where you need to hold multiple futures.
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<Vec<O>> {
         self.into_future()
     }
 
     /// Eagerly spawns the operation on a tokio task.
     ///
-    /// The returned [`DurableFuture`] is already running — this is
-    /// the replay-safe alternative to bare `tokio::spawn` for
-    /// durable operations.
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     pub fn spawn(self) -> DurableFuture<Vec<O>> {
         spawn_terminal!(self)
     }
@@ -124,14 +129,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     }
 }
 
-// ============================================================
-// JoinAllBuilder (hand-written — output is Vec<Settled<O>>, not O)
-// ============================================================
-
-/// Builder for [`DurableContext::join_all`] — collect all outcomes.
+/// Builder for [`DurableContext::join_all`]: collect all outcomes.
 ///
 /// Awaits all futures concurrently and returns `Vec<Settled<O>>`.
-/// Never short-circuits — every future runs to completion regardless
+/// Never short-circuits: every future runs to completion regardless
 /// of individual failures.
 ///
 /// # Examples
@@ -191,19 +192,27 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
         self
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
     ///
-    /// Equivalent to `.into_future()` but more discoverable for
-    /// fan-out patterns where you need to hold multiple futures.
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<Vec<Settled<O>>> {
         self.into_future()
     }
 
     /// Eagerly spawns the operation on a tokio task.
     ///
-    /// The returned [`DurableFuture`] is already running — this is
-    /// the replay-safe alternative to bare `tokio::spawn` for
-    /// durable operations.
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     pub fn spawn(self) -> DurableFuture<Vec<Settled<O>>> {
         spawn_terminal!(self)
     }
@@ -233,11 +242,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     }
 }
 
-// ============================================================
-// SelectOkBuilder (hand-written — needs futures storage)
-// ============================================================
-
-/// Builder for [`DurableContext::select_ok`] — first success wins.
+/// Builder for [`DurableContext::select_ok`]: first success wins.
 ///
 /// Returns the first successful `O`; losers are cancelled.
 ///
@@ -297,19 +302,27 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
         self
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
     ///
-    /// Equivalent to `.into_future()` but more discoverable for
-    /// fan-out patterns where you need to hold multiple futures.
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<O> {
         self.into_future()
     }
 
     /// Eagerly spawns the operation on a tokio task.
     ///
-    /// The returned [`DurableFuture`] is already running — this is
-    /// the replay-safe alternative to bare `tokio::spawn` for
-    /// durable operations.
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     pub fn spawn(self) -> DurableFuture<O> {
         spawn_terminal!(self)
     }
@@ -339,11 +352,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     }
 }
 
-// ============================================================
-// RaceBuilder (hand-written — needs futures storage)
-// ============================================================
-
-/// Builder for [`DurableContext::race`] — first settled wins.
+/// Builder for [`DurableContext::race`]: first settled wins.
 ///
 /// Returns the first result (success or failure); losers are cancelled.
 ///
@@ -403,19 +412,27 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
         self
     }
 
-    /// Converts this builder into a [`DurableFuture`] explicitly.
+    /// Converts this builder into a [`DurableFuture`] without starting it.
     ///
-    /// Equivalent to `.into_future()` but more discoverable for
-    /// fan-out patterns where you need to hold multiple futures.
+    /// [`DurableFuture`] is the one input type the combinators
+    /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+    /// [`DurableContext::select_ok`], and [`DurableContext::race`]) accept,
+    /// so `.future()` is how operations of different kinds join or race
+    /// together. It does not start the operation: whatever awaits the
+    /// returned future drives it, and a combinator drops the losers.
     pub fn future(self) -> DurableFuture<O> {
         self.into_future()
     }
 
     /// Eagerly spawns the operation on a tokio task.
     ///
-    /// The returned [`DurableFuture`] is already running — this is
-    /// the replay-safe alternative to bare `tokio::spawn` for
-    /// durable operations.
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime.
     pub fn spawn(self) -> DurableFuture<O> {
         spawn_terminal!(self)
     }

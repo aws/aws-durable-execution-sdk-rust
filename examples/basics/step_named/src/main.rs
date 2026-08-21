@@ -4,7 +4,7 @@
 //! appears in the execution history and in the structured log fields the SDK
 //! attaches to each operation span, so a human reading a trace sees
 //! `process-data` instead of an anonymous positional id. The name is metadata
-//! only — it does not affect operation identity, which is always derived from
+//! only: it does not affect operation identity, which is always derived from
 //! call order.
 //!
 //! This example also shows the natural way to take typed input: declare a

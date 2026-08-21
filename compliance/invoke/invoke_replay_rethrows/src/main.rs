@@ -15,7 +15,7 @@ async fn handler(
         Ok(v) => Ok(v),
         Err(err) => {
             if matches!(err.kind(), durable::OperationErrorKind::Invoke(_)) {
-                // Caught — continue with a wait then return.
+                // Caught: continue with a wait then return.
                 ctx.wait(Duration::from_secs(1)).await?;
                 Ok("caught and continued".to_owned())
             } else {
