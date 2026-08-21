@@ -101,6 +101,8 @@ pub use self::serdes::{JsonSerdes, Serdes};
 pub use self::step::StepSemantics;
 
 // Re-export rule: every foreign type in the public surface is re-exported.
+pub use aws_config::SdkConfig;
+pub use aws_sdk_lambda::Client as LambdaClient;
 pub use lambda_runtime::{self, Context as LambdaContext};
 
 use serde::{Deserialize, Serialize};
@@ -1098,7 +1100,7 @@ fn outcome_envelope(
 /// supplied `sdk_config` builds one; otherwise `None`, which defers to the
 /// ambient default resolved once at first use by [`ClientProvider`].
 pub(crate) fn base_lambda_client_from_options(
-    sdk_config: Option<aws_config::SdkConfig>,
+    sdk_config: Option<SdkConfig>,
     lambda_client: Option<aws_sdk_lambda::Client>,
 ) -> Option<aws_sdk_lambda::Client> {
     match (lambda_client, sdk_config) {
@@ -1602,7 +1604,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)] // reason: test assertion
     fn sdk_config_measurably_alters_client_construction() {
-        let sdk_config = aws_config::SdkConfig::builder()
+        let sdk_config = SdkConfig::builder()
             .behavior_version(aws_config::BehaviorVersion::latest())
             .region(aws_sdk_lambda::config::Region::new("eu-west-1"))
             .build();

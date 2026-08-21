@@ -144,6 +144,10 @@ impl OptionsBuilder {
     /// Use this to provide custom endpoint configuration, credentials, or
     /// HTTP client settings.
     ///
+    /// The parameter type is re-exported at the crate root as
+    /// [`SdkConfig`](crate::SdkConfig), so callers can name it without
+    /// depending on `aws-config` directly.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -158,7 +162,7 @@ impl OptionsBuilder {
     /// # drop(opts);
     /// # }
     /// ```
-    pub fn sdk_config(mut self, config: aws_config::SdkConfig) -> Self {
+    pub fn sdk_config(mut self, config: crate::SdkConfig) -> Self {
         self.sdk_config = Some(config);
         self
     }
@@ -175,22 +179,28 @@ impl OptionsBuilder {
     /// Transient-failure retry of the service calls is the client's own
     /// standard retry; the SDK adds no retry layer of its own.
     ///
+    /// The parameter type is re-exported at the crate root as
+    /// [`LambdaClient`](crate::LambdaClient), so callers can name it without
+    /// depending on `aws-sdk-lambda` directly.
+    ///
     /// # Examples
     ///
-    /// ```no_run
-    /// use aws_durable_execution_sdk_rust::Options;
+    /// The client and its configuration type are both reachable through the
+    /// crate root, so this compiles with no direct `aws-config` or
+    /// `aws-sdk-lambda` dependency:
     ///
-    /// # async fn example() {
-    /// let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    /// let client = aws_sdk_lambda::Client::new(&config);
+    /// ```no_run
+    /// use aws_durable_execution_sdk_rust::{LambdaClient, Options, SdkConfig};
+    ///
+    /// let config = SdkConfig::builder().build();
+    /// let client = LambdaClient::new(&config);
     /// let opts = Options::builder()
     ///     .lambda_client(client)
     ///     .build()
     ///     .expect("valid config");
     /// # drop(opts);
-    /// # }
     /// ```
-    pub fn lambda_client(mut self, client: aws_sdk_lambda::Client) -> Self {
+    pub fn lambda_client(mut self, client: crate::LambdaClient) -> Self {
         self.lambda_client = Some(client);
         self
     }
