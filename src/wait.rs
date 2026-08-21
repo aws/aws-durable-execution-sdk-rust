@@ -139,6 +139,9 @@ fn build_wait_start_update(
 }
 
 #[cfg(test)]
+// Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
+// behavior; production spawning is confined to the src/future.rs helpers.
+#[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::engine::{CheckpointLog, CheckpointRecord};

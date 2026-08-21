@@ -1146,7 +1146,10 @@ impl DurableContext {
         let ctx = self.clone();
         let coalescer = Arc::clone(coalescer);
         let batch = Arc::clone(batch);
-        drop(tokio::spawn(async move {
+        // Detached mode of the spawn abstraction (src/future.rs): this
+        // internal task runs no user future and creates no durable
+        // operations, and it must survive a cancelled contributor.
+        crate::future::spawn_detached(async move {
             let _writer = coalescer.writer_lock().lock().await;
             if let Some(updates) = coalescer.take_batch(&batch) {
                 // Failure latch (issue #43): once any buffered write has
@@ -1186,7 +1189,7 @@ impl DurableContext {
                 };
                 batch.publish(result);
             }
-        }));
+        });
     }
 
     /// Writes a sealed batch, splitting it into request-sized chunks that
@@ -2411,6 +2414,9 @@ fn format_op_identity(op_type: &str, sub_type: Option<&str>, name: Option<&str>)
 }
 
 #[cfg(test)]
+// Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
+// behavior; production spawning is confined to the src/future.rs helpers.
+#[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::client::{

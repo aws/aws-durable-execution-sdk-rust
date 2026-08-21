@@ -836,7 +836,11 @@ fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationErro
 const STEP_FALLBACK_ERROR_TYPE: &str = "Error";
 
 #[cfg(test)]
-#[expect(clippy::panic)] // reason: test assertions with descriptive messages
+#[expect(clippy::panic)]
+// reason: test assertions with descriptive messages
+// Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
+// behavior; production spawning is confined to the src/future.rs helpers.
+#[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::context::DurableContext;

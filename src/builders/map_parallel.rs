@@ -366,11 +366,7 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::lazy_scoped(
-            async move { execution.execute().await },
-            owner_scope,
-            op_scope,
-        )
+        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
     }
 }
 
@@ -671,11 +667,7 @@ where
             branches: self.branches,
         };
 
-        DurableFuture::lazy_scoped(
-            async move { execution.execute().await },
-            owner_scope,
-            op_scope,
-        )
+        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
     }
 }
 

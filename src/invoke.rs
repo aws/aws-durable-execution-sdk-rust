@@ -303,7 +303,11 @@ fn build_chained_invoke_start(
 
 #[cfg(test)]
 #[expect(clippy::panic)] // reason: test assertions with descriptive messages
-#[expect(clippy::indexing_slicing)] // reason: test assertions on known-populated vectors
+#[expect(clippy::indexing_slicing)]
+// reason: test assertions on known-populated vectors
+// Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
+// behavior; production spawning is confined to the src/future.rs helpers.
+#[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::context::DurableContext;

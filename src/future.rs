@@ -241,7 +241,7 @@ impl<O: Send + 'static> DurableFuture<O> {
             settled: false,
         };
 
-        let handle = tokio::spawn(async move {
+        let handle = spawn_raw(async move {
             // Register this task as blessed AFTER spawn (we need the task ID).
             if let Some(task_id) = tokio::task::try_id() {
                 task_ownership.bless_task(task_id);
@@ -319,6 +319,42 @@ impl<O: Send + 'static> DurableFuture<O> {
             park_redirect: Some(redirect),
         }
     }
+}
+
+/// The single production `tokio::spawn` call site in the crate.
+///
+/// The `clippy.toml` `disallowed-methods` rule bans bare `tokio::spawn`
+/// everywhere; this helper carries the crate's one production exception.
+/// Both faces of the spawn abstraction route through it:
+/// [`DurableFuture::spawn_blessed`], which registers the task with the
+/// task-ownership and suspension-scope accounting, and [`spawn_detached`],
+/// the abstraction's detached mode for internal bookkeeping tasks.
+fn spawn_raw<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[expect(clippy::disallowed_methods)]
+    // reason: the one production spawn call site the lint points everything
+    // else at; all production spawning routes through this helper
+    tokio::spawn(future)
+}
+
+/// The spawn abstraction's detached mode: runs an internal SDK bookkeeping
+/// future on its own task, deliberately unowned.
+///
+/// A detached task runs no user future and creates no durable operations,
+/// so the task-ownership blessing and scope accounting that
+/// [`DurableFuture::spawn_blessed`] provides do not apply. Nor is it
+/// abort-on-drop — that is the point: the checkpoint batch flusher must
+/// survive a cancelled contributor (a lost `race`, a dropped
+/// `DurableFuture`) whose drop would otherwise cancel an in-flight batch
+/// write that other contributors are waiting on.
+pub(crate) fn spawn_detached<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    drop(spawn_raw(future));
 }
 
 /// What a spawned task reports to its handle.
@@ -660,7 +696,11 @@ impl<O: Send + 'static> Callback<O> {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[expect(clippy::panic)] // reason: test assertions
+#[expect(clippy::panic)]
+// reason: test assertions
+// Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
+// behavior; production spawning is confined to the src/future.rs helpers.
+#[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::engine::CheckpointLog;

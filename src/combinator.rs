@@ -1131,7 +1131,11 @@ fn replay_combinator_failure(wire: crate::error::WireError, wire_id: &str) -> Op
     clippy::panic,
     clippy::indexing_slicing,
     clippy::items_after_statements
-)] // reason: test assertions
+)]
+// reason: test assertions
+// Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
+// behavior; production spawning is confined to the src/future.rs helpers.
+#[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};

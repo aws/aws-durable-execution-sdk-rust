@@ -620,8 +620,9 @@ pub(crate) async fn drive_invocation<F>(
 where
     F: Future<Output = Result<String, crate::error::WireError>> + Send,
 {
-    // Pin the handler future on the stack so we can poll it.
-    let mut pinned = Box::pin(handler_future);
+    // Pin the handler future on the stack so we can poll it. `F` is a
+    // concrete generic, so no heap allocation is needed.
+    let mut pinned = std::pin::pin!(handler_future);
 
     // Use poll_fn to manually drive the future with suspension checks.
     std::future::poll_fn(move |cx: &mut Context<'_>| {
@@ -642,9 +643,9 @@ where
         // Check if suspension was already requested (from a previous poll
         // cycle where an operation set the flag).
         if suspension_signal.is_suspend_requested() {
-            // Drop the future by letting `pinned` go out of scope when
-            // this closure is dropped. Return Ready(Pending) to the outer
-            // async — we're done.
+            // Drop the future by letting its stack-pinned storage go out
+            // of scope when this driver returns. Return Ready(Pending) to
+            // the outer async — we're done.
             return Poll::Ready(InvocationOutcome::Pending);
         }
 
@@ -693,9 +694,9 @@ where
                 // The future yielded — check if an operation requested
                 // suspension during this poll cycle.
                 if suspension_signal.is_suspend_requested() {
-                    // Suspension requested: drop the future (happens when
-                    // `pinned` goes out of scope after this return) and
-                    // report PENDING.
+                    // Suspension requested: drop the future (its
+                    // stack-pinned storage goes out of scope when this
+                    // driver returns) and report PENDING.
                     Poll::Ready(InvocationOutcome::Pending)
                 } else {
                     // Normal async yield — the future is waiting for some
@@ -745,7 +746,9 @@ pub(crate) async fn drive_scope<F>(
 where
     F: Future + Send,
 {
-    let mut pinned = Box::pin(inner);
+    // Stack-pinned: `F` is a concrete generic, so no heap allocation is
+    // needed to poll it.
+    let mut pinned = std::pin::pin!(inner);
     std::future::poll_fn(move |cx: &mut Context<'_>| {
         // Register this branch driver's waker so a park requested from a
         // sub-task within this scope re-polls us to observe the flag.
@@ -797,18 +800,23 @@ pub(crate) mod test_support {
         F: IntoFuture + Send,
         F::IntoFuture: Send,
     {
-        drive_invocation(
-            async move {
-                let _ = fut.await;
-                Ok::<_, crate::error::WireError>("ok".to_owned())
-            },
-            signal,
-        )
-        .await
+        // Box the operation future: `drive_invocation` stack-pins its
+        // argument, so a large operation future would otherwise inflate
+        // every test future that awaits this helper (clippy
+        // `large_futures`). Test-only; production handler futures are
+        // driven unboxed.
+        let fut = Box::pin(async move {
+            let _ = fut.await;
+            Ok::<_, crate::error::WireError>("ok".to_owned())
+        });
+        drive_invocation(fut, signal).await
     }
 }
 
 #[cfg(test)]
+// Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
+// behavior; production spawning is confined to the src/future.rs helpers.
+#[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;

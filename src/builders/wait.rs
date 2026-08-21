@@ -113,10 +113,6 @@ impl IntoFuture for WaitBuilder {
             duration_secs: self.duration_secs,
         };
 
-        DurableFuture::lazy_scoped(
-            async move { execution.execute().await },
-            owner_scope,
-            op_scope,
-        )
+        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
     }
 }

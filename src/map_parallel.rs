@@ -3487,6 +3487,9 @@ fn take_item<I>(items: &[std::sync::Mutex<Option<I>>], index: usize) -> Result<I
 
 #[cfg(test)]
 #[expect(clippy::indexing_slicing)]
+// Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
+// behavior; production spawning is confined to the src/future.rs helpers.
+#[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::context::DurableContext;

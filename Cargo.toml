@@ -117,6 +117,11 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["registry"]
 sha2 = "0.10"
 
 [dev-dependencies]
+# Self dev-dependency: enables `test-util` whenever a dev target (unit,
+# integration, or doc test) builds, so a plain `cargo test` runs the
+# `LocalRunner`-based tests without `--features test-util`. Dev-only, so
+# the feature never leaks into a consumer's default build.
+aws-durable-execution-sdk-rust = { path = ".", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 aws-smithy-runtime-api = { version = "1", features = ["http-1x"] }
 aws-smithy-types = "1"

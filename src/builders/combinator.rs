@@ -120,11 +120,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(
-            async move { execution.execute().await },
-            owner_scope,
-            op_scope,
-        )
+        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
     }
 }
 
@@ -233,11 +229,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(
-            async move { execution.execute().await },
-            owner_scope,
-            op_scope,
-        )
+        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
     }
 }
 
@@ -343,11 +335,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(
-            async move { execution.execute().await },
-            owner_scope,
-            op_scope,
-        )
+        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
     }
 }
 
@@ -453,10 +441,6 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(
-            async move { execution.execute().await },
-            owner_scope,
-            op_scope,
-        )
+        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
     }
 }

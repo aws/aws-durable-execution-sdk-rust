@@ -107,6 +107,7 @@ name = "aws-durable-execution-sdk-rust"
 version = "0.1.0"
 dependencies = [
  "aws-config",
+ "aws-durable-execution-sdk-rust",
  "aws-sdk-lambda",
  "aws-smithy-mocks",
  "aws-smithy-runtime-api",

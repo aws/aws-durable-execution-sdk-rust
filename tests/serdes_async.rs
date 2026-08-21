@@ -12,6 +12,9 @@
 
 #![cfg(feature = "test-util")]
 #![expect(clippy::expect_used)] // reason: test assertions with descriptive messages
+#![expect(clippy::disallowed_methods)]
+// reason: the test deliberately spawns a foreign (unblessed) task to exercise
+// runtime behavior; production spawning is confined to the src/future.rs helpers.
 
 use std::time::Duration;
 
