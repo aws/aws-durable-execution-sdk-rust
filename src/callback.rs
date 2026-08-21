@@ -74,10 +74,16 @@ where
             Some(CALLBACK_SUB_TYPE),
             self.name.as_deref(),
         )? {
+            // The backend assigns the callback ID in the START response, so
+            // every checkpointed callback record must carry one. A record
+            // without it is an invariant violation — fail at the fault
+            // instead of continuing with an empty ID (issue #47; the JS and
+            // Python SDKs fail the same way).
             let callback_id = self
                 .ctx
                 .checkpoint_callback_id(&positional_id)
-                .unwrap_or_default();
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| missing_callback_id_error(&wire_id, view.status.wire_str()))?;
             // Terminal statuses replay the recorded outcome without waiting
             // on the external system again (see `crate::observability`).
             let emit_replayed = || {
@@ -187,11 +193,16 @@ where
         }
 
         // After checkpointing START, the backend assigns a callback_id.
-        // Read it from the (now-updated) checkpoint log.
+        // Read it from the (now-updated) checkpoint log. A record without
+        // one is an invariant violation — fail at the fault instead of
+        // handing the caller an empty ID (issue #47).
         let callback_id = self
             .ctx
             .checkpoint_callback_id(&positional_id)
-            .unwrap_or_default();
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                missing_callback_id_error(&wire_id, CheckpointStatus::Started.wire_str())
+            })?;
 
         // Return pending — Result() will fire suspend.
         Ok(Callback::new_pending(callback_id, self.ctx.clone()))
@@ -773,6 +784,19 @@ fn callback_internal_error(msg: &str) -> OperationError {
     )))
 }
 
+/// Creates the error for a checkpointed callback record that carries no
+/// backend-assigned callback ID (issue #47). The backend assigns the ID
+/// in the START response, so its absence after START is an invariant
+/// violation; the message names the operation, and the operation context
+/// carries the wire ID and recorded status.
+fn missing_callback_id_error(wire_id: &str, status: &str) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Callback(CallbackError::new(
+        CallbackErrorKind::Internal,
+        Some(format!("no callback ID found for started callback: {wire_id}").into()),
+    )))
+    .with_operation(wire_id, status)
+}
+
 /// Creates a wait-for-callback internal error; the message becomes the
 /// source frame, keeping the kind a pure classification.
 fn wfcb_internal_error(msg: &str) -> OperationError {
@@ -1054,8 +1078,142 @@ mod tests {
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should succeed");
-        // The InMemoryClient doesn't assign callback IDs, so it's empty.
-        assert_eq!(cb.id(), "");
+        // The in-memory client assigns backend-style callback IDs.
+        assert_eq!(cb.id(), "in-mem-cb-1");
+    }
+
+    /// Asserts the error is the typed `CallbackError` for a missing
+    /// callback ID, naming the failing operation (issue #47).
+    fn assert_missing_callback_id_error(err: &OperationError, wire: &str) {
+        assert!(
+            matches!(
+                err.kind(),
+                OperationErrorKind::Callback(e)
+                    if matches!(e.kind(), CallbackErrorKind::Internal)
+            ),
+            "expected Callback/Internal error, got {err:#}"
+        );
+        assert_eq!(err.operation_id(), Some(wire));
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(wire),
+            "error should name the operation, got: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_started_missing_callback_id_fails() {
+        // A STARTED callback record without a backend-assigned callback ID
+        // is an invariant violation — the SDK must fail loudly instead of
+        // continuing with an empty ID (issue #47).
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Started,
+            None,
+            None,
+            None,
+            None,
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("no-id".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            serdes: crate::serdes::JsonSerdes,
+            _marker: std::marker::PhantomData,
+        };
+        let err = exec.execute().await.expect_err("must fail on missing id");
+        assert_missing_callback_id_error(&err, &wire);
+        assert_eq!(err.status(), Some("STARTED"));
+    }
+
+    #[tokio::test]
+    async fn replay_started_empty_callback_id_fails() {
+        // An empty-string callback ID is as unusable as a missing one and
+        // fails the same way (issue #47; same principle as #31).
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Started,
+            None,
+            None,
+            None,
+            Some(""),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            serdes: crate::serdes::JsonSerdes,
+            _marker: std::marker::PhantomData,
+        };
+        let err = exec.execute().await.expect_err("must fail on empty id");
+        assert_missing_callback_id_error(&err, &wire);
+    }
+
+    #[tokio::test]
+    async fn replay_succeeded_missing_callback_id_fails() {
+        // The invariant covers every checkpointed callback record, not just
+        // in-flight ones: the backend assigns the ID at START, so a
+        // terminal record without one is equally corrupt (issue #47).
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            Some(r#""hello""#),
+            None,
+            None,
+            None,
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            serdes: crate::serdes::JsonSerdes,
+            _marker: std::marker::PhantomData,
+        };
+        let err = exec.execute().await.expect_err("must fail on missing id");
+        assert_missing_callback_id_error(&err, &wire);
+    }
+
+    #[tokio::test]
+    async fn live_missing_callback_id_fails() {
+        // Live path: the backend's START response is expected to carry the
+        // assigned callback ID. When it does not (forced here with an
+        // explicit empty checkpoint response), the SDK fails with the typed
+        // error instead of returning an empty ID (issue #47).
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        client.enqueue_checkpoint_response(crate::client::TestResponse::Success(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client,
+            "token-1".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+        let wire = op_id.wire().to_owned();
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("no-id-live".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            serdes: crate::serdes::JsonSerdes,
+            _marker: std::marker::PhantomData,
+        };
+        let err = exec.execute().await.expect_err("must fail on missing id");
+        assert_missing_callback_id_error(&err, &wire);
+        assert_eq!(err.status(), Some("STARTED"));
     }
 
     #[tokio::test]
@@ -1206,8 +1364,8 @@ mod tests {
         // Use the builder's spawn path.
         let future = ctx.create_callback::<String>().name("spawn-test").spawn();
         let cb = future.await.expect("spawn should produce callback");
-        // Live path returns empty callback_id from InMemoryClient.
-        assert_eq!(cb.id(), "");
+        // Live path returns the backend-assigned callback_id.
+        assert!(!cb.id().is_empty(), "expected an assigned callback id");
     }
 
     #[tokio::test]

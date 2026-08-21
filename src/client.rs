@@ -380,6 +380,8 @@ pub(crate) struct InMemoryExecutionClient {
     get_state_failure: Mutex<Option<String>>,
     /// Token counter for generating unique tokens.
     token_counter: Mutex<u32>,
+    /// Counter for backend-style callback ID assignment on Callback START.
+    callback_counter: Mutex<u32>,
     /// All operation updates received across checkpoint calls.
     recorded_updates: Mutex<Vec<OperationUpdate>>,
 }
@@ -395,6 +397,7 @@ impl InMemoryExecutionClient {
             get_state_call_count: Mutex::new(0),
             get_state_failure: Mutex::new(None),
             token_counter: Mutex::new(0),
+            callback_counter: Mutex::new(0),
             recorded_updates: Mutex::new(Vec::new()),
         }
     }
@@ -442,6 +445,39 @@ impl ExecutionClient for InMemoryExecutionClient {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *count += 1;
         }
+
+        // Mirror the backend contract: the Callback START response carries
+        // the backend-assigned callback ID (issue #47). Assign one per
+        // Callback START update so the default success path behaves like
+        // the real service; explicitly enqueued responses stay
+        // authoritative and receive no auto-assigned operations.
+        let auto_ops: Vec<Operation> = updates
+            .iter()
+            .filter(|u| {
+                u.r#type() == &OperationType::Callback
+                    && u.action() == &aws_sdk_lambda::types::OperationAction::Start
+            })
+            .map(|u| {
+                let mut counter = self
+                    .callback_counter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *counter += 1;
+                #[allow(clippy::expect_used)] // reason: test double — valid builder input
+                Operation::builder()
+                    .id(u.id())
+                    .r#type(OperationType::Callback)
+                    .status(aws_sdk_lambda::types::OperationStatus::Pending)
+                    .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+                    .callback_details(
+                        aws_sdk_lambda::types::CallbackDetails::builder()
+                            .callback_id(format!("in-mem-cb-{counter}"))
+                            .build(),
+                    )
+                    .build()
+                    .expect("all required Operation fields set")
+            })
+            .collect();
 
         // Record the updates for test assertions.
         {
@@ -500,7 +536,7 @@ impl ExecutionClient for InMemoryExecutionClient {
                     *counter += 1;
                     Ok(CheckpointOutput {
                         checkpoint_token: format!("token-{counter}"),
-                        updated_operations: Vec::new(),
+                        updated_operations: auto_ops,
                         next_marker: None,
                     })
                 }
