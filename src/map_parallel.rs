@@ -2665,6 +2665,15 @@ fn should_stop_failure(
     failure_count: usize,
     total_items: usize,
 ) -> bool {
+    // Empty config: fail fast. When NO completion criterion is configured
+    // (no thresholds and no predicate — which is also what an absent
+    // config becomes), a single failure exceeds tolerance, matching the
+    // Python and JS SDKs (issue #52). Configuring any criterion opts out
+    // of this implicit fail-fast and hands the decision to that criterion.
+    if !cfg.has_criteria() {
+        return failure_count > 0;
+    }
+
     // Count-based tolerance.
     if let Some(tolerated) = cfg.tolerated_failure_count()
         && failure_count > tolerated
@@ -3404,6 +3413,82 @@ mod tests {
         );
     }
 
+    /// Issue #52: with NO completion config, the first item failure fails
+    /// the batch (fail-fast), matching the Python and JS SDKs. Verified
+    /// end-to-end on both `map` and `parallel` plain `.await`.
+    #[tokio::test]
+    async fn absent_completion_config_fails_fast_end_to_end() {
+        use crate::future::Branch;
+
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let err = ctx
+            .parallel(vec![
+                Branch::new("ok", |_ctx| async move { Ok(1_i32) }),
+                Branch::new("boom", |_ctx| async move { Err("intentional".into()) }),
+            ])
+            .await
+            .expect_err("a branch failure without a completion config must fail the batch");
+        assert!(
+            format!("{err:#}").contains("intentional"),
+            "the batch error must carry the failing branch's message, got: {err:#}"
+        );
+
+        let (map_ctx, _c) = test_ctx_with_client(CheckpointLog::empty());
+        let map_err = map_ctx
+            .map(vec![1_i32, -1], |_child, item, _idx| async move {
+                if item < 0 {
+                    Err("intentional".into())
+                } else {
+                    Ok(item)
+                }
+            })
+            .await
+            .expect_err("an item failure without a completion config must fail the batch");
+        assert!(
+            format!("{map_err:#}").contains("intentional"),
+            "the batch error must carry the failing item's message, got: {map_err:#}"
+        );
+    }
+
+    /// Issue #52: an EMPTY `CompletionConfig` behaves exactly as no config —
+    /// fail-fast — and `await_batch` reports the batch as ended by
+    /// `FAILURE_TOLERANCE_EXCEEDED`, the same reason an explicit
+    /// `with_tolerated_failure_count(0)` records.
+    #[tokio::test]
+    async fn empty_completion_config_fails_fast_end_to_end() {
+        use crate::future::Branch;
+
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = ctx
+            .parallel(vec![Branch::new("boom", |_ctx| async move {
+                Err::<i32, _>("intentional".into())
+            })])
+            .completion(crate::builders::map_parallel::CompletionConfig::default())
+            .await_batch()
+            .await
+            .expect("await_batch must return the batch even when it fails fast");
+        assert_eq!(
+            batch.reason,
+            CompletionReason::FailureToleranceExceeded,
+            "an empty config must record the same reason as explicit fail-fast"
+        );
+        assert_eq!(batch.failure_count(), 1);
+
+        // Plain `.await` on the same workload converts it into an error.
+        let (ctx2, _c2) = test_ctx_with_client(CheckpointLog::empty());
+        let err = ctx2
+            .parallel(vec![Branch::new("boom", |_ctx| async move {
+                Err::<i32, _>("intentional".into())
+            })])
+            .completion(crate::builders::map_parallel::CompletionConfig::default())
+            .await
+            .expect_err("a failure under an empty config must fail the batch");
+        assert!(
+            format!("{err:#}").contains("intentional"),
+            "the batch error must carry the branch's message, got: {err:#}"
+        );
+    }
+
     /// Parity: `map` and `parallel` `await_batch` must agree on the batch
     /// shape for equivalent workloads — same completion reason, same
     /// per-index statuses, values, counts, and overall status string.
@@ -3649,6 +3734,56 @@ mod tests {
         assert!(
             !should_stop_failure(&cfg, 0, 10),
             "pct=0 with no failures should not stop"
+        );
+    }
+
+    /// Issue #52: an EMPTY config (no threshold, no predicate — which is
+    /// also what an absent config becomes) fails fast on the first failure,
+    /// matching the Python and JS SDKs.
+    #[tokio::test]
+    async fn empty_completion_config_fails_fast() {
+        let cfg = crate::builders::map_parallel::CompletionConfig::default();
+        assert!(
+            should_stop_failure(&cfg, 1, 10),
+            "an empty config must fail fast on the first failure"
+        );
+        assert!(
+            !should_stop_failure(&cfg, 0, 10),
+            "an empty config with no failures must not stop"
+        );
+    }
+
+    /// Issue #52: configuring ANY criterion opts out of the implicit
+    /// fail-fast — a min_successful-only or predicate-only config tolerates
+    /// failures and lets its own criterion drive completion.
+    #[tokio::test]
+    async fn any_configured_criterion_disables_implicit_fail_fast() {
+        // min_successful only: failures are tolerated (Python parity —
+        // has_criteria is true, and no failure tolerance is configured).
+        let min_only = crate::builders::map_parallel::CompletionConfig::with_min_successful(2);
+        assert!(
+            !should_stop_failure(&min_only, 1, 10),
+            "a min_successful-only config must tolerate failures"
+        );
+
+        // predicate only: the predicate owns the completion decision
+        // (JS parity).
+        let predicate_only =
+            crate::builders::map_parallel::CompletionConfig::with_completion_predicate(|_stats| {
+                false
+            });
+        assert!(
+            !should_stop_failure(&predicate_only, 1, 10),
+            "a predicate-only config must tolerate failures"
+        );
+
+        // pct=100: the tolerate-all recipe — the failure rate can never
+        // strictly exceed 100%.
+        let tolerate_all =
+            crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(100);
+        assert!(
+            !should_stop_failure(&tolerate_all, 10, 10),
+            "pct=100 must tolerate even a fully failed batch"
         );
     }
 

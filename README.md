@@ -467,7 +467,12 @@ let branches: Vec<Branch<u32>> = vec![
 let results = ctx.parallel(branches).name("fan-out").await?;
 ```
 
-Both accept `.max_concurrency(...)` and `.completion(...)`. A
+Both accept `.max_concurrency(...)` and `.completion(...)`. By default —
+with no `.completion(...)` call, or with an empty `CompletionConfig` — the
+first item failure fails the batch, matching the Python and JS SDKs;
+configuring any criterion replaces that implicit fail-fast (use
+`with_tolerated_failure_count(0)` for explicit fail-fast, or
+`with_tolerated_failure_percentage(100)` to tolerate all failures). A
 `CompletionConfig` ends the batch early: `with_min_successful(n)` stops once
 `n` items succeed, `with_tolerated_failure_count(0)` fails fast on the first
 error, and `CompletionConfig::builder()` combines thresholds so the first one

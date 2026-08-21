@@ -137,6 +137,17 @@ where
     }
 
     /// Sets the completion configuration.
+    ///
+    /// **Default: fail fast.** Without this call — or with an empty
+    /// [`CompletionConfig`] (no threshold, no predicate) — the first item
+    /// failure fails the batch, matching the Python and JS SDKs.
+    /// Configuring any criterion replaces that implicit fail-fast with the
+    /// configured criteria:
+    ///
+    /// - explicit fail-fast:
+    ///   [`CompletionConfig::with_tolerated_failure_count(0)`](CompletionConfig::with_tolerated_failure_count)
+    /// - tolerate all failures:
+    ///   [`CompletionConfig::with_tolerated_failure_percentage(100)`](CompletionConfig::with_tolerated_failure_percentage)
     pub fn completion(mut self, config: CompletionConfig) -> Self {
         self.completion = Some(config);
         self
@@ -447,6 +458,17 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     }
 
     /// Sets the completion configuration.
+    ///
+    /// **Default: fail fast.** Without this call — or with an empty
+    /// [`CompletionConfig`] (no threshold, no predicate) — the first branch
+    /// failure fails the batch, matching the Python and JS SDKs.
+    /// Configuring any criterion replaces that implicit fail-fast with the
+    /// configured criteria:
+    ///
+    /// - explicit fail-fast:
+    ///   [`CompletionConfig::with_tolerated_failure_count(0)`](CompletionConfig::with_tolerated_failure_count)
+    /// - tolerate all failures:
+    ///   [`CompletionConfig::with_tolerated_failure_percentage(100)`](CompletionConfig::with_tolerated_failure_percentage)
     pub fn completion(mut self, config: CompletionConfig) -> Self {
         self.completion = Some(config);
         self
@@ -666,6 +688,17 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 /// [completion predicate](Self::with_completion_predicate)), the first
 /// trigger to fire wins.
 ///
+/// # Default: fail fast
+///
+/// An **empty** config — [`CompletionConfig::default()`], with no threshold
+/// and no predicate — fails the batch on the **first item failure**, exactly
+/// as running with no config at all does. This matches the Python and JS
+/// SDKs. Configuring any criterion opts out of that implicit fail-fast and
+/// hands the decision to the configured criteria:
+///
+/// - explicit fail-fast: [`with_tolerated_failure_count(0)`](Self::with_tolerated_failure_count)
+/// - tolerate all failures: [`with_tolerated_failure_percentage(100)`](Self::with_tolerated_failure_percentage)
+///
 /// Construct with [`CompletionConfig::builder`] (which combines thresholds
 /// and validates them at [`build`](CompletionConfigBuilder::build) time) or
 /// with one of the single-threshold constructors. Fields are private per
@@ -761,6 +794,12 @@ impl CompletionConfig {
     }
 
     /// Creates a config with just a `min_successful` threshold.
+    ///
+    /// **Default when unset:** the batch runs until every item settles.
+    /// Note that a config carrying only this threshold has no failure
+    /// tolerance configured, so item failures are tolerated while the
+    /// batch waits to reach `min` successes — the implicit fail-fast of an
+    /// empty config no longer applies once any criterion is set.
     #[must_use]
     pub fn with_min_successful(min: usize) -> Self {
         Self {
@@ -771,7 +810,11 @@ impl CompletionConfig {
 
     /// Creates a config with just a `tolerated_failure_count` threshold.
     ///
-    /// Use `0` for fail-fast behavior (stop on first failure).
+    /// Use `0` for explicit fail-fast behavior (stop on first failure).
+    ///
+    /// **Default when unset:** an empty config fails fast on the first
+    /// failure; a config with some other criterion set applies only that
+    /// criterion.
     #[must_use]
     pub fn with_tolerated_failure_count(count: usize) -> Self {
         Self {
@@ -788,7 +831,13 @@ impl CompletionConfig {
     /// truncation — so a failure rate of 33.3% (1 of 3) correctly exceeds a
     /// 33% threshold.
     ///
-    /// Use `0` for fail-fast behavior (stop on first failure).
+    /// Use `0` for explicit fail-fast behavior (stop on first failure).
+    /// Use `100` to tolerate all failures (the failure rate can never
+    /// strictly exceed 100%).
+    ///
+    /// **Default when unset:** an empty config fails fast on the first
+    /// failure; a config with some other criterion set applies only that
+    /// criterion.
     #[must_use]
     pub fn with_tolerated_failure_percentage(pct: usize) -> Self {
         Self {
@@ -804,6 +853,9 @@ impl CompletionConfig {
     /// this way records [`CompletionReason::PredicateMatched`], and — like a
     /// [`min_successful`](Self::with_min_successful) completion — item
     /// failures inside it are tolerated rather than propagated as errors.
+    /// Setting a predicate counts as a completion criterion, so it also
+    /// replaces the implicit fail-fast of an empty config — the predicate
+    /// owns the completion decision.
     ///
     /// When combined with fixed thresholds (via
     /// [`CompletionConfig::builder`]), the first trigger to fire wins,
@@ -877,6 +929,20 @@ impl CompletionConfig {
     #[must_use]
     pub fn has_completion_predicate(&self) -> bool {
         self.completion_predicate.is_some()
+    }
+
+    /// Reports whether ANY completion criterion is configured — a threshold
+    /// or a custom predicate (crate-internal).
+    ///
+    /// An empty config (nothing set) fails the batch on the first item
+    /// failure, exactly as running with no config does; configuring any
+    /// criterion opts out of that implicit fail-fast (issue #52, matching
+    /// the Python and JS SDKs).
+    pub(crate) fn has_criteria(&self) -> bool {
+        self.min_successful.is_some()
+            || self.tolerated_failure_count.is_some()
+            || self.tolerated_failure_percentage.is_some()
+            || self.completion_predicate.is_some()
     }
 
     /// Evaluates the custom completion predicate against the running batch
@@ -992,6 +1058,11 @@ impl std::fmt::Debug for CompletionConfigBuilder {
 
 impl CompletionConfigBuilder {
     /// Completes the batch early once this many items succeed.
+    ///
+    /// **Default when unset:** the batch runs until every item settles.
+    /// Setting this (or any other criterion) replaces the implicit
+    /// fail-fast of an empty config; a config carrying only this threshold
+    /// tolerates item failures while waiting to reach `min` successes.
     pub fn min_successful(mut self, min: usize) -> Self {
         self.min_successful = Some(min);
         self
@@ -999,7 +1070,11 @@ impl CompletionConfigBuilder {
 
     /// Fails the batch once more than this many items fail.
     ///
-    /// Use `0` for fail-fast behavior (stop on first failure).
+    /// Use `0` for explicit fail-fast behavior (stop on first failure).
+    ///
+    /// **Default when unset:** an empty config fails fast on the first
+    /// failure; a config with some other criterion set applies only that
+    /// criterion.
     pub fn tolerated_failure_count(mut self, count: usize) -> Self {
         self.tolerated_failure_count = Some(count);
         self
@@ -1007,6 +1082,14 @@ impl CompletionConfigBuilder {
 
     /// Fails the batch once the failure percentage strictly exceeds this
     /// threshold (integer 0-100).
+    ///
+    /// Use `0` for explicit fail-fast behavior (stop on first failure).
+    /// Use `100` to tolerate all failures (the failure rate can never
+    /// strictly exceed 100%).
+    ///
+    /// **Default when unset:** an empty config fails fast on the first
+    /// failure; a config with some other criterion set applies only that
+    /// criterion.
     ///
     /// A value above 100 is rejected by [`build`](Self::build).
     pub fn tolerated_failure_percentage(mut self, pct: usize) -> Self {
@@ -1021,7 +1104,10 @@ impl CompletionConfigBuilder {
     /// [`CompletionReason::PredicateMatched`]. It composes with the fixed
     /// thresholds: the SDK checks `min_successful`, then the failure
     /// tolerances, then this predicate — the first trigger to fire wins,
-    /// matching the existing threshold semantics.
+    /// matching the existing threshold semantics. Setting a predicate
+    /// counts as a completion criterion, so it also replaces the implicit
+    /// fail-fast of an empty config — the predicate owns the completion
+    /// decision.
     ///
     /// # Determinism — read this before using
     ///
