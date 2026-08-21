@@ -340,9 +340,7 @@ mod tests {
             .retry_strategy
             .as_ref()
             .expect("retry_strategy must install a strategy");
-        let err = crate::StepError::from_kind(crate::StepErrorKind::ExecutionFailed {
-            message: "boom".to_owned(),
-        });
+        let err = crate::StepError::new(crate::StepErrorKind::ExecutionFailed, Some("boom".into()));
 
         assert_eq!(
             strategy(&err, 1),

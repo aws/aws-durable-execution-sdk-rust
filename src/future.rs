@@ -260,10 +260,9 @@ impl<O: Send + 'static> DurableFuture<O> {
                     // The sender was dropped without a value: the task was
                     // cancelled (aborted) before completing.
                     Err(_) => Err(OperationError::from_kind(
-                        crate::error::OperationErrorKind::Step(crate::error::StepError::from_kind(
-                            crate::error::StepErrorKind::ExecutionFailed {
-                                message: "spawned task was cancelled".to_owned(),
-                            },
+                        crate::error::OperationErrorKind::Step(crate::error::StepError::new(
+                            crate::error::StepErrorKind::ExecutionFailed,
+                            Some("spawned task was cancelled".into()),
                         )),
                     )),
                 }
@@ -421,9 +420,7 @@ impl<O: Send + 'static> Branch<O> {
                     let ctx = ctx_rx.await.map_err(|_| {
                         ChildFnError::new("branch context was never delivered (coordinator gone)")
                     })?;
-                    factory(ctx)
-                        .await
-                        .map_err(|e| ChildFnError::new(e.to_string()))
+                    factory(ctx).await.map_err(ChildFnError::from)
                 }),
             },
         }
@@ -577,10 +574,9 @@ impl<O: Send + 'static> Callback<O> {
                     outcome.unwrap_or_else(|| {
                         Err(OperationError::from_kind(
                             crate::error::OperationErrorKind::Callback(
-                                crate::error::CallbackError::from_kind(
-                                    crate::error::CallbackErrorKind::Internal {
-                                        message: "settled callback had no outcome".to_owned(),
-                                    },
+                                crate::error::CallbackError::new(
+                                    crate::error::CallbackErrorKind::Internal,
+                                    Some("settled callback had no outcome".into()),
                                 ),
                             ),
                         ))

@@ -27,12 +27,22 @@ async fn handler(
     let execution_id = ctx.execution_arn().to_owned();
 
     let retry = |err: &durable::StepError, attempt: u32| {
-        // Only retry if the error message indicates it's a TransientError.
+        // Only retry if the escaping error IS a TransientError: the step
+        // error's source() carries the concrete error, so the "instance
+        // of" check is a downcast, not string matching.
         if attempt >= 3 {
             return durable::RetryDecision::Stop;
         }
-        let msg = err.to_string();
-        if msg.contains("TransientError") || msg.contains("Temporary failure") {
+        let is_transient = std::iter::successors(
+            std::error::Error::source(err),
+            |e| e.source(),
+        )
+        .any(|e| {
+            e.downcast_ref::<TransientError>().is_some()
+                || e.downcast_ref::<durable::TypedError>()
+                    .is_some_and(|t| t.error_type() == "TransientError")
+        });
+        if is_transient {
             durable::RetryDecision::Retry {
                 delay: Duration::from_secs(1),
             }
@@ -45,9 +55,11 @@ async fn handler(
         .step(move |_sc| async move {
             let count = compliance::increment_attempt(&execution_id).await?;
             if count < 2 {
-                let err: durable::BoxError = Box::new(TransientError {
+                // TypedError records the concrete type name as the wire
+                // ErrorType (a boxed error's type is otherwise erased).
+                let err: durable::BoxError = Box::new(durable::TypedError::new(TransientError {
                     message: "Temporary failure".to_owned(),
-                });
+                }));
                 return Err(err);
             }
             Ok("recovered from transient".to_owned())

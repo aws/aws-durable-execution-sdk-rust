@@ -339,14 +339,11 @@ where
                         Some(STEP_SUB_TYPE),
                         view.attempt,
                     );
-                    let (error_type, error_message) = self
+                    let wire = self
                         .ctx
-                        .checkpoint_error_parts(&positional_id)
+                        .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Ok(StepPrelude::Done(Err(replay_failure(
-                        error_type.as_deref(),
-                        error_message.as_deref(),
-                    ))));
+                    return Ok(StepPrelude::Done(Err(replay_failure(wire, &wire_id))));
                 }
                 CheckpointStatus::Pending => {
                     // Retry timer hasn't fired yet — suspend.
@@ -406,7 +403,7 @@ where
             let start_update = build_start_update(&wire_id, name.as_deref(), ctx.parent_wire_id());
             ctx.checkpoint_updates(vec![start_update])
                 .await
-                .map_err(|e| client_error_to_op_error(&e))?;
+                .map_err(client_error_to_op_error)?;
         }
 
         // The body runs inside a tracing span carrying the structured-log
@@ -492,7 +489,7 @@ async fn handle_success<O, S: Serdes<O>>(
     let update = build_succeed_update(wire_id, name, ctx.parent_wire_id(), &serialized);
     ctx.checkpoint_updates(vec![update])
         .await
-        .map_err(|e| client_error_to_op_error(&e))?;
+        .map_err(client_error_to_op_error)?;
 
     // Return deserialized from the serialized form (round-trip parity).
     deserialize_result(serdes, serialized, serdes_ctx).await
@@ -507,11 +504,15 @@ async fn handle_failure<O>(
     err: BoxError,
     attempt: u32,
 ) -> Result<O, OperationError> {
-    let step_err = StepError::from_kind(StepErrorKind::ExecutionFailed {
-        message: err.to_string(),
-    });
+    // Derive the wire failure record from the escaping error before it is
+    // moved into the step error: message flattening, `error_type`
+    // pass-through, `error_data` chain walk, and stack capture all happen
+    // here, at the single wire-derivation site.
+    let wire = crate::error::wire_error_for(&*err, STEP_FALLBACK_ERROR_TYPE);
+    let step_err = StepError::new(StepErrorKind::ExecutionFailed, Some(err));
 
-    // Consult the retry strategy.
+    // Consult the retry strategy. The strategy sees the live escaping
+    // error through the step error's `source()`.
     let decision = if let Some(strategy) = retry_strategy {
         strategy(&step_err, attempt)
     } else {
@@ -527,27 +528,31 @@ async fn handle_failure<O>(
                 .as_secs()
                 .saturating_add(u64::from(delay.subsec_nanos() > 0));
             let delay_secs = i32::try_from(whole_secs.max(1)).unwrap_or(i32::MAX);
-            let update = build_retry_update(wire_id, name, ctx.parent_wire_id(), &err, delay_secs);
+            let update = build_retry_update(wire_id, name, ctx.parent_wire_id(), &wire, delay_secs);
             ctx.checkpoint_updates(vec![update])
                 .await
-                .map_err(|e| client_error_to_op_error(&e))?;
+                .map_err(client_error_to_op_error)?;
 
             // Suspend — the backend owns the retry timer.
             ctx.suspend_now().await
         }
         RetryDecision::Stop => {
             // Checkpoint FAIL (permanent).
-            let update = build_fail_update(wire_id, name, ctx.parent_wire_id(), &err);
+            let update = build_fail_update(wire_id, name, ctx.parent_wire_id(), &wire);
             ctx.checkpoint_updates(vec![update])
                 .await
-                .map_err(|e| client_error_to_op_error(&e))?;
+                .map_err(client_error_to_op_error)?;
 
-            Err(OperationError::from_kind(OperationErrorKind::Step(
-                StepError::from_kind(StepErrorKind::RetriesExhausted {
-                    attempts: attempt,
-                    last_error: err.to_string(),
-                }),
-            )))
+            // The escaping error stays reachable through `source()`; the
+            // attempt count is the kind's structural fact.
+            Err(
+                OperationError::from_kind(OperationErrorKind::Step(StepError::new(
+                    StepErrorKind::RetriesExhausted(crate::error::RetriesExhausted::new(attempt)),
+                    step_err.into_source(),
+                )))
+                .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+                .with_wire(wire),
+            )
         }
     }
 }
@@ -611,7 +616,7 @@ fn build_retry_update(
     wire_id: &str,
     name: Option<&str>,
     parent_wire_id: Option<&str>,
-    err: &BoxError,
+    error: &crate::error::WireError,
     delay_secs: i32,
 ) -> OperationUpdate {
     let mut builder = OperationUpdate::builder()
@@ -619,12 +624,7 @@ fn build_retry_update(
         .r#type(OperationType::Step)
         .sub_type(STEP_SUB_TYPE)
         .action(OperationAction::Retry)
-        .error(
-            aws_sdk_lambda::types::ErrorObject::builder()
-                .error_type(error_type_name(&**err))
-                .error_message(err.to_string())
-                .build(),
-        )
+        .error(error.to_error_object())
         .step_options(
             aws_sdk_lambda::types::StepOptions::builder()
                 .next_attempt_delay_seconds(delay_secs)
@@ -649,19 +649,14 @@ fn build_fail_update(
     wire_id: &str,
     name: Option<&str>,
     parent_wire_id: Option<&str>,
-    err: &BoxError,
+    error: &crate::error::WireError,
 ) -> OperationUpdate {
     let mut builder = OperationUpdate::builder()
         .id(wire_id)
         .r#type(OperationType::Step)
         .sub_type(STEP_SUB_TYPE)
         .action(OperationAction::Fail)
-        .error(
-            aws_sdk_lambda::types::ErrorObject::builder()
-                .error_type(error_type_name(&**err))
-                .error_message(err.to_string())
-                .build(),
-        );
+        .error(error.to_error_object());
 
     if let Some(n) = name {
         builder = builder.name(n);
@@ -693,7 +688,7 @@ async fn serialize_value<O, S: Serdes<O>>(
     serdes
         .serialize(value, serdes_ctx)
         .await
-        .map_err(|e| step_serialization_error(&*e))
+        .map_err(step_serialization_error)
 }
 
 /// Deserializes a step wire string through the configured serdes.
@@ -705,15 +700,15 @@ async fn deserialize_result<O, S: Serdes<O>>(
     serdes
         .deserialize(serialized, serdes_ctx)
         .await
-        .map_err(|e| step_serialization_error(&*e))
+        .map_err(step_serialization_error)
 }
 
-/// Wraps any error as a step `SerializationFailed` operation error.
-fn step_serialization_error<E: std::fmt::Display + ?Sized>(e: &E) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
-        StepErrorKind::SerializationFailed {
-            message: e.to_string(),
-        },
+/// Wraps a serdes error as a step `SerializationFailed` operation error,
+/// carrying the error itself as the source.
+fn step_serialization_error(e: BoxError) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Step(StepError::new(
+        StepErrorKind::SerializationFailed,
+        Some(e),
     )))
 }
 
@@ -728,82 +723,39 @@ async fn replay_success<O, S: Serdes<O>>(
 
 /// Rebuilds a step error from the failure fields of a replayed record.
 ///
-/// `error_type` is the wire `ErrorType` that [`error_type_name`] derived
-/// heuristically when the failure was first recorded (see its docs for the
-/// exact derivation and its limits). It is folded into the message as a
-/// `"{type}: {message}"` prefix for diagnostics only — nothing matches on
-/// it, so an imprecise type name cannot change replay behavior.
-fn replay_failure(error_type: Option<&str>, error_message: Option<&str>) -> OperationError {
-    let msg = match (error_type, error_message) {
-        (Some(t), Some(m)) => format!("{t}: {m}"),
-        (None, Some(m)) => m.to_owned(),
-        (Some(t), None) => t.to_owned(),
-        (None, None) => "unknown error".to_owned(),
-    };
-    OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
-        StepErrorKind::ExecutionFailed { message: msg },
+/// The recorded wire fields travel on the synthetic source (a
+/// [`crate::error::ReplayedFailure`]) rather than being folded into a
+/// message, so `kind()` remains meaningful after a replay and the
+/// recorded `error_type` stays programmatically recoverable through a
+/// `source()` downcast.
+fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Step(StepError::new(
+        StepErrorKind::ExecutionFailed,
+        Some(crate::error::ReplayedFailure::source_from(wire.clone())),
+    )))
+    .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+    .with_wire(wire)
+}
+
+fn client_error_to_op_error(err: ClientError) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Step(StepError::new(
+        StepErrorKind::ExecutionFailed,
+        Some(Box::new(err)),
     )))
 }
 
-fn client_error_to_op_error(err: &ClientError) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
-        StepErrorKind::ExecutionFailed {
-            message: err.to_string(),
-        },
-    )))
-}
-
-/// Derives the wire `ErrorType` for a failed step from a boxed error.
+/// The wire `ErrorType` recorded for a step failure whose escaping error
+/// carries no structured identity.
 ///
-/// # Why a heuristic
-///
-/// A step body returns `Result<O, BoxError>`, so the concrete error type is
-/// erased *by the caller* before the SDK ever sees it — `?` boxes the error
-/// at the user's call site. `std::any::type_name` cannot recover a name
-/// from a `dyn Error` trait object, so the only material available here is
-/// the error's `Debug` rendering. Capturing the real type name would
-/// require a generic error parameter on the public step API, which is not
-/// worth the surface cost for a diagnostic label.
-///
-/// # Exact behavior
-///
-/// Renders the error with `{:?}` and scans that string for the first token
-/// (split on any character that is neither alphanumeric nor `_`) that
-/// starts with an uppercase letter; that token is the wire `ErrorType`. If
-/// no such token exists, the fallback is the literal `"Error"`.
-///
-/// * A derived `Debug` on a unit/struct error yields the type's own name
-///   (`TransientError` → `"TransientError"`), which is the case this
-///   heuristic is tuned for.
-/// * A `String`/`&str` error boxed via `.into()` renders as a quoted
-///   lowercase message, so it falls back to `"Error"` (pinned by the
-///   `error_type_name_fallback_to_error` test below).
-/// * The heuristic is silently "wrong" for wrapper types: `Debug` output
-///   like `Custom { kind: InvalidData, .. }` yields `"Custom"`, and a
-///   capitalized first word of a hand-written `Debug` message is taken as
-///   the type name even when it is prose.
-///
-/// # Where the value goes
-///
-/// The name is sent to the backend in `ErrorObject.error_type` by
-/// [`build_fail_update`] and [`build_retry_update`], stored in the
-/// execution history, and read back on replay by [`replay_failure`], which
-/// folds it into the replayed error's message as a `"{type}: {message}"`
-/// prefix. It is a **diagnostic label only**: no SDK code path branches on
-/// its value, so an imprecise name degrades history readability, not
-/// correctness. Changing the derivation changes the wire history and the
-/// replayed error text — treat that as a wire-visible change.
-fn error_type_name(err: &(dyn std::error::Error + Send + Sync)) -> String {
-    let debug = format!("{err:?}");
-    // Heuristic: first capitalized word as type name.
-    if let Some(first) = debug
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .find(|s| !s.is_empty() && s.starts_with(char::is_uppercase))
-    {
-        return first.to_owned();
-    }
-    "Error".to_owned()
-}
+/// A step body returns `Result<O, BoxError>`, so the concrete error type
+/// is erased *by the caller* before the SDK ever sees it — `?` boxes the
+/// error at the user's call site, and Rust offers no runtime name for a
+/// `dyn Error`. Rather than guessing one from a `Debug` rendering, the
+/// SDK records this explicit generic name. An error that *does* carry
+/// structured identity — an [`OperationError`], or a
+/// [`crate::error::ReplayedFailure`] — records its registry name or its
+/// original recorded type instead (see [`crate::error::wire_error_for`]).
+const STEP_FALLBACK_ERROR_TYPE: &str = "Error";
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // reason: test assertions
@@ -835,25 +787,45 @@ mod tests {
     }
 
     #[test]
-    fn replay_failure_formats_error_with_type_and_message() {
-        let err = replay_failure(Some("TypeError"), Some("bad input"));
-        let msg = err.to_string();
-        assert!(msg.contains("TypeError"), "got: {msg}");
-        assert!(msg.contains("bad input"), "got: {msg}");
+    fn replay_failure_keeps_kind_and_wire_fields_apart() {
+        let wire = crate::error::WireError::new(Some("TypeError"), Some("bad input"));
+        let err = replay_failure(wire, "wire-1");
+        // kind() is meaningful after a replay.
+        let OperationErrorKind::Step(step_err) = err.kind() else {
+            unreachable!("replay builds a step error");
+        };
+        assert!(matches!(step_err.kind(), StepErrorKind::ExecutionFailed));
+        // The type is NOT folded into the message: the frame stays clean...
+        assert_eq!(err.to_string(), "operation error: step");
+        // ...and the recorded fields are programmatically recoverable.
+        let source = std::error::Error::source(step_err).expect("synthetic source");
+        let replayed = source
+            .downcast_ref::<crate::error::ReplayedFailure>()
+            .expect("replay source is a ReplayedFailure");
+        assert_eq!(replayed.error_type(), Some("TypeError"));
+        assert_eq!(replayed.error_message(), Some("bad input"));
+        // The wire record, operation id, and status are reachable.
+        assert_eq!(err.operation_id(), Some("wire-1"));
+        assert_eq!(err.status(), Some("FAILED"));
+        assert_eq!(
+            err.wire().and_then(crate::error::WireError::error_type),
+            Some("TypeError")
+        );
+        // The chain renders the recorded message via the alternate form —
+        // without folding the type into the text.
+        let chain = format!("{err:#}");
+        assert!(chain.contains("bad input"), "got: {chain}");
+        assert!(
+            !chain.contains("TypeError"),
+            "type must not fold into text: {chain}"
+        );
     }
 
     #[test]
-    fn replay_failure_message_only() {
-        let err = replay_failure(None, Some("something failed"));
-        let msg = err.to_string();
-        assert!(msg.contains("something failed"), "got: {msg}");
-    }
-
-    #[test]
-    fn replay_failure_unknown_when_empty() {
-        let err = replay_failure(None, None);
-        let msg = err.to_string();
-        assert!(msg.contains("unknown error"), "got: {msg}");
+    fn replay_failure_empty_record_displays_unknown() {
+        let err = replay_failure(crate::error::WireError::default(), "wire-1");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("unknown error"), "got: {chain}");
     }
 
     // ── Serialization tests ─────────────────────────────────────────────
@@ -906,9 +878,7 @@ mod tests {
     #[test]
     fn default_retry_stops_at_max_attempts() {
         let strategy = default_retry_strategy();
-        let err = StepError::from_kind(StepErrorKind::ExecutionFailed {
-            message: "fail".to_owned(),
-        });
+        let err = StepError::new(StepErrorKind::ExecutionFailed, Some("fail".into()));
         // Attempt 6 should stop (max_attempts = 6).
         let decision = strategy(&err, 6);
         assert_eq!(decision, RetryDecision::Stop);
@@ -917,9 +887,7 @@ mod tests {
     #[test]
     fn default_retry_retries_below_max() {
         let strategy = default_retry_strategy();
-        let err = StepError::from_kind(StepErrorKind::ExecutionFailed {
-            message: "fail".to_owned(),
-        });
+        let err = StepError::new(StepErrorKind::ExecutionFailed, Some("fail".into()));
         let decision = strategy(&err, 1);
         match decision {
             RetryDecision::Retry { delay } => {
@@ -936,9 +904,7 @@ mod tests {
         // Attempt 5: base = 5 * 2^4 = 80, capped at 60.
         // With full jitter: [0, 60] → rounded: [1, 60].
         let strategy = default_retry_strategy();
-        let err = StepError::from_kind(StepErrorKind::ExecutionFailed {
-            message: "fail".to_owned(),
-        });
+        let err = StepError::new(StepErrorKind::ExecutionFailed, Some("fail".into()));
         let decision = strategy(&err, 5);
         match decision {
             RetryDecision::Retry { delay } => {
@@ -948,30 +914,6 @@ mod tests {
             }
             RetryDecision::Stop => panic!("expected retry for attempt 5"),
         }
-    }
-
-    // ── Error type name extraction ──────────────────────────────────────
-
-    #[test]
-    fn error_type_name_extracts_first_capitalized() {
-        #[derive(Debug)]
-        struct TransientError;
-        impl std::fmt::Display for TransientError {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "transient error")
-            }
-        }
-        impl std::error::Error for TransientError {}
-        let name = error_type_name(&TransientError);
-        assert_eq!(name, "TransientError");
-    }
-
-    #[test]
-    fn error_type_name_fallback_to_error() {
-        // An error whose debug starts with lowercase.
-        let err: Box<dyn std::error::Error + Send + Sync> = "lowercase".into();
-        let name = error_type_name(&*err);
-        assert_eq!(name, "Error");
     }
 
     // ── Live execution tests (with mock client) ─────────────────────────
@@ -1097,10 +1039,14 @@ mod tests {
             result: Some("99".to_owned()),
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -1154,10 +1100,14 @@ mod tests {
             result: None,
             error_type: Some("CustomError".to_owned()),
             error_message: Some("it broke".to_owned()),
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -1190,9 +1140,14 @@ mod tests {
 
         let result = exec.execute().await;
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("CustomError"), "got: {err_msg}");
+        let err = result.unwrap_err();
+        let err_msg = format!("{err:#}");
         assert!(err_msg.contains("it broke"), "got: {err_msg}");
+        // The recorded type is wire data, not display text.
+        assert_eq!(
+            err.wire().and_then(crate::error::WireError::error_type),
+            Some("CustomError")
+        );
         assert!(
             !executed.load(Ordering::SeqCst),
             "closure should NOT execute during replay"
@@ -1233,10 +1188,87 @@ mod tests {
 
         let result = exec.execute().await;
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = format!("{:#}", result.unwrap_err());
         assert!(
             err_msg.contains("retries exhausted") || err_msg.contains("always fails"),
             "got: {err_msg}"
+        );
+    }
+
+    /// Acceptance (issue #41): on the live path, an operation failure
+    /// exposes the caller's concrete error type through a `source()`
+    /// downcast — the escaping error is carried, not stringified.
+    #[tokio::test]
+    async fn step_live_failure_source_downcasts_to_concrete_user_type() {
+        use crate::client::InMemoryExecutionClient;
+
+        #[derive(Debug)]
+        struct PaymentDeclined {
+            code: u16,
+        }
+        impl std::fmt::Display for PaymentDeclined {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "payment declined (code {})", self.code)
+            }
+        }
+        impl std::error::Error for PaymentDeclined {}
+
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+            client,
+            "token0".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+
+        let no_retry: RetryStrategy =
+            Box::new(|_err: &StepError, _attempt: u32| RetryDecision::Stop);
+        let closure = |_: StepContext| async {
+            Err::<i32, BoxError>(Box::new(PaymentDeclined { code: 402 }))
+        };
+
+        let exec = StepExecution {
+            ctx,
+            op_id,
+            name: None,
+            retry_strategy: Some(no_retry),
+            serdes: crate::serdes::JsonSerdes,
+            semantics: StepSemantics::default(),
+            closure,
+            _marker: std::marker::PhantomData,
+        };
+
+        let err = exec.execute().await.expect_err("step must fail");
+
+        // Walk source() to the caller's concrete error and downcast it.
+        let mut source: Option<&(dyn std::error::Error + 'static)> =
+            std::error::Error::source(&err);
+        let mut found = None;
+        while let Some(e) = source {
+            if let Some(declined) = e.downcast_ref::<PaymentDeclined>() {
+                found = Some(declined);
+                break;
+            }
+            source = e.source();
+        }
+        let declined = found.expect("caller's concrete error type must be reachable via source()");
+        assert_eq!(declined.code, 402);
+
+        // The wire failure record is reachable from the error too.
+        assert_eq!(err.status(), Some("FAILED"));
+        let wire = err.wire().expect("live failure carries its wire record");
+        assert_eq!(wire.error_type(), Some("Error"));
+        assert!(
+            wire.error_message()
+                .is_some_and(|m| m.contains("payment declined (code 402)")),
+            "wire message flattens the chain: {wire:?}"
+        );
+        assert!(
+            !wire.stack_trace().is_empty(),
+            "a live failure captures a stack trace"
         );
     }
 
@@ -1399,7 +1431,7 @@ mod tests {
         let inner_result = result.unwrap();
         assert!(inner_result.is_err());
         #[allow(clippy::unwrap_used)] // reason: test — verified Err above
-        let err_msg = inner_result.unwrap_err().to_string();
+        let err_msg = format!("{:#}", inner_result.unwrap_err());
         assert!(
             err_msg.contains("task") || err_msg.contains("ownership"),
             "expected ownership error, got: {err_msg}"
@@ -1425,10 +1457,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -1472,7 +1508,7 @@ mod tests {
             result.is_err(),
             "expected failure for interrupted + no retry"
         );
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = format!("{:#}", result.unwrap_err());
         assert!(
             err_msg.contains("retries exhausted") || err_msg.contains("interrupted"),
             "got: {err_msg}"
@@ -1498,10 +1534,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -1569,10 +1609,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -1620,9 +1664,7 @@ mod tests {
     use crate::builders::{JitterStrategy, RetryStrategyConfig};
 
     fn sample_error() -> StepError {
-        StepError::from_kind(StepErrorKind::ExecutionFailed {
-            message: "boom".to_owned(),
-        })
+        StepError::new(StepErrorKind::ExecutionFailed, Some("boom".into()))
     }
 
     /// Extracts the retry delay in whole seconds, panicking on `Stop`.

@@ -2194,7 +2194,12 @@ mod tests {
             .await;
 
         assert!(result.is_failure());
-        assert_eq!(result.error_type(), Some("StepError"));
+        // The execution record re-records the step failure's own recorded
+        // identity: a plain boxed error carries no user type, so the step
+        // record's generic "Error" passes through the boundary unchanged
+        // (the "StepError" registry name is only the fallback for an
+        // operation error with no attached wire identity).
+        assert_eq!(result.error_type(), Some("Error"));
         assert!(result.operations().iter().any(TestOperation::failed));
     }
 
@@ -3693,7 +3698,8 @@ mod tests {
                         foreign
                             .step(|_| async { Ok(7_i32) })
                             .await
-                            .map_err(|e| e.to_string())
+                            // `{:#}` flattens the frame and its chain.
+                            .map_err(|e| format!("{e:#}"))
                     })
                     .await
                     .map_err(|e| e.to_string())?;
@@ -4000,10 +4006,11 @@ mod tests {
     // ── Harness fidelity: production wire-error mapping ─────────────────
 
     /// The runner reports the SAME wire error message production reports.
-    /// For `ChildContextError::ChildFailed`, production extracts the RAW
-    /// child message (via `wire_error_from_operation_error`), not the full
-    /// `Display` chain — the divergence the old duplicated
-    /// `wire_error_from_box_error` in this module had.
+    /// Every failure flattens through the one flattening site, so a child
+    /// failure's wire message is the full chain — one frame per layer —
+    /// with the raw child message as its final frame. (The old special
+    /// case that reported only the raw message was the Display/wire
+    /// asymmetry the error-model redesign removed.)
     #[tokio::test]
     async fn child_failure_wire_error_matches_production_raw_message() {
         let result: TestResult<i32> = LocalRunner::new()
@@ -4021,16 +4028,19 @@ mod tests {
             .await;
 
         assert!(result.is_failure());
-        assert_eq!(result.error_type(), Some("ChildContextError"));
+        // The execution record re-records the child-context record's own
+        // recorded identity ("ChildFnError", the boundary's fallback for a
+        // plain boxed error) rather than degrading it to the outer kind's
+        // registry name — recorded identity passes through boundaries.
+        assert_eq!(result.error_type(), Some("ChildFnError"));
         let msg = result.error_message().unwrap_or_default();
         assert!(
             msg.contains("boom-child"),
-            "raw child message must survive: {msg}"
+            "raw child message must survive as the chain's final frame: {msg}"
         );
-        assert!(
-            !msg.contains("child failed:"),
-            "wire message must be the raw child message (production extraction), not the \
-             Display chain: {msg}"
+        assert_eq!(
+            msg, "operation error: child_context: child failed: boom-child",
+            "wire message is the flattened chain, one frame per layer"
         );
     }
 }

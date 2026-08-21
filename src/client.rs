@@ -464,6 +464,10 @@ fn operation_to_record(op: &Operation) -> (String, CheckpointRecord) {
         result: extract_result(op),
         error_type: extract_error_type(op),
         error_message: extract_error_message(op),
+        error_data: extract_wire_error_field(op, |e| e.error_data.clone()),
+        stack_trace: extract_wire_error_field(op, |e| {
+            (!e.stack_trace().is_empty()).then(|| e.stack_trace().to_vec())
+        }),
         attempt,
         // ChainedInvoke payloads live in their own record fields — mirroring
         // parse_single_operation in lib.rs, which is the JSON-path reference
@@ -482,6 +486,16 @@ fn operation_to_record(op: &Operation) -> (String, CheckpointRecord) {
             .as_ref()
             .and_then(|i| i.error.as_ref())
             .and_then(|e| e.error_message.clone()),
+        invoke_error_data: op
+            .chained_invoke_details
+            .as_ref()
+            .and_then(|i| i.error.as_ref())
+            .and_then(|e| e.error_data.clone()),
+        invoke_stack_trace: op
+            .chained_invoke_details
+            .as_ref()
+            .and_then(|i| i.error.as_ref())
+            .and_then(|e| (!e.stack_trace().is_empty()).then(|| e.stack_trace().to_vec())),
         // Large child contexts require ContextDetails.ReplayChildren to
         // signal re-execution of children; mirror the JSON path.
         replay_children: op
@@ -642,6 +656,31 @@ fn extract_error_message(op: &Operation) -> Option<String> {
                 .as_ref()
                 .and_then(|cb| cb.error.as_ref())
                 .and_then(|e| e.error_message.clone())
+        })
+}
+
+/// Extracts one field of the first error object present on the operation,
+/// checking step, context, and callback details in that order (mirroring
+/// [`extract_error_type`]).
+fn extract_wire_error_field<T>(
+    op: &Operation,
+    read: impl Fn(&aws_sdk_lambda::types::ErrorObject) -> Option<T>,
+) -> Option<T> {
+    op.step_details
+        .as_ref()
+        .and_then(|s| s.error.as_ref())
+        .and_then(&read)
+        .or_else(|| {
+            op.context_details
+                .as_ref()
+                .and_then(|c| c.error.as_ref())
+                .and_then(&read)
+        })
+        .or_else(|| {
+            op.callback_details
+                .as_ref()
+                .and_then(|cb| cb.error.as_ref())
+                .and_then(&read)
         })
 }
 
@@ -1150,10 +1189,14 @@ mod tests {
                 result: None,
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,

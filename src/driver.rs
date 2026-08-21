@@ -67,13 +67,11 @@ pub(crate) enum InvocationOutcome {
     /// before it can proceed. The engine drops the handler future and
     /// reports PENDING to the runtime.
     Pending,
-    /// The handler returned an error with a wire error type and message.
+    /// The handler returned an error with its wire failure record.
     Failed {
-        /// The wire error type (e.g. `CallbackError`, `StepError`).
-        error_type: String,
-        /// The wire error message (the raw inner message, not the full
-        /// Display chain).
-        error_message: String,
+        /// The wire failure record (type, message, opaque data, stack
+        /// trace) reported in the response envelope.
+        error: crate::error::WireError,
     },
 }
 
@@ -548,7 +546,7 @@ pub(crate) async fn drive_invocation<F>(
     suspension_signal: Arc<SuspensionSignal>,
 ) -> InvocationOutcome
 where
-    F: Future<Output = Result<String, (String, String)>> + Send,
+    F: Future<Output = Result<String, crate::error::WireError>> + Send,
 {
     // Pin the handler future on the stack so we can poll it.
     let mut pinned = Box::pin(handler_future);
@@ -567,8 +565,10 @@ where
         // would be for suspension.
         if let Some(fatal) = suspension_signal.fatal_error() {
             return Poll::Ready(InvocationOutcome::Failed {
-                error_type: fatal.error_type,
-                error_message: fatal.error_message,
+                error: crate::error::WireError::new(
+                    Some(fatal.error_type),
+                    Some(fatal.error_message),
+                ),
             });
         }
 
@@ -590,8 +590,10 @@ where
                 // execution — a successful completion would erase it.
                 if let Some(fatal) = suspension_signal.fatal_error() {
                     return Poll::Ready(InvocationOutcome::Failed {
-                        error_type: fatal.error_type,
-                        error_message: fatal.error_message,
+                        error: crate::error::WireError::new(
+                            Some(fatal.error_type),
+                            Some(fatal.error_message),
+                        ),
                     });
                 }
                 // An operation may have requested suspension AND the
@@ -610,8 +612,10 @@ where
                 // may have been stringified through child/batch boundaries).
                 if let Some(fatal) = suspension_signal.fatal_error() {
                     return Poll::Ready(InvocationOutcome::Failed {
-                        error_type: fatal.error_type,
-                        error_message: fatal.error_message,
+                        error: crate::error::WireError::new(
+                            Some(fatal.error_type),
+                            Some(fatal.error_message),
+                        ),
                     });
                 }
                 // Same precedence rule: if an operation requested
@@ -621,18 +625,17 @@ where
                 {
                     Poll::Ready(InvocationOutcome::Pending)
                 } else {
-                    Poll::Ready(InvocationOutcome::Failed {
-                        error_type: err.0,
-                        error_message: err.1,
-                    })
+                    Poll::Ready(InvocationOutcome::Failed { error: err })
                 }
             }
             Poll::Pending => {
                 // Fatal precedence over suspension: see above.
                 if let Some(fatal) = suspension_signal.fatal_error() {
                     return Poll::Ready(InvocationOutcome::Failed {
-                        error_type: fatal.error_type,
-                        error_message: fatal.error_message,
+                        error: crate::error::WireError::new(
+                            Some(fatal.error_type),
+                            Some(fatal.error_message),
+                        ),
                     });
                 }
                 // The future yielded — check if an operation requested
@@ -745,7 +748,7 @@ pub(crate) mod test_support {
         drive_invocation(
             async move {
                 let _ = fut.await;
-                Ok::<_, (String, String)>("ok".to_owned())
+                Ok::<_, crate::error::WireError>("ok".to_owned())
             },
             signal,
         )
@@ -827,7 +830,7 @@ mod tests {
             async move {
                 // User tries a "catch-all" pattern — wrapping in a closure
                 // that catches panics. This cannot catch future-drop.
-                let result: Result<String, (String, String)> = async {
+                let result: Result<String, crate::error::WireError> = async {
                     signal_clone.request_suspend();
                     tokio::task::yield_now().await;
                     Ok("survived".to_owned())
@@ -876,7 +879,7 @@ mod tests {
         let signal = Arc::new(SuspensionSignal::new());
 
         let outcome = drive_invocation(
-            async move { Ok::<_, (String, String)>("done".to_owned()) },
+            async move { Ok::<_, crate::error::WireError>("done".to_owned()) },
             Arc::clone(&signal),
         )
         .await;
@@ -889,18 +892,21 @@ mod tests {
         let signal = Arc::new(SuspensionSignal::new());
 
         let outcome = drive_invocation(
-            async move { Err(("Error".to_owned(), "boom".to_owned())) },
+            async move {
+                Err(crate::error::WireError::new(
+                    Some("Error".to_owned()),
+                    Some("boom".to_owned()),
+                ))
+            },
             Arc::clone(&signal),
         )
         .await;
 
-        assert_eq!(
-            outcome,
-            InvocationOutcome::Failed {
-                error_type: "Error".to_owned(),
-                error_message: "boom".to_owned(),
-            }
-        );
+        let InvocationOutcome::Failed { error } = outcome else {
+            unreachable!("expected Failed, got {outcome:?}");
+        };
+        assert_eq!(error.error_type(), Some("Error"));
+        assert_eq!(error.error_message(), Some("boom"));
     }
 
     // ── Resume: replayed operations return frozen results ────────────────
@@ -922,10 +928,14 @@ mod tests {
                 result: Some(r#""frozen_value""#.to_owned()),
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -1205,10 +1215,14 @@ mod suspension_containment_and_task_ownership {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -1232,7 +1246,7 @@ mod suspension_containment_and_task_ownership {
             async move {
                 let _ = ctx_h.wait(Duration::from_secs(30)).await;
                 ran_c.store(true, Ordering::SeqCst);
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         )
@@ -1257,7 +1271,7 @@ mod suspension_containment_and_task_ownership {
                     .invoke::<serde_json::Value, _>("target-fn", "input".to_owned())
                     .await;
                 ran_c.store(true, Ordering::SeqCst);
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         )
@@ -1285,7 +1299,7 @@ mod suspension_containment_and_task_ownership {
                     .name("retrying")
                     .await;
                 ran_c.store(true, Ordering::SeqCst);
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         )
@@ -1315,7 +1329,7 @@ mod suspension_containment_and_task_ownership {
                     })
                     .await;
                 ran_c.store(true, Ordering::SeqCst);
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         )
@@ -1337,12 +1351,15 @@ mod suspension_containment_and_task_ownership {
         let outcome = drive_invocation(
             async move {
                 let Ok(cb) = ctx_h.create_callback::<serde_json::Value>().await else {
-                    return Err(("E".to_owned(), "create failed".to_owned()));
+                    return Err(crate::error::WireError::new(
+                        Some("E".to_owned()),
+                        Some("create failed".to_owned()),
+                    ));
                 };
                 // Awaiting a pending callback result suspends.
                 let _ = cb.result().await;
                 ran_c.store(true, Ordering::SeqCst);
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         )
@@ -1379,7 +1396,7 @@ mod suspension_containment_and_task_ownership {
                     .await
                     .expect("replayed completed wait returns Ok");
                 ran_c.store(true, Ordering::SeqCst);
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         )
@@ -1410,7 +1427,7 @@ mod suspension_containment_and_task_ownership {
                 if r.is_err() {
                     caught_c.store(true, Ordering::SeqCst);
                 }
-                Ok::<_, (String, String)>("handled".to_owned())
+                Ok::<_, crate::error::WireError>("handled".to_owned())
             },
             signal,
         )
@@ -1439,7 +1456,7 @@ mod suspension_containment_and_task_ownership {
                 if r.is_err() {
                     caught_c.store(true, Ordering::SeqCst);
                 }
-                Ok::<_, (String, String)>("handled".to_owned())
+                Ok::<_, crate::error::WireError>("handled".to_owned())
             },
             signal,
         )
@@ -1573,7 +1590,7 @@ mod suspension_containment_and_task_ownership {
                     // point until the timeout fires and drops us.
                     let _ = ctx_h.wait(Duration::from_secs(30)).await;
                     let _ = sib.await;
-                    Ok::<_, (String, String)>("done".to_owned())
+                    Ok::<_, crate::error::WireError>("done".to_owned())
                 },
                 signal,
             ),
@@ -1685,7 +1702,7 @@ mod scoped_suspension {
                     }),
                 ];
                 let _ = ctx_h.parallel(branches).await;
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         )
@@ -1724,7 +1741,7 @@ mod scoped_suspension {
                     }),
                 ];
                 let _ = ctx_h.parallel(branches).await;
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         )
@@ -1768,7 +1785,7 @@ mod scoped_suspension {
                     }));
                 }
                 let _ = ctx_h.parallel(branches).max_concurrency(2).await;
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         )
@@ -1819,7 +1836,7 @@ mod scoped_suspension {
                     }),
                 ];
                 let r = ctx_h.parallel(branches).max_concurrency(1).await;
-                Ok::<_, (String, String)>(format!("{}", r.is_ok()))
+                Ok::<_, crate::error::WireError>(format!("{}", r.is_ok()))
             },
             signal,
         )
@@ -1861,7 +1878,7 @@ mod scoped_suspension {
                     })
                 })];
                 let _ = ctx_h.parallel(outer).await;
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         );
@@ -1909,7 +1926,7 @@ mod scoped_suspension {
                             .expect("valid completion config"),
                     )
                     .await;
-                Ok::<_, (String, String)>(format!("ok={}", r.is_ok()))
+                Ok::<_, crate::error::WireError>(format!("ok={}", r.is_ok()))
             },
             signal,
         )
@@ -1933,12 +1950,11 @@ mod scoped_suspension {
 
         let outcome = drive_invocation(
             async move {
-                ctx_h
-                    .wait(Duration::from_secs(30))
-                    .await
-                    .map_err(|e| ("W".to_owned(), e.to_string()))?;
+                ctx_h.wait(Duration::from_secs(30)).await.map_err(|e| {
+                    crate::error::WireError::new(Some("W".to_owned()), Some(e.to_string()))
+                })?;
                 after_c.store(true, Ordering::SeqCst);
-                Ok::<_, (String, String)>("done".to_owned())
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
             signal,
         )
@@ -2056,7 +2072,7 @@ mod spawn_scope_regressions {
                         .spawn();
                     let _ = work.await;
                     let _ = wait.await;
-                    Ok::<_, (String, String)>("done".to_owned())
+                    Ok::<_, crate::error::WireError>("done".to_owned())
                 },
                 signal,
             ),
@@ -2106,7 +2122,7 @@ mod spawn_scope_regressions {
                         .name("work")
                         .spawn();
                     let (_timer, _result) = tokio::join!(wait, work);
-                    Ok::<_, (String, String)>("done".to_owned())
+                    Ok::<_, crate::error::WireError>("done".to_owned())
                 },
                 signal,
             ),
@@ -2168,7 +2184,7 @@ mod spawn_scope_regressions {
 
                     // Handler completes normally. The driver should see the
                     // parked spawn and report Pending instead of Complete.
-                    Ok::<_, (String, String)>("done".to_owned())
+                    Ok::<_, crate::error::WireError>("done".to_owned())
                 },
                 signal,
             ),
@@ -2238,7 +2254,7 @@ mod spawn_scope_regressions {
                         .spawn();
 
                     let _ = tokio::join!(combo, sibling);
-                    Ok::<_, (String, String)>("done".to_owned())
+                    Ok::<_, crate::error::WireError>("done".to_owned())
                 },
                 signal,
             ),

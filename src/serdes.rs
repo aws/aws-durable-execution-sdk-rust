@@ -691,9 +691,10 @@ impl FileSystemSerdes {
         context: &SerdesContext,
     ) -> Result<String, BoxError> {
         let json_str = serde_json::to_string(value).map_err(|e| -> BoxError {
-            Box::new(FileSystemSerdesError::new(format!(
-                "failed to render value as JSON: {e}"
-            )))
+            Box::new(FileSystemSerdesError::with_source(
+                "failed to render value as JSON",
+                e,
+            ))
         })?;
         match self.config.storage_mode {
             FileSystemSerdesMode::Always => {
@@ -769,16 +770,18 @@ impl FileSystemSerdes {
         // key would be misparsed as a file reference.
         if context.origin() == PayloadOrigin::External {
             return serde_json::from_str(envelope).map_err(|e| -> BoxError {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "invalid external payload JSON: {e}"
-                )))
+                Box::new(FileSystemSerdesError::with_source(
+                    "invalid external payload JSON",
+                    e,
+                ))
             });
         }
 
         let parsed: Envelope<'_> = serde_json::from_str(envelope).map_err(|e| -> BoxError {
-            Box::new(FileSystemSerdesError::new(format!(
-                "invalid envelope JSON: {e}"
-            )))
+            Box::new(FileSystemSerdesError::with_source(
+                "invalid envelope JSON",
+                e,
+            ))
         })?;
 
         if let Some(marker) = parsed.marker {
@@ -797,9 +800,10 @@ impl FileSystemSerdes {
                         ))
                     })?;
                     serde_json::from_str(value.get()).map_err(|e| -> BoxError {
-                        Box::new(FileSystemSerdesError::new(format!(
-                            "invalid inline data in envelope: {e}"
-                        )))
+                        Box::new(FileSystemSerdesError::with_source(
+                            "invalid inline data in envelope",
+                            e,
+                        ))
                     })
                 }
                 "file" => {
@@ -826,9 +830,10 @@ impl FileSystemSerdes {
             // Legacy inline data: the "data" field holds the value's JSON
             // verbatim.
             serde_json::from_str(data.get()).map_err(|e| -> BoxError {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "invalid inline data in envelope: {e}"
-                )))
+                Box::new(FileSystemSerdesError::with_source(
+                    "invalid inline data in envelope",
+                    e,
+                ))
             })
         } else if let Some(raw) = parsed.raw {
             // Legacy inline envelope. The writer no longer produces
@@ -837,14 +842,16 @@ impl FileSystemSerdes {
             // raw form stored the value as a plain string; re-encode it as a
             // JSON string literal and parse `T` from that.
             let as_json = serde_json::to_string(&raw).map_err(|e| -> BoxError {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "failed to re-encode legacy raw envelope: {e}"
-                )))
+                Box::new(FileSystemSerdesError::with_source(
+                    "failed to re-encode legacy raw envelope",
+                    e,
+                ))
             })?;
             serde_json::from_str(&as_json).map_err(|e| -> BoxError {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "invalid legacy raw data in envelope: {e}"
-                )))
+                Box::new(FileSystemSerdesError::with_source(
+                    "invalid legacy raw data in envelope",
+                    e,
+                ))
             })
         } else {
             Err(Box::new(FileSystemSerdesError::new(
@@ -890,18 +897,19 @@ impl FileSystemSerdes {
         display_path: &str,
     ) -> Result<T, BoxError> {
         let canonical_base = std::fs::canonicalize(&self.base_path).map_err(|e| -> BoxError {
-            Box::new(FileSystemSerdesError::new(format!(
-                "failed to canonicalize base_path '{}': {e}",
-                self.base_path
-            )))
+            Box::new(FileSystemSerdesError::with_source(
+                format!("failed to canonicalize base_path '{}'", self.base_path),
+                e,
+            ))
         })?;
         // Canonicalizing the full file path resolves every symlink,
         // including one at the final component, so the containment check
         // below judges the file's real location.
         let canonical_file = std::fs::canonicalize(path).map_err(|e| -> BoxError {
-            Box::new(FileSystemSerdesError::new(format!(
-                "failed to resolve file '{display_path}': {e}"
-            )))
+            Box::new(FileSystemSerdesError::with_source(
+                format!("failed to resolve file '{display_path}'"),
+                e,
+            ))
         })?;
         if !canonical_file.starts_with(&canonical_base) {
             return Err(Box::new(FileSystemSerdesError::new(format!(
@@ -910,14 +918,16 @@ impl FileSystemSerdes {
             ))));
         }
         let contents = std::fs::read_to_string(&canonical_file).map_err(|e| -> BoxError {
-            Box::new(FileSystemSerdesError::new(format!(
-                "failed to read file '{display_path}': {e}"
-            )))
+            Box::new(FileSystemSerdesError::with_source(
+                format!("failed to read file '{display_path}'"),
+                e,
+            ))
         })?;
         serde_json::from_str(&contents).map_err(|e| -> BoxError {
-            Box::new(FileSystemSerdesError::new(format!(
-                "invalid JSON in file '{display_path}': {e}"
-            )))
+            Box::new(FileSystemSerdesError::with_source(
+                format!("invalid JSON in file '{display_path}'"),
+                e,
+            ))
         })
     }
 
@@ -943,9 +953,10 @@ impl FileSystemSerdes {
         let dir_path = format!("{}/{relative_dir}", self.base_path);
         std::fs::create_dir_all(&dir_path).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "failed to create directory '{dir_path}': {e}"
-                )))
+                Box::new(FileSystemSerdesError::with_source(
+                    format!("failed to create directory '{dir_path}'"),
+                    e,
+                ))
             },
         )?;
 
@@ -1023,17 +1034,18 @@ impl FileSystemSerdes {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let canonical_dir = std::fs::canonicalize(dir_path).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "failed to canonicalize directory '{dir_path}': {e}"
-                )))
+                Box::new(FileSystemSerdesError::with_source(
+                    format!("failed to canonicalize directory '{dir_path}'"),
+                    e,
+                ))
             },
         )?;
         let canonical_base = std::fs::canonicalize(&self.base_path).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(FileSystemSerdesError::new(format!(
-                    "failed to canonicalize base_path '{}': {e}",
-                    self.base_path
-                )))
+                Box::new(FileSystemSerdesError::with_source(
+                    format!("failed to canonicalize base_path '{}'", self.base_path),
+                    e,
+                ))
             },
         )?;
         if !canonical_dir.starts_with(&canonical_base) {
@@ -1113,26 +1125,59 @@ where
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct FileSystemSerdesError {
-    message: String,
+    context: String,
+    source: Option<crate::error::Source>,
 }
 
 impl FileSystemSerdesError {
-    /// Creates a new filesystem serdes error.
+    /// Creates a new filesystem serdes error from a description alone.
     #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
+    pub fn new(context: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            context: context.into(),
+            source: None,
+        }
+    }
+
+    /// Creates a filesystem serdes error carrying the underlying failure
+    /// as its source (internal). The context describes the operation that
+    /// failed; the cause stays reachable through
+    /// [`source()`](std::error::Error::source) rather than being
+    /// formatted into the message.
+    pub(crate) fn with_source(
+        context: impl Into<String>,
+        source: impl Into<crate::error::Source>,
+    ) -> Self {
+        Self {
+            context: context.into(),
+            source: Some(source.into()),
         }
     }
 }
 
 impl std::fmt::Display for FileSystemSerdesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "filesystem serdes error: {}", self.message)
+        struct Frame<'a>(&'a str);
+        impl std::fmt::Display for Frame<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "filesystem serdes error: {}", self.0)
+            }
+        }
+        if f.alternate() {
+            crate::error::write_chain(f, &Frame(&self.context), std::error::Error::source(self))
+        } else {
+            write!(f, "{}", Frame(&self.context))
+        }
     }
 }
 
-impl std::error::Error for FileSystemSerdesError {}
+impl std::error::Error for FileSystemSerdesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|s| s as &(dyn std::error::Error + 'static))
+    }
+}
 
 // ============================================================
 // Helper functions
@@ -1211,17 +1256,19 @@ fn publish_unique_payload_file(
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                return Err(Box::new(FileSystemSerdesError::new(format!(
-                    "failed to write file '{staging_path}': {e}"
-                ))));
+                return Err(Box::new(FileSystemSerdesError::with_source(
+                    format!("failed to write file '{staging_path}'"),
+                    e,
+                )));
             }
         };
         if let Err(e) = staging.write_all(json_str.as_bytes()) {
             drop(staging);
             let _ = std::fs::remove_file(&staging_path);
-            return Err(Box::new(FileSystemSerdesError::new(format!(
-                "failed to write file '{staging_path}': {e}"
-            ))));
+            return Err(Box::new(FileSystemSerdesError::with_source(
+                format!("failed to write file '{staging_path}'"),
+                e,
+            )));
         }
         drop(staging);
 
@@ -1234,9 +1281,10 @@ fn publish_unique_payload_file(
             Ok(()) => return Ok(file_name),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => {
-                return Err(Box::new(FileSystemSerdesError::new(format!(
-                    "failed to move file into place at '{file_path}': {e}"
-                ))));
+                return Err(Box::new(FileSystemSerdesError::with_source(
+                    format!("failed to move file into place at '{file_path}'"),
+                    e,
+                )));
             }
         }
     }

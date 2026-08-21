@@ -662,8 +662,7 @@ where
                 let items = Arc::clone(&items_ref);
                 let closure = Arc::clone(&closure);
                 async move {
-                    let item =
-                        take_item(&items, index).map_err(|e| ChildFnError::new(e.to_string()))?;
+                    let item = take_item(&items, index).map_err(ChildFnError::from)?;
                     (closure)(child_ctx, item, index).await.map_err(Into::into)
                 }
             }),
@@ -907,7 +906,8 @@ where
             Ok(item) => return Ok(ItemPrelude::Done(item)),
             Err(e) => {
                 // ReplayChildren sentinel: fall through to re-execution.
-                let is_replay_children = e.to_string().contains(REPLAY_CHILDREN_SENTINEL);
+                let is_replay_children =
+                    crate::error::chain_string(&e).contains(REPLAY_CHILDREN_SENTINEL);
                 if !is_replay_children {
                     return Err(e);
                 }
@@ -985,14 +985,19 @@ where
                     error_type: None,
                 }))
             }
-            ScopeOutcome::Completed(Err(child_err)) => Ok(ItemOutcome::Terminal(BatchItem {
-                index: req.index,
-                name: req.item_name.clone(),
-                status: BatchItemStatus::Failed,
-                result: None,
-                error_message: Some(child_err.to_string()),
-                error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
-            })),
+            ScopeOutcome::Completed(Err(child_err)) => {
+                // The recorded message is the flattened chain, built at
+                // the single flattening site.
+                let wire = crate::error::wire_error_for(&child_err, CHILD_FN_ERROR_TYPE);
+                Ok(ItemOutcome::Terminal(BatchItem {
+                    index: req.index,
+                    name: req.item_name.clone(),
+                    status: BatchItemStatus::Failed,
+                    result: None,
+                    error_message: wire.error_message().map(str::to_owned),
+                    error_type: wire.error_type().map(str::to_owned),
+                }))
+            }
         };
     }
 
@@ -1054,20 +1059,17 @@ where
                 return Ok(ItemOutcome::Suspended);
             }
 
-            // Checkpoint failure.
-            let err_message = child_err.to_string();
+            // Checkpoint failure. The wire record is derived from the
+            // carried error, so the message is the flattened chain and
+            // `error_data`/`stack_trace` pass through the boundary.
+            let wire = crate::error::wire_error_for(&child_err, CHILD_FN_ERROR_TYPE);
             let builder = OperationUpdate::builder()
                 .id(child_wire)
                 .r#type(OperationType::Context)
                 .sub_type(req.child_sub_type.clone())
                 .action(OperationAction::Fail)
                 .parent_id(req.parent_wire.clone())
-                .error(
-                    aws_sdk_lambda::types::ErrorObject::builder()
-                        .error_type(CHILD_FN_ERROR_TYPE)
-                        .error_message(err_message.clone())
-                        .build(),
-                );
+                .error(wire.to_error_object());
 
             #[allow(clippy::expect_used)] // reason: all required fields are set above
             let update = builder
@@ -1082,8 +1084,8 @@ where
                 name: req.item_name.clone(),
                 status: BatchItemStatus::Failed,
                 result: None,
-                error_message: Some(err_message),
-                error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
+                error_message: wire.error_message().map(str::to_owned),
+                error_type: wire.error_type().map(str::to_owned),
             }))
         }
     }
@@ -1366,10 +1368,11 @@ where
                         .action(OperationAction::Fail)
                         .parent_id(self.parent_wire.to_owned())
                         .error(
-                            aws_sdk_lambda::types::ErrorObject::builder()
-                                .error_type(CHILD_FN_ERROR_TYPE)
-                                .error_message(message.clone())
-                                .build(),
+                            crate::error::WireError::new(
+                                Some(CHILD_FN_ERROR_TYPE),
+                                Some(message.clone()),
+                            )
+                            .to_error_object(),
                         );
                     if let Ok(update) = update.build() {
                         let _ = self.ctx.checkpoint_updates(vec![update]).await;
@@ -1437,7 +1440,8 @@ where
                 Ok(())
             }
             Err(e) => {
-                let is_replay_children = e.to_string().contains(REPLAY_CHILDREN_SENTINEL);
+                let is_replay_children =
+                    crate::error::chain_string(&e).contains(REPLAY_CHILDREN_SENTINEL);
                 if !is_replay_children {
                     return Err(e);
                 }
@@ -1621,7 +1625,8 @@ where
                     // The children's operations are still in the checkpoint
                     // log, so re-executing the batch will replay each child
                     // from its terminal record.
-                    let is_replay_children = e.to_string().contains(REPLAY_CHILDREN_SENTINEL);
+                    let is_replay_children =
+                        crate::error::chain_string(&e).contains(REPLAY_CHILDREN_SENTINEL);
                     if !is_replay_children {
                         // A recorded batch FAILURE replays as this error; an
                         // internal replay problem (missing/corrupt payload)
@@ -2694,11 +2699,10 @@ where
 
 /// Constructs a batch operation error.
 fn batch_error(message: &str) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::ChildContext(
-        ChildContextError::from_kind(ChildContextErrorKind::Internal {
-            message: message.to_owned(),
-        }),
-    ))
+    OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
+        ChildContextErrorKind::Internal,
+        Some(message.to_owned().into()),
+    )))
 }
 
 /// Wraps owned map inputs in indexed take-once slots shareable across
@@ -2863,10 +2867,14 @@ mod tests {
                 result: Some(result.to_owned()),
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -2886,10 +2894,14 @@ mod tests {
                 result: None,
                 error_type: Some("ChildFnError".to_owned()),
                 error_message: Some(msg.to_owned()),
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -2912,10 +2924,14 @@ mod tests {
                 result: None,
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: true,
                 callback_id: None,
                 op_type: None,
@@ -3306,10 +3322,14 @@ mod tests {
                     result: Some(payload.to_string()),
                     error_type: None,
                     error_message: None,
+                    error_data: None,
+                    stack_trace: None,
                     attempt: 0,
                     invoke_result: None,
                     invoke_error_type: None,
                     invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
                     replay_children: false,
                     callback_id: None,
                     op_type: None,
@@ -4126,10 +4146,14 @@ mod tests {
                     result: Some(payload.to_string()),
                     error_type: None,
                     error_message: None,
+                    error_data: None,
+                    stack_trace: None,
                     attempt: 0,
                     invoke_result: None,
                     invoke_error_type: None,
                     invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
                     replay_children: false,
                     callback_id: None,
                     op_type: None,
@@ -4288,7 +4312,7 @@ mod tests {
             .max_concurrency(0)
             .await;
         let err = result.expect_err("max_concurrency=0 must error");
-        let msg = err.to_string();
+        let msg = format!("{err:#}");
         assert!(
             msg.contains("max concurrency must be positive"),
             "error message should mention validation: {msg}"
@@ -4307,7 +4331,7 @@ mod tests {
             .max_concurrency(0)
             .await;
         let err = result.expect_err("max_concurrency=0 must error");
-        let msg = err.to_string();
+        let msg = format!("{err:#}");
         assert!(
             msg.contains("max concurrency must be positive"),
             "error message should mention validation: {msg}"
@@ -4596,8 +4620,8 @@ mod tests {
         let err =
             result.expect_err("a panicking branch must surface as a controlled batch failure");
         assert!(
-            err.to_string().contains("boom in map branch"),
-            "batch failure should carry the branch panic message, got: {err}"
+            format!("{err:#}").contains("boom in map branch"),
+            "batch failure should carry the branch panic message, got: {err:#}"
         );
     }
 
@@ -4637,8 +4661,8 @@ mod tests {
         let err =
             result.expect_err("a panicking branch must surface as a controlled batch failure");
         assert!(
-            err.to_string().contains("boom in parallel branch"),
-            "batch failure should carry the branch panic message, got: {err}"
+            format!("{err:#}").contains("boom in parallel branch"),
+            "batch failure should carry the branch panic message, got: {err:#}"
         );
     }
 
@@ -5089,10 +5113,14 @@ mod tests {
                     result: None,
                     error_type: None,
                     error_message: None,
+                    error_data: None,
+                    stack_trace: None,
                     attempt: 0,
                     invoke_result: None,
                     invoke_error_type: None,
                     invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
                     replay_children: false,
                     callback_id: None,
                     op_type: None,
@@ -5108,10 +5136,14 @@ mod tests {
                     result: Some(wire),
                     error_type: None,
                     error_message: None,
+                    error_data: None,
+                    stack_trace: None,
                     attempt: 0,
                     invoke_result: None,
                     invoke_error_type: None,
                     invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
                     replay_children: false,
                     callback_id: None,
                     op_type: None,
@@ -5157,10 +5189,14 @@ mod tests {
                 result: Some(payload.to_string()),
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,

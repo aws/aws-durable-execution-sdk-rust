@@ -115,14 +115,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
                         Some(COMBINATOR_SUB_TYPE),
                         view.attempt,
                     );
-                    let (error_type, error_message) = self
+                    let wire = self
                         .ctx
-                        .checkpoint_error_parts(&positional_id)
+                        .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Err(replay_combinator_failure(
-                        error_type.as_deref(),
-                        error_message.as_deref(),
-                    ));
+                    return Err(replay_combinator_failure(wire, &wire_id));
                 }
                 _ => {} // Started/Pending: fall through to re-execute
             }
@@ -185,22 +182,19 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         }
 
         if let Some((failed_index, op_err)) = first_error {
-            // Checkpoint FAIL.
-            let err_msg = op_err.to_string();
-            checkpoint_fail(
-                &self.ctx,
-                &wire_id,
-                self.name.as_deref(),
-                COMBINATOR_ERROR_TYPE,
-                &err_msg,
-            )
-            .await?;
+            // Checkpoint FAIL. The wire record is derived from the loser
+            // itself, so `error_data` and identity pass through.
+            let wire = wire_error_from_loser(&op_err);
+            checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+            // The loser is preserved as an error, reachable via source().
             return Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                CombinatorError::from_kind(CombinatorErrorKind::JoinFailed {
-                    failed_index,
-                    message: err_msg,
-                }),
-            )));
+                CombinatorError::new(
+                    CombinatorErrorKind::JoinFailed(crate::error::JoinFailed::new(failed_index)),
+                    vec![Box::new(op_err)],
+                ),
+            ))
+            .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+            .with_wire(wire));
         }
 
         // All succeeded — collect results in order.
@@ -299,14 +293,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
                         Some(COMBINATOR_SUB_TYPE),
                         view.attempt,
                     );
-                    let (error_type, error_message) = self
+                    let wire = self
                         .ctx
-                        .checkpoint_error_parts(&positional_id)
+                        .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Err(replay_combinator_failure(
-                        error_type.as_deref(),
-                        error_message.as_deref(),
-                    ));
+                    return Err(replay_combinator_failure(wire, &wire_id));
                 }
                 _ => {}
             }
@@ -372,14 +363,16 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             })
             .collect();
 
-        // Serialize with error-aware serdes (rejected → message string).
+        // Serialize with error-aware serdes. A rejected slot's error is
+        // flattened into the payload here — the checkpoint stores text,
+        // and replay rebuilds a synthetic source from it.
         let serialized = {
             let serializable: Vec<SerializedSettled<&O>> = collected
                 .iter()
                 .map(|s| match s {
                     Settled::Fulfilled(v) => SerializedSettled::Fulfilled { value: v },
                     Settled::Rejected(err) => SerializedSettled::Rejected {
-                        message: err.to_string(),
+                        message: crate::error::chain_string(err),
                     },
                 })
                 .collect();
@@ -451,14 +444,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                         Some(COMBINATOR_SUB_TYPE),
                         view.attempt,
                     );
-                    let (error_type, error_message) = self
+                    let wire = self
                         .ctx
-                        .checkpoint_error_parts(&positional_id)
+                        .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Err(replay_combinator_failure(
-                        error_type.as_deref(),
-                        error_message.as_deref(),
-                    ));
+                    return Err(replay_combinator_failure(wire, &wire_id));
                 }
                 _ => {}
             }
@@ -470,15 +460,16 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         // explicitly with `EmptyInput` (matching `race`) rather than an
         // `AllFailed` carrying zero errors.
         if self.futures.is_empty() {
-            checkpoint_fail(
-                &self.ctx,
-                &wire_id,
-                self.name.as_deref(),
+            let wire = crate::error::wire_error_manual(
                 EMPTY_INPUT_ERROR_TYPE,
                 "select_ok called with no futures",
-            )
-            .await?;
-            return Err(combinator_empty_input_error());
+            );
+            checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+            // Attach the checkpointed context so the live error matches
+            // what a replay of this record reconstructs.
+            return Err(combinator_empty_input_error()
+                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+                .with_wire(wire));
         }
 
         // Live path: race all futures, keep going until one succeeds or all fail.
@@ -498,7 +489,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
             task_index.insert(abort.id(), idx);
         }
 
-        let mut errors: Vec<(usize, String)> = Vec::new();
+        let mut errors: Vec<(usize, crate::error::Source)> = Vec::new();
 
         while let Some(task_result) = join_set.join_next_with_id().await {
             match task_result {
@@ -516,7 +507,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                 }
                 Ok((task_id, (idx, Err(op_err)))) => {
                     task_index.remove(&task_id);
-                    errors.push((idx, op_err.to_string()));
+                    errors.push((idx, Box::new(op_err)));
                 }
                 Err(join_err) => {
                     let Some(idx) = task_index.remove(&join_err.id()) else {
@@ -524,30 +515,36 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                             "task terminated with an unrecognized task id",
                         ));
                     };
-                    errors.push((idx, format!("task join failed: {join_err}")));
+                    errors.push((
+                        idx,
+                        crate::error::ContextualError::source_from(
+                            "task join failed",
+                            Box::new(join_err) as crate::error::Source,
+                        ),
+                    ));
                 }
             }
         }
 
-        // All failed — build aggregate error.
+        // All failed — build the aggregate error keeping every loser (in
+        // input order) as an error rather than a flattened string.
         errors.sort_by_key(|(idx, _)| *idx);
-        let error_messages: Vec<String> = errors.into_iter().map(|(_, msg)| msg).collect();
-        let err_display = format!("all {} futures failed", error_messages.len());
-
-        checkpoint_fail(
-            &self.ctx,
-            &wire_id,
-            self.name.as_deref(),
+        let losers: Vec<crate::error::Source> = errors.into_iter().map(|(_, err)| err).collect();
+        let wire = crate::error::wire_error_manual(
             COMBINATOR_ERROR_TYPE,
-            &err_display,
-        )
-        .await?;
+            format!("all {} futures failed", losers.len()),
+        );
 
-        Err(OperationError::from_kind(OperationErrorKind::Combinator(
-            CombinatorError::from_kind(CombinatorErrorKind::AllFailed {
-                errors: error_messages,
-            }),
-        )))
+        checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+
+        Err(
+            OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
+                CombinatorErrorKind::AllFailed,
+                losers,
+            )))
+            .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+            .with_wire(wire),
+        )
     }
 }
 
@@ -608,14 +605,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                         Some(COMBINATOR_SUB_TYPE),
                         view.attempt,
                     );
-                    let (error_type, error_message) = self
+                    let wire = self
                         .ctx
-                        .checkpoint_error_parts(&positional_id)
+                        .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Err(replay_combinator_failure(
-                        error_type.as_deref(),
-                        error_message.as_deref(),
-                    ));
+                    return Err(replay_combinator_failure(wire, &wire_id));
                 }
                 _ => {}
             }
@@ -626,15 +620,16 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
         // Empty input — there is no future that could settle. Fail
         // explicitly with `EmptyInput` (matching `select_ok`).
         if self.futures.is_empty() {
-            checkpoint_fail(
-                &self.ctx,
-                &wire_id,
-                self.name.as_deref(),
+            let wire = crate::error::wire_error_manual(
                 EMPTY_INPUT_ERROR_TYPE,
                 "race called with no futures",
-            )
-            .await?;
-            return Err(combinator_empty_input_error());
+            );
+            checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+            // Attach the checkpointed context so the live error matches
+            // what a replay of this record reconstructs.
+            return Err(combinator_empty_input_error()
+                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+                .with_wire(wire));
         }
 
         // Live path: race all futures, first settled wins.
@@ -670,35 +665,43 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
             }
             Ok((_idx, Err(op_err))) => {
                 // Winner is a failure — race propagates it. The losing
-                // error is flattened to its display message and surfaced
-                // as `FirstSettledFailed`; the wire `error_type` carries
-                // the discriminator so replay reproduces the same variant.
-                let err_msg = op_err.to_string();
-                checkpoint_fail(
-                    &self.ctx,
-                    &wire_id,
-                    self.name.as_deref(),
-                    FIRST_SETTLED_FAILED_ERROR_TYPE,
-                    &err_msg,
-                )
-                .await?;
+                // error is preserved as the combinator error's source;
+                // the wire `error_type` carries the discriminator so
+                // replay reproduces the same variant, while the message,
+                // `error_data`, and `stack_trace` derive from the loser
+                // itself (pass-through, with a fresh capture only when
+                // the chain recorded none).
+                let wire =
+                    crate::error::wire_error_with_type(&op_err, FIRST_SETTLED_FAILED_ERROR_TYPE);
+                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
                 Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                    CombinatorError::from_kind(CombinatorErrorKind::FirstSettledFailed {
-                        message: err_msg,
-                    }),
-                )))
+                    CombinatorError::new(
+                        CombinatorErrorKind::FirstSettledFailed,
+                        vec![Box::new(op_err)],
+                    ),
+                ))
+                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+                .with_wire(wire))
             }
             Err(join_err) => {
-                let msg = format!("task join failed: {join_err}");
-                checkpoint_fail(
-                    &self.ctx,
-                    &wire_id,
-                    self.name.as_deref(),
+                let wire = crate::error::wire_error_manual(
                     COMBINATOR_ERROR_TYPE,
-                    &msg,
-                )
-                .await?;
-                Err(combinator_internal_error(&msg))
+                    format!("task join failed: {join_err}"),
+                );
+                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+                // Attach the checkpointed context so the live error
+                // matches what a replay of this record reconstructs.
+                Err(OperationError::from_kind(OperationErrorKind::Combinator(
+                    CombinatorError::new(
+                        CombinatorErrorKind::Internal,
+                        vec![crate::error::ContextualError::source_from(
+                            "task join failed",
+                            Box::new(join_err) as crate::error::Source,
+                        )],
+                    ),
+                ))
+                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+                .with_wire(wire))
             }
         }
     }
@@ -821,10 +824,9 @@ async fn checkpoint_fail(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
-    error_type: &str,
-    error_message: &str,
+    error: &crate::error::WireError,
 ) -> Result<(), OperationError> {
-    use aws_sdk_lambda::types::{ErrorObject, OperationAction, OperationType, OperationUpdate};
+    use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 
     fatal_gate(ctx)?;
 
@@ -833,12 +835,7 @@ async fn checkpoint_fail(
         .r#type(OperationType::Context)
         .sub_type(COMBINATOR_SUB_TYPE.to_owned())
         .action(OperationAction::Fail)
-        .error(
-            ErrorObject::builder()
-                .error_type(error_type)
-                .error_message(error_message)
-                .build(),
-        );
+        .error(error.to_error_object());
 
     if let Some(n) = name {
         builder = builder.name(n.to_owned());
@@ -858,21 +855,29 @@ async fn checkpoint_fail(
     Ok(())
 }
 
-/// Creates a combinator internal `OperationError`.
+/// Creates a combinator internal `OperationError`; the message becomes
+/// the source frame, keeping the kind a pure classification.
 fn combinator_internal_error(message: &str) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::from_kind(
-        CombinatorErrorKind::Internal {
-            message: message.to_owned(),
-        },
+    OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
+        CombinatorErrorKind::Internal,
+        vec![message.to_owned().into()],
     )))
 }
 
 /// Creates the `EmptyInput` combinator `OperationError` shared by `race`
 /// and `select_ok` (live and replay paths).
 fn combinator_empty_input_error() -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::from_kind(
+    OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
         CombinatorErrorKind::EmptyInput,
+        Vec::new(),
     )))
+}
+
+/// Derives the wire failure record for a losing future's error,
+/// preserving pass-through identity (`error_type`, `error_data`) and
+/// flattening the message once.
+fn wire_error_from_loser(op_err: &OperationError) -> crate::error::WireError {
+    crate::error::wire_error_for(op_err, COMBINATOR_ERROR_TYPE)
 }
 
 /// Replays a successful `Vec<O>` from a checkpoint record.
@@ -911,9 +916,16 @@ fn replay_settled_success<O: DeserializeOwned>(
         .map(|s| match s {
             SerializedSettled::Fulfilled { value } => Settled::Fulfilled(value),
             SerializedSettled::Rejected { message } => {
-                Settled::Rejected(OperationError::from_kind(OperationErrorKind::ChildContext(
-                    ChildContextError::from_kind(ChildContextErrorKind::ChildFailed { message }),
-                )))
+                let wire = crate::error::WireError::new(None::<String>, Some(message));
+                Settled::Rejected(
+                    OperationError::from_kind(OperationErrorKind::ChildContext(
+                        ChildContextError::new(
+                            ChildContextErrorKind::ChildFailed,
+                            Some(crate::error::ReplayedFailure::source_from(wire.clone())),
+                        ),
+                    ))
+                    .with_wire(wire),
+                )
             }
         })
         .collect();
@@ -929,24 +941,23 @@ fn replay_settled_success<O: DeserializeOwned>(
 /// replay are indistinguishable. Everything else (including records
 /// written before these discriminators existed) reconstructs as
 /// `Internal` carrying the recorded message.
-fn replay_combinator_failure(
-    error_type: Option<&str>,
-    error_message: Option<&str>,
-) -> OperationError {
-    if error_type == Some(EMPTY_INPUT_ERROR_TYPE) {
-        return combinator_empty_input_error();
+fn replay_combinator_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+    if wire.error_type() == Some(EMPTY_INPUT_ERROR_TYPE) {
+        return combinator_empty_input_error()
+            .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+            .with_wire(wire);
     }
-    let message = error_message
-        .unwrap_or("unknown combinator error")
-        .to_owned();
-    let kind = if error_type == Some(FIRST_SETTLED_FAILED_ERROR_TYPE) {
-        CombinatorErrorKind::FirstSettledFailed { message }
+    let kind = if wire.error_type() == Some(FIRST_SETTLED_FAILED_ERROR_TYPE) {
+        CombinatorErrorKind::FirstSettledFailed
     } else {
-        CombinatorErrorKind::Internal { message }
+        CombinatorErrorKind::Internal
     };
-    OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::from_kind(
+    OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
         kind,
+        vec![crate::error::ReplayedFailure::source_from(wire.clone())],
     )))
+    .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+    .with_wire(wire)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1032,10 +1043,14 @@ mod tests {
                 result: Some(result.to_owned()),
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -1060,10 +1075,14 @@ mod tests {
                 result: None,
                 error_type: Some(err_type.to_owned()),
                 error_message: Some(err_msg.to_owned()),
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -1099,9 +1118,10 @@ mod tests {
         let a = DurableFuture::from_async(async { Ok(1) });
         let b: DurableFuture<i32> = DurableFuture::from_async(async {
             Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                CombinatorError::from_kind(CombinatorErrorKind::Internal {
-                    message: "boom".to_owned(),
-                }),
+                CombinatorError::new(
+                    CombinatorErrorKind::Internal,
+                    vec!["boom".to_owned().into()],
+                ),
             )))
         });
         let c = DurableFuture::from_async(async {
@@ -1183,9 +1203,10 @@ mod tests {
         let err = exec.execute().await.unwrap_err();
         match err.kind() {
             OperationErrorKind::Combinator(ce) => match ce.kind() {
-                CombinatorErrorKind::JoinFailed { failed_index, .. } => {
+                CombinatorErrorKind::JoinFailed(details) => {
                     assert_eq!(
-                        *failed_index, 1,
+                        details.failed_index(),
+                        1,
                         "panic must be attributed to the panicking future's index"
                     );
                 }
@@ -1234,9 +1255,10 @@ mod tests {
         let b: DurableFuture<String> = DurableFuture::from_async(async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                CombinatorError::from_kind(CombinatorErrorKind::Internal {
-                    message: "err-idx1".to_owned(),
-                }),
+                CombinatorError::new(
+                    CombinatorErrorKind::Internal,
+                    vec!["err-idx1".to_owned().into()],
+                ),
             )))
         });
 
@@ -1250,7 +1272,12 @@ mod tests {
         let err = exec.execute().await.unwrap_err();
         match err.kind() {
             OperationErrorKind::Combinator(ce) => match ce.kind() {
-                CombinatorErrorKind::AllFailed { errors } => {
+                CombinatorErrorKind::AllFailed => {
+                    let errors: Vec<String> = ce
+                        .failures()
+                        .iter()
+                        .map(|e| crate::error::chain_string(&**e))
+                        .collect();
                     assert_eq!(errors.len(), 2);
                     assert!(
                         errors[0].contains("task join failed"),
@@ -1275,9 +1302,10 @@ mod tests {
         let a = DurableFuture::from_async(async { Ok(1) });
         let b: DurableFuture<i32> = DurableFuture::from_async(async {
             Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                CombinatorError::from_kind(CombinatorErrorKind::Internal {
-                    message: "task-b-failed".to_owned(),
-                }),
+                CombinatorError::new(
+                    CombinatorErrorKind::Internal,
+                    vec!["task-b-failed".to_owned().into()],
+                ),
             )))
         });
         let c = DurableFuture::from_async(async { Ok(3) });
@@ -1314,7 +1342,7 @@ mod tests {
         let result = exec.execute().await.unwrap();
         assert_eq!(result.len(), 3);
         assert!(matches!(&result[0], Settled::Fulfilled(42)));
-        assert!(matches!(&result[1], Settled::Rejected(e) if e.to_string().contains("oops")));
+        assert!(matches!(&result[1], Settled::Rejected(e) if format!("{e:#}").contains("oops")));
         assert!(matches!(&result[2], Settled::Fulfilled(99)));
     }
 
@@ -1327,9 +1355,10 @@ mod tests {
         let a = DurableFuture::from_async(async { Ok("winner".to_owned()) });
         let b: DurableFuture<String> = DurableFuture::from_async(async {
             Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                CombinatorError::from_kind(CombinatorErrorKind::Internal {
-                    message: "fail".to_owned(),
-                }),
+                CombinatorError::new(
+                    CombinatorErrorKind::Internal,
+                    vec!["fail".to_owned().into()],
+                ),
             )))
         });
 
@@ -1349,16 +1378,18 @@ mod tests {
         let ctx = test_ctx_with_client(CheckpointLog::empty());
         let a: DurableFuture<String> = DurableFuture::from_async(async {
             Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                CombinatorError::from_kind(CombinatorErrorKind::Internal {
-                    message: "err-a".to_owned(),
-                }),
+                CombinatorError::new(
+                    CombinatorErrorKind::Internal,
+                    vec!["err-a".to_owned().into()],
+                ),
             )))
         });
         let b: DurableFuture<String> = DurableFuture::from_async(async {
             Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                CombinatorError::from_kind(CombinatorErrorKind::Internal {
-                    message: "err-b".to_owned(),
-                }),
+                CombinatorError::new(
+                    CombinatorErrorKind::Internal,
+                    vec!["err-b".to_owned().into()],
+                ),
             )))
         });
 
@@ -1372,8 +1403,8 @@ mod tests {
         let err = exec.execute().await.unwrap_err();
         match err.kind() {
             OperationErrorKind::Combinator(ce) => match ce.kind() {
-                CombinatorErrorKind::AllFailed { errors } => {
-                    assert_eq!(errors.len(), 2);
+                CombinatorErrorKind::AllFailed => {
+                    assert_eq!(ce.failures().len(), 2);
                 }
                 other => panic!("expected AllFailed, got: {other:?}"),
             },
@@ -1427,9 +1458,10 @@ mod tests {
         // The failure resolves first (no delay); the success is slow.
         let a: DurableFuture<String> = DurableFuture::from_async(async {
             Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                CombinatorError::from_kind(CombinatorErrorKind::Internal {
-                    message: "fast-fail".to_owned(),
-                }),
+                CombinatorError::new(
+                    CombinatorErrorKind::Internal,
+                    vec!["fast-fail".to_owned().into()],
+                ),
             )))
         });
         let b = DurableFuture::from_async(async {
@@ -1447,16 +1479,29 @@ mod tests {
         let err = exec.execute().await.unwrap_err();
         match err.kind() {
             OperationErrorKind::Combinator(ce) => match ce.kind() {
-                CombinatorErrorKind::FirstSettledFailed { message } => {
+                CombinatorErrorKind::FirstSettledFailed => {
+                    let message = crate::error::chain_string(ce);
                     assert!(
                         message.contains("fast-fail"),
-                        "loser's message must be preserved: {message}"
+                        "loser's error must be preserved: {message}"
                     );
                 }
                 other => panic!("expected FirstSettledFailed, got: {other:?}"),
             },
             other => panic!("expected Combinator, got: {other:?}"),
         }
+        // The recorded first-settled failure derives from the loser: the
+        // discriminator names the variant, and a stack trace is present
+        // (pass-through from the loser, or captured at the record site).
+        let wire = err.wire().expect("first-settled failure carries wire");
+        assert_eq!(
+            wire.error_type(),
+            Some("CombinatorError.FirstSettledFailed")
+        );
+        assert!(
+            !wire.stack_trace().is_empty(),
+            "first-settled failure record must carry a stack trace"
+        );
     }
 
     #[tokio::test]
@@ -1482,7 +1527,8 @@ mod tests {
         let err = exec.execute().await.unwrap_err();
         match err.kind() {
             OperationErrorKind::Combinator(ce) => match ce.kind() {
-                CombinatorErrorKind::FirstSettledFailed { message } => {
+                CombinatorErrorKind::FirstSettledFailed => {
+                    let message = crate::error::chain_string(ce);
                     assert!(
                         message.contains("fast-fail"),
                         "replayed message must match the recorded one: {message}"
@@ -1516,6 +1562,16 @@ mod tests {
             }
             other => panic!("expected Combinator, got: {other:?}"),
         }
+        // The live error carries the checkpointed context — the same
+        // operation id, status, and wire record a replay reconstructs.
+        assert!(err.operation_id().is_some(), "live EmptyInput has op id");
+        assert_eq!(err.status(), Some("FAILED"));
+        let wire = err.wire().expect("live EmptyInput carries wire record");
+        assert_eq!(wire.error_type(), Some("CombinatorError.EmptyInput"));
+        assert!(
+            !wire.stack_trace().is_empty(),
+            "manually constructed live failure records capture a stack"
+        );
     }
 
     #[tokio::test]
@@ -1540,6 +1596,12 @@ mod tests {
             }
             other => panic!("expected Combinator, got: {other:?}"),
         }
+        // Live/replay parity: the checkpointed context is attached.
+        assert!(err.operation_id().is_some(), "live EmptyInput has op id");
+        assert_eq!(err.status(), Some("FAILED"));
+        let wire = err.wire().expect("live EmptyInput carries wire record");
+        assert_eq!(wire.error_type(), Some("CombinatorError.EmptyInput"));
+        assert!(!wire.stack_trace().is_empty());
     }
 
     #[tokio::test]

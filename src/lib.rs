@@ -89,9 +89,11 @@ pub use self::tracing_layer::ReplayFilterLayer;
 pub use self::context::{DurableContext, StepContext};
 pub use self::error::{
     CallbackError, CallbackErrorKind, ChildContextError, ChildContextErrorKind, CombinatorError,
-    CombinatorErrorKind, InvokeError, InvokeErrorKind, NonDeterministicExecutionError,
-    NonDeterministicExecutionErrorKind, OperationError, OperationErrorKind, StepError,
-    StepErrorKind, WaitError, WaitErrorKind, WaitForConditionError, WaitForConditionErrorKind,
+    CombinatorErrorKind, FunctionNotFound, InvokeError, InvokeErrorKind, JoinFailed,
+    MaxChecksExceeded, NonDeterministicExecutionError, NonDeterministicExecutionErrorKind,
+    OperationError, OperationErrorKind, OperationMismatch, ReplayedFailure, RetriesExhausted,
+    StepError, StepErrorKind, TypedError, UnexpectedStatus, WaitError, WaitErrorKind,
+    WaitForConditionError, WaitForConditionErrorKind, WireError,
 };
 pub use self::future::{Branch, DurableFuture, Settled};
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
@@ -403,48 +405,49 @@ where
     }
 }
 
-/// Extracts the wire error type and raw error message from a `BoxError`.
+/// Derives the wire failure record from a handler-level `BoxError`.
 ///
 /// Attempts to downcast to `OperationError` for structured extraction;
-/// falls back to `HandlerError` with the Display string for unknown types.
-fn wire_error_from_box_error(err: BoxError) -> (String, String) {
+/// falls back to `HandlerError` for unknown types. The message is the
+/// error's flattened chain, built by the module-wide single flattening
+/// site (see [`error::wire_error_for`]).
+fn wire_error_from_box_error(err: BoxError) -> WireError {
     match err.downcast::<OperationError>() {
         Ok(op_err) => wire_error_from_operation_error(&op_err),
-        Err(other) => ("HandlerError".to_owned(), other.to_string()),
+        Err(other) => error::wire_error_for(&*other, "HandlerError"),
     }
 }
 
-/// Extracts the wire error type and raw error message from an `OperationError`.
+/// Derives the wire failure record from an `OperationError`.
 ///
-/// For callback external failures, the wire message is the raw external
-/// error message (not the full Display chain). For other errors, the full
-/// Display string is used.
-fn wire_error_from_operation_error(err: &OperationError) -> (String, String) {
-    match err.kind() {
-        OperationErrorKind::Step(_) => ("StepError".to_owned(), err.to_string()),
-        OperationErrorKind::Wait(_) => ("WaitError".to_owned(), err.to_string()),
-        OperationErrorKind::Invoke(_) => ("InvokeError".to_owned(), err.to_string()),
-        OperationErrorKind::Callback(cb_err) => {
-            let message = match cb_err.kind() {
-                CallbackErrorKind::ExternalFailure { message, .. } => message.clone(),
-                _ => err.to_string(),
-            };
-            ("CallbackError".to_owned(), message)
-        }
-        OperationErrorKind::ChildContext(child_err) => {
-            let message = match child_err.kind() {
-                ChildContextErrorKind::ChildFailed { message } => message.clone(),
-                _ => err.to_string(),
-            };
-            ("ChildContextError".to_owned(), message)
-        }
-        OperationErrorKind::WaitForCondition(_) => {
-            ("WaitForConditionError".to_owned(), err.to_string())
-        }
-        OperationErrorKind::Combinator(_) => ("PromiseCombinatorError".to_owned(), err.to_string()),
-        OperationErrorKind::NonDeterministicExecution(_) => {
-            ("NonDeterministicExecutionError".to_owned(), err.to_string())
-        }
+/// The wire type comes from the error's recorded wire identity when it
+/// has one (preserving the original type across boundaries), else from
+/// the kind's registry name. For callback external failures, the wire
+/// message is the externally reported message (not the full chain).
+fn wire_error_from_operation_error(err: &OperationError) -> WireError {
+    if let OperationErrorKind::Callback(cb_err) = err.kind()
+        && matches!(cb_err.kind(), CallbackErrorKind::ExternalFailure)
+        && let Some(wire) = err.wire()
+    {
+        // Report the external caller's own failure fields verbatim.
+        return wire.clone();
+    }
+    error::wire_error_for(err, err.kind().wire_type_name())
+}
+
+/// Parses a wire `StackTrace` array (of strings) from an error object.
+fn parse_stack_trace(error: &serde_json::Value) -> Option<Vec<String>> {
+    let frames: Vec<String> = error
+        .get("StackTrace")?
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(String::from)
+        .collect();
+    if frames.is_empty() {
+        None
+    } else {
+        Some(frames)
     }
 }
 
@@ -523,6 +526,11 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
         .and_then(|e| e.get("ErrorMessage"))
         .and_then(serde_json::Value::as_str)
         .map(String::from);
+    let error_data = error
+        .and_then(|e| e.get("ErrorData"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    let stack_trace = error.and_then(parse_stack_trace);
     #[allow(clippy::cast_possible_truncation)] // reason: attempt ≤ MAX_ATTEMPTS (small)
     #[allow(clippy::cast_sign_loss)] // reason: clamped to non-negative
     let attempt = step_details
@@ -545,6 +553,11 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
         .and_then(|e| e.get("ErrorMessage"))
         .and_then(serde_json::Value::as_str)
         .map(String::from);
+    let invoke_error_data = invoke_error
+        .and_then(|e| e.get("ErrorData"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    let invoke_stack_trace = invoke_error.and_then(parse_stack_trace);
 
     // Parse ContextDetails for child context operations.
     let context_details = op.get("ContextDetails");
@@ -582,6 +595,13 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
             .and_then(serde_json::Value::as_str)
             .map(String::from)
     });
+    let error_data = error_data.or_else(|| {
+        context_error
+            .and_then(|e| e.get("ErrorData"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+    });
+    let stack_trace = stack_trace.or_else(|| context_error.and_then(parse_stack_trace));
 
     // Also check for result in CallbackDetails (callback success payload).
     let result = result.or_else(|| {
@@ -605,6 +625,13 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
             .and_then(serde_json::Value::as_str)
             .map(String::from)
     });
+    let error_data = error_data.or_else(|| {
+        callback_error
+            .and_then(|e| e.get("ErrorData"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+    });
+    let stack_trace = stack_trace.or_else(|| callback_error.and_then(parse_stack_trace));
 
     Some((
         id.to_owned(),
@@ -614,10 +641,14 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
             result,
             error_type,
             error_message,
+            error_data,
+            stack_trace,
             attempt,
             invoke_result,
             invoke_error_type,
             invoke_error_message,
+            invoke_error_data,
+            invoke_stack_trace,
             replay_children,
             callback_id,
             op_type: Some(op_type.to_owned()),
@@ -859,7 +890,7 @@ where
                 async {
                     match (handler)(customer_input, ctx).await {
                         Ok(result) => serde_json::to_string(&result)
-                            .map_err(|e| ("HandlerError".to_owned(), e.to_string())),
+                            .map_err(|e| error::wire_error_for(&e, "HandlerError")),
                         Err(e) => Err(wire_error_from_box_error(e)),
                     }
                 }
@@ -938,16 +969,31 @@ fn outcome_envelope(outcome: driver::InvocationOutcome, ctx: &DurableContext) ->
                 "Status": "PENDING"
             })
         }
-        driver::InvocationOutcome::Failed {
-            error_type,
-            error_message,
-        } => {
+        driver::InvocationOutcome::Failed { error } => {
+            let mut error_map = serde_json::Map::new();
+            error_map.insert(
+                "ErrorType".to_owned(),
+                serde_json::Value::String(error.error_type().unwrap_or("Error").to_owned()),
+            );
+            error_map.insert(
+                "ErrorMessage".to_owned(),
+                serde_json::Value::String(error.error_message().unwrap_or_default().to_owned()),
+            );
+            if let Some(data) = error.error_data() {
+                error_map.insert(
+                    "ErrorData".to_owned(),
+                    serde_json::Value::String(data.to_owned()),
+                );
+            }
+            if !error.stack_trace().is_empty() {
+                error_map.insert(
+                    "StackTrace".to_owned(),
+                    serde_json::json!(error.stack_trace()),
+                );
+            }
             serde_json::json!({
                 "Status": "FAILED",
-                "Error": {
-                    "ErrorType": error_type,
-                    "ErrorMessage": error_message
-                }
+                "Error": serde_json::Value::Object(error_map)
             })
         }
     }
@@ -1421,10 +1467,14 @@ mod tests {
                 result: Some("\"inline\"".to_owned()),
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 1,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,

@@ -531,8 +531,9 @@ impl DurableContext {
             .task_ownership
             .check_current_task()
             .map_err(|msg| {
-                OperationError::from_kind(OperationErrorKind::Step(StepError::from_kind(
-                    StepErrorKind::ExecutionFailed { message: msg },
+                OperationError::from_kind(OperationErrorKind::Step(StepError::new(
+                    StepErrorKind::ExecutionFailed,
+                    Some(msg.into()),
                 )))
             })
     }
@@ -593,15 +594,17 @@ impl DurableContext {
             .flatten()
     }
 
-    /// Returns the recorded error type/message pair for the given
-    /// positional ID, cloning only those strings. `None` means no record
+    /// Returns the recorded wire failure record for the given positional
+    /// ID, cloning only the failure strings. `None` means no record
     /// exists.
-    pub(crate) fn checkpoint_error_parts(
+    pub(crate) fn checkpoint_wire_error(
         &self,
         positional_id: &str,
-    ) -> Option<(Option<String>, Option<String>)> {
+    ) -> Option<crate::error::WireError> {
         self.with_checkpoint_record(positional_id, |record| {
-            (record.error_type.clone(), record.error_message.clone())
+            crate::error::WireError::new(record.error_type.clone(), record.error_message.clone())
+                .with_error_data(record.error_data.clone())
+                .with_stack_trace(record.stack_trace.clone().unwrap_or_default())
         })
     }
 
@@ -760,16 +763,19 @@ impl DurableContext {
     ) -> OperationError {
         let err = OperationError::from_kind(OperationErrorKind::NonDeterministicExecution(
             NonDeterministicExecutionError::from_kind(
-                NonDeterministicExecutionErrorKind::OperationMismatch {
-                    wire_id: wire_id.to_owned(),
-                    expected: expected.to_owned(),
-                    actual: format_op_identity(claimed_type, claimed_sub_type, claimed_name),
-                },
+                NonDeterministicExecutionErrorKind::OperationMismatch(
+                    crate::error::OperationMismatch::new(
+                        wire_id,
+                        expected,
+                        format_op_identity(claimed_type, claimed_sub_type, claimed_name),
+                    ),
+                ),
             ),
         ));
-        self.inner
-            .suspension_signal
-            .record_fatal("NonDeterministicExecutionError".to_owned(), err.to_string());
+        self.inner.suspension_signal.record_fatal(
+            "NonDeterministicExecutionError".to_owned(),
+            crate::error::chain_string(&err),
+        );
         err
     }
 
@@ -1728,7 +1734,7 @@ impl DurableContext {
     /// Losers are dropped (cancelled) when the first success resolves.
     /// If every future fails, the operation fails with
     /// [`CombinatorErrorKind::AllFailed`](crate::CombinatorErrorKind::AllFailed)
-    /// carrying each future's error message.
+    /// preserving each future's error (see [`CombinatorError::failures`](crate::CombinatorError::failures)).
     ///
     /// # Empty input
     ///
@@ -1770,8 +1776,8 @@ impl DurableContext {
     /// When the first settled outcome is a failure, the operation fails
     /// with
     /// [`CombinatorErrorKind::FirstSettledFailed`](crate::CombinatorErrorKind::FirstSettledFailed)
-    /// carrying the losing future's error message; the same variant is
-    /// produced live and on replay.
+    /// carrying the losing future's error as its source; the same variant
+    /// is produced live and on replay.
     ///
     /// # Empty input
     ///
@@ -2288,10 +2294,14 @@ mod tests {
             result: Some("42".to_owned()),
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: Some("Step".to_owned()),
@@ -2326,10 +2336,14 @@ mod tests {
             result: Some("42".to_owned()),
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 2,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: true,
             callback_id: None,
             op_type: Some("Step".to_owned()),
@@ -2362,10 +2376,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: Some("Step".to_owned()),
@@ -2383,7 +2401,7 @@ mod tests {
             err.kind(),
             OperationErrorKind::NonDeterministicExecution(_)
         ));
-        let display = err.to_string();
+        let display = format!("{err:#}");
         assert!(
             display.contains("Step") && display.contains("Wait"),
             "expected both identities in error: {display}"
@@ -2398,10 +2416,14 @@ mod tests {
             result: Some(r#""state""#.to_owned()),
             error_type: Some("SomeError".to_owned()),
             error_message: Some("it broke".to_owned()),
+            error_data: None,
+            stack_trace: None,
             attempt: 5,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: Some("cb-42".to_owned()),
             op_type: None,
@@ -2420,12 +2442,11 @@ mod tests {
 
         assert_eq!(ctx.checkpoint_callback_id("1").as_deref(), Some("cb-42"));
 
-        let parts = ctx.checkpoint_error_parts("1");
-        assert_eq!(
-            parts,
-            Some((Some("SomeError".to_owned()), Some("it broke".to_owned())))
-        );
-        assert!(ctx.checkpoint_error_parts("2").is_none());
+        let wire = ctx.checkpoint_wire_error("1");
+        let wire = wire.expect("record 1 exists");
+        assert_eq!(wire.error_type(), Some("SomeError"));
+        assert_eq!(wire.error_message(), Some("it broke"));
+        assert!(ctx.checkpoint_wire_error("2").is_none());
 
         let view = ctx.checkpoint_status_view("1");
         assert!(view.is_some());
@@ -2443,10 +2464,14 @@ mod tests {
             result: Some(r#""summary""#.to_owned()),
             error_type: Some("BatchError".to_owned()),
             error_message: Some("batch broke".to_owned()),
+            error_data: None,
+            stack_trace: None,
             attempt: 3,
             invoke_result: Some("never-projected".to_owned()),
             invoke_error_type: Some("never-projected".to_owned()),
             invoke_error_message: Some("never-projected".to_owned()),
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: true,
             callback_id: Some("cb-99".to_owned()),
             op_type: Some("Context".to_owned()),
@@ -2484,10 +2509,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: Some("Step".to_owned()),
@@ -2503,7 +2532,7 @@ mod tests {
             err.kind(),
             OperationErrorKind::NonDeterministicExecution(_)
         ));
-        let display = err.to_string();
+        let display = format!("{err:#}");
         assert!(
             display.contains("Step"),
             "expected Step in error: {display}"
@@ -2528,10 +2557,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: Some("Step".to_owned()),
@@ -2564,10 +2597,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: Some("Step".to_owned()),
@@ -2585,7 +2622,7 @@ mod tests {
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
-        let display = err.to_string();
+        let display = format!("{err:#}");
         assert!(
             display.contains("fetch-user"),
             "expected name in error: {display}"
@@ -2611,10 +2648,14 @@ mod tests {
             result: Some("1".to_owned()),
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -2642,10 +2683,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: Some("STEP".to_owned()),
@@ -2677,10 +2722,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: Some("\"ok\"".to_owned()),
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             // Exactly what parse_single_operation stores from the inline
@@ -2719,10 +2768,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: Some("CHAINED_INVOKE".to_owned()),
@@ -2776,10 +2829,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: op_type.map(ToOwned::to_owned),
@@ -2811,7 +2868,7 @@ mod tests {
             err.kind(),
             OperationErrorKind::NonDeterministicExecution(_)
         ));
-        let display = err.to_string();
+        let display = format!("{err:#}");
         assert!(
             display.contains("my-step"),
             "expected stored name in error: {display}"
@@ -2832,7 +2889,7 @@ mod tests {
             err.kind(),
             OperationErrorKind::NonDeterministicExecution(_)
         ));
-        let display = err.to_string();
+        let display = format!("{err:#}");
         assert!(
             display.contains("new-name"),
             "expected claimed name in error: {display}"

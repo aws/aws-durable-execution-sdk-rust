@@ -67,10 +67,14 @@ impl WaitExecution {
                 | CheckpointStatus::Stopped => {
                     // Unexpected status for wait — treat as error.
                     return Err(OperationError::from_kind(OperationErrorKind::Wait(
-                        WaitError::from_kind(WaitErrorKind::UnexpectedStatus {
-                            status: format!("{:?}", view.status),
-                        }),
-                    )));
+                        WaitError::new(
+                            WaitErrorKind::UnexpectedStatus(crate::error::UnexpectedStatus::new(
+                                view.status.wire_str(),
+                            )),
+                            None,
+                        ),
+                    ))
+                    .with_operation(&wire_id, view.status.wire_str()));
                 }
             }
         }
@@ -85,7 +89,7 @@ impl WaitExecution {
         self.ctx
             .checkpoint_updates(vec![update])
             .await
-            .map_err(|e| client_error_to_op_error(&e))?;
+            .map_err(client_error_to_op_error)?;
 
         // Request suspension — the backend owns the timer.
         self.ctx.suspend_now().await
@@ -121,11 +125,10 @@ fn build_wait_start_update(
         .expect("all required OperationUpdate fields set")
 }
 
-fn client_error_to_op_error(err: &ClientError) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Wait(WaitError::from_kind(
-        WaitErrorKind::CheckpointFailed {
-            message: err.to_string(),
-        },
+fn client_error_to_op_error(err: ClientError) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Wait(WaitError::new(
+        WaitErrorKind::CheckpointFailed,
+        Some(Box::new(err)),
     )))
 }
 
@@ -146,10 +149,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -184,10 +191,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -223,10 +234,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -254,14 +269,21 @@ mod tests {
             matches!(
                 err.kind(),
                 OperationErrorKind::Wait(e)
-                    if matches!(e.kind(), WaitErrorKind::UnexpectedStatus { .. })
+                    if matches!(e.kind(), WaitErrorKind::UnexpectedStatus(_))
             ),
             "expected Wait/UnexpectedStatus error, got {:?}",
             err.kind()
         );
+        // The offending status is a structural fact behind the payload's
+        // accessor, and renders in the flattened chain.
+        if let OperationErrorKind::Wait(e) = err.kind()
+            && let WaitErrorKind::UnexpectedStatus(details) = e.kind()
+        {
+            assert_eq!(details.status(), "FAILED");
+        }
         assert!(
-            err.to_string().contains("Failed"),
-            "display must carry the offending status: {err}"
+            format!("{err:#}").contains("FAILED"),
+            "the chain must carry the offending status: {err:#}"
         );
     }
 
@@ -377,7 +399,7 @@ mod tests {
 
         // Should fail with an ownership error.
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = format!("{:#}", result.unwrap_err());
         assert!(
             err_msg.contains("task") || err_msg.contains("owner"),
             "expected ownership error, got: {err_msg}"

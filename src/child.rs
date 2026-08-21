@@ -285,14 +285,11 @@ where
             Some(CHILD_SUB_TYPE),
             attempt,
         );
-        let (error_type, error_message) = self
+        let wire = self
             .ctx
-            .checkpoint_error_parts(positional_id)
+            .checkpoint_wire_error(positional_id)
             .unwrap_or_default();
-        Err(replay_failure(
-            error_type.as_deref(),
-            error_message.as_deref(),
-        ))
+        Err(replay_failure(wire, wire_id))
     }
 }
 
@@ -329,13 +326,12 @@ where
                 let serialized = serialize_value(value, &serdes, serdes_ctx.clone()).await?;
                 deserialize_value(serialized, &serdes, serdes_ctx).await
             }
-            (ChildRunMode::Reconstruct, Err(child_err)) => {
-                Err(OperationError::from_kind(OperationErrorKind::ChildContext(
-                    ChildContextError::from_kind(ChildContextErrorKind::ChildFailed {
-                        message: child_err.to_string(),
-                    }),
-                )))
-            }
+            (ChildRunMode::Reconstruct, Err(child_err)) => Err(OperationError::from_kind(
+                OperationErrorKind::ChildContext(ChildContextError::new(
+                    ChildContextErrorKind::ChildFailed,
+                    Some(child_err.into_source()),
+                )),
+            )),
             (ChildRunMode::Live, Ok(value)) => {
                 // Success: serialize and checkpoint.
                 let serialized = serialize_value(value, &serdes, serdes_ctx.clone()).await?;
@@ -349,7 +345,7 @@ where
             }
             (ChildRunMode::Live, Err(child_err)) => {
                 // Failure: checkpoint FAIL with error details.
-                Err(checkpoint_live_failure(&ctx, name.as_deref(), &wire_id, &child_err).await)
+                Err(checkpoint_live_failure(&ctx, name.as_deref(), &wire_id, child_err).await)
             }
         }
     }
@@ -434,20 +430,19 @@ async fn checkpoint_live_failure(
     ctx: &DurableContext,
     name: Option<&str>,
     wire_id: &str,
-    child_err: &ChildFnError,
+    child_err: ChildFnError,
 ) -> OperationError {
-    let err_message = child_err.to_string();
+    // Derive the wire failure from the carried error: the message is the
+    // flattened chain, and `error_data`/`stack_trace` pass through from
+    // the cause chain, so an inner failure's payload survives this
+    // boundary.
+    let wire = crate::error::wire_error_for(&child_err, "ChildFnError");
     let mut fail_builder = OperationUpdate::builder()
         .id(wire_id.to_owned())
         .r#type(OperationType::Context)
         .sub_type(CHILD_SUB_TYPE.to_owned())
         .action(OperationAction::Fail)
-        .error(
-            aws_sdk_lambda::types::ErrorObject::builder()
-                .error_type("ChildFnError")
-                .error_message(err_message.clone())
-                .build(),
-        );
+        .error(wire.to_error_object());
     if let Some(n) = name {
         fail_builder = fail_builder.name(n);
     }
@@ -463,11 +458,12 @@ async fn checkpoint_live_failure(
     // child error (the next invocation will re-execute).
     let _ = ctx.checkpoint_updates(vec![update]).await;
 
-    OperationError::from_kind(OperationErrorKind::ChildContext(
-        ChildContextError::from_kind(ChildContextErrorKind::ChildFailed {
-            message: err_message,
-        }),
-    ))
+    OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
+        ChildContextErrorKind::ChildFailed,
+        Some(child_err.into_source()),
+    )))
+    .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+    .with_wire(wire)
 }
 
 /// Replays a successful child context result from the checkpoint log.
@@ -483,13 +479,17 @@ async fn replay_success<O, S: Serdes<O>>(
 }
 
 /// Replays a failed child context result from the checkpoint log.
-fn replay_failure(error_type: Option<&str>, error_message: Option<&str>) -> OperationError {
-    let message = error_message.unwrap_or_else(|| error_type.unwrap_or("child context failed"));
-    OperationError::from_kind(OperationErrorKind::ChildContext(
-        ChildContextError::from_kind(ChildContextErrorKind::ChildFailed {
-            message: message.to_owned(),
-        }),
-    ))
+///
+/// The recorded failure fields travel on the synthetic source rather
+/// than being folded into a message, so the recorded `error_type` (and
+/// `error_data`, when present) stays programmatically recoverable.
+fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
+        ChildContextErrorKind::ChildFailed,
+        Some(crate::error::ReplayedFailure::source_from(wire.clone())),
+    )))
+    .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+    .with_wire(wire)
 }
 
 /// Serializes a value through the configured serdes (ownership transfers;
@@ -517,13 +517,14 @@ async fn deserialize_value<O, S: Serdes<O>>(
         .map_err(|e| child_internal_error(&format!("deserialize result: {e}")))
 }
 
-/// Constructs a `ChildContextError::Internal` wrapped as an `OperationError`.
+/// Constructs a `ChildContextError::Internal` wrapped as an
+/// `OperationError`; the message becomes the source frame, keeping the
+/// kind a pure classification.
 fn child_internal_error(message: &str) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::ChildContext(
-        ChildContextError::from_kind(ChildContextErrorKind::Internal {
-            message: message.to_owned(),
-        }),
-    ))
+    OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
+        ChildContextErrorKind::Internal,
+        Some(message.to_owned().into()),
+    )))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -558,10 +559,14 @@ mod tests {
                 result: Some(result.to_owned()),
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -586,10 +591,14 @@ mod tests {
                 result: None,
                 error_type: Some(err_type.to_owned()),
                 error_message: Some(err_msg.to_owned()),
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -648,7 +657,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        let msg = err.to_string();
+        let msg = format!("{err:#}");
         assert!(
             msg.contains("step exploded"),
             "error should contain original message: {msg}"
@@ -695,8 +704,9 @@ mod tests {
         let err = result.unwrap_err();
         match err.kind() {
             OperationErrorKind::ChildContext(ce) => match ce.kind() {
-                ChildContextErrorKind::ChildFailed { message } => {
-                    assert!(message.contains("boom"));
+                ChildContextErrorKind::ChildFailed => {
+                    let message = crate::error::chain_string(ce);
+                    assert!(message.contains("boom"), "chain: {message}");
                 }
                 other => unreachable!("unexpected kind: {other:?}"),
             },

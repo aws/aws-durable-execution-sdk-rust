@@ -262,13 +262,12 @@ where
                         Some(WFC_SUB_TYPE),
                         view.attempt,
                     );
-                    let (error_type, error_message) = self
+                    let wire = self
                         .ctx
-                        .checkpoint_error_parts(&positional_id)
+                        .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
                     return Ok(WfcPrelude::Done(Err(replay_terminal_failure(
-                        error_type.as_deref(),
-                        error_message.as_deref(),
+                        wire, &wire_id,
                     ))));
                 }
                 CheckpointStatus::Pending => {
@@ -322,7 +321,7 @@ where
             self.ctx
                 .checkpoint_updates(vec![start_update])
                 .await
-                .map_err(|e| wfc_client_error(&e))?;
+                .map_err(wfc_client_error)?;
         }
 
         let Self {
@@ -393,7 +392,7 @@ where
                         self.ctx
                             .checkpoint_updates(vec![update])
                             .await
-                            .map_err(|e| wfc_client_error(&e))?;
+                            .map_err(wfc_client_error)?;
 
                         Ok(deserialized)
                     }
@@ -416,47 +415,59 @@ where
                         self.ctx
                             .checkpoint_updates(vec![update])
                             .await
-                            .map_err(|e| wfc_client_error(&e))?;
+                            .map_err(wfc_client_error)?;
 
                         self.ctx.suspend_now().await
                     }
                     WaitDecision::Exhausted { reason } => {
                         // Strategy exhaustion: checkpoint FAIL, raise
                         // WaitForConditionError (Python #530 fix).
+                        let wire = crate::error::wire_error_manual(
+                            "WaitForConditionError",
+                            reason.as_str(),
+                        );
                         let update = build_wfc_fail_update(
                             &self.wire_id,
                             self.name.as_deref(),
                             self.ctx.parent_wire_id(),
-                            &reason,
+                            &wire,
                         );
                         self.ctx
                             .checkpoint_updates(vec![update])
                             .await
-                            .map_err(|e| wfc_client_error(&e))?;
+                            .map_err(wfc_client_error)?;
 
-                        Err(wfc_op_error(WaitForConditionErrorKind::MaxChecksExceeded {
-                            checks: attempt,
-                        }))
+                        Err(wfc_op_error(WaitForConditionErrorKind::MaxChecksExceeded(
+                            crate::error::MaxChecksExceeded::new(attempt),
+                        ))
+                        .with_operation(&self.wire_id, CheckpointStatus::Failed.wire_str())
+                        .with_wire(wire))
                     }
                 }
             }
             Err(check_err) => {
                 // Check function error: checkpoint FAIL immediately (no retry
                 // for check errors).
+                // The wire record is derived from the check error itself:
+                // flattened message, `error_data`/`stack_trace` pass-through.
+                let wire = crate::error::wire_error_with_type(&*check_err, "WaitForConditionError");
                 let update = build_wfc_fail_update(
                     &self.wire_id,
                     self.name.as_deref(),
                     self.ctx.parent_wire_id(),
-                    &check_err.to_string(),
+                    &wire,
                 );
                 self.ctx
                     .checkpoint_updates(vec![update])
                     .await
-                    .map_err(|e| wfc_client_error(&e))?;
+                    .map_err(wfc_client_error)?;
 
-                Err(wfc_op_error(WaitForConditionErrorKind::CheckFailed {
-                    message: check_err.to_string(),
-                }))
+                Err(wfc_op_error_with_source(
+                    WaitForConditionErrorKind::CheckFailed,
+                    Some(check_err),
+                )
+                .with_operation(&self.wire_id, CheckpointStatus::Failed.wire_str())
+                .with_wire(wire))
             }
         }
     }
@@ -476,17 +487,17 @@ async fn replay_terminal_success<S, SD: Serdes<S>>(
 }
 
 /// Replays a terminal failure from the checkpoint log.
-fn replay_terminal_failure(
-    error_type: Option<&str>,
-    error_message: Option<&str>,
-) -> OperationError {
-    let msg = match (error_type, error_message) {
-        (Some(t), Some(m)) => format!("{t}: {m}"),
-        (None, Some(m)) => m.to_owned(),
-        (Some(t), None) => t.to_owned(),
-        (None, None) => "unknown error".to_owned(),
-    };
-    wfc_op_error(WaitForConditionErrorKind::CheckFailed { message: msg })
+///
+/// The recorded failure fields travel on the synthetic source rather
+/// than being folded into a message, so `kind()` stays meaningful after
+/// a replay.
+fn replay_terminal_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+    wfc_op_error_with_source(
+        WaitForConditionErrorKind::CheckFailed,
+        Some(crate::error::ReplayedFailure::source_from(wire.clone())),
+    )
+    .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+    .with_wire(wire)
 }
 
 /// Serializes state through the configured serdes (ownership transfers;
@@ -497,9 +508,7 @@ async fn serialize_state<S, SD: Serdes<S>>(
     serdes_ctx: SerdesContext,
 ) -> Result<String, OperationError> {
     serdes.serialize(value, serdes_ctx).await.map_err(|e| {
-        wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-            message: e.to_string(),
-        })
+        wfc_op_error_with_source(WaitForConditionErrorKind::SerializationFailed, Some(e))
     })
 }
 
@@ -511,9 +520,13 @@ async fn deserialize_state_str<S, SD: Serdes<S>>(
     serdes_ctx: SerdesContext,
 ) -> Result<S, OperationError> {
     serdes.deserialize(payload, serdes_ctx).await.map_err(|e| {
-        wfc_op_error(WaitForConditionErrorKind::SerializationFailed {
-            message: format!("state deserialization failed: {e}"),
-        })
+        wfc_op_error_with_source(
+            WaitForConditionErrorKind::SerializationFailed,
+            Some(crate::error::ContextualError::source_from(
+                "state deserialization failed",
+                e,
+            )),
+        )
     })
 }
 
@@ -560,19 +573,14 @@ fn build_wfc_fail_update(
     wire_id: &str,
     name: Option<&str>,
     parent_wire_id: Option<&str>,
-    error_message: &str,
+    error: &crate::error::WireError,
 ) -> OperationUpdate {
     let mut builder = OperationUpdate::builder()
         .id(wire_id)
         .r#type(OperationType::Step)
         .sub_type(WFC_SUB_TYPE)
         .action(OperationAction::Fail)
-        .error(
-            aws_sdk_lambda::types::ErrorObject::builder()
-                .error_type("WaitForConditionError")
-                .error_message(error_message)
-                .build(),
-        );
+        .error(error.to_error_object());
 
     if let Some(n) = name {
         builder = builder.name(n);
@@ -590,15 +598,20 @@ fn build_wfc_fail_update(
 // ── Error helpers ───────────────────────────────────────────────────────
 
 fn wfc_op_error(kind: WaitForConditionErrorKind) -> OperationError {
+    wfc_op_error_with_source(kind, None)
+}
+
+fn wfc_op_error_with_source(
+    kind: WaitForConditionErrorKind,
+    source: Option<crate::error::Source>,
+) -> OperationError {
     OperationError::from_kind(OperationErrorKind::WaitForCondition(
-        WaitForConditionError::from_kind(kind),
+        WaitForConditionError::new(kind, source),
     ))
 }
 
-fn wfc_client_error(err: &crate::client::ClientError) -> OperationError {
-    wfc_op_error(WaitForConditionErrorKind::CheckFailed {
-        message: err.to_string(),
-    })
+fn wfc_client_error(err: crate::client::ClientError) -> OperationError {
+    wfc_op_error_with_source(WaitForConditionErrorKind::CheckFailed, Some(Box::new(err)))
 }
 
 #[cfg(test)]
@@ -663,10 +676,14 @@ mod tests {
             result: Some("1".to_owned()),
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 1,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -784,10 +801,14 @@ mod tests {
             result: Some(accepted_envelope.clone()),
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 1,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -825,10 +846,8 @@ mod tests {
 
         let error = exec.execute().await.unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("injected Retry checkpoint failure"),
-            "unexpected checkpoint error: {error}"
+            format!("{error:#}").contains("injected Retry checkpoint failure"),
+            "unexpected checkpoint error: {error:#}"
         );
 
         let restored: i32 = filesystem_serdes
@@ -882,10 +901,14 @@ mod tests {
             result: Some("1".to_owned()),
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 1,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -947,13 +970,23 @@ mod tests {
         let err = result.unwrap_err();
         match err.kind() {
             OperationErrorKind::WaitForCondition(wfc_err) => match wfc_err.kind() {
-                WaitForConditionErrorKind::MaxChecksExceeded { checks } => {
-                    assert_eq!(*checks, 1);
+                WaitForConditionErrorKind::MaxChecksExceeded(details) => {
+                    assert_eq!(details.checks(), 1);
                 }
                 other => panic!("expected MaxChecksExceeded, got: {other:?}"),
             },
             other => panic!("expected WaitForCondition error, got: {other:?}"),
         }
+        // The exhaustion record is constructed at a fixed-discriminator
+        // site with no escaping error to walk — the stack is captured at
+        // the construction site rather than left empty.
+        let wire = err.wire().unwrap();
+        assert_eq!(wire.error_type(), Some("WaitForConditionError"));
+        assert_eq!(wire.error_message(), Some("max attempts exceeded"));
+        assert!(
+            !wire.stack_trace().is_empty(),
+            "exhaustion failure record must carry a stack trace"
+        );
     }
 
     /// REGRESSION TEST: corrupt checkpointed state → loud `WaitForConditionError`.
@@ -972,10 +1005,14 @@ mod tests {
             result: Some("\"not-a-number\"".to_owned()),
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 2,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -1010,10 +1047,11 @@ mod tests {
         let err = result.unwrap_err();
         match err.kind() {
             OperationErrorKind::WaitForCondition(wfc_err) => match wfc_err.kind() {
-                WaitForConditionErrorKind::SerializationFailed { message } => {
+                WaitForConditionErrorKind::SerializationFailed => {
+                    let message = crate::error::chain_string(wfc_err);
                     assert!(
                         message.contains("state deserialization failed"),
-                        "error message should indicate state deserialization failure: {message}"
+                        "error chain should indicate state deserialization failure: {message}"
                     );
                 }
                 other => panic!("expected SerializationFailed, got: {other:?}"),
@@ -1042,7 +1080,7 @@ mod tests {
 
         let result = exec.execute().await;
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = format!("{:#}", result.unwrap_err());
         assert!(err_msg.contains("check function failed"), "got: {err_msg}");
     }
 
@@ -1056,10 +1094,14 @@ mod tests {
             result: Some("42".to_owned()),
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 3,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -1099,10 +1141,14 @@ mod tests {
             result: None,
             error_type: Some("WaitForConditionError".to_owned()),
             error_message: Some("max attempts exceeded".to_owned()),
+            error_data: None,
+            stack_trace: None,
             attempt: 3,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -1130,7 +1176,7 @@ mod tests {
 
         let result = exec.execute().await;
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = format!("{:#}", result.unwrap_err());
         assert!(err_msg.contains("max attempts exceeded"), "got: {err_msg}");
     }
 

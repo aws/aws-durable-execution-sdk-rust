@@ -20,10 +20,12 @@ use durable::{CombinatorErrorKind, DurableFuture, OperationErrorKind, RetryDecis
 fn describe_combinator_error(err: &durable::OperationError) -> String {
     match err.kind() {
         OperationErrorKind::Combinator(ce) => match ce.kind() {
-            CombinatorErrorKind::FirstSettledFailed { message } => {
-                format!("FirstSettledFailed:{message}")
+            CombinatorErrorKind::FirstSettledFailed { .. } => {
+                // The loser travels as the error's source; flatten it the
+                // documented way.
+                format!("FirstSettledFailed:{ce:#}")
             }
-            CombinatorErrorKind::EmptyInput => "EmptyInput".to_owned(),
+            CombinatorErrorKind::EmptyInput { .. } => "EmptyInput".to_owned(),
             other => format!("other:{other:?}"),
         },
         other => format!("non-combinator:{other:?}"),

@@ -102,19 +102,25 @@ where
                         Some(CHAINED_INVOKE_SUB_TYPE),
                         view.attempt,
                     );
-                    let (error_type, error_message) = self
+                    let (error_type, error_message, error_data, stack_trace) = self
                         .ctx
                         .with_checkpoint_record(&positional_id, |record| {
                             (
                                 record.invoke_error_type.clone(),
                                 record.invoke_error_message.clone(),
+                                record.invoke_error_data.clone(),
+                                record.invoke_stack_trace.clone(),
                             )
                         })
                         .unwrap_or_default();
                     return Err(invoke_error_from_record(
                         &self.function_id,
-                        error_type.as_deref(),
-                        error_message.as_deref(),
+                        error_type,
+                        error_message,
+                        error_data,
+                        stack_trace,
+                        &wire_id,
+                        view.status.wire_str(),
                     ));
                 }
                 CheckpointStatus::Started | CheckpointStatus::Pending | CheckpointStatus::Ready => {
@@ -130,10 +136,12 @@ where
                         view.attempt,
                     );
                     return Err(OperationError::from_kind(OperationErrorKind::Invoke(
-                        InvokeError::from_kind(InvokeErrorKind::FunctionFailed {
-                            message: "invoke cancelled".to_owned(),
-                        }),
-                    )));
+                        InvokeError::new(
+                            InvokeErrorKind::FunctionFailed,
+                            Some("invoke cancelled".into()),
+                        ),
+                    ))
+                    .with_operation(&wire_id, view.status.wire_str()));
                 }
             }
         }
@@ -157,7 +165,7 @@ where
         self.ctx
             .checkpoint_updates(vec![update])
             .await
-            .map_err(|e| client_error_to_invoke_op_error(&e))?;
+            .map_err(client_error_to_invoke_op_error)?;
 
         // Suspend — the backend owns the child invocation.
         self.ctx.suspend_now().await
@@ -179,7 +187,7 @@ async fn serialize_invoke_input<I, PS: Serdes<I>>(
     payload_serdes
         .serialize(input, serdes_ctx.clone())
         .await
-        .map_err(|e| invoke_serialization_error(&format!("payload serdes: {e}")))
+        .map_err(|e| invoke_serialization_error("payload serdes", e))
 }
 
 /// Deserializes the invoke result payload through the configured serdes.
@@ -197,40 +205,53 @@ async fn deserialize_invoke_result<O, RS: Serdes<O>>(
     result_serdes
         .deserialize(payload, serdes_ctx.with_origin(PayloadOrigin::External))
         .await
-        .map_err(|e| invoke_serialization_error(&format!("result serdes: {e}")))
+        .map_err(|e| invoke_serialization_error("result serdes", e))
 }
 
-/// Wraps a message as an invoke `SerializationFailed` operation error.
-fn invoke_serialization_error(message: &str) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::from_kind(
-        InvokeErrorKind::SerializationFailed {
-            message: message.to_owned(),
-        },
+/// Wraps a serdes error as an invoke `SerializationFailed` operation
+/// error, keeping the serdes failure as the source under a boundary
+/// context frame.
+fn invoke_serialization_error(boundary: &str, e: crate::BoxError) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::new(
+        InvokeErrorKind::SerializationFailed,
+        Some(crate::error::ContextualError::source_from(boundary, e)),
     )))
 }
 
 /// Reconstructs an `InvokeError` from a failed checkpoint record.
+///
+/// The recorded failure fields travel on the synthetic source rather
+/// than being folded into a message, so `kind()` stays meaningful and
+/// the recorded `error_type` stays recoverable after a replay. All four
+/// wire fields are preserved: `error_data` and `stack_trace` pass
+/// through verbatim (store-and-expose — never captured fresh on replay),
+/// so the record attached to the [`crate::error::ReplayedFailure`] is
+/// complete.
 fn invoke_error_from_record(
     function_id: &str,
-    error_type: Option<&str>,
-    error_message: Option<&str>,
+    error_type: Option<String>,
+    error_message: Option<String>,
+    error_data: Option<String>,
+    stack_trace: Option<Vec<String>>,
+    wire_id: &str,
+    status: &str,
 ) -> OperationError {
-    let msg = match (error_type, error_message) {
-        (Some(t), Some(m)) => format!("{t}: {m}"),
-        (None, Some(m)) => m.to_owned(),
-        (Some(t), None) => t.to_owned(),
-        (None, None) => format!("invoked function {function_id} failed"),
-    };
-    OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::from_kind(
-        InvokeErrorKind::FunctionFailed { message: msg },
+    let message = error_message.unwrap_or_else(|| format!("invoked function {function_id} failed"));
+    let wire = crate::error::WireError::new(error_type, Some(message))
+        .with_error_data(error_data)
+        .with_stack_trace(stack_trace.unwrap_or_default());
+    OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::new(
+        InvokeErrorKind::FunctionFailed,
+        Some(crate::error::ReplayedFailure::source_from(wire.clone())),
     )))
+    .with_operation(wire_id, status)
+    .with_wire(wire)
 }
 
-fn client_error_to_invoke_op_error(err: &ClientError) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::from_kind(
-        InvokeErrorKind::FunctionFailed {
-            message: err.to_string(),
-        },
+fn client_error_to_invoke_op_error(err: ClientError) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::new(
+        InvokeErrorKind::FunctionFailed,
+        Some(Box::new(err)),
     )))
 }
 
@@ -297,10 +318,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: Some(r#""hello from target""#.to_owned()),
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -372,10 +397,14 @@ mod tests {
                 result: None,
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: Some(payload),
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -436,10 +465,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: Some("TargetError".to_owned()),
             invoke_error_message: Some("target function error".to_owned()),
+            invoke_error_data: Some("{\"code\":7}".to_owned()),
+            invoke_stack_trace: Some(vec!["frame-a".to_owned(), "frame-b".to_owned()]),
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -469,9 +502,29 @@ mod tests {
         let result = exec.execute().await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        let err_msg = err.to_string();
-        assert!(err_msg.contains("TargetError"), "got: {err_msg}");
+        // The recorded message renders in the chain; the recorded type is
+        // data on the wire record, not display text.
+        let err_msg = format!("{err:#}");
         assert!(err_msg.contains("target function error"), "got: {err_msg}");
+        // All four recorded wire fields are preserved on the error's
+        // attached record — nothing is discarded on replay.
+        let wire = err.wire().unwrap();
+        assert_eq!(wire.error_type(), Some("TargetError"));
+        assert_eq!(wire.error_message(), Some("target function error"));
+        assert_eq!(wire.error_data(), Some("{\"code\":7}"));
+        assert_eq!(wire.stack_trace(), ["frame-a", "frame-b"]);
+        // ...and the same complete record travels on the synthetic source.
+        let mut link: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+        let replayed = loop {
+            let Some(e) = link else {
+                panic!("no ReplayedFailure in the chain");
+            };
+            if let Some(r) = e.downcast_ref::<crate::error::ReplayedFailure>() {
+                break r;
+            }
+            link = e.source();
+        };
+        assert_eq!(replayed.wire(), wire);
         // Verify it's an InvokeError kind.
         assert!(matches!(err.kind(), OperationErrorKind::Invoke(_)));
     }
@@ -485,10 +538,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: None,
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -691,7 +748,7 @@ mod tests {
         .unwrap();
 
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = format!("{:#}", result.unwrap_err());
         assert!(
             err_msg.contains("task") || err_msg.contains("owner"),
             "expected ownership error, got: {err_msg}"
@@ -707,10 +764,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: Some("null".to_owned()),
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -841,10 +902,14 @@ mod tests {
             result: None,
             error_type: None,
             error_message: None,
+            error_data: None,
+            stack_trace: None,
             attempt: 0,
             invoke_result: Some("\"WORLD\"".to_owned()),
             invoke_error_type: None,
             invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: false,
             callback_id: None,
             op_type: None,
@@ -917,12 +982,12 @@ mod tests {
             other => panic!("expected Invoke error, got {other:?}"),
         };
         assert!(
-            matches!(inner.kind(), InvokeErrorKind::SerializationFailed { .. }),
+            matches!(inner.kind(), InvokeErrorKind::SerializationFailed),
             "expected SerializationFailed, got {inner}"
         );
         assert!(
-            err.to_string().contains("boom"),
-            "error must carry the original serde failure: {err}"
+            format!("{err:#}").contains("boom"),
+            "error must carry the original serde failure: {err:#}"
         );
 
         // 2. No invoke checkpoint was emitted.

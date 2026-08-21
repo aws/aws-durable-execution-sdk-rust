@@ -188,6 +188,21 @@ impl CheckpointStatus {
             Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Stopped
         )
     }
+
+    /// The wire (`UPPER_CASE`) spelling of this status, as the backend
+    /// reports it.
+    pub(crate) fn wire_str(self) -> &'static str {
+        match self {
+            Self::Started => "STARTED",
+            Self::Pending => "PENDING",
+            Self::Ready => "READY",
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+            Self::Cancelled => "CANCELLED",
+            Self::TimedOut => "TIMED_OUT",
+            Self::Stopped => "STOPPED",
+        }
+    }
 }
 
 /// A stored operation record from the checkpoint log.
@@ -212,6 +227,11 @@ pub(crate) struct CheckpointRecord {
     pub(crate) error_type: Option<String>,
     /// Error message (for failed/timed-out operations).
     pub(crate) error_message: Option<String>,
+    /// Opaque error payload (for failed/timed-out operations). Written
+    /// and passed through verbatim — never deserialized.
+    pub(crate) error_data: Option<String>,
+    /// Recorded stack trace frames (for failed/timed-out operations).
+    pub(crate) stack_trace: Option<Vec<String>>,
     /// The attempt number from the backend's step details (0 if unavailable).
     pub(crate) attempt: u32,
     /// The serialized result payload from a succeeded chained invoke.
@@ -220,6 +240,11 @@ pub(crate) struct CheckpointRecord {
     pub(crate) invoke_error_type: Option<String>,
     /// Error message from a failed chained invoke.
     pub(crate) invoke_error_message: Option<String>,
+    /// Opaque error payload from a failed chained invoke. Written and
+    /// passed through verbatim — never deserialized.
+    pub(crate) invoke_error_data: Option<String>,
+    /// Recorded stack trace frames from a failed chained invoke.
+    pub(crate) invoke_stack_trace: Option<Vec<String>>,
     /// Whether the child context result was too large and must be
     /// reconstructed by re-executing the child body (`ReplayChildren` mode).
     pub(crate) replay_children: bool,
@@ -657,10 +682,14 @@ mod tests {
                 result: Some(r#""hello""#.to_owned()),
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -687,10 +716,14 @@ mod tests {
                 result: Some(r"42".to_owned()),
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -722,10 +755,14 @@ mod tests {
             result: Some(r#""payload""#.to_owned()),
             error_type: Some("SomeError".to_owned()),
             error_message: Some("it broke".to_owned()),
+            error_data: None,
+            stack_trace: None,
             attempt: 3,
             invoke_result: Some(r#""invoke-payload""#.to_owned()),
             invoke_error_type: Some("InvokeError".to_owned()),
             invoke_error_message: Some("invoke broke".to_owned()),
+            invoke_error_data: None,
+            invoke_stack_trace: None,
             replay_children: true,
             callback_id: Some("cb-123".to_owned()),
             op_type: Some("Step".to_owned()),
@@ -806,10 +843,14 @@ mod tests {
                     result: Some("a".to_owned()),
                     error_type: None,
                     error_message: None,
+                    error_data: None,
+                    stack_trace: None,
                     attempt: 0,
                     invoke_result: None,
                     invoke_error_type: None,
                     invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
                     replay_children: false,
                     callback_id: None,
                     op_type: None,
@@ -825,10 +866,14 @@ mod tests {
                     result: Some("b".to_owned()),
                     error_type: None,
                     error_message: None,
+                    error_data: None,
+                    stack_trace: None,
                     attempt: 0,
                     invoke_result: None,
                     invoke_error_type: None,
                     invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
                     replay_children: false,
                     callback_id: None,
                     op_type: None,
@@ -886,10 +931,14 @@ mod tests {
                 result: None,
                 error_type: None,
                 error_message: None,
+                error_data: None,
+                stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
                 invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
                 replay_children: false,
                 callback_id: None,
                 op_type: None,
@@ -923,10 +972,14 @@ mod tests {
                     result: Some("x".to_owned()),
                     error_type: None,
                     error_message: None,
+                    error_data: None,
+                    stack_trace: None,
                     attempt: 0,
                     invoke_result: None,
                     invoke_error_type: None,
                     invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
                     replay_children: false,
                     callback_id: None,
                     op_type: None,
@@ -942,10 +995,14 @@ mod tests {
                     result: None,
                     error_type: Some("StepError".to_owned()),
                     error_message: Some("oops".to_owned()),
+                    error_data: None,
+                    stack_trace: None,
                     attempt: 0,
                     invoke_result: None,
                     invoke_error_type: None,
                     invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
                     replay_children: false,
                     callback_id: None,
                     op_type: None,

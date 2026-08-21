@@ -85,12 +85,11 @@ where
         };
 
         // Present the failure to the strategy in the same shape a step's
-        // strategy sees. Live and replayed failures carry the same message
-        // (the replay path reads the recorded error), so a strategy that
+        // strategy sees: the attempt's error is the step error's source.
+        // Live and replayed failures carry the same recorded failure (the
+        // replay path reads the recorded error), so a strategy that
         // inspects the error decides identically across invocations.
-        let step_err = StepError::from_kind(StepErrorKind::ExecutionFailed {
-            message: err.to_string(),
-        });
+        let step_err = StepError::new(StepErrorKind::ExecutionFailed, Some(Box::new(err)));
         match strategy(&step_err, attempt) {
             RetryDecision::Retry { delay } => {
                 // Durable wait between attempts: checkpoint-suspend, the
@@ -102,14 +101,25 @@ where
                     .name(format!("retry-delay-{attempt}"))
                     .await
                     .map_err(|wait_err| {
-                        ChildFnError::new(format!("with_retry delay wait failed: {wait_err}"))
+                        ChildFnError::new(crate::error::ContextualError::source_from(
+                            "with_retry delay wait failed",
+                            Box::new(wait_err) as crate::error::Source,
+                        ))
                     })?;
                 attempt = attempt.saturating_add(1);
             }
             RetryDecision::Stop => {
-                return Err(ChildFnError::new(format!(
-                    "retries exhausted after {attempt} attempts: {err}"
-                )));
+                // Exhaustion carries the last attempt's error as its
+                // source rather than a flattened string.
+                let last = step_err
+                    .into_source()
+                    .unwrap_or_else(|| "with_retry attempt failed".into());
+                return Err(ChildFnError::new(
+                    crate::error::ContextualError::source_from(
+                        format!("retries exhausted after {attempt} attempts"),
+                        last,
+                    ),
+                ));
             }
         }
     }

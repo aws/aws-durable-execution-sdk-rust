@@ -22,10 +22,19 @@ async fn handler(
     _event: serde_json::Value,
     ctx: durable::DurableContext,
 ) -> Result<serde_json::Value, durable::BoxError> {
-    // Strategy only retries "ValidationError", not TransientError.
+    // Strategy only retries "ValidationError", not TransientError. The
+    // wire type name travels on the TypedError wrapper reachable through
+    // source().
     let retry = |err: &durable::StepError, _attempt: u32| {
-        let msg = err.to_string();
-        if msg.contains("ValidationError") {
+        let retries = std::iter::successors(
+            std::error::Error::source(err),
+            |e| e.source(),
+        )
+        .any(|e| {
+            e.downcast_ref::<durable::TypedError>()
+                .is_some_and(|t| t.error_type() == "ValidationError")
+        });
+        if retries {
             durable::RetryDecision::Retry {
                 delay: std::time::Duration::from_secs(1),
             }
@@ -36,9 +45,11 @@ async fn handler(
 
     let result: String = ctx
         .step(|_| async {
-            let err: durable::BoxError = Box::new(TransientError {
+            // TypedError records the concrete type name as the wire
+            // ErrorType (a boxed error's type is otherwise erased).
+            let err: durable::BoxError = Box::new(durable::TypedError::new(TransientError {
                 message: "transient failure".to_owned(),
-            });
+            }));
             Err(err)
         })
         .retry_strategy(retry)
