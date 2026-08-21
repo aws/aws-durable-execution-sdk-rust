@@ -1702,16 +1702,19 @@ impl fmt::Display for JoinFailed {
 // NonDeterministicExecutionError
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Error raised when a replay operation does not match the checkpointed
-/// history — the handler produced operations in a different order between
-/// invocations.
+/// Error raised when replay cannot faithfully reproduce the checkpointed
+/// history — the claimed operation does not match the record at its slot
+/// (the handler produced operations in a different order between
+/// invocations), or the record carries a status this SDK version cannot
+/// interpret.
 ///
 /// This is a fatal, non-recoverable error: the execution must be failed and
 /// cannot be retried without resetting the checkpoint log.
 ///
-/// There is no foreign cause to carry — the mismatch report *is* the
+/// There is no foreign cause to carry — the report *is* the
 /// error — so this type has no source; its structural facts live behind
-/// the [`OperationMismatch`] payload's accessors.
+/// the kind payload's accessors (see [`OperationMismatch`] and
+/// [`UnrecognizedStatus`]).
 ///
 /// # Examples
 ///
@@ -1785,12 +1788,24 @@ pub enum NonDeterministicExecutionErrorKind {
     /// The claimed operation's identity (type, sub-type, or name) does not
     /// match the checkpointed record at the same positional slot.
     OperationMismatch(OperationMismatch),
+    /// The checkpointed record carries a status this SDK version does not
+    /// recognize, so replay cannot interpret the recorded outcome.
+    ///
+    /// This arises when the durable execution service introduces a new
+    /// operation status that predates this SDK build. Guessing is unsafe in
+    /// both directions — treating a possibly-terminal operation as
+    /// re-runnable re-executes completed work, and fabricating a terminal
+    /// outcome returns a result that was never recorded — so the execution
+    /// fails naming the raw status. Upgrading the SDK to a version that
+    /// understands the status is the remedy.
+    UnrecognizedStatus(UnrecognizedStatus),
 }
 
 impl fmt::Display for NonDeterministicExecutionErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OperationMismatch(details) => write!(f, "{details}"),
+            Self::UnrecognizedStatus(details) => write!(f, "{details}"),
         }
     }
 }
@@ -1845,6 +1860,50 @@ impl fmt::Display for OperationMismatch {
             "operation at wire id {} does not match checkpoint: \
              expected {}, got {}",
             self.wire_id, self.expected, self.actual
+        )
+    }
+}
+
+/// Details of a [`NonDeterministicExecutionErrorKind::UnrecognizedStatus`]
+/// failure.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct UnrecognizedStatus {
+    wire_id: String,
+    status: String,
+}
+
+impl UnrecognizedStatus {
+    /// Creates the payload (internal).
+    pub(crate) fn new(wire_id: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            wire_id: wire_id.into(),
+            status: status.into(),
+        }
+    }
+
+    /// The wire ID (SHA-256 hex) of the operation whose record carries the
+    /// unrecognized status.
+    #[must_use]
+    pub fn wire_id(&self) -> &str {
+        &self.wire_id
+    }
+
+    /// The raw status value the service reported, verbatim.
+    #[must_use]
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+}
+
+impl fmt::Display for UnrecognizedStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "operation at wire id {} replayed with unrecognized status {:?}: \
+             this SDK version cannot interpret the recorded outcome; \
+             upgrade the SDK to a version that understands this status",
+            self.wire_id, self.status
         )
     }
 }

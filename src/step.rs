@@ -380,6 +380,13 @@ where
                 | CheckpointStatus::Stopped => {
                     // Fall through to live execution.
                 }
+                CheckpointStatus::Unknown(ref raw) => {
+                    // Unreachable in production — `checkpoint_view_validated`
+                    // already failed the execution (issue #45). Kept as a
+                    // typed arm so a future bypass cannot fall through to
+                    // live execution and re-run a possibly-terminal step.
+                    return Err(self.ctx.unrecognized_status_error(&wire_id, raw));
+                }
             }
         }
 

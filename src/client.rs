@@ -672,10 +672,19 @@ pub(crate) async fn resolve_bootstrap_log(
 }
 
 /// Maps SDK `OperationStatus` to internal `CheckpointStatus`.
+///
+/// Every modeled variant maps explicitly; anything else — the generated
+/// enum's unknown-variant carrier, or a variant added by an
+/// aws-sdk-lambda upgrade before this list is revisited — maps to
+/// [`CheckpointStatus::Unknown`] carrying the raw wire value, which replay
+/// refuses to interpret (issue #45). The `operation_status_variant_canary`
+/// test pins the modeled variant set, so a new upstream variant fails CI
+/// for explicit classification instead of shipping through `Unknown`.
 fn sdk_status_to_checkpoint_status(
     status: &aws_sdk_lambda::types::OperationStatus,
 ) -> CheckpointStatus {
     match status {
+        aws_sdk_lambda::types::OperationStatus::Started => CheckpointStatus::Started,
         aws_sdk_lambda::types::OperationStatus::Pending => CheckpointStatus::Pending,
         aws_sdk_lambda::types::OperationStatus::Ready => CheckpointStatus::Ready,
         aws_sdk_lambda::types::OperationStatus::Succeeded => CheckpointStatus::Succeeded,
@@ -683,8 +692,7 @@ fn sdk_status_to_checkpoint_status(
         aws_sdk_lambda::types::OperationStatus::Cancelled => CheckpointStatus::Cancelled,
         aws_sdk_lambda::types::OperationStatus::TimedOut => CheckpointStatus::TimedOut,
         aws_sdk_lambda::types::OperationStatus::Stopped => CheckpointStatus::Stopped,
-        // Started and future variants: non-terminal safe default.
-        _ => CheckpointStatus::Started,
+        other => CheckpointStatus::Unknown(other.as_str().to_owned()),
     }
 }
 
@@ -1547,7 +1555,8 @@ mod tests {
     /// source (the exact version Cargo.lock pins, in the local cargo
     /// registry) and fails when the variant set changes, forcing the
     /// classification to be revisited instead of defaulted. The sibling
-    /// enum audit for `OperationStatus` lands with #45.
+    /// audit for the `types` enums lives in
+    /// `upstream_type_enum_variant_canary` (issue #45).
     #[test]
     fn checkpoint_error_variant_canary() {
         const CLASSIFIED_VARIANTS: &[&str] = &[
@@ -1577,6 +1586,171 @@ mod tests {
              Reclassify the new/removed variants in classify_checkpoint_error \
              (src/client.rs), then update this canary's pinned list."
         );
+    }
+
+    /// Canary: pins the variant set of every upstream `types` enum the SDK
+    /// matches with a wildcard arm — `OperationStatus`, `OperationType`,
+    /// `OperationAction`, `ExecutionStatus`, and `EventType` (issue #45,
+    /// extending the #43 pattern above).
+    ///
+    /// All five enums are `#[non_exhaustive]`, so a variant added by an
+    /// aws-sdk-lambda upgrade would silently take each match's wildcard
+    /// default — for `OperationStatus` that now means
+    /// `CheckpointStatus::Unknown`, which fails replay rather than
+    /// misclassifying, but the canary still forces the variant to be mapped
+    /// explicitly instead of shipping through the fallback. The pinned
+    /// lists include the generated enums' own `Unknown` carrier variant.
+    #[test]
+    #[allow(clippy::too_many_lines)] // reason: table-driven canary pins five enums' variant lists
+    fn upstream_type_enum_variant_canary() {
+        struct Pin {
+            file: &'static str,
+            enum_name: &'static str,
+            variants: &'static [&'static str],
+            wildcard_sites: &'static str,
+        }
+        let pins = [
+            Pin {
+                file: "src/types/_operation_status.rs",
+                enum_name: "OperationStatus",
+                variants: &[
+                    "Cancelled",
+                    "Failed",
+                    "Pending",
+                    "Ready",
+                    "Started",
+                    "Stopped",
+                    "Succeeded",
+                    "TimedOut",
+                    "Unknown",
+                ],
+                wildcard_sites: "sdk_status_to_checkpoint_status (src/client.rs); \
+                                 operation_status_str and operation_status_wire_str \
+                                 (src/test_util.rs)",
+            },
+            Pin {
+                file: "src/types/_operation_type.rs",
+                enum_name: "OperationType",
+                variants: &[
+                    "Callback",
+                    "ChainedInvoke",
+                    "Context",
+                    "Execution",
+                    "Step",
+                    "Unknown",
+                    "Wait",
+                ],
+                wildcard_sites: "operation_type_to_string (src/client.rs); \
+                                 operation_type_str (src/tracing_layer.rs); \
+                                 operation_type_str (src/test_util.rs)",
+            },
+            Pin {
+                file: "src/types/_operation_action.rs",
+                enum_name: "OperationAction",
+                variants: &["Cancel", "Fail", "Retry", "Start", "Succeed", "Unknown"],
+                wildcard_sites: "terminalize_unwritten_outcomes (src/context.rs); \
+                                 PendingTransitionEvent::emit (src/tracing_layer.rs); \
+                                 BackendState::apply_update (src/test_util.rs); \
+                                 child_starts_before_first_terminal \
+                                 (src/map_parallel.rs tests)",
+            },
+            Pin {
+                file: "src/types/_execution_status.rs",
+                enum_name: "ExecutionStatus",
+                variants: &[
+                    "Failed",
+                    "Running",
+                    "Stopped",
+                    "Succeeded",
+                    "TimedOut",
+                    "Unknown",
+                ],
+                wildcard_sites: "execution_status_str (src/test_util.rs)",
+            },
+            Pin {
+                file: "src/types/_event_type.rs",
+                enum_name: "EventType",
+                variants: &[
+                    "CallbackFailed",
+                    "CallbackStarted",
+                    "CallbackSucceeded",
+                    "CallbackTimedOut",
+                    "ChainedInvokeFailed",
+                    "ChainedInvokeStarted",
+                    "ChainedInvokeStopped",
+                    "ChainedInvokeSucceeded",
+                    "ChainedInvokeTimedOut",
+                    "ContextFailed",
+                    "ContextStarted",
+                    "ContextSucceeded",
+                    "ExecutionFailed",
+                    "ExecutionStarted",
+                    "ExecutionStopped",
+                    "ExecutionSucceeded",
+                    "ExecutionTimedOut",
+                    "InvocationCompleted",
+                    "StepFailed",
+                    "StepStarted",
+                    "StepSucceeded",
+                    "Unknown",
+                    "WaitCancelled",
+                    "WaitStarted",
+                    "WaitSucceeded",
+                ],
+                wildcard_sites: "apply_event_to_op and event_op_type (src/test_util.rs)",
+            },
+        ];
+
+        for pin in pins {
+            let source = read_sdk_source(pin.file);
+            let mut actual = extract_enum_variants(&source, pin.enum_name);
+            actual.sort_unstable();
+
+            let mut expected: Vec<String> = pin.variants.iter().map(|s| (*s).to_owned()).collect();
+            expected.sort_unstable();
+
+            assert_eq!(
+                actual, expected,
+                "aws-sdk-lambda's {} variant set changed. Classify the new/removed \
+                 variants explicitly at every wildcard match site — {} — then update \
+                 this canary's pinned list.",
+                pin.enum_name, pin.wildcard_sites
+            );
+        }
+    }
+
+    /// A modeled `OperationStatus` maps to its explicit `CheckpointStatus`;
+    /// anything the SDK build does not model maps to
+    /// `CheckpointStatus::Unknown` carrying the raw wire value, never to a
+    /// guessed known status (the pre-#45 wildcard mapped it to `Started`,
+    /// silently treating a possibly-terminal operation as re-runnable).
+    #[test]
+    fn unknown_operation_status_maps_to_unknown_carrying_raw() {
+        use aws_sdk_lambda::types::OperationStatus;
+
+        let novel = OperationStatus::from("PAUSED");
+        assert_eq!(
+            sdk_status_to_checkpoint_status(&novel),
+            CheckpointStatus::Unknown("PAUSED".to_owned())
+        );
+
+        let modeled = [
+            (OperationStatus::Started, CheckpointStatus::Started),
+            (OperationStatus::Pending, CheckpointStatus::Pending),
+            (OperationStatus::Ready, CheckpointStatus::Ready),
+            (OperationStatus::Succeeded, CheckpointStatus::Succeeded),
+            (OperationStatus::Failed, CheckpointStatus::Failed),
+            (OperationStatus::Cancelled, CheckpointStatus::Cancelled),
+            (OperationStatus::TimedOut, CheckpointStatus::TimedOut),
+            (OperationStatus::Stopped, CheckpointStatus::Stopped),
+        ];
+        for (sdk, expected) in modeled {
+            assert_eq!(
+                sdk_status_to_checkpoint_status(&sdk),
+                expected,
+                "modeled variant {sdk:?} must map explicitly"
+            );
+        }
     }
 
     /// Reads a source file out of the aws-sdk-lambda version Cargo.lock

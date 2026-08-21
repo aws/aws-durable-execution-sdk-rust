@@ -174,7 +174,7 @@ impl IdCounter {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// The status of a checkpointed operation, as recorded by the backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheckpointStatus {
     /// Operation started but not yet resolved.
     Started,
@@ -192,21 +192,43 @@ pub(crate) enum CheckpointStatus {
     TimedOut,
     /// Operation was stopped.
     Stopped,
+    /// A status this SDK version does not recognize, carrying the raw
+    /// value the service reported.
+    ///
+    /// A status the SDK cannot interpret must never be *acted on*: replay
+    /// reaching an `Unknown` record fails the execution naming the raw
+    /// status (see `DurableContext::checkpoint_view_validated`), because
+    /// guessing — treating a possibly-terminal outcome as re-runnable, or
+    /// fabricating a terminal outcome from an unreadable record — corrupts
+    /// the execution either way.
+    Unknown(String),
 }
 
 impl CheckpointStatus {
     /// Returns true if this status represents a terminal (settled) outcome
     /// that replay can return without re-executing.
-    pub(crate) fn is_terminal(self) -> bool {
+    ///
+    /// `Unknown` reports terminal: a status this SDK does not recognize may
+    /// well be a terminal status the service added, so nothing may re-run
+    /// or overwrite the record. Every replay path that would need to
+    /// *interpret* the record fails the execution first (see
+    /// `DurableContext::checkpoint_view_validated`), so this answer only
+    /// steers bookkeeping that must not touch the record.
+    pub(crate) fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Stopped
+            Self::Succeeded
+                | Self::Failed
+                | Self::Cancelled
+                | Self::TimedOut
+                | Self::Stopped
+                | Self::Unknown(_)
         )
     }
 
     /// The wire (`UPPER_CASE`) spelling of this status, as the backend
-    /// reports it.
-    pub(crate) fn wire_str(self) -> &'static str {
+    /// reports it. `Unknown` yields the raw value verbatim.
+    pub(crate) fn wire_str(&self) -> &str {
         match self {
             Self::Started => "STARTED",
             Self::Pending => "PENDING",
@@ -216,6 +238,7 @@ impl CheckpointStatus {
             Self::Cancelled => "CANCELLED",
             Self::TimedOut => "TIMED_OUT",
             Self::Stopped => "STOPPED",
+            Self::Unknown(raw) => raw,
         }
     }
 }
@@ -284,7 +307,7 @@ pub(crate) struct CheckpointRecord {
 /// strings. Use `CheckpointLog::status_view` (or the context-level
 /// `checkpoint_status_view`) instead of `CheckpointLog::get` when the
 /// caller consumes only these fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckpointStatusView {
     /// The operation's status.
     pub(crate) status: CheckpointStatus,
@@ -387,11 +410,13 @@ impl CheckpointLog {
         guard.get(wire_id).map(f)
     }
 
-    /// Returns a compact copy-type view (status, attempt, `replay_children`)
-    /// of the stored record, without cloning its owned strings.
+    /// Returns a compact view (status, attempt, `replay_children`) of the
+    /// stored record, cloning only the status (a payload string on
+    /// `Unknown`, nothing otherwise) and none of the record's owned
+    /// payload strings.
     pub(crate) fn status_view(&self, wire_id: &str) -> Option<CheckpointStatusView> {
         self.with_record(wire_id, |record| CheckpointStatusView {
-            status: record.status,
+            status: record.status.clone(),
             attempt: record.attempt,
             replay_children: record.replay_children,
         })
@@ -517,6 +542,28 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CheckpointStatus (issue #45) ────────────────────────────────────
+
+    /// `Unknown` reports terminal: a status the SDK does not recognize may
+    /// be a terminal status the service added, so bookkeeping must never
+    /// treat the record as re-runnable or overwrite it. (Replay paths that
+    /// would interpret the record fail the execution before this answer
+    /// matters — see `checkpoint_view_validated`.)
+    #[test]
+    fn unknown_status_is_terminal_and_keeps_raw_wire_value() {
+        let unknown = CheckpointStatus::Unknown("PAUSED".to_owned());
+        assert!(unknown.is_terminal());
+        assert_eq!(unknown.wire_str(), "PAUSED");
+    }
+
+    #[test]
+    fn known_status_wire_spellings_are_upper_case() {
+        assert_eq!(CheckpointStatus::TimedOut.wire_str(), "TIMED_OUT");
+        assert_eq!(CheckpointStatus::Started.wire_str(), "STARTED");
+        assert!(!CheckpointStatus::Started.is_terminal());
+        assert!(CheckpointStatus::TimedOut.is_terminal());
+    }
 
     // ── Counter basics ──────────────────────────────────────────────────
 
@@ -798,9 +845,10 @@ mod tests {
         assert_eq!(view.attempt, 3);
         assert!(view.replay_children);
 
-        // The view is a copy type: using it twice must compile.
-        let copy = view;
-        assert_eq!(copy, view);
+        // The view clones cheaply: only an `Unknown` status carries an
+        // owned string.
+        let clone = view.clone();
+        assert_eq!(clone, view);
 
         assert!(log.status_view("missing").is_none());
     }

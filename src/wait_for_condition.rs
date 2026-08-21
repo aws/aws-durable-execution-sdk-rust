@@ -289,6 +289,13 @@ where
                     // Only statusStarted skips START — other statuses
                     // need a fresh StepStarted for the per-attempt protocol.
                 }
+                CheckpointStatus::Unknown(ref raw) => {
+                    // Unreachable in production — `checkpoint_view_validated`
+                    // already failed the execution (issue #45). Kept as a
+                    // typed arm so a future bypass cannot fall through to a
+                    // fresh attempt against a possibly-terminal record.
+                    return Err(self.ctx.unrecognized_status_error(&wire_id, raw));
+                }
             }
         }
 

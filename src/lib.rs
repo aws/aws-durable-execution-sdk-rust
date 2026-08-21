@@ -92,8 +92,8 @@ pub use self::error::{
     CombinatorErrorKind, FunctionNotFound, InvokeError, InvokeErrorKind, JoinFailed,
     MaxChecksExceeded, NonDeterministicExecutionError, NonDeterministicExecutionErrorKind,
     OperationError, OperationErrorKind, OperationMismatch, ReplayedFailure, RetriesExhausted,
-    StepError, StepErrorKind, TypedError, UnexpectedStatus, WaitError, WaitErrorKind,
-    WaitForConditionError, WaitForConditionErrorKind, WireError,
+    StepError, StepErrorKind, TypedError, UnexpectedStatus, UnrecognizedStatus, WaitError,
+    WaitErrorKind, WaitForConditionError, WaitForConditionErrorKind, WireError,
 };
 pub use self::future::{Branch, DurableFuture, Settled};
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
@@ -501,16 +501,21 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
         .get("Status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("STARTED");
-    // The backend sends status in UPPER_CASE (wire format).
+    // The backend sends status in UPPER_CASE (wire format). `TIMED_OUT` is
+    // the only wire spelling for a timeout, per the smithy model and the
+    // Python and JS SDKs; a `TIMEDOUT` value therefore falls to `Unknown`
+    // like any other unrecognized status (issue #45), carrying the raw
+    // value as received so replay can name it when it fails the execution.
     let status = match status_str.to_ascii_uppercase().as_str() {
+        "STARTED" => engine::CheckpointStatus::Started,
         "SUCCEEDED" => engine::CheckpointStatus::Succeeded,
         "FAILED" => engine::CheckpointStatus::Failed,
         "PENDING" => engine::CheckpointStatus::Pending,
         "READY" => engine::CheckpointStatus::Ready,
         "CANCELLED" => engine::CheckpointStatus::Cancelled,
-        "TIMEDOUT" | "TIMED_OUT" => engine::CheckpointStatus::TimedOut,
+        "TIMED_OUT" => engine::CheckpointStatus::TimedOut,
         "STOPPED" => engine::CheckpointStatus::Stopped,
-        _ => engine::CheckpointStatus::Started,
+        _ => engine::CheckpointStatus::Unknown(status_str.to_owned()),
     };
 
     // Extract step details.
@@ -1304,6 +1309,72 @@ mod tests {
             .expect("Result should be a serialized JSON string");
         let echoed: serde_json::Value = serde_json::from_str(result_json).unwrap();
         assert_eq!(echoed, serde_json::json!({ "count": 42 }));
+    }
+
+    // ── Status parsing tests (issue #45) ────────────────────────────────
+
+    /// Builds a minimal step operation JSON with the given wire status.
+    fn step_op_with_status(status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "Id": "op-1",
+            "Type": "Step",
+            "Status": status,
+            "StepDetails": {}
+        })
+    }
+
+    #[test]
+    fn parse_status_timed_out_wire_value_maps_to_timed_out() {
+        #[allow(clippy::unwrap_used)] // reason: test assertion — minimal op parses
+        let (_, record) = parse_single_operation(&step_op_with_status("TIMED_OUT")).unwrap();
+        assert_eq!(record.status, engine::CheckpointStatus::TimedOut);
+    }
+
+    /// `TIMEDOUT` is not a wire value — the smithy model and the Python and
+    /// JS SDKs spell it `TIMED_OUT` only — so the parser must not accept it
+    /// (the removed pre-#45 arm did).
+    #[test]
+    fn parse_status_timedout_without_underscore_is_unrecognized() {
+        #[allow(clippy::unwrap_used)] // reason: test assertion — minimal op parses
+        let (_, record) = parse_single_operation(&step_op_with_status("TIMEDOUT")).unwrap();
+        assert_eq!(
+            record.status,
+            engine::CheckpointStatus::Unknown("TIMEDOUT".to_owned())
+        );
+    }
+
+    /// An unrecognized status maps to `Unknown` carrying the raw value as
+    /// received (original casing), never to a guessed known status.
+    #[test]
+    fn parse_unknown_status_carries_raw_value() {
+        #[allow(clippy::unwrap_used)] // reason: test assertion — minimal op parses
+        let (_, record) = parse_single_operation(&step_op_with_status("Paused")).unwrap();
+        assert_eq!(
+            record.status,
+            engine::CheckpointStatus::Unknown("Paused".to_owned())
+        );
+    }
+
+    /// Every modeled wire status still maps explicitly, and the parser
+    /// stays case-insensitive for them.
+    #[test]
+    fn parse_known_statuses_map_explicitly() {
+        let cases = [
+            ("STARTED", engine::CheckpointStatus::Started),
+            ("PENDING", engine::CheckpointStatus::Pending),
+            ("READY", engine::CheckpointStatus::Ready),
+            ("SUCCEEDED", engine::CheckpointStatus::Succeeded),
+            ("FAILED", engine::CheckpointStatus::Failed),
+            ("CANCELLED", engine::CheckpointStatus::Cancelled),
+            ("TIMED_OUT", engine::CheckpointStatus::TimedOut),
+            ("STOPPED", engine::CheckpointStatus::Stopped),
+            ("Succeeded", engine::CheckpointStatus::Succeeded),
+        ];
+        for (wire, expected) in cases {
+            #[allow(clippy::unwrap_used)] // reason: test assertion — minimal op parses
+            let (_, record) = parse_single_operation(&step_op_with_status(wire)).unwrap();
+            assert_eq!(record.status, expected, "wire status {wire:?}");
+        }
     }
 
     // ── CallbackDetails parsing tests ───────────────────────────────────

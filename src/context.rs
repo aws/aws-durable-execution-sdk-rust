@@ -23,8 +23,8 @@ use crate::checkpoint_coalescer::{
 use crate::client::{CheckpointOutput, ClientError, ExecutionClient};
 use crate::driver::{SuspensionSignal, TaskOwnership};
 use crate::engine::{
-    CheckpointLog, CheckpointRecord, CheckpointStatusView, EngineState, OperationId,
-    TerminalReplaySnapshot,
+    CheckpointLog, CheckpointRecord, CheckpointStatus, CheckpointStatusView, EngineState,
+    OperationId, TerminalReplaySnapshot,
 };
 use crate::error::{
     NonDeterministicExecutionError, NonDeterministicExecutionErrorKind, OperationError,
@@ -611,7 +611,7 @@ impl DurableContext {
         self.inner.engine.checkpoint_log.with_record(&wire_id, f)
     }
 
-    /// Returns the compact copy-type view (status, attempt,
+    /// Returns the compact view (status, attempt,
     /// `replay_children`) of the checkpoint record for the given positional
     /// ID, without cloning any of the record's owned strings.
     pub(crate) fn checkpoint_status_view(
@@ -679,7 +679,7 @@ impl DurableContext {
         positional_id: &str,
     ) -> Option<TerminalReplaySnapshot> {
         self.with_checkpoint_record(positional_id, |record| TerminalReplaySnapshot {
-            status: record.status,
+            status: record.status.clone(),
             replay_children: record.replay_children,
             result: record.result.clone(),
             error_message: record.error_message.clone(),
@@ -694,8 +694,11 @@ impl DurableContext {
     /// Returns `Ok(None)` when no record exists (live position, nothing to
     /// validate), `Ok(Some(view))` when the identity matches, and the
     /// `NonDeterministicExecution` error (also recorded on the fatal slot,
-    /// exactly as [`Self::validate_replay_identity`] does) on mismatch.
-    /// Nothing is cloned on the match path.
+    /// exactly as [`Self::validate_replay_identity`] does) on mismatch —
+    /// or when the record carries a [`CheckpointStatus::Unknown`] status
+    /// this SDK version cannot interpret, in which case the error names
+    /// the raw status. Nothing is cloned on the match path beyond the
+    /// status itself.
     pub(crate) fn checkpoint_view_validated(
         &self,
         positional_id: &str,
@@ -708,7 +711,7 @@ impl DurableContext {
             (
                 replay_identity_mismatch(record, claimed_type, claimed_sub_type, claimed_name),
                 CheckpointStatusView {
-                    status: record.status,
+                    status: record.status.clone(),
                     attempt: record.attempt,
                     replay_children: record.replay_children,
                 },
@@ -725,6 +728,13 @@ impl DurableContext {
                 claimed_sub_type,
                 claimed_name,
             ));
+        }
+        if let CheckpointStatus::Unknown(raw) = &view.status {
+            // A status this SDK cannot interpret must never be acted on:
+            // guessing non-terminal re-runs completed work, and guessing
+            // terminal fabricates an outcome that was never recorded. Fail
+            // the execution naming the raw status (issue #45).
+            return Err(self.unrecognized_status_error(wire_id, raw));
         }
         Ok(Some(view))
     }
@@ -827,6 +837,30 @@ impl DurableContext {
                         expected,
                         format_op_identity(claimed_type, claimed_sub_type, claimed_name),
                     ),
+                ),
+            ),
+        ));
+        self.inner.suspension_signal.record_fatal(
+            "NonDeterministicExecutionError".to_owned(),
+            crate::error::chain_string(&err),
+        );
+        err
+    }
+
+    /// Builds the execution-fatal error for a checkpoint record whose
+    /// status this SDK version does not recognize, recording it on the
+    /// shared fatal slot (issue #45).
+    ///
+    /// Exactly like [`Self::replay_mismatch_error`], the fatal-slot write
+    /// makes the invocation driver fail the execution with the dedicated
+    /// error even if the returned `Err` is swallowed on its way up. The
+    /// error message carries the raw status verbatim, so the operator can
+    /// see which service-side status the SDK build predates.
+    pub(crate) fn unrecognized_status_error(&self, wire_id: &str, raw: &str) -> OperationError {
+        let err = OperationError::from_kind(OperationErrorKind::NonDeterministicExecution(
+            NonDeterministicExecutionError::from_kind(
+                NonDeterministicExecutionErrorKind::UnrecognizedStatus(
+                    crate::error::UnrecognizedStatus::new(wire_id, raw),
                 ),
             ),
         ));
@@ -2799,6 +2833,101 @@ mod tests {
             display.contains("Step") && display.contains("Wait"),
             "expected both identities in error: {display}"
         );
+    }
+
+    /// Replay reaching a record whose status this SDK version does not
+    /// recognize must fail the execution naming the raw status (issue
+    /// #45) — never return the view for the operation to act on.
+    #[test]
+    #[allow(clippy::panic)] // reason: test assertions over non_exhaustive kinds
+    fn checkpoint_view_validated_fails_execution_on_unrecognized_status() {
+        let ctx = ctx_with_record_at_1(CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Unknown("PAUSED".to_owned()),
+            result: None,
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            op_name: None,
+        });
+
+        assert!(
+            ctx.suspension_signal().fatal_error().is_none(),
+            "no fatal recorded before the replay check"
+        );
+
+        // Identity matches — the failure is the status, not the identity.
+        let result = ctx.checkpoint_view_validated("1", "wire-1", "Step", Some("Step"), None);
+        assert!(result.is_err());
+        #[allow(clippy::unwrap_used)] // reason: test assertion — verified Err above
+        let err = result.unwrap_err();
+        let OperationErrorKind::NonDeterministicExecution(nde) = err.kind() else {
+            panic!("expected NonDeterministicExecution, got {:?}", err.kind());
+        };
+        let NonDeterministicExecutionErrorKind::UnrecognizedStatus(details) = nde.kind() else {
+            panic!("expected UnrecognizedStatus, got {:?}", nde.kind());
+        };
+        assert_eq!(details.wire_id(), "wire-1");
+        assert_eq!(details.status(), "PAUSED");
+        let display = format!("{err:#}");
+        assert!(
+            display.contains("PAUSED"),
+            "error must name the raw status: {display}"
+        );
+
+        // The fatal slot is written so the invocation driver fails the
+        // execution even if the returned `Err` is swallowed downstream.
+        let fatal = ctx
+            .suspension_signal()
+            .fatal_error()
+            .expect("unrecognized status must record a fatal error");
+        assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
+        assert!(
+            fatal.error_message.contains("PAUSED"),
+            "fatal message must carry the raw status: {}",
+            fatal.error_message
+        );
+    }
+
+    /// A record with a recognized status and matching identity records no
+    /// fatal and returns the view — the #45 guard fires only on `Unknown`.
+    #[test]
+    fn checkpoint_view_validated_known_status_records_no_fatal() {
+        let ctx = ctx_with_record_at_1(CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::TimedOut,
+            result: None,
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            op_name: None,
+        });
+
+        let result = ctx.checkpoint_view_validated("1", "wire-1", "Step", Some("Step"), None);
+        assert!(matches!(result, Ok(Some(_))));
+        assert!(ctx.suspension_signal().fatal_error().is_none());
     }
 
     #[test]

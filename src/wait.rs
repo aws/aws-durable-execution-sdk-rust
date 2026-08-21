@@ -75,6 +75,13 @@ impl WaitExecution {
                     ))
                     .with_operation(&wire_id, view.status.wire_str()));
                 }
+                CheckpointStatus::Unknown(ref raw) => {
+                    // Unreachable in production — `checkpoint_view_validated`
+                    // already failed the execution (issue #45). Kept as a
+                    // typed arm so a future bypass fails loudly instead of
+                    // being demoted to a catchable unexpected-status error.
+                    return Err(self.ctx.unrecognized_status_error(&wire_id, raw));
+                }
             }
         }
 
@@ -274,11 +281,15 @@ mod tests {
             err.kind()
         );
         // The offending status is a structural fact behind the payload's
-        // accessor, and renders in the flattened chain.
-        if let OperationErrorKind::Wait(e) = err.kind()
-            && let WaitErrorKind::UnexpectedStatus(details) = e.kind()
-        {
-            assert_eq!(details.status(), "FAILED");
+        // accessor, and renders in the flattened chain. (A let-chain here
+        // trips 1.94.1's irrefutable-let lint — `WaitErrorKind` has one
+        // variant — so extract through a single-arm match instead.)
+        if let OperationErrorKind::Wait(e) = err.kind() {
+            match e.kind() {
+                WaitErrorKind::UnexpectedStatus(details) => {
+                    assert_eq!(details.status(), "FAILED");
+                }
+            }
         }
         assert!(
             format!("{err:#}").contains("FAILED"),

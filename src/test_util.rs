@@ -2240,7 +2240,7 @@ fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
     );
     obj.insert(
         "Status".to_owned(),
-        serde_json::json!(operation_status_str(&stored.status)),
+        serde_json::json!(operation_status_wire_str(&stored.status)),
     );
     if let Some(st) = &stored.sub_type {
         obj.insert("SubType".to_owned(), serde_json::json!(st));
@@ -2325,6 +2325,27 @@ fn operation_status_str(s: &OperationStatus) -> &'static str {
         OperationStatus::TimedOut => "TimedOut",
         OperationStatus::Stopped => "Stopped",
         _ => "Unknown",
+    }
+}
+
+/// Wire (`UPPER_CASE`) operation status for the envelope JSON that
+/// `parse_single_operation` reads.
+///
+/// The envelope must speak the service's wire dialect exactly: the real
+/// backend sends `TIMED_OUT` (never `TIMEDOUT`), and the production parser
+/// treats any other spelling as an unrecognized status (issue #45), so the
+/// local runner rendering `PascalCase` here would fail replay.
+fn operation_status_wire_str(s: &OperationStatus) -> &'static str {
+    match *s {
+        OperationStatus::Started => "STARTED",
+        OperationStatus::Pending => "PENDING",
+        OperationStatus::Ready => "READY",
+        OperationStatus::Succeeded => "SUCCEEDED",
+        OperationStatus::Failed => "FAILED",
+        OperationStatus::Cancelled => "CANCELLED",
+        OperationStatus::TimedOut => "TIMED_OUT",
+        OperationStatus::Stopped => "STOPPED",
+        _ => "UNKNOWN",
     }
 }
 

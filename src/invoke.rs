@@ -142,6 +142,13 @@ where
                     ))
                     .with_operation(&wire_id, view.status.wire_str()));
                 }
+                CheckpointStatus::Unknown(ref raw) => {
+                    // Unreachable in production — `checkpoint_view_validated`
+                    // already failed the execution (issue #45). Kept as a
+                    // typed arm so a future bypass cannot suspend forever on
+                    // a status that may be terminal.
+                    return Err(self.ctx.unrecognized_status_error(&wire_id, raw));
+                }
             }
         }
 
