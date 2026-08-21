@@ -19,6 +19,39 @@ publish = false
 [lib]
 name = "aws_durable_execution_sdk_rust"
 
+# Types from other crates that are deliberately part of this crate's public
+# API. `cargo +nightly check-external-types` (wired into ci.yml) fails the
+# build when a foreign type outside this list reaches the public surface,
+# which is the mechanical guard against leaks like #37 (`serde_json::Value`
+# in the `Serdes` signature) and #38 (`SdkConfig`/`Client` public but not
+# re-exported). Keep this list minimal, and keep `serde_json` out of it:
+# raw JSON values are an implementation detail (see `InvocationPayload` /
+# `InvocationResponse`).
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    # The serialization contract: handler events, outputs, and operation
+    # payloads are bounded by serde's traits. serde re-exports them from
+    # serde_core, and rustdoc records the defining crate, so both paths
+    # are needed.
+    "serde::*",
+    "serde_core::*",
+    # The Lambda runtime is the crate's execution substrate: the crate
+    # re-exports it (`pub use lambda_runtime`), `run`/`wrap` speak its
+    # `LambdaEvent`/`Error` types, and `DurableContext::lambda_context`
+    # returns its `Context`.
+    "lambda_runtime",
+    "lambda_runtime::*",
+    # `Options` accepts a caller-supplied SDK configuration or Lambda
+    # client (both re-exported from the crate root; see #38).
+    "aws_types::sdk_config::SdkConfig",
+    "aws_sdk_lambda::client::Client",
+    # The `replay-filter` feature exists to implement tracing-subscriber's
+    # `Filter` trait, which necessarily names these types in the impl.
+    "tracing_subscriber::layer::Filter",
+    "tracing_subscriber::registry::LookupSpan",
+    "tracing_core::subscriber::Subscriber",
+]
+
 # Non-default feature gating the in-process local testing runner
 # (`test_util::LocalRunner`). Off by default so the always-on public API and
 # dependency graph are unchanged; enable with `--features test-util`.

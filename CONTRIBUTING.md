@@ -308,8 +308,15 @@ run and a reviewer's first pass.
 
 CI runs four workflows on a pull request. `ci.yml` splits `make check` into a
 `check` job and a `dependencies` job, verifies the declared minimum Rust
-version with an `msrv` job, then builds and lints the `compliance` and
-`examples` workspaces. `codeql.yml` runs static analysis over the Rust sources.
+version with an `msrv` job, guards the public API surface with an
+`external-types` job (no foreign type may reach the public API unless the
+allowlist under `[package.metadata.cargo_check_external_types]` in
+`Cargo.toml` names it deliberately) and a `semver` job (cargo-semver-checks
+compares the pull request against its base branch, so a breaking API change
+needs the matching version bump), proves every feature combination compiles
+with a `feature-powerset` job (cargo-hack), then builds and lints the
+`compliance` and `examples` workspaces.
+`codeql.yml` runs static analysis over the Rust sources.
 `conformance-tests.yml` runs the ten conformance suites when the SDK or the
 handlers change. `cloud-tests.yml` deploys the example stacks and runs the cloud
 harness. Everything must be green before merge. The conformance and cloud

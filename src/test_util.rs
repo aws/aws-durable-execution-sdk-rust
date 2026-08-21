@@ -868,8 +868,10 @@ impl LocalRunner {
             }
 
             let payload = build_envelope(&backend, &event_json, self.initial_page_size);
-            let lambda_event =
-                lambda_runtime::LambdaEvent::new(payload, lambda_runtime::Context::default());
+            let lambda_event = lambda_runtime::LambdaEvent::new(
+                crate::InvocationPayload(payload),
+                lambda_runtime::Context::default(),
+            );
 
             // Await the service future INLINE — never on a spawned task.
             // This reproduces the production topology (`lambda_runtime`
@@ -877,7 +879,7 @@ impl LocalRunner {
             // `tokio::task::try_id()` is `None` at context-creation time
             // and the task-ownership guard behaves as it does deployed.
             let response = match service(lambda_event).await {
-                Ok(envelope) => envelope,
+                Ok(envelope) => envelope.0,
                 Err(e) => {
                     // The invocation itself failed (a Lambda runtime
                     // error) — e.g. a retryable checkpoint failure that

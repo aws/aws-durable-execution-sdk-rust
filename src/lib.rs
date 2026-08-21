@@ -671,13 +671,36 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
     ))
 }
 
+/// The raw invocation payload `lambda_runtime` hands to the service
+/// functions [`wrap`] produces.
+///
+/// Opaque by design: the payload is the durable invocation envelope the
+/// service sends, and its JSON representation is an implementation detail
+/// between the runtime and the SDK. Callers never construct or inspect
+/// one — `lambda_runtime::service_fn` deserializes it, and the service
+/// function consumes it. Keeping the inner value private is what keeps
+/// `serde_json` out of the crate's public API.
+#[derive(Debug, serde::Deserialize)]
+pub struct InvocationPayload(pub(crate) serde_json::Value);
+
+/// The durable response envelope one invocation of a [`wrap`]-produced
+/// service function resolves with.
+///
+/// Opaque by design: the envelope carries the invocation's status
+/// (`SUCCEEDED`, `FAILED`, or suspension) for the durable execution
+/// service to read, and its JSON representation is an implementation
+/// detail between the SDK and the service. Callers hand it back to
+/// `lambda_runtime` unexamined.
+#[derive(Debug, serde::Serialize)]
+pub struct InvocationResponse(pub(crate) serde_json::Value);
+
 /// Boxed, pinned future of one Lambda invocation of a wrapped durable
 /// handler: the return type of the service functions [`wrap`] produces.
 ///
 /// Crate-internal: rustdoc renders the alias transparently, and callers
 /// only ever name the `impl Fn` the wrappers return.
 type BoxedInvocationFuture = std::pin::Pin<
-    Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
+    Box<dyn Future<Output = Result<InvocationResponse, lambda_runtime::Error>> + Send>,
 >;
 
 /// Creates a Lambda service function with durable execution support.
@@ -723,7 +746,7 @@ type BoxedInvocationFuture = std::pin::Pin<
 pub fn wrap<F, E, Fut, O>(
     handler: F,
     options: Options,
-) -> impl Fn(lambda_runtime::LambdaEvent<serde_json::Value>) -> BoxedInvocationFuture + Send + Sync
+) -> impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture + Send + Sync
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
     E: for<'de> Deserialize<'de> + Send + 'static,
@@ -778,7 +801,7 @@ pub(crate) fn wrap_with_execution_client<F, E, Fut, O>(
     handler: F,
     exec_client: std::sync::Arc<dyn client::ExecutionClient>,
     checkpoint_buffer_window: Option<std::time::Duration>,
-) -> impl Fn(lambda_runtime::LambdaEvent<serde_json::Value>) -> BoxedInvocationFuture + Send + Sync
+) -> impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture + Send + Sync
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
     E: for<'de> Deserialize<'de> + Send + 'static,
@@ -801,7 +824,7 @@ fn wrap_with_provider<F, E, Fut, O>(
     handler: F,
     provider: ClientProvider,
     checkpoint_buffer_window: Option<std::time::Duration>,
-) -> impl Fn(lambda_runtime::LambdaEvent<serde_json::Value>) -> BoxedInvocationFuture + Send + Sync
+) -> impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture + Send + Sync
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
     E: for<'de> Deserialize<'de> + Send + 'static,
@@ -813,13 +836,13 @@ where
     let handler = StdArc::new(handler);
     let provider = StdArc::new(provider);
 
-    move |event: lambda_runtime::LambdaEvent<serde_json::Value>| -> std::pin::Pin<
-        Box<dyn Future<Output = Result<serde_json::Value, lambda_runtime::Error>> + Send>,
+    move |event: lambda_runtime::LambdaEvent<InvocationPayload>| -> std::pin::Pin<
+        Box<dyn Future<Output = Result<InvocationResponse, lambda_runtime::Error>> + Send>,
     > {
         let handler = StdArc::clone(&handler);
         let provider = StdArc::clone(&provider);
         Box::pin(async move {
-            let (raw_payload, lambda_ctx) = event.into_parts();
+            let (InvocationPayload(raw_payload), lambda_ctx) = event.into_parts();
 
             // Parse and validate the durable invocation envelope.
             let envelope = parse_envelope(&raw_payload)?.ok_or_else(|| {
@@ -1004,7 +1027,7 @@ async fn flush_failure_response(
     flush: &context::FlushFailure,
     outcome: driver::InvocationOutcome,
     ctx: &DurableContext,
-) -> Result<serde_json::Value, lambda_runtime::Error> {
+) -> Result<InvocationResponse, lambda_runtime::Error> {
     let error = flush.primary_error();
     if !flush.any_non_retryable() {
         return Err(lambda_runtime::Error::from(format!(
@@ -1040,12 +1063,14 @@ async fn flush_failure_response(
 fn outcome_envelope(
     outcome: driver::InvocationOutcome,
     ctx: &DurableContext,
-) -> Result<serde_json::Value, lambda_runtime::Error> {
+) -> Result<InvocationResponse, lambda_runtime::Error> {
     match outcome {
-        driver::InvocationOutcome::Complete(serialized) => Ok(serde_json::json!({
-            "Status": "SUCCEEDED",
-            "Result": serialized
-        })),
+        driver::InvocationOutcome::Complete(serialized) => {
+            Ok(InvocationResponse(serde_json::json!({
+                "Status": "SUCCEEDED",
+                "Result": serialized
+            })))
+        }
         driver::InvocationOutcome::Pending => {
             // Emitted while the handler's `durable_execution` span is
             // entered — the instrumented handler future has already been
@@ -1059,9 +1084,9 @@ fn outcome_envelope(
                 ctx.execution_arn(),
                 &ctx.lambda_context().request_id,
             );
-            Ok(serde_json::json!({
+            Ok(InvocationResponse(serde_json::json!({
                 "Status": "PENDING"
-            }))
+            })))
         }
         driver::InvocationOutcome::Fault { message } => {
             // A retryable checkpoint failure: fail the invocation itself
@@ -1091,10 +1116,10 @@ fn outcome_envelope(
                     serde_json::json!(error.stack_trace()),
                 );
             }
-            Ok(serde_json::json!({
+            Ok(InvocationResponse(serde_json::json!({
                 "Status": "FAILED",
                 "Error": serde_json::Value::Object(error_map)
-            }))
+            })))
         }
     }
 }
@@ -1239,8 +1264,11 @@ mod tests {
             },
             offline_options(),
         );
-        let event = lambda_runtime::LambdaEvent::new(payload, lambda_runtime::Context::default());
-        service(event).await
+        let event = lambda_runtime::LambdaEvent::new(
+            InvocationPayload(payload),
+            lambda_runtime::Context::default(),
+        );
+        service(event).await.map(|response| response.0)
     }
 
     #[tokio::test]

@@ -92,6 +92,100 @@ jobs:
       - name: Direct dependency allowlist
         run: sh scripts/check-direct-deps.sh
 
+  # Public API surface: no foreign type may appear in the public API unless
+  # the allowlist in Cargo.toml ([package.metadata.cargo_check_external_types])
+  # names it deliberately. This is the mechanical guard that would have
+  # caught #37 (serde_json::Value in the Serdes signature) and #38
+  # (SdkConfig/Client public but not re-exported). See issue #39.
+  #
+  # cargo-check-external-types reads rustdoc's unstable JSON output, so each
+  # release pins an exact nightly; 0.5.0 pins nightly-2026-03-20. Bump the
+  # two together.
+  external-types:
+    name: public API (external types)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-03-20 --profile minimal
+          rustup default nightly-2026-03-20
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+
+      # No prebuilt distribution exists for this tool, so cache the compiled
+      # binary; the key ties it to the tool version and the pinned nightly.
+      - name: Cache cargo-check-external-types
+        id: cache-cet
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-check-external-types
+          key: cargo-check-external-types-0.5.0-nightly-2026-03-20
+
+      - name: Install cargo-check-external-types
+        if: steps.cache-cet.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-check-external-types --version 0.5.0
+
+      - name: Check external types in public API
+        env:
+          # The workflow-wide `-D warnings` belongs to the stable lint gate
+          # in `check`; a pinned nightly's extra lints must not fail the
+          # API-surface check.
+          RUSTFLAGS: ''
+        run: cargo +nightly-2026-03-20 check-external-types --all-features
+
+  # Public API breakage: cargo-semver-checks compares this revision's API
+  # against the pull request's base branch, so an accidental breaking change
+  # fails CI unless the version is bumped accordingly (issue #39). The crate
+  # is unpublished, so the baseline is a git rev rather than a registry
+  # release — which only exists for pull requests; a push to alpha has no
+  # meaningful baseline (the PR that produced it was already checked).
+  semver:
+    name: public API (semver)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # cargo-semver-checks materializes the baseline from git history;
+          # the default depth-1 checkout does not contain the base branch.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        with:
+          tool: cargo-semver-checks@0.50.0
+
+      - name: Check for semver-breaking API changes
+        run: cargo semver-checks check-release --baseline-rev origin/${{ github.base_ref }}
+
+  # Feature combinations: every set in the feature powerset must compile, so
+  # `--no-default-features` and `--features test-util` are both proven to
+  # build rather than assumed to (issue #39).
+  feature-powerset:
+    name: feature powerset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        with:
+          tool: cargo-hack@0.6.45
+
+      - name: Check the feature powerset
+        run: cargo hack check --feature-powerset --all-targets
+
   # The conformance handlers and examples are separate cargo workspaces with
   # heavier dependency graphs, deliberately outside the SDK's `make check`.
   # CI still compiles both so a public API change cannot silently break them.
