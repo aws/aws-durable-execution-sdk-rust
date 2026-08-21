@@ -286,7 +286,7 @@ where
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         use crate::child::ChildExecution;
 
         // The block is a child context on the wire; validate against the
@@ -304,6 +304,8 @@ where
         let serdes = Arc::new(self.serdes);
         let loop_serdes = Arc::clone(&serdes);
 
+        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
+
         let execution = ChildExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -317,6 +319,10 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::from_async(async move { execution.execute().await })
+        DurableFuture::lazy_scoped(
+            async move { execution.execute().await },
+            owner_scope,
+            op_scope,
+        )
     }
 }

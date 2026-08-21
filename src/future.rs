@@ -103,13 +103,61 @@ impl<O: Send + 'static> DurableFuture<O> {
 
     /// Redirects this future's park behaviour to `scope`.
     ///
-    /// Only meaningful for spawned futures (produced by `.spawn()`): when
-    /// the inner spawned task parks, the handle will park `scope` instead
-    /// of the scope captured at `.spawn()` time. No-op on non-spawned
-    /// futures.
+    /// When the underlying operation parks, the future parks `scope`
+    /// instead of the scope captured when the future was created. Both
+    /// terminals participate: a spawned future (produced by `.spawn()`)
+    /// reads the redirect when its task reports `Parked`, and a lazy
+    /// future (produced by [`Self::lazy_scoped`] via `.future()` or
+    /// `.await`) reads it when its own scope suspends. This is what lets
+    /// a combinator isolate a losing input's suspension onto a scope it
+    /// controls (issue #49). No-op on futures without a redirect cell
+    /// (immediate-error preflight futures, raw test futures).
     pub(crate) fn set_park_scope(&self, scope: std::sync::Arc<crate::driver::SuspensionSignal>) {
         if let Some(redirect) = &self.park_redirect {
             redirect.set(scope);
+        }
+    }
+
+    /// Creates a lazy `DurableFuture` that runs `fut` inside its OWN
+    /// suspension scope, mirroring [`Self::spawn_blessed`] without the
+    /// eager tokio task.
+    ///
+    /// The builder's context was rebound onto `op_scope` (a fresh child
+    /// scope) before `fut` was constructed, so every park inside the
+    /// operation lands on `op_scope` rather than on the scope the builder
+    /// was created from. [`drive_scope`](crate::driver::drive_scope)
+    /// observes that park and this wrapper forwards it: to the redirect
+    /// target when [`Self::set_park_scope`] installed one (the future is a
+    /// combinator constituent), otherwise to `owner_scope` (the scope the
+    /// operation was created on — a direct `.await` must still suspend the
+    /// caller). After forwarding, the future pends forever: a parked
+    /// operation resumes only on a later invocation, exactly like the
+    /// spawned path.
+    pub(crate) fn lazy_scoped<F>(
+        fut: F,
+        owner_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
+        op_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
+    ) -> Self
+    where
+        F: Future<Output = Result<O, OperationError>> + Send + 'static,
+    {
+        use crate::driver::{ScopeOutcome, drive_scope};
+
+        let redirect = std::sync::Arc::new(ParkRedirect::new());
+        let redirect_handle = std::sync::Arc::clone(&redirect);
+
+        Self {
+            inner: Box::pin(async move {
+                match drive_scope(fut, op_scope).await {
+                    ScopeOutcome::Completed(result) => result,
+                    ScopeOutcome::Suspended => {
+                        let park_target = redirect_handle.get().unwrap_or(owner_scope);
+                        park_target.park_owner();
+                        std::future::pending().await
+                    }
+                }
+            }),
+            park_redirect: Some(redirect),
         }
     }
 
@@ -570,31 +618,40 @@ impl<O: Send + 'static> Callback<O> {
     /// }
     /// ```
     pub fn result(self) -> DurableFuture<O> {
-        DurableFuture::from_async(async move {
-            match self.state {
-                CallbackState::Settled(outcome) => {
-                    // Replay path: return the stored outcome directly.
-                    outcome.unwrap_or_else(|| {
-                        Err(OperationError::from_kind(
-                            crate::error::OperationErrorKind::Callback(
-                                crate::error::CallbackError::new(
-                                    crate::error::CallbackErrorKind::Internal,
-                                    Some("settled callback had no outcome".into()),
-                                ),
+        match self.state {
+            CallbackState::Settled(outcome) => DurableFuture::from_async(async move {
+                // Replay path: return the stored outcome directly.
+                outcome.unwrap_or_else(|| {
+                    Err(OperationError::from_kind(
+                        crate::error::OperationErrorKind::Callback(
+                            crate::error::CallbackError::new(
+                                crate::error::CallbackErrorKind::Internal,
+                                Some("settled callback had no outcome".into()),
                             ),
-                        ))
-                    })
-                }
-                CallbackState::Pending(ctx) => {
-                    // Live path: request suspension and park. The driver drops
-                    // the handler future at this await point; control never
-                    // returns here, so the callback result cannot surface until
-                    // the callback is completed externally and the invocation
-                    // replays with a settled record.
-                    ctx.suspend_now().await
-                }
+                        ),
+                    ))
+                })
+            }),
+            CallbackState::Pending(ctx) => {
+                // Live path: request suspension and park. The stored context
+                // carries the CALLER's scope (create_callback deliberately
+                // does not rebind — see `CreateCallbackBuilder::into_future`),
+                // so rebind onto a fresh scope here: a direct `.await` still
+                // suspends the caller, while a combinator can redirect this
+                // future's park onto a scope it controls instead of parking
+                // the caller after a sibling already settled (issue #49).
+                // Either way control never returns here; the callback result
+                // surfaces only when a later invocation replays with a
+                // settled record.
+                let owner_scope = std::sync::Arc::clone(ctx.suspension_signal());
+                let (scoped_ctx, op_scope) = ctx.spawn_scope();
+                DurableFuture::lazy_scoped(
+                    async move { scoped_ctx.suspend_now().await },
+                    owner_scope,
+                    op_scope,
+                )
             }
-        })
+        }
     }
 }
 

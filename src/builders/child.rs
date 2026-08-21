@@ -170,10 +170,12 @@ where
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         use crate::child::ChildExecution;
 
         preflight_identity!(self, "Context", crate::child::CHILD_SUB_TYPE);
+
+        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
 
         let execution = ChildExecution {
             ctx: self.ctx,
@@ -184,6 +186,10 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::from_async(async move { execution.execute().await })
+        DurableFuture::lazy_scoped(
+            async move { execution.execute().await },
+            owner_scope,
+            op_scope,
+        )
     }
 }

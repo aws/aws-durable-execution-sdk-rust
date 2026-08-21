@@ -96,37 +96,29 @@ macro_rules! spawn_terminal {
     }};
 }
 
-/// Like [`spawn_terminal!`] but also redirects park signals from the
-/// builder's constituent `futures` onto the combinator's spawn scope.
+/// The scope rebind shared by every builder's lazy terminal (`.await` /
+/// `.future()`), evaluated inside `into_future` after `preflight_identity!`.
 ///
-/// Without this, a constituent that was itself `.spawn()`ed would park the
-/// OUTER owner scope — the same scope that counts the combinator as
-/// outstanding — creating a deadlock cycle: the owner waits for the
-/// combinator to settle, while the combinator waits for the constituent to
-/// complete, which it never will (it parked).
+/// Rebinds the builder's context onto a FRESH child suspension scope and
+/// returns `(owner_scope, op_scope)` for
+/// [`DurableFuture::lazy_scoped`](crate::future::DurableFuture): every park
+/// inside the operation lands on `op_scope` rather than on the scope the
+/// builder was created from, so whoever polls the future decides where the
+/// suspension goes. A direct `.await` forwards it to `owner_scope`
+/// (identical caller-visible behavior); a combinator redirects it onto a
+/// scope it controls, so a losing input's park never suspends the caller
+/// after a winner settled (issue #49).
 ///
-/// By redirecting, the constituent's park hits the combinator's spawn scope
-/// instead. [`drive_scope`](crate::driver::drive_scope) detects the
-/// suspension and the combinator settles as parked on the owner scope,
-/// breaking the cycle.
-macro_rules! spawn_combinator_terminal {
+/// This is one helper rather than thirteen copies for the same reason as
+/// [`spawn_terminal!`]: no lazy terminal can drift out of the isolation.
+///
+/// The builder must have a `ctx: DurableContext` field.
+macro_rules! rebind_lazy_scope {
     ($builder:expr) => {{
-        let mut builder = $builder;
-        let owner_scope = ::std::sync::Arc::clone(builder.ctx.suspension_signal());
-        let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
-        let (spawn_ctx, spawn_scope) = builder.ctx.spawn_scope();
-        // Redirect each constituent future's park to the combinator's scope.
-        for future in &builder.futures {
-            future.set_park_scope(::std::sync::Arc::clone(&spawn_scope));
-        }
-        builder.ctx = spawn_ctx;
-        let future = ::std::future::IntoFuture::into_future(builder);
-        $crate::future::DurableFuture::spawn_blessed(
-            future,
-            task_ownership,
-            owner_scope,
-            spawn_scope,
-        )
+        let owner_scope = ::std::sync::Arc::clone($builder.ctx.suspension_signal());
+        let (scoped_ctx, op_scope) = $builder.ctx.spawn_scope();
+        $builder.ctx = scoped_ctx;
+        (owner_scope, op_scope)
     }};
 }
 

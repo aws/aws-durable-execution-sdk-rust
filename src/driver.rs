@@ -2325,10 +2325,12 @@ mod spawn_scope_regressions {
     /// creating a deadlock: root waits for the combinator to settle, but the
     /// combinator's `JoinSet` hangs on the parked constituent.
     ///
-    /// With the fix, the constituent's park is redirected to the combinator's
-    /// spawn scope, so `drive_scope` detects suspension and the combinator
-    /// settles as Parked on root, breaking the cycle. The runnable sibling
-    /// spawned alongside must still complete before the invocation suspends.
+    /// With the fix, the constituent's park is redirected to a per-input
+    /// scope the combinator drives (see `spawn_constituent` in
+    /// `combinator.rs`), so the parked input surfaces as an outcome, the
+    /// combinator suspends its own scope, and it settles as Parked on root,
+    /// breaking the cycle. The runnable sibling spawned alongside must still
+    /// complete before the invocation suspends.
     #[tokio::test]
     async fn spawned_combinator_with_parking_input_does_not_deadlock() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));

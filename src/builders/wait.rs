@@ -99,10 +99,12 @@ impl IntoFuture for WaitBuilder {
     type Output = Result<(), OperationError>;
     type IntoFuture = DurableFuture<()>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         use crate::wait::WaitExecution;
 
         preflight_identity!(self, "Wait", crate::wait::WAIT_SUB_TYPE);
+
+        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
 
         let execution = WaitExecution {
             ctx: self.ctx,
@@ -111,6 +113,10 @@ impl IntoFuture for WaitBuilder {
             duration_secs: self.duration_secs,
         };
 
-        DurableFuture::from_async(async move { execution.execute().await })
+        DurableFuture::lazy_scoped(
+            async move { execution.execute().await },
+            owner_scope,
+            op_scope,
+        )
     }
 }

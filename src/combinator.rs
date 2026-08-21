@@ -20,6 +20,15 @@
 //! Losers are dropped (cancelled) when a combinator resolves; each
 //! combinator runs inside a child context so the combined result is
 //! checkpointed atomically.
+//!
+//! Suspension is isolated per input: each constituent runs in its own
+//! suspension scope ([`spawn_constituent`]), so a parked input — a pending
+//! wait, an unresolved callback — never suspends the caller's scope. The
+//! combined outcome is recorded the moment the completion condition is met
+//! (a winner for `race`/`select_ok`, a first error for `try_join_all`),
+//! whatever the losing inputs are doing. The combinator itself suspends
+//! only when no input can make progress: everything still pending has
+//! durably parked and the completion condition is unmet (issue #49).
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -129,6 +138,9 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         }
 
         // Live path: run all futures concurrently, fail-fast on first error.
+        // Each constituent runs under its own suspension scope (see
+        // `drive_constituent`), so a parked input surfaces as `Suspended`
+        // here instead of parking the caller's scope.
         let count = self.futures.len();
         let mut results: Vec<Option<O>> = (0..count).map(|_| None).collect();
         let mut join_set = tokio::task::JoinSet::new();
@@ -139,29 +151,34 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
             std::collections::HashMap::with_capacity(count);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            let task_ownership = self.ctx.task_ownership().clone();
-            let abort = join_set.spawn(async move {
-                bless_current_task(&task_ownership);
-                (idx, future.await)
-            });
+            let abort = spawn_constituent(&self.ctx, &mut join_set, idx, future);
             task_index.insert(abort.id(), idx);
         }
 
         let mut first_error: Option<(usize, OperationError)> = None;
+        let mut parked = 0_usize;
         while let Some(task_result) = join_set.join_next_with_id().await {
             match task_result {
-                Ok((task_id, (idx, Ok(value)))) => {
+                Ok((task_id, (idx, ConstituentOutcome::Settled(Ok(value))))) => {
                     task_index.remove(&task_id);
                     if let Some(slot) = results.get_mut(idx) {
                         *slot = Some(value);
                     }
                 }
-                Ok((task_id, (idx, Err(op_err)))) => {
+                Ok((task_id, (idx, ConstituentOutcome::Settled(Err(op_err))))) => {
                     task_index.remove(&task_id);
                     first_error = Some((idx, op_err));
                     // Abort remaining tasks (fail-fast + loser-drop).
                     join_set.abort_all();
                     break;
+                }
+                Ok((task_id, (_idx, ConstituentOutcome::Parked))) => {
+                    // The input parked its own scope; the join cannot
+                    // complete this invocation, but runnable siblings keep
+                    // going (they checkpoint their own results) and a
+                    // settling error can still fail fast.
+                    task_index.remove(&task_id);
+                    parked += 1;
                 }
                 Err(join_err) => {
                     // JoinError means the task panicked or was cancelled.
@@ -195,6 +212,16 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
             ))
             .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
             .with_wire(wire));
+        }
+
+        // No error, but at least one input is durably parked: nothing left
+        // here can make progress, so the combinator itself suspends. The
+        // settled inputs recorded their own checkpoints, so a later
+        // invocation replays them instantly and resumes only the parked
+        // ones. No combined outcome is recorded — the completion condition
+        // was not met.
+        if parked > 0 {
+            return Ok(self.ctx.suspend_now().await);
         }
 
         // All succeeded — collect results in order.
@@ -305,7 +332,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
         }
 
-        // Live path: run all futures, never short-circuit.
+        // Live path: run all futures, never short-circuit. Each constituent
+        // runs under its own suspension scope (see `drive_constituent`), so
+        // a parked input surfaces as `Parked` here instead of parking the
+        // caller's scope.
         let count = self.futures.len();
         let mut settled: Vec<Option<Settled<O>>> = (0..count).map(|_| None).collect();
         let mut join_set = tokio::task::JoinSet::new();
@@ -315,27 +345,31 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             std::collections::HashMap::with_capacity(count);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            let task_ownership = self.ctx.task_ownership().clone();
-            let abort = join_set.spawn(async move {
-                bless_current_task(&task_ownership);
-                (idx, future.await)
-            });
+            let abort = spawn_constituent(&self.ctx, &mut join_set, idx, future);
             task_index.insert(abort.id(), idx);
         }
 
+        let mut parked = 0_usize;
         while let Some(task_result) = join_set.join_next_with_id().await {
             match task_result {
-                Ok((task_id, (idx, Ok(value)))) => {
+                Ok((task_id, (idx, ConstituentOutcome::Settled(Ok(value))))) => {
                     task_index.remove(&task_id);
                     if let Some(slot) = settled.get_mut(idx) {
                         *slot = Some(Settled::Fulfilled(value));
                     }
                 }
-                Ok((task_id, (idx, Err(op_err)))) => {
+                Ok((task_id, (idx, ConstituentOutcome::Settled(Err(op_err))))) => {
                     task_index.remove(&task_id);
                     if let Some(slot) = settled.get_mut(idx) {
                         *slot = Some(Settled::Rejected(op_err));
                     }
+                }
+                Ok((task_id, (_idx, ConstituentOutcome::Parked))) => {
+                    // The input parked its own scope; its slot stays empty.
+                    // Siblings keep running — a parked input never blocks
+                    // them — and the decision is made after the drain.
+                    task_index.remove(&task_id);
+                    parked += 1;
                 }
                 Err(join_err) => {
                     // Task panicked or was cancelled — record as rejected at
@@ -351,6 +385,15 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
                     }
                 }
             }
+        }
+
+        // At least one input is durably parked: the collection cannot
+        // complete this invocation. Everything runnable already settled
+        // (and checkpointed its own outcome), so suspend and let a later
+        // invocation resume only the parked inputs. No combined outcome is
+        // recorded — `join_all` completes only when every input settles.
+        if parked > 0 {
+            return Ok(self.ctx.suspend_now().await);
         }
 
         // Collect in order.
@@ -472,7 +515,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                 .with_wire(wire));
         }
 
-        // Live path: race all futures, keep going until one succeeds or all fail.
+        // Live path: race all futures, keep going until one succeeds or all
+        // fail. Each constituent runs under its own suspension scope (see
+        // `drive_constituent`), so a parked input surfaces as `Parked` here
+        // instead of parking the caller's scope after a sibling succeeded.
         let count = self.futures.len();
         let mut join_set = tokio::task::JoinSet::new();
         // Maps a task's id back to its input index so a `JoinError` is
@@ -481,20 +527,19 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
             std::collections::HashMap::with_capacity(count);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            let task_ownership = self.ctx.task_ownership().clone();
-            let abort = join_set.spawn(async move {
-                bless_current_task(&task_ownership);
-                (idx, future.await)
-            });
+            let abort = spawn_constituent(&self.ctx, &mut join_set, idx, future);
             task_index.insert(abort.id(), idx);
         }
 
         let mut errors: Vec<(usize, crate::error::Source)> = Vec::new();
+        let mut parked = 0_usize;
 
         while let Some(task_result) = join_set.join_next_with_id().await {
             match task_result {
-                Ok((_task_id, (_idx, Ok(value)))) => {
+                Ok((_task_id, (_idx, ConstituentOutcome::Settled(Ok(value))))) => {
                     // First success — cancel losers (drop via abort_all).
+                    // Parked losers only ever parked their own constituent
+                    // scopes, so recording the winner is not blocked by them.
                     join_set.abort_all();
 
                     // Checkpoint SUCCESS with the winner.
@@ -505,9 +550,16 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                         .await?;
                     return Ok(value);
                 }
-                Ok((task_id, (idx, Err(op_err)))) => {
+                Ok((task_id, (idx, ConstituentOutcome::Settled(Err(op_err))))) => {
                     task_index.remove(&task_id);
                     errors.push((idx, Box::new(op_err)));
+                }
+                Ok((task_id, (_idx, ConstituentOutcome::Parked))) => {
+                    // The input parked its own scope; it may still succeed on
+                    // a later invocation, so it neither wins nor counts as a
+                    // failure now.
+                    task_index.remove(&task_id);
+                    parked += 1;
                 }
                 Err(join_err) => {
                     let Some(idx) = task_index.remove(&join_err.id()) else {
@@ -524,6 +576,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                     ));
                 }
             }
+        }
+
+        // No success yet, and at least one input is durably parked: it may
+        // still deliver the success, so recording `AllFailed` now would be
+        // premature. Suspend; the settled failures replay instantly from
+        // their own checkpoints and only the parked inputs resume.
+        if parked > 0 {
+            return Ok(self.ctx.suspend_now().await);
         }
 
         // All failed — build the aggregate error keeping every loser (in
@@ -632,78 +692,92 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                 .with_wire(wire));
         }
 
-        // Live path: race all futures, first settled wins.
+        // Live path: race all futures, first settled wins. Each constituent
+        // runs under its own suspension scope (see `drive_constituent`), so
+        // a losing input's park surfaces as `Parked` here instead of
+        // suspending the caller after the winner already settled — the
+        // defect that let replay pick a different winner (issue #49).
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            let task_ownership = self.ctx.task_ownership().clone();
-            join_set.spawn(async move {
-                bless_current_task(&task_ownership);
-                (idx, future.await)
-            });
+            spawn_constituent(&self.ctx, &mut join_set, idx, future);
         }
 
-        // Wait for the first completed task. The join set is non-empty
-        // (empty input returned above), so a settled task always arrives.
-        let Some(task_result) = join_set.join_next().await else {
-            return Err(combinator_internal_error(
-                "race: join set drained without a settled future",
-            ));
-        };
+        // Wait for the first SETTLED task; parked inputs do not settle and
+        // do not block a later sibling from winning.
+        while let Some(task_result) = join_set.join_next().await {
+            let settled_result = match task_result {
+                Ok((_idx, ConstituentOutcome::Parked)) => {
+                    // The input parked its own scope; keep waiting for a
+                    // sibling to settle.
+                    continue;
+                }
+                Ok((_idx, ConstituentOutcome::Settled(result))) => Ok(result),
+                Err(join_err) => Err(join_err),
+            };
 
-        // Cancel all remaining losers.
-        join_set.abort_all();
+            // Cancel all remaining losers.
+            join_set.abort_all();
 
-        match task_result {
-            Ok((_idx, Ok(value))) => {
-                // Winner is a success.
-                let serialized = serde_json::to_string(&value).map_err(|e| {
-                    combinator_internal_error(&format!("serialization failed: {e}"))
-                })?;
-                checkpoint_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized).await?;
-                Ok(value)
-            }
-            Ok((_idx, Err(op_err))) => {
-                // Winner is a failure — race propagates it. The losing
-                // error is preserved as the combinator error's source;
-                // the wire `error_type` carries the discriminator so
-                // replay reproduces the same variant, while the message,
-                // `error_data`, and `stack_trace` derive from the loser
-                // itself (pass-through, with a fresh capture only when
-                // the chain recorded none).
-                let wire =
-                    crate::error::wire_error_with_type(&op_err, FIRST_SETTLED_FAILED_ERROR_TYPE);
-                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
-                Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                    CombinatorError::new(
-                        CombinatorErrorKind::FirstSettledFailed,
-                        vec![Box::new(op_err)],
-                    ),
-                ))
-                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
-                .with_wire(wire))
-            }
-            Err(join_err) => {
-                let wire = crate::error::wire_error_manual(
-                    COMBINATOR_ERROR_TYPE,
-                    format!("task join failed: {join_err}"),
-                );
-                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
-                // Attach the checkpointed context so the live error
-                // matches what a replay of this record reconstructs.
-                Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                    CombinatorError::new(
-                        CombinatorErrorKind::Internal,
-                        vec![crate::error::ContextualError::source_from(
-                            "task join failed",
-                            Box::new(join_err) as crate::error::Source,
-                        )],
-                    ),
-                ))
-                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
-                .with_wire(wire))
+            match settled_result {
+                Ok(Ok(value)) => {
+                    // Winner is a success.
+                    let serialized = serde_json::to_string(&value).map_err(|e| {
+                        combinator_internal_error(&format!("serialization failed: {e}"))
+                    })?;
+                    checkpoint_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized)
+                        .await?;
+                    return Ok(value);
+                }
+                Ok(Err(op_err)) => {
+                    // Winner is a failure — race propagates it. The losing
+                    // error is preserved as the combinator error's source;
+                    // the wire `error_type` carries the discriminator so
+                    // replay reproduces the same variant, while the message,
+                    // `error_data`, and `stack_trace` derive from the loser
+                    // itself (pass-through, with a fresh capture only when
+                    // the chain recorded none).
+                    let wire = crate::error::wire_error_with_type(
+                        &op_err,
+                        FIRST_SETTLED_FAILED_ERROR_TYPE,
+                    );
+                    checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+                    return Err(OperationError::from_kind(OperationErrorKind::Combinator(
+                        CombinatorError::new(
+                            CombinatorErrorKind::FirstSettledFailed,
+                            vec![Box::new(op_err)],
+                        ),
+                    ))
+                    .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+                    .with_wire(wire));
+                }
+                Err(join_err) => {
+                    let wire = crate::error::wire_error_manual(
+                        COMBINATOR_ERROR_TYPE,
+                        format!("task join failed: {join_err}"),
+                    );
+                    checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+                    // Attach the checkpointed context so the live error
+                    // matches what a replay of this record reconstructs.
+                    return Err(OperationError::from_kind(OperationErrorKind::Combinator(
+                        CombinatorError::new(
+                            CombinatorErrorKind::Internal,
+                            vec![crate::error::ContextualError::source_from(
+                                "task join failed",
+                                Box::new(join_err) as crate::error::Source,
+                            )],
+                        ),
+                    ))
+                    .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+                    .with_wire(wire));
+                }
             }
         }
+
+        // Every input parked without settling: no winner can be decided
+        // this invocation, so the race itself suspends. Nothing is
+        // recorded — the winner is frozen only once an input settles.
+        Ok(self.ctx.suspend_now().await)
     }
 }
 
@@ -722,6 +796,45 @@ pub(crate) fn bless_current_task(task_ownership: &TaskOwnership) {
     if let Some(task_id) = tokio::task::try_id() {
         task_ownership.bless_task(task_id);
     }
+}
+
+/// How one combinator input ended within this invocation.
+enum ConstituentOutcome<O> {
+    /// The input resolved with a success or a failure.
+    Settled(Result<O, OperationError>),
+    /// The input durably parked; only a later invocation can resume it.
+    Parked,
+}
+
+/// Spawns one combinator input onto `join_set`, isolated in its own
+/// suspension scope.
+///
+/// The input's park is redirected onto a fresh child scope (via
+/// [`DurableFuture::set_park_scope`]) which
+/// [`drive_scope`](crate::driver::drive_scope) observes on the spawned
+/// task, so a parking input completes its task with
+/// [`ConstituentOutcome::Parked`] instead of parking the caller's scope.
+/// This is what keeps a losing input's suspension from ending the
+/// invocation after a winner already settled (issue #49), and what lets
+/// the combinator decide for itself when no input can make progress.
+fn spawn_constituent<O: Send + 'static>(
+    ctx: &DurableContext,
+    join_set: &mut tokio::task::JoinSet<(usize, ConstituentOutcome<O>)>,
+    idx: usize,
+    future: DurableFuture<O>,
+) -> tokio::task::AbortHandle {
+    use crate::driver::{ScopeOutcome, drive_scope};
+
+    let scope = std::sync::Arc::new(ctx.suspension_signal().new_child_scope());
+    future.set_park_scope(std::sync::Arc::clone(&scope));
+    let task_ownership = ctx.task_ownership().clone();
+    join_set.spawn(async move {
+        bless_current_task(&task_ownership);
+        match drive_scope(future, scope).await {
+            ScopeOutcome::Completed(result) => (idx, ConstituentOutcome::Settled(result)),
+            ScopeOutcome::Suspended => (idx, ConstituentOutcome::Parked),
+        }
+    })
 }
 
 /// Refuses a combinator's terminal checkpoint once an execution-fatal error

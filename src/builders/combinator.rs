@@ -96,7 +96,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<Vec<O>> {
-        spawn_combinator_terminal!(self)
+        spawn_terminal!(self)
     }
 }
 
@@ -106,10 +106,12 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         use crate::combinator::TryJoinAllExecution;
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+
+        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
 
         let execution = TryJoinAllExecution {
             ctx: self.ctx,
@@ -118,7 +120,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::from_async(async move { execution.execute().await })
+        DurableFuture::lazy_scoped(
+            async move { execution.execute().await },
+            owner_scope,
+            op_scope,
+        )
     }
 }
 
@@ -203,7 +209,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<Vec<Settled<O>>> {
-        spawn_combinator_terminal!(self)
+        spawn_terminal!(self)
     }
 }
 
@@ -213,10 +219,12 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     type Output = Result<Vec<Settled<O>>, OperationError>;
     type IntoFuture = DurableFuture<Vec<Settled<O>>>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         use crate::combinator::JoinAllExecution;
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+
+        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
 
         let execution = JoinAllExecution {
             ctx: self.ctx,
@@ -225,7 +233,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::from_async(async move { execution.execute().await })
+        DurableFuture::lazy_scoped(
+            async move { execution.execute().await },
+            owner_scope,
+            op_scope,
+        )
     }
 }
 
@@ -307,7 +319,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<O> {
-        spawn_combinator_terminal!(self)
+        spawn_terminal!(self)
     }
 }
 
@@ -317,10 +329,12 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         use crate::combinator::SelectOkExecution;
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+
+        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
 
         let execution = SelectOkExecution {
             ctx: self.ctx,
@@ -329,7 +343,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::from_async(async move { execution.execute().await })
+        DurableFuture::lazy_scoped(
+            async move { execution.execute().await },
+            owner_scope,
+            op_scope,
+        )
     }
 }
 
@@ -411,7 +429,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
     /// the replay-safe alternative to bare `tokio::spawn` for
     /// durable operations.
     pub fn spawn(self) -> DurableFuture<O> {
-        spawn_combinator_terminal!(self)
+        spawn_terminal!(self)
     }
 }
 
@@ -421,10 +439,12 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         use crate::combinator::RaceExecution;
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+
+        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
 
         let execution = RaceExecution {
             ctx: self.ctx,
@@ -433,6 +453,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::from_async(async move { execution.execute().await })
+        DurableFuture::lazy_scoped(
+            async move { execution.execute().await },
+            owner_scope,
+            op_scope,
+        )
     }
 }

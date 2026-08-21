@@ -264,10 +264,12 @@ where
     type Output = Result<S, OperationError>;
     type IntoFuture = DurableFuture<S>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         use crate::wait_for_condition::WaitForConditionExecution;
 
         preflight_identity!(self, "Step", crate::wait_for_condition::WFC_SUB_TYPE);
+
+        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
 
         let execution = WaitForConditionExecution {
             ctx: self.ctx,
@@ -279,7 +281,11 @@ where
             check: self.check,
         };
 
-        DurableFuture::from_async(async move { execution.execute().await })
+        DurableFuture::lazy_scoped(
+            async move { execution.execute().await },
+            owner_scope,
+            op_scope,
+        )
     }
 }
 

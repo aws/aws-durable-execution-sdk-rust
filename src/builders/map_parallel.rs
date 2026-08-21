@@ -344,10 +344,12 @@ where
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         use crate::map_parallel::MapExecution;
 
         preflight_identity!(self, "Context", crate::map_parallel::MAP_SUB_TYPE);
+
+        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
 
         let execution = MapExecution {
             ctx: self.ctx,
@@ -364,7 +366,11 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::from_async(async move { execution.execute().await })
+        DurableFuture::lazy_scoped(
+            async move { execution.execute().await },
+            owner_scope,
+            op_scope,
+        )
     }
 }
 
@@ -646,10 +652,12 @@ where
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         use crate::map_parallel::ParallelExecution;
 
         preflight_identity!(self, "Context", crate::map_parallel::PARALLEL_SUB_TYPE);
+
+        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
 
         let execution = ParallelExecution {
             ctx: self.ctx,
@@ -663,7 +671,11 @@ where
             branches: self.branches,
         };
 
-        DurableFuture::from_async(async move { execution.execute().await })
+        DurableFuture::lazy_scoped(
+            async move { execution.execute().await },
+            owner_scope,
+            op_scope,
+        )
     }
 }
 
