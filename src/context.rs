@@ -554,6 +554,17 @@ impl DurableContext {
         );
     }
 
+    /// Peeks at the operation identity `offset` positions ahead of the next
+    /// mint in this namespace, without advancing the counter or touching
+    /// the replay span.
+    ///
+    /// Terminal-batch replay uses this to derive the child IDs a prior live
+    /// run minted: reading them non-destructively lets a failed replay
+    /// attempt fall back to re-execution with the counter untouched.
+    pub(crate) fn peek_id_at(&self, offset: usize) -> OperationId {
+        self.inner.engine.id_counter.peek_at(offset as u64)
+    }
+
     /// Returns a reference to the suspension signal for this context.
     ///
     /// Operations use this to request suspension when they cannot proceed.
@@ -613,6 +624,11 @@ impl DurableContext {
 
     /// Returns whether a checkpoint record exists for the given positional
     /// ID, without cloning anything.
+    ///
+    /// Production operation paths read record presence through
+    /// [`Self::checkpoint_view_validated`] (which also validates identity);
+    /// this direct form is retained for unit tests.
+    #[cfg(test)]
     pub(crate) fn has_checkpoint_record(&self, positional_id: &str) -> bool {
         let wire_id = crate::engine::compute_wire_id_public(positional_id);
         self.inner.engine.checkpoint_log.contains(&wire_id)

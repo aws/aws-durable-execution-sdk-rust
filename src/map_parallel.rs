@@ -60,10 +60,11 @@ const REPLAY_CHILDREN_SENTINEL: &str = "__replay_children_reexecute__";
 /// batch summary payload and the child records agree on error identity.
 const CHILD_FN_ERROR_TYPE: &str = "ChildFnError";
 
-/// The terminal status of one item or branch in a batch operation.
+/// The status of one item or branch in a batch operation.
 ///
 /// Each item in a [`BatchResult`] has a status indicating whether it
-/// completed successfully or failed.
+/// completed successfully, failed, or had started but not yet reached a
+/// terminal state when the batch completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BatchItemStatus {
@@ -71,6 +72,13 @@ pub enum BatchItemStatus {
     Succeeded,
     /// The item failed.
     Failed,
+    /// The item had started but was not terminal when the batch completed.
+    ///
+    /// Reported on replay from the batch decision record's started set:
+    /// the item began under the live run but a completion trigger settled
+    /// the batch before it finished. It carries no result and no error,
+    /// and its child checkpoints are never consulted.
+    Started,
 }
 
 /// The outcome of one item or branch in a batch operation.
@@ -287,6 +295,23 @@ impl CompletionReason {
             "FAILURE_TOLERANCE_EXCEEDED" => Self::FailureToleranceExceeded,
             "PREDICATE_MATCHED" => Self::PredicateMatched,
             _ => Self::AllCompleted,
+        }
+    }
+
+    /// Strictly parses the wire representation, returning `None` for a
+    /// string this SDK never writes.
+    ///
+    /// The batch decision record uses this instead of [`Self::from_wire`]:
+    /// a decision record is SDK-owned bookkeeping whose reason replay
+    /// reports verbatim, so an unrecognized value there is corruption to
+    /// reject, not a future variant to tolerate.
+    pub(crate) fn try_from_wire(s: &str) -> Option<Self> {
+        match s {
+            "ALL_COMPLETED" => Some(Self::AllCompleted),
+            "MIN_SUCCESSFUL_REACHED" => Some(Self::MinSuccessfulReached),
+            "FAILURE_TOLERANCE_EXCEEDED" => Some(Self::FailureToleranceExceeded),
+            "PREDICATE_MATCHED" => Some(Self::PredicateMatched),
+            _ => None,
         }
     }
 }
@@ -789,6 +814,10 @@ fn collect_successful<O>(batch_result: BatchResult<O>) -> Result<Vec<O>, Operati
                 }
                 // Within tolerance: skip this item in the Vec<O> output.
             }
+            // Started-but-not-terminal at batch completion (replayed from
+            // the decision record): carries no value, so it is skipped in
+            // the Vec<O> success view exactly like a tolerated failure.
+            BatchItemStatus::Started => {}
         }
     }
     // Check if the batch itself failed due to tolerance exceeded.
@@ -807,6 +836,12 @@ struct PreClaimed {
     index: usize,
     op_id: OperationId,
     is_terminal: bool,
+    /// Whether the checkpoint log holds ANY record for this child — a
+    /// terminal record or a `Started` one from a prior invocation. Drives
+    /// two decisions at dispatch: a child with a record never gets a second
+    /// `Start` write, and a recorded child counts as "ever started" in the
+    /// batch decision record.
+    has_record: bool,
 }
 
 /// Per-in-flight-branch metadata the coordinator retains so it can record a
@@ -855,7 +890,6 @@ struct ItemRequest<IS> {
     child_op_id: OperationId,
     index: usize,
     is_terminal: bool,
-    start_checkpointed: bool,
     parent_wire: String,
     child_sub_type: String,
     item_name: String,
@@ -928,33 +962,11 @@ where
         return Ok(ItemPrelude::Run { child_ctx });
     }
 
-    // Check if we need to checkpoint START for this child.
-    // Skip if the caller already checkpointed START synchronously (for
-    // concurrency safety).
-    if !req.start_checkpointed && !req.ctx.has_checkpoint_record(&child_positional) {
-        let update = build_child_update(
-            &child_wire,
-            &req.item_name,
-            &req.child_sub_type,
-            &req.parent_wire,
-            OperationAction::Start,
-        );
-        if let Err(err) = req.ctx.checkpoint_updates(vec![update]).await {
-            // Audit (#43) — batch child START: the item closure has not
-            // run, so no terminal FAIL is needed; re-invocation
-            // reconverges on the same write. Routing unrecoverable (not
-            // as an item failure) matters doubly here: a tolerant
-            // completion config must not absorb a checkpoint failure.
-            return req
-                .ctx
-                .checkpoint_failure_unrecoverable(&child_wire, err, None)
-                .await;
-        }
-    }
-
     // Create child context with its OWN suspension scope so a park inside
     // the body is caught locally as Suspended instead of tearing down the
-    // whole invocation.
+    // whole invocation. The child's `Start` was already checkpointed by the
+    // coordinator at dispatch (the coordinator is the sole writer of child
+    // starts; see `execute_batch`), or exists from a prior invocation.
     Ok(ItemPrelude::Run {
         child_ctx: req.ctx.new_scoped_child(&child_positional),
     })
@@ -1370,6 +1382,12 @@ struct BatchProgress<O> {
     suspended_count: usize,
     /// Whether ANY branch parked this invocation.
     any_suspended: bool,
+    /// Which items were EVER admitted — dispatched live this invocation, or
+    /// holding a checkpoint record from a prior one. Ordered admission makes
+    /// this a contiguous prefix of the input, and its length is the
+    /// `totalCount` the batch decision record carries: the number of items
+    /// ever started, NOT the input length.
+    started: Vec<bool>,
 }
 
 impl<O> BatchProgress<O> {
@@ -1379,6 +1397,14 @@ impl<O> BatchProgress<O> {
             results: (0..total_items).map(|_| None).collect(),
             suspended_count: 0,
             any_suspended: false,
+            started: vec![false; total_items],
+        }
+    }
+
+    /// Marks one item as ever admitted (see [`Self::started`]).
+    fn mark_started(&mut self, index: usize) {
+        if let Some(slot) = self.started.get_mut(index) {
+            *slot = true;
         }
     }
 
@@ -1593,7 +1619,6 @@ where
                     child_op_id: op_id.clone(),
                     index,
                     is_terminal: true,
-                    start_checkpointed: false,
                     parent_wire: self.parent_wire.to_owned(),
                     child_sub_type: self.child_sub_type.to_owned(),
                     item_name: item_name.to_owned(),
@@ -1713,6 +1738,12 @@ where
     // Identity validation and the status read happen in one read-guard pass;
     // the terminal payload/error projection is cloned only when the batch is
     // actually terminal and must be replayed.
+    // When the parent is terminal with `replay_children` and its payload
+    // parses as a batch decision record, replay OBEYS the record instead of
+    // re-deriving the outcome. `Some` constrains the re-execution below to
+    // the recorded admission set and completion reason.
+    let mut replay_plan: Option<ReplayPlan> = None;
+
     if let Some(view) = ctx.checkpoint_view_validated(
         &parent_positional,
         &parent_wire,
@@ -1725,51 +1756,46 @@ where
                 .checkpoint_terminal_replay(&parent_positional)
                 .ok_or_else(|| batch_error("terminal batch has no checkpoint record"))?;
             let serdes_ctx = SerdesContext::new(&parent_wire, ctx.execution_arn());
-            match replay_terminal_batch(
-                &ctx,
-                &snapshot,
-                &parent_positional,
-                total_items,
-                &serdes,
-                &result_serdes,
-                &serdes_ctx,
-            )
-            .await
+
+            // A successful batch too large to checkpoint inline recorded a
+            // decision record (`totalCount`, `completionReason`, index set)
+            // instead of its payload. A record-less `replay_children`
+            // payload — written by an older SDK — falls through to the
+            // unconstrained re-execution, exactly as before; a non-empty
+            // payload that fails to parse is corrupt and fails the replay
+            // instead of falling back.
+            let decision = if matches!(snapshot.status, CheckpointStatus::Succeeded)
+                && snapshot.replay_children
             {
-                Ok(result) => {
-                    // Recorded terminal batch summary returned without
-                    // re-running the batch (see `crate::observability`).
-                    ctx.emit_operation_replayed(
-                        &parent_wire,
-                        parent_name.as_deref(),
-                        "Context",
-                        Some(parent_sub_type),
-                        view.attempt,
-                    );
-                    // Advance the parent counter past the iteration IDs that
-                    // were consumed during the original execution. Sequential
-                    // (concurrency=1) only claims started items; concurrent
-                    // claims all items upfront.
-                    let concurrency = max_concurrency.unwrap_or(total_items).max(1);
-                    if concurrency == 1 {
-                        ctx.advance_counter(result.items.len());
-                    } else {
-                        ctx.advance_counter(total_items);
-                    }
-                    return Ok(result);
-                }
-                Err(e) => {
-                    // ReplayChildren sentinel: fall through to re-execution.
-                    // The children's operations are still in the checkpoint
-                    // log, so re-executing the batch will replay each child
-                    // from its terminal record.
-                    let is_replay_children =
-                        crate::error::chain_string(&e).contains(REPLAY_CHILDREN_SENTINEL);
-                    if !is_replay_children {
-                        // A recorded batch FAILURE replays as this error; an
-                        // internal replay problem (missing/corrupt payload)
-                        // is not a replayed outcome and emits nothing.
-                        if matches!(snapshot.status, CheckpointStatus::Failed) {
+                parse_decision_record(snapshot.result.as_deref())?
+            } else {
+                None
+            };
+
+            if let Some(record) = decision {
+                let plan = ReplayPlan::from_record(&record, total_items)?;
+                let concurrency = max_concurrency.unwrap_or(total_items).max(1);
+                // Fast path (Normal nesting): decode every completed item
+                // straight from its child record (after validating each
+                // child's replay identity), report items in the started
+                // set as STARTED without consulting their child
+                // checkpoints, and omit every index at or beyond
+                // `totalCount`. Flat items have no
+                // child records, so Flat always reconstructs through the
+                // plan-constrained re-execution below.
+                if nesting != NestingMode::Flat {
+                    match replay_batch_from_record(
+                        &ctx,
+                        &plan,
+                        item_namer.as_ref(),
+                        &serdes,
+                        child_sub_type,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            // Recorded terminal batch returned without
+                            // re-running the batch.
                             ctx.emit_operation_replayed(
                                 &parent_wire,
                                 parent_name.as_deref(),
@@ -1777,11 +1803,92 @@ where
                                 Some(parent_sub_type),
                                 view.attempt,
                             );
+                            // Counter parity with the live run: concurrent
+                            // pre-claims an ID per input item; sequential
+                            // minted one per ADMITTED item, and ordered
+                            // admission makes that exactly `totalCount`.
+                            if concurrency == 1 {
+                                ctx.advance_counter(plan.total_count);
+                            } else {
+                                ctx.advance_counter(total_items);
+                            }
+                            return Ok(result);
                         }
-                        return Err(e);
+                        Err(e) => {
+                            let is_replay_children =
+                                crate::error::chain_string(&e).contains(REPLAY_CHILDREN_SENTINEL);
+                            if !is_replay_children {
+                                return Err(e);
+                            }
+                            // A completed CHILD whose own result was too
+                            // large to checkpoint inline: reconstruct it by
+                            // re-execution, still constrained by the plan.
+                        }
                     }
-                    // Fall through: the batch parent is terminal but we need
-                    // to re-execute children to reconstruct the result.
+                }
+                replay_plan = Some(plan);
+                // Fall through: re-execute ONLY the recorded admission set.
+            } else {
+                match replay_terminal_batch(
+                    &ctx,
+                    &snapshot,
+                    &parent_positional,
+                    total_items,
+                    &serdes,
+                    &result_serdes,
+                    &serdes_ctx,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        // Recorded terminal batch summary returned without
+                        // re-running the batch (see `crate::observability`).
+                        ctx.emit_operation_replayed(
+                            &parent_wire,
+                            parent_name.as_deref(),
+                            "Context",
+                            Some(parent_sub_type),
+                            view.attempt,
+                        );
+                        // Advance the parent counter past the iteration IDs
+                        // that were consumed during the original execution.
+                        // Sequential (concurrency=1) only claims started
+                        // items; concurrent claims all items upfront.
+                        let concurrency = max_concurrency.unwrap_or(total_items).max(1);
+                        if concurrency == 1 {
+                            ctx.advance_counter(result.items.len());
+                        } else {
+                            ctx.advance_counter(total_items);
+                        }
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        // ReplayChildren sentinel: fall through to
+                        // re-execution. The children's operations are still
+                        // in the checkpoint log, so re-executing the batch
+                        // will replay each child from its terminal record.
+                        let is_replay_children =
+                            crate::error::chain_string(&e).contains(REPLAY_CHILDREN_SENTINEL);
+                        if !is_replay_children {
+                            // A recorded batch FAILURE replays as this
+                            // error; an internal replay problem
+                            // (missing/corrupt payload) is not a replayed
+                            // outcome and emits nothing.
+                            if matches!(snapshot.status, CheckpointStatus::Failed) {
+                                ctx.emit_operation_replayed(
+                                    &parent_wire,
+                                    parent_name.as_deref(),
+                                    "Context",
+                                    Some(parent_sub_type),
+                                    view.attempt,
+                                );
+                            }
+                            return Err(e);
+                        }
+                        // Fall through: the batch parent is terminal but we
+                        // need to re-execute children to reconstruct the
+                        // result.
+                    }
                 }
             }
         }
@@ -1819,12 +1926,18 @@ where
             SerdesContext::new(&parent_wire, ctx.execution_arn()),
         )
         .await?;
+        let decision_json = serialize_decision_record(&build_decision_record(
+            &result.items,
+            0,
+            CompletionReason::AllCompleted,
+        ))?;
         checkpoint_batch_success_serialized(
             &ctx,
             &parent_wire,
             parent_name.as_deref(),
             parent_sub_type,
             &serialized_payload,
+            &decision_json,
         )
         .await?;
         return Ok(result);
@@ -1842,7 +1955,10 @@ where
     // 6. Pre-claim child IDs.
     // For concurrency > 1 (concurrent path): claim ALL child IDs upfront
     // on the owning task (determinism rule 4 — deterministic ID ordering
-    // regardless of completion order).
+    // regardless of completion order). Claiming is LOCAL — no `Start` is
+    // checkpointed here; the coordinator writes each child's `Start` at
+    // dispatch, so a child is admitted (and recorded) only when a
+    // concurrency slot is actually free for it.
     // For concurrency == 1 (sequential path): mint IDs lazily, one at a
     // time inside the loop, so only STARTED items consume IDs
     // and the service doesn't see dangling operations for never-started
@@ -1851,64 +1967,51 @@ where
     if concurrency > 1 {
         for i in 0..total_items {
             let child_op_id = ctx.mint_id();
-            let child_positional = child_op_id.positional().to_owned();
-            let child_wire = child_op_id.wire().to_owned();
-            let child_name = item_namer.as_ref().map(|namer| namer(i));
-            // Non-determinism detection on child items happens inside the
-            // validated view fetch; only the status is consumed here.
-            let is_terminal = ctx
-                .checkpoint_view_validated(
+            // Under a replay plan, only indexes the record admits as
+            // COMPLETED have their child checkpoints consulted. Started-set
+            // entries are reconstructed from the record alone and
+            // never-started entries are omitted, so reading (and
+            // identity-validating) their views here would violate the
+            // record's contract and could raise a spurious
+            // non-determinism error for a record replay never touches.
+            // The ID is still minted above for counter parity with the
+            // live run, which claims one per input item.
+            let consult_checkpoint = replay_plan.as_ref().is_none_or(|plan| plan.admits(i));
+            let (has_record, is_terminal) = if consult_checkpoint {
+                let child_positional = child_op_id.positional().to_owned();
+                let child_wire = child_op_id.wire().to_owned();
+                let child_name = item_namer.as_ref().map(|namer| namer(i));
+                // Non-determinism detection on child items happens inside
+                // the validated view fetch; only the status is consumed
+                // here.
+                let view = ctx.checkpoint_view_validated(
                     &child_positional,
                     &child_wire,
                     "Context",
                     Some(child_sub_type),
                     child_name.as_deref(),
-                )?
-                .is_some_and(|view| view.status.is_terminal());
+                )?;
+                (view.is_some(), view.is_some_and(|v| v.status.is_terminal()))
+            } else {
+                (false, false)
+            };
             pre_claimed.push(PreClaimed {
                 index: i,
                 op_id: child_op_id,
                 is_terminal,
+                has_record,
             });
         }
     }
 
     // 7. Execute items with bounded concurrency, branch-local suspension, and
-    // slot-holding accounting.
-
-    // 7a. For concurrent mode: checkpoint ALL child STARTs synchronously
-    // BEFORE dispatching any tasks. This prevents token rotation races
-    // between the main loop and spawned tasks: all child STARTs are
-    // checkpointed on the owning task before any spawned task runs.
-    if concurrency > 1 {
-        for pre in &pre_claimed {
-            if !pre.is_terminal
-                && nesting != NestingMode::Flat
-                && !ctx.has_checkpoint_record(pre.op_id.positional())
-            {
-                let child_wire = pre.op_id.wire().to_owned();
-                let item_name_str = item_namer
-                    .as_ref()
-                    .map_or_else(String::new, |namer| namer(pre.index));
-                let update = build_child_update(
-                    &child_wire,
-                    &item_name_str,
-                    child_sub_type,
-                    &parent_wire,
-                    OperationAction::Start,
-                );
-                if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43) — pre-claimed batch child START: the
-                    // item closure has not run, so no terminal FAIL is
-                    // needed; re-invocation reconverges on the same
-                    // write.
-                    return ctx
-                        .checkpoint_failure_unrecoverable(&child_wire, err, None)
-                        .await;
-                }
-            }
-        }
-    }
+    // slot-holding accounting. Admission is ordered and LAZY: the
+    // coordinator — the sole writer of child starts — checkpoints each
+    // child's `Start` at the moment it dispatches that child, in index
+    // order, as concurrency slots free up. No child `Start` is written
+    // before its item is about to run, so an early completion trigger or a
+    // failure part-way leaves no starts recorded for children that never
+    // ran.
 
     // Coordinator loop. In-flight = running + suspended, bounded by
     // `concurrency`: a SUSPENDED branch KEEPS its slot (only terminal
@@ -1938,6 +2041,16 @@ where
     let mut progress = BatchProgress::<O>::new(total_items);
     let mut running: usize = 0;
     let mut next_index: usize = 0;
+
+    // A child holding ANY checkpoint record was admitted by a prior
+    // invocation — it counts toward the "ever started" prefix the decision
+    // record carries even if a completion trigger keeps this invocation
+    // from re-dispatching it.
+    for pre in &pre_claimed {
+        if pre.has_record {
+            progress.mark_started(pre.index);
+        }
+    }
 
     let env = BatchEnv {
         ctx: &ctx,
@@ -1974,6 +2087,15 @@ where
             if !pre.is_terminal {
                 continue;
             }
+            // Under a replay plan only the recorded admission set
+            // contributes to the result (a terminal record outside it
+            // cannot exist for a well-formed record; skipping is
+            // defensive).
+            if let Some(plan) = &replay_plan
+                && !plan.admits(i)
+            {
+                continue;
+            }
             let item_name = item_namer
                 .as_ref()
                 .map_or_else(String::new, |namer| namer(i));
@@ -1993,13 +2115,49 @@ where
         // Dispatch while capacity remains and not-started eligible work exists.
         // A completion trigger (`tracker.stop_reason`) halts new dispatch;
         // already-running branches are still drained below (in-flight
-        // branches always complete).
-        while progress.tracker.stop_reason.is_none()
+        // branches always complete). Under a replay plan the trigger check
+        // is bypassed: the recorded admission set IS the outcome being
+        // reproduced, so every admitted item is dispatched regardless of
+        // what the thresholds would re-derive, and the recorded reason is
+        // taken verbatim below.
+        while (replay_plan.is_some() || progress.tracker.stop_reason.is_none())
             && next_index < total_items
             && running + progress.suspended_count < concurrency
         {
             let i = next_index;
             next_index += 1;
+
+            // Under a replay plan, everything outside the recorded
+            // admission set is resolved from the record alone: an index at
+            // or beyond `totalCount` never started and is omitted; an
+            // index in the started set was non-terminal when the batch
+            // completed and is reported as STARTED — with no result and no
+            // error, its child checkpoints never consulted. A started-set
+            // item still consumed an ID on the live sequential path, so
+            // its counter position is skipped rather than reused.
+            if let Some(plan) = &replay_plan
+                && !plan.admits(i)
+            {
+                if i < plan.total_count {
+                    let item_name = item_namer
+                        .as_ref()
+                        .map_or_else(String::new, |namer| namer(i));
+                    if let Some(slot) = progress.results.get_mut(i) {
+                        *slot = Some(BatchItem {
+                            index: i,
+                            name: item_name,
+                            status: BatchItemStatus::Started,
+                            result: None,
+                            error_message: None,
+                            error_type: None,
+                        });
+                    }
+                    if concurrency == 1 {
+                        ctx.advance_counter(1);
+                    }
+                }
+                continue;
+            }
 
             // Concurrent mode: recorded-terminal children were already
             // applied by the replay pass above — skip them here.
@@ -2018,6 +2176,7 @@ where
                     index: pre.index,
                     op_id: pre.op_id.clone(),
                     is_terminal: pre.is_terminal,
+                    has_record: pre.has_record,
                 }
             } else {
                 let child_op_id = ctx.mint_id();
@@ -2026,21 +2185,27 @@ where
                 let child_name = item_namer.as_ref().map(|namer| namer(i));
                 // Non-determinism detection on child items happens inside
                 // the validated view fetch; only the status is consumed.
-                let is_terminal = ctx
-                    .checkpoint_view_validated(
-                        &child_positional,
-                        &child_wire,
-                        "Context",
-                        Some(child_sub_type),
-                        child_name.as_deref(),
-                    )?
-                    .is_some_and(|view| view.status.is_terminal());
+                let view = ctx.checkpoint_view_validated(
+                    &child_positional,
+                    &child_wire,
+                    "Context",
+                    Some(child_sub_type),
+                    child_name.as_deref(),
+                )?;
+                let has_record = view.is_some();
+                let is_terminal = view.is_some_and(|v| v.status.is_terminal());
                 PreClaimed {
                     index: i,
                     op_id: child_op_id,
                     is_terminal,
+                    has_record,
                 }
             };
+
+            // The item is admitted: it enters the "ever started" prefix the
+            // batch decision record reports (recorded-terminal items were
+            // started by the invocation that recorded them).
+            progress.mark_started(i);
 
             // Recorded-terminal child (sequential path only — the
             // concurrent path applied its recorded terminals in the replay
@@ -2065,9 +2230,6 @@ where
                 continue;
             }
 
-            let start_checkpointed =
-                concurrency > 1 && !pc.is_terminal && nesting != NestingMode::Flat;
-
             // Compute the item name in the coordinator so it is available both
             // for the branch body and for a controlled-failure checkpoint if
             // the branch task ends via a `JoinError`.
@@ -2077,12 +2239,39 @@ where
             let branch_index = pc.index;
             let branch_wire = pc.op_id.wire().to_owned();
 
+            // Ordered lazy admission: the coordinator — the sole writer of
+            // child starts — checkpoints this child's `Start` NOW, at
+            // dispatch, just before spawning its body. Writing on the
+            // owning task (never inside the spawned task) keeps every
+            // start committed before the child's own writes, and no start
+            // exists for a child that never ran. A child holding a record
+            // from a prior invocation resumes without a second `Start`.
+            if nesting != NestingMode::Flat && !pc.has_record {
+                let update = build_child_update(
+                    &branch_wire,
+                    &item_name,
+                    &child_sub_type_owned,
+                    &parent_wire,
+                    OperationAction::Start,
+                );
+                if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+                    // Audit (#43) — batch child START: the item closure has
+                    // not run, so no terminal FAIL is needed; re-invocation
+                    // reconverges on the same write. Routing unrecoverable
+                    // (not as an item failure) matters doubly here: a
+                    // tolerant completion config must not absorb a
+                    // checkpoint failure.
+                    return ctx
+                        .checkpoint_failure_unrecoverable(&branch_wire, err, None)
+                        .await;
+                }
+            }
+
             let req = ItemRequest {
                 ctx: ctx.clone(),
                 child_op_id: pc.op_id,
                 index: branch_index,
                 is_terminal: pc.is_terminal,
-                start_checkpointed,
                 parent_wire: parent_wire.clone(),
                 child_sub_type: child_sub_type_owned.clone(),
                 item_name: item_name.clone(),
@@ -2124,6 +2313,7 @@ where
         tracker,
         results,
         any_suspended,
+        started,
         ..
     } = progress;
 
@@ -2135,14 +2325,30 @@ where
     // coordinator future is dropped at teardown, aborting the guards.
     // Started-not-terminal children replay on the next invocation. When a
     // trigger DID fire, parked branches are excluded (like never-started
-    // work) and the batch completes normally.
-    if any_suspended && tracker.stop_reason.is_none() {
+    // work) and the batch completes normally. Under a replay plan the
+    // trigger state is not consulted (thresholds re-fire spuriously on
+    // recorded outcomes): a parked reconstruction always suspends, so an
+    // admitted item is never silently dropped from a recorded result.
+    if any_suspended && (replay_plan.is_some() || tracker.stop_reason.is_none()) {
         return Ok(ctx.suspend_now::<BatchResult<O>>().await);
     }
 
-    // 9. Assemble results in input order (only terminal items; suspended and
-    // never-started branches are omitted).
+    // 9. Assemble results in input order (terminal items; suspended and
+    // never-started branches are omitted — except under a replay plan,
+    // where the record's started set appears as STARTED items).
     let final_items: Vec<BatchItem<O>> = results.into_iter().flatten().collect();
+
+    // 8b. Under a replay plan, the batch outcome is already durably
+    // recorded: the reason is taken verbatim from the decision record and
+    // NOTHING is re-checkpointed — the record being obeyed is the parent's
+    // terminal state. `final_items` holds the recorded admission set's
+    // reconstructed outcomes.
+    if let Some(plan) = replay_plan {
+        return Ok(BatchResult {
+            items: final_items,
+            reason: plan.reason,
+        });
+    }
 
     // 10. Determine completion reason: the first trigger to fire during the
     // run (recorded at the settle event that fired it — first trigger wins),
@@ -2173,6 +2379,12 @@ where
         }
     });
 
+    // Ordered admission makes the ever-started set the contiguous prefix
+    // `[0, ever_started)`: its length is the `totalCount` the decision
+    // record carries — the number of items ever started, NOT the input
+    // length.
+    let ever_started = started.iter().rposition(|s| *s).map_or(0, |i| i + 1);
+
     let batch_result = BatchResult {
         items: final_items,
         reason,
@@ -2193,6 +2405,15 @@ where
     )
     .await?;
 
+    // The decision record travels alongside the payload: when the payload
+    // is too large to checkpoint inline, the record is written in its place
+    // so replay can obey the recorded outcome instead of re-deriving it.
+    let decision_json = serialize_decision_record(&build_decision_record(
+        &batch_result.items,
+        ever_started,
+        batch_result.reason,
+    ))?;
+
     // 12. Checkpoint the parent SUCCEED.
     checkpoint_batch_success_serialized(
         &ctx,
@@ -2200,6 +2421,7 @@ where
         parent_name.as_deref(),
         parent_sub_type,
         &serialized_payload,
+        &decision_json,
     )
     .await?;
 
@@ -2329,16 +2551,303 @@ where
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Batch decision record (large-result path)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The SDK-owned decision record a batch checkpoints in place of a result
+/// payload too large to store inline.
+///
+/// Mirrors the Python SDK's summary envelope: `totalCount` is the number of
+/// items EVER STARTED — not the input length; ordered admission makes the
+/// started set the contiguous prefix `[0, totalCount)` — `completionReason`
+/// is the wire form of [`CompletionReason`], and one of `startedIndexes` /
+/// `completedIndexes` (whichever is shorter) names the partition of that
+/// prefix: `startedIndexes` lists items that began but were not terminal
+/// when the batch completed, `completedIndexes` lists the terminal ones.
+/// The read side accepts either form and reconstructs the other against the
+/// same prefix, so the record stays compact at both early-exit extremes.
+///
+/// The record is plain JSON and deliberately BYPASSES `result_serdes`,
+/// matching Python: it is the SDK's own bookkeeping, carries no user-typed
+/// values, and must stay readable even when the configured serdes is the
+/// reason the real payload outgrew the checkpoint limit. `replay_children`
+/// on the parent record is the discriminator — a `replay_children` payload
+/// is a decision record; a plain payload is the serdes-transformed batch
+/// summary.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct BatchDecisionRecord {
+    /// Number of items ever started (the admitted prefix length).
+    #[serde(rename = "totalCount")]
+    total_count: usize,
+    /// Wire form of the batch's [`CompletionReason`], taken verbatim by
+    /// replay.
+    #[serde(rename = "completionReason")]
+    completion_reason: String,
+    /// Indexes (within `[0, totalCount)`) of items that began but were not
+    /// terminal when the batch completed. Written only when it is the
+    /// shorter set.
+    #[serde(
+        rename = "startedIndexes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    started_indexes: Option<Vec<usize>>,
+    /// Indexes (within `[0, totalCount)`) of items that reached a terminal
+    /// state. Written only when it is the shorter set.
+    #[serde(
+        rename = "completedIndexes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    completed_indexes: Option<Vec<usize>>,
+}
+
+/// Builds the decision record for a completed batch: `ever_started` is the
+/// admitted prefix length, `items` are the terminal outcomes, and the
+/// shorter of the two index sets is the one written.
+fn build_decision_record<O>(
+    items: &[BatchItem<O>],
+    ever_started: usize,
+    reason: CompletionReason,
+) -> BatchDecisionRecord {
+    let mut completed_flags = vec![false; ever_started];
+    for item in items {
+        if let Some(slot) = completed_flags.get_mut(item.index) {
+            *slot = true;
+        }
+    }
+    let completed: Vec<usize> = completed_flags
+        .iter()
+        .enumerate()
+        .filter_map(|(i, done)| done.then_some(i))
+        .collect();
+    let started_only: Vec<usize> = completed_flags
+        .iter()
+        .enumerate()
+        .filter_map(|(i, done)| (!done).then_some(i))
+        .collect();
+    let (started_indexes, completed_indexes) = if started_only.len() <= completed.len() {
+        (Some(started_only), None)
+    } else {
+        (None, Some(completed))
+    };
+    BatchDecisionRecord {
+        total_count: ever_started,
+        completion_reason: reason.as_str().to_owned(),
+        started_indexes,
+        completed_indexes,
+    }
+}
+
+/// Serializes a decision record as plain JSON (never through
+/// `result_serdes` — see [`BatchDecisionRecord`]).
+fn serialize_decision_record(record: &BatchDecisionRecord) -> Result<String, OperationError> {
+    serde_json::to_string(record)
+        .map_err(|e| batch_error(&format!("serialize batch decision record: {e}")))
+}
+
+/// Parses a terminal batch's `replay_children` payload as a decision
+/// record.
+///
+/// `Ok(None)` — an absent or empty payload — means the record predates
+/// decision records (a record-less `replay_children` write from an older
+/// SDK), and the caller falls back to the pre-record re-execution
+/// behaviour. A NON-EMPTY payload on a `replay_children` batch parent can
+/// only be a decision record this SDK wrote, so one that fails to parse is
+/// corrupt bookkeeping: the safe response is an error, never a silent
+/// fall-back to unconstrained re-execution that could resurrect items the
+/// recorded batch never started.
+fn parse_decision_record(
+    payload: Option<&str>,
+) -> Result<Option<BatchDecisionRecord>, OperationError> {
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(payload)
+        .map(Some)
+        .map_err(|e| batch_error(&format!("malformed batch decision record: {e}")))
+}
+
+/// What a decision record instructs replay to do: which indexes were ever
+/// started, which of those completed, and the reason the batch ended.
+#[derive(Debug)]
+struct ReplayPlan {
+    /// Number of items ever started (`totalCount`, validated to be no
+    /// larger than the input length).
+    total_count: usize,
+    /// Per-index completion flag over `[0, total_count)`.
+    completed: Vec<bool>,
+    /// The recorded completion reason, reported verbatim.
+    reason: CompletionReason,
+}
+
+impl ReplayPlan {
+    /// Derives the plan from a parsed decision record, rejecting any record
+    /// this SDK's writer could not have produced. The writer emits exactly
+    /// one index form (the shorter set), every index inside
+    /// `[0, totalCount)`, a `totalCount` no larger than the input it ran
+    /// over, and a known completion-reason wire value — so a record that
+    /// violates any of those is corrupt bookkeeping. Silently repairing it
+    /// (clamping, ignoring, defaulting) would convert recorded outcomes
+    /// into different ones; failing keeps replay deterministic and safe.
+    fn from_record(
+        record: &BatchDecisionRecord,
+        total_items: usize,
+    ) -> Result<Self, OperationError> {
+        if record.total_count > total_items {
+            return Err(batch_error(&format!(
+                "invalid batch decision record: totalCount {} exceeds the input length {}",
+                record.total_count, total_items
+            )));
+        }
+        let Some(reason) = CompletionReason::try_from_wire(&record.completion_reason) else {
+            return Err(batch_error(&format!(
+                "invalid batch decision record: unknown completionReason {:?}",
+                record.completion_reason
+            )));
+        };
+        let total_count = record.total_count;
+        let (indexes, indexes_are_completed) =
+            match (&record.completed_indexes, &record.started_indexes) {
+                (Some(_), Some(_)) => {
+                    return Err(batch_error(
+                        "invalid batch decision record: both startedIndexes and \
+                         completedIndexes are present",
+                    ));
+                }
+                (None, None) => {
+                    return Err(batch_error(
+                        "invalid batch decision record: neither startedIndexes nor \
+                         completedIndexes is present",
+                    ));
+                }
+                (Some(completed), None) => (completed, true),
+                (None, Some(started)) => (started, false),
+            };
+        let mut completed = vec![!indexes_are_completed; total_count];
+        for &i in indexes {
+            let Some(slot) = completed.get_mut(i) else {
+                return Err(batch_error(&format!(
+                    "invalid batch decision record: index {i} is outside [0, {total_count})",
+                )));
+            };
+            *slot = indexes_are_completed;
+        }
+        Ok(Self {
+            total_count,
+            completed,
+            reason,
+        })
+    }
+
+    /// Whether replay admits item `index` for terminal reconstruction: it
+    /// must be inside the started prefix AND recorded as completed.
+    /// Started-but-not-terminal items are reported as
+    /// [`BatchItemStatus::Started`] from the record alone, and
+    /// never-started items are omitted entirely.
+    fn admits(&self, index: usize) -> bool {
+        index < self.total_count && self.completed.get(index).copied().unwrap_or(false)
+    }
+}
+
+/// Fast replay of a large-result batch (Normal nesting): reconstructs the
+/// batch result directly from the decision record and the child checkpoint
+/// records, without re-running any item body.
+///
+/// Child IDs are PEEKED, never minted, so a fall-back to re-execution — an
+/// admitted child whose own result was too large to checkpoint inline
+/// surfaces as the `ReplayChildren` sentinel — leaves the parent counter
+/// untouched for the re-execution path; the caller advances the counter
+/// only after a successful reconstruction. Items in the started set are
+/// reported as [`BatchItemStatus::Started`] without consulting their child
+/// checkpoints, and indexes at or beyond `totalCount` are omitted entirely.
+///
+/// Every completed child's replay identity (type, sub-type, name) is
+/// validated against its checkpoint record before its terminal payload is
+/// read, so a handler change that renames or retypes a child raises
+/// `NonDeterministicExecution` here exactly as it does on the re-execution
+/// path. Started-set children are exempt — their records are never
+/// consulted at all.
+async fn replay_batch_from_record<O, IS>(
+    ctx: &DurableContext,
+    plan: &ReplayPlan,
+    item_namer: Option<&Arc<dyn Fn(usize) -> String + Send + Sync>>,
+    serdes: &Arc<IS>,
+    child_sub_type: &str,
+) -> Result<BatchResult<O>, OperationError>
+where
+    O: Send + 'static,
+    IS: Serdes<O>,
+{
+    let mut items = Vec::new();
+    for i in 0..plan.total_count {
+        let child_name = item_namer.map(|namer| namer(i));
+        if !plan.completed.get(i).copied().unwrap_or(false) {
+            // STARTED at batch completion: reported from the record with
+            // no result and no error; its child checkpoints are never
+            // read.
+            items.push(BatchItem {
+                index: i,
+                name: child_name.unwrap_or_default(),
+                status: BatchItemStatus::Started,
+                result: None,
+                error_message: None,
+                error_type: None,
+            });
+            continue;
+        }
+        let op_id = ctx.peek_id_at(i);
+        // Non-determinism detection: validate the claimed child identity
+        // against the record before decoding its terminal payload.
+        ctx.checkpoint_view_validated(
+            op_id.positional(),
+            op_id.wire(),
+            "Context",
+            Some(child_sub_type),
+            child_name.as_deref(),
+        )?;
+        let item_name = child_name.unwrap_or_default();
+        let serdes_ctx = SerdesContext::new(op_id.wire().to_owned(), ctx.execution_arn());
+        let item =
+            replay_terminal_child(ctx, op_id.positional(), i, &item_name, serdes, &serdes_ctx)
+                .await?;
+        items.push(item);
+    }
+    Ok(BatchResult {
+        items,
+        reason: plan.reason,
+    })
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Checkpoint helpers
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Checkpoints the parent batch as SUCCEEDED with the pre-serialized result.
+///
+/// When the serialized payload exceeds [`CHECKPOINT_SIZE_LIMIT_BYTES`], the
+/// record is written with `replay_children(true)` and `decision_json` — the
+/// batch decision record — as its payload, so replay can obey the recorded
+/// outcome (`totalCount`, `completionReason`, index set) instead of
+/// re-deriving it by re-execution. A modern terminal batch is NEVER written
+/// without its decision record: should the record itself exceed the limit
+/// (a pathological interleaving across tens of thousands of items), the
+/// checkpoint is refused with an error rather than written record-less,
+/// because a record-less write would replay through the unconstrained
+/// re-execution path and could resurrect items the live batch never
+/// started. The refusal is deterministic — replay reaches the same state
+/// and fails the same way — so no false outcome is ever recorded.
 async fn checkpoint_batch_success_serialized(
     ctx: &DurableContext,
     parent_wire: &str,
     parent_name: Option<&str>,
     parent_sub_type: &str,
     serialized_payload: &str,
+    decision_json: &str,
 ) -> Result<(), OperationError> {
     let mut builder = OperationUpdate::builder()
         .id(parent_wire.to_owned())
@@ -2354,11 +2863,21 @@ async fn checkpoint_batch_success_serialized(
     }
 
     if serialized_payload.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
-        builder = builder.context_options(
-            aws_sdk_lambda::types::ContextOptions::builder()
-                .replay_children(true)
-                .build(),
-        );
+        if decision_json.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
+            // Never write a modern terminal batch without its decision
+            // record (see the function docs).
+            return Err(batch_error(
+                "batch decision record exceeds the checkpoint size limit; \
+                 refusing to record the batch outcome without it",
+            ));
+        }
+        builder = builder
+            .context_options(
+                aws_sdk_lambda::types::ContextOptions::builder()
+                    .replay_children(true)
+                    .build(),
+            )
+            .payload(decision_json.to_owned());
     } else {
         builder = builder.payload(serialized_payload.to_owned());
     }
@@ -2588,6 +3107,10 @@ impl CompletionTracker {
         match status {
             BatchItemStatus::Succeeded => self.success_count += 1,
             BatchItemStatus::Failed => self.failure_count += 1,
+            // Not a terminal outcome: never fed to the tracker (a Started
+            // item exists only in replayed results, and the replay path
+            // does not consult the tracker).
+            BatchItemStatus::Started => return,
         }
         if let Some(slot) = self.pending.get_mut(index) {
             *slot = Some(status);
@@ -2609,6 +3132,9 @@ impl CompletionTracker {
             match ready {
                 BatchItemStatus::Succeeded => self.committed_success += 1,
                 BatchItemStatus::Failed => self.committed_failure += 1,
+                // Unreachable: `settle` returns before storing a Started
+                // status in `pending` (it is not a terminal outcome).
+                BatchItemStatus::Started => {}
             }
             self.next_commit += 1;
             if self.stop_reason.is_none() {
@@ -2817,6 +3343,7 @@ where
         let status_str = match status {
             BatchItemStatus::Succeeded => "SUCCEEDED",
             BatchItemStatus::Failed => "FAILED",
+            BatchItemStatus::Started => "STARTED",
         };
         let (result_str, rebuilt_value) = match (status, result) {
             (BatchItemStatus::Succeeded, Some(value)) => {
@@ -2886,6 +3413,7 @@ where
         let status = match cp.status.as_str() {
             "SUCCEEDED" => BatchItemStatus::Succeeded,
             "FAILED" => BatchItemStatus::Failed,
+            "STARTED" => BatchItemStatus::Started,
             other => return Err(batch_error(&format!("unknown item status: {other}"))),
         };
         let result = if status == BatchItemStatus::Succeeded && !cp.result.is_empty() {
@@ -5609,5 +6137,776 @@ mod tests {
         assert_eq!(files.len(), 3, "each item needs its own file: {files:?}");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Issue #36: ordered lazy admission + batch decision record ──────────
+
+    /// Splits the recorded updates into child starts seen BEFORE the first
+    /// child terminal write and the total child start count. A child update
+    /// is one carrying a `ParentId`.
+    fn child_starts_before_first_terminal(
+        client: &crate::client::InMemoryExecutionClient,
+    ) -> (usize, usize) {
+        let updates = client.recorded_updates();
+        let mut starts_before_first_terminal = 0;
+        let mut total_starts = 0;
+        let mut saw_terminal = false;
+        for u in &updates {
+            if u.parent_id().is_none() {
+                continue;
+            }
+            match u.action() {
+                OperationAction::Start => {
+                    total_starts += 1;
+                    if !saw_terminal {
+                        starts_before_first_terminal += 1;
+                    }
+                }
+                _ => saw_terminal = true,
+            }
+        }
+        (starts_before_first_terminal, total_starts)
+    }
+
+    /// Acceptance (issue #36): a batch larger than the concurrency limit
+    /// issues no child `Start` checkpoint before its first item runs.
+    /// Ordered lazy admission writes each `Start` at dispatch, so at most
+    /// `concurrency` starts can exist before the first item outcome — never
+    /// the whole batch.
+    #[tokio::test]
+    async fn batch_larger_than_concurrency_issues_no_start_before_first_item_runs() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let result = ctx
+            .map(
+                vec![1_i32, 2, 3, 4, 5, 6],
+                |_child, item, _idx| async move { Ok(item * 10) },
+            )
+            .max_concurrency(2)
+            .await
+            .expect("map must succeed");
+        assert_eq!(result, vec![10, 20, 30, 40, 50, 60]);
+
+        let (starts_before, total_starts) = child_starts_before_first_terminal(&client);
+        assert_eq!(
+            total_starts, 6,
+            "every admitted item gets exactly one Start"
+        );
+        assert!(
+            starts_before <= 2,
+            "at most `concurrency` child Starts may precede the first item \
+             outcome (lazy admission), found {starts_before}"
+        );
+    }
+
+    /// Finds the batch parent's SUCCEED update (the terminal update with no
+    /// `ParentId` on a root-level batch).
+    fn parent_succeed_update(client: &crate::client::InMemoryExecutionClient) -> OperationUpdate {
+        client
+            .recorded_updates()
+            .into_iter()
+            .find(|u| u.parent_id().is_none() && matches!(u.action(), OperationAction::Succeed))
+            .expect("batch parent SUCCEED update must be recorded")
+    }
+
+    /// A batch whose serialized result exceeds the checkpoint size limit
+    /// records the decision record — `totalCount`, `completionReason`, and
+    /// the shorter index set — as the `replay_children` payload, instead of
+    /// no payload at all.
+    #[tokio::test]
+    async fn large_batch_result_checkpoints_decision_record() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let big = "x".repeat(200 * 1024);
+        let result = ctx
+            .map(
+                vec![big.clone(), big],
+                |_child, item: String, _idx| async move { Ok(item) },
+            )
+            .await
+            .expect("map must succeed");
+        assert_eq!(result.len(), 2);
+
+        let parent = parent_succeed_update(&client);
+        assert_eq!(
+            parent.context_options().and_then(|c| c.replay_children),
+            Some(true),
+            "oversized batch payload must set replay_children"
+        );
+        let record: BatchDecisionRecord = serde_json::from_str(
+            parent
+                .payload()
+                .expect("large-result parent must carry the decision record"),
+        )
+        .expect("payload must parse as a plain-JSON decision record");
+        assert_eq!(record.total_count, 2);
+        assert_eq!(record.completion_reason, "ALL_COMPLETED");
+        // Everything completed: the empty started set is the shorter form.
+        assert_eq!(record.started_indexes, Some(Vec::new()));
+        assert_eq!(record.completed_indexes, None);
+    }
+
+    /// Acceptance (issue #36): `totalCount` is the number of items EVER
+    /// STARTED, not the input length. A sequential batch of 6 that stops on
+    /// `min_successful(1)` after its first item records `totalCount = 1`.
+    #[tokio::test]
+    async fn decision_record_total_count_is_ever_started_not_input_length() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let batch = ctx
+            .map(
+                vec![0_usize, 1, 2, 3, 4, 5],
+                |_child, _item, idx| async move { Ok("y".repeat(300 * 1024) + &idx.to_string()) },
+            )
+            .max_concurrency(1)
+            .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+            .await_batch()
+            .await
+            .expect("map must succeed");
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        assert_eq!(batch.items.len(), 1);
+
+        let parent = parent_succeed_update(&client);
+        let record: BatchDecisionRecord = serde_json::from_str(
+            parent
+                .payload()
+                .expect("large-result parent must carry the decision record"),
+        )
+        .expect("payload must parse as a plain-JSON decision record");
+        assert_eq!(
+            record.total_count, 1,
+            "totalCount counts items ever started, not the 6 input items"
+        );
+        assert_eq!(record.completion_reason, "MIN_SUCCESSFUL_REACHED");
+        assert_eq!(record.started_indexes, Some(Vec::new()));
+    }
+
+    /// The decision record must be PLAIN JSON even when a custom
+    /// `result_serdes` transforms the batch summary: it is the SDK's own
+    /// bookkeeping and must stay readable when the configured serdes is the
+    /// reason the payload outgrew the limit.
+    #[tokio::test]
+    async fn decision_record_bypasses_result_serdes() {
+        use crate::serdes::test_support::HexEnvelopeSerdes;
+
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let big = "z".repeat(200 * 1024);
+        let result = ctx
+            .map(
+                vec![big.clone(), big],
+                |_child, item: String, _idx| async move { Ok(item) },
+            )
+            .result_serdes(HexEnvelopeSerdes)
+            .await
+            .expect("map must succeed");
+        assert_eq!(result.len(), 2);
+
+        let parent = parent_succeed_update(&client);
+        let record: BatchDecisionRecord = serde_json::from_str(
+            parent
+                .payload()
+                .expect("large-result parent must carry the decision record"),
+        )
+        .expect("the decision record must parse as plain JSON, not the hex wire form");
+        assert_eq!(record.total_count, 2);
+    }
+
+    /// Builds a terminal batch-parent record carrying a decision record as
+    /// its `replay_children` payload.
+    fn decision_record_parent(positional_id: &str, decision: &str) -> (String, CheckpointRecord) {
+        let wire_id = crate::engine::compute_wire_id_public(positional_id);
+        (
+            wire_id.clone(),
+            CheckpointRecord {
+                id: wire_id,
+                status: CheckpointStatus::Succeeded,
+                result: Some(decision.to_owned()),
+                error_type: None,
+                error_message: None,
+                error_data: None,
+                stack_trace: None,
+                attempt: 0,
+                invoke_result: None,
+                invoke_error_type: None,
+                invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
+                replay_children: true,
+                callback_id: None,
+                op_type: None,
+                sub_type: None,
+                op_name: None,
+            },
+        )
+    }
+
+    /// Acceptance (issue #36): a batch that stopped on a completion
+    /// threshold, replayed on the large-result path, reproduces the live
+    /// item statuses and reason from the decision record without re-running
+    /// unstarted items (or any item body at all — completed items decode
+    /// from their child records).
+    #[tokio::test]
+    async fn replay_of_threshold_stopped_large_batch_obeys_decision_record() {
+        // Live history: 6 input items, min_successful stopped the batch
+        // after items 0 and 1 completed; items 2..5 never started. The
+        // parent's payload was too large to store, so the decision record
+        // was written in its place. Children claimed IDs "2" and "3".
+        let decision =
+            r#"{"totalCount":2,"completionReason":"MIN_SUCCESSFUL_REACHED","startedIndexes":[]}"#;
+        let log = CheckpointLog::from_records(vec![
+            decision_record_parent("1", decision),
+            succeeded_record("2", "\"hello\""),
+            succeeded_record("3", "\"world\""),
+        ]);
+        let ctx = test_ctx(log);
+
+        let batch: BatchResult<String> = ctx
+            .map(
+                vec![0_usize, 1, 2, 3, 4, 5],
+                |_child, _item, _idx| async move {
+                    unreachable!("replay must not re-run any item body")
+                },
+            )
+            .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(2))
+            .await_batch()
+            .await
+            .expect("replay must succeed");
+
+        assert_eq!(
+            batch.reason,
+            CompletionReason::MinSuccessfulReached,
+            "the recorded reason is taken verbatim"
+        );
+        assert_eq!(batch.items.len(), 2, "unstarted items stay omitted");
+        assert_eq!(batch.items[0].index, 0);
+        assert_eq!(batch.items[0].result.as_deref(), Some("hello"));
+        assert_eq!(batch.items[1].index, 1);
+        assert_eq!(batch.items[1].result.as_deref(), Some("world"));
+    }
+
+    /// Acceptance (issue #36): an index in the decision record's STARTED
+    /// set is reported as [`BatchItemStatus::Started`] without consulting
+    /// its child checkpoints: the child here holds only a non-terminal
+    /// `Started` record, which would error if replay tried to decode it as
+    /// terminal. Never-started indexes (at or beyond `totalCount`) stay
+    /// omitted.
+    #[tokio::test]
+    async fn replay_reports_started_set_as_started_without_reading_child_checkpoints() {
+        let started_record = |positional_id: &str| {
+            let wire_id = crate::engine::compute_wire_id_public(positional_id);
+            (
+                wire_id.clone(),
+                CheckpointRecord {
+                    id: wire_id,
+                    status: CheckpointStatus::Started,
+                    result: None,
+                    error_type: None,
+                    error_message: None,
+                    error_data: None,
+                    stack_trace: None,
+                    attempt: 0,
+                    invoke_result: None,
+                    invoke_error_type: None,
+                    invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
+                    replay_children: false,
+                    callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
+                },
+            )
+        };
+        // Items 0 and 2 completed; item 1 started but was still running
+        // when the min-successful trigger completed the batch.
+        let decision =
+            r#"{"totalCount":3,"completionReason":"MIN_SUCCESSFUL_REACHED","startedIndexes":[1]}"#;
+        let log = CheckpointLog::from_records(vec![
+            decision_record_parent("1", decision),
+            succeeded_record("2", "\"a\""),
+            started_record("3"),
+            succeeded_record("4", "\"c\""),
+        ]);
+        let ctx = test_ctx(log);
+
+        let batch: BatchResult<String> = ctx
+            .map(vec![0_usize, 1, 2, 3], |_child, _item, _idx| async move {
+                unreachable!("replay must not re-run any item body")
+            })
+            .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(2))
+            .await_batch()
+            .await
+            .expect("replay must succeed");
+
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        let statuses: Vec<(usize, BatchItemStatus)> =
+            batch.items.iter().map(|i| (i.index, i.status)).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (0, BatchItemStatus::Succeeded),
+                (1, BatchItemStatus::Started),
+                (2, BatchItemStatus::Succeeded),
+            ],
+            "started-set item is reported STARTED; the never-started item is omitted"
+        );
+        assert!(
+            batch.items[1].result.is_none() && batch.items[1].error_message.is_none(),
+            "a STARTED item carries no result and no error"
+        );
+        // The Vec<O> success view skips the STARTED item.
+        assert_eq!(batch.results(), vec!["a", "c"]);
+    }
+
+    /// The plan-constrained FALLBACK (fast replay hit a completed child
+    /// recorded `replay_children` and fell through to re-execution) must
+    /// consult child checkpoints only for indexes the plan admits as
+    /// COMPLETED. Started-set and never-started indexes here hold records
+    /// with a hostile identity (`op_type: Step`) that would raise
+    /// `NonDeterministicExecution` if the concurrent pre-claim loop read
+    /// them — as it did before this fix.
+    #[tokio::test]
+    async fn plan_constrained_fallback_reads_only_admitted_child_checkpoints() {
+        // A record whose stored identity can never match a batch child's
+        // claim ("Context"): any validated read of it fails.
+        let poisoned_record = |positional_id: &str| {
+            let wire_id = crate::engine::compute_wire_id_public(positional_id);
+            (
+                wire_id.clone(),
+                CheckpointRecord {
+                    id: wire_id,
+                    status: CheckpointStatus::Started,
+                    result: None,
+                    error_type: None,
+                    error_message: None,
+                    error_data: None,
+                    stack_trace: None,
+                    attempt: 0,
+                    invoke_result: None,
+                    invoke_error_type: None,
+                    invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
+                    replay_children: false,
+                    callback_id: None,
+                    op_type: Some("Step".to_owned()),
+                    sub_type: None,
+                    op_name: None,
+                },
+            )
+        };
+        // Live history: items 0 and 2 completed, item 1 started-not-
+        // terminal, item 3 never started. Item 0's own result was too
+        // large to store inline (`replay_children`), so fast replay falls
+        // through and the plan constrains the re-execution.
+        let decision =
+            r#"{"totalCount":3,"completionReason":"MIN_SUCCESSFUL_REACHED","startedIndexes":[1]}"#;
+        let log = CheckpointLog::from_records(vec![
+            decision_record_parent("1", decision),
+            replay_children_success_record("2"),
+            poisoned_record("3"),
+            succeeded_record("4", "\"c\""),
+            poisoned_record("5"),
+        ]);
+        // The fallback re-executes item 0's body to reconstruct its
+        // oversized result, so a live client is needed.
+        let (ctx, _client) = test_ctx_with_client(log);
+
+        let batch: BatchResult<String> = ctx
+            .map(vec![0_usize, 1, 2, 3], |_child, _item, idx| async move {
+                assert_eq!(idx, 0, "only the replay_children item re-executes");
+                Ok("a".to_owned())
+            })
+            .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(2))
+            .await_batch()
+            .await
+            .expect("plan-constrained fallback must not read non-admitted child checkpoints");
+
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        let statuses: Vec<(usize, BatchItemStatus)> =
+            batch.items.iter().map(|i| (i.index, i.status)).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (0, BatchItemStatus::Succeeded),
+                (1, BatchItemStatus::Started),
+                (2, BatchItemStatus::Succeeded),
+            ],
+            "started-set item reported STARTED from the record; never-started omitted"
+        );
+        assert_eq!(batch.results(), vec!["a", "c"]);
+    }
+
+    /// A record-less `replay_children` payload — written before decision
+    /// records existed — falls back to today's behaviour: re-execution,
+    /// which replays each recorded-terminal child from its own record.
+    #[tokio::test]
+    async fn record_less_replay_children_payload_falls_back_to_reexecution() {
+        let parent_wire = crate::engine::compute_wire_id_public("1");
+        let log = CheckpointLog::from_records(vec![
+            (
+                parent_wire.clone(),
+                CheckpointRecord {
+                    id: parent_wire,
+                    status: CheckpointStatus::Succeeded,
+                    result: None,
+                    error_type: None,
+                    error_message: None,
+                    error_data: None,
+                    stack_trace: None,
+                    attempt: 0,
+                    invoke_result: None,
+                    invoke_error_type: None,
+                    invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
+                    replay_children: true,
+                    callback_id: None,
+                    op_type: None,
+                    sub_type: None,
+                    op_name: None,
+                },
+            ),
+            succeeded_record("2", "\"hello\""),
+            succeeded_record("3", "\"world\""),
+        ]);
+        // Re-execution re-checkpoints the parent, so a live client is
+        // needed — exactly as before decision records existed.
+        let (ctx, _client) = test_ctx_with_client(log);
+
+        let result: Vec<String> = ctx
+            .map(
+                vec!["a".to_owned(), "b".to_owned()],
+                |_child, _item: String, _idx| async move {
+                    unreachable!("recorded-terminal children replay from their records")
+                },
+            )
+            .await
+            .expect("fall-back re-execution must succeed");
+        assert_eq!(result, vec!["hello", "world"]);
+    }
+
+    /// Acceptance (issue #36): `NestingMode::Flat` reports its started set
+    /// from the record. Flat items have no child checkpoints, so the
+    /// decision record is the only source: replay re-runs exactly the
+    /// completed set (reconstructing values), reports the started set as
+    /// [`BatchItemStatus::Started`] without running those bodies, skips
+    /// the never-started items, and takes the reason verbatim.
+    #[tokio::test]
+    async fn flat_batch_replay_reports_started_set_from_record() {
+        // Items 0 and 2 completed; item 1 started but was still running
+        // when the trigger completed the batch; items 3..5 never started.
+        let decision =
+            r#"{"totalCount":3,"completionReason":"MIN_SUCCESSFUL_REACHED","startedIndexes":[1]}"#;
+        let log = CheckpointLog::from_records(vec![decision_record_parent("1", decision)]);
+        let ctx = test_ctx(log);
+
+        let invoked = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let invoked_probe = Arc::clone(&invoked);
+
+        let batch = ctx
+            .map(vec![0_usize, 1, 2, 3, 4, 5], move |_child, _item, idx| {
+                let invoked = Arc::clone(&invoked_probe);
+                async move {
+                    invoked
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(idx);
+                    Ok(format!("flat-{idx}"))
+                }
+            })
+            .nesting(NestingMode::Flat)
+            .max_concurrency(2)
+            .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(2))
+            .await_batch()
+            .await
+            .expect("flat replay must succeed");
+
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        let statuses: Vec<(usize, BatchItemStatus)> =
+            batch.items.iter().map(|i| (i.index, i.status)).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (0, BatchItemStatus::Succeeded),
+                (1, BatchItemStatus::Started),
+                (2, BatchItemStatus::Succeeded),
+            ],
+            "the started set is reported STARTED from the record; unstarted items are omitted"
+        );
+        let mut ran = invoked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        ran.sort_unstable();
+        assert_eq!(
+            ran,
+            vec![0, 2],
+            "flat replay re-runs the completed set only — never started-set or unstarted items"
+        );
+    }
+
+    #[test]
+    fn decision_record_writes_the_shorter_index_set() {
+        let items = vec![
+            BatchItem::<u32>::new(
+                0,
+                String::new(),
+                BatchItemStatus::Succeeded,
+                Some(1),
+                None,
+                None,
+            ),
+            BatchItem::<u32>::new(
+                1,
+                String::new(),
+                BatchItemStatus::Succeeded,
+                Some(2),
+                None,
+                None,
+            ),
+            BatchItem::<u32>::new(2, String::new(), BatchItemStatus::Failed, None, None, None),
+        ];
+        // 3 completed of 4 started: the 1-element started set is shorter.
+        let record = build_decision_record(&items, 4, CompletionReason::PredicateMatched);
+        assert_eq!(record.total_count, 4);
+        assert_eq!(record.completion_reason, "PREDICATE_MATCHED");
+        assert_eq!(record.started_indexes, Some(vec![3]));
+        assert_eq!(record.completed_indexes, None);
+
+        // 1 completed of 4 started: the 1-element completed set is shorter.
+        let one = vec![BatchItem::<u32>::new(
+            2,
+            String::new(),
+            BatchItemStatus::Succeeded,
+            Some(1),
+            None,
+            None,
+        )];
+        let record = build_decision_record(&one, 4, CompletionReason::AllCompleted);
+        assert_eq!(record.started_indexes, None);
+        assert_eq!(record.completed_indexes, Some(vec![2]));
+    }
+
+    #[test]
+    fn replay_plan_reconstructs_either_index_form() {
+        // From the started form.
+        let record = BatchDecisionRecord {
+            total_count: 4,
+            completion_reason: "ALL_COMPLETED".to_owned(),
+            started_indexes: Some(vec![1, 3]),
+            completed_indexes: None,
+        };
+        let plan = ReplayPlan::from_record(&record, 10).expect("well-formed record");
+        assert_eq!(plan.total_count, 4);
+        assert!(plan.admits(0) && plan.admits(2));
+        assert!(!plan.admits(1) && !plan.admits(3));
+        assert!(!plan.admits(4), "beyond totalCount is never admitted");
+
+        // From the completed form.
+        let record = BatchDecisionRecord {
+            total_count: 3,
+            completion_reason: "MIN_SUCCESSFUL_REACHED".to_owned(),
+            started_indexes: None,
+            completed_indexes: Some(vec![2]),
+        };
+        let plan = ReplayPlan::from_record(&record, 10).expect("well-formed record");
+        assert!(!plan.admits(0) && !plan.admits(1) && plan.admits(2));
+        assert_eq!(plan.reason, CompletionReason::MinSuccessfulReached);
+    }
+
+    /// A syntactically valid decision record that the SDK's writer could
+    /// not have produced is rejected outright: silently repairing it
+    /// (clamping `totalCount`, ignoring out-of-range indexes, defaulting a
+    /// missing index form or an unknown reason) would convert recorded
+    /// outcomes into different ones.
+    #[test]
+    fn replay_plan_rejects_semantically_invalid_records() {
+        let base = || BatchDecisionRecord {
+            total_count: 3,
+            completion_reason: "ALL_COMPLETED".to_owned(),
+            started_indexes: Some(vec![1]),
+            completed_indexes: None,
+        };
+
+        // totalCount larger than the current input length.
+        let record = base();
+        let err = ReplayPlan::from_record(&record, 2).expect_err("totalCount > input");
+        assert!(
+            crate::error::chain_string(&err).contains("exceeds the input length"),
+            "unexpected error: {err}"
+        );
+
+        // Both index forms present.
+        let mut record = base();
+        record.completed_indexes = Some(vec![0, 2]);
+        let err = ReplayPlan::from_record(&record, 10).expect_err("both index forms");
+        assert!(crate::error::chain_string(&err).contains("both startedIndexes"));
+
+        // Neither index form present.
+        let mut record = base();
+        record.started_indexes = None;
+        let err = ReplayPlan::from_record(&record, 10).expect_err("neither index form");
+        assert!(crate::error::chain_string(&err).contains("neither startedIndexes"));
+
+        // Index outside [0, totalCount) — in either form.
+        let mut record = base();
+        record.started_indexes = Some(vec![3]);
+        let err = ReplayPlan::from_record(&record, 10).expect_err("started index out of range");
+        assert!(crate::error::chain_string(&err).contains("outside [0, 3)"));
+        let mut record = base();
+        record.started_indexes = None;
+        record.completed_indexes = Some(vec![50]);
+        let err = ReplayPlan::from_record(&record, 10).expect_err("completed index out of range");
+        assert!(crate::error::chain_string(&err).contains("outside [0, 3)"));
+
+        // Unknown completion-reason wire value.
+        let mut record = base();
+        record.completion_reason = "SOME_FUTURE_REASON".to_owned();
+        let err = ReplayPlan::from_record(&record, 10).expect_err("unknown reason");
+        assert!(crate::error::chain_string(&err).contains("unknown completionReason"));
+    }
+
+    #[test]
+    fn parse_decision_record_legacy_fallback_only_for_absent_or_empty() {
+        // Absent or empty payloads are legacy record-less writes: fall back.
+        assert!(matches!(parse_decision_record(None), Ok(None)));
+        assert!(matches!(parse_decision_record(Some("")), Ok(None)));
+        assert!(matches!(parse_decision_record(Some("   ")), Ok(None)));
+        // A NON-EMPTY payload that is not a decision record is corrupt
+        // bookkeeping: an error, never a silent fall-back.
+        assert!(parse_decision_record(Some("not json")).is_err());
+        assert!(parse_decision_record(Some(r#"{"unrelated":true}"#)).is_err());
+        let record = parse_decision_record(Some(
+            r#"{"totalCount":2,"completionReason":"ALL_COMPLETED","startedIndexes":[]}"#,
+        ))
+        .expect("parse must not error")
+        .expect("well-formed record must parse");
+        assert_eq!(record.total_count, 2);
+    }
+
+    /// A malformed (non-empty, unparseable) decision record fails the
+    /// replay instead of falling back to unconstrained re-execution, which
+    /// could resurrect items the recorded batch never started.
+    #[tokio::test]
+    async fn malformed_decision_record_fails_replay_instead_of_reexecuting() {
+        let log = CheckpointLog::from_records(vec![decision_record_parent(
+            "1",
+            r#"{"totalCount":"#, // truncated JSON: corrupt, not legacy
+        )]);
+        let ctx = test_ctx(log);
+
+        let result: Result<Vec<String>, _> = ctx
+            .map(vec![0_usize, 1, 2], |_child, _item, _idx| async move {
+                unreachable!("a corrupt decision record must not re-execute any item")
+            })
+            .await;
+
+        let Err(err) = result else {
+            unreachable!("replay of a corrupt decision record must fail")
+        };
+        let display = crate::error::chain_string(&err);
+        assert!(
+            display.contains("malformed batch decision record"),
+            "expected the malformed-record error, got: {display}"
+        );
+    }
+
+    /// The oversized-record write path refuses to checkpoint rather than
+    /// writing a modern terminal batch without its decision record (a
+    /// record-less write would replay through unconstrained re-execution).
+    #[tokio::test]
+    async fn oversized_decision_record_refuses_checkpoint_instead_of_dropping_record() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let oversized_payload = "p".repeat(CHECKPOINT_SIZE_LIMIT_BYTES + 1);
+        let oversized_decision = "d".repeat(CHECKPOINT_SIZE_LIMIT_BYTES + 1);
+        let parent_wire = crate::engine::compute_wire_id_public("1");
+
+        let result = checkpoint_batch_success_serialized(
+            &ctx,
+            &parent_wire,
+            None,
+            MAP_SUB_TYPE,
+            &oversized_payload,
+            &oversized_decision,
+        )
+        .await;
+
+        let Err(err) = result else {
+            unreachable!("an oversized decision record must refuse the checkpoint")
+        };
+        let display = crate::error::chain_string(&err);
+        assert!(
+            display.contains("decision record exceeds the checkpoint size limit"),
+            "expected the oversized-record error, got: {display}"
+        );
+        assert!(
+            client
+                .recorded_updates()
+                .iter()
+                .all(|u| !matches!(u.action(), OperationAction::Succeed)),
+            "no terminal SUCCEED may be written without its decision record"
+        );
+    }
+
+    /// Non-determinism regression (fast replay path): a completed child's
+    /// replay identity is validated before its terminal payload is read, so
+    /// a changed child sub-type raises `NonDeterministicExecution` instead
+    /// of replaying the stale record successfully.
+    #[tokio::test]
+    async fn fast_replay_validates_completed_child_identity() {
+        // Child "2" (item 0) carries a recorded identity that does NOT
+        // match a map iteration: same type but a different sub-type.
+        let mismatched_child = {
+            let wire_id = crate::engine::compute_wire_id_public("2");
+            (
+                wire_id.clone(),
+                CheckpointRecord {
+                    id: wire_id,
+                    status: CheckpointStatus::Succeeded,
+                    result: Some("\"a\"".to_owned()),
+                    error_type: None,
+                    error_message: None,
+                    error_data: None,
+                    stack_trace: None,
+                    attempt: 0,
+                    invoke_result: None,
+                    invoke_error_type: None,
+                    invoke_error_message: None,
+                    invoke_error_data: None,
+                    invoke_stack_trace: None,
+                    replay_children: false,
+                    callback_id: None,
+                    op_type: Some("Context".to_owned()),
+                    sub_type: Some("ParallelBranch".to_owned()),
+                    op_name: None,
+                },
+            )
+        };
+        let decision = r#"{"totalCount":2,"completionReason":"ALL_COMPLETED","startedIndexes":[]}"#;
+        let log = CheckpointLog::from_records(vec![
+            decision_record_parent("1", decision),
+            mismatched_child,
+            succeeded_record("3", "\"b\""),
+        ]);
+        let ctx = test_ctx(log);
+
+        let result: Result<BatchResult<String>, _> = ctx
+            .map(vec![0_usize, 1], |_child, _item, _idx| async move {
+                unreachable!("identity mismatch must fail before any re-execution")
+            })
+            .await_batch()
+            .await;
+
+        let Err(err) = result else {
+            unreachable!("a mismatched child identity must fail the replay")
+        };
+        assert!(
+            matches!(err.kind(), OperationErrorKind::NonDeterministicExecution(_)),
+            "expected NonDeterministicExecution, got: {err:#}"
+        );
     }
 }

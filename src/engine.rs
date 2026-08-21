@@ -152,6 +152,21 @@ impl IdCounter {
         let next_n = self.counter.load(Ordering::SeqCst) + 1;
         self.format(next_n)
     }
+
+    /// Peeks at the operation identity `offset` positions ahead of the next
+    /// `mint()`, without advancing the counter.
+    ///
+    /// `peek_at(0)` names the same position as [`Self::peek_next`]. Used by
+    /// terminal-batch replay to derive the child IDs a prior live run minted
+    /// without consuming counter positions, so a replay attempt that must
+    /// fall back to re-execution leaves the counter exactly where the
+    /// re-execution path expects it.
+    pub(crate) fn peek_at(&self, offset: u64) -> OperationId {
+        let n = self.counter.load(Ordering::SeqCst) + 1 + offset;
+        let positional = self.format(n);
+        let wire = compute_wire_id(&positional);
+        OperationId { positional, wire }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
