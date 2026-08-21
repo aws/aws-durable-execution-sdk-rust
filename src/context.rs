@@ -1821,9 +1821,15 @@ impl DurableContext {
     /// Creates a wait-for-condition operation that polls until a predicate
     /// is satisfied.
     ///
-    /// The check function is called repeatedly with the current state until
-    /// the condition is met (implementation-defined termination signal via
-    /// the state type).
+    /// The check function is called repeatedly with the current state, and
+    /// the configured strategy decides after each check whether to
+    /// complete, keep polling, or fail. Set one with
+    /// [`wait_strategy`](crate::builders::WaitForConditionBuilder::wait_strategy)
+    /// (a bounded [`WaitStrategy`](crate::builders::wait_for_condition::WaitStrategy)
+    /// configuration) or
+    /// [`wait_strategy_fn`](crate::builders::WaitForConditionBuilder::wait_strategy_fn)
+    /// (a custom closure). With no strategy set, the check runs exactly
+    /// once and the operation completes with that state.
     ///
     /// # Examples
     ///

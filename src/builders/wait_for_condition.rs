@@ -24,7 +24,13 @@ pub use crate::wait_for_condition::WaitDecision;
 /// Builder for a wait-for-condition operation.
 ///
 /// Created by [`DurableContext::wait_for_condition`]. Configure the polling
-/// strategy with `.wait_strategy_fn()`.
+/// strategy with [`wait_strategy`](Self::wait_strategy) (a bounded
+/// [`WaitStrategy`] configuration) or
+/// [`wait_strategy_fn`](Self::wait_strategy_fn) (a custom closure).
+///
+/// With **no strategy set**, the check runs exactly once and the operation
+/// completes with that check's state — it does not poll. Set a strategy to
+/// poll.
 ///
 /// The builder is generic over the check closure `F` and its future `Fut`
 /// so the check is stored **without type erasure**; both parameters are
@@ -118,10 +124,17 @@ where
         self
     }
 
-    /// Sets the wait strategy (polling interval and backoff config).
+    /// Sets the wait strategy from a [`WaitStrategy`] configuration.
     ///
-    /// This converts the [`WaitStrategy`] config struct into a functional
-    /// strategy internally.
+    /// The configuration carries a completion predicate over the state, an
+    /// attempt cap, and exponential-backoff delay shaping. After each check,
+    /// the derived strategy returns [`WaitDecision::Complete`] when the
+    /// predicate matches the new state, [`WaitDecision::Exhausted`] once
+    /// `max_attempts` checks have run without the predicate matching, and
+    /// [`WaitDecision::Continue`] with the computed backoff delay otherwise.
+    ///
+    /// With no strategy set at all, the check runs exactly once and the
+    /// operation completes with that state.
     ///
     /// # Examples
     ///
@@ -137,7 +150,8 @@ where
     ///     let done = ctx
     ///         .wait_for_condition(|_step_ctx, state: i32| async move { Ok(state + 1) }, 0_i32)
     ///         .wait_strategy(
-    ///             WaitStrategy::builder()
+    ///             WaitStrategy::builder(|state: &i32| *state >= 3)
+    ///                 .max_attempts(10)
     ///                 .initial_delay(Duration::from_secs(2))
     ///                 .max_delay(Duration::from_secs(30))
     ///                 .build(),
@@ -146,26 +160,9 @@ where
     ///     Ok(done)
     /// }
     /// ```
-    #[allow(clippy::needless_pass_by_value)] // reason: API consistency with other builder chain methods
-    pub fn wait_strategy(mut self, strategy: WaitStrategy) -> Self {
-        // Convert the config struct into a functional strategy with
-        // exponential backoff.
-        let initial = strategy.initial_delay();
-        let max = strategy.max_delay();
-        let factor = strategy.backoff_factor();
-        self.wait_strategy = Some(Box::new(move |_state: S, attempt: u32| {
-            // Default behavior: always continue with backoff.
-            #[allow(clippy::cast_possible_truncation)] // reason: attempt is small
-            let exponent = attempt.saturating_sub(1);
-            let base_secs =
-                initial.as_secs_f64() * factor.powi(i32::try_from(exponent).unwrap_or(0));
-            let capped = base_secs.min(max.as_secs_f64());
-            #[allow(clippy::cast_possible_truncation)]
-            #[allow(clippy::cast_sign_loss)]
-            let delay_secs = capped.ceil().max(1.0) as u64;
-            WaitDecision::Continue {
-                delay: Duration::from_secs(delay_secs),
-            }
+    pub fn wait_strategy(mut self, strategy: WaitStrategy<S>) -> Self {
+        self.wait_strategy = Some(Box::new(move |state: S, attempt: u32| {
+            strategy.decide(&state, attempt)
         }));
         self
     }
@@ -175,6 +172,15 @@ where
     /// The strategy receives the current (deserialized) state and the
     /// 1-based attempt number, and returns a [`WaitDecision`].
     /// The SDK boxes the closure internally — no `Box::new` at the call site.
+    ///
+    /// The closure is responsible for termination: return
+    /// [`WaitDecision::complete`] when the condition is met, and bound the
+    /// polling with [`WaitDecision::exhausted`] (for example once `attempt`
+    /// reaches a cap) so the operation cannot poll until the execution
+    /// times out. Prefer [`wait_strategy`](Self::wait_strategy) when a
+    /// predicate plus attempt cap expresses the condition — it makes the
+    /// bound impossible to forget. With no strategy set at all, the check
+    /// runs exactly once and the operation completes with that state.
     ///
     /// # Examples
     ///
@@ -280,10 +286,30 @@ where
 /// Configuration for the wait strategy used by
 /// [`DurableContext::wait_for_condition`].
 ///
-/// Controls the polling interval and backoff behavior for condition checks.
-/// Construct with [`WaitStrategy::builder`] — unset values keep their
-/// [`Default`] value. Fields are private per C-STRUCT-PRIVATE; read values
-/// back through the accessors.
+/// Carries the three things a bounded poll needs: a **completion
+/// predicate** over the state (the operation completes when it returns
+/// `true`), an attempt cap (**`max_attempts`** — reaching it without the
+/// predicate matching fails the operation with a `MaxChecksExceeded`
+/// error), and exponential-backoff **delay shaping** (`initial_delay`,
+/// `max_delay`, `backoff_rate`, `jitter`) for the suspension between
+/// checks.
+///
+/// The predicate is required at construction — [`WaitStrategy::builder`]
+/// takes it as its argument — so a strategy that polls forever cannot be
+/// constructed. The remaining knobs default to 60 attempts, a 5 second
+/// initial delay, a 5 minute maximum delay, a 1.5 backoff rate, and
+/// [`JitterStrategy::Full`](crate::builders::JitterStrategy), matching the
+/// JS and Python SDK defaults.
+///
+/// The delay before check `n + 1` is `initial_delay * backoff_rate^(n - 1)`
+/// capped at `max_delay`, jittered per
+/// [`JitterStrategy`](crate::builders::JitterStrategy), and quantized
+/// to whole seconds with a one-second minimum, always rounding **up**
+/// (`max(1, ceil(delay))`) — a sampled delay never fires earlier than
+/// sampled, for every jitter strategy.
+///
+/// Fields are private per C-STRUCT-PRIVATE; read values back through the
+/// accessors.
 ///
 /// # Examples
 ///
@@ -291,52 +317,106 @@ where
 /// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitStrategy;
 /// use std::time::Duration;
 ///
-/// let strategy = WaitStrategy::builder()
+/// let strategy = WaitStrategy::builder(|state: &i32| *state >= 3)
+///     .max_attempts(10)
 ///     .initial_delay(Duration::from_secs(2))
-///     .max_delay(Duration::from_secs(30))
 ///     .build();
-/// assert_eq!(strategy.initial_delay(), Duration::from_secs(2));
-/// // Unset values keep the default.
-/// let default_factor = WaitStrategy::default().backoff_factor();
-/// assert!((strategy.backoff_factor() - default_factor).abs() < f64::EPSILON);
+/// assert_eq!(strategy.max_attempts(), 10);
+/// // Unset knobs keep the JS/Python-aligned defaults.
+/// assert_eq!(strategy.max_delay(), Duration::from_mins(5));
+/// assert!((strategy.backoff_rate() - 1.5).abs() < f64::EPSILON);
 /// ```
-#[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct WaitStrategy {
+pub struct WaitStrategy<S> {
+    /// Predicate over the state; `true` completes the operation.
+    completion_predicate: std::sync::Arc<dyn Fn(&S) -> bool + Send + Sync>,
+    /// Total number of checks allowed before the operation exhausts.
+    max_attempts: u32,
     /// Initial delay between condition checks.
     initial_delay: Duration,
     /// Maximum delay between condition checks.
     max_delay: Duration,
     /// Backoff multiplier applied after each check.
-    backoff_factor: f64,
+    backoff_rate: f64,
+    /// Jitter applied to each computed delay.
+    jitter: crate::builders::JitterStrategy,
 }
 
-impl Default for WaitStrategy {
-    fn default() -> Self {
+/// Default `max_attempts`, aligned with the JS and Python SDKs.
+const DEFAULT_MAX_ATTEMPTS: u32 = 60;
+/// Default `initial_delay`, aligned with the JS and Python SDKs.
+const DEFAULT_INITIAL_DELAY: Duration = Duration::from_secs(5);
+/// Default `max_delay`, aligned with the JS and Python SDKs.
+const DEFAULT_MAX_DELAY: Duration = Duration::from_mins(5);
+/// Default `backoff_rate`, aligned with the JS and Python SDKs.
+const DEFAULT_BACKOFF_RATE: f64 = 1.5;
+
+impl<S> std::fmt::Debug for WaitStrategy<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitStrategy")
+            .field("max_attempts", &self.max_attempts)
+            .field("initial_delay", &self.initial_delay)
+            .field("max_delay", &self.max_delay)
+            .field("backoff_rate", &self.backoff_rate)
+            .field("jitter", &self.jitter)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> Clone for WaitStrategy<S> {
+    fn clone(&self) -> Self {
         Self {
-            initial_delay: Duration::from_secs(1),
-            max_delay: Duration::from_mins(1),
-            backoff_factor: 2.0,
+            completion_predicate: std::sync::Arc::clone(&self.completion_predicate),
+            max_attempts: self.max_attempts,
+            initial_delay: self.initial_delay,
+            max_delay: self.max_delay,
+            backoff_rate: self.backoff_rate,
+            jitter: self.jitter,
         }
     }
 }
 
-impl WaitStrategy {
-    /// Creates a new [`WaitStrategyBuilder`] seeded with the default values.
+impl<S> WaitStrategy<S> {
+    /// Creates a new [`WaitStrategyBuilder`] from the required completion
+    /// predicate.
+    ///
+    /// The predicate receives the state each check produced and returns
+    /// `true` when the condition is met, which completes the operation.
+    /// Taking it here — rather than through an optional setter — makes an
+    /// unbounded strategy unrepresentable. Knobs left unset keep the
+    /// JS/Python-aligned defaults (60 attempts, 5s initial delay, 5min
+    /// maximum delay, 1.5 backoff rate, full jitter).
     ///
     /// # Examples
     ///
     /// ```
     /// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitStrategy;
-    /// use std::time::Duration;
     ///
-    /// let strategy = WaitStrategy::builder()
-    ///     .backoff_factor(1.5)
+    /// let strategy = WaitStrategy::builder(|state: &i32| *state >= 3)
+    ///     .backoff_rate(2.0)
     ///     .build();
-    /// assert!((strategy.backoff_factor() - 1.5).abs() < f64::EPSILON);
+    /// assert!((strategy.backoff_rate() - 2.0).abs() < f64::EPSILON);
+    /// assert_eq!(strategy.max_attempts(), 60);
     /// ```
-    pub fn builder() -> WaitStrategyBuilder {
-        WaitStrategyBuilder::default()
+    pub fn builder<P>(completion_predicate: P) -> WaitStrategyBuilder<S>
+    where
+        P: Fn(&S) -> bool + Send + Sync + 'static,
+    {
+        WaitStrategyBuilder {
+            completion_predicate: std::sync::Arc::new(completion_predicate),
+            max_attempts: None,
+            initial_delay: None,
+            max_delay: None,
+            backoff_rate: None,
+            jitter: None,
+        }
+    }
+
+    /// Returns the total number of checks allowed before the operation
+    /// exhausts.
+    #[must_use]
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
     }
 
     /// Returns the initial delay between condition checks.
@@ -353,67 +433,182 @@ impl WaitStrategy {
 
     /// Returns the backoff multiplier applied after each check.
     #[must_use]
-    pub fn backoff_factor(&self) -> f64 {
-        self.backoff_factor
+    pub fn backoff_rate(&self) -> f64 {
+        self.backoff_rate
     }
+
+    /// Returns the jitter applied to each computed delay.
+    #[must_use]
+    pub fn jitter(&self) -> crate::builders::JitterStrategy {
+        self.jitter
+    }
+
+    /// Computes the wait decision after a check produced `state` on the
+    /// 1-based attempt `attempt`.
+    ///
+    /// Order matters: the predicate is consulted first, so a condition
+    /// satisfied on the final allowed check completes rather than
+    /// exhausting. Exhaustion carries the attempt count in its reason.
+    pub(crate) fn decide(&self, state: &S, attempt: u32) -> WaitDecision {
+        if (self.completion_predicate)(state) {
+            return WaitDecision::Complete;
+        }
+        if attempt >= self.max_attempts {
+            return WaitDecision::Exhausted {
+                reason: format!(
+                    "max attempts exceeded: {attempt} checks completed (max_attempts = {})",
+                    self.max_attempts
+                ),
+            };
+        }
+
+        // Exponential backoff: initial * rate^(attempt-1), capped at max,
+        // jittered, then quantized with the round-up-min-1s policy
+        // (`max(1, ceil(delay))`) — see [`quantize_wait_delay`].
+        let exponent = i32::try_from(attempt).unwrap_or(1) - 1;
+        let base = (self.initial_delay.as_secs_f64() * self.backoff_rate.powi(exponent))
+            .min(self.max_delay.as_secs_f64());
+        let jittered = match self.jitter {
+            crate::builders::JitterStrategy::None => base,
+            // Half jitter: base/2 plus random in [0, base/2] => [base/2, base].
+            crate::builders::JitterStrategy::Half => {
+                base / 2.0 + crate::step::rand_full_jitter(base / 2.0)
+            }
+            // Full jitter: random in [0, base].
+            crate::builders::JitterStrategy::Full => crate::step::rand_full_jitter(base),
+        };
+        WaitDecision::Continue {
+            delay: quantize_wait_delay(jittered),
+        }
+    }
+}
+
+/// Quantizes a fractional delay in seconds to a whole-second [`Duration`]
+/// with a one-second minimum, always rounding **up**: `max(1, ceil(delay))`,
+/// the policy issue #35 requires (Python does the same). A sampled delay is
+/// therefore never scheduled earlier than sampled — `4.4s` becomes `5s`.
+///
+/// This is deliberately independent of the retry path's
+/// `step::quantize_delay_secs`, whose `Full`-jitter arm rounds to the
+/// *nearest* second to preserve the legacy retry delay distribution. Wait
+/// strategies carry no such legacy and apply the round-up policy uniformly
+/// across every jitter strategy.
+///
+/// Conversion goes through [`Duration::try_from_secs_f64`] rather than a
+/// lossy `as` cast; a non-finite or out-of-range input falls back to the
+/// one-second minimum.
+fn quantize_wait_delay(jittered: f64) -> Duration {
+    let secs = jittered.ceil().max(1.0);
+    Duration::try_from_secs_f64(secs).unwrap_or(Duration::from_secs(1))
 }
 
 /// Builder for [`WaitStrategy`].
 ///
-/// Follows the Rust API Guidelines C-BUILDER pattern. All methods consume
-/// and return `self` for chaining. Values left unset keep the
-/// [`WaitStrategy::default`] value.
+/// Created by [`WaitStrategy::builder`], which takes the required
+/// completion predicate. Follows the Rust API Guidelines C-BUILDER
+/// pattern: all methods consume and return `self` for chaining, and knobs
+/// left unset keep the JS/Python-aligned defaults (60 attempts, 5s initial
+/// delay, 5min maximum delay, 1.5 backoff rate,
+/// [`JitterStrategy::Full`](crate::builders::JitterStrategy)).
 ///
 /// # Examples
 ///
 /// ```
+/// use aws_durable_execution_sdk_rust::builders::JitterStrategy;
 /// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitStrategy;
 /// use std::time::Duration;
 ///
-/// let strategy = WaitStrategy::builder()
+/// let strategy = WaitStrategy::builder(|state: &u32| *state > 0)
+///     .max_attempts(20)
 ///     .initial_delay(Duration::from_millis(500))
 ///     .max_delay(Duration::from_secs(10))
-///     .backoff_factor(3.0)
+///     .backoff_rate(3.0)
+///     .jitter(JitterStrategy::None)
 ///     .build();
 /// assert_eq!(strategy.max_delay(), Duration::from_secs(10));
 /// ```
-#[derive(Debug, Clone, Default)]
 #[must_use = "builders do nothing unless .build() is called"]
 #[non_exhaustive]
-pub struct WaitStrategyBuilder {
+pub struct WaitStrategyBuilder<S> {
+    completion_predicate: std::sync::Arc<dyn Fn(&S) -> bool + Send + Sync>,
+    max_attempts: Option<u32>,
     initial_delay: Option<Duration>,
     max_delay: Option<Duration>,
-    backoff_factor: Option<f64>,
+    backoff_rate: Option<f64>,
+    jitter: Option<crate::builders::JitterStrategy>,
 }
 
-impl WaitStrategyBuilder {
-    /// Sets the initial delay between condition checks.
+impl<S> std::fmt::Debug for WaitStrategyBuilder<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitStrategyBuilder")
+            .field("max_attempts", &self.max_attempts)
+            .field("initial_delay", &self.initial_delay)
+            .field("max_delay", &self.max_delay)
+            .field("backoff_rate", &self.backoff_rate)
+            .field("jitter", &self.jitter)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> Clone for WaitStrategyBuilder<S> {
+    fn clone(&self) -> Self {
+        Self {
+            completion_predicate: std::sync::Arc::clone(&self.completion_predicate),
+            max_attempts: self.max_attempts,
+            initial_delay: self.initial_delay,
+            max_delay: self.max_delay,
+            backoff_rate: self.backoff_rate,
+            jitter: self.jitter,
+        }
+    }
+}
+
+impl<S> WaitStrategyBuilder<S> {
+    /// Sets the total number of checks allowed before the operation fails
+    /// with a `MaxChecksExceeded` error.
+    ///
+    /// The cap counts checks, so `max_attempts(1)` runs the check once and
+    /// exhausts if the predicate is not satisfied by its state.
+    pub fn max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = Some(max_attempts);
+        self
+    }
+
+    /// Sets the initial delay between condition checks, prior to jitter.
     pub fn initial_delay(mut self, delay: Duration) -> Self {
         self.initial_delay = Some(delay);
         self
     }
 
-    /// Sets the maximum delay between condition checks.
+    /// Sets the maximum delay between condition checks, prior to jitter.
     pub fn max_delay(mut self, delay: Duration) -> Self {
         self.max_delay = Some(delay);
         self
     }
 
     /// Sets the backoff multiplier applied after each check.
-    pub fn backoff_factor(mut self, factor: f64) -> Self {
-        self.backoff_factor = Some(factor);
+    pub fn backoff_rate(mut self, rate: f64) -> Self {
+        self.backoff_rate = Some(rate);
         self
     }
 
-    /// Builds the [`WaitStrategy`], filling unset values from
-    /// [`WaitStrategy::default`].
+    /// Sets the jitter applied to each computed delay.
+    pub fn jitter(mut self, jitter: crate::builders::JitterStrategy) -> Self {
+        self.jitter = Some(jitter);
+        self
+    }
+
+    /// Builds the [`WaitStrategy`], filling unset knobs with the
+    /// JS/Python-aligned defaults.
     #[must_use]
-    pub fn build(self) -> WaitStrategy {
-        let defaults = WaitStrategy::default();
+    pub fn build(self) -> WaitStrategy<S> {
         WaitStrategy {
-            initial_delay: self.initial_delay.unwrap_or(defaults.initial_delay),
-            max_delay: self.max_delay.unwrap_or(defaults.max_delay),
-            backoff_factor: self.backoff_factor.unwrap_or(defaults.backoff_factor),
+            completion_predicate: self.completion_predicate,
+            max_attempts: self.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS),
+            initial_delay: self.initial_delay.unwrap_or(DEFAULT_INITIAL_DELAY),
+            max_delay: self.max_delay.unwrap_or(DEFAULT_MAX_DELAY),
+            backoff_rate: self.backoff_rate.unwrap_or(DEFAULT_BACKOFF_RATE),
+            jitter: self.jitter.unwrap_or_default(),
         }
     }
 }
@@ -424,60 +619,101 @@ impl WaitStrategyBuilder {
 #[allow(clippy::panic)] // reason: test assertions on unexpected variants
 mod tests {
     use super::*;
+    use crate::builders::JitterStrategy;
 
-    /// The `WaitStrategy` builder sets each knob independently and leaves
-    /// unset knobs at their `Default` value.
+    /// The `WaitStrategy` builder sets each knob independently, and unset
+    /// knobs keep the JS/Python-aligned defaults (60 attempts, 5s initial
+    /// delay, 5min maximum delay, 1.5 backoff rate, full jitter).
     #[test]
     fn wait_strategy_builder_overrides_only_what_is_set() {
-        let defaults = WaitStrategy::default();
-
-        let strategy = WaitStrategy::builder()
-            .initial_delay(Duration::from_secs(5))
+        let partial = WaitStrategy::builder(|state: &i32| *state >= 3)
+            .initial_delay(Duration::from_secs(2))
             .build();
-        assert_eq!(strategy.initial_delay(), Duration::from_secs(5));
-        assert_eq!(strategy.max_delay(), defaults.max_delay());
-        assert!((strategy.backoff_factor() - defaults.backoff_factor()).abs() < f64::EPSILON);
+        assert_eq!(partial.initial_delay(), Duration::from_secs(2));
+        assert_eq!(partial.max_attempts(), 60);
+        assert_eq!(partial.max_delay(), Duration::from_mins(5));
+        assert!((partial.backoff_rate() - 1.5).abs() < f64::EPSILON);
+        assert_eq!(partial.jitter(), JitterStrategy::Full);
 
-        let full = WaitStrategy::builder()
+        let full = WaitStrategy::builder(|state: &i32| *state >= 3)
+            .max_attempts(7)
             .initial_delay(Duration::from_millis(500))
             .max_delay(Duration::from_secs(10))
-            .backoff_factor(3.0)
+            .backoff_rate(3.0)
+            .jitter(JitterStrategy::Half)
             .build();
+        assert_eq!(full.max_attempts(), 7);
         assert_eq!(full.initial_delay(), Duration::from_millis(500));
         assert_eq!(full.max_delay(), Duration::from_secs(10));
-        assert!((full.backoff_factor() - 3.0).abs() < f64::EPSILON);
-
-        // Default behavior is unchanged by the builder rework.
-        assert_eq!(defaults.initial_delay(), Duration::from_secs(1));
-        assert_eq!(defaults.max_delay(), Duration::from_mins(1));
-        assert!((defaults.backoff_factor() - 2.0).abs() < f64::EPSILON);
+        assert!((full.backoff_rate() - 3.0).abs() < f64::EPSILON);
+        assert_eq!(full.jitter(), JitterStrategy::Half);
     }
 
-    /// A [`WaitStrategy`] built through its builder drives the derived polling
-    /// schedule: the first delay is `initial_delay`, each subsequent delay
-    /// grows by `backoff_factor`, and the sequence is capped at `max_delay`.
+    /// A state satisfying the completion predicate yields `Complete` — and
+    /// the predicate wins over exhaustion, so a condition satisfied on the
+    /// final allowed check completes rather than exhausting.
     #[test]
-    fn wait_strategy_builder_drives_polling_schedule() {
-        let ctx = DurableContext::__test_context();
+    fn predicate_satisfied_yields_complete() {
+        let strategy = WaitStrategy::builder(|state: &i32| *state >= 3)
+            .max_attempts(5)
+            .build();
 
-        let builder = ctx
-            .wait_for_condition(|_sc, state: i32| async move { Ok(state) }, 0_i32)
-            .wait_strategy(
-                WaitStrategy::builder()
-                    .initial_delay(Duration::from_secs(2))
-                    .max_delay(Duration::from_secs(10))
-                    .backoff_factor(3.0)
-                    .build(),
-            );
+        assert!(matches!(strategy.decide(&3, 1), WaitDecision::Complete));
+        assert!(matches!(strategy.decide(&100, 2), WaitDecision::Complete));
+        // Attempt at (and past) the cap still completes when the predicate
+        // is satisfied.
+        assert!(matches!(strategy.decide(&3, 5), WaitDecision::Complete));
+        assert!(matches!(strategy.decide(&3, 6), WaitDecision::Complete));
+    }
 
-        let strategy = builder
-            .wait_strategy
-            .as_ref()
-            .expect("wait_strategy must install a strategy");
+    /// Reaching `max_attempts` without the predicate matching yields
+    /// `Exhausted`, and the reason carries the attempt count.
+    #[test]
+    fn max_attempts_reached_yields_exhausted_with_attempt_count() {
+        let strategy = WaitStrategy::builder(|state: &i32| *state >= 3)
+            .max_attempts(3)
+            .jitter(JitterStrategy::None)
+            .build();
 
-        let delay_of = |attempt: u32| match strategy(0_i32, attempt) {
+        // Below the cap: continue.
+        assert!(matches!(
+            strategy.decide(&0, 2),
+            WaitDecision::Continue { .. }
+        ));
+
+        // At the cap: exhausted, with the attempt count in the reason.
+        match strategy.decide(&0, 3) {
+            WaitDecision::Exhausted { reason } => {
+                assert!(
+                    reason.contains("3 checks"),
+                    "reason must carry the attempt count: {reason}"
+                );
+                assert!(
+                    reason.contains("max attempts exceeded"),
+                    "reason must name the cause: {reason}"
+                );
+            }
+            other => panic!("expected Exhausted at the cap, got {other:?}"),
+        }
+    }
+
+    /// With `JitterStrategy::None` the schedule is deterministic: the first
+    /// delay is `initial_delay`, each subsequent delay grows by
+    /// `backoff_rate`, the sequence caps at `max_delay`, and sub-second
+    /// results round up to the one-second minimum.
+    #[test]
+    fn deterministic_schedule_respects_backoff_and_max_delay() {
+        let strategy = WaitStrategy::builder(|state: &i32| *state >= 100)
+            .max_attempts(60)
+            .initial_delay(Duration::from_secs(2))
+            .max_delay(Duration::from_secs(10))
+            .backoff_rate(3.0)
+            .jitter(JitterStrategy::None)
+            .build();
+
+        let delay_of = |attempt: u32| match strategy.decide(&0, attempt) {
             WaitDecision::Continue { delay } => delay,
-            other => panic!("config-derived strategy must always continue, got {other:?}"),
+            other => panic!("expected Continue below the cap, got {other:?}"),
         };
 
         // attempt 1 → initial (2s); attempt 2 → 2s * 3 = 6s;
@@ -486,31 +722,157 @@ mod tests {
         assert_eq!(delay_of(2), Duration::from_secs(6));
         assert_eq!(delay_of(3), Duration::from_secs(10));
         assert_eq!(delay_of(9), Duration::from_secs(10));
+
+        // Sub-second base delays quantize up to the one-second minimum.
+        let tiny = WaitStrategy::builder(|state: &i32| *state >= 100)
+            .initial_delay(Duration::from_millis(100))
+            .jitter(JitterStrategy::None)
+            .build();
+        match tiny.decide(&0, 1) {
+            WaitDecision::Continue { delay } => assert_eq!(delay, Duration::from_secs(1)),
+            other => panic!("expected Continue, got {other:?}"),
+        }
     }
 
-    /// The default [`WaitStrategy`] keeps its pre-builder behavior: a 1 second
-    /// first delay doubling up to the 1 minute cap.
+    /// Full jitter draws from `[0, base]` (quantized, min 1s), and the
+    /// delay never exceeds `max_delay` even deep into the schedule.
     #[test]
-    fn default_wait_strategy_schedule_unchanged() {
+    fn full_jitter_delays_stay_within_bounds() {
+        let strategy = WaitStrategy::builder(|state: &i32| *state >= 100)
+            .initial_delay(Duration::from_secs(10))
+            .max_delay(Duration::from_secs(30))
+            .backoff_rate(2.0)
+            .jitter(JitterStrategy::Full)
+            .build();
+
+        for _ in 0..50 {
+            // Attempt 1: base = 10s. Full jitter in [0, 10], min 1s.
+            match strategy.decide(&0, 1) {
+                WaitDecision::Continue { delay } => {
+                    assert!(
+                        delay >= Duration::from_secs(1) && delay <= Duration::from_secs(10),
+                        "full-jitter delay {delay:?} outside [1s, base]"
+                    );
+                }
+                other => panic!("expected Continue, got {other:?}"),
+            }
+            // Attempt 20: base capped at max_delay (30s).
+            match strategy.decide(&0, 20) {
+                WaitDecision::Continue { delay } => {
+                    assert!(
+                        delay <= Duration::from_secs(30),
+                        "full-jitter delay {delay:?} exceeds max_delay"
+                    );
+                }
+                other => panic!("expected Continue, got {other:?}"),
+            }
+        }
+    }
+
+    /// Half jitter draws from `[base / 2, base]`, and the documented lower
+    /// bound survives quantization.
+    #[test]
+    fn half_jitter_delays_stay_within_bounds() {
+        let strategy = WaitStrategy::builder(|state: &i32| *state >= 100)
+            .initial_delay(Duration::from_secs(10))
+            .max_delay(Duration::from_secs(30))
+            .jitter(JitterStrategy::Half)
+            .build();
+
+        for _ in 0..50 {
+            // Attempt 1: base = 10s. Half jitter in [5, 10].
+            match strategy.decide(&0, 1) {
+                WaitDecision::Continue { delay } => {
+                    assert!(
+                        delay >= Duration::from_secs(5) && delay <= Duration::from_secs(10),
+                        "half-jitter delay {delay:?} outside [base/2, base]"
+                    );
+                }
+                other => panic!("expected Continue, got {other:?}"),
+            }
+        }
+    }
+
+    /// `wait_strategy` installs a strategy derived from the config: the
+    /// three outcomes (`Complete` / `Continue` / `Exhausted`) flow through
+    /// the installed closure exactly as `decide` produces them.
+    #[test]
+    fn wait_strategy_installs_config_derived_strategy() {
         let ctx = DurableContext::__test_context();
 
         let builder = ctx
             .wait_for_condition(|_sc, state: i32| async move { Ok(state) }, 0_i32)
-            .wait_strategy(WaitStrategy::default());
+            .wait_strategy(
+                WaitStrategy::builder(|state: &i32| *state >= 3)
+                    .max_attempts(4)
+                    .initial_delay(Duration::from_secs(2))
+                    .max_delay(Duration::from_secs(10))
+                    .backoff_rate(3.0)
+                    .jitter(JitterStrategy::None)
+                    .build(),
+            );
 
         let strategy = builder
             .wait_strategy
             .as_ref()
             .expect("wait_strategy must install a strategy");
 
-        let delay_of = |attempt: u32| match strategy(0_i32, attempt) {
-            WaitDecision::Continue { delay } => delay,
-            other => panic!("config-derived strategy must always continue, got {other:?}"),
-        };
+        // Predicate satisfied → Complete.
+        assert!(matches!(strategy(3_i32, 1), WaitDecision::Complete));
+        // Predicate unmet below the cap → Continue with the backoff delay.
+        match strategy(0_i32, 2) {
+            WaitDecision::Continue { delay } => assert_eq!(delay, Duration::from_secs(6)),
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        // Predicate unmet at the cap → Exhausted.
+        assert!(matches!(strategy(0_i32, 4), WaitDecision::Exhausted { .. }));
+    }
 
-        assert_eq!(delay_of(1), Duration::from_secs(1));
-        assert_eq!(delay_of(2), Duration::from_secs(2));
-        assert_eq!(delay_of(3), Duration::from_secs(4));
-        assert_eq!(delay_of(20), Duration::from_mins(1));
+    /// The wait-strategy quantizer implements the round-up-min-1s policy
+    /// issue #35 requires (`max(1, ceil(delay))`): a fractional sample is
+    /// never scheduled earlier than sampled — `4.4s` rounds **up** to `5s`,
+    /// unlike the retry path's legacy Full-jitter nearest-rounding, which
+    /// would schedule it at `4s`.
+    #[test]
+    fn quantize_wait_delay_rounds_up_with_one_second_minimum() {
+        // Regression for the reviewer finding: 4.4 must become 5, not 4.
+        assert_eq!(quantize_wait_delay(4.4), Duration::from_secs(5));
+        // Nearest-rounding would also disagree here (4.5 → 5 either way,
+        // 4.1 → 4 under round()); ceil is unambiguous.
+        assert_eq!(quantize_wait_delay(4.1), Duration::from_secs(5));
+        // Whole seconds pass through unchanged.
+        assert_eq!(quantize_wait_delay(5.0), Duration::from_secs(5));
+        // Sub-second and zero samples clamp to the one-second minimum.
+        assert_eq!(quantize_wait_delay(0.4), Duration::from_secs(1));
+        assert_eq!(quantize_wait_delay(0.0), Duration::from_secs(1));
+        // Defensive fallback: a non-finite input degrades to the minimum
+        // rather than panicking.
+        assert_eq!(quantize_wait_delay(f64::NAN), Duration::from_secs(1));
+    }
+
+    /// End-to-end through `decide`: with `Full` jitter the sample lands in
+    /// `[0, base]`, so after round-up quantization every delay is a whole
+    /// second in `[1s, ceil(base)]` — never rounded below the sample.
+    #[test]
+    fn full_jitter_decide_never_rounds_below_one_second() {
+        let strategy = WaitStrategy::builder(|state: &i32| *state >= 100)
+            // base for attempt 1 is 1s, so full-jitter samples are all
+            // fractional in [0, 1]; round-up must yield exactly 1s.
+            .initial_delay(Duration::from_secs(1))
+            .jitter(JitterStrategy::Full)
+            .build();
+
+        for _ in 0..50 {
+            match strategy.decide(&0, 1) {
+                WaitDecision::Continue { delay } => {
+                    assert_eq!(
+                        delay,
+                        Duration::from_secs(1),
+                        "sample in [0, 1] must quantize up to exactly 1s"
+                    );
+                }
+                other => panic!("expected Continue, got {other:?}"),
+            }
+        }
     }
 }

@@ -11,7 +11,9 @@
 //!   when checkpointed state fails to deserialize. It never silently resets
 //!   to `initial_state`.
 //! - [`WaitDecision`] is the type returned by the wait strategy.
-//! - Wait strategy exhaustion raises `WaitForConditionError::MaxChecksExceeded`.
+//! - Wait strategy exhaustion raises `WaitForConditionError::MaxChecksExceeded`,
+//!   live and on replay: the terminal record carries a dedicated wire
+//!   discriminator, so the replayed error keeps the same kind and check count.
 
 use std::future::Future;
 use std::time::Duration;
@@ -267,7 +269,9 @@ where
                         .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
                     return Ok(WfcPrelude::Done(Err(replay_terminal_failure(
-                        wire, &wire_id,
+                        wire,
+                        &wire_id,
+                        view.attempt,
                     ))));
                 }
                 CheckpointStatus::Pending => {
@@ -411,7 +415,9 @@ where
                 let decision = if let Some(strategy) = &self.wait_strategy {
                     strategy(deserialized.clone(), attempt)
                 } else {
-                    // Default: if no strategy provided, complete immediately.
+                    // Documented no-strategy behavior: the check runs exactly
+                    // once and the operation completes with that state (see
+                    // `WaitForConditionBuilder` docs).
                     WaitDecision::Complete
                 };
 
@@ -465,9 +471,13 @@ where
                     }
                     WaitDecision::Exhausted { reason } => {
                         // Strategy exhaustion: checkpoint FAIL, raise
-                        // WaitForConditionError (Python #530 fix).
+                        // WaitForConditionError (Python #530 fix). The
+                        // record's type is the fixed exhaustion
+                        // discriminator so replay reconstructs the same
+                        // `MaxChecksExceeded` classification (see
+                        // `replay_terminal_failure`).
                         let wire = crate::error::wire_error_manual(
-                            "WaitForConditionError",
+                            crate::error::WFC_EXHAUSTED_ERROR_TYPE,
                             reason.as_str(),
                         );
                         let update = build_wfc_fail_update(
@@ -560,12 +570,34 @@ async fn replay_terminal_success<S, SD: Serdes<S>>(
 /// than being folded into a message, so `kind()` stays meaningful after
 /// a replay.
 ///
-/// A record whose `error_type` is the serialization discriminator
-/// ([`crate::error::SERIALIZATION_FAILED_ERROR_TYPE`]) reconstructs
-/// `WaitForConditionErrorKind::SerializationFailed` — the kind the live
-/// path yielded after persisting that record — so replay reproduces the
-/// recorded failure's classification (issue #43).
-fn replay_terminal_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+/// The wire `error_type` discriminates the classification so replay
+/// reproduces what the live path yielded after persisting the record
+/// (issue #43):
+///
+/// - [`crate::error::SERIALIZATION_FAILED_ERROR_TYPE`] reconstructs
+///   `WaitForConditionErrorKind::SerializationFailed`.
+/// - [`crate::error::WFC_EXHAUSTED_ERROR_TYPE`] reconstructs
+///   `WaitForConditionErrorKind::MaxChecksExceeded`, deriving the check
+///   count from `recorded_attempt` — the checkpoint record's completed
+///   retry count — exactly as the live path derived its 1-based attempt
+///   number (`recorded + 1`), so `MaxChecksExceeded::checks()` reports
+///   the same value live and replayed. Like the live exhaustion error,
+///   the replayed one carries no foreign source: the kind is the whole
+///   story, and the recorded reason stays readable on the attached wire
+///   record.
+/// - Anything else is a check failure.
+fn replay_terminal_failure(
+    wire: crate::error::WireError,
+    wire_id: &str,
+    recorded_attempt: u32,
+) -> OperationError {
+    if wire.error_type() == Some(crate::error::WFC_EXHAUSTED_ERROR_TYPE) {
+        return wfc_op_error(WaitForConditionErrorKind::MaxChecksExceeded(
+            crate::error::MaxChecksExceeded::new(recorded_attempt.saturating_add(1)),
+        ))
+        .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+        .with_wire(wire);
+    }
     let kind = if wire.error_type() == Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) {
         WaitForConditionErrorKind::SerializationFailed
     } else {
@@ -1071,7 +1103,10 @@ mod tests {
         // site with no escaping error to walk — the stack is captured at
         // the construction site rather than left empty.
         let wire = err.wire().unwrap();
-        assert_eq!(wire.error_type(), Some("WaitForConditionError"));
+        assert_eq!(
+            wire.error_type(),
+            Some(crate::error::WFC_EXHAUSTED_ERROR_TYPE)
+        );
         assert_eq!(wire.error_message(), Some("max attempts exceeded"));
         assert!(
             !wire.stack_trace().is_empty(),
@@ -1268,6 +1303,80 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{:#}", result.unwrap_err());
         assert!(err_msg.contains("max attempts exceeded"), "got: {err_msg}");
+    }
+
+    /// REGRESSION TEST: a replayed exhaustion record keeps its
+    /// `MaxChecksExceeded` classification.
+    ///
+    /// The live path persists the fixed exhaustion discriminator on the
+    /// terminal FAIL; replay must reconstruct the same kind — not the
+    /// generic `CheckFailed` — with `checks()` derived from the record's
+    /// completed-retry count (`attempt + 1`), matching what the live path
+    /// reported.
+    #[tokio::test]
+    async fn replay_exhaustion_keeps_max_checks_exceeded_classification() {
+        let wire_key = crate::engine::compute_wire_id_public("1");
+        let record = CheckpointRecord {
+            id: wire_key.clone(),
+            status: CheckpointStatus::Failed,
+            result: None,
+            error_type: Some(crate::error::WFC_EXHAUSTED_ERROR_TYPE.to_owned()),
+            error_message: Some("max checks exceeded: 3".to_owned()),
+            error_data: None,
+            stack_trace: None,
+            // Two completed retries: the outcome came from attempt 3.
+            attempt: 2,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        };
+        let ctx = make_ctx_with_log(vec![(wire_key, record)]);
+        let op_id = ctx.mint_id();
+
+        let exec = WaitForConditionExecution::<i32, _, _> {
+            ctx,
+            op_id,
+            name: None,
+            initial_state: 0,
+            wait_strategy: None,
+            serdes: crate::serdes::JsonSerdes,
+            check: |_ctx, _state: i32| async move {
+                #[allow(unreachable_code)] // reason: type anchor for the diverging body
+                {
+                    panic!("check must NOT execute during replay");
+                    Ok::<i32, BoxError>(0)
+                }
+            },
+        };
+
+        let err = exec.execute().await.unwrap_err();
+        match err.kind() {
+            OperationErrorKind::WaitForCondition(wfc_err) => match wfc_err.kind() {
+                WaitForConditionErrorKind::MaxChecksExceeded(details) => {
+                    assert_eq!(
+                        details.checks(),
+                        3,
+                        "replay must derive checks() from the recorded attempt count"
+                    );
+                }
+                other => panic!("expected MaxChecksExceeded on replay, got: {other:?}"),
+            },
+            other => panic!("expected WaitForCondition error, got: {other:?}"),
+        }
+        // The recorded reason stays readable on the attached wire record.
+        let wire = err.wire().unwrap();
+        assert_eq!(
+            wire.error_type(),
+            Some(crate::error::WFC_EXHAUSTED_ERROR_TYPE)
+        );
+        assert_eq!(wire.error_message(), Some("max checks exceeded: 3"));
     }
 
     /// Test: spawn delegates to blessed task.

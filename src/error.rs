@@ -556,6 +556,23 @@ pub(crate) fn serialization_failure_wire(err: &(dyn Error + 'static)) -> WireErr
     wire_error_with_type(err, SERIALIZATION_FAILED_ERROR_TYPE)
 }
 
+/// The wire `ErrorType` recorded on the terminal `FAIL` a
+/// wait-for-condition operation persists when its wait strategy
+/// exhausted (returned [`WaitDecision::Exhausted`]).
+///
+/// This type is the replay discriminator for the exhaustion
+/// classification: the live path yields a
+/// [`WaitForConditionErrorKind::MaxChecksExceeded`]-kinded error after
+/// persisting this record, and replay reconstructs the SAME kind — with
+/// the check count derived from the checkpoint record's attempt field —
+/// by matching this type, so a handler that branches on the kind (or
+/// reads [`MaxChecksExceeded::checks`]) takes the same path live and
+/// replayed. It is a protocol discriminator written via
+/// [`wire_error_manual`], never derived from a user error's own identity.
+///
+/// [`WaitDecision::Exhausted`]: crate::builders::wait_for_condition::WaitDecision::Exhausted
+pub(crate) const WFC_EXHAUSTED_ERROR_TYPE: &str = "WaitForCondition.MaxChecksExceeded";
+
 /// Builds the small wire record a terminal `FAIL` carries when the
 /// operation's own outcome write was permanently rejected (issue #43).
 ///

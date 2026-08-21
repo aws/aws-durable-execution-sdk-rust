@@ -330,14 +330,20 @@ let count = ctx
     .await?;
 ```
 
-Pass a `WaitStrategy` to `.wait_strategy(...)` instead when you want
-configurable exponential backoff between polls. `WaitStrategy` controls
-only the delay timing; it always returns `WaitDecision::continue_with(...)`
-and never completes the operation on its own. The condition check itself
-must drive the state toward a value that your `wait_strategy_fn` recognizes
-as done, or use a `wait_strategy_fn` that stops after a maximum attempt
-count. Build a `WaitStrategy` with `WaitStrategy::builder()`, setting
-`initial_delay`, `max_delay`, and `backoff_factor`.
+Pass a `WaitStrategy` to `.wait_strategy(...)` instead when a predicate
+plus attempt cap expresses the condition. A `WaitStrategy` carries a
+required completion predicate over the state, a `max_attempts` cap, and
+exponential backoff configuration (`initial_delay`, `max_delay`,
+`backoff_rate`, `jitter`). After each check it completes the operation
+when the predicate matches the new state, fails it with a
+`MaxChecksExceeded` error once `max_attempts` checks have run, and
+otherwise suspends for the computed backoff delay. Build one with
+`WaitStrategy::builder(predicate)` — the predicate is the builder's
+argument, so an unbounded strategy cannot be constructed — and the
+remaining knobs default to 60 attempts, 5 second initial delay, 5 minute
+maximum delay, 1.5 backoff rate, and full jitter, matching the JS and
+Python SDKs. With no strategy set at all, the check runs exactly once and
+the operation completes with that state.
 
 ### callbacks
 

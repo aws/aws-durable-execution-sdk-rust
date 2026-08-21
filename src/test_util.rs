@@ -2638,6 +2638,168 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn wait_strategy_config_completes_on_predicate() {
+        // The config-derived strategy (issue #35) completes once its
+        // completion predicate matches the state the check produced.
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let final_state = ctx
+                        .wait_for_condition(
+                            |_sc, state: Counter| async move {
+                                Ok(Counter {
+                                    count: state.count + 1,
+                                })
+                            },
+                            Counter { count: 0 },
+                        )
+                        .name("poll")
+                        .wait_strategy(
+                            crate::builders::wait_for_condition::WaitStrategy::builder(
+                                |state: &Counter| state.count >= 3,
+                            )
+                            .initial_delay(std::time::Duration::from_secs(1))
+                            .jitter(crate::builders::JitterStrategy::None)
+                            .build(),
+                        )
+                        .await?;
+                    Ok::<_, BoxError>(final_state.count)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            result.output(),
+            Some(&3),
+            "the operation must complete when the predicate first matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_strategy_config_exhausts_at_max_attempts() {
+        // A predicate that never matches must exhaust at max_attempts with
+        // a MaxChecksExceeded failure, not poll forever.
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let final_state = ctx
+                        .wait_for_condition(
+                            |_sc, state: Counter| async move {
+                                Ok(Counter {
+                                    count: state.count + 1,
+                                })
+                            },
+                            Counter { count: 0 },
+                        )
+                        .name("never-ready")
+                        .wait_strategy(
+                            crate::builders::wait_for_condition::WaitStrategy::builder(
+                                |_state: &Counter| false,
+                            )
+                            .max_attempts(2)
+                            .initial_delay(std::time::Duration::from_secs(1))
+                            .jitter(crate::builders::JitterStrategy::None)
+                            .build(),
+                        )
+                        .await?;
+                    Ok::<_, BoxError>(final_state.count)
+                },
+                (),
+            )
+            .await;
+
+        assert!(
+            !result.is_success(),
+            "an unmatched predicate must exhaust, not succeed"
+        );
+        let message = result.error_message().unwrap_or_default();
+        assert!(
+            message.contains("max checks exceeded: 2"),
+            "failure must name exhaustion with the attempt count: {message}"
+        );
+    }
+
+    /// REGRESSION TEST: exhaustion keeps its `MaxChecksExceeded`
+    /// classification across a terminal replay.
+    ///
+    /// The handler catches the exhaustion error and then suspends on a
+    /// wait, so the next invocation replays the failed operation from its
+    /// checkpoint. Both the live catch and the replayed catch must
+    /// classify as `MaxChecksExceeded` with the same `checks()` value —
+    /// the returned output comes from the final (replaying) invocation,
+    /// so a replay misclassified as `CheckFailed` fails the execution.
+    #[tokio::test]
+    async fn wait_strategy_exhaustion_classification_survives_replay() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let outcome = ctx
+                        .wait_for_condition(
+                            |_sc, state: Counter| async move {
+                                Ok(Counter {
+                                    count: state.count + 1,
+                                })
+                            },
+                            Counter { count: 0 },
+                        )
+                        .name("never-ready")
+                        .wait_strategy(
+                            crate::builders::wait_for_condition::WaitStrategy::builder(
+                                |_state: &Counter| false,
+                            )
+                            .max_attempts(2)
+                            .initial_delay(std::time::Duration::from_secs(1))
+                            .jitter(crate::builders::JitterStrategy::None)
+                            .build(),
+                        )
+                        .await;
+
+                    let Err(err) = outcome else {
+                        return Err("expected exhaustion".into());
+                    };
+                    let checks = match err.kind() {
+                        crate::OperationErrorKind::WaitForCondition(wfc) => match wfc.kind() {
+                            crate::WaitForConditionErrorKind::MaxChecksExceeded(details) => {
+                                details.checks()
+                            }
+                            other => {
+                                return Err(
+                                    format!("expected MaxChecksExceeded, got: {other:?}").into()
+                                );
+                            }
+                        },
+                        other => {
+                            return Err(
+                                format!("expected WaitForCondition error, got: {other:?}").into()
+                            );
+                        }
+                    };
+
+                    // Suspend so a later invocation replays the failed
+                    // operation as a frozen terminal outcome.
+                    ctx.wait(std::time::Duration::from_secs(1)).await?;
+                    Ok::<_, BoxError>(checks)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            result.output(),
+            Some(&2),
+            "the replayed error must report the same check count as the live one"
+        );
+        assert!(
+            result.invocation_count() >= 3,
+            "the exhaustion must have been replayed at least once (got {} invocations)",
+            result.invocation_count()
+        );
+    }
+
     // 4. child contexts ───────────────────────────────────────────────────
 
     #[tokio::test]

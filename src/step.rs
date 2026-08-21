@@ -86,7 +86,7 @@ impl RetryStrategyConfig {
 /// - [`JitterStrategy::Half`] rounds **up**: the documented
 ///   `[base / 2, base]` lower bound survives quantization only under a
 ///   ceiling (nearest-rounding could dip up to half a second below it).
-fn quantize_delay_secs(jittered: f64, jitter: JitterStrategy) -> u64 {
+pub(crate) fn quantize_delay_secs(jittered: f64, jitter: JitterStrategy) -> u64 {
     let quantized = match jitter {
         JitterStrategy::Full => jittered.round(),
         JitterStrategy::None | JitterStrategy::Half => jittered.ceil(),
@@ -102,7 +102,7 @@ fn quantize_delay_secs(jittered: f64, jitter: JitterStrategy) -> u64 {
 ///
 /// Uses time + thread-id + counter hashing for determinism-safe randomness
 /// (no rand crate dependency).
-fn rand_full_jitter(max_secs: f64) -> f64 {
+pub(crate) fn rand_full_jitter(max_secs: f64) -> f64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::time::SystemTime;
