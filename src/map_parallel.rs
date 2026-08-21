@@ -937,10 +937,17 @@ where
             &req.parent_wire,
             OperationAction::Start,
         );
-        req.ctx
-            .checkpoint_updates(vec![update])
-            .await
-            .map_err(|e| batch_error(&format!("checkpoint child start: {e}")))?;
+        if let Err(err) = req.ctx.checkpoint_updates(vec![update]).await {
+            // Audit (#43) — batch child START: the item closure has not
+            // run, so no terminal FAIL is needed; re-invocation
+            // reconverges on the same write. Routing unrecoverable (not
+            // as an item failure) matters doubly here: a tolerant
+            // completion config must not absorb a checkpoint failure.
+            return req
+                .ctx
+                .checkpoint_failure_unrecoverable(&child_wire, err, None)
+                .await;
+        }
     }
 
     // Create child context with its OWN suspension scope so a park inside
@@ -974,16 +981,40 @@ where
         return match outcome {
             ScopeOutcome::Suspended => Ok(ItemOutcome::Suspended),
             ScopeOutcome::Completed(Ok(value)) => {
-                let serialized = serialize_value(value, serdes, serdes_ctx.clone()).await?;
-                let deserialized: O = deserialize_value(serialized, serdes, serdes_ctx).await?;
-                Ok(ItemOutcome::Terminal(BatchItem {
-                    index: req.index,
-                    name: req.item_name.clone(),
-                    status: BatchItemStatus::Succeeded,
-                    result: Some(deserialized),
-                    error_message: None,
-                    error_type: None,
-                }))
+                // A result serialization failure is LOCAL and
+                // deterministic: the item closure already ran, so the item
+                // settles as a failed `BatchItem` instead of yielding a
+                // catchable coordinator error with no record (issue #43).
+                // FLAT items have no per-child record — the failure is
+                // recorded inside the parent batch's summary payload when
+                // the parent checkpoints, and replay reconstructs the same
+                // failed item from it, so live and replayed batches agree.
+                let round_trip = async {
+                    let serialized = serialize_value(value, serdes, serdes_ctx.clone()).await?;
+                    let deserialized: O = deserialize_value(serialized, serdes, serdes_ctx).await?;
+                    Ok::<_, OperationError>(deserialized)
+                };
+                match round_trip.await {
+                    Ok(deserialized) => Ok(ItemOutcome::Terminal(BatchItem {
+                        index: req.index,
+                        name: req.item_name.clone(),
+                        status: BatchItemStatus::Succeeded,
+                        result: Some(deserialized),
+                        error_message: None,
+                        error_type: None,
+                    })),
+                    Err(op_err) => {
+                        let wire = crate::error::serialization_failure_wire(&op_err);
+                        Ok(ItemOutcome::Terminal(BatchItem {
+                            index: req.index,
+                            name: req.item_name.clone(),
+                            status: BatchItemStatus::Failed,
+                            result: None,
+                            error_message: wire.error_message().map(str::to_owned),
+                            error_type: wire.error_type().map(str::to_owned),
+                        }))
+                    }
+                }
             }
             ScopeOutcome::Completed(Err(child_err)) => {
                 // The recorded message is the flattened chain, built at
@@ -1011,9 +1042,59 @@ where
         }
         ScopeOutcome::Completed(Ok(value)) => {
             // Serialize and checkpoint success.
-            let serialized = serialize_value(value, serdes, serdes_ctx.clone()).await?;
+            //
+            // A result serialization failure is LOCAL and deterministic:
+            // the item closure already ran, so a terminal FAIL is
+            // persisted for the child FIRST, and the item settles as a
+            // failed `BatchItem` (issue #43). That is exactly the shape a
+            // replay of the FAIL record produces (see
+            // [`replay_terminal_child`]), so live and replayed batches
+            // agree, and the closure never re-runs for this failure.
+            let serialized = match serialize_value(value, serdes, serdes_ctx.clone()).await {
+                Ok(serialized) => serialized,
+                Err(op_err) => {
+                    let wire = crate::error::serialization_failure_wire(&op_err);
+                    let update = build_child_fail_update(
+                        &child_wire,
+                        &req.item_name,
+                        &req.child_sub_type,
+                        &req.parent_wire,
+                        &wire,
+                    );
+                    if let Err(client_err) = req.ctx.checkpoint_updates(vec![update]).await {
+                        // Audit (#43) — batch child FAIL (serialization):
+                        // the item closure ran; the failed FAIL write
+                        // routes unrecoverable with a minimal terminal
+                        // FAIL retry.
+                        let cwire = crate::error::checkpoint_failure_wire(&client_err);
+                        let terminal = build_child_fail_update(
+                            &child_wire,
+                            &req.item_name,
+                            &req.child_sub_type,
+                            &req.parent_wire,
+                            &cwire,
+                        );
+                        return req
+                            .ctx
+                            .checkpoint_failure_unrecoverable(
+                                &child_wire,
+                                client_err,
+                                Some(terminal),
+                            )
+                            .await;
+                    }
+                    return Ok(ItemOutcome::Terminal(BatchItem {
+                        index: req.index,
+                        name: req.item_name.clone(),
+                        status: BatchItemStatus::Failed,
+                        result: None,
+                        error_message: wire.error_message().map(str::to_owned),
+                        error_type: wire.error_type().map(str::to_owned),
+                    }));
+                }
+            };
             let mut builder = OperationUpdate::builder()
-                .id(child_wire)
+                .id(child_wire.clone())
                 .r#type(OperationType::Context)
                 .sub_type(req.child_sub_type.clone())
                 .action(OperationAction::Succeed)
@@ -1034,10 +1115,26 @@ where
                 .build()
                 .expect("all required OperationUpdate fields set");
 
-            req.ctx
-                .checkpoint_updates(vec![update])
-                .await
-                .map_err(|e| batch_error(&format!("checkpoint child succeed: {e}")))?;
+            if let Err(err) = req.ctx.checkpoint_updates(vec![update]).await {
+                // Audit (#43) — batch child SUCCEED: the item closure
+                // ran, so its side effects need a recorded outcome. A
+                // permanent rejection persists a small terminal FAIL
+                // before the execution fails. Routing unrecoverable (not
+                // as an item failure) keeps a tolerant completion config
+                // from absorbing a checkpoint failure.
+                let cwire = crate::error::checkpoint_failure_wire(&err);
+                let terminal = build_child_fail_update(
+                    &child_wire,
+                    &req.item_name,
+                    &req.child_sub_type,
+                    &req.parent_wire,
+                    &cwire,
+                );
+                return req
+                    .ctx
+                    .checkpoint_failure_unrecoverable(&child_wire, err, Some(terminal))
+                    .await;
+            }
 
             // Round-trip deserialize for live == replay consistency.
             let deserialized: O = deserialize_value(serialized, serdes, serdes_ctx).await?;
@@ -1064,7 +1161,7 @@ where
             // `error_data`/`stack_trace` pass through the boundary.
             let wire = crate::error::wire_error_for(&child_err, CHILD_FN_ERROR_TYPE);
             let builder = OperationUpdate::builder()
-                .id(child_wire)
+                .id(child_wire.clone())
                 .r#type(OperationType::Context)
                 .sub_type(req.child_sub_type.clone())
                 .action(OperationAction::Fail)
@@ -1076,8 +1173,26 @@ where
                 .build()
                 .expect("all required OperationUpdate fields set");
 
-            // Best-effort checkpoint.
-            let _ = req.ctx.checkpoint_updates(vec![update]).await;
+            if let Err(client_err) = req.ctx.checkpoint_updates(vec![update]).await {
+                // Audit (#43) — batch child FAIL: the item closure ran
+                // and failed; the failed FAIL write routes unrecoverable
+                // with a minimal terminal FAIL retry (the original
+                // carried the item error's payload). Discarding it would
+                // let a tolerant batch continue on a record claiming less
+                // than what executed.
+                let cwire = crate::error::checkpoint_failure_wire(&client_err);
+                let terminal = build_child_fail_update(
+                    &child_wire,
+                    &req.item_name,
+                    &req.child_sub_type,
+                    &req.parent_wire,
+                    &cwire,
+                );
+                return req
+                    .ctx
+                    .checkpoint_failure_unrecoverable(&child_wire, client_err, Some(terminal))
+                    .await;
+            }
 
             Ok(ItemOutcome::Terminal(BatchItem {
                 index: req.index,
@@ -1357,9 +1472,9 @@ where
                     Err(_) => "branch task was cancelled".to_owned(),
                 };
 
-                // Best-effort child FAIL checkpoint. Skipped in FLAT mode,
-                // which emits no child-context events (mirrors the normal
-                // fail path).
+                // Child FAIL checkpoint for the panicked/cancelled branch.
+                // Skipped in FLAT mode, which emits no child-context
+                // events (mirrors the normal fail path).
                 if self.nesting != NestingMode::Flat {
                     let update = OperationUpdate::builder()
                         .id(meta.child_wire.clone())
@@ -1374,8 +1489,29 @@ where
                             )
                             .to_error_object(),
                         );
-                    if let Ok(update) = update.build() {
-                        let _ = self.ctx.checkpoint_updates(vec![update]).await;
+                    if let Ok(update) = update.build()
+                        && let Err(client_err) = self.ctx.checkpoint_updates(vec![update]).await
+                    {
+                        // Audit (#43) — batch child FAIL (panicked
+                        // branch): the item closure ran; the failed FAIL
+                        // write routes unrecoverable with a minimal
+                        // terminal FAIL retry.
+                        let cwire = crate::error::checkpoint_failure_wire(&client_err);
+                        let terminal = build_child_fail_update(
+                            &meta.child_wire,
+                            &meta.item_name,
+                            self.child_sub_type,
+                            self.parent_wire,
+                            &cwire,
+                        );
+                        return self
+                            .ctx
+                            .checkpoint_failure_unrecoverable(
+                                &meta.child_wire,
+                                client_err,
+                                Some(terminal),
+                            )
+                            .await;
                     }
                 }
 
@@ -1657,9 +1793,14 @@ where
             OperationAction::Start,
             &ctx,
         );
-        ctx.checkpoint_updates(vec![update])
-            .await
-            .map_err(|e| batch_error(&format!("checkpoint parent start: {e}")))?;
+        if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+            // Audit (#43) — batch parent START: no item closure has run,
+            // so no terminal FAIL is needed; re-invocation reconverges
+            // on the same write.
+            return ctx
+                .checkpoint_failure_unrecoverable(&parent_wire, err, None)
+                .await;
+        }
     }
 
     // 4. Empty collection: checkpoint success immediately.
@@ -1754,9 +1895,15 @@ where
                     &parent_wire,
                     OperationAction::Start,
                 );
-                ctx.checkpoint_updates(vec![update])
-                    .await
-                    .map_err(|e| batch_error(&format!("checkpoint child start: {e}")))?;
+                if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+                    // Audit (#43) — pre-claimed batch child START: the
+                    // item closure has not run, so no terminal FAIL is
+                    // needed; re-invocation reconverges on the same
+                    // write.
+                    return ctx
+                        .checkpoint_failure_unrecoverable(&child_wire, err, None)
+                        .await;
+                }
             }
         }
     }
@@ -2219,9 +2366,18 @@ async fn checkpoint_batch_success_serialized(
         .build()
         .expect("all required OperationUpdate fields set");
 
-    ctx.checkpoint_updates(vec![update])
-        .await
-        .map_err(|e| batch_error(&format!("checkpoint parent succeed: {e}")))?;
+    if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+        // Audit (#43) — batch parent SUCCEED: the batch's items ran, so
+        // the batch outcome needs a recorded terminal. A permanent
+        // rejection persists a small terminal FAIL before the execution
+        // fails.
+        let cwire = crate::error::checkpoint_failure_wire(&err);
+        let terminal =
+            build_parent_fail_update(parent_wire, parent_name, parent_sub_type, ctx, &cwire);
+        return ctx
+            .checkpoint_failure_unrecoverable(parent_wire, err, Some(terminal))
+            .await;
+    }
 
     Ok(())
 }
@@ -2274,6 +2430,60 @@ fn build_child_update(
         builder = builder.name(child_name.to_owned());
     }
 
+    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    builder
+        .build()
+        .expect("all required OperationUpdate fields set")
+}
+
+/// Builds a child-level `FAIL` update carrying `wire` as its error — the
+/// terminal record persisted when the child's own outcome write was
+/// permanently rejected (issue #43).
+fn build_child_fail_update(
+    child_wire: &str,
+    child_name: &str,
+    child_sub_type: &str,
+    parent_wire: &str,
+    wire: &crate::error::WireError,
+) -> OperationUpdate {
+    let mut builder = OperationUpdate::builder()
+        .id(child_wire.to_owned())
+        .r#type(OperationType::Context)
+        .sub_type(child_sub_type.to_owned())
+        .action(OperationAction::Fail)
+        .parent_id(parent_wire.to_owned())
+        .error(wire.to_error_object());
+    if !child_name.is_empty() {
+        builder = builder.name(child_name.to_owned());
+    }
+    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    builder
+        .build()
+        .expect("all required OperationUpdate fields set")
+}
+
+/// Builds a parent-level `FAIL` update carrying `wire` as its error — the
+/// terminal record persisted when the batch parent's own outcome write
+/// was permanently rejected (issue #43).
+fn build_parent_fail_update(
+    wire_id: &str,
+    name: Option<&str>,
+    sub_type: &str,
+    ctx: &DurableContext,
+    wire: &crate::error::WireError,
+) -> OperationUpdate {
+    let mut builder = OperationUpdate::builder()
+        .id(wire_id.to_owned())
+        .r#type(OperationType::Context)
+        .sub_type(sub_type.to_owned())
+        .action(OperationAction::Fail)
+        .error(wire.to_error_object());
+    if let Some(n) = name {
+        builder = builder.name(n.to_owned());
+    }
+    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+        builder = builder.parent_id(parent_wire);
+    }
     #[allow(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
@@ -2943,30 +3153,30 @@ mod tests {
 
     #[tokio::test]
     async fn basic_map_two_items() {
-        // Without a client, the checkpoint will fail, but we can test that
-        // the structure is correct by using a replay path.
-        let ctx = test_ctx(CheckpointLog::empty());
-        // Map will fail at checkpoint (no client) — that's expected.
+        // A live client: the batch's checkpoint writes must succeed for
+        // the items to run to completion. (Pre-#43 this test used a
+        // client-less context and asserted the checkpoint failure
+        // surfaced as Err; a rejected write now parks the future for the
+        // invocation driver instead of yielding.)
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
         let result = ctx
             .map(vec![10, 20], |_child, item: i32, _idx| async move {
                 Ok(item * 2)
             })
             .await;
-        // Should error because no execution client.
-        assert!(result.is_err());
+        assert_eq!(result.unwrap(), vec![20, 40]);
     }
 
     #[tokio::test]
     async fn basic_parallel_two_branches() {
         use crate::future::Branch;
-        let ctx = test_ctx(CheckpointLog::empty());
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
         let branches = vec![
             Branch::new("a", |_ctx| Box::pin(async { Ok(1) })),
             Branch::new("b", |_ctx| Box::pin(async { Ok(2) })),
         ];
         let result = ctx.parallel(branches).await;
-        // Should error because no execution client.
-        assert!(result.is_err());
+        assert_eq!(result.unwrap(), vec![1, 2]);
     }
 
     /// `await_batch` on a tolerated mixed batch must report each branch's

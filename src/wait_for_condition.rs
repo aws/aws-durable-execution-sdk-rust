@@ -318,10 +318,15 @@ where
                 None,
                 None,
             );
-            self.ctx
-                .checkpoint_updates(vec![start_update])
-                .await
-                .map_err(wfc_client_error)?;
+            if let Err(err) = self.ctx.checkpoint_updates(vec![start_update]).await {
+                // Audit (#43) — wait-for-condition START: no user code ran
+                // for this attempt, so no terminal FAIL is needed;
+                // re-invocation reconverges on the same write.
+                return self
+                    .ctx
+                    .checkpoint_failure_unrecoverable(&wire_id, err, None)
+                    .await;
+            }
         }
 
         let Self {
@@ -353,6 +358,7 @@ where
 {
     /// Settles one check cycle: serializes the new state, consults the wait
     /// strategy, and runs the Succeed/Retry/Fail checkpoint protocol.
+    #[allow(clippy::too_many_lines)] // reason: the settle protocol (serialize, strategy, checkpoint) is a single logical unit; splitting would obscure it
     async fn settle(
         self,
         attempt: u32,
@@ -363,12 +369,43 @@ where
             Ok(new_state) => {
                 // Serialize the new state (ownership transfers to the
                 // serdes; the round trip below reconstructs it).
-                let serialized =
-                    serialize_state(&self.serdes, new_state, serdes_ctx.clone()).await?;
-
-                // Round-trip through serdes for consistency.
-                let deserialized: S =
-                    deserialize_state_str(&self.serdes, serialized.clone(), serdes_ctx).await?;
+                //
+                // A state serialization (or round-trip) failure is a
+                // LOCAL, deterministic, user-facing failure, so it stays
+                // catchable — but the terminal FAIL is persisted FIRST
+                // (issue #43). The check already ran, so its side effects
+                // need a recorded outcome: with the FAIL recorded, replay
+                // yields it instead of re-running the check.
+                let round_trip = async {
+                    let serialized =
+                        serialize_state(&self.serdes, new_state, serdes_ctx.clone()).await?;
+                    // Round-trip through serdes for consistency.
+                    let deserialized: S =
+                        deserialize_state_str(&self.serdes, serialized.clone(), serdes_ctx).await?;
+                    Ok::<_, OperationError>((serialized, deserialized))
+                };
+                let (serialized, deserialized) = match round_trip.await {
+                    Ok(pair) => pair,
+                    Err(op_err) => {
+                        let wire = crate::error::serialization_failure_wire(&op_err);
+                        let update = build_wfc_fail_update(
+                            &self.wire_id,
+                            self.name.as_deref(),
+                            self.ctx.parent_wire_id(),
+                            &wire,
+                        );
+                        if let Err(client_err) = self.ctx.checkpoint_updates(vec![update]).await {
+                            // Audit (#43) — wfc FAIL (serialization): the
+                            // check ran; the failed FAIL write routes
+                            // unrecoverable with a minimal terminal FAIL
+                            // retry.
+                            return self.checkpoint_unrecoverable(client_err).await;
+                        }
+                        return Err(op_err
+                            .with_operation(&self.wire_id, CheckpointStatus::Failed.wire_str())
+                            .with_wire(wire));
+                    }
+                };
 
                 // Consult the wait strategy.
                 let decision = if let Some(strategy) = &self.wait_strategy {
@@ -389,10 +426,13 @@ where
                             Some(&serialized),
                             None,
                         );
-                        self.ctx
-                            .checkpoint_updates(vec![update])
-                            .await
-                            .map_err(wfc_client_error)?;
+                        if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
+                            // Audit (#43) — wfc SUCCEED: the check ran, so
+                            // its side effects need a recorded outcome. A
+                            // permanent rejection persists a small
+                            // terminal FAIL before the execution fails.
+                            return self.checkpoint_unrecoverable(err).await;
+                        }
 
                         Ok(deserialized)
                     }
@@ -412,10 +452,14 @@ where
                             Some(&serialized),
                             Some(delay_secs),
                         );
-                        self.ctx
-                            .checkpoint_updates(vec![update])
-                            .await
-                            .map_err(wfc_client_error)?;
+                        if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
+                            // Audit (#43) — wfc RETRY: the check ran; a
+                            // retry the service never recorded would not
+                            // replay, so a permanent rejection persists a
+                            // small terminal FAIL before the execution
+                            // fails.
+                            return self.checkpoint_unrecoverable(err).await;
+                        }
 
                         self.ctx.suspend_now().await
                     }
@@ -432,10 +476,13 @@ where
                             self.ctx.parent_wire_id(),
                             &wire,
                         );
-                        self.ctx
-                            .checkpoint_updates(vec![update])
-                            .await
-                            .map_err(wfc_client_error)?;
+                        if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
+                            // Audit (#43) — wfc FAIL (strategy exhausted):
+                            // the check ran; the failed FAIL write routes
+                            // unrecoverable with a minimal terminal FAIL
+                            // retry.
+                            return self.checkpoint_unrecoverable(err).await;
+                        }
 
                         Err(wfc_op_error(WaitForConditionErrorKind::MaxChecksExceeded(
                             crate::error::MaxChecksExceeded::new(attempt),
@@ -457,10 +504,13 @@ where
                     self.ctx.parent_wire_id(),
                     &wire,
                 );
-                self.ctx
-                    .checkpoint_updates(vec![update])
-                    .await
-                    .map_err(wfc_client_error)?;
+                if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
+                    // Audit (#43) — wfc FAIL (check error): the check ran
+                    // and failed; the failed FAIL write routes
+                    // unrecoverable with a minimal terminal FAIL retry
+                    // (the original carried the check error's payload).
+                    return self.checkpoint_unrecoverable(err).await;
+                }
 
                 Err(wfc_op_error_with_source(
                     WaitForConditionErrorKind::CheckFailed,
@@ -470,6 +520,24 @@ where
                 .with_wire(wire))
             }
         }
+    }
+
+    /// Routes a rejected outcome write through the unrecoverable path
+    /// (issue #43), never returning. The check ran at every settle site,
+    /// so each supplies a small checkpoint-failure-derived terminal `FAIL`
+    /// — the record persisted before the execution dies when the
+    /// rejection is permanent.
+    async fn checkpoint_unrecoverable<T>(&self, err: crate::client::ClientError) -> T {
+        let cwire = crate::error::checkpoint_failure_wire(&err);
+        let terminal = build_wfc_fail_update(
+            &self.wire_id,
+            self.name.as_deref(),
+            self.ctx.parent_wire_id(),
+            &cwire,
+        );
+        self.ctx
+            .checkpoint_failure_unrecoverable(&self.wire_id, err, Some(terminal))
+            .await
     }
 }
 
@@ -491,9 +559,20 @@ async fn replay_terminal_success<S, SD: Serdes<S>>(
 /// The recorded failure fields travel on the synthetic source rather
 /// than being folded into a message, so `kind()` stays meaningful after
 /// a replay.
+///
+/// A record whose `error_type` is the serialization discriminator
+/// ([`crate::error::SERIALIZATION_FAILED_ERROR_TYPE`]) reconstructs
+/// `WaitForConditionErrorKind::SerializationFailed` — the kind the live
+/// path yielded after persisting that record — so replay reproduces the
+/// recorded failure's classification (issue #43).
 fn replay_terminal_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+    let kind = if wire.error_type() == Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) {
+        WaitForConditionErrorKind::SerializationFailed
+    } else {
+        WaitForConditionErrorKind::CheckFailed
+    };
     wfc_op_error_with_source(
-        WaitForConditionErrorKind::CheckFailed,
+        kind,
         Some(crate::error::ReplayedFailure::source_from(wire.clone())),
     )
     .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
@@ -610,12 +689,8 @@ fn wfc_op_error_with_source(
     ))
 }
 
-fn wfc_client_error(err: crate::client::ClientError) -> OperationError {
-    wfc_op_error_with_source(WaitForConditionErrorKind::CheckFailed, Some(Box::new(err)))
-}
-
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // reason: test assertions
+#[allow(clippy::unwrap_used, clippy::expect_used)] // reason: test assertions
 #[allow(clippy::panic)] // reason: test assertions with descriptive messages
 mod tests {
     use super::*;
@@ -844,10 +919,25 @@ mod tests {
             check: |_ctx, state: i32| async move { Ok::<i32, BoxError>(state + 1) },
         };
 
-        let error = exec.execute().await.unwrap_err();
+        // The injected RETRY-write rejection routes through the
+        // unrecoverable path (issue #43): the operation future parks for
+        // the invocation driver instead of yielding a catchable error, and
+        // the fatal slot records the checkpoint failure.
+        let signal = Arc::clone(exec.ctx.suspension_signal());
+        let parked = tokio::time::timeout(Duration::from_millis(200), exec.execute()).await;
         assert!(
-            format!("{error:#}").contains("injected Retry checkpoint failure"),
-            "unexpected checkpoint error: {error:#}"
+            parked.is_err(),
+            "a rejected RETRY checkpoint must park the future for the \
+             driver, not resolve"
+        );
+        let fatal = signal
+            .fatal_error()
+            .expect("the checkpoint failure records an execution-fatal error");
+        assert!(
+            fatal
+                .error_message
+                .contains("injected Retry checkpoint failure"),
+            "unexpected fatal: {fatal:?}"
         );
 
         let restored: i32 = filesystem_serdes

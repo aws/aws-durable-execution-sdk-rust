@@ -23,15 +23,17 @@ use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
 #[derive(Debug, Clone)]
 pub(crate) struct ClientError {
     message: String,
-    /// Whether the underlying failure was considered retryable.
+    /// Whether the underlying failure was classified retryable.
     ///
     /// The production client relies on the aws-sdk's standard retry, so by
     /// the time an error carries this flag the SDK has already exhausted
-    /// its attempts; no in-process retry loop reads it back. It records how
-    /// the failure was mapped (a failed service call is retryable — the
-    /// invocation fails and the durable service re-invokes) and lets tests
-    /// assert on that mapping.
-    #[cfg_attr(not(test), allow(dead_code))] // reason: read only by test assertions
+    /// its transport-level attempts. The flag decides the *recovery scope*
+    /// (see [`classify_checkpoint_error`]): a retryable failure fails the
+    /// invocation — the durable service re-invokes, which is the same
+    /// recovery as an interruption — while a non-retryable failure is a
+    /// permanent rejection that persists a terminal `FAIL` for the
+    /// operation and then fails the execution
+    /// ([`DurableContext::checkpoint_failure_unrecoverable`](crate::context::DurableContext::checkpoint_failure_unrecoverable)).
     retryable: bool,
 }
 
@@ -44,10 +46,9 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 impl ClientError {
-    /// Whether this error was mapped as retryable. Test-only: production
-    /// code no longer branches on it — the aws-sdk's standard retry owns
-    /// the retry decision.
-    #[cfg(test)]
+    /// Whether this error was classified retryable — the invocation fails
+    /// and the durable service re-invokes. `false` means a permanent
+    /// rejection: the terminal-`FAIL`-then-fail-the-execution path.
     pub(crate) fn is_retryable(&self) -> bool {
         self.retryable
     }
@@ -67,7 +68,7 @@ impl ClientError {
         }
     }
 
-    fn from_retryable(message: String) -> Self {
+    pub(crate) fn from_retryable(message: String) -> Self {
         Self {
             message,
             retryable: true,
@@ -191,10 +192,10 @@ impl ExecutionClient for LambdaExecutionClient {
                     })
                 }
                 // The SDK's standard retry has already retried everything
-                // transient; the final error maps into a retryable
-                // `ClientError` so invocation-level behavior is unchanged:
-                // the invocation fails and the durable service re-invokes.
-                Err(err) => Err(ClientError::from_retryable(format!("{err}"))),
+                // transient; the final error is classified into a recovery
+                // scope (invocation vs execution) — see
+                // `classify_checkpoint_error`.
+                Err(err) => Err(classify_checkpoint_error(&err)),
             }
         })
     }
@@ -243,6 +244,99 @@ impl ExecutionClient for LambdaExecutionClient {
                 operations: all_operations,
             })
         })
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Checkpoint error classification
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The message prefix the service puts on an `InvalidParameterValueException`
+/// that rejects a stale checkpoint token.
+///
+/// A stale token resolves on re-invocation (the service issues a fresh one),
+/// so this specific rejection is classified retryable — the carve-out the
+/// Java SDK's `DurableApiErrorClassifier` applies.
+const STALE_TOKEN_MESSAGE_PREFIX: &str = "Invalid Checkpoint Token";
+
+/// Classifies a final `CheckpointDurableExecution` error into a recovery
+/// scope, carried as [`ClientError::is_retryable`].
+///
+/// By the time this runs, the aws-sdk's standard retry has exhausted its
+/// transport-level attempts, so the question is no longer "try again now"
+/// but *which recovery converges*:
+///
+/// - **Retryable** — fail the invocation; the durable service re-invokes
+///   and replay resumes from the recorded state. This is the same recovery
+///   as an interruption. Applied to transport-level failures (dispatch,
+///   timeout, malformed response), throttling, 5xx, and the stale-token
+///   carve-out ([`STALE_TOKEN_MESSAGE_PREFIX`]).
+/// - **Non-retryable** — the service permanently rejected this write (for
+///   example an oversized payload). Re-invoking re-runs the body and hits
+///   the same rejection, so the caller persists a small terminal `FAIL`
+///   for the operation and fails the execution instead.
+///
+/// **Unknown errors default to retryable.** The original classification
+/// (pre-#43) defaulted unknown to non-retryable, with the rationale — from
+/// the r3726032098 review thread — that the surfaced error only failed the
+/// invocation and the service re-invoked anyway, so the default was
+/// harmless. That rationale belongs to the old model: under this model a
+/// non-retryable classification fails the *execution*, so a novel
+/// transient error variant defaulting to non-retryable would kill
+/// executions. Java and Python default unknown to retryable for the same
+/// reason. The `checkpoint_error_variant_canary` test pins the variant set
+/// this function classifies explicitly, so a new upstream variant fails CI
+/// for reclassification instead of falling silently into the default.
+///
+/// Generic over the response type `R` so tests can classify a
+/// `SdkError::service_error(err, ())` without constructing an HTTP
+/// response.
+fn classify_checkpoint_error<R: std::fmt::Debug>(
+    err: &aws_sdk_lambda::error::SdkError<
+        aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError,
+        R,
+    >,
+) -> ClientError {
+    use aws_sdk_lambda::error::SdkError;
+    use aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError as E;
+
+    let message = format!("{}", aws_sdk_lambda::error::DisplayErrorContext(err));
+
+    let SdkError::ServiceError(service_err) = err else {
+        // Dispatch failures, timeouts, and malformed responses are
+        // channel-level: nothing was permanently rejected.
+        return ClientError::from_retryable(message);
+    };
+
+    match service_err.err() {
+        // Throttling and service-side 5xx: transient by definition.
+        E::TooManyRequestsException(_) | E::ServiceException(_) => {
+            ClientError::from_retryable(message)
+        }
+        // A parameter rejection is deterministic — the same write fails the
+        // same way on every lap — EXCEPT the stale-token rejection, which a
+        // re-invocation resolves with a fresh token.
+        E::InvalidParameterValueException(inner) => {
+            if inner
+                .message()
+                .is_some_and(|m| m.starts_with(STALE_TOKEN_MESSAGE_PREFIX))
+            {
+                ClientError::from_retryable(message)
+            } else {
+                ClientError::non_retryable(message)
+            }
+        }
+        // KMS misconfiguration on the function: deterministic until an
+        // operator fixes the key, so re-invoking loops without progress.
+        E::KmsAccessDeniedException(_)
+        | E::KmsDisabledException(_)
+        | E::KmsInvalidStateException(_)
+        | E::KmsNotFoundException(_) => ClientError::non_retryable(message),
+        // Unknown errors are RETRYABLE — see the function docs for why the
+        // pre-#43 non-retryable default (r3726032098) no longer applies.
+        // The variant canary test keeps this arm from silently absorbing
+        // new modeled variants.
+        _ => ClientError::from_retryable(message),
     }
 }
 
@@ -784,13 +878,14 @@ mod tests {
         assert!(err.to_string().contains("no checkpoint token"));
     }
 
-    /// A checkpoint call whose final outcome is an error — here a modeled
-    /// client fault the SDK does not retry — maps into a retryable
-    /// `ClientError`: the invocation fails and the durable execution
-    /// service re-invokes, which is the recovery path.
+    /// A checkpoint call whose final outcome is a modeled parameter
+    /// rejection — a deterministic client fault the SDK does not retry —
+    /// classifies NON-retryable: re-invoking replays into the same
+    /// rejection, so the recovery is a terminal `FAIL` write followed by
+    /// failing the execution, not another lap.
     #[tokio::test]
     #[allow(clippy::expect_used)] // reason: test assertions
-    async fn checkpoint_final_error_maps_to_retryable_client_error() {
+    async fn checkpoint_final_error_maps_to_non_retryable_client_error() {
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution).then_error(|| {
             CheckpointDurableExecutionError::InvalidParameterValueException(
                 aws_sdk_lambda::types::error::InvalidParameterValueException::builder().build(),
@@ -803,7 +898,7 @@ mod tests {
             .checkpoint("arn:test", "tok", Vec::new())
             .await
             .expect_err("modeled error must fail the call");
-        assert!(err.is_retryable());
+        assert!(!err.is_retryable());
         assert_eq!(rule.num_calls(), 1, "a client fault is not retried");
     }
 
@@ -1359,5 +1454,208 @@ mod tests {
         #[allow(clippy::unwrap_used)]
         let r3 = log.get("step-3").unwrap();
         assert_eq!(r3.result.as_deref(), Some("\"result-3\""));
+    }
+
+    // ── Checkpoint error classification ─────────────────────────────────
+
+    use aws_sdk_lambda::error::SdkError;
+    use aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError as CkptErr;
+
+    fn classify<E: Into<CkptErr>>(err: E) -> ClientError {
+        classify_checkpoint_error(&SdkError::service_error(err.into(), ()))
+    }
+
+    fn invalid_parameter(message: Option<&str>) -> CkptErr {
+        let mut builder = aws_sdk_lambda::types::error::InvalidParameterValueException::builder();
+        if let Some(m) = message {
+            builder = builder.message(m);
+        }
+        CkptErr::InvalidParameterValueException(builder.build())
+    }
+
+    #[test]
+    fn throttling_and_5xx_classify_retryable() {
+        let throttled = classify(CkptErr::TooManyRequestsException(
+            aws_sdk_lambda::types::error::TooManyRequestsException::builder().build(),
+        ));
+        assert!(throttled.is_retryable());
+
+        let server = classify(CkptErr::ServiceException(
+            aws_sdk_lambda::types::error::ServiceException::builder().build(),
+        ));
+        assert!(server.is_retryable());
+    }
+
+    #[test]
+    fn invalid_parameter_classifies_non_retryable() {
+        assert!(!classify(invalid_parameter(Some("payload too large"))).is_retryable());
+        // No message at all: no stale-token evidence, permanent rejection.
+        assert!(!classify(invalid_parameter(None)).is_retryable());
+    }
+
+    /// The stale-token carve-out: `InvalidParameterValueException` whose
+    /// message starts with `Invalid Checkpoint Token` resolves on
+    /// re-invocation (the service issues a fresh token), so it is
+    /// retryable. Prefix match only — a stale-token mention elsewhere in
+    /// the message does not qualify.
+    #[test]
+    fn stale_token_rejection_classifies_retryable() {
+        let stale = classify(invalid_parameter(Some(
+            "Invalid Checkpoint Token: token has been superseded",
+        )));
+        assert!(stale.is_retryable());
+
+        let not_prefix = classify(invalid_parameter(Some(
+            "field X rejected (not an Invalid Checkpoint Token case)",
+        )));
+        assert!(!not_prefix.is_retryable());
+    }
+
+    #[test]
+    fn kms_misconfiguration_classifies_non_retryable() {
+        let kms = classify(CkptErr::KmsAccessDeniedException(
+            aws_sdk_lambda::types::error::KmsAccessDeniedException::builder().build(),
+        ));
+        assert!(!kms.is_retryable());
+    }
+
+    /// Unknown checkpoint API errors default to RETRYABLE. Under the #43
+    /// model a non-retryable classification fails the execution, so a
+    /// novel transient error variant must not kill executions by default
+    /// (the pre-#43 non-retryable default relied on the old model, where
+    /// the surfaced error only failed the invocation — r3726032098).
+    #[test]
+    fn unknown_error_classifies_retryable() {
+        let unknown = classify(CkptErr::unhandled("some new service error"));
+        assert!(unknown.is_retryable());
+    }
+
+    #[test]
+    fn transport_failures_classify_retryable() {
+        let timeout: SdkError<CkptErr, ()> = SdkError::timeout_error("connect timed out");
+        assert!(classify_checkpoint_error(&timeout).is_retryable());
+    }
+
+    /// Canary: pins the variant set of `CheckpointDurableExecutionError`,
+    /// the upstream enum [`classify_checkpoint_error`] matches with a
+    /// wildcard arm.
+    ///
+    /// The enum is `#[non_exhaustive]`, so the classifier's `match` cannot
+    /// reject new variants at compile time — a variant added by an
+    /// aws-sdk-lambda upgrade would silently take the unknown→retryable
+    /// default. This test parses the enum out of the dependency's own
+    /// source (the exact version Cargo.lock pins, in the local cargo
+    /// registry) and fails when the variant set changes, forcing the
+    /// classification to be revisited instead of defaulted. The sibling
+    /// enum audit for `OperationStatus` lands with #45.
+    #[test]
+    fn checkpoint_error_variant_canary() {
+        const CLASSIFIED_VARIANTS: &[&str] = &[
+            "InvalidParameterValueException",
+            "KmsAccessDeniedException",
+            "KmsDisabledException",
+            "KmsInvalidStateException",
+            "KmsNotFoundException",
+            "ServiceException",
+            "TooManyRequestsException",
+            "Unhandled",
+        ];
+
+        let source = read_sdk_source("src/operation/checkpoint_durable_execution.rs");
+        let mut actual = extract_enum_variants(&source, "CheckpointDurableExecutionError");
+        actual.sort_unstable();
+
+        let mut expected: Vec<String> = CLASSIFIED_VARIANTS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        expected.sort_unstable();
+
+        assert_eq!(
+            actual, expected,
+            "aws-sdk-lambda's CheckpointDurableExecutionError variant set changed. \
+             Reclassify the new/removed variants in classify_checkpoint_error \
+             (src/client.rs), then update this canary's pinned list."
+        );
+    }
+
+    /// Reads a source file out of the aws-sdk-lambda version Cargo.lock
+    /// pins, from the local cargo registry (already extracted — the test
+    /// binary that runs this compiled against it).
+    #[allow(clippy::expect_used)] // reason: test helper assertions
+    fn read_sdk_source(relative: &str) -> String {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let lockfile = std::fs::read_to_string(manifest_dir.join("Cargo.lock"))
+            .expect("Cargo.lock readable at the workspace root");
+        let version = lockfile
+            .split("[[package]]")
+            .find(|block| block.contains("name = \"aws-sdk-lambda\""))
+            .and_then(|block| {
+                block
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("version = \""))
+                    .map(|rest| rest.trim_end_matches('"').to_owned())
+            })
+            .expect("aws-sdk-lambda pinned in Cargo.lock");
+
+        let cargo_home = std::env::var_os("CARGO_HOME").map_or_else(
+            || {
+                let home = std::env::var_os("HOME").expect("HOME set");
+                std::path::PathBuf::from(home).join(".cargo")
+            },
+            std::path::PathBuf::from,
+        );
+        let registry_src = cargo_home.join("registry").join("src");
+        let crate_dir_name = format!("aws-sdk-lambda-{version}");
+        let crate_dir = std::fs::read_dir(&registry_src)
+            .expect("cargo registry src directory readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join(&crate_dir_name))
+            .find(|candidate| candidate.is_dir())
+            .expect("pinned aws-sdk-lambda version extracted in the cargo registry");
+
+        std::fs::read_to_string(crate_dir.join(relative)).expect("SDK source file readable")
+    }
+
+    /// Extracts the variant identifiers of a top-level `pub enum` from
+    /// generated SDK source. The generated layout is stable: variants sit
+    /// at one indentation level, as `Identifier(...)` or bare
+    /// `Identifier,`.
+    #[allow(clippy::panic, clippy::indexing_slicing, clippy::map_unwrap_or)]
+    // reason: test helper assertions over generated-source text
+    fn extract_enum_variants(source: &str, enum_name: &str) -> Vec<String> {
+        let header = format!("pub enum {enum_name} {{");
+        let start = source
+            .find(&header)
+            .unwrap_or_else(|| panic!("enum {enum_name} present in SDK source"));
+        let body_start = start + header.len();
+        let body_end = source[body_start..]
+            .find("\n}")
+            .map(|offset| body_start + offset)
+            .unwrap_or_else(|| panic!("enum {enum_name} body terminated"));
+        let body = &source[body_start..body_end];
+
+        body.lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                // Variant lines start with an uppercase identifier followed
+                // directly by `(` (tuple payload) or `,` (unit variant).
+                // Doc comments, attributes (including multi-line
+                // deprecation notes), and continuation lines do not.
+                let first = trimmed.chars().next()?;
+                if !first.is_ascii_uppercase() {
+                    return None;
+                }
+                let ident: String = trimmed
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect();
+                let rest = trimmed.get(ident.len()..)?;
+                if ident.is_empty() || !(rest.starts_with('(') || rest.starts_with(',')) {
+                    return None;
+                }
+                Some(ident)
+            })
+            .collect()
     }
 }

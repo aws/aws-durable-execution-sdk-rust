@@ -572,7 +572,8 @@ async fn replayed_events_cover_child_condition_and_callback() {
 /// A rejected checkpoint emits no record-transition lifecycle event: the
 /// events claim a transition was recorded, so they fire only after the
 /// checkpoint that persists it succeeds. The step whose START write is
-/// rejected surfaces the error and produces no `operation_started`.
+/// rejected unwinds the handler through the unrecoverable path (issue
+/// #43) — the execution fails, and no `operation_started` is emitted.
 #[tokio::test]
 async fn rejected_checkpoint_emits_no_record_transition_event() {
     let (buffer, _guard) = capture_subscriber();

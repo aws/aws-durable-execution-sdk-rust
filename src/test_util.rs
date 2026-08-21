@@ -429,6 +429,14 @@ pub struct LocalRunner {
     /// non-retryable error (fault injection; see
     /// [`fail_next_checkpoints`](Self::fail_next_checkpoints)).
     checkpoint_failures: usize,
+    /// Number of checkpoint calls to let through before the injected
+    /// failures start (see
+    /// [`fail_checkpoints_after`](Self::fail_checkpoints_after)).
+    checkpoint_failure_skip: usize,
+    /// Whether the injected checkpoint failures are retryable (invocation
+    /// fault; the runner re-invokes) rather than non-retryable (terminal
+    /// `FAIL` then execution failure).
+    checkpoint_failures_retryable: bool,
 }
 
 impl Default for LocalRunner {
@@ -465,6 +473,8 @@ impl LocalRunner {
             checkpoint_delay: None,
             checkpoint_batching: false,
             checkpoint_failures: 0,
+            checkpoint_failure_skip: 0,
+            checkpoint_failures_retryable: false,
         }
     }
 
@@ -573,12 +583,14 @@ impl LocalRunner {
 
     /// Makes the simulated backend reject the next `count` checkpoint
     /// calls with a non-retryable error, persisting nothing for them —
-    /// exactly like a service-side rejection.
+    /// exactly like a permanent service-side rejection.
     ///
-    /// Use it to test how a handler (and the SDK's telemetry — see
-    /// [`crate::observability`]) behaves when a checkpoint write fails:
-    /// the operation whose transition was rejected surfaces the error, and
-    /// no record-transition lifecycle event is emitted for it.
+    /// Under the #43 model a non-retryable checkpoint failure never
+    /// reaches the handler: the SDK persists a small terminal `FAIL` for
+    /// the operation (when user code already ran) and fails the
+    /// execution. Use this to test that model, and to assert no
+    /// record-transition lifecycle event is emitted for the rejected
+    /// write (see [`crate::observability`]).
     ///
     /// # Examples
     ///
@@ -591,6 +603,57 @@ impl LocalRunner {
     #[must_use]
     pub fn fail_next_checkpoints(mut self, count: usize) -> Self {
         self.checkpoint_failures = count;
+        self
+    }
+
+    /// Like [`fail_next_checkpoints`](Self::fail_next_checkpoints), but
+    /// lets the first `skip` checkpoint calls through before rejecting
+    /// the following `count` non-retryably.
+    ///
+    /// Use it to reject a specific write: a step's live path writes START
+    /// first and its outcome second, so `fail_checkpoints_after(1, 1)`
+    /// rejects exactly the outcome write while the START (and everything
+    /// after the failure window, such as the SDK's terminal `FAIL`
+    /// record) persists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().fail_checkpoints_after(1, 1);
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn fail_checkpoints_after(mut self, skip: usize, count: usize) -> Self {
+        self.checkpoint_failure_skip = skip;
+        self.checkpoint_failures = count;
+        self.checkpoint_failures_retryable = false;
+        self
+    }
+
+    /// Like [`fail_checkpoints_after`](Self::fail_checkpoints_after), but
+    /// the injected failures are RETRYABLE — simulating a transient
+    /// failure that exhausted the transport's own retries.
+    ///
+    /// Under the #43 model a retryable checkpoint failure fails the
+    /// invocation with no further writes; the runner then re-invokes,
+    /// exactly as the durable service does, and replay resumes from the
+    /// recorded state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().fail_checkpoints_after_retryable(1, 1);
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn fail_checkpoints_after_retryable(mut self, skip: usize, count: usize) -> Self {
+        self.checkpoint_failure_skip = skip;
+        self.checkpoint_failures = count;
+        self.checkpoint_failures_retryable = true;
         self
     }
 
@@ -709,6 +772,14 @@ impl LocalRunner {
             self.checkpoint_failures,
             std::sync::atomic::Ordering::SeqCst,
         );
+        backend.checkpoint_failures_skip.store(
+            self.checkpoint_failure_skip,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        backend.checkpoint_failures_retryable.store(
+            self.checkpoint_failures_retryable,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         self.run_on_backend(backend, handler, event).await
     }
 
@@ -759,6 +830,10 @@ impl LocalRunner {
         };
 
         let mut invocations = 0_usize;
+        // The most recent invocation fault (Lambda runtime error), kept so
+        // an execution that never terminates because every invocation
+        // faults reports the fault rather than a generic budget message.
+        let mut last_invocation_fault: Option<String> = None;
 
         loop {
             invocations += 1;
@@ -766,10 +841,23 @@ impl LocalRunner {
                 return TestResult {
                     disposition: Disposition::Suspended,
                     output: None,
-                    error_type: None,
-                    error_message: Some(format!(
-                        "execution did not terminate within {} invocations",
-                        self.max_invocations
+                    error_type: last_invocation_fault
+                        .is_some()
+                        .then(|| "RuntimeError".to_owned()),
+                    error_message: Some(last_invocation_fault.map_or_else(
+                        || {
+                            format!(
+                                "execution did not terminate within {} invocations",
+                                self.max_invocations
+                            )
+                        },
+                        |fault| {
+                            format!(
+                                "execution did not terminate within {} invocations; \
+                                 last invocation fault: {fault}",
+                                self.max_invocations
+                            )
+                        },
                     )),
                     operations: backend.snapshot_operations(),
                     invocations: invocations - 1,
@@ -788,14 +876,14 @@ impl LocalRunner {
             let response = match service(lambda_event).await {
                 Ok(envelope) => envelope,
                 Err(e) => {
-                    return TestResult {
-                        disposition: Disposition::Failed,
-                        output: None,
-                        error_type: Some("RuntimeError".to_owned()),
-                        error_message: Some(e.to_string()),
-                        operations: backend.snapshot_operations(),
-                        invocations,
-                    };
+                    // The invocation itself failed (a Lambda runtime
+                    // error) — e.g. a retryable checkpoint failure that
+                    // exhausted transport retries (issue #43), or a
+                    // bootstrap failure. The durable service re-invokes
+                    // on an invocation fault, so the runner does too;
+                    // `max_invocations` bounds a persistent fault.
+                    last_invocation_fault = Some(e.to_string());
+                    continue;
                 }
             };
 
@@ -1580,10 +1668,40 @@ struct Backend {
     /// coalescing (`checkpoint_delay`) actually reduced the number of
     /// writes.
     checkpoint_calls: std::sync::atomic::AtomicUsize,
-    /// Number of upcoming `checkpoint` calls to reject with a
-    /// non-retryable error, before touching any state (fault injection;
-    /// see [`LocalRunner::fail_next_checkpoints`]).
+    /// Number of upcoming `checkpoint` calls to reject, before touching
+    /// any state (fault injection; see
+    /// [`LocalRunner::fail_next_checkpoints`] and
+    /// [`LocalRunner::fail_checkpoints_after`]).
     checkpoint_failures_remaining: std::sync::atomic::AtomicUsize,
+    /// Number of `checkpoint` calls to let through before the injected
+    /// failures begin.
+    checkpoint_failures_skip: std::sync::atomic::AtomicUsize,
+    /// Whether injected checkpoint failures are retryable (see
+    /// [`LocalRunner::fail_checkpoints_after_retryable`]).
+    checkpoint_failures_retryable: std::sync::atomic::AtomicBool,
+    /// Per-call checkpoint plan (in-crate test seam): while non-empty,
+    /// each `checkpoint` call pops and obeys the front entry instead of
+    /// the counter-based injection (see
+    /// [`Backend::plan_checkpoint_calls`]).
+    #[cfg(test)]
+    checkpoint_plan: Mutex<std::collections::VecDeque<PlannedCheckpoint>>,
+}
+
+/// One planned behavior for an upcoming [`Backend`] `checkpoint` call
+/// (in-crate test seam; see [`Backend::plan_checkpoint_calls`]).
+#[cfg(test)]
+#[derive(Debug)]
+enum PlannedCheckpoint {
+    /// The call proceeds normally against the simulated store.
+    Pass,
+    /// The call is rejected with a non-retryable error, persisting
+    /// nothing. When `gate` is set, the rejection is held in flight until
+    /// the test adds a permit to the semaphore, so the test can order
+    /// events (e.g. dropping a contributor) against the in-flight write
+    /// deterministically.
+    FailNonRetryable {
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+    },
 }
 
 impl Backend {
@@ -1599,7 +1717,33 @@ impl Backend {
             get_state_calls: std::sync::atomic::AtomicUsize::new(0),
             checkpoint_calls: std::sync::atomic::AtomicUsize::new(0),
             checkpoint_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
+            checkpoint_failures_skip: std::sync::atomic::AtomicUsize::new(0),
+            checkpoint_failures_retryable: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            checkpoint_plan: Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Queues a per-call plan for upcoming `checkpoint` calls (in-crate
+    /// test seam). While entries remain, each call pops and obeys the
+    /// front entry — pass, fail retryably, or fail non-retryably (with an
+    /// optional in-flight gate) — instead of the counter-based injection.
+    /// Once the plan is exhausted, calls fall back to the counters.
+    #[cfg(test)]
+    fn plan_checkpoint_calls(&self, plan: Vec<PlannedCheckpoint>) {
+        self.checkpoint_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(plan);
+    }
+
+    /// Pops the next planned checkpoint behavior, if a plan is queued.
+    #[cfg(test)]
+    fn next_planned_checkpoint(&self) -> Option<PlannedCheckpoint> {
+        self.checkpoint_plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
     }
 
     /// The number of `get_state` calls the SDK has made against this
@@ -1872,22 +2016,68 @@ impl ExecutionClient for Backend {
     {
         self.checkpoint_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Injected fault (`LocalRunner::fail_next_checkpoints`): reject
-        // BEFORE touching any state, so the rejected write persists
-        // nothing — exactly like a service-side rejection.
-        if self
-            .checkpoint_failures_remaining
+        // In-crate test seam: a per-call plan (see
+        // [`Backend::plan_checkpoint_calls`]) takes precedence over the
+        // counter-based injection below while entries remain.
+        #[cfg(test)]
+        if let Some(planned) = self.next_planned_checkpoint() {
+            match planned {
+                PlannedCheckpoint::Pass => {}
+                PlannedCheckpoint::FailNonRetryable { gate } => {
+                    return Box::pin(async move {
+                        if let Some(gate) = gate {
+                            // Hold the failing write in flight until the
+                            // test releases it — lets a test drop a
+                            // contributor deterministically BEFORE the
+                            // failure publishes.
+                            let permit = gate.acquire().await;
+                            drop(permit);
+                        }
+                        Err(ClientError::new_non_retryable(
+                            "planned non-retryable checkpoint failure (test plan)",
+                        ))
+                    });
+                }
+            }
+        }
+        // Injected fault (`LocalRunner::fail_next_checkpoints` /
+        // `fail_checkpoints_after[_retryable]`): after letting `skip`
+        // calls through, reject BEFORE touching any state, so the
+        // rejected write persists nothing — exactly like a service-side
+        // rejection.
+        let skipped = self
+            .checkpoint_failures_skip
             .fetch_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |remaining| remaining.checked_sub(1),
             )
-            .is_ok()
+            .is_ok();
+        if !skipped
+            && self
+                .checkpoint_failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
         {
-            return Box::pin(async {
-                Err(ClientError::new_non_retryable(
-                    "injected checkpoint failure (LocalRunner::fail_next_checkpoints)",
-                ))
+            let retryable = self
+                .checkpoint_failures_retryable
+                .load(std::sync::atomic::Ordering::SeqCst);
+            return Box::pin(async move {
+                if retryable {
+                    Err(ClientError::from_retryable(
+                        "injected retryable checkpoint failure \
+                         (LocalRunner::fail_checkpoints_after_retryable)"
+                            .to_owned(),
+                    ))
+                } else {
+                    Err(ClientError::new_non_retryable(
+                        "injected checkpoint failure (LocalRunner::fail_next_checkpoints)",
+                    ))
+                }
             });
         }
         let updated_ops: Vec<Operation> = {
@@ -4000,6 +4190,138 @@ mod tests {
             3,
             "each step body must run exactly once across suspend/resume — \
              a checkpoint held past the PENDING boundary would re-execute it"
+        );
+    }
+
+    /// Review regression (issue #43): a failure RETAINED by a detached
+    /// batch flush — its only contributor was dropped before the rejection
+    /// published — must not be discarded, and the orphaned operation's
+    /// unwritten outcome must be terminalized. The retained rejection here
+    /// is NON-retryable (deterministic on every future invocation): were
+    /// it dropped, the orphaned operation would stay `Started` and
+    /// re-execute on every lap.
+    ///
+    /// With the coalescer's failure latch, the very next buffered write —
+    /// the later live step's START — never reaches the backend: its
+    /// flusher observes the latch under the writer lock, republishes the
+    /// retained non-retryable error, and the live contributor's
+    /// unrecoverable routing fails the execution. The end-of-invocation
+    /// flush point then classifies the retained failures and persists the
+    /// orphan's terminal FAIL. (The `Fault`-path retained-failure drain in
+    /// the wrapper remains as defense in depth: with the latch, a
+    /// non-retryable retained failure surfaces through the first
+    /// subsequent contributor as here, before any retryable fault can.)
+    #[tokio::test]
+    async fn retained_nonretryable_failure_terminalizes_orphan_and_fails_execution() {
+        let runner = LocalRunner::new().checkpoint_batching();
+        let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
+
+        // Call plan:
+        //   1. orphan START — passes.
+        //   2. orphan SUCCEED (detached batch flush) — held at the gate
+        //      until the handler releases it, then rejected non-retryably.
+        //      The handler drops the contributor while the write is held,
+        //      so the rejection publishes to nobody and is only RETAINED
+        //      (and latched).
+        // The live step's START never reaches the backend (failure
+        // latch), so the next real call is the orphan's terminal FAIL —
+        // it falls past the exhausted plan and persists.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        backend.plan_checkpoint_calls(vec![
+            PlannedCheckpoint::Pass,
+            PlannedCheckpoint::FailNonRetryable {
+                gate: Some(Arc::clone(&gate)),
+            },
+        ]);
+
+        let body_runs = Arc::new(AtomicU32::new(0));
+        let body_runs_h = Arc::clone(&body_runs);
+        let backend_h = Arc::clone(&backend);
+        let gate_h = Arc::clone(&gate);
+
+        let result = runner
+            .run_on_backend(
+                Arc::clone(&backend),
+                move |(), ctx: DurableContext| {
+                    let body_runs = Arc::clone(&body_runs_h);
+                    let backend = Arc::clone(&backend_h);
+                    let gate = Arc::clone(&gate_h);
+                    async move {
+                        let body_runs_step = Arc::clone(&body_runs);
+                        let orphan = ctx
+                            .step(move |_| {
+                                let body_runs = Arc::clone(&body_runs_step);
+                                async move {
+                                    body_runs.fetch_add(1, Ordering::SeqCst);
+                                    Ok("orphaned-outcome".to_owned())
+                                }
+                            })
+                            .name("orphan")
+                            .spawn();
+
+                        // Wait until the orphan's SUCCEED write is IN
+                        // FLIGHT (call 2 reached the backend, held at the
+                        // gate), then drop the contributor and release the
+                        // gate: the rejection now publishes to nobody and
+                        // is only retained by the coalescer.
+                        while backend.checkpoint_call_count() < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                        drop(orphan);
+                        gate.add_permits(1);
+
+                        // A later LIVE operation: its START write hits the
+                        // failure latch — no backend call — and republishes
+                        // the retained non-retryable rejection, whose
+                        // unrecoverable routing fails the execution. Before
+                        // the retention + latch, the retained failure above
+                        // was silently discarded.
+                        let live: String = ctx
+                            .step(|_| async { Ok("live".to_owned()) })
+                            .name("live")
+                            .await?;
+                        Ok::<_, BoxError>(live)
+                    }
+                },
+                (),
+            )
+            .await;
+
+        assert_eq!(
+            body_runs.load(Ordering::SeqCst),
+            1,
+            "the orphaned body must run exactly once — a discarded retained \
+             rejection would leave it `Started` and re-execute it"
+        );
+        assert_eq!(
+            result.invocation_count(),
+            1,
+            "the retained non-retryable rejection is deterministic: the \
+             execution must die in this invocation, not re-invoke into the \
+             same rejection"
+        );
+        assert!(
+            result.is_failure(),
+            "the execution must fail — the orphaned operation's record \
+             would otherwise claim less than what executed; got {:?} / {:?}",
+            result.error_type(),
+            result.error_message()
+        );
+        assert_eq!(
+            result.error_type(),
+            Some(crate::error::CHECKPOINT_FAILED_ERROR_TYPE)
+        );
+
+        // The terminal FAIL persisted for the orphaned operation.
+        let ops = result.operations();
+        let orphan_op = ops
+            .iter()
+            .find(|op| op.name.as_deref() == Some("orphan"))
+            .expect("the orphaned step's operation record exists");
+        assert_eq!(
+            orphan_op.status, "Failed",
+            "a terminal FAIL must be recorded for the operation whose \
+             retained outcome rejection was classified at the flush point"
         );
     }
 

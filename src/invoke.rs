@@ -10,7 +10,6 @@ use aws_sdk_lambda::types::{
 };
 
 use crate::Serdes;
-use crate::client::ClientError;
 use crate::context::DurableContext;
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{InvokeError, InvokeErrorKind, OperationError, OperationErrorKind};
@@ -162,10 +161,16 @@ where
             &wire_payload,
             self.tenant_id.as_deref(),
         );
-        self.ctx
-            .checkpoint_updates(vec![update])
-            .await
-            .map_err(client_error_to_invoke_op_error)?;
+        if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
+            // Audit (#43) — chained-invoke START: no user code ran (the
+            // input was serialized, but nothing external happened), so
+            // there is no side effect needing a recorded outcome. No
+            // terminal FAIL: re-invocation reconverges on the same write.
+            return self
+                .ctx
+                .checkpoint_failure_unrecoverable(&wire_id, err, None)
+                .await;
+        }
 
         // Suspend — the backend owns the child invocation.
         self.ctx.suspend_now().await
@@ -246,13 +251,6 @@ fn invoke_error_from_record(
     )))
     .with_operation(wire_id, status)
     .with_wire(wire)
-}
-
-fn client_error_to_invoke_op_error(err: ClientError) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::new(
-        InvokeErrorKind::FunctionFailed,
-        Some(Box::new(err)),
-    )))
 }
 
 // ── Update builder ──────────────────────────────────────────────────────

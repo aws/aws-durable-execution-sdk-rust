@@ -33,6 +33,15 @@
 //! - A sealed batch is split into one or more requests by
 //!   [`split_into_requests`], each within [`BatchLimits`] (operation count
 //!   and estimated payload bytes), preserving join order across the splits.
+//! - Once any buffered write fails, the **failure latch** is set (under
+//!   the writer lock, by the failing flusher) and no buffered write
+//!   reaches the backend again for the rest of the invocation: every
+//!   flusher — spawned or flush-point — checks the latch under the writer
+//!   lock before writing, and on a hit publishes the latched error to its
+//!   contributors and retains its updates as unwritten (issue #43,
+//!   "retryable exhaustion fails the invocation with no further writes").
+//!   The terminal `FAIL` writes of the non-retryable classification are
+//!   unaffected: they go through the direct (uncoalesced) path.
 //! - The flush itself runs on a spawned task (see
 //!   `DurableContext::spawn_batch_flush`), so a contributor that is dropped
 //!   mid-await (a lost `race`, for example) cannot cancel an in-flight batch
@@ -216,6 +225,49 @@ struct CoalescerState {
     pending: Vec<TrackedUpdate>,
     /// The batch the pending updates belong to, if one is open.
     batch: Option<Arc<CheckpointBatch>>,
+    /// Write failures observed by flushers, retained for the
+    /// end-of-invocation flush point (issue #43).
+    ///
+    /// A spawned batch flush publishes its error only to the batch's
+    /// contributors — and every contributor may already be dropped (a
+    /// lost `race`/`select_ok` branch, a dropped `DurableFuture`). Without
+    /// this retention such a failure would be fully discarded, leaving
+    /// the affected operations' records claiming less than what executed.
+    /// The flush point drains these via
+    /// [`CheckpointCoalescer::take_failed_flushes`] and applies the #43
+    /// classification (retryable fails the invocation; non-retryable
+    /// persists terminal `FAIL` records, then fails the execution).
+    failed: Vec<FailedFlush>,
+    /// The FIRST write failure this invocation's buffered channel
+    /// suffered — the failure latch (issue #43).
+    ///
+    /// Once set, no buffered write may reach the backend again this
+    /// invocation: "retryable exhaustion fails the invocation with no
+    /// further writes", and a write queued behind the failure would
+    /// otherwise persist replay-visible transitions after the invocation
+    /// is already doomed. Every flusher checks the latch under the
+    /// [`CheckpointCoalescer::writer_lock`] before writing (the latch is
+    /// always set by the failing flusher while it still holds that lock,
+    /// so a queued flusher cannot race past it); on a hit it publishes
+    /// the latched error to its contributors and retains its updates as
+    /// unwritten instead of calling the backend. Deliberately sticky:
+    /// [`CheckpointCoalescer::take_failed_flushes`] drains the retained
+    /// failures but never clears the latch — the coalescer lives for one
+    /// invocation, and its write channel does not come back within it.
+    latched: Option<ClientError>,
+}
+
+/// One checkpoint write failure retained by the coalescer: the error plus
+/// the updates the write did not persist (issue #43).
+#[derive(Debug)]
+pub(crate) struct FailedFlush {
+    /// The client error the write failed with.
+    pub(crate) error: ClientError,
+    /// The updates that were NOT persisted by the failed write — the
+    /// rejected chunk and everything after it, never a chunk that already
+    /// succeeded (a terminal `FAIL` must not be written over a persisted
+    /// outcome).
+    pub(crate) unwritten: Vec<OperationUpdate>,
 }
 
 /// The rendezvous for one coalesced checkpoint call: contributors await its
@@ -319,6 +371,38 @@ impl CheckpointCoalescer {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let batch = state.batch.take()?;
         Some((batch, std::mem::take(&mut state.pending)))
+    }
+
+    /// Retains a checkpoint write failure for the end-of-invocation flush
+    /// point (issue #43): `unwritten` are the updates the failed write did
+    /// not persist. Also latches the failure (first error wins) so no
+    /// later buffered write reaches the backend this invocation — see
+    /// [`CoalescerState::latched`].
+    pub(crate) fn record_failed_flush(&self, error: ClientError, unwritten: Vec<OperationUpdate>) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.latched.is_none() {
+            state.latched = Some(error.clone());
+        }
+        state.failed.push(FailedFlush { error, unwritten });
+    }
+
+    /// The first write failure this invocation's buffered channel
+    /// suffered, if any — the failure latch (issue #43). A flusher that
+    /// observes it (under the writer lock) must not call the backend: it
+    /// publishes this error to its contributors and retains its updates
+    /// via [`Self::record_failed_flush`] instead.
+    pub(crate) fn latched_failure(&self) -> Option<ClientError> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.latched.clone()
+    }
+
+    /// Drains the retained write failures, in occurrence order. The
+    /// failure latch is deliberately NOT cleared (see
+    /// [`CoalescerState::latched`]): the write channel stays poisoned for
+    /// the rest of the invocation.
+    pub(crate) fn take_failed_flushes(&self) -> Vec<FailedFlush> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut state.failed)
     }
 }
 
@@ -608,6 +692,45 @@ mod tests {
             result.expect("published Ok").checkpoint_token,
             "token-1",
             "waiter observes the published result"
+        );
+    }
+
+    /// The failure latch (issue #43): the FIRST recorded failure latches
+    /// and stays latched — later failures do not replace it, and draining
+    /// the retained failures does not clear it, because the buffered
+    /// write channel does not come back within an invocation.
+    #[test]
+    fn failure_latch_is_first_error_and_sticky() {
+        let coalescer = CheckpointCoalescer::new(Duration::ZERO);
+        assert!(
+            coalescer.latched_failure().is_none(),
+            "no latch before any failure"
+        );
+
+        coalescer.record_failed_flush(
+            ClientError::from_retryable("first failure".to_owned()),
+            vec![dummy_update("a")],
+        );
+        coalescer.record_failed_flush(
+            ClientError::new_non_retryable("second failure"),
+            vec![dummy_update("b")],
+        );
+
+        let latched = coalescer.latched_failure().expect("latch is set");
+        assert!(
+            latched.to_string().contains("first failure"),
+            "the first failure wins the latch: {latched}"
+        );
+
+        let drained = coalescer.take_failed_flushes();
+        assert_eq!(drained.len(), 2, "both failures retained in order");
+        assert!(
+            coalescer.take_failed_flushes().is_empty(),
+            "retained failures drain once"
+        );
+        assert!(
+            coalescer.latched_failure().is_some(),
+            "the latch survives the drain — the channel stays poisoned"
         );
     }
 }

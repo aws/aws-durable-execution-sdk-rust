@@ -771,9 +771,14 @@ async fn checkpoint_start(
         .build()
         .expect("all required OperationUpdate fields set");
 
-    ctx.checkpoint_updates(vec![update])
-        .await
-        .map_err(|e| combinator_internal_error(&format!("checkpoint start: {e}")))?;
+    if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+        // Audit (#43) — combinator START: no user code ran for the
+        // combined operation itself, so no terminal FAIL is needed;
+        // re-invocation reconverges on the same write.
+        return ctx
+            .checkpoint_failure_unrecoverable(wire_id, err, None)
+            .await;
+    }
     Ok(())
 }
 
@@ -809,9 +814,17 @@ async fn checkpoint_succeed(
         .build()
         .expect("all required OperationUpdate fields set");
 
-    ctx.checkpoint_updates(vec![update])
-        .await
-        .map_err(|e| combinator_internal_error(&format!("checkpoint succeed: {e}")))?;
+    if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+        // Audit (#43) — combinator SUCCEED: the winning branch(es) ran,
+        // so their side effects need a recorded outcome. A permanent
+        // rejection persists a small terminal FAIL before the execution
+        // fails.
+        let cwire = crate::error::checkpoint_failure_wire(&err);
+        let terminal = build_combinator_fail_update(ctx, wire_id, name, &cwire);
+        return ctx
+            .checkpoint_failure_unrecoverable(wire_id, err, Some(terminal))
+            .await;
+    }
     Ok(())
 }
 
@@ -849,10 +862,46 @@ async fn checkpoint_fail(
         .build()
         .expect("all required OperationUpdate fields set");
 
-    ctx.checkpoint_updates(vec![update])
-        .await
-        .map_err(|e| combinator_internal_error(&format!("checkpoint fail: {e}")))?;
+    if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+        // Audit (#43) — combinator FAIL: branch bodies ran; the failed
+        // FAIL write routes unrecoverable with a minimal terminal FAIL
+        // retry (the original carried the branch error's payload).
+        let cwire = crate::error::checkpoint_failure_wire(&err);
+        let terminal = build_combinator_fail_update(ctx, wire_id, name, &cwire);
+        return ctx
+            .checkpoint_failure_unrecoverable(wire_id, err, Some(terminal))
+            .await;
+    }
     Ok(())
+}
+
+/// Builds a combinator `FAIL` update carrying `wire` as its error — the
+/// terminal record persisted when the combinator's own outcome write was
+/// permanently rejected (issue #43).
+fn build_combinator_fail_update(
+    ctx: &DurableContext,
+    wire_id: &str,
+    name: Option<&str>,
+    wire: &crate::error::WireError,
+) -> aws_sdk_lambda::types::OperationUpdate {
+    use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
+
+    let mut builder = OperationUpdate::builder()
+        .id(wire_id.to_owned())
+        .r#type(OperationType::Context)
+        .sub_type(COMBINATOR_SUB_TYPE.to_owned())
+        .action(OperationAction::Fail)
+        .error(wire.to_error_object());
+    if let Some(n) = name {
+        builder = builder.name(n.to_owned());
+    }
+    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+        builder = builder.parent_id(parent_wire);
+    }
+    #[allow(clippy::expect_used)] // reason: all required fields are set above
+    builder
+        .build()
+        .expect("all required OperationUpdate fields set")
 }
 
 /// Creates a combinator internal `OperationError`; the message becomes

@@ -176,10 +176,15 @@ where
         // Callback creation is a flush point of the checkpoint-delay
         // contract: the backend assigns the callback_id in this response,
         // so the write cannot wait out a coalescing window.
-        self.ctx
-            .checkpoint_updates_urgent(vec![update])
-            .await
-            .map_err(|e| callback_internal_error(&format!("checkpoint start: {e}")))?;
+        if let Err(err) = self.ctx.checkpoint_updates_urgent(vec![update]).await {
+            // Audit (#43) — callback-creation START: no user code ran (the
+            // callback ID does not exist yet), so no terminal FAIL is
+            // needed; re-invocation reconverges on the same write.
+            return self
+                .ctx
+                .checkpoint_failure_unrecoverable(&wire_id, err, None)
+                .await;
+        }
 
         // After checkpointing START, the backend assigns a callback_id.
         // Read it from the (now-updated) checkpoint log.
@@ -375,9 +380,14 @@ where
         } else {
             // 3. First invocation — checkpoint ContextStarted.
             let update = build_wfcb_update(&wire_id, name.as_deref(), OperationAction::Start, &ctx);
-            ctx.checkpoint_updates(vec![update])
-                .await
-                .map_err(|e| wfcb_internal_error(&format!("checkpoint start: {e}")))?;
+            if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+                // Audit (#43) — wait-for-callback context START: no user
+                // code ran (the submitter has not been called), so no
+                // terminal FAIL is needed; re-invocation reconverges.
+                return ctx
+                    .checkpoint_failure_unrecoverable(&wire_id, err, None)
+                    .await;
+            }
         }
 
         // 4. Create child context with chained prefix.
@@ -427,9 +437,18 @@ where
                     .build()
                     .expect("all required OperationUpdate fields set");
 
-                ctx.checkpoint_updates(vec![update])
-                    .await
-                    .map_err(|e| wfcb_internal_error(&format!("checkpoint succeed: {e}")))?;
+                if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+                    // Audit (#43) — wait-for-callback SUCCEED: the
+                    // submitter ran and the external system completed the
+                    // callback, so those side effects need a recorded
+                    // outcome. A permanent rejection persists a small
+                    // terminal FAIL before the execution fails.
+                    let cwire = crate::error::checkpoint_failure_wire(&err);
+                    let terminal = build_wfcb_fail_update(&wire_id, name.as_deref(), &ctx, &cwire);
+                    return ctx
+                        .checkpoint_failure_unrecoverable(&wire_id, err, Some(terminal))
+                        .await;
+                }
 
                 // Round-trip deserialize for consistency.
                 let out: O = serde_json::from_str(&serialized)
@@ -456,12 +475,22 @@ where
                     .build()
                     .expect("all required OperationUpdate fields set");
 
-                // Best-effort checkpoint — if it fails, return the error
-                // anyway (the next invocation re-executes). Attach the
-                // checkpointed context so the live error matches what a
-                // replay of this record reconstructs: operation id,
-                // status, and the wire record are present either way.
-                let _ = ctx.checkpoint_updates(vec![update]).await;
+                // Checkpoint the failure so a replay of this record
+                // reconstructs the same error: operation id, status, and
+                // the wire record are present either way. A rejected
+                // write routes unrecoverable — discarding it would leave
+                // the record claiming less than what executed (#43).
+                if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
+                    // Audit (#43) — wait-for-callback FAIL: the submitter
+                    // (and possibly the external system) ran; the failed
+                    // FAIL write routes unrecoverable with a minimal
+                    // terminal FAIL retry.
+                    let cwire = crate::error::checkpoint_failure_wire(&client_err);
+                    let terminal = build_wfcb_fail_update(&wire_id, name.as_deref(), &ctx, &cwire);
+                    return ctx
+                        .checkpoint_failure_unrecoverable(&wire_id, client_err, Some(terminal))
+                        .await;
+                }
                 Err(err
                     .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
                     .with_wire(wire))
@@ -579,6 +608,32 @@ fn build_wfcb_update(
         .r#type(OperationType::Context)
         .sub_type(WFCB_SUB_TYPE.to_owned())
         .action(action);
+    if let Some(n) = name {
+        builder = builder.name(n.to_owned());
+    }
+    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+        builder = builder.parent_id(parent_wire);
+    }
+    #[allow(clippy::expect_used)] // reason: all required fields set above
+    builder
+        .build()
+        .expect("all required OperationUpdate fields set")
+}
+
+/// Builds the terminal `FAIL` update a wait-for-callback context persists
+/// when its own outcome write was permanently rejected (issue #43).
+fn build_wfcb_fail_update(
+    wire_id: &str,
+    name: Option<&str>,
+    ctx: &DurableContext,
+    wire: &crate::error::WireError,
+) -> OperationUpdate {
+    let mut builder = OperationUpdate::builder()
+        .id(wire_id.to_owned())
+        .r#type(OperationType::Context)
+        .sub_type(WFCB_SUB_TYPE.to_owned())
+        .action(OperationAction::Fail)
+        .error(wire.to_error_object());
     if let Some(n) = name {
         builder = builder.name(n.to_owned());
     }

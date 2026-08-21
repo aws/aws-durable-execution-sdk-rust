@@ -907,12 +907,37 @@ where
             // BEFORE the envelope reports the invocation's state to the
             // service, so buffering can never hold a checkpoint past the
             // end of the invocation. A no-op without configured buffering.
-            // Updates still buffered here belong to operations whose
-            // futures were dropped (e.g. losers of a `race`), so a flush
-            // failure cannot change the outcome; it is logged rather than
-            // propagated.
-            if let Err(e) = flush_ctx.flush_pending_checkpoints().await {
-                tracing::warn!(error = %e, "failed to flush coalesced checkpoints at invocation end");
+            //
+            // Checkpoint-failure interplay (issue #43): a `Fault` outcome
+            // skips the flush of pending writes — the write channel
+            // already failed retryably; a follow-up write would fail the
+            // same way, and the contract is "fails the invocation with no
+            // further writes". But failures already RETAINED by detached
+            // batch flushes (every contributor dropped — a lost
+            // `race`/`select_ok` branch) are still drained: a retained
+            // NON-retryable failure is deterministic, so dropping it here
+            // would leave its operations `Started` and re-executing on
+            // every future invocation — exactly the loop the flush point
+            // exists to end. Such a failure routes through the same
+            // terminalize-then-fail-the-execution path as a non-retryable
+            // flush failure; retryable-only retained failures are dropped
+            // with the invocation (the service re-invokes and the affected
+            // operations re-run under the interruption contract). Every
+            // other outcome flushes, and a flush failure routes through
+            // the same classification as any other checkpoint write
+            // failure (see `flush_failure_response`): retryable fails the
+            // invocation, non-retryable persists terminal `FAIL` records
+            // for the affected operations and fails the execution.
+            if matches!(outcome, driver::InvocationOutcome::Fault { .. }) {
+                // No flush of pending writes on a failed channel — but
+                // classify retained failures (see above).
+                if let Some(retained) = flush_ctx.take_retained_flush_failures().await
+                    && retained.any_non_retryable()
+                {
+                    return flush_failure_response(&retained, outcome, &flush_ctx).await;
+                }
+            } else if let Err(flush) = flush_ctx.flush_pending_checkpoints().await {
+                return flush_failure_response(&flush, outcome, &flush_ctx).await;
             }
 
             // Convert outcome to the durable response envelope.
@@ -926,6 +951,11 @@ where
             // invocation as a runtime fault and retry it, rather than marking
             // the execution FAILED with the handler's error.
             //
+            // The one deliberate exception is `Fault` — a retryable
+            // checkpoint failure — where retry-as-a-runtime-fault is
+            // exactly the intended recovery, so it maps to `Err` inside
+            // `outcome_envelope`.
+            //
             // The observable consequence, which is intentional: a handler
             // failure does not increment the Lambda `Errors` metric, does not
             // route to a DLQ or OnFailure destination, and does not mark the
@@ -933,9 +963,62 @@ where
             // execution status (`GetDurableExecution` /
             // `ListDurableExecutionsByFunction`) instead. See the rustdoc on
             // [`run`] and [`wrap`].
-            Ok(outcome_envelope(outcome, &flush_ctx))
+            outcome_envelope(outcome, &flush_ctx)
         })
     }
+}
+
+/// Applies the issue #43 checkpoint-failure classification to a failed
+/// end-of-invocation flush of buffered checkpoints — or, on the `Fault`
+/// path, to failures retained by detached batch flushes (nothing is
+/// flushed there; see the flush point in [`wrap`]).
+///
+/// - **Retryable** (every failure transient): the invocation fails with no
+///   further writes — the channel is down, and the service re-invokes,
+///   which is the same recovery as an interruption. This applies whatever
+///   the driver outcome was: reporting SUCCEEDED or PENDING would claim
+///   records the service never received, and the re-invocation converges
+///   (dropped contributors' operations re-run under the documented
+///   `AtLeastOncePerRetry` interruption contract).
+/// - **Non-retryable** (any failure permanent): re-invoking would replay
+///   into the same deterministic rejection, an infinite loop. Instead, a
+///   small terminal `FAIL` is persisted for every operation whose buffered
+///   outcome was lost (see
+///   [`DurableContext::terminalize_unwritten_outcomes`]), and the
+///   execution fails. A handler outcome of SUCCEEDED or PENDING is
+///   overridden — completing while an operation record claims less than
+///   what executed would violate the #43 invariant — and a `Fault`
+///   outcome (the retained-failure drain path) likewise becomes an
+///   execution failure carrying the retained error, while a handler that
+///   already FAILED keeps its own error as the execution result (the
+///   execution dies either way, and the handler's failure is the more
+///   meaningful root cause).
+async fn flush_failure_response(
+    flush: &context::FlushFailure,
+    outcome: driver::InvocationOutcome,
+    ctx: &DurableContext,
+) -> Result<serde_json::Value, lambda_runtime::Error> {
+    let error = flush.primary_error();
+    if !flush.any_non_retryable() {
+        return Err(lambda_runtime::Error::from(format!(
+            "failed to flush coalesced checkpoints at invocation end: {error}"
+        )));
+    }
+
+    tracing::error!(
+        error = %error,
+        "non-retryable failure flushing coalesced checkpoints; recording terminal \
+         FAILs for the affected operations and failing the execution"
+    );
+    ctx.terminalize_unwritten_outcomes(flush).await;
+
+    let failed = match outcome {
+        driver::InvocationOutcome::Failed { .. } => outcome,
+        _ => driver::InvocationOutcome::Failed {
+            error: error::checkpoint_failure_wire(error),
+        },
+    };
+    outcome_envelope(failed, ctx)
 }
 
 /// Converts the driver's invocation outcome into the durable response
@@ -943,15 +1026,19 @@ where
 /// suspension path (see [`crate::observability`]).
 ///
 /// The FAILED status deliberately travels in the envelope, not as a Lambda
-/// invocation error — see the envelope contract note at the call site.
-fn outcome_envelope(outcome: driver::InvocationOutcome, ctx: &DurableContext) -> serde_json::Value {
+/// invocation error — see the envelope contract note at the call site. The
+/// `Fault` outcome is the deliberate inverse: a retryable checkpoint
+/// failure returns `Err`, failing the Lambda invocation itself so the
+/// durable service re-invokes (issue #43).
+fn outcome_envelope(
+    outcome: driver::InvocationOutcome,
+    ctx: &DurableContext,
+) -> Result<serde_json::Value, lambda_runtime::Error> {
     match outcome {
-        driver::InvocationOutcome::Complete(serialized) => {
-            serde_json::json!({
-                "Status": "SUCCEEDED",
-                "Result": serialized
-            })
-        }
+        driver::InvocationOutcome::Complete(serialized) => Ok(serde_json::json!({
+            "Status": "SUCCEEDED",
+            "Result": serialized
+        })),
         driver::InvocationOutcome::Pending => {
             // Emitted while the handler's `durable_execution` span is
             // entered — the instrumented handler future has already been
@@ -965,9 +1052,15 @@ fn outcome_envelope(outcome: driver::InvocationOutcome, ctx: &DurableContext) ->
                 ctx.execution_arn(),
                 &ctx.lambda_context().request_id,
             );
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "Status": "PENDING"
-            })
+            }))
+        }
+        driver::InvocationOutcome::Fault { message } => {
+            // A retryable checkpoint failure: fail the invocation itself
+            // (no envelope, no further writes). The service re-invokes,
+            // which is the same recovery as an interruption.
+            Err(lambda_runtime::Error::from(message))
         }
         driver::InvocationOutcome::Failed { error } => {
             let mut error_map = serde_json::Map::new();
@@ -991,10 +1084,10 @@ fn outcome_envelope(outcome: driver::InvocationOutcome, ctx: &DurableContext) ->
                     serde_json::json!(error.stack_trace()),
                 );
             }
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "Status": "FAILED",
                 "Error": serde_json::Value::Object(error_map)
-            })
+            }))
         }
     }
 }

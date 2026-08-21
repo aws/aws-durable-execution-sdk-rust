@@ -7,7 +7,6 @@
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate, WaitOptions};
 
-use crate::client::ClientError;
 use crate::context::DurableContext;
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, WaitError, WaitErrorKind};
@@ -86,10 +85,17 @@ impl WaitExecution {
             self.ctx.parent_wire_id(),
             self.duration_secs,
         );
-        self.ctx
-            .checkpoint_updates(vec![update])
-            .await
-            .map_err(client_error_to_op_error)?;
+        if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
+            // Audit (#43) — wait START: no user code ran, so there is no
+            // side effect needing a recorded outcome. No terminal FAIL:
+            // the invocation dies, the service re-invokes, and replay
+            // reaches this point and attempts the same write, losing only
+            // one invocation.
+            return self
+                .ctx
+                .checkpoint_failure_unrecoverable(&wire_id, err, None)
+                .await;
+        }
 
         // Request suspension — the backend owns the timer.
         self.ctx.suspend_now().await
@@ -123,13 +129,6 @@ fn build_wait_start_update(
     builder
         .build()
         .expect("all required OperationUpdate fields set")
-}
-
-fn client_error_to_op_error(err: ClientError) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Wait(WaitError::new(
-        WaitErrorKind::CheckpointFailed,
-        Some(Box::new(err)),
-    )))
 }
 
 #[cfg(test)]

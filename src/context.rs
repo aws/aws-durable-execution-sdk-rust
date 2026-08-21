@@ -139,6 +139,47 @@ impl std::fmt::Debug for DurableContext {
     }
 }
 
+/// Every checkpoint write failure suffered by an invocation's buffered
+/// (coalesced) checkpoints, reported by
+/// [`DurableContext::flush_pending_checkpoints`] for the issue #43
+/// classification at the end-of-invocation flush point.
+#[derive(Debug)]
+pub(crate) struct FlushFailure {
+    /// The write failures, in occurrence order, each carrying the updates
+    /// it did not persist.
+    pub(crate) failures: Vec<crate::checkpoint_coalescer::FailedFlush>,
+}
+
+impl FlushFailure {
+    /// Whether any of the failures is non-retryable. Non-retryable wins
+    /// the classification: re-invoking on a deterministic rejection would
+    /// loop until the execution timeout (issue #43 defect 1), so a single
+    /// non-retryable failure routes the whole flush through the
+    /// terminal-FAIL-then-fail-the-execution path.
+    pub(crate) fn any_non_retryable(&self) -> bool {
+        self.failures.iter().any(|f| !f.error.is_retryable())
+    }
+
+    /// The error to report: the first non-retryable failure when one
+    /// exists (it decides the classification), otherwise the first
+    /// failure.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: `flush_pending_checkpoints` only constructs a
+    /// `FlushFailure` with at least one failure.
+    pub(crate) fn primary_error(&self) -> &ClientError {
+        self.failures
+            .iter()
+            .find(|f| !f.error.is_retryable())
+            .or_else(|| self.failures.first())
+            .map_or_else(
+                || unreachable!("FlushFailure is never constructed empty"),
+                |f| &f.error,
+            )
+    }
+}
+
 impl DurableContext {
     /// Returns a new context for testing purposes.
     ///
@@ -812,6 +853,82 @@ impl DurableContext {
         std::future::pending::<T>().await
     }
 
+    /// Routes a checkpoint write failure through the unrecoverable path
+    /// and never returns control to the caller (issue #43).
+    ///
+    /// A failed outcome write must never become a catchable operation
+    /// error: a handler that catches it branches on a decision no
+    /// checkpoint records, which replay cannot reproduce. Instead the
+    /// failure's classification (see
+    /// [`ClientError::is_retryable`](crate::client::ClientError)) picks
+    /// the recovery scope:
+    ///
+    /// - **Retryable** (exhausted transient failure, stale token): the
+    ///   write channel is down, so a follow-up write would fail the same
+    ///   way. Nothing more is written; the invocation fails with a Lambda
+    ///   runtime error and the service re-invokes — the same recovery as
+    ///   an interruption.
+    /// - **Non-retryable** (permanent rejection, e.g. oversized payload):
+    ///   re-invoking would re-run the body into the same rejection, an
+    ///   infinite loop with side effects firing once per lap. When the
+    ///   caller supplies `terminal_fail` — required at every site where
+    ///   user code already ran, so its side effects get a recorded
+    ///   outcome — that small terminal `FAIL` is written first (it goes
+    ///   through on a channel that rejected only the payload; a failure
+    ///   here is logged, not propagated, because the execution dies
+    ///   either way). Then the execution fails with
+    ///   [`CHECKPOINT_FAILED_ERROR_TYPE`](crate::error::CHECKPOINT_FAILED_ERROR_TYPE).
+    ///
+    /// Like [`Self::suspend_now`], the returned future never resolves: the
+    /// fatal slot is recorded and the invocation driver — which checks it
+    /// with priority over completion and suspension, from any scope in the
+    /// tree — drops the handler at its current await point, so user code
+    /// can neither catch nor ignore the failure.
+    pub(crate) async fn checkpoint_failure_unrecoverable<T>(
+        &self,
+        op_wire_id: &str,
+        err: ClientError,
+        terminal_fail: Option<OperationUpdate>,
+    ) -> T {
+        let message = format!("checkpoint write failed for operation {op_wire_id}: {err}");
+        if err.is_retryable() {
+            tracing::error!(
+                operation_id = %op_wire_id,
+                error = %err,
+                "retryable checkpoint failure exhausted retries; failing the invocation \
+                 so the service re-invokes"
+            );
+            self.inner
+                .suspension_signal
+                .record_invocation_fault(message);
+        } else {
+            tracing::error!(
+                operation_id = %op_wire_id,
+                error = %err,
+                "non-retryable checkpoint failure; recording terminal FAIL and failing \
+                 the execution"
+            );
+            if let Some(update) = terminal_fail {
+                // Direct write: the coalescing buffer may hold the very
+                // updates the service just rejected, and this record must
+                // not queue behind them.
+                if let Err(fail_err) = self.checkpoint_updates_direct(vec![update]).await {
+                    tracing::error!(
+                        operation_id = %op_wire_id,
+                        error = %fail_err,
+                        "terminal FAIL write also failed after non-retryable checkpoint \
+                         failure; failing the execution without a recorded outcome"
+                    );
+                }
+            }
+            self.inner.suspension_signal.record_fatal(
+                crate::error::CHECKPOINT_FAILED_ERROR_TYPE.to_owned(),
+                message,
+            );
+        }
+        std::future::pending::<T>().await
+    }
+
     /// Checkpoints operation updates via the execution client.
     ///
     /// When [`Options`](crate::Options) configured a `checkpoint_delay`
@@ -961,6 +1078,11 @@ impl DurableContext {
     /// contributor. The claim and the write both happen while holding the
     /// coalescer's writer lock, so buffered writes are totally ordered and
     /// a flush point that acquires the lock waits for this write to finish.
+    /// If an earlier buffered write already failed (the coalescer's
+    /// failure latch, checked under the same lock), nothing is written:
+    /// the claimed updates are retained as unwritten and the prior error
+    /// is published to this batch's contributors (issue #43, "no further
+    /// writes" after a checkpoint channel failure).
     ///
     /// The write runs on its own task deliberately: a contributor dropped
     /// mid-await (a lost `race`, a dropped `DurableFuture`) must not cancel
@@ -976,7 +1098,41 @@ impl DurableContext {
         drop(tokio::spawn(async move {
             let _writer = coalescer.writer_lock().lock().await;
             if let Some(updates) = coalescer.take_batch(&batch) {
-                let result = ctx.write_batched_updates(updates, coalescer.limits()).await;
+                // Failure latch (issue #43): once any buffered write has
+                // failed, the channel is down for the rest of the
+                // invocation — "no further writes". A flusher that queued
+                // on the writer lock behind the failing write must not
+                // perform another checkpoint call: doing so could persist
+                // replay-visible transitions after the invocation is
+                // already doomed. Instead it retains its updates for the
+                // flush-point classification and publishes the prior
+                // error, so its contributors route through the same
+                // unrecoverable path the failing batch's contributors
+                // took. The latch is set by the failing flusher while it
+                // holds this same lock, so the check cannot race it.
+                if let Some(prior) = coalescer.latched_failure() {
+                    coalescer.record_failed_flush(
+                        prior.clone(),
+                        updates.into_iter().map(|t| t.update).collect(),
+                    );
+                    batch.publish(Err(prior));
+                    return;
+                }
+                let result = match ctx.write_batched_updates(updates, coalescer.limits()).await {
+                    Ok(output) => Ok(output),
+                    Err((error, unwritten)) => {
+                        // Retain the failure for the end-of-invocation
+                        // flush point (issue #43): every contributor of
+                        // this batch may already be dropped (a lost
+                        // `race`/`select_ok` branch, a dropped
+                        // `DurableFuture`), and a failure published to
+                        // nobody would otherwise be fully discarded,
+                        // leaving the affected operations' records
+                        // claiming less than what executed.
+                        coalescer.record_failed_flush(error.clone(), unwritten);
+                        Err(error)
+                    }
+                };
                 batch.publish(result);
             }
         }));
@@ -988,7 +1144,11 @@ impl DurableContext {
     /// last chunk's output on success — backend-assigned fields from every
     /// chunk are already merged into the checkpoint log by
     /// [`Self::checkpoint_updates_direct`] — or the first chunk error,
-    /// which aborts the remaining chunks so contributors observe it.
+    /// which aborts the remaining chunks so contributors observe it. The
+    /// error carries the updates the write did NOT persist — the rejected
+    /// chunk plus every chunk after it, never a chunk that already
+    /// succeeded — so the #43 flush point can write terminal `FAIL`
+    /// records for exactly the operations whose outcomes were lost.
     ///
     /// Each chunk's lifecycle events are emitted immediately after that
     /// chunk's write succeeds (see [`Self::write_tracked_direct`]): a chunk
@@ -1002,18 +1162,36 @@ impl DurableContext {
         &self,
         updates: Vec<TrackedUpdate>,
         limits: BatchLimits,
-    ) -> Result<CheckpointOutput, ClientError> {
+    ) -> Result<CheckpointOutput, (ClientError, Vec<OperationUpdate>)> {
         if updates.is_empty() {
             // An empty seal (possible only defensively) still performs one
             // call so a waiting contributor receives a published result.
-            return self.checkpoint_updates_direct(Vec::new()).await;
+            return self
+                .checkpoint_updates_direct(Vec::new())
+                .await
+                .map_err(|e| (e, Vec::new()));
         }
+        let mut chunks = split_into_requests(updates, &limits).into_iter();
         let mut last = None;
-        for chunk in split_into_requests(updates, &limits) {
-            last = Some(self.write_tracked_direct(chunk).await?);
+        while let Some(chunk) = chunks.next() {
+            // Snapshot the chunk before the write consumes it: on
+            // rejection this chunk is the unwritten head, and the
+            // remaining chunks the unwritten tail.
+            let snapshot: Vec<OperationUpdate> = chunk.iter().map(|t| t.update.clone()).collect();
+            match self.write_tracked_direct(chunk).await {
+                Ok(output) => last = Some(output),
+                Err(err) => {
+                    let mut unwritten = snapshot;
+                    unwritten.extend(chunks.flatten().map(|t| t.update));
+                    return Err((err, unwritten));
+                }
+            }
         }
         last.ok_or_else(|| {
-            ClientError::new_non_retryable("internal: batched checkpoint produced no requests")
+            (
+                ClientError::new_non_retryable("internal: batched checkpoint produced no requests"),
+                Vec::new(),
+            )
         })
     }
 
@@ -1032,7 +1210,17 @@ impl DurableContext {
     /// this a true barrier: a batch a delay timer already claimed cannot
     /// still be in flight when this returns. A no-op when no buffering is
     /// configured or the buffer is idle.
-    pub(crate) async fn flush_pending_checkpoints(&self) -> Result<(), ClientError> {
+    ///
+    /// A failure is returned as a [`FlushFailure`] carrying every write
+    /// failure this invocation's buffered checkpoints suffered — the one
+    /// hit here directly, the remaining drained-but-unwritten batches, and
+    /// any failure a spawned batch flush retained because its contributors
+    /// were all dropped — together with the updates that were not
+    /// persisted, so the caller can apply the issue #43 classification
+    /// (retryable fails the invocation with no further writes;
+    /// non-retryable persists terminal `FAIL` records for the affected
+    /// operations, then fails the execution).
+    pub(crate) async fn flush_pending_checkpoints(&self) -> Result<(), FlushFailure> {
         let Some(coalescer) = self.inner.coalescer.clone() else {
             return Ok(());
         };
@@ -1040,15 +1228,196 @@ impl DurableContext {
         // (batches are only claimed and written under it), then holding it
         // across the drain keeps this flush ordered after those writes.
         let _writer = coalescer.writer_lock().lock().await;
+        // Failure latch (issue #43): a buffered write that already failed
+        // — in a spawned flush this drain never contributed to — poisons
+        // the channel for the rest of the invocation. Seed the drain's
+        // "already failed" state from it, so pending batches are published
+        // the prior error and retained as unwritten instead of written.
+        let mut prior: Option<ClientError> = coalescer.latched_failure();
+        let mut failures: Vec<crate::checkpoint_coalescer::FailedFlush> = Vec::new();
         while let Some((batch, updates)) = coalescer.take_any() {
-            let result = self
+            if let Some(error) = prior.clone() {
+                // The channel already failed: do not attempt further
+                // outcome writes ("no further writes" for the retryable
+                // case; the non-retryable case writes only the small
+                // terminal FAILs, and those go through the caller, not
+                // here). Publish the error and collect the updates as
+                // unwritten.
+                batch.publish(Err(error.clone()));
+                failures.push(crate::checkpoint_coalescer::FailedFlush {
+                    error,
+                    unwritten: updates.into_iter().map(|t| t.update).collect(),
+                });
+                continue;
+            }
+            match self
                 .write_batched_updates(updates, coalescer.limits())
-                .await;
-            let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
-            batch.publish(result);
-            outcome?;
+                .await
+            {
+                Ok(output) => batch.publish(Ok(output)),
+                Err((error, unwritten)) => {
+                    batch.publish(Err(error.clone()));
+                    prior = Some(error.clone());
+                    failures.push(crate::checkpoint_coalescer::FailedFlush { error, unwritten });
+                }
+            }
         }
-        Ok(())
+        // Failures a spawned flush retained because its contributors were
+        // all dropped happened BEFORE this drain: report them first.
+        let mut all = coalescer.take_failed_flushes();
+        all.extend(failures);
+        if all.is_empty() {
+            Ok(())
+        } else {
+            Err(FlushFailure { failures: all })
+        }
+    }
+
+    /// Drains ONLY the write failures retained by detached (spawned) batch
+    /// flushes, attempting no writes and leaving any still-pending batches
+    /// in the buffer untouched.
+    ///
+    /// This is the `Fault`-outcome counterpart of
+    /// [`Self::flush_pending_checkpoints`] (issue #43): when a retryable
+    /// checkpoint failure is already failing the invocation, the "no
+    /// further writes" contract forbids flushing the buffer — a follow-up
+    /// write would fail the same way, and re-invocation re-runs the
+    /// buffered operations under the interruption contract. But a failure
+    /// a spawned flush retained on behalf of dropped contributors (a lost
+    /// `race`/`select_ok` branch, a dropped [`crate::DurableFuture`]) has
+    /// already happened and must still be classified: silently discarding
+    /// a NON-retryable one would leave its operations' records claiming
+    /// less than what executed on every future invocation — the very loop
+    /// the #43 terminalization exists to end.
+    ///
+    /// Acquiring the coalescer's writer lock first waits out any batch
+    /// write still in flight (batches are only claimed and written under
+    /// it), so a failure that write is about to retain is observed rather
+    /// than raced past. Waiting is not writing: nothing is sent here.
+    pub(crate) async fn take_retained_flush_failures(&self) -> Option<FlushFailure> {
+        let coalescer = self.inner.coalescer.clone()?;
+        let _writer = coalescer.writer_lock().lock().await;
+        let failures = coalescer.take_failed_flushes();
+        if failures.is_empty() {
+            None
+        } else {
+            Some(FlushFailure { failures })
+        }
+    }
+
+    /// Writes a small terminal `FAIL` record for every operation whose
+    /// buffered OUTCOME write was lost to a non-retryable flush failure
+    /// (issue #43). Called by the invocation wrapper before it fails the
+    /// execution, so each affected operation's record claims exactly what
+    /// executed instead of a dangling `Started`.
+    ///
+    /// Per operation (first-appearance order across the failures):
+    /// - An operation with an unwritten outcome update (`Succeed`, `Fail`,
+    ///   or `Retry`) gets a terminal `FAIL` derived from the flush failure
+    ///   — user code ran, so its side effects need a recorded outcome. An
+    ///   unwritten `Start` for the same operation is written first so the
+    ///   `FAIL` has a record to terminate.
+    /// - An operation whose only unwritten update is its `Start` gets
+    ///   nothing: no user-visible outcome was discarded, and the execution
+    ///   is failing anyway.
+    /// - An operation the checkpoint log already shows terminal is
+    ///   skipped: a live contributor's unrecoverable routing may already
+    ///   have persisted its terminal `FAIL`, and a `FAIL` must never be
+    ///   written over a recorded outcome.
+    ///
+    /// Writes go one operation per request so one rejected record cannot
+    /// take its siblings' terminal `FAIL`s down with it; individual
+    /// failures are logged, not propagated — the execution dies either way.
+    pub(crate) async fn terminalize_unwritten_outcomes(&self, flush: &FlushFailure) {
+        use aws_sdk_lambda::types::OperationAction;
+
+        struct PerOp {
+            start: Option<OperationUpdate>,
+            outcome: Option<OperationUpdate>,
+            error: ClientError,
+        }
+        let mut order: Vec<String> = Vec::new();
+        let mut per_op: std::collections::HashMap<String, PerOp> = std::collections::HashMap::new();
+        for failure in &flush.failures {
+            for update in &failure.unwritten {
+                let entry = per_op.entry(update.id.clone()).or_insert_with(|| {
+                    order.push(update.id.clone());
+                    PerOp {
+                        start: None,
+                        outcome: None,
+                        error: failure.error.clone(),
+                    }
+                });
+                match update.action {
+                    OperationAction::Start => {
+                        entry.start.get_or_insert_with(|| update.clone());
+                    }
+                    _ => {
+                        entry.outcome.get_or_insert_with(|| update.clone());
+                    }
+                }
+            }
+        }
+
+        for wire_id in order {
+            let Some(op) = per_op.remove(&wire_id) else {
+                continue;
+            };
+            let Some(outcome) = op.outcome else {
+                // Start-only: no outcome was discarded (see doc above).
+                continue;
+            };
+            if self
+                .inner
+                .engine
+                .checkpoint_log
+                .status_view(&wire_id)
+                .is_some_and(|view| view.status.is_terminal())
+            {
+                continue;
+            }
+            let wire = crate::error::checkpoint_failure_wire(&op.error);
+            let mut updates = Vec::new();
+            if let Some(start) = op.start {
+                updates.push(start);
+            }
+            let mut builder = OperationUpdate::builder()
+                .id(outcome.id.clone())
+                .r#type(outcome.r#type.clone())
+                .action(OperationAction::Fail)
+                .error(wire.to_error_object());
+            if let Some(sub_type) = &outcome.sub_type {
+                builder = builder.sub_type(sub_type.clone());
+            }
+            if let Some(name) = &outcome.name {
+                builder = builder.name(name.clone());
+            }
+            if let Some(parent_id) = &outcome.parent_id {
+                builder = builder.parent_id(parent_id.clone());
+            }
+            match builder.build() {
+                Ok(fail_update) => {
+                    updates.push(fail_update);
+                    if let Err(err) = self.checkpoint_updates_direct(updates).await {
+                        tracing::error!(
+                            operation_id = %wire_id,
+                            error = %err,
+                            "terminal FAIL write failed after non-retryable flush \
+                             failure; the execution fails without a recorded outcome \
+                             for this operation"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(
+                        operation_id = %wire_id,
+                        error = %err,
+                        "could not build terminal FAIL update after non-retryable \
+                         flush failure"
+                    );
+                }
+            }
+        }
     }
 
     /// Writes operation updates through the execution client immediately.
@@ -3334,6 +3703,171 @@ mod tests {
             client.call_ids(),
             vec![vec!["op-in-flight".to_owned()]],
             "exactly the claimed batch was written, once"
+        );
+    }
+
+    /// A test client that FAILS every checkpoint call retryably, holding
+    /// the FIRST call at a gate so the test can order a second batch's
+    /// queuing against the in-flight failing write. Calls after the first
+    /// fail immediately (no gate), so a regression that performs an extra
+    /// write shows up as an extra recorded call instead of a hang.
+    #[derive(Debug)]
+    struct GatedRetryableFailClient {
+        gate: tokio::sync::Semaphore,
+        first: std::sync::atomic::AtomicBool,
+        /// Snapshot of update-ID lists, one entry per checkpoint call, in
+        /// call order.
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl GatedRetryableFailClient {
+        fn new() -> Self {
+            Self {
+                gate: tokio::sync::Semaphore::new(0),
+                first: std::sync::atomic::AtomicBool::new(true),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Releases the gated first call so its rejection lands.
+        fn release_first(&self) {
+            self.gate.add_permits(1);
+        }
+
+        fn call_ids(&self) -> Vec<Vec<String>> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        }
+    }
+
+    impl ExecutionClient for GatedRetryableFailClient {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(updates.iter().map(|u| u.id.clone()).collect());
+                if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    // Hold the first call in flight until the test
+                    // releases it; the permit is consumed so a second
+                    // call never blocks here.
+                    if let Ok(permit) = self.gate.acquire().await {
+                        permit.forget();
+                    }
+                }
+                Err(ClientError::from_retryable(
+                    "injected retryable checkpoint failure".to_owned(),
+                ))
+            })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
+        {
+            Box::pin(async {
+                Err(ClientError::new_non_retryable(
+                    "get_state not used in this test",
+                ))
+            })
+        }
+    }
+
+    /// REGRESSION (issue #43 review): a flusher QUEUED behind a failing
+    /// batch write must not perform another checkpoint call. Batch A's
+    /// write is in flight (held at the client's gate) when batch B opens
+    /// and queues its flusher on the writer lock; A then fails retryably.
+    /// "Retryable exhaustion fails the invocation with no further
+    /// writes": B's flusher must observe the failure latch under the
+    /// writer lock, publish the prior error to its contributors, and
+    /// retain its updates as unwritten — without calling the backend.
+    /// Before the latch, B's flusher acquired the lock after A's failure
+    /// and performed another write, persisting replay-visible transitions
+    /// after the invocation was already doomed.
+    #[tokio::test(start_paused = true)]
+    async fn queued_batch_flush_after_retryable_failure_writes_nothing() {
+        let client = Arc::new(GatedRetryableFailClient::new());
+        let ctx = coalescing_ctx(
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            Duration::ZERO,
+        );
+
+        // Batch A: its zero-delay flusher claims the batch under the
+        // writer lock and starts the write, which is held at the gate.
+        let contributor_a = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { ctx.checkpoint_updates(vec![make_update("op-a")]).await }
+        });
+        while client.call_count() < 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Batch B opens while A's write is in flight; its flusher queues
+        // on the writer lock behind A.
+        let contributor_b = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { ctx.checkpoint_updates(vec![make_update("op-b")]).await }
+        });
+        // Let B join the buffer and its flusher reach the writer lock.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // A's held write now fails retryably; B's queued flusher runs
+        // right after, under the same writer lock.
+        client.release_first();
+
+        let a = contributor_a.await.expect("contributor A task completes");
+        let b = contributor_b.await.expect("contributor B task completes");
+        let a_err = a.expect_err("batch A observes its own write failure");
+        let b_err = b.expect_err("batch B observes the latched prior failure");
+        assert!(a_err.is_retryable(), "A's injected failure is retryable");
+        assert!(
+            b_err.is_retryable(),
+            "the latch republishes the prior retryable error, so B's \
+             contributors route through the same fail-the-invocation path"
+        );
+
+        assert_eq!(
+            client.call_ids(),
+            vec![vec!["op-a".to_owned()]],
+            "batch B must cause NO checkpoint call after batch A's \
+             retryable failure — the channel is down and the invocation \
+             is already doomed"
+        );
+
+        // Both failures are retained for the flush-point classification:
+        // A's from the failed write, B's from the latch hit, each with
+        // its own unwritten updates.
+        let retained = ctx
+            .take_retained_flush_failures()
+            .await
+            .expect("both failures are retained");
+        let unwritten: Vec<Vec<String>> = retained
+            .failures
+            .iter()
+            .map(|f| f.unwritten.iter().map(|u| u.id.clone()).collect())
+            .collect();
+        assert_eq!(
+            unwritten,
+            vec![vec!["op-a".to_owned()], vec!["op-b".to_owned()]],
+            "each batch's updates are retained as unwritten, in order"
         );
     }
 

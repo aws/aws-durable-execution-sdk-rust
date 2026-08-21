@@ -73,6 +73,16 @@ pub(crate) enum InvocationOutcome {
         /// trace) reported in the response envelope.
         error: crate::error::WireError,
     },
+    /// The INVOCATION itself must fail — a Lambda runtime error rather
+    /// than a `FAILED` envelope — so the durable service re-invokes, the
+    /// same recovery as an interruption. Produced by a retryable
+    /// checkpoint write failure that exhausted transport-level retries:
+    /// the write channel is down, so nothing more is written and the
+    /// execution stays alive for the retry.
+    Fault {
+        /// The message reported as the Lambda invocation error.
+        message: String,
+    },
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -174,20 +184,62 @@ pub(crate) struct SuspensionSignal {
     quiescence: ScopeQuiescence,
 }
 
-/// An execution-fatal error recorded by an operation.
+/// An unrecoverable error recorded by an operation, together with the
+/// scope that must die for the execution to converge.
 ///
-/// Currently the only producer is non-determinism detection
-/// ([`crate::context::DurableContext::validate_replay_identity`]): a replay
-/// identity mismatch means the execution's recorded history no longer
-/// corresponds to the handler's operations, so no amount of re-invocation can
-/// make progress. The invocation driver checks this slot with priority over
-/// both completion and suspension.
+/// Producers:
+/// - non-determinism detection
+///   ([`crate::context::DurableContext::validate_replay_identity`]): a
+///   replay identity mismatch means no amount of re-invocation can make
+///   progress — [`FatalSeverity::FailExecution`];
+/// - checkpoint write failures
+///   ([`crate::context::DurableContext::checkpoint_failure_unrecoverable`]):
+///   a retryable failure fails the invocation so the service re-invokes
+///   ([`FatalSeverity::FailInvocation`]); a permanent rejection fails the
+///   execution ([`FatalSeverity::FailExecution`]).
+///
+/// The invocation driver checks this slot with priority over both
+/// completion and suspension.
 #[derive(Debug, Clone)]
 pub(crate) struct FatalError {
     /// The wire error type (e.g. `NonDeterministicExecutionError`).
     pub(crate) error_type: String,
     /// The full error message.
     pub(crate) error_message: String,
+    /// Which scope dies: the execution (terminal `FAILED` envelope) or
+    /// only this invocation (Lambda runtime error; the service
+    /// re-invokes).
+    pub(crate) severity: FatalSeverity,
+}
+
+/// The recovery scope of a [`FatalError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FatalSeverity {
+    /// The execution is over: report a `FAILED` envelope carrying the
+    /// error, which the service records as the execution result.
+    FailExecution,
+    /// Only this invocation dies: report a Lambda runtime error (no
+    /// envelope), and the service re-invokes — the interruption recovery
+    /// path.
+    FailInvocation,
+}
+
+impl FatalError {
+    /// Converts the recorded fatal into the invocation outcome its
+    /// severity demands.
+    pub(crate) fn into_outcome(self) -> InvocationOutcome {
+        match self.severity {
+            FatalSeverity::FailExecution => InvocationOutcome::Failed {
+                error: crate::error::WireError::new(
+                    Some(self.error_type),
+                    Some(self.error_message),
+                ),
+            },
+            FatalSeverity::FailInvocation => InvocationOutcome::Fault {
+                message: self.error_message,
+            },
+        }
+    }
 }
 
 impl SuspensionSignal {
@@ -223,16 +275,36 @@ impl SuspensionSignal {
     /// the failure is observed on the next poll rather than after an
     /// unrelated wakeup.
     pub(crate) fn record_fatal(&self, error_type: String, error_message: String) {
+        self.record(FatalError {
+            error_type,
+            error_message,
+            severity: FatalSeverity::FailExecution,
+        });
+    }
+
+    /// Records an invocation-fatal error into the shared slot (first record
+    /// wins): the invocation dies with a Lambda runtime error, the service
+    /// re-invokes, and the execution stays alive. Used by the retryable
+    /// checkpoint-failure path, where a follow-up write would fail the same
+    /// way and re-invocation is the recovery.
+    pub(crate) fn record_invocation_fault(&self, error_message: String) {
+        self.record(FatalError {
+            error_type: crate::error::CHECKPOINT_FAILED_ERROR_TYPE.to_owned(),
+            error_message,
+            severity: FatalSeverity::FailInvocation,
+        });
+    }
+
+    /// Shared body of the fatal-recording paths: first record wins, then
+    /// both this scope's driver and the invocation driver are woken.
+    fn record(&self, fatal: FatalError) {
         {
             let mut guard = self
                 .fatal
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.is_none() {
-                *guard = Some(FatalError {
-                    error_type,
-                    error_message,
-                });
+                *guard = Some(fatal);
             }
         }
         wake_slot(&self.scope_waker);
@@ -564,12 +636,7 @@ where
         // would mask the defect. The handler future is dropped exactly as it
         // would be for suspension.
         if let Some(fatal) = suspension_signal.fatal_error() {
-            return Poll::Ready(InvocationOutcome::Failed {
-                error: crate::error::WireError::new(
-                    Some(fatal.error_type),
-                    Some(fatal.error_message),
-                ),
-            });
+            return Poll::Ready(fatal.into_outcome());
         }
 
         // Check if suspension was already requested (from a previous poll
@@ -589,12 +656,7 @@ where
                 // batch before the handler resolved) must fail the
                 // execution — a successful completion would erase it.
                 if let Some(fatal) = suspension_signal.fatal_error() {
-                    return Poll::Ready(InvocationOutcome::Failed {
-                        error: crate::error::WireError::new(
-                            Some(fatal.error_type),
-                            Some(fatal.error_message),
-                        ),
-                    });
+                    return Poll::Ready(fatal.into_outcome());
                 }
                 // An operation may have requested suspension AND the
                 // handler still completed (e.g. error propagated via `?`
@@ -611,12 +673,7 @@ where
                 // whatever shape the handler's own error took (the mismatch
                 // may have been stringified through child/batch boundaries).
                 if let Some(fatal) = suspension_signal.fatal_error() {
-                    return Poll::Ready(InvocationOutcome::Failed {
-                        error: crate::error::WireError::new(
-                            Some(fatal.error_type),
-                            Some(fatal.error_message),
-                        ),
-                    });
+                    return Poll::Ready(fatal.into_outcome());
                 }
                 // Same precedence rule: if an operation requested
                 // suspension before the error propagated, the invocation
@@ -631,12 +688,7 @@ where
             Poll::Pending => {
                 // Fatal precedence over suspension: see above.
                 if let Some(fatal) = suspension_signal.fatal_error() {
-                    return Poll::Ready(InvocationOutcome::Failed {
-                        error: crate::error::WireError::new(
-                            Some(fatal.error_type),
-                            Some(fatal.error_message),
-                        ),
-                    });
+                    return Poll::Ready(fatal.into_outcome());
                 }
                 // The future yielded — check if an operation requested
                 // suspension during this poll cycle.
@@ -1187,7 +1239,7 @@ mod tests {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)] // reason: test module
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // reason: test module
 mod suspension_containment_and_task_ownership {
     use super::{InvocationOutcome, drive_invocation};
     use crate::client::{ExecutionClient, InMemoryExecutionClient, TestResponse};
@@ -1408,7 +1460,7 @@ mod suspension_containment_and_task_ownership {
         );
     }
 
-    // ── 3. Genuine failures remain catchable Err (not swallowed) ─────────
+    // ── 3. Validation errors remain catchable; checkpoint failures do not ─
 
     #[tokio::test]
     async fn validation_error_is_catchable_err() {
@@ -1439,8 +1491,14 @@ mod suspension_containment_and_task_ownership {
         );
     }
 
+    /// A checkpoint API failure is never yielded to the handler as a
+    /// catchable error (issue #43): the handler is dropped at its await
+    /// point exactly as `suspend_now` drops it, so a catch around the
+    /// operation cannot observe the failure or branch on it. A
+    /// non-retryable failure fails the EXECUTION with the
+    /// checkpoint-failure error type.
     #[tokio::test]
-    async fn checkpoint_failure_is_catchable_err() {
+    async fn non_retryable_checkpoint_failure_uncatchable_fails_execution() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         client.enqueue_checkpoint_response(TestResponse::NonRetryableError("kaboom".to_owned()));
         let ctx = live_ctx(Arc::clone(&client));
@@ -1450,8 +1508,10 @@ mod suspension_containment_and_task_ownership {
         let ctx_h = ctx.clone();
         let outcome = drive_invocation(
             async move {
-                // The live wait's START checkpoint fails non-retryably; the
-                // error must surface as a catchable Err, not a suspension.
+                // The live wait's START checkpoint fails non-retryably.
+                // Pre-#43 this surfaced as a catchable Err; now the future
+                // parks and the driver drops the handler, so neither branch
+                // below runs.
                 let r = ctx_h.wait(Duration::from_secs(5)).await;
                 if r.is_err() {
                     caught_c.store(true, Ordering::SeqCst);
@@ -1461,11 +1521,64 @@ mod suspension_containment_and_task_ownership {
             signal,
         )
         .await;
-        assert_eq!(outcome, InvocationOutcome::Complete("handled".to_owned()));
         assert!(
-            caught.load(Ordering::SeqCst),
-            "checkpoint failure must be catchable"
+            !caught.load(Ordering::SeqCst),
+            "a checkpoint API failure must not be observable by a catch"
         );
+        match outcome {
+            InvocationOutcome::Failed { error } => {
+                assert_eq!(
+                    error.error_type(),
+                    Some(crate::error::CHECKPOINT_FAILED_ERROR_TYPE),
+                    "a non-retryable checkpoint failure fails the execution \
+                     with the checkpoint-failure type"
+                );
+                assert!(
+                    error.error_message().is_some_and(|m| m.contains("kaboom")),
+                    "the service's rejection reason is preserved: {error:?}"
+                );
+            }
+            other => panic!("expected a FAILED execution outcome, got {other:?}"),
+        }
+    }
+
+    /// The retryable counterpart: a checkpoint failure that exhausted the
+    /// client's internal retries fails the INVOCATION (a Lambda runtime
+    /// error, so the service re-invokes — the interruption recovery path)
+    /// rather than the execution, and is equally unobservable by a catch.
+    #[tokio::test]
+    async fn retryable_checkpoint_failure_uncatchable_fails_invocation() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        client.enqueue_checkpoint_response(TestResponse::RetryableError("throttled".to_owned()));
+        let ctx = live_ctx(Arc::clone(&client));
+        let signal = Arc::clone(ctx.suspension_signal());
+        let caught = Arc::new(AtomicBool::new(false));
+        let caught_c = Arc::clone(&caught);
+        let ctx_h = ctx.clone();
+        let outcome = drive_invocation(
+            async move {
+                let r = ctx_h.wait(Duration::from_secs(5)).await;
+                if r.is_err() {
+                    caught_c.store(true, Ordering::SeqCst);
+                }
+                Ok::<_, crate::error::WireError>("handled".to_owned())
+            },
+            signal,
+        )
+        .await;
+        assert!(
+            !caught.load(Ordering::SeqCst),
+            "a checkpoint API failure must not be observable by a catch"
+        );
+        match outcome {
+            InvocationOutcome::Fault { message } => {
+                assert!(
+                    message.contains("throttled"),
+                    "the exhausted failure's reason is preserved: {message}"
+                );
+            }
+            other => panic!("expected an invocation Fault outcome, got {other:?}"),
+        }
     }
 
     // ── 5. Dropping a .spawn() handle cancels its task ──────────────────

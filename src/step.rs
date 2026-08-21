@@ -14,7 +14,6 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use tracing::Instrument;
 
 use crate::builders::{JitterStrategy, RetryStrategyConfig};
-use crate::client::ClientError;
 use crate::context::{DurableContext, StepContext};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
@@ -401,9 +400,16 @@ where
         // Checkpoint START (skip if step was already in Started state).
         if !already_started {
             let start_update = build_start_update(&wire_id, name.as_deref(), ctx.parent_wire_id());
-            ctx.checkpoint_updates(vec![start_update])
-                .await
-                .map_err(client_error_to_op_error)?;
+            if let Err(err) = ctx.checkpoint_updates(vec![start_update]).await {
+                // Audit (#43) — step START: no user code has run for this
+                // attempt, so there is no side effect needing a recorded
+                // outcome. No terminal FAIL: the invocation dies, the
+                // service re-invokes, and replay reaches this point and
+                // attempts the same write, losing only one invocation.
+                return ctx
+                    .checkpoint_failure_unrecoverable(&wire_id, err, None)
+                    .await;
+            }
         }
 
         // The body runs inside a tracing span carrying the structured-log
@@ -483,13 +489,56 @@ async fn handle_success<O, S: Serdes<O>>(
     let serdes_ctx = SerdesContext::new(wire_id, ctx.execution_arn());
 
     // Serialize the result (ownership transfers to the serdes).
-    let serialized = serialize_value(serdes, value, serdes_ctx.clone()).await?;
+    //
+    // A serialization failure is a LOCAL, deterministic, user-facing
+    // failure, so it stays catchable — but the terminal FAIL is persisted
+    // FIRST (issue #43). With the failure recorded, replay yields the
+    // recorded FAIL instead of re-running the body: the body executes
+    // exactly once, and a handler that catches the error branches on a
+    // decision replay reproduces.
+    let serialized = match serialize_value(serdes, value, serdes_ctx.clone()).await {
+        Ok(serialized) => serialized,
+        Err(op_err) => {
+            // The fixed serialization wire type is the replay
+            // discriminator: `replay_failure` matches it to reconstruct
+            // `StepErrorKind::SerializationFailed`, so a handler that
+            // branches on the kind takes the same path live and replayed.
+            let wire = crate::error::serialization_failure_wire(&op_err);
+            let update = build_fail_update(wire_id, name, ctx.parent_wire_id(), &wire);
+            if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
+                // Audit (#43) — step FAIL (serialization): the body ran,
+                // so the failed FAIL write routes unrecoverable with a
+                // minimal retry — the record just attempted was already
+                // small, but a checkpoint-failure-derived one is the
+                // uniform terminal shape.
+                let cwire = crate::error::checkpoint_failure_wire(&client_err);
+                let terminal = build_fail_update(wire_id, name, ctx.parent_wire_id(), &cwire);
+                return ctx
+                    .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
+                    .await;
+            }
+            return Err(op_err
+                .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+                .with_wire(wire));
+        }
+    };
 
     // Checkpoint SUCCEED with payload.
     let update = build_succeed_update(wire_id, name, ctx.parent_wire_id(), &serialized);
-    ctx.checkpoint_updates(vec![update])
-        .await
-        .map_err(client_error_to_op_error)?;
+    if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+        // Audit (#43) — step SUCCEED: the body ran and its side effects
+        // need a recorded outcome, so a permanent rejection persists a
+        // small terminal FAIL (it goes through on a channel that rejected
+        // only the payload) before the execution fails. Yielding the
+        // failure instead would let the handler branch on a decision no
+        // checkpoint records, and re-invoking without a terminal record
+        // would re-run the body once per lap until the execution timeout.
+        let cwire = crate::error::checkpoint_failure_wire(&err);
+        let terminal = build_fail_update(wire_id, name, ctx.parent_wire_id(), &cwire);
+        return ctx
+            .checkpoint_failure_unrecoverable(wire_id, err, Some(terminal))
+            .await;
+    }
 
     // Return deserialized from the serialized form (round-trip parity).
     deserialize_result(serdes, serialized, serdes_ctx).await
@@ -529,9 +578,18 @@ async fn handle_failure<O>(
                 .saturating_add(u64::from(delay.subsec_nanos() > 0));
             let delay_secs = i32::try_from(whole_secs.max(1)).unwrap_or(i32::MAX);
             let update = build_retry_update(wire_id, name, ctx.parent_wire_id(), &wire, delay_secs);
-            ctx.checkpoint_updates(vec![update])
-                .await
-                .map_err(client_error_to_op_error)?;
+            if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
+                // Audit (#43) — step RETRY: the body ran (and failed), so
+                // its side effects need a recorded outcome. A permanent
+                // rejection persists a small terminal FAIL before the
+                // execution fails; recorded retries replay, but a retry
+                // the service never recorded would not.
+                let cwire = crate::error::checkpoint_failure_wire(&client_err);
+                let terminal = build_fail_update(wire_id, name, ctx.parent_wire_id(), &cwire);
+                return ctx
+                    .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
+                    .await;
+            }
 
             // Suspend — the backend owns the retry timer.
             ctx.suspend_now().await
@@ -539,9 +597,18 @@ async fn handle_failure<O>(
         RetryDecision::Stop => {
             // Checkpoint FAIL (permanent).
             let update = build_fail_update(wire_id, name, ctx.parent_wire_id(), &wire);
-            ctx.checkpoint_updates(vec![update])
-                .await
-                .map_err(client_error_to_op_error)?;
+            if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
+                // Audit (#43) — step FAIL: the body ran, so the failed
+                // FAIL write routes unrecoverable with a minimal terminal
+                // FAIL retry (the original may have been rejected for its
+                // error payload's size; the checkpoint-failure-derived
+                // record is a few hundred bytes).
+                let cwire = crate::error::checkpoint_failure_wire(&client_err);
+                let terminal = build_fail_update(wire_id, name, ctx.parent_wire_id(), &cwire);
+                return ctx
+                    .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
+                    .await;
+            }
 
             // The escaping error stays reachable through `source()`; the
             // attempt count is the kind's structural fact.
@@ -728,20 +795,24 @@ async fn replay_success<O, S: Serdes<O>>(
 /// message, so `kind()` remains meaningful after a replay and the
 /// recorded `error_type` stays programmatically recoverable through a
 /// `source()` downcast.
+///
+/// A record whose `error_type` is the serialization discriminator
+/// ([`crate::error::SERIALIZATION_FAILED_ERROR_TYPE`]) reconstructs
+/// `StepErrorKind::SerializationFailed` — the kind the live path yielded
+/// after persisting that record — so replay reproduces the recorded
+/// failure's classification, not just its message (issue #43).
 fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+    let kind = if wire.error_type() == Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) {
+        StepErrorKind::SerializationFailed
+    } else {
+        StepErrorKind::ExecutionFailed
+    };
     OperationError::from_kind(OperationErrorKind::Step(StepError::new(
-        StepErrorKind::ExecutionFailed,
+        kind,
         Some(crate::error::ReplayedFailure::source_from(wire.clone())),
     )))
     .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
     .with_wire(wire)
-}
-
-fn client_error_to_op_error(err: ClientError) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::Step(StepError::new(
-        StepErrorKind::ExecutionFailed,
-        Some(Box::new(err)),
-    )))
 }
 
 /// The wire `ErrorType` recorded for a step failure whose escaping error

@@ -523,6 +523,51 @@ pub(crate) fn wire_error_manual(error_type: &str, message: impl Into<String>) ->
     WireError::new(Some(error_type), Some(message.into())).with_stack_trace(capture_stack_trace())
 }
 
+/// The wire `ErrorType` recorded when a checkpoint write itself failed —
+/// on the terminal `FAIL` record a permanent rejection persists for the
+/// operation, and on the `FAILED` envelope that then ends the execution.
+/// A handler never observes this type: checkpoint failures unwind the
+/// handler through the unrecoverable path (issue #43).
+pub(crate) const CHECKPOINT_FAILED_ERROR_TYPE: &str = "CheckpointFailedError";
+
+/// The wire `ErrorType` recorded on the terminal `FAIL` an operation
+/// persists when its result (or carried state) failed LOCAL serialization
+/// before the outcome write (issue #43).
+///
+/// This type is the replay discriminator for the serialization
+/// classification: the live path yields a `SerializationFailed`-kinded
+/// error after persisting this record, and replay reconstructs the SAME
+/// kind by matching this type, so a handler that branches on the kind
+/// takes the same path live and replayed. It is a protocol discriminator
+/// written via [`wire_error_with_type`], never derived from a user error's
+/// own identity.
+pub(crate) const SERIALIZATION_FAILED_ERROR_TYPE: &str = "SerializationError";
+
+/// Builds the wire record a terminal `FAIL` carries when the operation's
+/// result failed local serialization before its outcome write (issue #43).
+///
+/// The fixed [`SERIALIZATION_FAILED_ERROR_TYPE`] is what lets replay
+/// reconstruct the serialization classification (see the constant's doc);
+/// message flattening and the `error_data`/`stack_trace` chain walk are
+/// the standard [`wire_error_with_type`] behavior.
+pub(crate) fn serialization_failure_wire(err: &(dyn Error + 'static)) -> WireError {
+    wire_error_with_type(err, SERIALIZATION_FAILED_ERROR_TYPE)
+}
+
+/// Builds the small wire record a terminal `FAIL` carries when the
+/// operation's own outcome write was permanently rejected (issue #43).
+///
+/// Deliberately derived from the *checkpoint failure*, not from the
+/// operation's payload: the whole point of this record is that it is a
+/// few hundred bytes and goes through on a channel that rejected only
+/// the payload, ending the re-execution loop after one lap.
+pub(crate) fn checkpoint_failure_wire(err: &impl fmt::Display) -> WireError {
+    wire_error_manual(
+        CHECKPOINT_FAILED_ERROR_TYPE,
+        format!("checkpoint write failed: {err}"),
+    )
+}
+
 /// Returns the wire record carried by `err`, when `err` is one of the
 /// SDK's own wire-record-carrying types.
 fn wire_identity<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a WireError> {
@@ -980,21 +1025,22 @@ impl Error for WaitError {
 
 /// Specific kinds of wait failures.
 ///
+/// A checkpoint write failure is deliberately NOT a kind here: a failed
+/// wait START write unwinds the handler through the unrecoverable path
+/// (issue #43), so user code never observes it as a `WaitError`.
+///
 /// # Examples
 ///
 /// ```
 /// use aws_durable_execution_sdk_rust::WaitErrorKind;
 ///
-/// fn is_checkpoint_failure(kind: &WaitErrorKind) -> bool {
-///     matches!(kind, WaitErrorKind::CheckpointFailed { .. })
+/// fn is_unexpected_status(kind: &WaitErrorKind) -> bool {
+///     matches!(kind, WaitErrorKind::UnexpectedStatus(_))
 /// }
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum WaitErrorKind {
-    /// The wait's start could not be checkpointed with the service.
-    #[non_exhaustive]
-    CheckpointFailed,
     /// The wait's checkpointed record carries a status the SDK cannot
     /// resume from.
     UnexpectedStatus(UnexpectedStatus),
@@ -1003,7 +1049,6 @@ pub enum WaitErrorKind {
 impl fmt::Display for WaitErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CheckpointFailed => write!(f, "checkpoint failed"),
             Self::UnexpectedStatus(details) => write!(f, "{details}"),
         }
     }

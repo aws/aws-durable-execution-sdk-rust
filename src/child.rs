@@ -219,11 +219,15 @@ where
                 OperationAction::Start,
                 &self.ctx,
             );
-            // If checkpoint fails, surface as ChildContext internal error.
-            self.ctx
-                .checkpoint_updates(vec![update])
-                .await
-                .map_err(|e| child_internal_error(&format!("checkpoint start: {e}")))?;
+            if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
+                // Audit (#43) — child-context START: no user code ran (the
+                // closure has not been called), so no terminal FAIL is
+                // needed; re-invocation reconverges on the same write.
+                return self
+                    .ctx
+                    .checkpoint_failure_unrecoverable(&wire_id, err, None)
+                    .await;
+            }
         }
 
         // 4. Create child context with chained prefix.
@@ -334,11 +338,53 @@ where
             )),
             (ChildRunMode::Live, Ok(value)) => {
                 // Success: serialize and checkpoint.
-                let serialized = serialize_value(value, &serdes, serdes_ctx.clone()).await?;
+                //
+                // A result serialization failure is a LOCAL, deterministic,
+                // user-facing failure, so it stays catchable — but the
+                // terminal FAIL is persisted FIRST (issue #43). The closure
+                // already ran, so its side effects need a recorded outcome:
+                // with the FAIL recorded, replay yields it instead of
+                // re-running the closure, and a handler that catches the
+                // error branches on a decision replay reproduces.
+                let serialized = match serialize_value(value, &serdes, serdes_ctx.clone()).await {
+                    Ok(serialized) => serialized,
+                    Err(op_err) => {
+                        let wire = crate::error::serialization_failure_wire(&op_err);
+                        let update =
+                            build_child_fail_update(&wire_id, name.as_deref(), &ctx, &wire);
+                        if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
+                            // Audit (#43) — child FAIL (serialization): the
+                            // closure ran, so the failed FAIL write routes
+                            // unrecoverable with a minimal terminal FAIL
+                            // retry.
+                            let cwire = crate::error::checkpoint_failure_wire(&client_err);
+                            let terminal =
+                                build_child_fail_update(&wire_id, name.as_deref(), &ctx, &cwire);
+                            return ctx
+                                .checkpoint_failure_unrecoverable(
+                                    &wire_id,
+                                    client_err,
+                                    Some(terminal),
+                                )
+                                .await;
+                        }
+                        return Err(op_err
+                            .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+                            .with_wire(wire));
+                    }
+                };
                 let update = build_succeed_update(&wire_id, name.as_deref(), &ctx, &serialized);
-                ctx.checkpoint_updates(vec![update])
-                    .await
-                    .map_err(|e| child_internal_error(&format!("checkpoint succeed: {e}")))?;
+                if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
+                    // Audit (#43) — child-context SUCCEED: the closure
+                    // ran, so its side effects need a recorded outcome. A
+                    // permanent rejection persists a small terminal FAIL
+                    // before the execution fails.
+                    let cwire = crate::error::checkpoint_failure_wire(&err);
+                    let terminal = build_child_fail_update(&wire_id, name.as_deref(), &ctx, &cwire);
+                    return ctx
+                        .checkpoint_failure_unrecoverable(&wire_id, err, Some(terminal))
+                        .await;
+                }
 
                 // Round-trip deserialize for consistency (first-run == replay).
                 deserialize_value(serialized, &serdes, serdes_ctx).await
@@ -437,6 +483,37 @@ async fn checkpoint_live_failure(
     // the cause chain, so an inner failure's payload survives this
     // boundary.
     let wire = crate::error::wire_error_for(&child_err, "ChildFnError");
+    let update = build_child_fail_update(wire_id, name, ctx, &wire);
+
+    // A rejected FAIL write routes unrecoverable — discarding it would
+    // leave the record claiming less than what executed (#43).
+    if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
+        // Audit (#43) — child-context FAIL: the closure ran and failed;
+        // the failed FAIL write routes unrecoverable with a minimal
+        // terminal FAIL retry (the original carried the child error's
+        // payload).
+        let cwire = crate::error::checkpoint_failure_wire(&client_err);
+        let terminal = build_child_fail_update(wire_id, name, ctx, &cwire);
+        return ctx
+            .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
+            .await;
+    }
+
+    OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
+        ChildContextErrorKind::ChildFailed,
+        Some(child_err.into_source()),
+    )))
+    .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+    .with_wire(wire)
+}
+
+/// Builds a child-context `FAIL` update carrying `wire` as its error.
+fn build_child_fail_update(
+    wire_id: &str,
+    name: Option<&str>,
+    ctx: &DurableContext,
+    wire: &crate::error::WireError,
+) -> OperationUpdate {
     let mut fail_builder = OperationUpdate::builder()
         .id(wire_id.to_owned())
         .r#type(OperationType::Context)
@@ -450,20 +527,9 @@ async fn checkpoint_live_failure(
         fail_builder = fail_builder.parent_id(parent_wire);
     }
     #[allow(clippy::expect_used)] // reason: all required fields are set above
-    let update = fail_builder
+    fail_builder
         .build()
-        .expect("all required OperationUpdate fields set");
-
-    // Best-effort checkpoint — even if this fails, we report the
-    // child error (the next invocation will re-execute).
-    let _ = ctx.checkpoint_updates(vec![update]).await;
-
-    OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
-        ChildContextErrorKind::ChildFailed,
-        Some(child_err.into_source()),
-    )))
-    .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
-    .with_wire(wire)
+        .expect("all required OperationUpdate fields set")
 }
 
 /// Replays a successful child context result from the checkpoint log.
@@ -483,9 +549,21 @@ async fn replay_success<O, S: Serdes<O>>(
 /// The recorded failure fields travel on the synthetic source rather
 /// than being folded into a message, so the recorded `error_type` (and
 /// `error_data`, when present) stays programmatically recoverable.
+///
+/// A record whose `error_type` is the serialization discriminator
+/// ([`crate::error::SERIALIZATION_FAILED_ERROR_TYPE`]) reconstructs
+/// `ChildContextErrorKind::Internal` — the kind the live serialization
+/// path yielded after persisting that record — so replay reproduces the
+/// recorded failure's classification (issue #43). Every other record is
+/// a closure failure and reconstructs `ChildFailed`.
 fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+    let kind = if wire.error_type() == Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) {
+        ChildContextErrorKind::Internal
+    } else {
+        ChildContextErrorKind::ChildFailed
+    };
     OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
-        ChildContextErrorKind::ChildFailed,
+        kind,
         Some(crate::error::ReplayedFailure::source_from(wire.clone())),
     )))
     .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
@@ -610,19 +688,30 @@ mod tests {
 
     #[tokio::test]
     async fn child_live_path_runs_closure() {
-        let ctx = test_ctx(CheckpointLog::empty());
+        // A live client: the child's checkpoint writes must succeed for
+        // the closure to run to completion. (Pre-#43 this test used a
+        // client-less context and asserted the checkpoint failure
+        // surfaced as Err; a rejected write now parks the future for the
+        // invocation driver instead of yielding.)
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+        );
         let result: Result<i32, OperationError> = ctx
             .run_in_child_context(|child_ctx| async move {
-                // Child context should have prefix "1" (first op of root)
+                // Child context has prefix "1" (first op of root); its
+                // inner step runs and checkpoints under that namespace.
                 let step_result = child_ctx.step(|_| async { Ok(42) }).await?;
                 Ok(step_result)
             })
             .await;
-        // Without client, checkpoint will fail — but the closure runs.
-        // In live mode without a client, this errors at checkpoint.
-        // The important thing is the child context is created with the
-        // right prefix.
-        assert!(result.is_err()); // checkpoint fails (no client)
+        #[allow(clippy::unwrap_used)] // reason: test assertion
+        let value = result.unwrap();
+        assert_eq!(value, 42);
     }
 
     #[tokio::test]
@@ -718,7 +807,21 @@ mod tests {
     async fn spawn_child_starts_eagerly() {
         use tokio::sync::oneshot;
 
-        let ctx = test_ctx(CheckpointLog::empty());
+        // A working in-memory client: the child's START checkpoint must
+        // succeed for the body to run. (Pre-#43 this test used a
+        // client-less context and passed vacuously — the rejected START
+        // write dropped the sender, which settled `rx` without the body
+        // ever running. A rejected write now parks the child future for
+        // the driver instead of yielding, so the body needs a live
+        // checkpoint channel to demonstrate eagerness.)
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+        );
 
         let (tx, rx) = oneshot::channel::<()>();
 
@@ -726,20 +829,19 @@ mod tests {
             .run_in_child_context(move |_child_ctx| async move {
                 // Signal that the child body has started executing.
                 let _ = tx.send(());
-                // The child will fail at checkpoint (no client), but the
-                // body definitely ran.
                 Err("test complete".into())
             })
             .spawn();
 
         // The child body should have started BEFORE we await the handle.
         let signal = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
-        assert!(
-            signal.is_ok(),
+        assert_eq!(
+            signal.ok().and_then(Result::ok),
+            Some(()),
             "child body should start executing before await"
         );
 
-        // The handle should eventually resolve (with an error).
+        // The handle should eventually resolve (with the child's error).
         let result: Result<String, OperationError> = handle.await;
         assert!(result.is_err());
     }
