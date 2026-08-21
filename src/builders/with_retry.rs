@@ -75,6 +75,7 @@ use crate::serdes::JsonSerdes;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct WithRetryBuilder<O, F, Fut, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,

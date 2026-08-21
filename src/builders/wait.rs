@@ -34,6 +34,7 @@ use crate::future::DurableFuture;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct WaitBuilder {
     ctx: DurableContext,
     op_id: OperationId,

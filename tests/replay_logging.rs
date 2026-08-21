@@ -45,7 +45,7 @@ async fn handler_level_log_emitted_exactly_once_across_invocations() {
     let fmt_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(CaptureWriter(Arc::clone(&buffer)))
-        .with_filter(ReplayFilterLayer);
+        .with_filter(ReplayFilterLayer::new());
     let subscriber = tracing_subscriber::registry().with(fmt_layer);
     let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -97,7 +97,7 @@ async fn child_context_pre_wait_logs_emitted_exactly_once() {
     let fmt_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(CaptureWriter(Arc::clone(&buffer)))
-        .with_filter(ReplayFilterLayer);
+        .with_filter(ReplayFilterLayer::new());
     let subscriber = tracing_subscriber::registry().with(fmt_layer);
     let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -161,7 +161,7 @@ async fn map_branch_pre_wait_logs_emitted_exactly_once() {
     let fmt_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(CaptureWriter(Arc::clone(&buffer)))
-        .with_filter(ReplayFilterLayer);
+        .with_filter(ReplayFilterLayer::new());
     let subscriber = tracing_subscriber::registry().with(fmt_layer);
     let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -229,7 +229,7 @@ async fn post_flat_batch_marker_emitted_exactly_once_on_terminal_replay() {
     let fmt_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(CaptureWriter(Arc::clone(&buffer)))
-        .with_filter(ReplayFilterLayer);
+        .with_filter(ReplayFilterLayer::new());
     let subscriber = tracing_subscriber::registry().with(fmt_layer);
     let _guard = tracing::subscriber::set_default(subscriber);
 

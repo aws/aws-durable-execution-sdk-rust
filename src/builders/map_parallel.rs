@@ -64,6 +64,7 @@ pub use crate::map_parallel::{
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct MapBuilder<I, O, F, Fut, IS = JsonSerdes, RS = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
@@ -386,6 +387,7 @@ where
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct ParallelBuilder<O, IS = JsonSerdes, RS = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
@@ -696,6 +698,7 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 /// # Ok::<(), aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfigValidationError>(())
 /// ```
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct CompletionConfig {
     /// Completes the batch early once this many items succeed.
     /// `None` means no minimum-success threshold.

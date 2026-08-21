@@ -42,6 +42,7 @@ use crate::future::{DurableFuture, Settled};
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct TryJoinAllBuilder<O> {
     ctx: DurableContext,
     op_id: OperationId,
@@ -148,6 +149,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct JoinAllBuilder<O> {
     ctx: DurableContext,
     op_id: OperationId,
@@ -251,6 +253,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct SelectOkBuilder<O> {
     ctx: DurableContext,
     op_id: OperationId,
@@ -354,6 +357,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct RaceBuilder<O> {
     ctx: DurableContext,
     op_id: OperationId,

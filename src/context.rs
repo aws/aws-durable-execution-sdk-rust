@@ -121,6 +121,7 @@ impl std::fmt::Debug for Inner {
 /// }
 /// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct DurableContext {
     inner: Arc<Inner>,
 }
@@ -2208,6 +2209,7 @@ impl DurableContext {
 /// }
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StepContext {
     attempt: u32,
     _private: (),

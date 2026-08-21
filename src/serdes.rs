@@ -271,6 +271,12 @@ where
 /// # Ok::<(), BoxError>(())
 /// # }).unwrap();
 /// ```
+// `#[non_exhaustive]` exemption: a stateless marker constructed by value in
+// user code (`JsonSerdes.serialize(...)`, `.serdes(JsonSerdes)`) and the
+// default for every builder's serdes type parameter. The attribute would
+// remove that bare-name construction path, and the type's whole contract is
+// to carry no configuration — a configurable JSON serdes would be a new
+// type, not a field here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JsonSerdes;
 
@@ -508,6 +514,7 @@ impl FileSystemSerdesConfig {
 /// ```
 #[derive(Debug, Default)]
 #[must_use = "builders do nothing unless .build() is called"]
+#[non_exhaustive]
 pub struct FileSystemSerdesConfigBuilder {
     storage_mode: Option<FileSystemSerdesMode>,
     path_encoding: Option<FileSystemPathEncoding>,
@@ -631,6 +638,7 @@ impl FileSystemSerdesConfigBuilder {
 /// # drop(serdes);
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FileSystemSerdes {
     base_path: String,
     config: FileSystemSerdesConfig,

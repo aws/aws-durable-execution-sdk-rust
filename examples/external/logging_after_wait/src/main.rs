@@ -42,7 +42,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         .with(
             tracing_subscriber::fmt::layer()
                 .json()
-                .with_filter(ReplayFilterLayer),
+                .with_filter(ReplayFilterLayer::new()),
         )
         .init();
 

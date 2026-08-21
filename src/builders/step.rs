@@ -58,6 +58,7 @@ use crate::{BoxError, context::StepContext};
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct StepBuilder<O, F, Fut, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,

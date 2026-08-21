@@ -317,6 +317,7 @@ impl CompletionReason {
 /// assert_eq!(outcome.status(), BatchItemStatus::Failed);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SettledOutcome {
     /// Zero-based position of the item in the original input.
     index: usize,
@@ -379,6 +380,7 @@ impl SettledOutcome {
 /// assert_eq!(stats.outcomes().len(), 2);
 /// ```
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct BatchStats<'a> {
     /// Count of committed items that have succeeded so far.
     succeeded: usize,
@@ -2746,6 +2748,7 @@ fn item_summary_serdes_ctx(parent_wire: &str, execution_arn: &str, index: usize)
 /// serde::de::DeserializeOwned`), transforming the summary through its
 /// serde representation rather than field access.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct BatchSummary {
     results: Vec<BatchCheckpointItem>,
     reason: String,

@@ -42,6 +42,7 @@ use crate::error::{ChildFnError, OperationError};
 /// }
 /// ```
 #[must_use = "futures do nothing unless polled or spawned"]
+#[non_exhaustive]
 pub struct DurableFuture<O> {
     inner: Pin<Box<dyn Future<Output = Result<O, OperationError>> + Send>>,
     /// Optional shared cell that a spawned handle reads at park-time.
@@ -334,6 +335,7 @@ pub enum Settled<O> {
 /// });
 /// # drop(branch);
 /// ```
+#[non_exhaustive]
 pub struct Branch<O> {
     name: String,
     body: BranchBody<O>,
@@ -467,6 +469,7 @@ impl<O: Send + 'static> Branch<O> {
 /// }
 /// ```
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Callback<O> {
     id: String,
     state: CallbackState<O>,

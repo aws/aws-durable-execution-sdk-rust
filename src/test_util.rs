@@ -165,6 +165,7 @@ const DEFAULT_STATE_PAGE_SIZE: usize = 1;
 /// # }
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TestOperation {
     id: String,
     op_type: String,
@@ -288,6 +289,7 @@ enum Disposition {
 /// # }
 /// ```
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct TestResult<O> {
     disposition: Disposition,
     output: Option<O>,
@@ -402,6 +404,7 @@ enum CallbackOutcome {
 /// # }
 /// ```
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct LocalRunner {
     max_invocations: usize,
     callback_outcomes: Vec<CallbackOutcome>,
@@ -1086,6 +1089,7 @@ const CLOUD_RUNNER_ERROR: &str = "CloudRunnerError";
 /// # }
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CloudRunner {
     function_name: String,
     region: Option<String>,

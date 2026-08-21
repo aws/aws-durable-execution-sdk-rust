@@ -63,6 +63,7 @@ pub use crate::wait_for_condition::WaitDecision;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct WaitForConditionBuilder<S, F, Fut, SD = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
@@ -300,6 +301,7 @@ where
 /// assert!((strategy.backoff_factor() - default_factor).abs() < f64::EPSILON);
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WaitStrategy {
     /// Initial delay between condition checks.
     initial_delay: Duration,

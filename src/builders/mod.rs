@@ -229,6 +229,7 @@ pub enum JitterStrategy {
 /// assert_eq!(config.max_delay(), RetryStrategyConfig::default().max_delay());
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RetryStrategyConfig {
     /// Total number of attempts (initial attempt plus retries) before the
     /// error propagates.

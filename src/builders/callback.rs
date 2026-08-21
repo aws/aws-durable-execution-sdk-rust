@@ -54,6 +54,7 @@ pub use crate::future::Callback;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct CreateCallbackBuilder<O, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
@@ -213,6 +214,7 @@ where
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct WaitForCallbackBuilder<O, F, Fut, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,

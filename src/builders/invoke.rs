@@ -51,6 +51,7 @@ use crate::serdes::JsonSerdes;
 /// }
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
+#[non_exhaustive]
 pub struct InvokeBuilder<O, I, PS = JsonSerdes, RS = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,

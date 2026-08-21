@@ -58,7 +58,7 @@
 //! use tracing_subscriber::util::SubscriberInitExt;
 //!
 //! tracing_subscriber::registry()
-//!     .with(tracing_subscriber::fmt::layer().with_filter(ReplayFilterLayer))
+//!     .with(tracing_subscriber::fmt::layer().with_filter(ReplayFilterLayer::new()))
 //!     .init();
 //! ```
 //!
@@ -577,7 +577,7 @@ impl ReplayTracker {
 /// let subscriber = tracing_subscriber::registry().with(
 ///     tracing_subscriber::fmt::layer()
 ///         .json()
-///         .with_filter(ReplayFilterLayer),
+///         .with_filter(ReplayFilterLayer::new()),
 /// );
 ///
 /// // In a Lambda binary, install it globally instead:
@@ -587,8 +587,22 @@ impl ReplayTracker {
 /// });
 /// ```
 #[cfg(any(test, feature = "replay-filter"))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ReplayFilterLayer;
+
+#[cfg(any(test, feature = "replay-filter"))]
+impl ReplayFilterLayer {
+    /// Creates a replay filter.
+    ///
+    /// The filter carries no configuration today; construct it with this
+    /// method (or [`Default`]) rather than the bare struct name, so that a
+    /// future field addition stays compatible.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
 
 #[cfg(any(test, feature = "replay-filter"))]
 impl<S> tracing_subscriber::layer::Filter<S> for ReplayFilterLayer
@@ -907,7 +921,7 @@ mod tests {
             .flatten_event(true)
             .with_span_list(false)
             .with_writer(writer)
-            .with_filter(ReplayFilterLayer);
+            .with_filter(ReplayFilterLayer::new());
 
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -987,7 +1001,7 @@ mod tests {
             .flatten_event(true)
             .with_span_list(false)
             .with_writer(writer)
-            .with_filter(ReplayFilterLayer);
+            .with_filter(ReplayFilterLayer::new());
 
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -1066,7 +1080,7 @@ mod tests {
             .flatten_event(true)
             .with_span_list(false)
             .with_writer(writer)
-            .with_filter(ReplayFilterLayer);
+            .with_filter(ReplayFilterLayer::new());
 
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -1128,7 +1142,7 @@ mod tests {
             .flatten_event(true)
             .with_span_list(false)
             .with_writer(writer)
-            .with_filter(ReplayFilterLayer);
+            .with_filter(ReplayFilterLayer::new());
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -1183,7 +1197,7 @@ mod tests {
             .flatten_event(true)
             .with_span_list(false)
             .with_writer(writer)
-            .with_filter(ReplayFilterLayer);
+            .with_filter(ReplayFilterLayer::new());
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 

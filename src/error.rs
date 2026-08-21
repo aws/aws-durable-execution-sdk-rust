@@ -210,6 +210,7 @@ impl fmt::Display for WireError {
 /// `error_message` (plus `error_data` and `stack_trace` when recorded).
 /// Downcast to it to read the wire fields programmatically.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ReplayedFailure {
     wire: WireError,
 }
@@ -335,6 +336,7 @@ impl Error for ContextualError {
 /// the ordinary `source()` downcast walk, and a flattened chain reads
 /// `"TransientError: temporary failure"`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct TypedError {
     error_type: String,
     inner: Source,
