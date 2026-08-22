@@ -1754,7 +1754,7 @@ impl DurableContext {
     ///     Ok(receipt.id)
     /// }
     /// ```
-    pub fn invoke<O, I>(&self, function_id: &str, input: I) -> InvokeBuilder<O, I>
+    pub fn invoke<O, I>(&self, function_id: impl Into<String>, input: I) -> InvokeBuilder<O, I>
     where
         I: Send + 'static,
         O: Send + 'static,
@@ -1763,7 +1763,7 @@ impl DurableContext {
         // The input is carried TYPED into the builder: the payload serdes
         // receives the owned value directly at execution time (a write-only
         // transfer), so no intermediate representation is constructed here.
-        InvokeBuilder::new(self.clone(), op_id, function_id.to_owned(), input)
+        InvokeBuilder::new(self.clone(), op_id, function_id.into(), input)
     }
 
     /// Creates a child context for fan-out / sub-orchestration.
