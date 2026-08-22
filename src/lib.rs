@@ -208,6 +208,13 @@ pub(crate) type RetryStrategy = Box<dyn Fn(&StepError, u32) -> RetryDecision + S
 /// handler for each invocation. Equivalent to calling [`run_with_options`]
 /// with [`Options::default`].
 ///
+/// To customize the runtime, keep this entry point's shape but swap the
+/// function: for custom [`Options`] — an execution-wide [`Serdes`], a
+/// preconfigured Lambda client, or your own [`SdkConfig`] — use
+/// [`run_with_options`]; to add middleware around the service function
+/// itself, use [`wrap`], which returns the service function without
+/// starting the runtime.
+///
 /// The handler closure is called once per invocation. It receives the
 /// deserialized event and a [`DurableContext`] for performing durable
 /// operations. Per invocation, the runtime parses the durable envelope into
