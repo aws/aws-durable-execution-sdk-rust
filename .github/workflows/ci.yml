@@ -17,8 +17,8 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  # The eight commands of `make check`, split across this job and the
-  # `dependencies` job so a failure names itself.
+  # The nine commands of `make check`, split across this job, the
+  # `dependencies` job, and the `msrv` job so a failure names itself.
   check:
     name: check (sdk)
     runs-on: ubuntu-latest

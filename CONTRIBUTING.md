@@ -36,9 +36,13 @@ body text at 72 characters.
 
 The crate declares `rust-version = "1.94.1"` and edition 2024. Most CI jobs
 build on stable, but a dedicated `msrv` job in `ci.yml` runs `cargo check
---all-targets --all-features` on the declared minimum, so reaching for a
-feature newer than 1.94.1 fails that leg rather than silently raising the
-true minimum above the declared one. Bumping the minimum supported Rust
+--all-targets --all-features` on the declared minimum with warnings denied,
+so reaching for a feature newer than 1.94.1 — or tripping a warning only the
+older compiler emits — fails that leg rather than silently raising the
+true minimum above the declared one. `make check` runs the same check
+locally through `scripts/check-msrv.sh`, which reads the version from the
+root `Cargo.toml` and asks you to `rustup toolchain install` the minimum if
+it is missing, so the local gate sees what CI's `msrv` job sees. Bumping the minimum supported Rust
 version is an intentional, documented change: while the crate is pre-1.0, an
 MSRV bump ships as a minor release (0.x → 0.x+1), never as a patch, and the
 change must update every declaration in the same pull request: the root
@@ -74,7 +78,7 @@ dependency policy section below explains what adding to it involves.
 ## `make check`
 
 `make check` is the single entry point, and it must pass before you push. It
-runs eight commands in order, and any one of them failing fails the run:
+runs nine commands in order, and any one of them failing fails the run:
 
 | Command | Rejects |
 | --- | --- |
@@ -86,6 +90,7 @@ runs eight commands in order, and any one of them failing fails the run:
 | `cargo deny check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source |
 | `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlists do not name, in either the default-feature or the all-features graph |
 | `sh scripts/check-msrv-consistency.sh` | a `rust-version` declaration (in any manifest, the `msrv` CI job, or the README) that disagrees with the root `Cargo.toml`'s |
+| `sh scripts/check-msrv.sh` | code that does not compile warning-free on the declared minimum supported Rust version, matching CI's `msrv` job; if that toolchain is not installed, it fails with a `rustup toolchain install` hint rather than running on the wrong compiler |
 
 Two of those are stricter than their defaults. Clippy normally reports warnings
 and exits zero; `-D warnings` turns every one into an error, so a `pedantic`
