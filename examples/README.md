@@ -17,7 +17,7 @@ apply to Rust) is tracked in [`docs/porting-map.md`](../docs/porting-map.md).
 | Family | Scope |
 | --- | --- |
 | `basics/` | fundamental `step`, `wait`, retry, and no-op handler patterns |
-| `coordination/` | `run_in_child_context`, `parallel`, `map`, the four combinators, concurrent fan-out via `.spawn()`, determinism/replay behaviors |
+| `coordination/` | `run_in_child_context` (one child in `child_basic`, concurrent child fan-out joined with `try_join_all` in `child_fanout`), `parallel`, `map`, the four combinators, concurrent fan-out via `.spawn()`, determinism/replay behaviors |
 | `external/` | `invoke`, `create_callback`, `wait_for_callback`, `wait_for_condition`, serdes, large payloads, `tracing` logging, and the capstone comprehensive example |
 
 ## Build and deploy

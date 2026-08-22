@@ -1,0 +1,21 @@
+[package]
+name = "child_fanout"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+publish = false
+description = "Example: concurrent fan-out of spawned child contexts joined with try_join_all"
+
+[[bin]]
+name = "child_fanout"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-durable-execution-sdk-rust = { path = "../../.." }
+lambda_runtime = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

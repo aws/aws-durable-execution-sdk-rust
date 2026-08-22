@@ -38,6 +38,19 @@ Resources:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
 
+  ChildFanout:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/child_fanout/
+      Handler: bootstrap
+      Description: 'Example: concurrent fan-out of spawned child contexts joined with try_join_all'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
   ChildLargeData:
     Type: AWS::Serverless::Function
     Metadata:

@@ -12,6 +12,9 @@
 //! [`BoxError`](aws_durable_execution_sdk_rust::BoxError); a failing
 //! inner operation converts into it with `?`.
 //!
+//! For the concurrent case, spawning several such children with `.spawn()`
+//! and joining them, see the `child_fanout` example in this family.
+//!
 //! [`run_in_child_context`]: aws_durable_execution_sdk_rust::DurableContext::run_in_child_context
 
 use aws_durable_execution_sdk_rust as durable;

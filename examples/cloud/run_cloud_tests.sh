@@ -72,7 +72,9 @@ CALLBACK_RESULT='"approved by cloud test"'
 #   - combinator_race has a nondeterministic winner; BOTH "first" and
 #     "second" are valid results (the handler returns whichever step wins).
 #   - step_named deserializes a typed Input struct; wait_for_condition
-#     takes a bare integer threshold; invoke_tenant_id needs a tenantId.
+#     takes a bare integer threshold; invoke_tenant_id needs a tenantId;
+#     child_fanout deserializes a typed Order whose line items decide the
+#     fan-out width.
 #   - invoke_target and invoke_target_tenant are companion callees
 #     exercised transitively; they are deliberately absent from this table.
 EXPECTATIONS='
@@ -85,6 +87,7 @@ basics|wait_named|SUCCEEDED|||
 basics|multiple_waits|SUCCEEDED|||
 coordination|child_basic|SUCCEEDED|||
 coordination|child_failing_step|SUCCEEDED|||
+coordination|child_fanout|SUCCEEDED|{"order_id":"cloud-order","items":[{"kind":"physical","sku":"anvil","quantity":2},{"kind":"digital","sku":"field-guide"},{"kind":"subscription","plan":"pro","months":12}]}||
 coordination|child_large_data|SUCCEEDED|||
 coordination|child_serdes|SUCCEEDED|||
 coordination|combinator_join_all|SUCCEEDED|||

@@ -556,6 +556,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "child_fanout"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk-rust",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "child_large_data"
 version = "0.0.0"
 dependencies = [
