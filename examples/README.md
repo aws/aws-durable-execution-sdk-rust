@@ -3,14 +3,12 @@
 Deployable durable functions for the Rust SDK. Each example is a real Lambda
 function on the `provided.al2023` runtime and doubles as an end-to-end smoke
 test against the live service, using the same packaging story as
-`compliance/` (a shared cargo workspace, one `bootstrap` per example staged
+`conformance/` (a shared cargo workspace, one `bootstrap` per example staged
 under `publish/`).
 
 Examples are user-facing documentation. Every one is a single honest workload
 for one pattern, no artificial scaffolding, no option menus, no branching
-demo harnesses. The mapping from the JavaScript SDK's examples tree (which
-examples are ported, which are covered by a representative, and which do not
-apply to Rust) is tracked in [`docs/porting-map.md`](../docs/porting-map.md).
+demo harnesses.
 
 ## Families
 
@@ -25,7 +23,7 @@ apply to Rust) is tracked in [`docs/porting-map.md`](../docs/porting-map.md).
 Prerequisite: [cargo-lambda](https://www.cargo-lambda.info/), the build tool
 the Lambda Developer Guide documents for
 [packaging Rust functions](https://docs.aws.amazon.com/lambda/latest/dg/rust-package.html).
-It is the single build path for this workspace and for `compliance/`, used
+It is the single build path for this workspace and for `conformance/`, used
 identically on a workstation and in CI, so a local pass and a CI pass mean the
 same thing. A plain `cargo build` is not a substitute: it links against the
 build host's glibc, and a binary built on a host newer than the
@@ -50,7 +48,7 @@ sam deploy --template-file template_basics.yaml \
     --parameter-overrides ExecutionRoleArn=arn:aws:iam::<account>:role/<lambda-execution-role>
 ```
 
-`build_examples.sh` mirrors `compliance/build_examples.sh` exactly: one shared
+`build_examples.sh` mirrors `conformance/build_examples.sh` exactly: one shared
 `cargo lambda build` over the requested families, a skip-if-unchanged guard
 keyed on git HEAD + clean tree + a per-family stamp, and a `Makefile`-per-bootstrap
 for SAM's `BuildMethod: makefile`. It is a separate cargo workspace

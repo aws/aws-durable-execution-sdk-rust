@@ -1,8 +1,8 @@
 name: Conformance Tests
 
 # Full-integration conformance run: discovers suites from
-# compliance/template_<suite>.yaml, builds the Rust handlers against the
-# local SDK (compliance/ is its own cargo workspace with a path dependency
+# conformance/template_<suite>.yaml, builds the Rust handlers against the
+# local SDK (conformance/ is its own cargo workspace with a path dependency
 # on ../), and runs each suite as its own parallel matrix job with the
 # pinned language-agnostic runner.
 #
@@ -15,7 +15,7 @@ on:
     branches: [alpha]
     paths:
       - "src/**"
-      - "compliance/**"
+      - "conformance/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/conformance-tests.yml"
@@ -23,7 +23,7 @@ on:
     branches: [alpha]
     paths:
       - "src/**"
-      - "compliance/**"
+      - "conformance/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/conformance-tests.yml"
@@ -56,7 +56,7 @@ jobs:
 
       - name: Discover suites from templates
         id: discover
-        working-directory: compliance
+        working-directory: conformance
         run: |
           # template_smoke.yaml is a single hello handler used to verify that
           # a build deploys and runs; it is not one of the conformance
@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: compliance
+        working-directory: conformance
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -87,7 +87,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
         with:
-          workspaces: compliance
+          workspaces: conformance
 
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -98,7 +98,7 @@ jobs:
       # cargo-lambda pins the glibc version the handlers link against so they
       # start on the provided.al2023 runtime (glibc 2.34); a plain `cargo
       # build` on this runner produces binaries that require GLIBC_2.39 and
-      # die at startup. See compliance/build_examples.sh for the full note.
+      # die at startup. See conformance/build_examples.sh for the full note.
       - name: Install cargo-lambda
         run: pip install "cargo-lambda==1.8.6"
 
@@ -117,7 +117,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: conformance-handlers
-          path: compliance/handlers.tar.gz
+          path: conformance/handlers.tar.gz
           retention-days: 1
           if-no-files-found: error
 
@@ -134,7 +134,7 @@ jobs:
         suite: ${{ fromJSON(needs.discover_suites.outputs.suites) }}
     defaults:
       run:
-        working-directory: compliance
+        working-directory: conformance
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -142,7 +142,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: conformance-handlers
-          path: compliance
+          path: conformance
 
       - name: Unpack handlers
         run: |
@@ -190,7 +190,7 @@ jobs:
           pip install "git+https://github.com/aws/aws-durable-execution-conformance-tests.git@main#subdirectory=packages/aws-durable-execution-conformance-tests"
 
       # The history, nondeterminism, and combinator suites are contributed
-      # by this repo's extension package (compliance/conformance_ext); the
+      # by this repo's extension package (conformance/conformance_ext); the
       # runner discovers them through its extension entry point.
       - name: Install Rust SDK conformance extension
         run: pip install ./conformance_ext
@@ -222,6 +222,6 @@ jobs:
         with:
           name: conformance-report-${{ matrix.suite }}
           path: |
-            compliance/report-${{ matrix.suite }}.xml
-            compliance/history-${{ matrix.suite }}/
+            conformance/report-${{ matrix.suite }}.xml
+            conformance/history-${{ matrix.suite }}/
           if-no-files-found: warn

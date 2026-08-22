@@ -254,7 +254,9 @@ pub(crate) struct CheckpointRecord {
     /// Error message (for failed/timed-out operations).
     pub(crate) error_message: Option<String>,
     /// Opaque error payload (for failed/timed-out operations). Written
-    /// and passed through verbatim, never deserialized.
+    /// and passed through verbatim; never deserialized except for the
+    /// SDK-authored `select_ok` `AllFailed` losers payload, which
+    /// combinator replay decodes defensively.
     pub(crate) error_data: Option<String>,
     /// Recorded stack trace frames (for failed/timed-out operations).
     pub(crate) stack_trace: Option<Vec<String>>,
@@ -328,6 +330,12 @@ pub(crate) struct TerminalReplaySnapshot {
     pub(crate) error_message: Option<String>,
     /// Error type identifier (for failed operations).
     pub(crate) error_type: Option<String>,
+    /// Opaque error payload (for failed operations), passed through
+    /// verbatim so a replayed batch item carries the same wire failure
+    /// record its live counterpart did.
+    pub(crate) error_data: Option<String>,
+    /// Recorded stack trace frames (for failed operations).
+    pub(crate) stack_trace: Option<Vec<String>>,
 }
 
 /// The checkpoint log: maps positional operation IDs to stored records.

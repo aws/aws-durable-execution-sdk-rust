@@ -6,7 +6,7 @@
 # resolve of the SDK graph. This script runs a single `cargo lambda build` over
 # the requested families and stages each example's binary into
 # publish/<example>/bootstrap for SAM deployment on the provided.al2023
-# runtime. It mirrors compliance/build_examples.sh (same layout, same
+# runtime. It mirrors conformance/build_examples.sh (same layout, same
 # skip-guard, same Makefile-per-bootstrap contract); the SDK's own release
 # profile is untouched: fast-build tuning lives in examples/Cargo.toml.
 #

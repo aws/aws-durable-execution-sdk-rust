@@ -51,7 +51,11 @@ impl std::fmt::Debug for WaitBuilder {
 
 impl WaitBuilder {
     /// Creates a new wait builder (internal).
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, duration_secs: i32) -> Self {
+    pub(crate) fn new_internal(
+        ctx: DurableContext,
+        op_id: OperationId,
+        duration_secs: i32,
+    ) -> Self {
         Self {
             ctx,
             op_id,

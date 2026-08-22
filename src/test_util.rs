@@ -1617,11 +1617,38 @@ struct StoredOp {
     result: Option<String>,
     error_type: Option<String>,
     error_message: Option<String>,
+    /// Opaque error payload recorded with a failure, round-tripped
+    /// verbatim like the production backend does.
+    error_data: Option<String>,
+    /// Recorded stack trace frames, round-tripped verbatim.
+    stack_trace: Vec<String>,
     attempt: i32,
     callback_id: Option<String>,
     wait_seconds: Option<i32>,
     retry_delay: Option<i32>,
     callback_delivered: bool,
+}
+
+/// A fresh `Started` record for an operation seen for the first time; the
+/// caller merges name/sub-type metadata and the action's outcome fields.
+fn new_started_op(id: String, op_type: OperationType, sub_type: Option<String>) -> StoredOp {
+    StoredOp {
+        id,
+        op_type,
+        sub_type,
+        status: OperationStatus::Started,
+        name: None,
+        result: None,
+        error_type: None,
+        error_message: None,
+        error_data: None,
+        stack_trace: Vec::new(),
+        attempt: 0,
+        callback_id: None,
+        wait_seconds: None,
+        retry_delay: None,
+        callback_delivered: false,
+    }
 }
 
 /// Mutable state of the in-memory backend, guarded by a single mutex.
@@ -1884,12 +1911,15 @@ impl BackendState {
         let action = update.action().clone();
         let name = update.name().map(ToOwned::to_owned);
         let payload = update.payload().map(ToOwned::to_owned);
-        let (err_type, err_msg) = update.error().map_or((None, None), |e| {
-            (
-                e.error_type().map(ToOwned::to_owned),
-                e.error_message().map(ToOwned::to_owned),
-            )
-        });
+        let (err_type, err_msg, err_data, err_trace) =
+            update.error().map_or((None, None, None, Vec::new()), |e| {
+                (
+                    e.error_type().map(ToOwned::to_owned),
+                    e.error_message().map(ToOwned::to_owned),
+                    e.error_data().map(ToOwned::to_owned),
+                    e.stack_trace().to_vec(),
+                )
+            });
         let wait_seconds = update
             .wait_options()
             .and_then(aws_sdk_lambda::types::WaitOptions::wait_seconds);
@@ -1899,21 +1929,11 @@ impl BackendState {
 
         // Ensure the op exists.
         if self.find_mut(&id).is_none() {
-            self.ops.push(StoredOp {
-                id: id.clone(),
-                op_type: op_type.clone(),
-                sub_type: sub_type.clone(),
-                status: OperationStatus::Started,
-                name: name.clone(),
-                result: None,
-                error_type: None,
-                error_message: None,
-                attempt: 0,
-                callback_id: None,
-                wait_seconds: None,
-                retry_delay: None,
-                callback_delivered: false,
-            });
+            self.ops.push(new_started_op(
+                id.clone(),
+                op_type.clone(),
+                sub_type.clone(),
+            ));
         }
 
         // Decide callback-id assignment before taking the mutable op borrow
@@ -1950,6 +1970,8 @@ impl BackendState {
                 op.result = None;
                 op.error_type = None;
                 op.error_message = None;
+                op.error_data = None;
+                op.stack_trace = Vec::new();
                 if op.op_type == OperationType::Wait {
                     op.status = OperationStatus::Started;
                     op.wait_seconds = wait_seconds;
@@ -1972,6 +1994,8 @@ impl BackendState {
                 op.status = OperationStatus::Failed;
                 op.error_type = err_type;
                 op.error_message = err_msg;
+                op.error_data = err_data;
+                op.stack_trace = err_trace;
             }
             OperationAction::Retry => {
                 op.status = OperationStatus::Pending;
@@ -1979,6 +2003,8 @@ impl BackendState {
                 op.retry_delay = retry_delay.or(Some(1));
                 op.error_type = err_type;
                 op.error_message = err_msg;
+                op.error_data = err_data;
+                op.stack_trace = err_trace;
                 // wait_for_condition carries per-attempt state in the payload.
                 if payload.is_some() {
                     op.result = payload;
@@ -2135,6 +2161,12 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
         if let Some(m) = &stored.error_message {
             eb = eb.error_message(m);
         }
+        if let Some(d) = &stored.error_data {
+            eb = eb.error_data(d);
+        }
+        for frame in &stored.stack_trace {
+            eb = eb.stack_trace(frame);
+        }
         Some(eb.build())
     } else {
         None
@@ -2233,6 +2265,15 @@ fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
         }
         if let Some(m) = &stored.error_message {
             err.insert("ErrorMessage".to_owned(), serde_json::json!(m));
+        }
+        if let Some(d) = &stored.error_data {
+            err.insert("ErrorData".to_owned(), serde_json::json!(d));
+        }
+        if !stored.stack_trace.is_empty() {
+            err.insert(
+                "StackTrace".to_owned(),
+                serde_json::json!(stored.stack_trace),
+            );
         }
         serde_json::Value::Object(err)
     });

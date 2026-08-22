@@ -84,7 +84,8 @@ pub enum BatchItemStatus {
 /// The outcome of one item or branch in a batch operation.
 ///
 /// Contains the index, optional display name, terminal status, and either
-/// the result value or an error (type identifier plus message).
+/// the result value or the item's complete recorded failure record (type
+/// identifier, message, opaque `error_data` payload, and stack trace).
 ///
 /// # Examples
 ///
@@ -121,10 +122,30 @@ pub struct BatchItem<O> {
     /// survives checkpoint replay alongside the message. `None` when the
     /// payload recorded no type (a payload written before error typing).
     pub error_type: Option<String>,
+    /// Opaque wire `ErrorData` payload recorded with the failure (only
+    /// meaningful when status is Failed).
+    ///
+    /// Passed through verbatim from the failing item's recorded wire
+    /// record, never interpreted by the SDK. `None` when the failure
+    /// recorded no payload (including records written before this field
+    /// existed).
+    pub error_data: Option<String>,
+    /// Recorded wire `StackTrace` frames from the failure (only
+    /// meaningful when status is Failed).
+    ///
+    /// Store-and-expose only, exactly like
+    /// [`WireError::stack_trace`](crate::WireError::stack_trace). Empty
+    /// when the failure recorded no frames (including records written
+    /// before this field existed).
+    pub stack_trace: Vec<String>,
 }
 
 impl<O> BatchItem<O> {
     /// Creates a new batch item.
+    ///
+    /// The failure payload fields ([`error_data`](Self::error_data) and
+    /// [`stack_trace`](Self::stack_trace)) start empty; set them directly
+    /// when constructing a failed item that carries them.
     #[must_use]
     pub fn new(
         index: usize,
@@ -141,7 +162,45 @@ impl<O> BatchItem<O> {
             result,
             error_message,
             error_type,
+            error_data: None,
+            stack_trace: Vec::new(),
         }
+    }
+
+    /// Creates a failed item carrying the complete recorded wire failure
+    /// record: all four wire fields survive into the item, so live and
+    /// replayed batches expose the same failure identity.
+    pub(crate) fn failed_from_wire(
+        index: usize,
+        name: String,
+        wire: &crate::error::WireError,
+    ) -> Self {
+        Self {
+            index,
+            name,
+            status: BatchItemStatus::Failed,
+            result: None,
+            error_message: wire.error_message().map(str::to_owned),
+            error_type: wire.error_type().map(str::to_owned),
+            error_data: wire.error_data().map(str::to_owned),
+            stack_trace: wire.stack_trace().to_vec(),
+        }
+    }
+
+    /// Rebuilds the item's recorded failure as a wire record (all four
+    /// fields), for surfacing the failure as an operation error.
+    pub(crate) fn failure_wire(&self) -> crate::error::WireError {
+        crate::error::WireError::new(
+            self.error_type.as_deref(),
+            Some(
+                self.error_message
+                    .as_deref()
+                    .unwrap_or("branch failed")
+                    .to_owned(),
+            ),
+        )
+        .with_error_data(self.error_data.as_deref())
+        .with_stack_trace(self.stack_trace.clone())
     }
 }
 
@@ -794,8 +853,9 @@ where
 /// on a success trigger (`MinSuccessfulReached` or `PredicateMatched`),
 /// failed items are expected and NOT propagated as errors: they are simply
 /// skipped. Only a batch that ended because the failure tolerance was
-/// exceeded (including the default fail-fast case) becomes an `Err`,
-/// carrying the first failed item's message.
+/// exceeded (including the default fail-fast case) becomes an `Err`: a
+/// `ChildFailed`-kinded error carrying the first failed item's recorded
+/// wire record (`error_type`, message).
 fn collect_successful<O>(batch_result: BatchResult<O>) -> Result<Vec<O>, OperationError> {
     let mut results = Vec::with_capacity(batch_result.items.len());
     for item in batch_result.items {
@@ -807,10 +867,11 @@ fn collect_successful<O>(batch_result: BatchResult<O>) -> Result<Vec<O>, Operati
             }
             BatchItemStatus::Failed => {
                 if batch_result.reason == CompletionReason::FailureToleranceExceeded {
-                    let msg = item
-                        .error_message
-                        .unwrap_or_else(|| "branch failed".to_owned());
-                    return Err(batch_error(&msg));
+                    // A user item body failed: classify as ChildFailed
+                    // carrying the item's COMPLETE recorded wire record
+                    // (type, message, `error_data`, `stack_trace`),
+                    // reserving `Internal` for coordinator defects.
+                    return Err(item_failure_error(item.failure_wire()));
                 }
                 // Within tolerance: skip this item in the Vec<O> output.
             }
@@ -1012,17 +1073,16 @@ where
                         result: Some(deserialized),
                         error_message: None,
                         error_type: None,
+                        error_data: None,
+                        stack_trace: Vec::new(),
                     })),
                     Err(op_err) => {
                         let wire = crate::error::serialization_failure_wire(&op_err);
-                        Ok(ItemOutcome::Terminal(BatchItem {
-                            index: req.index,
-                            name: req.item_name.clone(),
-                            status: BatchItemStatus::Failed,
-                            result: None,
-                            error_message: wire.error_message().map(str::to_owned),
-                            error_type: wire.error_type().map(str::to_owned),
-                        }))
+                        Ok(ItemOutcome::Terminal(BatchItem::failed_from_wire(
+                            req.index,
+                            req.item_name.clone(),
+                            &wire,
+                        )))
                     }
                 }
             }
@@ -1030,14 +1090,11 @@ where
                 // The recorded message is the flattened chain, built at
                 // the single flattening site.
                 let wire = crate::error::wire_error_for(&child_err, CHILD_FN_ERROR_TYPE);
-                Ok(ItemOutcome::Terminal(BatchItem {
-                    index: req.index,
-                    name: req.item_name.clone(),
-                    status: BatchItemStatus::Failed,
-                    result: None,
-                    error_message: wire.error_message().map(str::to_owned),
-                    error_type: wire.error_type().map(str::to_owned),
-                }))
+                Ok(ItemOutcome::Terminal(BatchItem::failed_from_wire(
+                    req.index,
+                    req.item_name.clone(),
+                    &wire,
+                )))
             }
         };
     }
@@ -1093,14 +1150,11 @@ where
                             )
                             .await;
                     }
-                    return Ok(ItemOutcome::Terminal(BatchItem {
-                        index: req.index,
-                        name: req.item_name.clone(),
-                        status: BatchItemStatus::Failed,
-                        result: None,
-                        error_message: wire.error_message().map(str::to_owned),
-                        error_type: wire.error_type().map(str::to_owned),
-                    }));
+                    return Ok(ItemOutcome::Terminal(BatchItem::failed_from_wire(
+                        req.index,
+                        req.item_name.clone(),
+                        &wire,
+                    )));
                 }
             };
             let mut builder = OperationUpdate::builder()
@@ -1156,6 +1210,8 @@ where
                 result: Some(deserialized),
                 error_message: None,
                 error_type: None,
+                error_data: None,
+                stack_trace: Vec::new(),
             }))
         }
         ScopeOutcome::Completed(Err(child_err)) => {
@@ -1204,14 +1260,11 @@ where
                     .await;
             }
 
-            Ok(ItemOutcome::Terminal(BatchItem {
-                index: req.index,
-                name: req.item_name.clone(),
-                status: BatchItemStatus::Failed,
-                result: None,
-                error_message: wire.error_message().map(str::to_owned),
-                error_type: wire.error_type().map(str::to_owned),
-            }))
+            Ok(ItemOutcome::Terminal(BatchItem::failed_from_wire(
+                req.index,
+                req.item_name.clone(),
+                &wire,
+            )))
         }
     }
 }
@@ -1495,6 +1548,11 @@ where
                     Ok(payload) => panic_message(payload.as_ref()),
                     Err(_) => "branch task was cancelled".to_owned(),
                 };
+                // A panicked/cancelled branch has no escaping error to
+                // walk, so its wire record is just the type and message;
+                // the checkpointed child FAIL and the settled item carry
+                // the SAME record, keeping live and replay identical.
+                let wire = crate::error::WireError::new(Some(CHILD_FN_ERROR_TYPE), Some(message));
 
                 // Child FAIL checkpoint for the panicked/cancelled branch.
                 // Skipped in FLAT mode, which emits no child-context
@@ -1506,13 +1564,7 @@ where
                         .sub_type(self.child_sub_type.to_owned())
                         .action(OperationAction::Fail)
                         .parent_id(self.parent_wire.to_owned())
-                        .error(
-                            crate::error::WireError::new(
-                                Some(CHILD_FN_ERROR_TYPE),
-                                Some(message.clone()),
-                            )
-                            .to_error_object(),
-                        );
+                        .error(wire.to_error_object());
                     if let Ok(update) = update.build()
                         && let Err(client_err) = self.ctx.checkpoint_updates(vec![update]).await
                     {
@@ -1543,14 +1595,11 @@ where
                     self.completion_cfg,
                     self.total_items,
                     meta.index,
-                    ItemOutcome::Terminal(BatchItem {
-                        index: meta.index,
-                        name: meta.item_name,
-                        status: BatchItemStatus::Failed,
-                        result: None,
-                        error_message: Some(message),
-                        error_type: Some(CHILD_FN_ERROR_TYPE.to_owned()),
-                    }),
+                    ItemOutcome::Terminal(BatchItem::failed_from_wire(
+                        meta.index,
+                        meta.item_name,
+                        &wire,
+                    )),
                 );
                 Ok(())
             }
@@ -2146,6 +2195,8 @@ where
                             result: None,
                             error_message: None,
                             error_type: None,
+                            error_data: None,
+                            stack_trace: Vec::new(),
                         });
                     }
                     if concurrency == 1 {
@@ -2523,6 +2574,8 @@ where
                 result: Some(value),
                 error_message: None,
                 error_type: None,
+                error_data: None,
+                stack_trace: Vec::new(),
             })
         }
         CheckpointStatus::Failed => {
@@ -2534,6 +2587,8 @@ where
                 result: None,
                 error_message: Some(msg.to_owned()),
                 error_type: record.error_type.clone(),
+                error_data: record.error_data.clone(),
+                stack_trace: record.stack_trace.clone().unwrap_or_default(),
             })
         }
         _ => Err(batch_error(
@@ -2785,6 +2840,8 @@ where
                 result: None,
                 error_message: None,
                 error_type: None,
+                error_data: None,
+                stack_trace: Vec::new(),
             });
             continue;
         }
@@ -3282,6 +3339,12 @@ struct BatchCheckpointItem {
         skip_serializing_if = "String::is_empty"
     )]
     err_message: String,
+    /// Opaque per-item error payload, passed through verbatim.
+    #[serde(default, rename = "errData", skip_serializing_if = "Option::is_none")]
+    err_data: Option<String>,
+    /// Recorded per-item stack trace frames.
+    #[serde(default, rename = "stackTrace", skip_serializing_if = "Vec::is_empty")]
+    stack_trace: Vec<String>,
 }
 
 /// Converts a live `BatchResult` into the checkpoint payload format,
@@ -3315,6 +3378,8 @@ where
             result,
             error_message,
             error_type,
+            error_data,
+            stack_trace,
         } = item;
         let status_str = match status {
             BatchItemStatus::Succeeded => "SUCCEEDED",
@@ -3349,6 +3414,16 @@ where
                 String::new()
             },
             err_message: error_message.clone().unwrap_or_default(),
+            err_data: if status == BatchItemStatus::Failed {
+                error_data.clone()
+            } else {
+                None
+            },
+            stack_trace: if status == BatchItemStatus::Failed {
+                stack_trace.clone()
+            } else {
+                Vec::new()
+            },
         });
         rebuilt_items.push(BatchItem {
             index,
@@ -3357,6 +3432,8 @@ where
             result: rebuilt_value,
             error_message,
             error_type,
+            error_data,
+            stack_trace,
         });
     }
 
@@ -3413,18 +3490,45 @@ where
             } else {
                 None
             },
+            error_data: if status == BatchItemStatus::Failed {
+                cp.err_data
+            } else {
+                None
+            },
+            stack_trace: if status == BatchItemStatus::Failed {
+                cp.stack_trace
+            } else {
+                Vec::new()
+            },
         });
     }
 
     Ok(BatchResult { items, reason })
 }
 
-/// Constructs a batch operation error.
+/// Constructs a batch operation error for a coordinator defect: an
+/// internal invariant breach or a malformed record, never a user item's
+/// failure (those route through [`item_failure_error`], which classifies
+/// as `ChildFailed`).
 fn batch_error(message: &str) -> OperationError {
     OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
         ChildContextErrorKind::Internal,
         Some(message.to_owned().into()),
     )))
+}
+
+/// Constructs the operation error a batch surfaces when a USER item body
+/// failed (the failure tolerance was exceeded): classified as
+/// `ChildFailed`, carrying the failing item's COMPLETE recorded wire
+/// record so the error's identity (`error_type`, message, `error_data`,
+/// `stack_trace`) stays programmatically recoverable and identical live
+/// and on replay (both paths read the same recorded per-item fields).
+fn item_failure_error(wire: crate::error::WireError) -> OperationError {
+    OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
+        ChildContextErrorKind::ChildFailed,
+        Some(crate::error::ReplayedFailure::source_from(wire.clone())),
+    )))
+    .with_wire(wire)
 }
 
 /// Wraps owned map inputs in indexed take-once slots shareable across
@@ -3474,6 +3578,59 @@ mod tests {
             lambda_runtime::Context::default(),
             Arc::new(log),
         )
+    }
+
+    /// A user item body's failure surfaces as `ChildFailed` carrying the
+    /// item's COMPLETE recorded wire record — all four wire fields, not
+    /// just type and message (finding: item-body failures and coordinator
+    /// defects must not share a classification, and the recorded
+    /// `error_data`/`stack_trace` must not be discarded).
+    #[test]
+    fn collect_successful_classifies_item_failure_as_child_failed() {
+        let batch = BatchResult {
+            items: vec![BatchItem::<i32> {
+                index: 0,
+                name: "item-0".to_owned(),
+                status: BatchItemStatus::Failed,
+                result: None,
+                error_message: Some("boom-item".to_owned()),
+                error_type: Some("MyItemError".to_owned()),
+                error_data: Some(r#"{"detail":42}"#.to_owned()),
+                stack_trace: vec!["frame-0".to_owned(), "frame-1".to_owned()],
+            }],
+            reason: CompletionReason::FailureToleranceExceeded,
+        };
+        let err = collect_successful(batch).expect_err("tolerance exceeded must error");
+        let OperationErrorKind::ChildContext(child_err) = err.kind() else {
+            unreachable!("expected a child-context error, got {:?}", err.kind());
+        };
+        assert!(
+            matches!(child_err.kind(), ChildContextErrorKind::ChildFailed),
+            "item failures classify as ChildFailed: {:?}",
+            child_err.kind()
+        );
+        let wire = err.wire().expect("the item's wire record is attached");
+        assert_eq!(wire.error_type(), Some("MyItemError"));
+        assert_eq!(wire.error_message(), Some("boom-item"));
+        assert_eq!(wire.error_data(), Some(r#"{"detail":42}"#));
+        assert_eq!(
+            wire.stack_trace(),
+            ["frame-0".to_owned(), "frame-1".to_owned()]
+        );
+    }
+
+    /// Coordinator defects keep the `Internal` classification.
+    #[test]
+    fn batch_error_keeps_internal_classification_for_coordinator_defects() {
+        let err = batch_error("invariant breached");
+        let OperationErrorKind::ChildContext(child_err) = err.kind() else {
+            unreachable!("expected a child-context error, got {:?}", err.kind());
+        };
+        assert!(
+            matches!(child_err.kind(), ChildContextErrorKind::Internal),
+            "coordinator defects classify as Internal: {:?}",
+            child_err.kind()
+        );
     }
 
     /// Helper to create a live test context backed by a recording client.
@@ -3615,8 +3772,8 @@ mod tests {
                 result: None,
                 error_type: Some("ChildFnError".to_owned()),
                 error_message: Some(msg.to_owned()),
-                error_data: None,
-                stack_trace: None,
+                error_data: Some(r#"{"recorded":true}"#.to_owned()),
+                stack_trace: Some(vec!["recorded-frame".to_owned()]),
                 attempt: 0,
                 invoke_result: None,
                 invoke_error_type: None,
@@ -3812,6 +3969,11 @@ mod tests {
             "a replayed failed branch must retain its branch name"
         );
         assert_eq!(failed.error_message.as_deref(), Some("recorded failure"));
+        // The replayed item carries the child record's COMPLETE wire
+        // failure record, not just its type and message.
+        assert_eq!(failed.error_type.as_deref(), Some("ChildFnError"));
+        assert_eq!(failed.error_data.as_deref(), Some(r#"{"recorded":true}"#));
+        assert_eq!(failed.stack_trace, ["recorded-frame".to_owned()]);
 
         let succeeded = by_index(1);
         assert_eq!(succeeded.status, BatchItemStatus::Succeeded);
@@ -4443,9 +4605,9 @@ mod tests {
         /// Every predicate evaluation's view of the outcomes, as
         /// `(index, status)` pairs.
         type ObservedPrefixes = Vec<Vec<(usize, BatchItemStatus)>>;
-        let observed: std::sync::Arc<std::sync::Mutex<ObservedPrefixes>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let observed_handle = std::sync::Arc::clone(&observed);
+        let observed: Arc<std::sync::Mutex<ObservedPrefixes>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_handle = Arc::clone(&observed);
         let cfg = crate::builders::map_parallel::CompletionConfig::builder()
             .completion_predicate(move |stats| {
                 if let Ok(mut log) = observed_handle.lock() {
@@ -4874,12 +5036,23 @@ mod tests {
         assert_eq!(errors[0].error_type, None);
     }
 
-    /// A failed item's error type and message must survive the checkpoint
+    /// A failed item's COMPLETE wire failure record — type, message,
+    /// `error_data`, and `stack_trace` — must survive the checkpoint
     /// payload round-trip (`from_batch_result` → `to_batch_result`), so
     /// error identity is preserved across suspension and replay rather
     /// than being discarded on the way back in.
     #[tokio::test]
     async fn batch_checkpoint_round_trips_error_type_and_message() {
+        let mut failed_item = BatchItem::new(
+            1,
+            "boom".to_owned(),
+            BatchItemStatus::Failed,
+            None,
+            Some("it broke".to_owned()),
+            Some("CustomFailure".to_owned()),
+        );
+        failed_item.error_data = Some(r#"{"attempt":3}"#.to_owned());
+        failed_item.stack_trace = vec!["frame-a".to_owned(), "frame-b".to_owned()];
         let original: BatchResult<i32> = BatchResult::new(
             vec![
                 BatchItem::new(
@@ -4890,19 +5063,12 @@ mod tests {
                     None,
                     None,
                 ),
-                BatchItem::new(
-                    1,
-                    "boom".to_owned(),
-                    BatchItemStatus::Failed,
-                    None,
-                    Some("it broke".to_owned()),
-                    Some("CustomFailure".to_owned()),
-                ),
+                failed_item,
             ],
             CompletionReason::FailureToleranceExceeded,
         );
 
-        let json = std::sync::Arc::new(crate::serdes::JsonSerdes);
+        let json = Arc::new(crate::serdes::JsonSerdes);
         let (payload, _rebuilt) = from_batch_result(original, &json, "parent-wire", "arn:test")
             .await
             .expect("serializing a batch result must succeed");
@@ -4918,12 +5084,19 @@ mod tests {
         assert_eq!(failed.status, BatchItemStatus::Failed);
         assert_eq!(failed.error_message.as_deref(), Some("it broke"));
         assert_eq!(failed.error_type.as_deref(), Some("CustomFailure"));
+        assert_eq!(failed.error_data.as_deref(), Some(r#"{"attempt":3}"#));
+        assert_eq!(
+            failed.stack_trace,
+            ["frame-a".to_owned(), "frame-b".to_owned()]
+        );
         let errors = replayed.errors();
         assert_eq!(errors[0].error_type, Some("CustomFailure"));
         assert_eq!(errors[0].message, "it broke");
         let ok = &replayed.items[0];
         assert_eq!(ok.result, Some(7));
         assert!(ok.error_type.is_none());
+        assert!(ok.error_data.is_none());
+        assert!(ok.stack_trace.is_empty());
     }
 
     /// A failed item that recorded no error type (a live item defaults to
@@ -4942,7 +5115,7 @@ mod tests {
             )],
             CompletionReason::AllCompleted,
         );
-        let json = std::sync::Arc::new(crate::serdes::JsonSerdes);
+        let json = Arc::new(crate::serdes::JsonSerdes);
         let (payload, _rebuilt) = from_batch_result(original, &json, "parent-wire", "arn:test")
             .await
             .expect("serializing a batch result must succeed");
@@ -4961,13 +5134,17 @@ mod tests {
             r#"{"results":[{"index":0,"status":"FAILED","errMessage":"boom"}],"reason":"ALL_COMPLETED"}"#,
         )
         .expect("payload literal must deserialize");
-        let json = std::sync::Arc::new(crate::serdes::JsonSerdes);
+        let json = Arc::new(crate::serdes::JsonSerdes);
         let replayed: BatchResult<i32> = to_batch_result(payload, &json, "parent-wire", "arn:test")
             .await
             .expect("deserializing the payload must succeed");
         let item = replayed.items.first().expect("one item");
         assert_eq!(item.error_message.as_deref(), Some("boom"));
         assert_eq!(item.error_type, None);
+        // A payload written before `errData`/`stackTrace` existed replays
+        // with an empty failure payload rather than a fabricated one.
+        assert_eq!(item.error_data, None);
+        assert!(item.stack_trace.is_empty());
         assert_eq!(replayed.errors()[0].error_type, None);
     }
 

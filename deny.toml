@@ -12,7 +12,7 @@
 # [bans] directly for transitive deps in a useful way. The practical
 # approach that cargo-deny DOES support well:
 #
-# We list the 8 allowed production crates as `allow`. With
+# We list the allowed production crates as `allow`. With
 # `deny = []` (empty) and `multiple-versions = "warn"`, this setup
 # means: any DIRECT dependency not in `allow` triggers a ban violation.
 # Transitive dependencies of allowed crates are inherently acceptable
@@ -45,7 +45,8 @@ wildcards = "allow"
 # is provided by scripts/check-direct-deps.sh, which is wired into
 # `make check`. That script validates DIRECT [dependencies] of every
 # workspace member against two allowlists: the default-feature graph may
-# contain only the 8 spec-approved always-on crates, and the
+# contain only the spec-approved always-on crates (the ALWAYS_ON list in
+# that script is the source of truth for their count), and the
 # --all-features graph may add only the approved optional feature-gated
 # crates (currently tracing-subscriber, behind `replay-filter`).
 # This gives us the red gate the spec requires without needing to

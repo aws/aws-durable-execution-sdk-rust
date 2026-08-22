@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   One-time setup: Lambda execution role for running this repository's cloud
-  test suites (the conformance suites under compliance/ and the example suite
+  test suites (the conformance suites under conformance/ and the example suite
   under examples/) in your own AWS account. Deploy once with IAM-capable
   credentials, then pass the RoleArn output as ExecutionRoleArn to every test
   stack. The test stacks themselves never create IAM resources, so day-to-day

@@ -1,6 +1,6 @@
 [workspace]
-# The compliance/ conformance handlers form their OWN cargo workspace
-# (compliance/Cargo.toml) so they build into a single shared target dir and
+# The conformance/ handlers form their OWN cargo workspace
+# (conformance/Cargo.toml) so they build into a single shared target dir and
 # carry their own fast-build [profile.release] tuning without touching the
 # SDK's release profile. They are deliberately NOT members of this workspace:
 # they pull a heavier dependency graph (aws-sdk-dynamodb) that has no business

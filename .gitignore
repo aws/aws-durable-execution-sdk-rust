@@ -2,14 +2,14 @@
 /target
 
 # Generated conformance handler builds (Lambda bootstrap binaries and SAM
-# build metadata produced by compliance/build_examples.sh). Never commit
+# build metadata produced by conformance/build_examples.sh). Never commit
 # these: the binaries are ~15 MB each and the metadata embeds absolute
 # local paths.
-/compliance/build/
+/conformance/build/
 
-# Cargo.lock is checked in for reproducible builds of the compliance
+# Cargo.lock is checked in for reproducible builds of the conformance
 # binary crate. For library crates the convention is to gitignore it,
-# but this workspace contains a binary-like member (compliance handlers)
+# but this workspace contains a binary-like member (conformance handlers)
 # whose exact dependency resolution matters for conformance runs.
 # Decision: CHECK IN Cargo.lock (do not ignore it).
 # Ref: https://doc.rust-lang.org/cargo/faq.html#why-have-cargolock-in-version-control

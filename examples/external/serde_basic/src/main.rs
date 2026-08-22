@@ -2,9 +2,11 @@
 //!
 //! Every operation checkpoints its result through a serializer. The default is
 //! JSON; supplying a custom [`Serdes`] lets you transform the wire form:
-//! compress it, encrypt it, or (as here, illustratively) uppercase it. The SDK
-//! calls the serdes at every serialization point and reverses it on replay, so
-//! the transform is transparent to the rest of the handler.
+//! compress it, encrypt it, or (as here, illustratively) reverse it. The SDK
+//! calls the serdes at every serialization point and calls `deserialize` on
+//! replay, so a transform whose `deserialize` exactly inverts `serialize` is
+//! transparent to the rest of the handler: the step below observes `"hello"`
+//! whether the value came from live execution or from a replayed checkpoint.
 //!
 //! [`Serdes`]: aws_durable_execution_sdk_rust::Serdes
 
@@ -12,12 +14,14 @@ use aws_durable_execution_sdk_rust as durable;
 use durable::Serdes;
 use durable::serdes::SerdesContext;
 
-/// A serdes that uppercases the JSON wire form. Illustrative of the transform
-/// seam; production code would compress or encrypt here.
+/// A serdes that reverses the JSON wire form: a self-inverse, lossless
+/// transform. Illustrative of the transform seam; production code would
+/// compress or encrypt here, pairing each `serialize` transform with its
+/// exact inverse in `deserialize`.
 #[derive(Debug)]
-struct UppercaseSerdes;
+struct ReversedJsonSerdes;
 
-impl Serdes<String> for UppercaseSerdes {
+impl Serdes<String> for ReversedJsonSerdes {
     // reason: exercises the async-fn impl form user code writes
     #[expect(clippy::unused_async_trait_impl)]
     async fn serialize(
@@ -27,7 +31,7 @@ impl Serdes<String> for UppercaseSerdes {
     ) -> Result<String, durable::BoxError> {
         // The serdes receives the operation's typed value directly, not
         // pre-rendered JSON text or an erased intermediate.
-        Ok(serde_json::to_string(&value)?.to_uppercase())
+        Ok(serde_json::to_string(&value)?.chars().rev().collect())
     }
 
     // reason: exercises the async-fn impl form user code writes
@@ -37,7 +41,10 @@ impl Serdes<String> for UppercaseSerdes {
         wire: String,
         _context: SerdesContext,
     ) -> Result<String, durable::BoxError> {
-        Ok(serde_json::from_str(&wire)?)
+        // Undo the transform first, then parse the restored JSON: the
+        // inverse of `serialize`, applied in the opposite order.
+        let restored: String = wire.chars().rev().collect();
+        Ok(serde_json::from_str(&restored)?)
     }
 }
 
@@ -49,7 +56,7 @@ async fn handler(
     let value = ctx
         .step(|_| async { Ok("hello".to_owned()) })
         .name("produce")
-        .serdes(UppercaseSerdes)
+        .serdes(ReversedJsonSerdes)
         .await?;
     Ok(value)
 }

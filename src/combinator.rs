@@ -30,6 +30,8 @@
 //! only when no input can make progress: everything still pending has
 //! durably parked and the completion condition is unmet (issue #49).
 
+use std::sync::Arc;
+
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -47,8 +49,9 @@ use crate::future::{DurableFuture, Settled};
 pub(crate) const COMBINATOR_SUB_TYPE: &str = "RunInChildContext";
 
 /// Wire `error_type` for a combinator failure whose specific kind carries
-/// no dedicated wire discriminator (`JoinFailed`, `AllFailed`, internal
-/// errors). Replay reconstructs these as `CombinatorErrorKind::Internal`.
+/// no dedicated wire discriminator (internal errors, and records written
+/// before the discriminators below existed). Replay reconstructs these as
+/// `CombinatorErrorKind::Internal`.
 const COMBINATOR_ERROR_TYPE: &str = "CombinatorError";
 
 /// Wire `error_type` recording that a `race` settled first on a failure.
@@ -65,6 +68,79 @@ const FIRST_SETTLED_FAILED_ERROR_TYPE: &str = "CombinatorError.FirstSettledFaile
 /// [`CombinatorErrorKind::EmptyInput`], so the live and replay paths
 /// surface the same variant.
 const EMPTY_INPUT_ERROR_TYPE: &str = "CombinatorError.EmptyInput";
+
+/// Wire `error_type` prefix recording that a `try_join_all` input failed.
+///
+/// The failed input's index is appended after the trailing dot
+/// (`CombinatorError.JoinFailed.3`): the index is a structural fact of
+/// [`crate::error::JoinFailed`] that must survive replay, and the
+/// discriminator is an SDK-authored wire field replay may interpret
+/// (`error_data` stays opaque here: a join failure's record may carry
+/// pass-through external payloads). [`replay_combinator_failure`] maps the
+/// prefix back to [`CombinatorErrorKind::JoinFailed`] carrying the
+/// recorded index, so the live and replay paths surface the same variant
+/// and index.
+const JOIN_FAILED_ERROR_TYPE_PREFIX: &str = "CombinatorError.JoinFailed.";
+
+/// Wire `error_type` recording that every `select_ok` input failed.
+///
+/// The record's `error_data` carries the SDK-authored losers payload: a
+/// JSON array of one [`SerializedLoser`] per input, in input order, each
+/// holding the loser's own recorded wire failure record. The `AllFailed`
+/// record is written only by the live path below (never assembled from
+/// pass-through external payloads), so this is SDK-authored data guarded
+/// by an SDK-authored discriminator. [`replay_combinator_failure`] maps
+/// the discriminator back to [`CombinatorErrorKind::AllFailed`] and
+/// rebuilds one [`crate::error::ReplayedFailure`] per recorded loser, so
+/// each replayed `failures()` entry carries the same `error_type`,
+/// message, `error_data`, and `stack_trace` its live counterpart did. A
+/// record without a decodable payload (written before the payload
+/// existed, or malformed) falls back to one synthetic loser per input
+/// reconstructed from the aggregate record, preserving the `failures()`
+/// length.
+const ALL_FAILED_ERROR_TYPE: &str = "CombinatorError.AllFailed";
+
+/// Per-loser record persisted (as a JSON array) in an `AllFailed`
+/// aggregate record's `error_data`.
+///
+/// Mirrors [`SerializedSettled::Rejected`]: the loser's complete wire
+/// failure record (`error_type`, message, `error_data`, `stack_trace`),
+/// so each loser's identity survives the checkpoint round-trip rather
+/// than only the aggregate's flattened summary. Every field is optional
+/// with a default so hand-written or trimmed payloads still decode, and
+/// an absent field round-trips as absent rather than as an empty value.
+/// Replay only stores and exposes these fields (via
+/// [`crate::error::ReplayedFailure`]); it never dispatches on them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializedLoser {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_data: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    stack_trace: Vec<String>,
+}
+
+impl SerializedLoser {
+    /// Projects a loser's wire failure record into its persisted form.
+    fn from_wire(wire: &crate::error::WireError) -> Self {
+        Self {
+            error_type: wire.error_type().map(str::to_owned),
+            message: wire.error_message().map(str::to_owned),
+            error_data: wire.error_data().map(str::to_owned),
+            stack_trace: wire.stack_trace().to_vec(),
+        }
+    }
+
+    /// Rebuilds the loser's wire failure record from its persisted form.
+    fn into_wire(self) -> crate::error::WireError {
+        crate::error::WireError::new(self.error_type, self.message)
+            .with_error_data(self.error_data)
+            .with_stack_trace(self.stack_trace)
+    }
+}
 
 /// Internal execution state for `try_join_all`.
 pub(crate) struct TryJoinAllExecution<O> {
@@ -124,7 +200,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
                         .ctx
                         .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Err(replay_combinator_failure(wire, &wire_id));
+                    return Err(replay_combinator_failure(
+                        wire,
+                        &wire_id,
+                        self.futures.len(),
+                    ));
                 }
                 _ => {} // Started/Pending: fall through to re-execute
             }
@@ -195,9 +275,16 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         }
 
         if let Some((failed_index, op_err)) = first_error {
-            // Checkpoint FAIL. The wire record is derived from the loser
-            // itself, so `error_data` and identity pass through.
-            let wire = wire_error_from_loser(&op_err);
+            // Checkpoint FAIL. The wire `error_type` carries the JoinFailed
+            // discriminator with the failed input's index appended, so
+            // replay reconstructs the same variant and index; the message,
+            // `error_data`, and `stack_trace` derive from the loser itself
+            // (pass-through, with a fresh capture only when the chain
+            // recorded none).
+            let wire = crate::error::wire_error_with_type(
+                &op_err,
+                &format!("{JOIN_FAILED_ERROR_TYPE_PREFIX}{failed_index}"),
+            );
             checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
             // The loser is preserved as an error, reachable via source().
             return Err(OperationError::from_kind(OperationErrorKind::Combinator(
@@ -253,16 +340,28 @@ pub(crate) struct JoinAllExecution<O> {
 /// Serializable representation of a settled result for checkpointing.
 ///
 /// Error-aware serdes: rejected results are serialized as
-/// `{ status: "rejected", message }` so that error information
-/// survives the checkpoint round-trip. Fulfilled results serialize as
-/// `{ status: "fulfilled", value }`.
+/// `{ status: "rejected", ... }` carrying the outcome's full wire error
+/// record (`error_type`, `message`, `error_data`, `stack_trace`), so the
+/// failure's identity survives the checkpoint round-trip rather than
+/// only its flattened message (issue #41). Fulfilled results serialize
+/// as `{ status: "fulfilled", value }`. The error fields beyond the
+/// message are optional with defaults so records written before they
+/// existed still replay.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status")]
 enum SerializedSettled<O> {
     #[serde(rename = "fulfilled")]
     Fulfilled { value: O },
     #[serde(rename = "rejected")]
-    Rejected { message: String },
+    Rejected {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_data: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stack_trace: Vec<String>,
+    },
 }
 
 impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
@@ -316,7 +415,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
                         .ctx
                         .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Err(replay_combinator_failure(wire, &wire_id));
+                    return Err(replay_combinator_failure(
+                        wire,
+                        &wire_id,
+                        self.futures.len(),
+                    ));
                 }
                 _ => {}
             }
@@ -398,17 +501,33 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             })
             .collect();
 
-        // Serialize with error-aware serdes. A rejected slot's error is
-        // flattened into the payload here: the checkpoint stores text,
-        // and replay rebuilds a synthetic source from it.
+        // Serialize with error-aware serdes. A rejected slot records its
+        // full wire error (derived from the loser itself, so identity and
+        // `error_data` pass through), and replay rebuilds a synthetic
+        // source carrying those fields (issue #41).
         let serialized = {
             let serializable: Vec<SerializedSettled<&O>> = collected
                 .iter()
                 .map(|s| match s {
                     Settled::Fulfilled(v) => SerializedSettled::Fulfilled { value: v },
-                    Settled::Rejected(err) => SerializedSettled::Rejected {
-                        message: crate::error::chain_string(err),
-                    },
+                    Settled::Rejected(err) => {
+                        // Pass the outcome's own recorded wire record
+                        // through verbatim when it carries one (the normal
+                        // case: a failed constituent operation attaches its
+                        // terminal wire record); derive one only for a
+                        // wire-less error (e.g. an internal join failure).
+                        let wire = err.wire().cloned().unwrap_or_else(|| {
+                            crate::error::wire_error_for(err, COMBINATOR_ERROR_TYPE)
+                        });
+                        SerializedSettled::Rejected {
+                            message: wire
+                                .error_message()
+                                .map_or_else(|| crate::error::chain_string(err), str::to_owned),
+                            error_type: wire.error_type().map(str::to_owned),
+                            error_data: wire.error_data().map(str::to_owned),
+                            stack_trace: wire.stack_trace().to_vec(),
+                        }
+                    }
                 })
                 .collect();
 
@@ -479,7 +598,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                         .ctx
                         .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Err(replay_combinator_failure(wire, &wire_id));
+                    return Err(replay_combinator_failure(
+                        wire,
+                        &wire_id,
+                        self.futures.len(),
+                    ));
                 }
                 _ => {}
             }
@@ -575,13 +698,44 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         }
 
         // All failed: build the aggregate error keeping every loser (in
-        // input order) as an error rather than a flattened string.
+        // input order) as an error rather than a flattened string. The wire
+        // `error_type` carries the AllFailed discriminator so replay
+        // reconstructs the same variant, the recorded message names each
+        // loser's flattened chain in input order, and the record's
+        // `error_data` persists each loser's COMPLETE wire failure record
+        // (a JSON array of [`SerializedLoser`]), so replay rebuilds one
+        // loser per input with the same `error_type`, message,
+        // `error_data`, and `stack_trace` the live failures carried.
         errors.sort_by_key(|(idx, _)| *idx);
         let losers: Vec<crate::error::Source> = errors.into_iter().map(|(_, err)| err).collect();
+        let loser_summary = losers
+            .iter()
+            .enumerate()
+            .map(|(idx, err)| format!("[{idx}] {}", crate::error::chain_string(&**err)))
+            .collect::<Vec<_>>()
+            .join("; ");
+        // Pass each loser's own recorded wire record through verbatim when
+        // it carries one (the normal case: a failed constituent operation
+        // attaches its terminal wire record); derive one only for a
+        // wire-less error (e.g. an internal join failure).
+        let serialized_losers: Vec<SerializedLoser> = losers
+            .iter()
+            .map(|err| {
+                let wire = err
+                    .downcast_ref::<OperationError>()
+                    .and_then(|op| op.wire().cloned())
+                    .unwrap_or_else(|| crate::error::wire_error_for(&**err, COMBINATOR_ERROR_TYPE));
+                SerializedLoser::from_wire(&wire)
+            })
+            .collect();
         let wire = crate::error::wire_error_manual(
-            COMBINATOR_ERROR_TYPE,
-            format!("all {} futures failed", losers.len()),
-        );
+            ALL_FAILED_ERROR_TYPE,
+            format!("all {} futures failed: {loser_summary}", losers.len()),
+        )
+        // A payload of plain optional strings cannot fail JSON
+        // serialization in practice; if it ever did, the record simply
+        // carries no payload and replay falls back to synthetic losers.
+        .with_error_data(serde_json::to_string(&serialized_losers).ok());
 
         checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
 
@@ -653,7 +807,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                         .ctx
                         .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Err(replay_combinator_failure(wire, &wire_id));
+                    return Err(replay_combinator_failure(
+                        wire,
+                        &wire_id,
+                        self.futures.len(),
+                    ));
                 }
                 _ => {}
             }
@@ -805,8 +963,8 @@ fn spawn_constituent<O: Send + 'static>(
 ) -> tokio::task::AbortHandle {
     use crate::driver::{ScopeOutcome, drive_scope};
 
-    let scope = std::sync::Arc::new(ctx.suspension_signal().new_child_scope());
-    future.set_park_scope(std::sync::Arc::clone(&scope));
+    let scope = Arc::new(ctx.suspension_signal().new_child_scope());
+    future.set_park_scope(Arc::clone(&scope));
     let task_ownership = ctx.task_ownership().clone();
     join_set.spawn(async move {
         bless_current_task(&task_ownership);
@@ -1015,13 +1173,6 @@ fn combinator_empty_input_error() -> OperationError {
     )))
 }
 
-/// Derives the wire failure record for a losing future's error,
-/// preserving pass-through identity (`error_type`, `error_data`) and
-/// flattening the message once.
-fn wire_error_from_loser(op_err: &OperationError) -> crate::error::WireError {
-    crate::error::wire_error_for(op_err, COMBINATOR_ERROR_TYPE)
-}
-
 /// Replays a successful `Vec<O>` from a checkpoint record.
 fn replay_vec_success<O: DeserializeOwned>(
     result: Option<&String>,
@@ -1052,13 +1203,22 @@ fn replay_settled_success<O: DeserializeOwned>(
         .map_err(|e| combinator_internal_error(&format!("replay deserialization failed: {e}")))?;
 
     // Restore into Settled<O>: Rejected items become OperationErrors
-    // carrying the original message.
+    // whose synthetic sources carry the recorded wire fields
+    // (`error_type`, message, `error_data`, `stack_trace`), not just the
+    // flattened text (issue #41).
     let settled = serialized
         .into_iter()
         .map(|s| match s {
             SerializedSettled::Fulfilled { value } => Settled::Fulfilled(value),
-            SerializedSettled::Rejected { message } => {
-                let wire = crate::error::WireError::new(None::<String>, Some(message));
+            SerializedSettled::Rejected {
+                message,
+                error_type,
+                error_data,
+                stack_trace,
+            } => {
+                let wire = crate::error::WireError::new(error_type, Some(message))
+                    .with_error_data(error_data)
+                    .with_stack_trace(stack_trace);
                 Settled::Rejected(
                     OperationError::from_kind(OperationErrorKind::ChildContext(
                         ChildContextError::new(
@@ -1077,26 +1237,76 @@ fn replay_settled_success<O: DeserializeOwned>(
 /// Replays a failed combinator from a checkpoint record.
 ///
 /// The wire `error_type` is the variant discriminator: failures recorded
-/// as [`FIRST_SETTLED_FAILED_ERROR_TYPE`] or [`EMPTY_INPUT_ERROR_TYPE`]
-/// reconstruct the same [`CombinatorErrorKind`] variant the live path
-/// produced, so an error observed live and the same error observed on
-/// replay are indistinguishable. Everything else (including records
-/// written before these discriminators existed) reconstructs as
-/// `Internal` carrying the recorded message.
-fn replay_combinator_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+/// as [`FIRST_SETTLED_FAILED_ERROR_TYPE`], [`EMPTY_INPUT_ERROR_TYPE`],
+/// [`JOIN_FAILED_ERROR_TYPE_PREFIX`] (carrying the failed input's index
+/// as its suffix), or [`ALL_FAILED_ERROR_TYPE`] reconstruct the same
+/// [`CombinatorErrorKind`] variant the live path produced, so an error
+/// observed live and the same error observed on replay are
+/// indistinguishable. For `AllFailed`, the record's `error_data` carries
+/// the SDK-authored losers payload (one [`SerializedLoser`] per input, in
+/// input order), and each recorded loser rebuilds as its own
+/// [`crate::error::ReplayedFailure`] with the same wire fields the live
+/// loser carried. `input_len` is the combinator's input count, used only
+/// as the `AllFailed` fallback when the payload is missing or malformed:
+/// every input failed by definition, so the fallback carries one
+/// synthetic source per input, keeping `CombinatorError::failures().len()`
+/// replay-equivalent. Everything else (including records written before
+/// these discriminators existed) reconstructs as `Internal` carrying the
+/// recorded message.
+fn replay_combinator_failure(
+    wire: crate::error::WireError,
+    wire_id: &str,
+    input_len: usize,
+) -> OperationError {
     if wire.error_type() == Some(EMPTY_INPUT_ERROR_TYPE) {
         return combinator_empty_input_error()
             .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
             .with_wire(wire);
     }
-    let kind = if wire.error_type() == Some(FIRST_SETTLED_FAILED_ERROR_TYPE) {
-        CombinatorErrorKind::FirstSettledFailed
+    let recorded_join_index = wire
+        .error_type()
+        .and_then(|t| t.strip_prefix(JOIN_FAILED_ERROR_TYPE_PREFIX))
+        .and_then(|suffix| suffix.parse::<usize>().ok());
+    let (kind, failures) = if let Some(failed_index) = recorded_join_index {
+        (
+            CombinatorErrorKind::JoinFailed(crate::error::JoinFailed::new(failed_index)),
+            vec![crate::error::ReplayedFailure::source_from(wire.clone())],
+        )
+    } else if wire.error_type() == Some(ALL_FAILED_ERROR_TYPE) {
+        // Prefer the recorded losers payload: one ReplayedFailure per
+        // input, each carrying its loser's own recorded wire fields. The
+        // payload is SDK-authored (see [`ALL_FAILED_ERROR_TYPE`]) and
+        // decoded defensively: a record without one (written before the
+        // payload existed, or malformed) falls back to one synthetic
+        // loser per input rebuilt from the aggregate record, preserving
+        // the `failures()` length.
+        let recorded_losers = wire
+            .error_data()
+            .and_then(|data| serde_json::from_str::<Vec<SerializedLoser>>(data).ok())
+            .filter(|losers| !losers.is_empty());
+        let failures = match recorded_losers {
+            Some(losers) => losers
+                .into_iter()
+                .map(|loser| crate::error::ReplayedFailure::source_from(loser.into_wire()))
+                .collect(),
+            None => (0..input_len.max(1))
+                .map(|_| crate::error::ReplayedFailure::source_from(wire.clone()))
+                .collect(),
+        };
+        (CombinatorErrorKind::AllFailed, failures)
+    } else if wire.error_type() == Some(FIRST_SETTLED_FAILED_ERROR_TYPE) {
+        (
+            CombinatorErrorKind::FirstSettledFailed,
+            vec![crate::error::ReplayedFailure::source_from(wire.clone())],
+        )
     } else {
-        CombinatorErrorKind::Internal
+        (
+            CombinatorErrorKind::Internal,
+            vec![crate::error::ReplayedFailure::source_from(wire.clone())],
+        )
     };
     OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
-        kind,
-        vec![crate::error::ReplayedFailure::source_from(wire.clone())],
+        kind, failures,
     )))
     .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
     .with_wire(wire)
@@ -1206,6 +1416,17 @@ mod tests {
         err_type: &str,
         err_msg: &str,
     ) -> (String, CheckpointRecord) {
+        failed_record_with_data(positional_id, err_type, err_msg, None)
+    }
+
+    /// Helper to create a failed checkpoint record carrying an
+    /// `error_data` payload (e.g. an `AllFailed` losers payload).
+    fn failed_record_with_data(
+        positional_id: &str,
+        err_type: &str,
+        err_msg: &str,
+        error_data: Option<String>,
+    ) -> (String, CheckpointRecord) {
         let wire_id = crate::engine::compute_wire_id_public(positional_id);
         (
             wire_id.clone(),
@@ -1215,7 +1436,7 @@ mod tests {
                 result: None,
                 error_type: Some(err_type.to_owned()),
                 error_message: Some(err_msg.to_owned()),
-                error_data: None,
+                error_data,
                 stack_trace: None,
                 attempt: 0,
                 invoke_result: None,
@@ -1550,6 +1771,139 @@ mod tests {
             },
             other => panic!("expected Combinator, got: {other:?}"),
         }
+        // The aggregate record persists each loser's own wire record (in
+        // input order) in its `error_data`, so replay can rebuild the
+        // individual losers rather than clones of the aggregate.
+        let wire = err.wire().expect("live AllFailed carries wire record");
+        let payload = wire.error_data().expect("AllFailed persists losers");
+        let losers: Vec<SerializedLoser> =
+            serde_json::from_str(payload).expect("losers payload decodes");
+        assert_eq!(losers.len(), 2);
+        assert!(
+            losers[0]
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("err-a")),
+            "loser 0 keeps its own message: {:?}",
+            losers[0].message
+        );
+        assert!(
+            losers[1]
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("err-b")),
+            "loser 1 keeps its own message: {:?}",
+            losers[1].message
+        );
+    }
+
+    /// Replaying a recorded `AllFailed` rebuilds EACH loser from the
+    /// persisted losers payload: every `failures()` entry carries its own
+    /// recorded `error_type`, message, `error_data`, and `stack_trace`,
+    /// not clones of the aggregate record.
+    #[tokio::test]
+    async fn select_ok_all_failed_replay_rebuilds_each_recorded_loser() {
+        let losers_payload = serde_json::to_string(&vec![
+            SerializedLoser {
+                error_type: Some("TypeA".to_owned()),
+                message: Some("boom-a".to_owned()),
+                error_data: Some(r#"{"a":1}"#.to_owned()),
+                stack_trace: vec!["frame-a0".to_owned(), "frame-a1".to_owned()],
+            },
+            SerializedLoser {
+                error_type: Some("TypeB".to_owned()),
+                message: Some("boom-b".to_owned()),
+                error_data: None,
+                stack_trace: Vec::new(),
+            },
+        ])
+        .expect("payload serializes");
+        let (wire_id, record) = failed_record_with_data(
+            "1",
+            "CombinatorError.AllFailed",
+            "all 2 futures failed: [0] boom-a; [1] boom-b",
+            Some(losers_payload),
+        );
+        let log = CheckpointLog::from_records(vec![(wire_id, record)]);
+        let ctx = test_ctx(log);
+
+        let op_id = ctx.mint_id();
+        let exec = SelectOkExecution::<String> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![], // No futures needed on replay.
+        };
+        let err = exec.execute().await.unwrap_err();
+        let OperationErrorKind::Combinator(ce) = err.kind() else {
+            panic!("expected Combinator, got: {:?}", err.kind());
+        };
+        assert!(
+            matches!(ce.kind(), CombinatorErrorKind::AllFailed),
+            "expected AllFailed, got: {:?}",
+            ce.kind()
+        );
+        let failures = ce.failures();
+        assert_eq!(failures.len(), 2);
+        let replayed = |idx: usize| {
+            failures[idx]
+                .downcast_ref::<crate::error::ReplayedFailure>()
+                .expect("replayed loser is a ReplayedFailure")
+                .wire()
+                .clone()
+        };
+        let first = replayed(0);
+        assert_eq!(first.error_type(), Some("TypeA"));
+        assert_eq!(first.error_message(), Some("boom-a"));
+        assert_eq!(first.error_data(), Some(r#"{"a":1}"#));
+        assert_eq!(
+            first.stack_trace(),
+            ["frame-a0".to_owned(), "frame-a1".to_owned()]
+        );
+        let second = replayed(1);
+        assert_eq!(second.error_type(), Some("TypeB"));
+        assert_eq!(second.error_message(), Some("boom-b"));
+        assert_eq!(second.error_data(), None);
+        assert!(second.stack_trace().is_empty());
+    }
+
+    /// An `AllFailed` record WITHOUT a losers payload (written before the
+    /// payload existed) still replays as `AllFailed` with one synthetic
+    /// loser per input, preserving the `failures()` length.
+    #[tokio::test]
+    async fn select_ok_all_failed_replay_without_payload_falls_back() {
+        let (wire_id, record) = failed_record(
+            "1",
+            "CombinatorError.AllFailed",
+            "all 3 futures failed: [0] a; [1] b; [2] c",
+        );
+        let log = CheckpointLog::from_records(vec![(wire_id, record)]);
+        let ctx = test_ctx(log);
+
+        let op_id = ctx.mint_id();
+        let a: DurableFuture<String> = DurableFuture::from_async(async { panic!("never runs") });
+        let b: DurableFuture<String> = DurableFuture::from_async(async { panic!("never runs") });
+        let c: DurableFuture<String> = DurableFuture::from_async(async { panic!("never runs") });
+        let exec = SelectOkExecution::<String> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![a, b, c],
+        };
+        let err = exec.execute().await.unwrap_err();
+        let OperationErrorKind::Combinator(ce) = err.kind() else {
+            panic!("expected Combinator, got: {:?}", err.kind());
+        };
+        assert!(
+            matches!(ce.kind(), CombinatorErrorKind::AllFailed),
+            "expected AllFailed, got: {:?}",
+            ce.kind()
+        );
+        assert_eq!(
+            ce.failures().len(),
+            3,
+            "fallback keeps one synthetic loser per input"
+        );
     }
 
     #[tokio::test]

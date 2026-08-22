@@ -2,7 +2,7 @@
 # check-msrv-consistency.sh: Mechanical gate for MSRV declaration consistency.
 #
 # The root Cargo.toml's rust-version is the single source of truth for the
-# MSRV. But rust-version is also declared by every compliance handler and
+# MSRV. But rust-version is also declared by every conformance handler and
 # example crate (200+ manifests), quoted by the msrv CI job in ci.yml, and
 # stated in the README. A bump that misses any of them leaves a stale,
 # misleading declaration behind, exactly the drift this script exists to
@@ -34,7 +34,7 @@ fi
 
 # 1. Every manifest that declares rust-version must agree
 
-# find(1) rather than a checked-in list: new crates under compliance/ or
+# find(1) rather than a checked-in list: new crates under conformance/ or
 # examples/ are covered automatically. target/ holds vendored copies of
 # third-party manifests and is excluded.
 MISMATCHES=$(find . -path ./target -prune -o -name Cargo.toml -print \
@@ -74,7 +74,7 @@ fi
 if [ "$FAIL" -ne 0 ]; then
     echo ""
     echo "An MSRV bump must update every declaration in the same pull request:"
-    echo "the root Cargo.toml, every Cargo.toml under compliance/ and examples/"
+    echo "the root Cargo.toml, every Cargo.toml under conformance/ and examples/"
     echo "that declares rust-version, the msrv job in $CI_WORKFLOW, and README.md."
     echo "See CONTRIBUTING.md for the bump policy."
     exit 1

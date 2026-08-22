@@ -30,7 +30,8 @@ TREE_ERR_FILE=$(mktemp /tmp/check-direct-deps-tree-err.XXXXXX)
 VIOLATIONS_FILE=$(mktemp /tmp/check-direct-deps-violations.XXXXXX)
 trap 'rm -f "$TREE_FILE" "$TREE_ERR_FILE" "$VIOLATIONS_FILE"' EXIT INT HUP TERM
 
-# The 8 always-on production dependencies per the design spec.
+# The always-on production dependencies per the design spec. The allowlist
+# itself is the source of truth for the count: nothing else hardcodes it.
 ALWAYS_ON="aws-config aws-sdk-lambda lambda_runtime serde serde_json sha2 tokio tracing"
 
 # Optional, feature-gated production dependencies. Each entry needs the same
@@ -90,9 +91,9 @@ check_graph() {
                 *"(/"*")"*)
                     # This is a workspace member line: extract name (first field).
                     current_member=$(echo "$line" | awk '{print $1}')
-                    # Skip the compliance crate: it's test infrastructure, not production.
+                    # Skip the conformance crate: it is test infrastructure, not production.
                     case "$current_member" in
-                        compliance) current_member=""; continue ;;
+                        conformance) current_member=""; continue ;;
                     esac
                     continue
                     ;;

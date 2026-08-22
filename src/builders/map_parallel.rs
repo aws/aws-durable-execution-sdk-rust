@@ -95,7 +95,12 @@ where
     /// Creates a new builder (internal). Taking the items and closure here
     /// keeps the closure field non-optional: a builder without a body is
     /// unrepresentable.
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, items: Vec<I>, closure: F) -> Self {
+    pub(crate) fn new_internal(
+        ctx: DurableContext,
+        op_id: OperationId,
+        items: Vec<I>,
+        closure: F,
+    ) -> Self {
         Self {
             ctx,
             op_id,
@@ -433,7 +438,7 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     /// Creates a new builder (internal). Taking the branches here keeps the
     /// builder complete from construction: `context.parallel()` always has
     /// them in hand.
-    pub(crate) fn new(
+    pub(crate) fn new_internal(
         ctx: DurableContext,
         op_id: OperationId,
         branches: Vec<(String, crate::future::BranchBody<O>)>,

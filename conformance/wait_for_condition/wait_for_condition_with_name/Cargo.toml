@@ -1,0 +1,33 @@
+[package]
+name = "wait_for_condition_with_name"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+publish = false
+description = "Conformance handler: wait_for_condition_with_name"
+
+
+[[bin]]
+name = "wait_for_condition_with_name"
+path = "src/main.rs"
+
+[lints.clippy]
+all = "deny"
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[dependencies]
+aws-durable-execution-sdk-rust = { path = "../../.." }
+conformance = { path = "../.." }
+lambda_runtime = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"

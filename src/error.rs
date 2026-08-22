@@ -138,12 +138,17 @@ impl WireError {
 
     /// The wire `ErrorData`: an opaque payload attached to the failure.
     ///
-    /// The SDK writes this field and passes it through boundaries, but
-    /// **never deserializes it and never dispatches on it**: the wire
-    /// error fields can be supplied by an external caller (via
-    /// `SendDurableExecutionCallbackFailure`), so typed reconstruction
-    /// from an attacker-influenced payload is decode surface the SDK
-    /// refuses to have. Interpret it yourself if you know its shape.
+    /// The SDK writes this field and passes it through boundaries, and
+    /// **never dispatches on it**: the wire error fields can be supplied
+    /// by an external caller (via `SendDurableExecutionCallbackFailure`),
+    /// so typed reconstruction from an attacker-influenced payload is
+    /// decode surface the SDK refuses to have. Interpret it yourself if
+    /// you know its shape. The one record the SDK decodes is its own
+    /// `select_ok` `AllFailed` aggregate, whose `error_data` is
+    /// SDK-authored (never pass-through) and holds the losers' recorded
+    /// failure fields; combinator replay decodes it defensively (a
+    /// malformed payload falls back to synthetic losers) and only stores
+    /// and re-exposes the decoded strings, never branching on them.
     #[must_use]
     pub fn error_data(&self) -> Option<&str> {
         self.error_data.as_deref()

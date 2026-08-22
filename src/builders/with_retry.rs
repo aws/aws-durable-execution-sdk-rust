@@ -97,7 +97,7 @@ where
 {
     /// Creates a new builder (internal). Taking the closure here keeps the
     /// field non-optional: a builder without a body is unrepresentable.
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, closure: F) -> Self {
+    pub(crate) fn new_internal(ctx: DurableContext, op_id: OperationId, closure: F) -> Self {
         Self {
             ctx,
             op_id,

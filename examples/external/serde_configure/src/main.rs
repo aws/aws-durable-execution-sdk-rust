@@ -16,13 +16,14 @@ use aws_durable_execution_sdk_rust as durable;
 use durable::Serdes;
 use durable::serdes::SerdesContext;
 
-/// A serdes that uppercases the JSON wire form (illustrative). The blanket
-/// implementation over every JSON-able `T` is what lets ONE instance serve
-/// operations with different output types.
+/// A serdes that reverses the JSON wire form (illustrative): a
+/// self-inverse, lossless transform whose `deserialize` exactly undoes
+/// `serialize`. The blanket implementation over every JSON-able `T` is
+/// what lets ONE instance serve operations with different output types.
 #[derive(Debug)]
-struct UppercaseSerdes;
+struct ReversedJsonSerdes;
 
-impl<T> Serdes<T> for UppercaseSerdes
+impl<T> Serdes<T> for ReversedJsonSerdes
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
 {
@@ -33,7 +34,7 @@ where
         value: T,
         _context: SerdesContext,
     ) -> Result<String, durable::BoxError> {
-        Ok(serde_json::to_string(&value)?.to_uppercase())
+        Ok(serde_json::to_string(&value)?.chars().rev().collect())
     }
 
     // reason: exercises the async-fn impl form user code writes
@@ -43,7 +44,9 @@ where
         wire: String,
         _context: SerdesContext,
     ) -> Result<T, durable::BoxError> {
-        Ok(serde_json::from_str(&wire.to_lowercase())?)
+        // Undo the transform, then parse the restored JSON.
+        let restored: String = wire.chars().rev().collect();
+        Ok(serde_json::from_str(&restored)?)
     }
 }
 
@@ -53,7 +56,7 @@ async fn handler(
     _event: serde_json::Value,
     ctx: durable::DurableContext,
 ) -> Result<String, durable::BoxError> {
-    let shared = Arc::new(UppercaseSerdes);
+    let shared = Arc::new(ReversedJsonSerdes);
 
     let value = ctx
         .step(|_| async { Ok("hello".to_owned()) })

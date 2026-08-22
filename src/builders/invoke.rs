@@ -77,7 +77,7 @@ where
     I: Send + 'static,
 {
     /// Creates a new invoke builder (internal).
-    pub(crate) fn new(
+    pub(crate) fn new_internal(
         ctx: DurableContext,
         op_id: OperationId,
         function_id: String,

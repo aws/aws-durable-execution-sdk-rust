@@ -209,11 +209,14 @@ pub(crate) type RetryStrategy = Box<dyn Fn(&StepError, u32) -> RetryDecision + S
 /// with [`Options::default`].
 ///
 /// To customize the runtime, keep this entry point's shape but swap the
-/// function: for custom [`Options`] — an execution-wide [`Serdes`], a
-/// preconfigured Lambda client, or your own [`SdkConfig`] — use
-/// [`run_with_options`]; to add middleware around the service function
-/// itself, use [`wrap`], which returns the service function without
-/// starting the runtime.
+/// function: for custom [`Options`] — a preconfigured Lambda client, your
+/// own [`SdkConfig`], or checkpoint tuning — use [`run_with_options`]; to
+/// add middleware around the service function itself, use [`wrap`], which
+/// returns the service function without starting the runtime. Custom
+/// serialization is configured per operation, not through [`Options`]:
+/// pass a [`Serdes`] to an operation builder's `.serdes(...)`, sharing one
+/// implementation across operations behind an `Arc<S>` (which itself
+/// implements the trait) when they should serialize alike.
 ///
 /// The handler closure is called once per invocation. It receives the
 /// deserialized event and a [`DurableContext`] for performing durable
@@ -272,11 +275,14 @@ where
 
 /// Starts the durable function runtime with the given handler and options.
 ///
-/// Like [`run`], but applies the supplied [`Options`], for example an
-/// execution-wide default [`Serdes`] or a preconfigured Lambda client, to
-/// every invocation. Equivalent to registering [`wrap`] with the Lambda
+/// Like [`run`], but applies the supplied [`Options`], for example a
+/// preconfigured Lambda client or your own [`SdkConfig`], to every
+/// invocation. Equivalent to registering [`wrap`] with the Lambda
 /// runtime yourself:
 /// `lambda_runtime::run(lambda_runtime::service_fn(wrap(handler, options)))`.
+/// Serialization is not an [`Options`] concern: set a [`Serdes`] per
+/// operation via the builders' `.serdes(...)`, sharing an `Arc<S>` across
+/// operations that should serialize alike.
 ///
 /// The handler closure is called once per invocation. It receives the
 /// deserialized event and a [`DurableContext`] for performing durable

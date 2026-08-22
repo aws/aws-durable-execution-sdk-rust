@@ -47,7 +47,7 @@ version is an intentional, documented change: while the crate is pre-1.0, an
 MSRV bump ships as a minor release (0.x → 0.x+1), never as a patch, and the
 change must update every declaration in the same pull request: the root
 `Cargo.toml` is the source of truth, and every `Cargo.toml` under
-`compliance/` and `examples/` that declares `rust-version` (200+ manifests),
+`conformance/` and `examples/` that declares `rust-version` (200+ manifests),
 the `msrv` CI job, and the README must agree with it.
 `scripts/check-msrv-consistency.sh`, wired into `make check`, enforces this
 mechanically, so a bump that misses a declaration fails `make check`
@@ -104,7 +104,7 @@ independent cargo workspaces, each with its own lint table. The tables share a
 common core (the panic restriction lints, `missing_docs`, `unsafe_code =
 "forbid"`) but already differ in the groups they enable and the extra lints they
 carry. The root workspace adds `unreachable_pub`, `missing_debug_implementations`,
-`unused_qualifications`, and the `cargo` clippy group; the compliance and examples
+`unused_qualifications`, and the `cargo` clippy group; the conformance and examples
 workspaces omit those. A lint policy change that you intend to apply across the
 project must update all applicable `Cargo.toml` files, and the pull request should
 say why.
@@ -114,13 +114,13 @@ the SDK workspace only. Both feature-gated surfaces are already inside it:
 `cargo test --all-features` runs the `test-util` and `replay-filter`
 tests, so there is no separate feature-testing step to remember.
 
-`compliance/` and `examples/` are separate cargo workspaces whose heavier
+`conformance/` and `examples/` are separate cargo workspaces whose heavier
 dependency graph `make check` deliberately excludes so it stays fast. CI
 compiles and lints both, which catches a public API change that breaks them.
 Do the same locally when you change the public surface:
 
 ```sh
-(cd compliance && cargo build --all-targets && cargo clippy --all-targets -- -D warnings)
+(cd conformance && cargo build --all-targets && cargo clippy --all-targets -- -D warnings)
 (cd examples   && cargo build --all-targets && cargo clippy --all-targets -- -D warnings)
 ```
 
@@ -178,13 +178,15 @@ several operations or needs to observe replay.
 
 ## The conformance suite
 
-`compliance/` holds Lambda handlers in nine suites that a language-agnostic
-runner drives against the live service. The runner starts each handler's
+`conformance/` holds Lambda handlers in nine suites that a language-agnostic
+runner drives against the live service. (A `compliance` symlink points at it
+for tooling that predates the rename; new references should use
+`conformance/`.) The runner starts each handler's
 execution, then compares the recorded history against the language-independent
 durable execution contract, which is how we know the Rust implementation
 satisfies the service specification rather than merely passing its own tests.
-Each suite has a SAM template at `compliance/template_<suite>.yaml`.
-`compliance/template_smoke.yaml` is a single hello handler that checks a
+Each suite has a SAM template at `conformance/template_<suite>.yaml`.
+`conformance/template_smoke.yaml` is a single hello handler that checks a
 deployment works at all, so the runner does not validate it and CI skips it.
 
 Running the suite costs real time and real resources. A cold build of all
@@ -235,7 +237,7 @@ from a modern host dies at startup instead.
 pip3 install cargo-lambda
 pip install "git+https://github.com/aws/aws-durable-execution-conformance-tests.git@main#subdirectory=packages/aws-durable-execution-conformance-tests"
 
-cd compliance
+cd conformance
 ./build_examples.sh step          # build one suite; omit the argument to build every template
 
 python -m aws_durable_execution_conformance_tests.app \
@@ -320,7 +322,7 @@ allowlist under `[package.metadata.cargo_check_external_types]` in
 compares the pull request against its base branch, so a breaking API change
 needs the matching version bump), proves every feature combination compiles
 with a `feature-powerset` job (cargo-hack), then builds and lints the
-`compliance` and `examples` workspaces.
+`conformance` and `examples` workspaces.
 `codeql.yml` runs static analysis over the Rust sources.
 `conformance-tests.yml` runs the ten conformance suites when the SDK or the
 handlers change. `cloud-tests.yml` deploys the example stacks and runs the cloud

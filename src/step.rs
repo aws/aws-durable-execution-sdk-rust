@@ -342,7 +342,11 @@ where
                         .ctx
                         .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Ok(StepPrelude::Done(Err(replay_failure(wire, &wire_id))));
+                    return Ok(StepPrelude::Done(Err(replay_failure(
+                        wire,
+                        &wire_id,
+                        view.attempt,
+                    ))));
                 }
                 CheckpointStatus::Pending => {
                     // Retry timer hasn't fired yet: suspend.
@@ -806,13 +810,26 @@ async fn replay_success<O, S: Serdes<O>>(
 /// A record whose `error_type` is the serialization discriminator
 /// ([`crate::error::SERIALIZATION_FAILED_ERROR_TYPE`]) reconstructs
 /// `StepErrorKind::SerializationFailed`, the kind the live path yielded
-/// after persisting that record, so replay reproduces the recorded
-/// failure's classification, not just its message (issue #43).
-fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
+/// after persisting that record (issue #43). Every other record is an
+/// ordinary terminal step failure, which the live path yields as
+/// `StepErrorKind::RetriesExhausted` after its retry strategy stopped,
+/// so replay reconstructs the SAME kind: a handler that branches on the
+/// kind takes the same path live and replayed. The attempt count is
+/// derived from the record exactly as [`DurableContext::get_attempt`]
+/// reads it: the record stores completed retries, so the failing attempt
+/// is `recorded_attempt + 1` (the same derivation
+/// `wait_for_condition`'s exhaustion replay uses).
+fn replay_failure(
+    wire: crate::error::WireError,
+    wire_id: &str,
+    recorded_attempt: u32,
+) -> OperationError {
     let kind = if wire.error_type() == Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) {
         StepErrorKind::SerializationFailed
     } else {
-        StepErrorKind::ExecutionFailed
+        StepErrorKind::RetriesExhausted(crate::error::RetriesExhausted::new(
+            recorded_attempt.saturating_add(1),
+        ))
     };
     OperationError::from_kind(OperationErrorKind::Step(StepError::new(
         kind,
@@ -869,12 +886,18 @@ mod tests {
     #[test]
     fn replay_failure_keeps_kind_and_wire_fields_apart() {
         let wire = crate::error::WireError::new(Some("TypeError"), Some("bad input"));
-        let err = replay_failure(wire, "wire-1");
-        // kind() is meaningful after a replay.
+        let err = replay_failure(wire, "wire-1", 2);
+        // kind() is meaningful after a replay: an ordinary terminal step
+        // failure replays as RetriesExhausted, the kind the live path
+        // yielded, with the failing attempt derived from the record
+        // (completed retries + 1).
         let OperationErrorKind::Step(step_err) = err.kind() else {
             unreachable!("replay builds a step error");
         };
-        assert!(matches!(step_err.kind(), StepErrorKind::ExecutionFailed));
+        let StepErrorKind::RetriesExhausted(details) = step_err.kind() else {
+            unreachable!("ordinary failures replay as RetriesExhausted");
+        };
+        assert_eq!(details.attempts(), 3);
         // The type is NOT folded into the message: the frame stays clean...
         assert_eq!(err.to_string(), "operation error: step");
         // ...and the recorded fields are programmatically recoverable.
@@ -903,9 +926,25 @@ mod tests {
 
     #[test]
     fn replay_failure_empty_record_displays_unknown() {
-        let err = replay_failure(crate::error::WireError::default(), "wire-1");
+        let err = replay_failure(crate::error::WireError::default(), "wire-1", 0);
         let chain = format!("{err:#}");
         assert!(chain.contains("unknown error"), "got: {chain}");
+    }
+
+    #[test]
+    fn replay_failure_serialization_discriminator_keeps_its_kind() {
+        let wire = crate::error::WireError::new(
+            Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE),
+            Some("bad payload"),
+        );
+        let err = replay_failure(wire, "wire-1", 0);
+        let OperationErrorKind::Step(step_err) = err.kind() else {
+            unreachable!("replay builds a step error");
+        };
+        assert!(matches!(
+            step_err.kind(),
+            StepErrorKind::SerializationFailed
+        ));
     }
 
     // Serialization tests

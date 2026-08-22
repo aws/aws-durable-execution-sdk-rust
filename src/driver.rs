@@ -582,6 +582,82 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// How one watched drive of a future ended: the shared vocabulary of
+/// [`drive_watched`], the poll loop `drive_invocation` and `drive_scope`
+/// both build on.
+enum DrivenToEnd<T> {
+    /// The future resolved and no interruption was observed at that poll.
+    Completed(T),
+    /// The watcher interrupted the drive (suspension was requested, a
+    /// spawned operation durably parked after the future resolved, or,
+    /// for the invocation driver, a fatal error was recorded). The future
+    /// was dropped at its current await point.
+    Interrupted,
+}
+
+/// The shared polling-with-watcher loop under [`drive_invocation`] and
+/// [`drive_scope`].
+///
+/// Pins `future` on the stack (a concrete generic, so no heap
+/// allocation) and polls it, consulting the caller's predicates at the
+/// three points both drivers check:
+///
+/// - `register` runs first every poll, installing the loop's waker so an
+///   event from another task (a park, a fatal record) re-polls the loop
+///   to observe it;
+/// - `interrupted` is checked before each poll and again when the future
+///   returns `Pending`, so a pending interruption drops the future
+///   rather than waiting for it;
+/// - `interrupted_on_ready` is checked when the future resolves, letting
+///   a same-poll interruption (or a durably parked `.spawn()`ed
+///   operation) take precedence over the resolved value.
+///
+/// The caller re-reads its signal after the drive to decide what an
+/// interruption means; this loop only reports THAT one happened.
+async fn drive_watched<F, R, P, Q>(
+    future: F,
+    register: R,
+    interrupted: P,
+    interrupted_on_ready: Q,
+) -> DrivenToEnd<F::Output>
+where
+    F: Future + Send,
+    R: Fn(&Waker),
+    P: Fn() -> bool,
+    Q: Fn() -> bool,
+{
+    let mut pinned = std::pin::pin!(future);
+    std::future::poll_fn(move |cx: &mut Context<'_>| {
+        register(cx.waker());
+
+        if interrupted() {
+            // Drop the future by letting its stack-pinned storage go out
+            // of scope when this loop returns.
+            return Poll::Ready(DrivenToEnd::Interrupted);
+        }
+
+        match pinned.as_mut().poll(cx) {
+            Poll::Ready(value) => {
+                if interrupted_on_ready() {
+                    Poll::Ready(DrivenToEnd::Interrupted)
+                } else {
+                    Poll::Ready(DrivenToEnd::Completed(value))
+                }
+            }
+            Poll::Pending => {
+                if interrupted() {
+                    Poll::Ready(DrivenToEnd::Interrupted)
+                } else {
+                    // Normal async yield: the future is waiting for some
+                    // other wakeup (e.g., I/O). Continue polling.
+                    Poll::Pending
+                }
+            }
+        }
+    })
+    .await
+}
+
 /// Drives a single invocation of the user's handler future.
 ///
 /// The driver polls the future to completion or until suspension is
@@ -593,6 +669,15 @@ impl Drop for AbortOnDrop {
 /// also yields `Pending`: the parked operation recorded state that only a
 /// later invocation can resume, so its result must not be discarded by
 /// completing the invocation.
+///
+/// A recorded fatal error (non-determinism mismatch) takes precedence
+/// over EVERYTHING, including suspension: the execution's recorded
+/// history no longer matches the handler's operations, so suspending
+/// and re-invoking cannot make progress and completing successfully
+/// would mask the defect. The fatal predicates interrupt the drive at
+/// every check point (including a fatal recorded during the poll that
+/// resolved the future), and the post-drive fatal read maps the
+/// interruption to the dedicated outcome.
 pub(crate) async fn drive_invocation<F>(
     handler_future: F,
     suspension_signal: Arc<SuspensionSignal>,
@@ -600,93 +685,39 @@ pub(crate) async fn drive_invocation<F>(
 where
     F: Future<Output = Result<String, crate::error::WireError>> + Send,
 {
-    // Pin the handler future on the stack so we can poll it. `F` is a
-    // concrete generic, so no heap allocation is needed.
-    let mut pinned = std::pin::pin!(handler_future);
+    let ended = {
+        let register_signal = Arc::clone(&suspension_signal);
+        let pre_signal = Arc::clone(&suspension_signal);
+        let ready_signal = Arc::clone(&suspension_signal);
+        drive_watched(
+            handler_future,
+            // Register this poll loop's waker so an operation that
+            // suspends (or a fatal recorded) from a spawned task wakes
+            // the driver to observe it.
+            move |waker| register_signal.register_driver_waker(waker),
+            move || pre_signal.fatal_error().is_some() || pre_signal.is_suspend_requested(),
+            move || {
+                ready_signal.fatal_error().is_some()
+                    || ready_signal.is_suspend_requested()
+                    || ready_signal.any_spawn_parked()
+            },
+        )
+        .await
+    };
 
-    // Use poll_fn to manually drive the future with suspension checks.
-    std::future::poll_fn(move |cx: &mut Context<'_>| {
-        // Register this poll loop's waker so an operation that suspends from
-        // a spawned task can wake the driver to observe the signal.
-        suspension_signal.register_driver_waker(cx.waker());
+    // Fatal precedence: whatever ended the drive, a recorded fatal error
+    // is the outcome (the mismatch may have been stringified through
+    // child/batch boundaries, so the handler's own error shape is never
+    // preferred over the dedicated report).
+    if let Some(fatal) = suspension_signal.fatal_error() {
+        return fatal.into_outcome();
+    }
 
-        // A recorded fatal error (non-determinism mismatch) takes precedence
-        // over EVERYTHING, including suspension: the execution's recorded
-        // history no longer matches the handler's operations, so suspending
-        // and re-invoking cannot make progress and completing successfully
-        // would mask the defect. The handler future is dropped exactly as it
-        // would be for suspension.
-        if let Some(fatal) = suspension_signal.fatal_error() {
-            return Poll::Ready(fatal.into_outcome());
-        }
-
-        // Check if suspension was already requested (from a previous poll
-        // cycle where an operation set the flag).
-        if suspension_signal.is_suspend_requested() {
-            // Drop the future by letting its stack-pinned storage go out
-            // of scope when this driver returns. Return Ready(Pending) to
-            // the outer async: we're done.
-            return Poll::Ready(InvocationOutcome::Pending);
-        }
-
-        // Poll the handler future once.
-        match pinned.as_mut().poll(cx) {
-            Poll::Ready(Ok(result)) => {
-                // A fatal error recorded DURING this poll (e.g. a replay
-                // identity mismatch swallowed by a combinator or a tolerant
-                // batch before the handler resolved) must fail the
-                // execution: a successful completion would erase it.
-                if let Some(fatal) = suspension_signal.fatal_error() {
-                    return Poll::Ready(fatal.into_outcome());
-                }
-                // An operation may have requested suspension AND the
-                // handler still completed (e.g. error propagated via `?`
-                // without yielding). Suspension takes precedence.
-                if suspension_signal.is_suspend_requested() || suspension_signal.any_spawn_parked()
-                {
-                    Poll::Ready(InvocationOutcome::Pending)
-                } else {
-                    Poll::Ready(InvocationOutcome::Complete(result))
-                }
-            }
-            Poll::Ready(Err(err)) => {
-                // Fatal precedence: report the dedicated error rather than
-                // whatever shape the handler's own error took (the mismatch
-                // may have been stringified through child/batch boundaries).
-                if let Some(fatal) = suspension_signal.fatal_error() {
-                    return Poll::Ready(fatal.into_outcome());
-                }
-                // Same precedence rule: if an operation requested
-                // suspension before the error propagated, the invocation
-                // outcome is Pending, not Failed.
-                if suspension_signal.is_suspend_requested() || suspension_signal.any_spawn_parked()
-                {
-                    Poll::Ready(InvocationOutcome::Pending)
-                } else {
-                    Poll::Ready(InvocationOutcome::Failed { error: err })
-                }
-            }
-            Poll::Pending => {
-                // Fatal precedence over suspension: see above.
-                if let Some(fatal) = suspension_signal.fatal_error() {
-                    return Poll::Ready(fatal.into_outcome());
-                }
-                // The future yielded: check if an operation requested
-                // suspension during this poll cycle.
-                if suspension_signal.is_suspend_requested() {
-                    // Suspension requested: drop the future (its
-                    // stack-pinned storage goes out of scope when this
-                    // driver returns) and report PENDING.
-                    Poll::Ready(InvocationOutcome::Pending)
-                } else {
-                    // Normal async yield: the future is waiting for some
-                    // other wakeup (e.g., I/O). Continue polling.
-                    Poll::Pending
-                }
-            }
-        }
-    })
-    .await
+    match ended {
+        DrivenToEnd::Interrupted => InvocationOutcome::Pending,
+        DrivenToEnd::Completed(Ok(result)) => InvocationOutcome::Complete(result),
+        DrivenToEnd::Completed(Err(err)) => InvocationOutcome::Failed { error: err },
+    }
 }
 
 /// The outcome of driving a single branch future within one scope.
@@ -722,36 +753,24 @@ pub(crate) async fn drive_scope<F>(
 where
     F: Future + Send,
 {
-    // Stack-pinned: `F` is a concrete generic, so no heap allocation is
-    // needed to poll it.
-    let mut pinned = std::pin::pin!(inner);
-    std::future::poll_fn(move |cx: &mut Context<'_>| {
-        // Register this branch driver's waker so a park requested from a
-        // sub-task within this scope re-polls us to observe the flag.
-        scope.register_scope_waker(cx.waker());
-
-        if scope.is_suspend_requested() {
-            return Poll::Ready(ScopeOutcome::Suspended);
-        }
-
-        match pinned.as_mut().poll(cx) {
-            Poll::Ready(value) => {
-                if scope.is_suspend_requested() || scope.any_spawn_parked() {
-                    Poll::Ready(ScopeOutcome::Suspended)
-                } else {
-                    Poll::Ready(ScopeOutcome::Completed(value))
-                }
-            }
-            Poll::Pending => {
-                if scope.is_suspend_requested() {
-                    Poll::Ready(ScopeOutcome::Suspended)
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
-    })
-    .await
+    let ended = {
+        let register_scope = Arc::clone(&scope);
+        let pre_scope = Arc::clone(&scope);
+        let ready_scope = Arc::clone(&scope);
+        drive_watched(
+            inner,
+            // Register this branch driver's waker so a park requested from
+            // a sub-task within this scope re-polls us to observe the flag.
+            move |waker| register_scope.register_scope_waker(waker),
+            move || pre_scope.is_suspend_requested(),
+            move || ready_scope.is_suspend_requested() || ready_scope.any_spawn_parked(),
+        )
+        .await
+    };
+    match ended {
+        DrivenToEnd::Completed(value) => ScopeOutcome::Completed(value),
+        DrivenToEnd::Interrupted => ScopeOutcome::Suspended,
+    }
 }
 
 #[cfg(test)]

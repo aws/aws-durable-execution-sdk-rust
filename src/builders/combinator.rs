@@ -57,7 +57,7 @@ impl<O> std::fmt::Debug for TryJoinAllBuilder<O> {
 
 impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoinAllBuilder<O> {
     /// Creates a new builder (internal).
-    pub(crate) fn new(
+    pub(crate) fn new_internal(
         ctx: DurableContext,
         op_id: OperationId,
         futures: Vec<DurableFuture<O>>,
@@ -170,7 +170,7 @@ impl<O> std::fmt::Debug for JoinAllBuilder<O> {
 
 impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAllBuilder<O> {
     /// Creates a new builder (internal).
-    pub(crate) fn new(
+    pub(crate) fn new_internal(
         ctx: DurableContext,
         op_id: OperationId,
         futures: Vec<DurableFuture<O>>,
@@ -280,7 +280,7 @@ impl<O> std::fmt::Debug for SelectOkBuilder<O> {
 
 impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectOkBuilder<O> {
     /// Creates a new builder (internal).
-    pub(crate) fn new(
+    pub(crate) fn new_internal(
         ctx: DurableContext,
         op_id: OperationId,
         futures: Vec<DurableFuture<O>>,
@@ -390,7 +390,7 @@ impl<O> std::fmt::Debug for RaceBuilder<O> {
 
 impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBuilder<O> {
     /// Creates a new builder (internal).
-    pub(crate) fn new(
+    pub(crate) fn new_internal(
         ctx: DurableContext,
         op_id: OperationId,
         futures: Vec<DurableFuture<O>>,

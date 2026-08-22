@@ -1,0 +1,71 @@
+[workspace]
+# Real cargo workspace: every conformance handler is a member, so the whole
+# suite builds into ONE shared target dir (conformance/target) with a single
+# resolve of the shared SDK + aws-sdk dependency graph. Handlers must NOT
+# carry their own `[workspace]` opt-out: that would make each an isolated
+# cargo project with its own target/ and Cargo.lock, duplicating the
+# dependency cache per handler and multiplying full-suite rebuild time.
+members = [
+    "smoke/*",
+    "step/*",
+    "wait/*",
+    "callback/*",
+    "child/*",
+    "invoke/*",
+    "map/*",
+    "parallel/*",
+    "wait_for_callback/*",
+    "wait_for_condition/*",
+    "history/*",
+    "nondeterminism/*",
+    "combinator/*",
+]
+resolver = "2"
+
+# Workspace lints for the aggregator crate (below). Handler crates keep their
+# own inline [lints] tables (same policy). Mirrors the panic/doc policy used
+# across the project; the `cargo` group is intentionally omitted to avoid
+# multiple-crate-version noise from the aws-sdk transitive graph.
+[workspace.lints.clippy]
+all = "deny"
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+# Fast-build conformance profile: SCOPED TO THIS WORKSPACE ONLY. The SDK's
+# own root Cargo.toml has no [profile] tables and is not touched here.
+# Handler crates are thin glue that never runs hot, so their own code compiles
+# at opt-level 1 (fast). Dependencies, the SDK, tokio, aws-sdk, serde, are
+# built at opt-level 3 via the package."*" override (Cargo applies `*` to all
+# dependencies but NOT to workspace members). debug info off, no LTO, and many
+# codegen units keep the per-crate compile fast and parallel.
+[profile.release]
+opt-level = 1
+debug = false
+lto = false
+codegen-units = 256
+
+[profile.release.package."*"]
+opt-level = 3
+
+[package]
+name = "conformance"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+publish = false
+description = "Conformance handlers for the AWS Durable Execution conformance test suite"
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-config = "1"
+aws-sdk-dynamodb = "1"
+aws-durable-execution-sdk-rust = { path = ".." }

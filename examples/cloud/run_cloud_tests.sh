@@ -3,7 +3,7 @@
 #
 # Invokes every directly-invokable example in the three deployed family
 # stacks and asserts its durable execution reaches the terminal state
-# documented in examples/README.md and docs/porting-map.md. Callback
+# documented in examples/README.md. Callback
 # examples suspend awaiting an external completion; this harness drives
 # them with `aws lambda send-durable-execution-callback-success`.
 #

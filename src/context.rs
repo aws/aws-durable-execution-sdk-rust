@@ -684,6 +684,8 @@ impl DurableContext {
             result: record.result.clone(),
             error_message: record.error_message.clone(),
             error_type: record.error_type.clone(),
+            error_data: record.error_data.clone(),
+            stack_trace: record.stack_trace.clone(),
         })
     }
 
@@ -1694,7 +1696,7 @@ impl DurableContext {
         let op_id = self.mint_id();
         // The closure is stored unerased; the single erasure point is the
         // builder's `.future()` / `.await`, producing one DurableFuture box.
-        StepBuilder::new(self.clone(), op_id, f)
+        StepBuilder::new_internal(self.clone(), op_id, f)
     }
 
     /// Creates a durable wait (timer) operation.
@@ -1724,7 +1726,7 @@ impl DurableContext {
         // reason: duration ≤ i32::MAX for practical timers
         let secs = (duration.as_secs_f64().ceil() as i64).min(i64::from(i32::MAX)) as i32;
         let op_id = self.mint_id();
-        WaitBuilder::new(self.clone(), op_id, secs)
+        WaitBuilder::new_internal(self.clone(), op_id, secs)
     }
 
     /// Creates a durable invoke operation to call another durable function.
@@ -1763,7 +1765,7 @@ impl DurableContext {
         // The input is carried TYPED into the builder: the payload serdes
         // receives the owned value directly at execution time (a write-only
         // transfer), so no intermediate representation is constructed here.
-        InvokeBuilder::new(self.clone(), op_id, function_id.into(), input)
+        InvokeBuilder::new_internal(self.clone(), op_id, function_id.into(), input)
     }
 
     /// Creates a child context for fan-out / sub-orchestration.
@@ -1800,7 +1802,7 @@ impl DurableContext {
         // BoxError into the internal child-error carrier at the boundary,
         // and the single erasure point is the builder's `.future()` /
         // `.await`, producing one DurableFuture box.
-        ChildBuilder::new(self.clone(), op_id, f)
+        ChildBuilder::new_internal(self.clone(), op_id, f)
     }
 
     /// Runs a closure against a child context and retries the closure's
@@ -1868,7 +1870,7 @@ impl DurableContext {
         O: Send + 'static,
     {
         let op_id = self.mint_id();
-        WithRetryBuilder::new(self.clone(), op_id, f)
+        WithRetryBuilder::new_internal(self.clone(), op_id, f)
     }
 
     /// Creates a wait-for-condition operation that polls until a predicate
@@ -1918,7 +1920,7 @@ impl DurableContext {
         S: Clone + Send + Sync + 'static,
     {
         let op_id = self.mint_id();
-        WaitForConditionBuilder::new(self.clone(), op_id, initial_state, check)
+        WaitForConditionBuilder::new_internal(self.clone(), op_id, initial_state, check)
     }
 
     /// Creates a callback token for external completion.
@@ -1953,7 +1955,7 @@ impl DurableContext {
         O: Send + 'static,
     {
         let op_id = self.mint_id();
-        CreateCallbackBuilder::new(self.clone(), op_id)
+        CreateCallbackBuilder::new_internal(self.clone(), op_id)
     }
 
     /// Creates a wait-for-callback operation that registers and waits for
@@ -1993,7 +1995,7 @@ impl DurableContext {
         O: DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        WaitForCallbackBuilder::new(self.clone(), op_id, submitter)
+        WaitForCallbackBuilder::new_internal(self.clone(), op_id, submitter)
     }
 
     /// Creates a map operation that applies a function to each item in a
@@ -2045,7 +2047,7 @@ impl DurableContext {
         // is the builder's `.future()` / `.await`, producing one
         // DurableFuture box.
         let items: Vec<I> = items.into_iter().collect();
-        MapBuilder::new(self.clone(), op_id, items, f)
+        MapBuilder::new_internal(self.clone(), op_id, items, f)
     }
 
     /// Creates a parallel operation that executes named branches
@@ -2079,7 +2081,7 @@ impl DurableContext {
     {
         let op_id = self.mint_id();
         let branch_tuples: Vec<_> = branches.into_iter().map(Branch::into_parts).collect();
-        ParallelBuilder::new(self.clone(), op_id, branch_tuples)
+        ParallelBuilder::new_internal(self.clone(), op_id, branch_tuples)
     }
 
     /// Joins all futures, failing fast on the first error.
@@ -2117,7 +2119,7 @@ impl DurableContext {
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        TryJoinAllBuilder::new(self.clone(), op_id, futures.into_iter().collect())
+        TryJoinAllBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
     }
 
     /// Joins all futures, collecting every outcome as [`Settled`](crate::Settled).
@@ -2155,7 +2157,7 @@ impl DurableContext {
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        JoinAllBuilder::new(self.clone(), op_id, futures.into_iter().collect())
+        JoinAllBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
     }
 
     /// Returns the first successful result.
@@ -2196,7 +2198,7 @@ impl DurableContext {
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        SelectOkBuilder::new(self.clone(), op_id, futures.into_iter().collect())
+        SelectOkBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
     }
 
     /// Returns the first settled result, whether success or failure.
@@ -2236,7 +2238,7 @@ impl DurableContext {
         O: Serialize + DeserializeOwned + Send + 'static,
     {
         let op_id = self.mint_id();
-        RaceBuilder::new(self.clone(), op_id, futures.into_iter().collect())
+        RaceBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
     }
 }
 
@@ -2981,8 +2983,8 @@ mod tests {
             result: Some(r#""summary""#.to_owned()),
             error_type: Some("BatchError".to_owned()),
             error_message: Some("batch broke".to_owned()),
-            error_data: None,
-            stack_trace: None,
+            error_data: Some(r#"{"code":7}"#.to_owned()),
+            stack_trace: Some(vec!["frame-a".to_owned()]),
             attempt: 3,
             invoke_result: Some("never-projected".to_owned()),
             invoke_error_type: Some("never-projected".to_owned()),
@@ -3005,6 +3007,8 @@ mod tests {
                 result: Some(r#""summary""#.to_owned()),
                 error_message: Some("batch broke".to_owned()),
                 error_type: Some("BatchError".to_owned()),
+                error_data: Some(r#"{"code":7}"#.to_owned()),
+                stack_trace: Some(vec!["frame-a".to_owned()]),
             })
         );
 

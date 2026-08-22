@@ -448,6 +448,73 @@ async fn step_serialization_failure_kind_is_replay_equivalent() {
     assert_eq!(step_op.error_type(), Some(SERIALIZATION_FAILED));
 }
 
+/// An ordinary terminal step failure classifies as
+/// `StepErrorKind::RetriesExhausted` on the live path, and replay must
+/// reconstruct the SAME kind carrying the SAME attempt count from the
+/// recorded FAIL: a handler that branches on the kind (or the attempt)
+/// creates the same operations live and replayed.
+#[tokio::test]
+async fn step_retries_exhausted_kind_is_replay_equivalent() {
+    let kinds = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let kinds_h = Arc::clone(&kinds);
+
+    let result = LocalRunner::new()
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let kinds = Arc::clone(&kinds_h);
+                async move {
+                    let step_result = ctx
+                        .step(|_| async { Err::<String, durable::BoxError>("boom".into()) })
+                        .name("always-fails")
+                        .retry_strategy(|_err, attempt| {
+                            if attempt >= 2 {
+                                durable::RetryDecision::Stop
+                            } else {
+                                durable::RetryDecision::Retry {
+                                    delay: Duration::from_secs(1),
+                                }
+                            }
+                        })
+                        .await;
+                    let err = step_result.expect_err("the step must fail terminally");
+                    // The full Debug rendering carries both the variant and
+                    // its attempt payload, so equality across invocations
+                    // asserts kind AND attempt equivalence.
+                    kinds
+                        .lock()
+                        .expect("test mutex")
+                        .push(step_kind_label(&err));
+
+                    // Cross an invocation boundary so the next observation
+                    // is reconstructed from the recorded FAIL.
+                    ctx.wait(Duration::from_secs(1)).name("boundary").await?;
+                    Ok::<_, durable::BoxError>("recovered".to_owned())
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await;
+
+    assert!(result.is_success(), "{:?}", result.error_message());
+    let kinds = kinds.lock().expect("test mutex");
+    assert!(
+        kinds.len() >= 2,
+        "need one live and at least one replayed observation, got {kinds:?}"
+    );
+    assert!(
+        kinds[0].contains("RetriesExhausted"),
+        "the live kind must be RetriesExhausted: {kinds:?}"
+    );
+    assert!(
+        kinds[0].contains("attempts: 2"),
+        "the live kind must carry the failing attempt: {kinds:?}"
+    );
+    assert!(
+        kinds.windows(2).all(|w| w[0] == w[1]),
+        "live and replayed kinds (including attempts) must match: {kinds:?}"
+    );
+}
+
 /// Review finding 2 (child context): a child whose result fails
 /// serialization persists a terminal FAIL BEFORE yielding, so the closure
 /// runs exactly once across an invocation boundary and replay yields the

@@ -74,7 +74,7 @@ impl<O, S> std::fmt::Debug for CreateCallbackBuilder<O, S> {
 
 impl<O: Send + 'static> CreateCallbackBuilder<O> {
     /// Creates a new builder (internal).
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId) -> Self {
+    pub(crate) fn new_internal(ctx: DurableContext, op_id: OperationId) -> Self {
         Self {
             ctx,
             op_id,
@@ -259,7 +259,7 @@ where
     /// Creates a new builder (internal). Taking the submitter here keeps
     /// the field non-optional: a builder without a submitter is
     /// unrepresentable.
-    pub(crate) fn new(ctx: DurableContext, op_id: OperationId, submitter: F) -> Self {
+    pub(crate) fn new_internal(ctx: DurableContext, op_id: OperationId, submitter: F) -> Self {
         Self {
             ctx,
             op_id,
