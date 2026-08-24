@@ -12,7 +12,7 @@ name: Conformance Tests
 
 on:
   push:
-    branches: [alpha]
+    branches: [main]
     paths:
       - "src/**"
       - "conformance/**"
@@ -20,7 +20,7 @@ on:
       - "Cargo.lock"
       - ".github/workflows/conformance-tests.yml"
   pull_request:
-    branches: [alpha]
+    branches: [main]
     paths:
       - "src/**"
       - "conformance/**"
