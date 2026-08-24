@@ -179,9 +179,7 @@ several operations or needs to observe replay.
 ## The conformance suite
 
 `conformance/` holds Lambda handlers in nine suites that a language-agnostic
-runner drives against the live service. (A `compliance` symlink points at it
-for tooling that predates the rename; new references should use
-`conformance/`.) The runner starts each handler's
+runner drives against the live service. The runner starts each handler's
 execution, then compares the recorded history against the language-independent
 durable execution contract, which is how we know the Rust implementation
 satisfies the service specification rather than merely passing its own tests.
