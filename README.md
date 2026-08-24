@@ -9,20 +9,16 @@ minutes or a month therefore fits in one ordinary async Rust function, and
 once the service records a step's result, replay returns that result
 without re-running the body.
 
-## Status
+> [!WARNING]
+> This is an experimental preview, not intended for production use. The API
+> may change without notice, and the final version may look different from
+> what you see today.
 
-Preview. The `main` branch carries the current code. Steps, waits, invokes,
-callbacks, child contexts, map, parallel, and the four combinators all work
-against the live service, and the API may still change. `make check` runs the
-quality checks: formatting, clippy, tests and doctests, docs, and the
-dependency policy.
-
-The crate is not on crates.io yet, so depend on the repository directly. It
-requires Rust 1.94.1 or newer and edition 2024.
+The SDK requires Rust 1.94.1 or newer and edition 2024.
 
 ```toml
 [dependencies]
-aws-durable-execution-sdk-rust = { git = "https://github.com/aws/aws-durable-execution-sdk-rust", branch = "main" }
+aws-durable-execution-sdk-rust = { git = "https://github.com/aws/aws-durable-execution-sdk-rust" }
 lambda_runtime = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros"] }
@@ -723,6 +719,15 @@ demo harness.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, the quality
 gate, and how to run the test suites.
+
+## Acknowledgments
+
+Big thanks to [@jlizen](https://github.com/jlizen),
+[@landonxjames](https://github.com/landonxjames), and
+[@bnusunny](https://github.com/bnusunny), whose insightful advice on the
+early experimental versions caught the bugs before they became bugs, and
+whose eagle-eyed reviews caught the subtle (and not-so-subtle!) ones before
+they could bite anyone.
 
 ## License
 
