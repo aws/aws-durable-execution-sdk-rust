@@ -14,7 +14,9 @@ edition = "2024"
 rust-version = "1.94.1"
 license = "Apache-2.0"
 description = "Rust SDK for AWS Lambda Durable Functions"
-publish = false
+repository = "https://github.com/aws/aws-durable-execution-sdk-rust"
+readme = "README.md"
+keywords = ["aws", "lambda", "durable-execution", "workflow"]
 
 [lib]
 name = "aws_durable_execution_sdk"
@@ -74,6 +76,11 @@ cargo = { level = "warn", priority = -1 }
 # Allow multiple versions of transitive dependencies: the AWS SDK
 # ecosystem has not yet converged on single versions for all crates.
 multiple_crate_versions = { level = "allow", priority = 1 }
+# cargo_common_metadata demands `categories`, and no crates.io category
+# fits a durable-execution SDK (there is no workflow/orchestration/
+# serverless category; the aws-sdk crates ship without registry metadata
+# for the same reason). Keywords are still set voluntarily in [package].
+cargo_common_metadata = { level = "allow", priority = 1 }
 # Panic-policy restriction lints (not covered by all/pedantic; added explicitly).
 # A panic in the SDK kills the customer's Lambda invocation.
 unwrap_used = "deny"
