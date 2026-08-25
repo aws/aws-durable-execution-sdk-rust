@@ -66,6 +66,17 @@ description = "Conformance handlers for the AWS Durable Execution conformance te
 workspace = true
 
 [dependencies]
-aws-config = "1"
-aws-sdk-dynamodb = "1"
+# default-features = false drops the legacy rustls 0.21 TLS backend that
+# default features pull in via aws-smithy-http-client (same trim the SDK's
+# own Cargo.toml applies; see issue #50). The legacy chain pinned the
+# RUSTSEC-flagged rustls-webpki 0.101, which Dependabot cannot security-bump.
+aws-config = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-durable-execution-sdk = { path = ".." }
