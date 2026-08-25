@@ -8,7 +8,7 @@
 //! created in the same sequence, so each is paired with the same recorded
 //! result on every replay.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Mints a clock-derived token in a step, then runs two ordered steps.
 async fn handler(

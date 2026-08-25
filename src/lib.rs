@@ -16,7 +16,7 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use aws_durable_execution_sdk_rust as durable;
+//! use aws_durable_execution_sdk as durable;
 //! use serde::{Deserialize, Serialize};
 //!
 //! #[derive(Deserialize, Serialize)]
@@ -147,7 +147,7 @@ use tracing::Instrument as _;
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,
@@ -169,7 +169,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::RetryDecision;
+/// use aws_durable_execution_sdk::RetryDecision;
 /// use std::time::Duration;
 ///
 /// let retry = RetryDecision::Retry {
@@ -250,7 +250,7 @@ pub(crate) type RetryStrategy = Box<dyn Fn(&StepError, u32) -> RetryDecision + S
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use serde::Deserialize;
 ///
 /// #[derive(Deserialize)]
@@ -301,7 +301,7 @@ where
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use serde::Deserialize;
 ///
 /// #[derive(Deserialize)]
@@ -768,7 +768,7 @@ type BoxedInvocationFuture = std::pin::Pin<
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Deserialize)]

@@ -3,7 +3,7 @@
 //! Operation builders are lazy: a builder that is only held does no work until
 //! it is awaited. `.spawn()` opts into eager execution: it starts the
 //! operation immediately on its own task and returns a running
-//! [`DurableFuture`](aws_durable_execution_sdk_rust::DurableFuture) you await
+//! [`DurableFuture`](aws_durable_execution_sdk::DurableFuture) you await
 //! later. Several `.spawn()`ed operations therefore make progress
 //! concurrently while you set up more work.
 //!
@@ -16,7 +16,7 @@
 //! This example spawns three steps eagerly and sums their results once all have
 //! completed.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Spawns three steps eagerly and returns the sum of their results.
 async fn handler(

@@ -1,6 +1,6 @@
 //! Conformance requirement 3-9: child replay (child then wait).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: child followed by wait; on replay child returns cached result.

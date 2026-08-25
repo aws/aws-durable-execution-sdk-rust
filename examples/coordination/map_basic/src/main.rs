@@ -12,11 +12,11 @@
 //!
 //! This example maps a short list of strings, naming each item's context.
 //!
-//! [`map`]: aws_durable_execution_sdk_rust::DurableContext::map
-//! [`parallel`]: aws_durable_execution_sdk_rust::DurableContext::parallel
-//! [`item_namer`]: aws_durable_execution_sdk_rust::builders::MapBuilder::item_namer
+//! [`map`]: aws_durable_execution_sdk::DurableContext::map
+//! [`parallel`]: aws_durable_execution_sdk::DurableContext::parallel
+//! [`item_namer`]: aws_durable_execution_sdk::builders::MapBuilder::item_namer
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Maps over a list of strings, naming each item's context by index.
 async fn handler(

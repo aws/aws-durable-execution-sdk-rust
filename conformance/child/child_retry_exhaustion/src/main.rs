@@ -1,6 +1,6 @@
 //! Conformance requirement 3-8: child with retry exhaustion.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: child step always fails, retries exhaust.

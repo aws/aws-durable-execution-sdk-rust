@@ -1,7 +1,7 @@
 //! Conformance requirement 8-22: Parallel tolerated-failure-percentage at the
 //! boundary (exactly 25% with one failure in four branches).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
 

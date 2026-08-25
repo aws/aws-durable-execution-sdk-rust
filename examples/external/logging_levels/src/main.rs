@@ -8,7 +8,7 @@
 //! `lambda_runtime::tracing::init_default_subscriber()`, which honors
 //! `AWS_LAMBDA_LOG_FORMAT` and `AWS_LAMBDA_LOG_LEVEL`.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Emits one event at each level from inside a step, then returns.
 async fn handler(

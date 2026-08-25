@@ -1,6 +1,6 @@
 //! Conformance requirement 3-1: child context with a single step.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: child context with a single step returning the input.
 async fn handler(

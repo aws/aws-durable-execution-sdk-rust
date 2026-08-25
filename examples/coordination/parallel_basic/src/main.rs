@@ -12,12 +12,12 @@
 //! and one that waits before returning, showing that heterogeneous work with
 //! the same result type composes cleanly.
 //!
-//! [`parallel`]: aws_durable_execution_sdk_rust::DurableContext::parallel
-//! [`Branch`]: aws_durable_execution_sdk_rust::Branch
+//! [`parallel`]: aws_durable_execution_sdk::DurableContext::parallel
+//! [`Branch`]: aws_durable_execution_sdk::Branch
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Branch;
 
 /// Fans out two branches concurrently and returns their results in order.

@@ -1,16 +1,16 @@
 //! Create a callback token, hand it to an external system, and block until that
 //! system reports the result.
 //!
-//! [`DurableContext::create_callback`](aws_durable_execution_sdk_rust::DurableContext::create_callback)
+//! [`DurableContext::create_callback`](aws_durable_execution_sdk::DurableContext::create_callback)
 //! mints a durable callback and returns a
-//! [`Callback`](aws_durable_execution_sdk_rust::builders::callback::Callback) immediately. The
+//! [`Callback`](aws_durable_execution_sdk::builders::callback::Callback) immediately. The
 //! callback id is what you deliver to the outside world (a webhook target, a
 //! queue message, an approval email). The execution then suspends on
 //! `cb.result()` until an external caller completes the callback with
 //! `SendDurableExecutionCallbackSuccess`, at which point the recorded result is
 //! returned. The event is used as the callback's name.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {

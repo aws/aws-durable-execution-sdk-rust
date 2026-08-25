@@ -103,11 +103,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-durable-execution-sdk-rust"
+name = "aws-durable-execution-sdk"
 version = "0.1.0"
 dependencies = [
  "aws-config",
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "aws-sdk-lambda",
  "aws-smithy-mocks",
  "aws-smithy-runtime-api",

@@ -1,6 +1,6 @@
 //! Conformance requirement 5-3: invoke returning a complex nested object.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: invoke with complex event, target echoes it back.
 async fn handler(

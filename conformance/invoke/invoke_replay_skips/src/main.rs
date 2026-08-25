@@ -1,6 +1,6 @@
 //! Conformance requirement 5-9: replay skips succeeded invoke.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: invoke then wait: on replay the invoke returns cached result.

@@ -6,7 +6,7 @@
 //! outcomes distinguishes genuine branch execution (exactly one of each)
 //! from the all-rejected failure mode.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Settled;
 
 /// Handler: joins one succeeding and one failing step, returns the counts.

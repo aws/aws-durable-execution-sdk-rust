@@ -29,7 +29,7 @@ use crate::serdes::JsonSerdes;
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Serialize, Deserialize)]
@@ -147,7 +147,7 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use durable::serdes::SerdesContext;
     ///
     /// # struct UpperSerdes;
@@ -224,7 +224,7 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,

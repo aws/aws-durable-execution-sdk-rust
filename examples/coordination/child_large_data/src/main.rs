@@ -9,7 +9,7 @@
 //! by a serdes that offloads the bytes to an external store; see the
 //! large-payload example in the external/serdes family for that pattern.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Runs a child that produces a large (~128 KB) result and returns its length.
 async fn handler(

@@ -12,7 +12,7 @@
 //! failed with the same error every time: the failure is deterministic. This
 //! is the intended terminal state for this example, not a defect.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Completes a durable step, then returns an error as the execution's outcome.
 async fn handler(

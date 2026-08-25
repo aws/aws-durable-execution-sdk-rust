@@ -1,6 +1,6 @@
 //! Conformance requirement 5-12: invoke then step.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: invoke target, then step processes the result.
 async fn handler(

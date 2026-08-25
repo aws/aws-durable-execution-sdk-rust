@@ -1,7 +1,7 @@
 //! Conformance requirement 9-2: Map invoked with the items-only form (no name
 //! argument), each item returns directly.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 
 /// Handler: map without a name, items doubled.

@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 7-5: wait_for_callback with 3s timeout.
 //! No external completion, so it times out.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 #[tokio::main]

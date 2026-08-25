@@ -1,6 +1,6 @@
 //! Conformance requirement 2-1: wait basic.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: a single wait operation with a specified duration.

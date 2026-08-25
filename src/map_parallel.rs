@@ -90,7 +90,7 @@ pub enum BatchItemStatus {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::{BatchItemStatus, BatchItem};
+/// use aws_durable_execution_sdk::builders::map_parallel::{BatchItemStatus, BatchItem};
 ///
 /// let item: BatchItem<i32> = BatchItem::new(
 ///     0,
@@ -213,7 +213,7 @@ impl<O> BatchItem<O> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::BatchStatus;
+/// use aws_durable_execution_sdk::builders::map_parallel::BatchStatus;
 ///
 /// assert_eq!(BatchStatus::Succeeded.as_str(), "SUCCEEDED");
 /// assert_eq!(BatchStatus::Failed.to_string(), "FAILED");
@@ -258,7 +258,7 @@ impl std::fmt::Display for BatchStatus {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::{BatchResult, BatchItem, BatchItemStatus, CompletionReason};
+/// use aws_durable_execution_sdk::builders::map_parallel::{BatchResult, BatchItem, BatchItemStatus, CompletionReason};
 ///
 /// let result: BatchResult<i32> = BatchResult::new(
 ///     vec![BatchItem::new(
@@ -303,7 +303,7 @@ pub struct BatchError<'a> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::CompletionReason;
+/// use aws_durable_execution_sdk::builders::map_parallel::CompletionReason;
 ///
 /// let reason = CompletionReason::AllCompleted;
 /// assert_eq!(reason.as_str(), "ALL_COMPLETED");
@@ -394,7 +394,7 @@ impl CompletionReason {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::{BatchItemStatus, SettledOutcome};
+/// use aws_durable_execution_sdk::builders::map_parallel::{BatchItemStatus, SettledOutcome};
 ///
 /// let outcome = SettledOutcome::new(3, BatchItemStatus::Failed);
 /// assert_eq!(outcome.index(), 3);
@@ -450,7 +450,7 @@ impl SettledOutcome {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::{BatchItemStatus, BatchStats, SettledOutcome};
+/// use aws_durable_execution_sdk::builders::map_parallel::{BatchItemStatus, BatchStats, SettledOutcome};
 ///
 /// let outcomes = [
 ///     SettledOutcome::new(0, BatchItemStatus::Failed),
@@ -543,7 +543,7 @@ impl<'a> BatchStats<'a> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::{
+/// use aws_durable_execution_sdk::builders::map_parallel::{
 ///     BatchResult, BatchItem, BatchItemStatus, BatchStatus, CompletionReason,
 /// };
 ///
@@ -675,7 +675,7 @@ impl<O> BatchResult<O> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::NestingMode;
+/// use aws_durable_execution_sdk::builders::map_parallel::NestingMode;
 ///
 /// let mode = NestingMode::Flat;
 /// assert_ne!(mode, NestingMode::Normal);

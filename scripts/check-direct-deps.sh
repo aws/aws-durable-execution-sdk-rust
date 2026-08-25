@@ -83,7 +83,7 @@ check_graph() {
             esac
 
             # Workspace members have a local path in parentheses, e.g.:
-            #   aws-durable-execution-sdk-rust v0.1.0 (/path/to/crate)
+            #   aws-durable-execution-sdk v0.1.0 (/path/to/crate)
             # Duplicates (shown as dep of another member) have (*) and should
             # NOT start a new section.
             case "$line" in

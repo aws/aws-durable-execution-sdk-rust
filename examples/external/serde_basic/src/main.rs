@@ -8,9 +8,9 @@
 //! transparent to the rest of the handler: the step below observes `"hello"`
 //! whether the value came from live execution or from a replayed checkpoint.
 //!
-//! [`Serdes`]: aws_durable_execution_sdk_rust::Serdes
+//! [`Serdes`]: aws_durable_execution_sdk::Serdes
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Serdes;
 use durable::serdes::SerdesContext;
 

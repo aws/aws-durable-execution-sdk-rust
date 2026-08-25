@@ -1,6 +1,6 @@
 //! Conformance requirement 2-5: wait with long duration (1 hour).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: a wait with a 1-hour duration, verifying conversion to seconds.

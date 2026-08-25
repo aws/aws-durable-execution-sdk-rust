@@ -1,6 +1,6 @@
 //! Chained durable invocation: call another durable function and use its result.
 //!
-//! [`DurableContext::invoke`](aws_durable_execution_sdk_rust::DurableContext::invoke)
+//! [`DurableContext::invoke`](aws_durable_execution_sdk::DurableContext::invoke)
 //! starts a child durable execution of a different function and checkpoints its
 //! result. On replay the recorded result is returned without re-invoking the
 //! callee, so the call happens exactly once across the whole execution.
@@ -9,7 +9,7 @@
 //! variable so the same handler works against any deployed callee. The output
 //! type is turbofished; the input type is inferred.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Invokes the echo target with the incoming event and returns its result.
 async fn handler(

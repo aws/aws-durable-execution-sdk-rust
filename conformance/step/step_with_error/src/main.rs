@@ -1,6 +1,6 @@
 //! Conformance requirement 1-19: step with error (fails permanently, no retries).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: step that always fails, with no retries.
 async fn handler(

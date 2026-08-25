@@ -103,7 +103,7 @@ impl std::fmt::Debug for Inner {
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,
@@ -1594,7 +1594,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -1617,7 +1617,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -1646,7 +1646,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -1674,7 +1674,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -1707,7 +1707,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use std::time::Duration;
     ///
     /// async fn handler(
@@ -1737,7 +1737,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use serde::{Deserialize, Serialize};
     ///
     /// #[derive(Serialize, Deserialize)]
@@ -1777,7 +1777,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -1831,8 +1831,8 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
-    /// use aws_durable_execution_sdk_rust::RetryDecision;
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::RetryDecision;
     /// use std::time::Duration;
     ///
     /// async fn handler(
@@ -1889,7 +1889,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use serde::{Deserialize, Serialize};
     ///
     /// #[derive(Clone, Serialize, Deserialize)]
@@ -1932,7 +1932,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use serde::{Deserialize, Serialize};
     ///
     /// #[derive(Serialize, Deserialize)]
@@ -1968,7 +1968,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use serde::{Deserialize, Serialize};
     ///
     /// #[derive(Deserialize, Serialize)]
@@ -2007,7 +2007,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use serde::{Deserialize, Serialize};
     ///
     /// #[derive(Clone, Serialize, Deserialize)]
@@ -2056,7 +2056,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -2097,7 +2097,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -2135,7 +2135,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -2176,7 +2176,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -2219,7 +2219,7 @@ impl DurableContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -2255,7 +2255,7 @@ impl DurableContext {
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,

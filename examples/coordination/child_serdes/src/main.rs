@@ -13,9 +13,9 @@
 //! applies to large payloads without change, so a serdes and a large-payload
 //! child compose directly.
 //!
-//! [`Serdes`]: aws_durable_execution_sdk_rust::Serdes
+//! [`Serdes`]: aws_durable_execution_sdk::Serdes
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Serdes;
 use durable::serdes::SerdesContext;
 

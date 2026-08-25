@@ -1,7 +1,7 @@
 //! Conformance requirement 9-7: Map with a min-successful completion config
 //! stops early once enough items succeed.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 use durable::builders::map_parallel::CompletionConfig;
 

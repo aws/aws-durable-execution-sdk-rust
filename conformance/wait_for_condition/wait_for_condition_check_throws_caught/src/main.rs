@@ -1,6 +1,6 @@
 //! Conformance handler for requirement 6-8: check throws, caught by handler.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::builders::wait_for_condition::WaitDecision;
 
 #[tokio::main]

@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 4-16: callback with numeric deserialization.
 //! Callback payload is a number, handler returns count and doubled value.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use serde::Serialize;
 
 /// Output returned by the handler.

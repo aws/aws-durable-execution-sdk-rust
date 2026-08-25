@@ -1,6 +1,6 @@
 //! Conformance requirement 1-16: retry specific exception (non-retryable fails).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::fmt;
 
 /// Custom error type (TransientError) that the retry strategy does NOT retry.

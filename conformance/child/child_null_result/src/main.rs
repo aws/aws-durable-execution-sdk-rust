@@ -1,6 +1,6 @@
 //! Conformance requirement 3-16: child returns null without any durable op.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: child returns null (None) without calling any operations.
 async fn handler(

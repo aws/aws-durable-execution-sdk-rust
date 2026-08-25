@@ -4,12 +4,12 @@
 //! The handler is identical to `invoke_target`; tenant isolation is configured
 //! on the deployed function (`TenancyConfig` in the SAM template), not in
 //! handler code. The caller passes a tenant id through
-//! [`InvokeBuilder::tenant_id`](aws_durable_execution_sdk_rust::builders::InvokeBuilder::tenant_id),
+//! [`InvokeBuilder::tenant_id`](aws_durable_execution_sdk::builders::InvokeBuilder::tenant_id),
 //! and the platform routes the invocation to the matching tenant partition.
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Echoes the input event unchanged after a one-second durable wait.
 async fn handler(

@@ -21,7 +21,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       Description: >-
-        Execution role for aws-durable-execution-sdk-rust cloud test suites.
+        Execution role for aws-durable-execution-sdk cloud test suites.
         Grants the union of what the conformance suites and the example suite
         need. Intended for a dedicated test account.
       AssumeRolePolicyDocument:

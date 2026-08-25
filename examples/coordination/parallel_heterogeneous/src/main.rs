@@ -1,6 +1,6 @@
 //! Heterogeneous fan-out: differently-typed operations in parallel.
 //!
-//! [`parallel`](aws_durable_execution_sdk_rust::DurableContext::parallel)
+//! [`parallel`](aws_durable_execution_sdk::DurableContext::parallel)
 //! requires a single branch result type. When you want to run operations that
 //! return *different* types concurrently, the idiom is to hold the operation
 //! builders and drive them with `tokio::join!`. Each builder claims its
@@ -14,7 +14,7 @@
 //!
 //! This example joins a numeric step and a string step, then combines them.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Joins two differently-typed steps concurrently and combines their results.
 async fn handler(

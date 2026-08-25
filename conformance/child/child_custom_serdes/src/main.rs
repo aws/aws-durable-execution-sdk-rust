@@ -1,6 +1,6 @@
 //! Conformance requirement 3-14: child with custom serdes.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Uppercases the serialized result.
 #[derive(Debug)]

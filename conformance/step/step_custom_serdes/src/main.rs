@@ -1,6 +1,6 @@
 //! Conformance requirement 1-6: step with custom serdes (uppercase).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Serdes;
 use durable::serdes::SerdesContext;
 

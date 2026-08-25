@@ -8,11 +8,11 @@
 //! state or configuration it carries) serves every operation and output
 //! type it supports.
 //!
-//! [`Serdes`]: aws_durable_execution_sdk_rust::Serdes
+//! [`Serdes`]: aws_durable_execution_sdk::Serdes
 
 use std::sync::Arc;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Serdes;
 use durable::serdes::SerdesContext;
 

@@ -18,7 +18,7 @@ The SDK requires Rust 1.94.1 or newer and edition 2024.
 
 ```toml
 [dependencies]
-aws-durable-execution-sdk-rust = { git = "https://github.com/aws/aws-durable-execution-sdk-rust" }
+aws-durable-execution-sdk = { git = "https://github.com/aws/aws-durable-execution-sdk-rust" }
 lambda_runtime = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros"] }
@@ -33,7 +33,7 @@ two second timer, then runs a second step that reads the first result.
 ```rust no_run
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 async fn handler(
     _event: serde_json::Value,

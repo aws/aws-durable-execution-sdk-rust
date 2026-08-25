@@ -1,6 +1,6 @@
 //! Conformance requirement 1-1: step basic (succeeds on first attempt).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: single step that returns a greeting.
 async fn handler(

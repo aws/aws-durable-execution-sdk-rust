@@ -1,6 +1,6 @@
 //! Basic step: checkpoint one unit of work.
 //!
-//! [`ctx.step`](aws_durable_execution_sdk_rust::DurableContext::step) runs a
+//! [`ctx.step`](aws_durable_execution_sdk::DurableContext::step) runs a
 //! closure and records its result. The first time the function runs, the
 //! closure executes and the return value is checkpointed. If the execution is
 //! later interrupted and replayed, the closure is NOT run again: the recorded
@@ -11,11 +11,11 @@
 //! A step body may be nondeterministic (call a service, read the clock); only
 //! the recorded result participates in replay. Note that the step closure
 //! receives a
-//! [`StepContext`](aws_durable_execution_sdk_rust::StepContext), which
+//! [`StepContext`](aws_durable_execution_sdk::StepContext), which
 //! deliberately exposes no durable operations: nesting durable operations
 //! inside a step is a compile error, not a runtime surprise.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Runs one checkpointed step and returns its result.
 async fn handler(

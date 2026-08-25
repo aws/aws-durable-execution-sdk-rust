@@ -1,7 +1,7 @@
 //! Child contexts: an isolated, composable unit of durable work.
 //!
 //! [`run_in_child_context`] runs a closure in its own child
-//! [`DurableContext`](aws_durable_execution_sdk_rust::DurableContext).
+//! [`DurableContext`](aws_durable_execution_sdk::DurableContext).
 //! Operations inside the child are numbered in a namespace nested under the
 //! parent, so a child is a self-contained unit you can build, name, and later
 //! fan out concurrently without operation identities colliding. The child's
@@ -9,15 +9,15 @@
 //!
 //! This example runs one child that performs two sequential steps and returns
 //! a combined result. The child body returns
-//! [`BoxError`](aws_durable_execution_sdk_rust::BoxError); a failing
+//! [`BoxError`](aws_durable_execution_sdk::BoxError); a failing
 //! inner operation converts into it with `?`.
 //!
 //! For the concurrent case, spawning several such children with `.spawn()`
 //! and joining them, see the `child_fanout` example in this family.
 //!
-//! [`run_in_child_context`]: aws_durable_execution_sdk_rust::DurableContext::run_in_child_context
+//! [`run_in_child_context`]: aws_durable_execution_sdk::DurableContext::run_in_child_context
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Runs a single child context that fetches a name and formats a greeting.
 async fn handler(

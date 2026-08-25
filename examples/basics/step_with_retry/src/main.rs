@@ -4,9 +4,9 @@
 //! unavailable. A [`retry_strategy`] turns those transient failures into
 //! automatic retries with backoff. The strategy is a function of the error and
 //! the attempt number (1-based); it returns
-//! [`RetryDecision::Retry`](aws_durable_execution_sdk_rust::RetryDecision::Retry)
+//! [`RetryDecision::Retry`](aws_durable_execution_sdk::RetryDecision::Retry)
 //! with a delay, or
-//! [`RetryDecision::Stop`](aws_durable_execution_sdk_rust::RetryDecision::Stop)
+//! [`RetryDecision::Stop`](aws_durable_execution_sdk::RetryDecision::Stop)
 //! to give up and propagate the error.
 //!
 //! Between attempts the execution suspends for the delay and resumes later, so
@@ -16,17 +16,17 @@
 //!
 //! This example demonstrates the pattern deterministically: the step reads the
 //! 1-based attempt number from its
-//! [`StepContext`](aws_durable_execution_sdk_rust::StepContext) and fails the
+//! [`StepContext`](aws_durable_execution_sdk::StepContext) and fails the
 //! first two attempts, so the retry path is exercised end to end and the third
 //! attempt succeeds. Real code would instead fail because an actual dependency
 //! call failed.
 //!
-//! [`retry_strategy`]: aws_durable_execution_sdk_rust::DurableContext::step
+//! [`retry_strategy`]: aws_durable_execution_sdk::DurableContext::step
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
-use aws_durable_execution_sdk_rust::{RetryDecision, StepSemantics};
+use aws_durable_execution_sdk as durable;
+use aws_durable_execution_sdk::{RetryDecision, StepSemantics};
 
 /// Runs a step that succeeds only on its third attempt, driven by a retry
 /// strategy that backs off and stops after three attempts.

@@ -4,7 +4,7 @@
 //! which must be blessed with the task-ownership guard: an unblessed
 //! branch is rejected as a foreign task and the combinator fails.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: joins two step futures and returns the sum of their results.
 async fn handler(

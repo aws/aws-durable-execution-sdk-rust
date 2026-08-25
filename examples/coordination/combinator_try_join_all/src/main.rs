@@ -12,10 +12,10 @@
 //!
 //! This example gathers three steps into a single result vector.
 //!
-//! [`try_join_all`]: aws_durable_execution_sdk_rust::DurableContext::try_join_all
-//! [`DurableFuture`]: aws_durable_execution_sdk_rust::DurableFuture
+//! [`try_join_all`]: aws_durable_execution_sdk::DurableContext::try_join_all
+//! [`DurableFuture`]: aws_durable_execution_sdk::DurableFuture
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Gathers three concurrent steps, failing fast if any errors.
 async fn handler(

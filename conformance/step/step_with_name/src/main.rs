@@ -1,6 +1,6 @@
 //! Conformance requirement 1-2: step with explicit name.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: step with a named operation.
 async fn handler(

@@ -6,7 +6,7 @@
 //! conformance test expects `ExecutionStatus: SUCCEEDED` with a result object,
 //! so the error is caught and returned as a successful Lambda response.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
 

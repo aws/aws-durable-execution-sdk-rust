@@ -1,6 +1,6 @@
 //! Basic wait: pause a durable function without holding the invocation open.
 //!
-//! [`ctx.wait`](aws_durable_execution_sdk_rust::DurableContext::wait) suspends
+//! [`ctx.wait`](aws_durable_execution_sdk::DurableContext::wait) suspends
 //! the execution for a
 //! [`Duration`](std::time::Duration). This is not a `sleep` that blocks a
 //! running Lambda: the SDK checkpoints the wait, the invocation ends, and the
@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Logs a line, waits two seconds (suspending the execution), then completes.
 async fn handler(

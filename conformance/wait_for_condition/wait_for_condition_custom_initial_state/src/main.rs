@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 6-4: wait_for_condition custom initial state.
 //! Initial state of 5, polls until threshold from input.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::builders::wait_for_condition::WaitDecision;
 use std::time::Duration;
 

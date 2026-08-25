@@ -1,6 +1,6 @@
 //! Conformance requirement 5-14: multiple sequential invokes.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: two sequential invokes, second consumes the first's result.
 async fn handler(

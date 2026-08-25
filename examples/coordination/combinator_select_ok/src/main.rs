@@ -10,9 +10,9 @@
 //! This example races a failing operation against a succeeding one and returns
 //! the successful value.
 //!
-//! [`select_ok`]: aws_durable_execution_sdk_rust::DurableContext::select_ok
+//! [`select_ok`]: aws_durable_execution_sdk::DurableContext::select_ok
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Returns the first successful result, skipping a failing operation.
 async fn handler(

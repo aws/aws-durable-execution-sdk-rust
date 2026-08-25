@@ -1,6 +1,6 @@
 //! Conformance requirement 5-13: invoke inside a child context.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: invoke inside a child context.
 async fn handler(

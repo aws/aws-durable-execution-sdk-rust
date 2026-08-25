@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 6-1: wait_for_condition basic.
 //! Polls an incrementing counter until it reaches the input threshold.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::builders::wait_for_condition::WaitDecision;
 use std::time::Duration;
 

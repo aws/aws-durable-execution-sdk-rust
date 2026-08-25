@@ -1,6 +1,6 @@
 //! Target function that fails: waits briefly then returns an error.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Error handler: wait 1s then fail.

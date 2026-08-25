@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 
 /// Handler: parallel with one branch doing a step and another doing a wait.

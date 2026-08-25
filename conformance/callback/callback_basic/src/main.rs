@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 4-1: create callback basic.
 //! Creates a callback using the input as the name, blocks on result, returns it.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {

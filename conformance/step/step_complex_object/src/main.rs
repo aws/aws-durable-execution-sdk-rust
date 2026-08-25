@@ -1,6 +1,6 @@
 //! Conformance requirement 1-4: returning a complex nested object.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use serde::{Deserialize, Serialize};
 
 /// Input event.

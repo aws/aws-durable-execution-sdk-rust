@@ -9,9 +9,9 @@
 //! The behavior is defined by conformance requirement 9-12. This example maps
 //! three numbers in flat mode, incrementing each.
 //!
-//! [`NestingMode::Flat`]: aws_durable_execution_sdk_rust::builders::map_parallel::NestingMode::Flat
+//! [`NestingMode::Flat`]: aws_durable_execution_sdk::builders::map_parallel::NestingMode::Flat
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::builders::map_parallel::NestingMode;
 
 /// Maps three numbers in flat (virtual) contexts and returns the results.

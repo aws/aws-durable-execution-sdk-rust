@@ -4,7 +4,7 @@
 //! ownership error instead of settling normally. Both branches return the
 //! same value so the winner is deterministic regardless of scheduling.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: races two steps that both return "done".
 async fn handler(

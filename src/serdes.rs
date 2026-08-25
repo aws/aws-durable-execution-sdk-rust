@@ -81,8 +81,8 @@ use crate::BoxError;
 /// through a blanket `impl`.
 ///
 /// ```compile_fail,E0277
-/// use aws_durable_execution_sdk_rust as durable;
-/// use aws_durable_execution_sdk_rust::serdes::{Serdes, SerdesContext};
+/// use aws_durable_execution_sdk as durable;
+/// use aws_durable_execution_sdk::serdes::{Serdes, SerdesContext};
 ///
 /// #[derive(serde::Serialize, serde::Deserialize)]
 /// struct Order { id: u64 }
@@ -126,8 +126,8 @@ use crate::BoxError;
 /// implementation satisfies the `impl Future` return type:
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::BoxError;
-/// use aws_durable_execution_sdk_rust::serdes::{Serdes, SerdesContext};
+/// use aws_durable_execution_sdk::BoxError;
+/// use aws_durable_execution_sdk::serdes::{Serdes, SerdesContext};
 ///
 /// struct UppercaseSerdes;
 ///
@@ -201,8 +201,8 @@ pub trait Serdes<T>: Send + Sync + 'static {
 ///
 /// ```no_run
 /// use std::sync::Arc;
-/// use aws_durable_execution_sdk_rust as durable;
-/// use aws_durable_execution_sdk_rust::serdes::FileSystemSerdes;
+/// use aws_durable_execution_sdk as durable;
+/// use aws_durable_execution_sdk::serdes::FileSystemSerdes;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,
@@ -255,8 +255,8 @@ where
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::BoxError;
-/// use aws_durable_execution_sdk_rust::serdes::{JsonSerdes, Serdes, SerdesContext};
+/// use aws_durable_execution_sdk::BoxError;
+/// use aws_durable_execution_sdk::serdes::{JsonSerdes, Serdes, SerdesContext};
 ///
 /// # tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
 /// let context = SerdesContext::new("step-1", "arn:test");
@@ -309,7 +309,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::serdes::{PayloadOrigin, SerdesContext};
+/// use aws_durable_execution_sdk::serdes::{PayloadOrigin, SerdesContext};
 ///
 /// let ctx = SerdesContext::new("step-1", "arn:test");
 /// assert_eq!(ctx.origin(), PayloadOrigin::SdkRecord);
@@ -341,7 +341,7 @@ pub enum PayloadOrigin {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::serdes::SerdesContext;
+/// use aws_durable_execution_sdk::serdes::SerdesContext;
 ///
 /// let ctx = SerdesContext::new("step-1", "arn:aws:lambda:us-east-1:123:function:my-fn:1/durable-execution/exec-1/inv-1");
 /// assert_eq!(ctx.operation_id(), "step-1");
@@ -404,7 +404,7 @@ impl SerdesContext {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::serdes::FileSystemSerdesMode;
+/// use aws_durable_execution_sdk::serdes::FileSystemSerdesMode;
 ///
 /// let mode = FileSystemSerdesMode::Overflow;
 /// assert!(matches!(mode, FileSystemSerdesMode::Overflow));
@@ -428,7 +428,7 @@ pub enum FileSystemSerdesMode {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::serdes::FileSystemPathEncoding;
+/// use aws_durable_execution_sdk::serdes::FileSystemPathEncoding;
 ///
 /// let enc = FileSystemPathEncoding::Hash;
 /// assert!(matches!(enc, FileSystemPathEncoding::Hash));
@@ -450,7 +450,7 @@ pub enum FileSystemPathEncoding {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::serdes::{FileSystemSerdesConfig, FileSystemSerdesMode, FileSystemPathEncoding};
+/// use aws_durable_execution_sdk::serdes::{FileSystemSerdesConfig, FileSystemSerdesMode, FileSystemPathEncoding};
 ///
 /// let config = FileSystemSerdesConfig::builder()
 ///     .storage_mode(FileSystemSerdesMode::Overflow)
@@ -493,7 +493,7 @@ impl FileSystemSerdesConfig {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::serdes::{FileSystemSerdesConfig, FileSystemSerdesMode};
+/// use aws_durable_execution_sdk::serdes::{FileSystemSerdesConfig, FileSystemSerdesMode};
 ///
 /// let config = FileSystemSerdesConfig::builder()
 ///     .storage_mode(FileSystemSerdesMode::Overflow)
@@ -611,7 +611,7 @@ impl FileSystemSerdesConfigBuilder {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::serdes::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
+/// use aws_durable_execution_sdk::serdes::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
 ///
 /// // Always write to filesystem (default)
 /// let serdes = FileSystemSerdes::new("/mnt/efs");
@@ -639,7 +639,7 @@ impl FileSystemSerdes {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::serdes::FileSystemSerdes;
+    /// use aws_durable_execution_sdk::serdes::FileSystemSerdes;
     ///
     /// let serdes = FileSystemSerdes::new("/mnt/efs");
     /// # drop(serdes);
@@ -657,7 +657,7 @@ impl FileSystemSerdes {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::serdes::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
+    /// use aws_durable_execution_sdk::serdes::{FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode};
     ///
     /// let serdes = FileSystemSerdes::with_config(
     ///     "/mnt/s3",
@@ -1109,7 +1109,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::serdes::FileSystemSerdesError;
+/// use aws_durable_execution_sdk::serdes::FileSystemSerdesError;
 ///
 /// let err = FileSystemSerdesError::new("file not found: /mnt/data.json");
 /// assert!(err.to_string().contains("file not found"));

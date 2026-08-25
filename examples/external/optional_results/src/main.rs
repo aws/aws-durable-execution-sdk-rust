@@ -5,7 +5,7 @@
 //! returns [`Option`], which serializes to JSON `null` when `None`. Both
 //! checkpoint and replay like any other result.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Runs a unit-returning step and an `Option`-returning step.
 async fn handler(

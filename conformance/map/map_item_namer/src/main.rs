@@ -3,7 +3,7 @@
 //!
 //! Uses `.item_namer()` to assign custom display names to each iteration.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 
 /// Handler: map that multiplies items by 10 with custom iteration names.

@@ -4,7 +4,7 @@
 //! result vector. As with an empty parallel, handling zero items without a
 //! special case keeps calling code simple when the input may be empty.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Maps over an empty collection and returns the result count.
 async fn handler(

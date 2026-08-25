@@ -4,7 +4,7 @@
 //! Uses `.result_serdes()` with a custom serializer that emits
 //! `"OPSERDE:X,Y"` for the whole map result payload.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{DurableContext, Serdes};
 use durable::serdes::SerdesContext;
 

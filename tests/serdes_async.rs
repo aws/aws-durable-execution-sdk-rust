@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Serdes;
 use durable::serdes::FileSystemSerdes;
 use durable::test_util::LocalRunner;

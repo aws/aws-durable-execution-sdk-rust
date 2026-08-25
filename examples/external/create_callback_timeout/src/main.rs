@@ -1,16 +1,16 @@
 //! Create a callback with a timeout and handle the timeout gracefully.
 //!
-//! [`CreateCallbackBuilder::timeout`](aws_durable_execution_sdk_rust::builders::CreateCallbackBuilder::timeout)
+//! [`CreateCallbackBuilder::timeout`](aws_durable_execution_sdk::builders::CreateCallbackBuilder::timeout)
 //! bounds how long the execution waits for external completion. If no result
 //! arrives in time, awaiting the callback yields a
-//! [`CallbackError`](aws_durable_execution_sdk_rust::CallbackError). This
+//! [`CallbackError`](aws_durable_execution_sdk::CallbackError). This
 //! example does not arrange any external completion, so it always times out;
 //! it catches the error and returns a fallback rather than failing the
 //! execution: the same pattern you would use for a real optional approval.
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::OperationErrorKind;
 
 #[tokio::main]

@@ -2,7 +2,7 @@
 //!
 //! A durable function is an ordinary Lambda handler wrapped by
 //! [`durable::run`]. It becomes "durable" only when it uses operations on the
-//! [`DurableContext`](aws_durable_execution_sdk_rust::DurableContext): steps,
+//! [`DurableContext`](aws_durable_execution_sdk::DurableContext): steps,
 //! waits, child contexts, and so on. This example uses none of them: it simply
 //! logs a line and returns a value, which shows the minimum wiring every
 //! durable function shares before any checkpointing enters the picture.
@@ -10,7 +10,7 @@
 //! Because there are no durable operations, the function runs to completion in
 //! a single invocation and never suspends.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Returns a fixed greeting. No durable operations, so no checkpoints and no
 /// replay: the handler runs start to finish in one invocation.

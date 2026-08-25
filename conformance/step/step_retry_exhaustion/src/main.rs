@@ -1,6 +1,6 @@
 //! Conformance requirement 1-12: retry exhaustion (max attempts = 4).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: step that always fails, with 4 total attempts.

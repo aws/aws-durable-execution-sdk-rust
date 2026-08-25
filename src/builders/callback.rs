@@ -33,7 +33,7 @@ pub use crate::future::Callback;
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use serde::{Deserialize, Serialize};
 /// use std::time::Duration;
 ///
@@ -208,7 +208,7 @@ where
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Deserialize, Serialize)]
@@ -297,7 +297,7 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use std::time::Duration;
     ///
     /// async fn handler(
@@ -338,8 +338,8 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
-    /// use aws_durable_execution_sdk_rust::builders::RetryStrategyConfig;
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::builders::RetryStrategyConfig;
     /// use std::time::Duration;
     ///
     /// async fn handler(

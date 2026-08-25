@@ -4,7 +4,7 @@
 //! records a step, the replay claims a wait at the same position. The SDK
 //! must detect the type mismatch and fail the execution.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: first operation is a step on first execution, a wait on replay.

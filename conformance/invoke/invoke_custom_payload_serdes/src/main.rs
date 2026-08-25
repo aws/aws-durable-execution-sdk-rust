@@ -3,7 +3,7 @@
 //! The custom payload serdes uppercases string payloads before sending
 //! to the target.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Custom serdes that uppercases string payloads on serialization.
 #[derive(Debug)]

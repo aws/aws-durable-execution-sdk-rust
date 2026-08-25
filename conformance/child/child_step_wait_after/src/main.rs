@@ -1,6 +1,6 @@
 //! Conformance requirement 3-18: child with step+wait, then top-level step+wait.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: child (step + wait), then top-level step + wait.

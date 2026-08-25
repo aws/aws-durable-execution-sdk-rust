@@ -1,7 +1,7 @@
 //! Conformance requirement 8-5: Parallel invoked with an empty branches list
 //! completes immediately.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 
 /// Handler: parallel with empty branches.

@@ -1,13 +1,13 @@
 //! Chained invoke scoped to a tenant.
 //!
 //! For a multi-tenant callee,
-//! [`InvokeBuilder::tenant_id`](aws_durable_execution_sdk_rust::builders::InvokeBuilder::tenant_id)
+//! [`InvokeBuilder::tenant_id`](aws_durable_execution_sdk::builders::InvokeBuilder::tenant_id)
 //! routes the invocation to a specific tenant's partition. The callee must be
 //! deployed with tenant isolation enabled (see the companion
 //! `invoke_target_tenant` and its `TenancyConfig`). The tenant id and payload
 //! arrive together in the event.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use serde::Deserialize;
 
 /// Event carrying the tenant to isolate to and the payload to forward.

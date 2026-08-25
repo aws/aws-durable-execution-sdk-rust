@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::observability::{TARGET, event_names, field_names, span_names};
 use durable::test_util::LocalRunner;
 use tracing_subscriber::layer::SubscriberExt;

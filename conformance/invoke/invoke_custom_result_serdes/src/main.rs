@@ -2,7 +2,7 @@
 //!
 //! The custom result serdes uppercases the invoke result on deserialization.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Custom serdes that uppercases the result on deserialization.
 ///

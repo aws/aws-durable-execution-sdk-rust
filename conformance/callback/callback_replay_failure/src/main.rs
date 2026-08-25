@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 4-13: callback failure caught → wait → return.
 //! Handler catches callback failure and continues with a wait.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 #[tokio::main]

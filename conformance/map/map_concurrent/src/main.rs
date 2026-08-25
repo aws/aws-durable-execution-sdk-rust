@@ -1,7 +1,7 @@
 //! Conformance requirement 9-11: Map with max-concurrency > 1 preserves
 //! index-ordered results.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 
 /// Handler: map with concurrency=2, returns items in order.

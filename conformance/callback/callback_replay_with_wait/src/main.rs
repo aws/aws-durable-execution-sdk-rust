@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 4-12: callback success → wait → return.
 //! Verifies replay of both callback and wait across 3 invocations.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 #[tokio::main]

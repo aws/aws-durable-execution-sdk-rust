@@ -1,7 +1,7 @@
 //! Conformance requirement 8-19: Parallel with invalid max-concurrency raises
 //! a validation error.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 
 /// Handler: parallel with max-concurrency=0 (invalid).

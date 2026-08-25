@@ -1,6 +1,6 @@
 //! Conformance requirement 1-17: step with AtMostOncePerRetry (no retry, crashes).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::StepSemantics;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;

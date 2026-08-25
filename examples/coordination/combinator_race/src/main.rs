@@ -13,9 +13,9 @@
 //!
 //! This example races two steps and returns the winner.
 //!
-//! [`race`]: aws_durable_execution_sdk_rust::DurableContext::race
+//! [`race`]: aws_durable_execution_sdk::DurableContext::race
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Returns the first step to settle; the winner is checkpointed for replay.
 async fn handler(

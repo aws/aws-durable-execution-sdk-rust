@@ -52,7 +52,7 @@
 //! on a `tracing-subscriber` layer like any other filter:
 //!
 //! ```ignore
-//! use aws_durable_execution_sdk_rust::ReplayFilterLayer;
+//! use aws_durable_execution_sdk::ReplayFilterLayer;
 //! use tracing_subscriber::Layer as _;
 //! use tracing_subscriber::layer::SubscriberExt;
 //! use tracing_subscriber::util::SubscriberInitExt;
@@ -550,14 +550,14 @@ impl ReplayTracker {
 ///
 /// ```toml
 /// [dependencies]
-/// aws-durable-execution-sdk-rust = { git = "https://github.com/aws/aws-durable-execution-sdk-rust", branch = "alpha", features = ["replay-filter"] }
+/// aws-durable-execution-sdk = { git = "https://github.com/aws/aws-durable-execution-sdk-rust", features = ["replay-filter"] }
 /// tracing-subscriber = { version = "0.3", features = ["registry"] }
 /// ```
 ///
 /// Then install the filter on a subscriber layer:
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::ReplayFilterLayer;
+/// use aws_durable_execution_sdk::ReplayFilterLayer;
 /// use tracing_subscriber::Layer as _;
 /// use tracing_subscriber::layer::SubscriberExt;
 ///

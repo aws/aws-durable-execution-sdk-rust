@@ -1,7 +1,7 @@
 //! Conformance requirement 8-1: Parallel basic (two branches, each a single
 //! step, all succeed).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 
 /// Handler: two parallel branches, each returning a constant string via a step.

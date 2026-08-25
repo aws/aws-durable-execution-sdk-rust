@@ -1,6 +1,6 @@
 //! Conformance requirement 1-11: step with retry (fails then succeeds).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: step that fails on first attempt and succeeds on second,

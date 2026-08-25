@@ -5,7 +5,7 @@
 //! parent with `replay_children` set. On replay, the SDK re-executes the
 //! items to reconstruct the result from their terminal checkpoint records.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 
 /// Handler: map producing >256KB aggregate results.

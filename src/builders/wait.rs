@@ -19,7 +19,7 @@ use crate::future::DurableFuture;
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use std::time::Duration;
 ///
 /// async fn handler(
@@ -95,7 +95,7 @@ impl WaitBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use std::time::Duration;
     ///
     /// async fn handler(

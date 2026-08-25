@@ -27,8 +27,8 @@ use crate::error::{ChildFnError, OperationError};
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
-/// use aws_durable_execution_sdk_rust::DurableFuture;
+/// use aws_durable_execution_sdk as durable;
+/// use aws_durable_execution_sdk::DurableFuture;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,
@@ -384,7 +384,7 @@ impl<O: Send + 'static> Future for DurableFuture<O> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{Settled, OperationError};
+/// use aws_durable_execution_sdk::{Settled, OperationError};
 ///
 /// let ok: Settled<i32> = Settled::Fulfilled(42);
 /// let err: Settled<i32> = Settled::Rejected(OperationError::__test_error());
@@ -411,7 +411,7 @@ pub enum Settled<O> {
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust::{Branch, DurableContext};
+/// use aws_durable_execution_sdk::{Branch, DurableContext};
 ///
 /// let branch = Branch::new("process-a", |ctx: DurableContext| async move {
 ///     let v = ctx.step(|_| async { Ok(1) }).await?;
@@ -479,7 +479,7 @@ impl<O: Send + 'static> Branch<O> {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust::{Branch, DurableContext};
+    /// use aws_durable_execution_sdk::{Branch, DurableContext};
     ///
     /// let branch: Branch<i32> = Branch::new("my-branch", |_ctx: DurableContext| async move {
     ///     Ok(42)
@@ -534,7 +534,7 @@ impl<O: Send + 'static> Branch<O> {
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Serialize, Deserialize)]
@@ -593,7 +593,7 @@ impl<O: Send + 'static> Callback<O> {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use serde::{Deserialize, Serialize};
     ///
     /// #[derive(Serialize, Deserialize)]
@@ -637,7 +637,7 @@ impl<O: Send + 'static> Callback<O> {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use serde::{Deserialize, Serialize};
     ///
     /// #[derive(Serialize, Deserialize)]

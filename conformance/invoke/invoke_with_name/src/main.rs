@@ -1,6 +1,6 @@
 //! Conformance requirement 5-2: invoke with an explicit operation name.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use serde::Deserialize;
 
 /// Input with a name field and a payload.

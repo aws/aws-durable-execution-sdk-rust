@@ -1,6 +1,6 @@
 //! Conformance requirement 5-8: invoke with tenant ID.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use serde::Deserialize;
 
 /// Input with tenant ID and payload.

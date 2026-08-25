@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::test_util::LocalRunner;
 use durable::{CombinatorErrorKind, DurableFuture, OperationErrorKind, RetryDecision};
 

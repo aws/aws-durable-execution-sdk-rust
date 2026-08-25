@@ -6,11 +6,11 @@
 //! anonymous positional id. The name is metadata only and does not affect
 //! operation identity.
 //!
-//! [`ctx.wait`]: aws_durable_execution_sdk_rust::DurableContext::wait
+//! [`ctx.wait`]: aws_durable_execution_sdk::DurableContext::wait
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Waits two seconds under a human-readable name, then completes.
 async fn handler(

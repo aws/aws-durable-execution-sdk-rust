@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 4-8: callback (5s timeout) + step + await timeout.
 //! Creates a callback with 5s timeout, runs a step, then awaits (timeout fires).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 #[tokio::main]

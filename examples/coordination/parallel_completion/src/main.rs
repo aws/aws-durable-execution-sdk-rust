@@ -7,14 +7,14 @@
 //! (`tolerated_failure_count`, `tolerated_failure_percentage`) for bounding how
 //! many branch failures may pass before the batch aborts. A single threshold
 //! has a named constructor; combine several with
-//! [`CompletionConfig::builder`](aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfig::builder).
+//! [`CompletionConfig::builder`](aws_durable_execution_sdk::builders::map_parallel::CompletionConfig::builder).
 //!
 //! This example runs three branches under a policy that completes once two
 //! succeed, returning the results gathered by that point.
 //!
-//! [`CompletionConfig`]: aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfig
+//! [`CompletionConfig`]: aws_durable_execution_sdk::builders::map_parallel::CompletionConfig
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Branch;
 use durable::builders::map_parallel::CompletionConfig;
 

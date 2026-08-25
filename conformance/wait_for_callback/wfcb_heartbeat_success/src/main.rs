@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 7-13: wait_for_callback with 10s heartbeat, success.
 //! External system sends heartbeat then success.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 #[tokio::main]

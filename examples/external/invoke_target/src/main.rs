@@ -2,14 +2,14 @@
 //! echoes its input after a brief durable wait.
 //!
 //! `invoke_simple` and `comprehensive` call this function with
-//! [`DurableContext::invoke`](aws_durable_execution_sdk_rust::DurableContext::invoke).
+//! [`DurableContext::invoke`](aws_durable_execution_sdk::DurableContext::invoke).
 //! It is deployed in the same stack as the callers, which name it through the
 //! `TARGET_FUNCTION_NAME` environment variable. A chained callee is itself an
 //! ordinary durable function: nothing special marks it as a target.
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Echoes the input event unchanged after a one-second durable wait.
 async fn handler(

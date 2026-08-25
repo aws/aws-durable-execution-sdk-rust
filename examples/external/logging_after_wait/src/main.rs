@@ -7,11 +7,11 @@
 //! "before" line is emitted on the first invocation, and the "after" line on
 //! the resumed invocation, each exactly once across the whole execution.
 //!
-//! [`ReplayFilterLayer`]: aws_durable_execution_sdk_rust::ReplayFilterLayer
+//! [`ReplayFilterLayer`]: aws_durable_execution_sdk::ReplayFilterLayer
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust::{self as durable, ReplayFilterLayer};
+use aws_durable_execution_sdk::{self as durable, ReplayFilterLayer};
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;

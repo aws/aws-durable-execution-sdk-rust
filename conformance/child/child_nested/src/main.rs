@@ -1,6 +1,6 @@
 //! Conformance requirement 3-6: nested child contexts.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: outer child with a step, then inner child with its own step.
 async fn handler(

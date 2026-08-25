@@ -6,7 +6,7 @@
 //! identity mismatch and fail the execution instead of handing
 //! "load-config"'s recorded result to "process-data".
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: drops the first step on replay.

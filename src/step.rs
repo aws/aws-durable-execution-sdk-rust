@@ -137,7 +137,7 @@ pub(crate) fn rand_full_jitter(max_secs: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::StepSemantics;
+/// use aws_durable_execution_sdk::StepSemantics;
 ///
 /// // Default: re-execute on replay if interrupted.
 /// let default = StepSemantics::AtLeastOncePerRetry;

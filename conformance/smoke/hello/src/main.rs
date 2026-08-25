@@ -4,7 +4,7 @@
 //! invoking any durable operations. Its purpose is to prove the deploy +
 //! invoke pipeline works for Rust.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use serde::{Deserialize, Serialize};
 
 /// Input event for the smoke handler.

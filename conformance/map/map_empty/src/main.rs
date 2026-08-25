@@ -1,7 +1,7 @@
 //! Conformance requirement 9-4: Map invoked with an empty items list completes
 //! immediately with no iterations.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 
 /// Handler: map with empty items.

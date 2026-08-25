@@ -1,6 +1,6 @@
 //! Conformance requirement 3-12: child step interrupted on first attempt.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: child step exits process on first attempt, succeeds on second.
 async fn handler(

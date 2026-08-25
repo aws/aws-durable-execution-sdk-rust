@@ -40,7 +40,7 @@ pub(crate) const WFC_SUB_TYPE: &str = "WaitForCondition";
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitDecision;
+/// use aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision;
 /// use std::time::Duration;
 ///
 /// // Condition met: stop polling.

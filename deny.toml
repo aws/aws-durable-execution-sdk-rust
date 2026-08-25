@@ -1,4 +1,4 @@
-# cargo-deny configuration for aws-durable-execution-sdk-rust
+# cargo-deny configuration for aws-durable-execution-sdk
 #
 # Enforcement strategy for the closed production dependency allowlist:
 #

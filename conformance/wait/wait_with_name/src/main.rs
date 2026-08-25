@@ -1,6 +1,6 @@
 //! Conformance requirement 2-2: wait with name.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: a wait operation with an explicit name parameter.

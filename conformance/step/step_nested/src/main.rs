@@ -1,6 +1,6 @@
 //! Conformance requirement 1-3: sequential steps where second depends on first.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: two sequential steps, second uses first's result.
 async fn handler(

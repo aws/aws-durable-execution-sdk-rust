@@ -34,7 +34,7 @@
 //! # Events
 //!
 //! Lifecycle events are emitted at the `DEBUG` level with the target
-//! [`TARGET`] (`aws_durable_execution_sdk_rust::lifecycle`). The event's
+//! [`TARGET`] (`aws_durable_execution_sdk::lifecycle`). The event's
 //! `message` is its stable name.
 //!
 //! Operation events fire when the SDK records an operation transition
@@ -115,7 +115,7 @@
 //! // INFO everywhere, plus every SDK lifecycle event.
 //! let filter = EnvFilter::new(format!(
 //!     "info,{}=debug",
-//!     aws_durable_execution_sdk_rust::observability::TARGET,
+//!     aws_durable_execution_sdk::observability::TARGET,
 //! ));
 //! let subscriber = tracing_subscriber::registry()
 //!     .with(tracing_subscriber::fmt::layer().json())
@@ -141,7 +141,7 @@
 //! // opentelemetry_sdk = "0.30"
 //! // tracing-opentelemetry = "0.31"
 //! // tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-//! use aws_durable_execution_sdk_rust as durable;
+//! use aws_durable_execution_sdk as durable;
 //! use opentelemetry::trace::TracerProvider as _;
 //! use tracing_subscriber::layer::SubscriberExt as _;
 //! use tracing_subscriber::util::SubscriberInitExt as _;
@@ -182,7 +182,7 @@
 ///
 /// Use it to enable or route lifecycle events independently of the rest of
 /// the application's logs, e.g. `EnvFilter::new("info,{TARGET}=debug")`.
-pub const TARGET: &str = "aws_durable_execution_sdk_rust::lifecycle";
+pub const TARGET: &str = "aws_durable_execution_sdk::lifecycle";
 
 /// Names of the spans the SDK creates.
 pub mod span_names {
@@ -272,7 +272,7 @@ mod tests {
     fn contract_names_are_stable() {
         // These literals are the public contract; a change here is a
         // semver-relevant event that must be deliberate.
-        assert_eq!(TARGET, "aws_durable_execution_sdk_rust::lifecycle");
+        assert_eq!(TARGET, "aws_durable_execution_sdk::lifecycle");
         assert_eq!(span_names::EXECUTION, "durable_execution");
         assert_eq!(span_names::OPERATION, "durable_operation");
         assert_eq!(event_names::OPERATION_STARTED, "operation_started");

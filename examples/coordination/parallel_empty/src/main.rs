@@ -4,7 +4,7 @@
 //! vector. Handling zero elements without a special case keeps calling code
 //! simple when the branch set is computed from data that may be empty.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Branch;
 
 /// Runs a parallel operation with no branches and returns the result count.

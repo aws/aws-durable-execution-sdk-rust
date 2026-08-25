@@ -1,6 +1,6 @@
 //! Conformance requirement 2-4: wait with different duration units.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: a wait using minutes, verifying conversion to seconds.

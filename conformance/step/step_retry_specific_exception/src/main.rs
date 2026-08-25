@@ -1,6 +1,6 @@
 //! Conformance requirement 1-15: retry specific exception.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::fmt;
 use std::time::Duration;
 

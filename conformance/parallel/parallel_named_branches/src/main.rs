@@ -1,6 +1,6 @@
 //! Conformance requirement 8-3: Parallel invoked with named-branch objects.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 
 /// Handler: parallel with explicitly named branches.

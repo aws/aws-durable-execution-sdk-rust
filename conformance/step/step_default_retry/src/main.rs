@@ -1,6 +1,6 @@
 //! Conformance requirement 1-13: default retry strategy.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: step that fails on first two attempts and succeeds on third,
 /// using the SDK's default retry (no explicit config). Tracks via DDB.

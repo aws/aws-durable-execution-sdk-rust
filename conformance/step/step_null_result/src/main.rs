@@ -1,6 +1,6 @@
 //! Conformance requirement 1-5: step returning null/None.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: step returning null.
 async fn handler(

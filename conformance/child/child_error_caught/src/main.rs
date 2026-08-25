@@ -1,6 +1,6 @@
 //! Conformance requirement 3-5: child error caught, execution continues.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: child fails, error caught, recovery step follows.
 async fn handler(

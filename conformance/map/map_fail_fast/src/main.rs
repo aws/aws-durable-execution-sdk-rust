@@ -1,7 +1,7 @@
 //! Conformance requirement 9-5: Map with tolerated-failure-count=0 stops after
 //! first failure.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 use durable::builders::map_parallel::CompletionConfig;
 

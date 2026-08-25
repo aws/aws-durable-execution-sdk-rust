@@ -6,7 +6,7 @@
 //! incoming order, each fulfilled by a different multi-step workflow — fan
 //! out explicitly instead: spawn one child context per unit of work with
 //! `.spawn()`, collect the running
-//! [`DurableFuture`](aws_durable_execution_sdk_rust::DurableFuture)s, and
+//! [`DurableFuture`](aws_durable_execution_sdk::DurableFuture)s, and
 //! join them with [`try_join_all`]. Each child performs multi-step work of
 //! its own, exactly as in the `child_basic` example, and all children make
 //! progress concurrently.
@@ -31,9 +31,9 @@
 //! entitlements, and schedules the first renewal. The parent joins the
 //! confirmations and returns one fulfillment summary.
 //!
-//! [`try_join_all`]: aws_durable_execution_sdk_rust::DurableContext::try_join_all
+//! [`try_join_all`]: aws_durable_execution_sdk::DurableContext::try_join_all
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use serde::Deserialize;
 
 /// Handler input: an order to fulfill.

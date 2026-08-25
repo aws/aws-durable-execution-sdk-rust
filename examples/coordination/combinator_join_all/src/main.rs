@@ -1,8 +1,8 @@
 //! `join_all`: collect every outcome, successes and failures alike.
 //!
 //! [`join_all`] runs operations concurrently and returns a
-//! [`Settled`] per operation: [`Fulfilled`](aws_durable_execution_sdk_rust::Settled::Fulfilled)
-//! with the value or [`Rejected`](aws_durable_execution_sdk_rust::Settled::Rejected)
+//! [`Settled`] per operation: [`Fulfilled`](aws_durable_execution_sdk::Settled::Fulfilled)
+//! with the value or [`Rejected`](aws_durable_execution_sdk::Settled::Rejected)
 //! with the error, never failing fast. It is the durable analogue of
 //! `Promise.allSettled`, for when you want every result regardless of
 //! individual failures. Errors inside the settled results are preserved through
@@ -12,10 +12,10 @@
 //! outcomes, completing successfully because `join_all` does not propagate the
 //! failure.
 //!
-//! [`join_all`]: aws_durable_execution_sdk_rust::DurableContext::join_all
-//! [`Settled`]: aws_durable_execution_sdk_rust::Settled
+//! [`join_all`]: aws_durable_execution_sdk::DurableContext::join_all
+//! [`Settled`]: aws_durable_execution_sdk::Settled
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Settled;
 
 /// Joins a succeeding and a failing step, summarizing every outcome.

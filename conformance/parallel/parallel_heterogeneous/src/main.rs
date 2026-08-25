@@ -1,7 +1,7 @@
 //! Conformance requirement 8-4: Parallel whose branches return different types
 //! (string, number, object).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 
 /// Handler: heterogeneous parallel branches using `serde_json::Value`.

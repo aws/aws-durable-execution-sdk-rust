@@ -3,7 +3,7 @@
 //!
 //! Uses `NestingMode::Flat` to suppress per-item context checkpoint events.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 use durable::builders::map_parallel::NestingMode;
 

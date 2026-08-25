@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust::{self as durable, ReplayFilterLayer};
+use aws_durable_execution_sdk::{self as durable, ReplayFilterLayer};
 use durable::test_util::LocalRunner;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt;

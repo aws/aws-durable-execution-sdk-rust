@@ -1,6 +1,6 @@
 //! Conformance requirement 1-10: replay re-throws failed step.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::OperationError;
 use std::time::Duration;
 

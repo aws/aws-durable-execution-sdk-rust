@@ -151,7 +151,7 @@ pub use self::with_retry::WithRetryBuilder;
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::JitterStrategy;
+/// use aws_durable_execution_sdk::builders::JitterStrategy;
 ///
 /// assert_eq!(JitterStrategy::default(), JitterStrategy::Full);
 /// ```
@@ -200,7 +200,7 @@ pub enum JitterStrategy {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::{JitterStrategy, RetryStrategyConfig};
+/// use aws_durable_execution_sdk::builders::{JitterStrategy, RetryStrategyConfig};
 /// use std::time::Duration;
 ///
 /// let config = RetryStrategyConfig::builder()
@@ -254,7 +254,7 @@ impl RetryStrategyConfig {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::builders::RetryStrategyConfig;
+    /// use aws_durable_execution_sdk::builders::RetryStrategyConfig;
     ///
     /// let config = RetryStrategyConfig::builder()
     ///     .backoff_rate(1.5)
@@ -307,7 +307,7 @@ impl RetryStrategyConfig {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::{JitterStrategy, RetryStrategyConfig};
+/// use aws_durable_execution_sdk::builders::{JitterStrategy, RetryStrategyConfig};
 /// use std::time::Duration;
 ///
 /// let config = RetryStrategyConfig::builder()

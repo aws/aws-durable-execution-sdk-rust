@@ -1,13 +1,13 @@
 //! Poll a condition until it is satisfied, with a bounded wait strategy.
 //!
-//! [`DurableContext::wait_for_condition`](aws_durable_execution_sdk_rust::DurableContext::wait_for_condition)
+//! [`DurableContext::wait_for_condition`](aws_durable_execution_sdk::DurableContext::wait_for_condition)
 //! repeatedly runs a check, carrying state between attempts, and suspends for a
 //! delay between polls so it does not hold the invocation open. The state
 //! (here a counter starting at 0) is checkpointed each attempt and survives
 //! across resumes. The strategy returns
-//! [`WaitDecision::complete`](aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitDecision::complete)
+//! [`WaitDecision::complete`](aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision::complete)
 //! once the counter reaches the requested threshold, or
-//! [`WaitDecision::continue_with`](aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitDecision::continue_with)
+//! [`WaitDecision::continue_with`](aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision::continue_with)
 //! to poll again after a delay.
 //!
 //! The threshold comes from the event and is small, so the loop is bounded to
@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::builders::wait_for_condition::WaitDecision;
 
 #[tokio::main]

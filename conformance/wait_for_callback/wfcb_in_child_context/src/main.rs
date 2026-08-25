@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 7-8: wait_for_callback inside a child context.
 //! Nested inside a child context named "wrapper".
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {

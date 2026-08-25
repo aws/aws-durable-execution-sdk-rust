@@ -10,9 +10,9 @@
 //! This example also shows the natural way to take typed input: declare a
 //! `Deserialize` struct and let `durable::run` deserialize the event into it.
 //!
-//! [`name`]: aws_durable_execution_sdk_rust::DurableContext::step
+//! [`name`]: aws_durable_execution_sdk::DurableContext::step
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use serde::Deserialize;
 
 /// Handler input: the payload to process.

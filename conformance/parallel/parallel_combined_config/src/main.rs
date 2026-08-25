@@ -1,7 +1,7 @@
 //! Conformance requirement 8-18: Parallel combined completion config
 //! (min-successful + tolerated-failure-count).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
 

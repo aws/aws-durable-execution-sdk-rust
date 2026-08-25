@@ -1,7 +1,7 @@
 //! Conformance requirement 8-21: Nested parallel (parallel inside a parallel
 //! branch).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 
 /// Handler: outer parallel with one branch that runs an inner parallel.

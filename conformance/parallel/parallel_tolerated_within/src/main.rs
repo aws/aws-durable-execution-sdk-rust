@@ -1,7 +1,7 @@
 //! Conformance requirement 8-9: Parallel tolerating one failure completes all
 //! branches.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
 

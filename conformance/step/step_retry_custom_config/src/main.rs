@@ -1,6 +1,6 @@
 //! Conformance requirement 1-14: retry with custom config (2s initial, 3x backoff, no jitter).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: step that fails twice then succeeds, with custom retry

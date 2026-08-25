@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 
 /// Handler: map with item 0 doing a step and item 1 doing wait+step.

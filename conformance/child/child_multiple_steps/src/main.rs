@@ -1,6 +1,6 @@
 //! Conformance requirement 3-3: child context with multiple sequential steps.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: child with two sequential steps.
 async fn handler(

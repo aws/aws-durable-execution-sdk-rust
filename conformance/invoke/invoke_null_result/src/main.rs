@@ -1,6 +1,6 @@
 //! Conformance requirement 5-4: invoke with null payload, target returns null.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: invoke with null input.
 async fn handler(

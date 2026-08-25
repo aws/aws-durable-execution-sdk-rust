@@ -3,7 +3,7 @@
 //! externally-delivered payload into Unix epoch seconds, so the value decodes
 //! directly into the output type.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{BoxError, Serdes};
 use serde::{Deserialize, Serialize};
 

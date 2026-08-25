@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 4-19: two callbacks: create both, wait in reverse.
 //! Create A, create B, wait for B, wait for A, return both.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use serde::Serialize;
 use std::collections::HashMap;
 

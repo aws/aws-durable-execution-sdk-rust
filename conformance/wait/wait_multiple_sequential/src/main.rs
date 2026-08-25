@@ -1,6 +1,6 @@
 //! Conformance requirement 2-3: multiple sequential waits.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use serde::Serialize;
 use std::time::Duration;
 

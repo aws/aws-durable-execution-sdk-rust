@@ -300,7 +300,7 @@ impl Error for ContextualError {
 /// (its creation site) is the explicit alternative:
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{BoxError, TypedError};
+/// use aws_durable_execution_sdk::{BoxError, TypedError};
 ///
 /// #[derive(Debug)]
 /// struct PaymentDeclined;
@@ -606,7 +606,7 @@ fn capture_stack_trace() -> Vec<String> {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{OperationError, OperationErrorKind};
+/// use aws_durable_execution_sdk::{OperationError, OperationErrorKind};
 ///
 /// fn handle_error(err: &OperationError) {
 ///     match err.kind() {
@@ -645,7 +645,7 @@ impl OperationError {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::{OperationError, OperationErrorKind, StepErrorKind};
+    /// use aws_durable_execution_sdk::{OperationError, OperationErrorKind, StepErrorKind};
     ///
     /// let err = OperationError::__test_error();
     /// if let OperationErrorKind::Step(step_err) = err.kind() {
@@ -768,7 +768,7 @@ impl Error for OperationError {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{OperationError, OperationErrorKind};
+/// use aws_durable_execution_sdk::{OperationError, OperationErrorKind};
 ///
 /// fn is_retryable(err: &OperationError) -> bool {
 ///     // Callback timeouts are external; everything else is treated as
@@ -838,7 +838,7 @@ impl fmt::Display for OperationErrorKind {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{StepError, StepErrorKind};
+/// use aws_durable_execution_sdk::{StepError, StepErrorKind};
 ///
 /// fn describe(err: &StepError) -> String {
 ///     match err.kind() {
@@ -899,7 +899,7 @@ impl Error for StepError {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::StepErrorKind;
+/// use aws_durable_execution_sdk::StepErrorKind;
 ///
 /// fn attempts_used(kind: &StepErrorKind) -> Option<u32> {
 ///     match kind {
@@ -964,7 +964,7 @@ impl fmt::Display for RetriesExhausted {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{WaitError, WaitErrorKind};
+/// use aws_durable_execution_sdk::{WaitError, WaitErrorKind};
 ///
 /// fn describe(err: &WaitError) -> String {
 ///     match err.kind() {
@@ -1020,7 +1020,7 @@ impl Error for WaitError {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::WaitErrorKind;
+/// use aws_durable_execution_sdk::WaitErrorKind;
 ///
 /// fn is_unexpected_status(kind: &WaitErrorKind) -> bool {
 ///     matches!(kind, WaitErrorKind::UnexpectedStatus(_))
@@ -1075,7 +1075,7 @@ impl fmt::Display for UnexpectedStatus {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{InvokeError, InvokeErrorKind};
+/// use aws_durable_execution_sdk::{InvokeError, InvokeErrorKind};
 ///
 /// fn missing_function(err: &InvokeError) -> Option<&str> {
 ///     match err.kind() {
@@ -1125,7 +1125,7 @@ impl Error for InvokeError {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::InvokeErrorKind;
+/// use aws_durable_execution_sdk::InvokeErrorKind;
 ///
 /// fn failed_in_function(kind: &InvokeErrorKind) -> bool {
 ///     // Unit kind variants are `#[non_exhaustive]`: match them with
@@ -1202,7 +1202,7 @@ impl fmt::Display for FunctionNotFound {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{CallbackError, CallbackErrorKind};
+/// use aws_durable_execution_sdk::{CallbackError, CallbackErrorKind};
 ///
 /// fn describe(err: &CallbackError) -> String {
 ///     match err.kind() {
@@ -1257,7 +1257,7 @@ impl Error for CallbackError {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::CallbackErrorKind;
+/// use aws_durable_execution_sdk::CallbackErrorKind;
 ///
 /// fn is_external(kind: &CallbackErrorKind) -> bool {
 ///     matches!(
@@ -1310,7 +1310,7 @@ impl fmt::Display for CallbackErrorKind {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{WaitForConditionError, WaitForConditionErrorKind};
+/// use aws_durable_execution_sdk::{WaitForConditionError, WaitForConditionErrorKind};
 ///
 /// fn checks_used(err: &WaitForConditionError) -> Option<u32> {
 ///     match err.kind() {
@@ -1360,7 +1360,7 @@ impl Error for WaitForConditionError {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::WaitForConditionErrorKind;
+/// use aws_durable_execution_sdk::WaitForConditionErrorKind;
 ///
 /// fn check_function_failed(kind: &WaitForConditionErrorKind) -> bool {
 ///     matches!(kind, WaitForConditionErrorKind::CheckFailed { .. })
@@ -1420,7 +1420,7 @@ impl fmt::Display for MaxChecksExceeded {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{ChildContextError, ChildContextErrorKind};
+/// use aws_durable_execution_sdk::{ChildContextError, ChildContextErrorKind};
 ///
 /// fn child_body_failed(err: &ChildContextError) -> bool {
 ///     matches!(err.kind(), ChildContextErrorKind::ChildFailed { .. })
@@ -1467,7 +1467,7 @@ impl Error for ChildContextError {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::ChildContextErrorKind;
+/// use aws_durable_execution_sdk::ChildContextErrorKind;
 ///
 /// fn is_internal(kind: &ChildContextErrorKind) -> bool {
 ///     matches!(kind, ChildContextErrorKind::Internal { .. })
@@ -1504,7 +1504,7 @@ impl fmt::Display for ChildContextErrorKind {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{CombinatorError, CombinatorErrorKind};
+/// use aws_durable_execution_sdk::{CombinatorError, CombinatorErrorKind};
 ///
 /// fn report(err: &CombinatorError) {
 ///     if let CombinatorErrorKind::AllFailed { .. } = err.kind() {
@@ -1570,7 +1570,7 @@ impl Error for CombinatorError {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::CombinatorErrorKind;
+/// use aws_durable_execution_sdk::CombinatorErrorKind;
 ///
 /// fn first_failed_index(kind: &CombinatorErrorKind) -> Option<usize> {
 ///     match kind {
@@ -1664,7 +1664,7 @@ impl fmt::Display for JoinFailed {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::{
+/// use aws_durable_execution_sdk::{
 ///     NonDeterministicExecutionError, NonDeterministicExecutionErrorKind,
 /// };
 ///
@@ -1716,7 +1716,7 @@ impl Error for NonDeterministicExecutionError {}
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::NonDeterministicExecutionErrorKind;
+/// use aws_durable_execution_sdk::NonDeterministicExecutionErrorKind;
 ///
 /// fn mismatch_slot(kind: &NonDeterministicExecutionErrorKind) -> Option<&str> {
 ///     match kind {

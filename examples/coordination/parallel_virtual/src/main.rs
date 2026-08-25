@@ -9,9 +9,9 @@
 //! The behavior is defined by conformance requirement 8-12. This example fans
 //! out three flat branches, each scaling its index.
 //!
-//! [`NestingMode::Flat`]: aws_durable_execution_sdk_rust::builders::map_parallel::NestingMode::Flat
+//! [`NestingMode::Flat`]: aws_durable_execution_sdk::builders::map_parallel::NestingMode::Flat
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::Branch;
 use durable::builders::map_parallel::NestingMode;
 

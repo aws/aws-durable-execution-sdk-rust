@@ -11,7 +11,7 @@ use std::time::Duration;
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust::Options;
+/// use aws_durable_execution_sdk::Options;
 ///
 /// // Attempting to set both sdk_config and lambda_client errors at build():
 /// // let opts = Options::builder()
@@ -51,7 +51,7 @@ impl std::error::Error for OptionsValidationError {}
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust::Options;
+/// use aws_durable_execution_sdk::Options;
 ///
 /// let options = Options::builder()
 ///     .build()
@@ -81,7 +81,7 @@ impl Default for Options {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::Options;
+    /// use aws_durable_execution_sdk::Options;
     ///
     /// let opts = Options::default();
     /// # drop(opts);
@@ -102,7 +102,7 @@ impl Options {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::Options;
+    /// use aws_durable_execution_sdk::Options;
     ///
     /// let builder = Options::builder();
     /// let opts = builder.build().expect("valid config");
@@ -121,7 +121,7 @@ impl Options {
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust::{Options, OptionsBuilder};
+/// use aws_durable_execution_sdk::{Options, OptionsBuilder};
 ///
 /// let options = Options::builder()
 ///     .build()
@@ -156,7 +156,7 @@ impl OptionsBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust::Options;
+    /// use aws_durable_execution_sdk::Options;
     ///
     /// # async fn example() {
     /// let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
@@ -198,7 +198,7 @@ impl OptionsBuilder {
     /// `aws-sdk-lambda` dependency:
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust::{LambdaClient, Options, SdkConfig};
+    /// use aws_durable_execution_sdk::{LambdaClient, Options, SdkConfig};
     ///
     /// let config = SdkConfig::builder().build();
     /// let client = LambdaClient::new(&config);
@@ -247,7 +247,7 @@ impl OptionsBuilder {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::Options;
+    /// use aws_durable_execution_sdk::Options;
     /// use std::time::Duration;
     ///
     /// let opts = Options::builder()
@@ -302,7 +302,7 @@ impl OptionsBuilder {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::Options;
+    /// use aws_durable_execution_sdk::Options;
     ///
     /// let opts = Options::builder()
     ///     .checkpoint_batching(true)
@@ -326,7 +326,7 @@ impl OptionsBuilder {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::Options;
+    /// use aws_durable_execution_sdk::Options;
     ///
     /// let opts = Options::builder().build();
     /// assert!(opts.is_ok());

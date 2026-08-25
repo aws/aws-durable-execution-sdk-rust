@@ -38,8 +38,8 @@ pub use crate::wait_for_condition::WaitDecision;
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
-/// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitDecision;
+/// use aws_durable_execution_sdk as durable;
+/// use aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision;
 /// use serde::{Serialize, Deserialize};
 /// use std::time::Duration;
 ///
@@ -141,8 +141,8 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
-    /// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitStrategy;
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::builders::wait_for_condition::WaitStrategy;
     /// use std::time::Duration;
     ///
     /// async fn handler(
@@ -186,8 +186,8 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
-    /// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitDecision;
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision;
     /// use std::time::Duration;
     ///
     /// async fn handler(
@@ -331,7 +331,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitStrategy;
+/// use aws_durable_execution_sdk::builders::wait_for_condition::WaitStrategy;
 /// use std::time::Duration;
 ///
 /// let strategy = WaitStrategy::builder(|state: &i32| *state >= 3)
@@ -410,7 +410,7 @@ impl<S> WaitStrategy<S> {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitStrategy;
+    /// use aws_durable_execution_sdk::builders::wait_for_condition::WaitStrategy;
     ///
     /// let strategy = WaitStrategy::builder(|state: &i32| *state >= 3)
     ///     .backoff_rate(2.0)
@@ -534,8 +534,8 @@ fn quantize_wait_delay(jittered: f64) -> Duration {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::JitterStrategy;
-/// use aws_durable_execution_sdk_rust::builders::wait_for_condition::WaitStrategy;
+/// use aws_durable_execution_sdk::builders::JitterStrategy;
+/// use aws_durable_execution_sdk::builders::wait_for_condition::WaitStrategy;
 /// use std::time::Duration;
 ///
 /// let strategy = WaitStrategy::builder(|state: &u32| *state > 0)

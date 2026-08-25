@@ -4,7 +4,7 @@
 //! The Rust SDK automatically propagates failures as `Err`, so this handler
 //! simply lets the error bubble up (equivalent to Go's `ThrowIfError()`).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
 

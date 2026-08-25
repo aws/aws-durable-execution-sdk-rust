@@ -1,17 +1,17 @@
 //! Retry a failing step until the strategy stops, then recover.
 //!
-//! A [`retry_strategy`](aws_durable_execution_sdk_rust::DurableContext::step)
+//! A [`retry_strategy`](aws_durable_execution_sdk::DurableContext::step)
 //! decides, per attempt, whether to retry or stop. When it returns
-//! [`RetryDecision::Stop`](aws_durable_execution_sdk_rust::RetryDecision::Stop)
+//! [`RetryDecision::Stop`](aws_durable_execution_sdk::RetryDecision::Stop)
 //! the last error propagates as a
-//! [`StepError`](aws_durable_execution_sdk_rust::StepError). This example's step
+//! [`StepError`](aws_durable_execution_sdk::StepError). This example's step
 //! always fails; the strategy allows three attempts then stops, and the handler
 //! catches the exhausted error and returns a graceful summary instead of
 //! failing the execution.
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{OperationErrorKind, RetryDecision};
 
 /// Runs an always-failing step with a bounded retry policy and recovers.

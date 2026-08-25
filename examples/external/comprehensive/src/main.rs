@@ -7,16 +7,16 @@
 //! compose in one handler. The target function is named through the
 //! `TARGET_FUNCTION_NAME` environment variable.
 //!
-//! [`step`]: aws_durable_execution_sdk_rust::DurableContext::step
-//! [`wait`]: aws_durable_execution_sdk_rust::DurableContext::wait
-//! [`run_in_child_context`]: aws_durable_execution_sdk_rust::DurableContext::run_in_child_context
-//! [`map`]: aws_durable_execution_sdk_rust::DurableContext::map
-//! [`invoke`]: aws_durable_execution_sdk_rust::DurableContext::invoke
-//! [`wait_for_condition`]: aws_durable_execution_sdk_rust::DurableContext::wait_for_condition
+//! [`step`]: aws_durable_execution_sdk::DurableContext::step
+//! [`wait`]: aws_durable_execution_sdk::DurableContext::wait
+//! [`run_in_child_context`]: aws_durable_execution_sdk::DurableContext::run_in_child_context
+//! [`map`]: aws_durable_execution_sdk::DurableContext::map
+//! [`invoke`]: aws_durable_execution_sdk::DurableContext::invoke
+//! [`wait_for_condition`]: aws_durable_execution_sdk::DurableContext::wait_for_condition
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::builders::wait_for_condition::WaitDecision;
 
 /// Runs one of each core operation and returns a JSON summary.

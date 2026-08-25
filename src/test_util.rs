@@ -80,7 +80,7 @@
 //! # Examples
 //!
 //! ```
-//! use aws_durable_execution_sdk_rust as durable;
+//! use aws_durable_execution_sdk as durable;
 //! use durable::test_util::LocalRunner;
 //!
 //! # #[tokio::main]
@@ -138,7 +138,7 @@ const DEFAULT_STATE_PAGE_SIZE: usize = 1;
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use durable::test_util::LocalRunner;
 ///
 /// # #[tokio::main]
@@ -261,7 +261,7 @@ enum Disposition {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use durable::test_util::LocalRunner;
 ///
 /// # #[tokio::main]
@@ -370,7 +370,7 @@ enum CallbackOutcome {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use durable::test_util::LocalRunner;
 ///
 /// # #[tokio::main]
@@ -449,7 +449,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new();
     /// # drop(runner);
@@ -480,7 +480,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new().single_page();
     /// # drop(runner);
@@ -498,7 +498,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new().max_invocations(10);
     /// # drop(runner);
@@ -519,7 +519,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new().initial_page_size(1);
     /// # drop(runner);
@@ -539,7 +539,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new().checkpoint_page_size(1);
     /// # drop(runner);
@@ -560,7 +560,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     /// use std::time::Duration;
     ///
     /// let runner = LocalRunner::new().checkpoint_delay(Duration::from_millis(20));
@@ -586,7 +586,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new().fail_next_checkpoints(1);
     /// # drop(runner);
@@ -610,7 +610,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new().fail_checkpoints_after(1, 1);
     /// # drop(runner);
@@ -635,7 +635,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new().fail_checkpoints_after_retryable(1, 1);
     /// # drop(runner);
@@ -659,7 +659,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new().checkpoint_batching();
     /// # drop(runner);
@@ -684,7 +684,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new().callback_success(&"approved");
     /// # drop(runner);
@@ -702,7 +702,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
     ///
     /// let runner = LocalRunner::new().callback_timeout();
     /// # drop(runner);
@@ -730,7 +730,7 @@ impl LocalRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     /// use durable::test_util::LocalRunner;
     ///
     /// # #[tokio::main]
@@ -1053,7 +1053,7 @@ const CLOUD_RUNNER_ERROR: &str = "CloudRunnerError";
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use durable::test_util::CloudRunner;
 /// use std::time::Duration;
 ///
@@ -1093,7 +1093,7 @@ impl CloudRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::CloudRunner;
+    /// use aws_durable_execution_sdk::test_util::CloudRunner;
     ///
     /// let runner = CloudRunner::new("order-processor");
     /// # drop(runner);
@@ -1117,7 +1117,7 @@ impl CloudRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::CloudRunner;
+    /// use aws_durable_execution_sdk::test_util::CloudRunner;
     ///
     /// let runner = CloudRunner::new("f").region("us-west-2");
     /// # drop(runner);
@@ -1135,7 +1135,7 @@ impl CloudRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::CloudRunner;
+    /// use aws_durable_execution_sdk::test_util::CloudRunner;
     ///
     /// let runner = CloudRunner::new("f").qualifier("PROD");
     /// # drop(runner);
@@ -1151,7 +1151,7 @@ impl CloudRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::CloudRunner;
+    /// use aws_durable_execution_sdk::test_util::CloudRunner;
     /// use std::time::Duration;
     ///
     /// let runner = CloudRunner::new("f").poll_interval(Duration::from_secs(5));
@@ -1169,7 +1169,7 @@ impl CloudRunner {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::test_util::CloudRunner;
+    /// use aws_durable_execution_sdk::test_util::CloudRunner;
     ///
     /// let runner = CloudRunner::new("f").max_poll_attempts(30);
     /// # drop(runner);
@@ -1192,7 +1192,7 @@ impl CloudRunner {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust::test_util::CloudRunner;
+    /// use aws_durable_execution_sdk::test_util::CloudRunner;
     ///
     /// # #[tokio::main]
     /// # async fn main() {

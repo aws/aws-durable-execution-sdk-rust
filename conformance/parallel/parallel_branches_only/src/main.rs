@@ -1,7 +1,7 @@
 //! Conformance requirement 8-2: Parallel invoked with the branches-only form
 //! (no name argument).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 
 /// Handler: parallel with no name, two branches returning constants.

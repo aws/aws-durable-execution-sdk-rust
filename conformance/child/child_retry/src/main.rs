@@ -1,6 +1,6 @@
 //! Conformance requirement 3-7: child with retry (fails first, succeeds second).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: child step fails first attempt, succeeds on retry.

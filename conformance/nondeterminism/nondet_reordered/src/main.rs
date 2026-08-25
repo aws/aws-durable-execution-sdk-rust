@@ -6,7 +6,7 @@
 //! the record checkpointed for "alpha") and fail the execution instead of
 //! silently replaying the wrong recorded result.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: swaps step order between first execution and replay.

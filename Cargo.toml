@@ -8,7 +8,7 @@
 members = ["."]
 
 [package]
-name = "aws-durable-execution-sdk-rust"
+name = "aws-durable-execution-sdk"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.1"
@@ -17,7 +17,7 @@ description = "Rust SDK for AWS Lambda Durable Functions"
 publish = false
 
 [lib]
-name = "aws_durable_execution_sdk_rust"
+name = "aws_durable_execution_sdk"
 
 # Types from other crates that are deliberately part of this crate's public
 # API. `cargo +nightly check-external-types` (wired into ci.yml) fails the
@@ -121,7 +121,7 @@ sha2 = "0.10"
 # integration, or doc test) builds, so a plain `cargo test` runs the
 # `LocalRunner`-based tests without `--features test-util`. Dev-only, so
 # the feature never leaks into a consumer's default build.
-aws-durable-execution-sdk-rust = { path = ".", features = ["test-util"] }
+aws-durable-execution-sdk = { path = ".", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 aws-smithy-runtime-api = { version = "1", features = ["http-1x"] }
 aws-smithy-types = "1"

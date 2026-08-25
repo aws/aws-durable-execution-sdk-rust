@@ -1,6 +1,6 @@
 //! Conformance requirement 3-15: child throws error without any durable op.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: child function returns error directly (no ops).
 async fn handler(

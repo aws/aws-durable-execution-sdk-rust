@@ -1,6 +1,6 @@
 //! Conformance requirement 5-6: invoke target fails, caught, execution succeeds.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: invoke target that errors, catch InvokeError, return fallback.
 async fn handler(

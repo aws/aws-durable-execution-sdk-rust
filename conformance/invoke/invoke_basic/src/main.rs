@@ -1,6 +1,6 @@
 //! Conformance requirement 5-1: invoke basic (target function succeeds).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: invoke an echo target function with the event input.
 async fn handler(

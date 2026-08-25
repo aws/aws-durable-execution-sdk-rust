@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Joins a spawned wait with a spawned step and returns the step's value.
 async fn handler(

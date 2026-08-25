@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 4-5: create callback with heartbeat then success.
 //! Heartbeat keeps callback alive past initial heartbeat interval.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 #[tokio::main]

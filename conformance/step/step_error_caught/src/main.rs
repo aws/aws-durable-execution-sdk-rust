@@ -1,6 +1,6 @@
 //! Conformance requirement 1-20: error caught and handled (try/catch).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::OperationError;
 
 /// Handler: step fails, user code catches error, continues with fallback step.

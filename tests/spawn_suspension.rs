@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::test_util::LocalRunner;
 
 /// Reproducer from issue #48. On a current-thread runtime the spawned task

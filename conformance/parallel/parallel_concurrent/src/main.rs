@@ -1,7 +1,7 @@
 //! Conformance requirement 8-11: Parallel executing branches concurrently
 //! returns index-ordered results.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 
 /// Handler: parallel with max-concurrency=2, three branches.

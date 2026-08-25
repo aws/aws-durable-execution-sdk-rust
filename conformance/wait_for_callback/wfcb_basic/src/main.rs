@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 7-1: wait_for_callback basic.
 //! Submitter is a no-op; external system completes the callback with success.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {

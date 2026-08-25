@@ -152,7 +152,7 @@ cannot, and expect the discussion to be about whether we take on the
 dependency at all. Development dependencies carry none of
 this weight: `deny.toml` sets `exclude-dev = true` and you may add one freely.
 
-[`ReplayFilterLayer`]: https://github.com/aws/aws-durable-execution-sdk-rust/blob/alpha/src/tracing_layer.rs
+[`ReplayFilterLayer`]: https://github.com/aws/aws-durable-execution-sdk-rust/blob/main/src/tracing_layer.rs
 
 `cargo deny check` handles the rest of the supply chain. It enforces a permissive
 license allowlist, so a dependency arriving under an unlisted license fails, and

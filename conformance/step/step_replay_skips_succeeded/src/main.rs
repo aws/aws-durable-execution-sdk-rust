@@ -1,6 +1,6 @@
 //! Conformance requirement 1-9: replay skips succeeded step.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 /// Handler: step that logs "step executed", followed by wait. Replay returns

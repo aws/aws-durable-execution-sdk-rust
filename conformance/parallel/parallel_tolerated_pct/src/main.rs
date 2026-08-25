@@ -1,7 +1,7 @@
 //! Conformance requirement 8-13: Parallel stops early once the failure
 //! percentage exceeds the tolerated-failure-percentage.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
 

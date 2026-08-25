@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 7-15: wait_for_callback with null/empty payload.
 //! External system completes with success but no payload.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {

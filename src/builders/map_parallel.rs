@@ -37,7 +37,7 @@ pub use crate::map_parallel::{
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 /// use serde::{Serialize, Deserialize};
 ///
 /// #[derive(Clone, Serialize, Deserialize)]
@@ -250,7 +250,7 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     event: Vec<String>,
@@ -394,7 +394,7 @@ where
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,
@@ -574,7 +574,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -738,7 +738,7 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfig;
+/// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
 ///
 /// // Fail-fast: stop on the first failure.
 /// let fail_fast = CompletionConfig::with_tolerated_failure_count(0);
@@ -759,7 +759,7 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 ///     .build()?;
 /// assert_eq!(combined.min_successful(), Some(2));
 /// assert_eq!(combined.tolerated_failure_count(), Some(1));
-/// # Ok::<(), aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfigValidationError>(())
+/// # Ok::<(), aws_durable_execution_sdk::builders::map_parallel::CompletionConfigValidationError>(())
 /// ```
 #[derive(Clone, Default)]
 #[non_exhaustive]
@@ -817,11 +817,11 @@ impl CompletionConfig {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfig;
+    /// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
     ///
     /// let config = CompletionConfig::builder().min_successful(3).build()?;
     /// assert_eq!(config.min_successful(), Some(3));
-    /// # Ok::<(), aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfigValidationError>(())
+    /// # Ok::<(), aws_durable_execution_sdk::builders::map_parallel::CompletionConfigValidationError>(())
     /// ```
     pub fn builder() -> CompletionConfigBuilder {
         CompletionConfigBuilder::default()
@@ -917,7 +917,7 @@ impl CompletionConfig {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfig;
+    /// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
     ///
     /// // End the batch once half the items have settled.
     /// let config =
@@ -1019,7 +1019,7 @@ impl CompletionConfig {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfig;
+/// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
 ///
 /// let err = CompletionConfig::builder()
 ///     .tolerated_failure_percentage(101)
@@ -1052,14 +1052,14 @@ impl std::error::Error for CompletionConfigValidationError {}
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfig;
+/// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
 ///
 /// let config = CompletionConfig::builder()
 ///     .min_successful(2)
 ///     .tolerated_failure_percentage(25)
 ///     .build()?;
 /// assert_eq!(config.tolerated_failure_percentage(), Some(25));
-/// # Ok::<(), aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfigValidationError>(())
+/// # Ok::<(), aws_durable_execution_sdk::builders::map_parallel::CompletionConfigValidationError>(())
 /// ```
 #[derive(Clone, Default)]
 #[must_use = "builders do nothing unless .build() is called"]
@@ -1167,7 +1167,7 @@ impl CompletionConfigBuilder {
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfig;
+    /// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
     ///
     /// // Stop early once 2 items succeed OR any 3 items settle,
     /// // whichever fires first.
@@ -1176,7 +1176,7 @@ impl CompletionConfigBuilder {
     ///     .completion_predicate(|stats| stats.settled() >= 3)
     ///     .build()?;
     /// assert!(config.has_completion_predicate());
-    /// # Ok::<(), aws_durable_execution_sdk_rust::builders::map_parallel::CompletionConfigValidationError>(())
+    /// # Ok::<(), aws_durable_execution_sdk::builders::map_parallel::CompletionConfigValidationError>(())
     /// ```
     pub fn completion_predicate<F>(mut self, predicate: F) -> Self
     where

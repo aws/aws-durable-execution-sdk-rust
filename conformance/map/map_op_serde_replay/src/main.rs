@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{DurableContext, Serdes};
 use durable::serdes::SerdesContext;
 

@@ -1,7 +1,7 @@
 //! Conformance requirement 9-10: Map stops early once the failure percentage
 //! exceeds tolerated-failure-percentage.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 use durable::builders::map_parallel::CompletionConfig;
 

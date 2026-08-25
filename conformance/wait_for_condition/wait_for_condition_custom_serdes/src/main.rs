@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 6-11: custom serdes.
 //! Custom serializer adds "ENC:" prefix; custom deserializer strips it.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{BoxError, Serdes};
 use durable::builders::wait_for_condition::WaitDecision;
 use durable::serdes::SerdesContext;

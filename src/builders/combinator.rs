@@ -25,7 +25,7 @@ use crate::future::{DurableFuture, Settled};
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,
@@ -138,7 +138,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,
@@ -249,7 +249,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,
@@ -359,7 +359,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
+/// use aws_durable_execution_sdk as durable;
 ///
 /// async fn handler(
 ///     _event: serde_json::Value,

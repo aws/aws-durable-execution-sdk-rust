@@ -5,7 +5,7 @@
 //! min-successful. The conformance test expects a metadata projection; we
 //! construct it from the number of results returned.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::{Branch, DurableContext};
 use durable::builders::map_parallel::CompletionConfig;
 

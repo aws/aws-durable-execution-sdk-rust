@@ -4,7 +4,7 @@
 //! task, so no branch can win. With the blessing in place, the failing
 //! branch loses and the succeeding branch's value is returned.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: selects the first successful of a failing and a succeeding step.
 async fn handler(

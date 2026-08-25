@@ -1,7 +1,7 @@
 //! Conformance requirement 9-3: Map function receives both the item and its
 //! zero-based index and uses both.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use durable::DurableContext;
 
 /// Handler: map that adds item + index.

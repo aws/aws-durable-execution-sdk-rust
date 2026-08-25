@@ -32,8 +32,8 @@ use crate::{BoxError, context::StepContext};
 /// # Examples
 ///
 /// ```no_run
-/// use aws_durable_execution_sdk_rust as durable;
-/// use aws_durable_execution_sdk_rust::RetryDecision;
+/// use aws_durable_execution_sdk as durable;
+/// use aws_durable_execution_sdk::RetryDecision;
 /// use std::time::Duration;
 ///
 /// async fn handler(
@@ -118,8 +118,8 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
-    /// use aws_durable_execution_sdk_rust::RetryDecision;
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::RetryDecision;
     /// use std::time::Duration;
     ///
     /// async fn handler(
@@ -160,8 +160,8 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
-    /// use aws_durable_execution_sdk_rust::builders::RetryStrategyConfig;
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::builders::RetryStrategyConfig;
     /// use std::time::Duration;
     ///
     /// async fn handler(
@@ -223,8 +223,8 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
-    /// use aws_durable_execution_sdk_rust::StepSemantics;
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::StepSemantics;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,
@@ -271,7 +271,7 @@ where
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk_rust as durable;
+    /// use aws_durable_execution_sdk as durable;
     ///
     /// async fn handler(
     ///     _event: serde_json::Value,

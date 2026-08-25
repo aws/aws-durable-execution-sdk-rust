@@ -6,7 +6,7 @@
 //! completes correctly when the bootstrap path follows the pagination
 //! marker instead of replaying against a truncated log.
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;

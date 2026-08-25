@@ -1,5 +1,5 @@
 //! Guard non-durable side effects with
-//! [`DurableContext::is_replaying`](aws_durable_execution_sdk_rust::DurableContext::is_replaying).
+//! [`DurableContext::is_replaying`](aws_durable_execution_sdk::DurableContext::is_replaying).
 //!
 //! Code between durable operations re-runs on every resume. If a side effect is
 //! not itself a durable operation (a metric emit, a one-shot log), wrap it in a
@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Reports the replay flag around a durable wait.
 async fn handler(

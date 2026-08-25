@@ -1,7 +1,7 @@
 //! Conformance handler for requirement 7-14: wait_for_callback timeout caught.
 //! Handler catches timeout and returns "timed-out-handled".
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 use std::time::Duration;
 
 #[tokio::main]

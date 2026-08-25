@@ -93,7 +93,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-durable-execution-sdk-rust"
+name = "aws-durable-execution-sdk"
 version = "0.1.0"
 dependencies = [
  "aws-config",
@@ -537,7 +537,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 name = "child_basic"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -548,7 +548,7 @@ dependencies = [
 name = "child_failing_step"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -559,7 +559,7 @@ dependencies = [
 name = "child_fanout"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -570,7 +570,7 @@ dependencies = [
 name = "child_large_data"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -581,7 +581,7 @@ dependencies = [
 name = "child_serdes"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -607,7 +607,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 name = "combinator_join_all"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -618,7 +618,7 @@ dependencies = [
 name = "combinator_race"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -629,7 +629,7 @@ dependencies = [
 name = "combinator_select_ok"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -640,7 +640,7 @@ dependencies = [
 name = "combinator_try_join_all"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -651,7 +651,7 @@ dependencies = [
 name = "comprehensive"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -661,7 +661,7 @@ dependencies = [
 name = "concurrent_operations"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -721,7 +721,7 @@ dependencies = [
 name = "create_callback_heartbeat"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -732,7 +732,7 @@ dependencies = [
 name = "create_callback_simple"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -743,7 +743,7 @@ dependencies = [
 name = "create_callback_timeout"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -838,7 +838,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 name = "error_determinism"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1020,7 +1020,7 @@ dependencies = [
 name = "handler_error"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1036,7 +1036,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 name = "hello_world"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1315,7 +1315,7 @@ dependencies = [
 name = "invoke_simple"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1325,7 +1325,7 @@ dependencies = [
 name = "invoke_target"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1335,7 +1335,7 @@ dependencies = [
 name = "invoke_target_tenant"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1345,7 +1345,7 @@ dependencies = [
 name = "invoke_tenant_id"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1433,7 +1433,7 @@ dependencies = [
 name = "large_payload"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1467,7 +1467,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "logging_after_wait"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1479,7 +1479,7 @@ dependencies = [
 name = "logging_levels"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1490,7 +1490,7 @@ dependencies = [
 name = "map_basic"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1501,7 +1501,7 @@ dependencies = [
 name = "map_completion"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1512,7 +1512,7 @@ dependencies = [
 name = "map_concurrency"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1523,7 +1523,7 @@ dependencies = [
 name = "map_empty"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1534,7 +1534,7 @@ dependencies = [
 name = "map_virtual"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1571,7 +1571,7 @@ dependencies = [
 name = "multiple_waits"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1582,7 +1582,7 @@ dependencies = [
 name = "no_replay_execution"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1637,7 +1637,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "optional_results"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1653,7 +1653,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 name = "parallel_basic"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1664,7 +1664,7 @@ dependencies = [
 name = "parallel_completion"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1675,7 +1675,7 @@ dependencies = [
 name = "parallel_empty"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1686,7 +1686,7 @@ dependencies = [
 name = "parallel_heterogeneous"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1697,7 +1697,7 @@ dependencies = [
 name = "parallel_virtual"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -1814,7 +1814,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "retry_exhaustion"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1954,7 +1954,7 @@ dependencies = [
 name = "serde_basic"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -1964,7 +1964,7 @@ dependencies = [
 name = "serde_configure"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -2088,7 +2088,7 @@ dependencies = [
 name = "spawn_with_wait"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -2105,7 +2105,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "step_basic"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -2115,7 +2115,7 @@ dependencies = [
 name = "step_named"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde",
  "serde_json",
@@ -2126,7 +2126,7 @@ dependencies = [
 name = "step_with_retry"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -2468,7 +2468,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 name = "wait_basic"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -2479,7 +2479,7 @@ dependencies = [
 name = "wait_for_callback_basic"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -2489,7 +2489,7 @@ dependencies = [
 name = "wait_for_callback_submitter"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -2500,7 +2500,7 @@ dependencies = [
 name = "wait_for_callback_timeout"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -2510,7 +2510,7 @@ dependencies = [
 name = "wait_for_condition"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",
@@ -2520,7 +2520,7 @@ dependencies = [
 name = "wait_named"
 version = "0.0.0"
 dependencies = [
- "aws-durable-execution-sdk-rust",
+ "aws-durable-execution-sdk",
  "lambda_runtime",
  "serde_json",
  "tokio",

@@ -1,6 +1,6 @@
 //! Conformance requirement 3-4: child context step failure (no retry).
 
-use aws_durable_execution_sdk_rust as durable;
+use aws_durable_execution_sdk as durable;
 
 /// Handler: child with a failing step (no retry).
 async fn handler(
