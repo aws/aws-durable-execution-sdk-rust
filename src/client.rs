@@ -245,7 +245,7 @@ impl ExecutionClient for LambdaExecutionClient {
 /// A stale token resolves on re-invocation (the service issues a fresh one),
 /// so this specific rejection is classified retryable: the carve-out the
 /// Java SDK's `DurableApiErrorClassifier` applies.
-const STALE_TOKEN_MESSAGE_PREFIX: &str = "Invalid Checkpoint Token";
+const STALE_TOKEN_MESSAGE_PREFIX: &str = "Invalid checkpoint token";
 
 /// Classifies a final `CheckpointDurableExecution` error into a recovery
 /// scope, carried as [`ClientError::is_retryable`].
@@ -917,6 +917,31 @@ mod tests {
         assert_eq!(rule.num_calls(), 1, "a client fault is not retried");
     }
 
+    /// The backend reports stale checkpoint tokens as an
+    /// `InvalidParameterValueException` whose message starts with
+    /// `Invalid checkpoint token`; the production client must classify
+    /// that modeled 4xx as retryable so the invocation fails and durable
+    /// execution can resume with a fresh token.
+    #[tokio::test]
+    async fn checkpoint_stale_token_error_maps_to_retryable_client_error() {
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution).then_error(|| {
+            CheckpointDurableExecutionError::InvalidParameterValueException(
+                aws_sdk_lambda::types::error::InvalidParameterValueException::builder()
+                    .message("Invalid checkpoint token: token has been superseded")
+                    .build(),
+            )
+        });
+        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
+        let client = LambdaExecutionClient::new(sdk_client);
+
+        let err = client
+            .checkpoint("arn:test", "tok", Vec::new())
+            .await
+            .expect_err("stale checkpoint token must fail the call");
+        assert!(err.is_retryable());
+        assert_eq!(rule.num_calls(), 1, "a client fault is not retried");
+    }
+
     /// Transient-failure retry belongs to the aws-sdk's standard retry and
     /// nothing else: a persistent 503 is attempted exactly the SDK's
     /// default 3 times, not 9, which the deleted hand-rolled outer loop
@@ -1481,21 +1506,26 @@ mod tests {
     }
 
     /// The stale-token carve-out: `InvalidParameterValueException` whose
-    /// message starts with `Invalid Checkpoint Token` resolves on
+    /// message starts with `Invalid checkpoint token` resolves on
     /// re-invocation (the service issues a fresh token), so it is
     /// retryable. Prefix match only: a stale-token mention elsewhere in
     /// the message does not qualify.
     #[test]
     fn stale_token_rejection_classifies_retryable() {
         let stale = classify(invalid_parameter(Some(
-            "Invalid Checkpoint Token: token has been superseded",
+            "Invalid checkpoint token: token has been superseded",
         )));
         assert!(stale.is_retryable());
 
         let not_prefix = classify(invalid_parameter(Some(
-            "field X rejected (not an Invalid Checkpoint Token case)",
+            "field X rejected (not an Invalid checkpoint token case)",
         )));
         assert!(!not_prefix.is_retryable());
+
+        let wrong_case = classify(invalid_parameter(Some(
+            "Invalid Checkpoint Token: old non-service spelling",
+        )));
+        assert!(!wrong_case.is_retryable());
     }
 
     #[test]
