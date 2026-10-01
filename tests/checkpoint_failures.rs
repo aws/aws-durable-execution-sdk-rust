@@ -927,3 +927,111 @@ async fn retryable_flush_failure_fails_invocation_and_reinvocation_converges() {
          (AtLeastOncePerRetry): nothing further was written for it"
     );
 }
+
+/// A checkpoint response that did not include a checkpoint token must
+/// stop checkpointing and report `PENDING`, even when it is discovered only
+/// AFTER the handler itself already returned a value: the handler's own
+/// completed outcome must never be reported once its outcome write was
+/// withdrawn.
+///
+/// `withdraw_checkpoints_after(1, 1)` lets the step's START write through
+/// and answers its SUCCEED write (the batched outcome, flushed at
+/// end-of-invocation) with a token-less response.
+#[tokio::test]
+async fn late_token_withdrawal_after_handler_returns_reports_pending() {
+    let body_runs = Arc::new(AtomicU32::new(0));
+    let body_runs_h = Arc::clone(&body_runs);
+
+    let result = LocalRunner::new()
+        .checkpoint_batching()
+        .withdraw_checkpoints_after(1, 1)
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let body_runs = Arc::clone(&body_runs_h);
+                async move {
+                    let runs_at_entry = body_runs.load(Ordering::SeqCst);
+                    let body_runs_step = Arc::clone(&body_runs);
+                    // Start the step eagerly and never await it, exactly as
+                    // a `race` starts its branches; the handler returns its
+                    // own result below while this background step's
+                    // outcome write is still in flight.
+                    let orphan = ctx
+                        .step(move |_| {
+                            let body_runs = Arc::clone(&body_runs_step);
+                            async move {
+                                body_runs.fetch_add(1, Ordering::SeqCst);
+                                Ok("orphaned-outcome".to_owned())
+                            }
+                        })
+                        .name("orphan")
+                        .spawn();
+
+                    // Wait for the body to have run, then give its
+                    // SUCCEED write time to join the coalescing buffer
+                    // before the handler returns its own value.
+                    //
+                    // The 30ms sleep below is a synchronization assumption,
+                    // not a proof: it assumes the orphan step's SUCCEED
+                    // write reaches the coalescing buffer within that
+                    // window. `LocalRunner`/`InMemoryExecutionClient` expose
+                    // no deterministic hook for pending-buffer occupancy
+                    // (that state is crate-private, `#[cfg(test)]`-only, and
+                    // not reachable from this integration test's crate), so
+                    // there is nothing stabler to poll here today. Under
+                    // contention this can under-wait and let the test pass
+                    // without exercising the intended race; it cannot
+                    // false-fail (a withdrawal injected before the write
+                    // joins the buffer is still a withdrawal).
+                    while body_runs.load(Ordering::SeqCst) == runs_at_entry {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    drop(orphan);
+
+                    Ok::<_, durable::BoxError>("handler-done".to_owned())
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await;
+
+    assert!(
+        result.is_suspended(),
+        "a token-less checkpoint response must stop checkpointing this invocation \
+         and report PENDING instead of the handler's own completed outcome: \
+         {:?} / {:?}",
+        result.error_type(),
+        result.error_message()
+    );
+    assert_eq!(
+        result.output(),
+        None,
+        "the handler's own return value must never be reported once its \
+         checkpointing was withdrawn"
+    );
+    assert!(
+        !result.is_failure(),
+        "a withdrawn token is not a failure of either the invocation or the \
+         execution"
+    );
+    assert_eq!(
+        result.invocation_count(),
+        1,
+        "the withdrawn invocation reports PENDING with nothing further to \
+         advance, so the runner must not keep re-invoking it"
+    );
+
+    let orphan_op = result
+        .operations()
+        .iter()
+        .find(|op| op.name() == Some("orphan"))
+        .expect("the orphaned step's operation record exists");
+    assert_eq!(
+        orphan_op.status(),
+        "Started",
+        "the orphan's outcome write was withdrawn, so it must remain in its \
+         replay-safe non-terminal state (not Succeeded, and not any other \
+         terminal state either, which would equally prevent replay); got {}",
+        orphan_op.status()
+    );
+}

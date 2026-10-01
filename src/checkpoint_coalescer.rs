@@ -56,7 +56,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use aws_sdk_lambda::types::OperationUpdate;
+use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use tokio::sync::Notify;
 use tokio::sync::futures::Notified;
 
@@ -268,6 +268,33 @@ pub(crate) struct FailedFlush {
     /// succeeded (a terminal `FAIL` must not be written over a persisted
     /// outcome).
     pub(crate) unwritten: Vec<OperationUpdate>,
+    /// Whether an EARLIER chunk of the same sealed batch, written before
+    /// this failure occurred, carried the execution's own terminal
+    /// `EXECUTION`/`Succeed` update and was accepted by the service.
+    ///
+    /// A sealed batch can split into several requests, and nothing
+    /// guarantees the terminal update is in the last one. Once the service
+    /// has accepted it, the execution is recorded `SUCCEEDED` no matter
+    /// what a later chunk's missing token does; this flag carries that
+    /// fact out of `DurableContext::write_batched_updates` so the
+    /// end-of-invocation decision does not have to re-derive acceptance
+    /// from request content (see `FlushFailure::any_terminal_accepted`).
+    pub(crate) terminal_accepted: bool,
+}
+
+/// Whether any update in `chunk` is the execution's own terminal
+/// `EXECUTION`/`Succeed` update (the oversized-result write
+/// `withDurableExecution` sends after the handler returns).
+///
+/// Checked on `Succeed` specifically because every current construction
+/// site for an EXECUTION-type update always sets `Succeed`; if an
+/// EXECUTION-type `Fail` update is ever introduced, every caller of this
+/// function must be revisited to decide whether it also counts as
+/// execution-already-finished.
+pub(crate) fn chunk_carries_execution_terminal(chunk: &[TrackedUpdate]) -> bool {
+    chunk.iter().any(|t| {
+        t.update.r#type == OperationType::Execution && t.update.action == OperationAction::Succeed
+    })
 }
 
 /// The rendezvous for one coalesced checkpoint call: contributors await its
@@ -378,12 +405,21 @@ impl CheckpointCoalescer {
     /// not persist. Also latches the failure (first error wins) so no
     /// later buffered write reaches the backend this invocation: see
     /// [`CoalescerState::latched`].
-    pub(crate) fn record_failed_flush(&self, error: ClientError, unwritten: Vec<OperationUpdate>) {
+    pub(crate) fn record_failed_flush(
+        &self,
+        error: ClientError,
+        unwritten: Vec<OperationUpdate>,
+        terminal_accepted: bool,
+    ) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.latched.is_none() {
             state.latched = Some(error.clone());
         }
-        state.failed.push(FailedFlush { error, unwritten });
+        state.failed.push(FailedFlush {
+            error,
+            unwritten,
+            terminal_accepted,
+        });
     }
 
     /// The first write failure this invocation's buffered channel
@@ -416,8 +452,8 @@ mod tests {
     fn dummy_update(id: &str) -> OperationUpdate {
         OperationUpdate::builder()
             .id(id.to_owned())
-            .r#type(aws_sdk_lambda::types::OperationType::Step)
-            .action(aws_sdk_lambda::types::OperationAction::Start)
+            .r#type(OperationType::Step)
+            .action(OperationAction::Start)
             .build()
             .expect("all required OperationUpdate fields set")
     }
@@ -512,8 +548,8 @@ mod tests {
         let payload_update = |id: &str, payload_len: usize| {
             OperationUpdate::builder()
                 .id(id.to_owned())
-                .r#type(aws_sdk_lambda::types::OperationType::Step)
-                .action(aws_sdk_lambda::types::OperationAction::Succeed)
+                .r#type(OperationType::Step)
+                .action(OperationAction::Succeed)
                 .payload("x".repeat(payload_len))
                 .build()
                 .expect("all required OperationUpdate fields set")
@@ -551,8 +587,8 @@ mod tests {
     fn oversized_single_update_goes_alone() {
         let big = OperationUpdate::builder()
             .id("big".to_owned())
-            .r#type(aws_sdk_lambda::types::OperationType::Step)
-            .action(aws_sdk_lambda::types::OperationAction::Succeed)
+            .r#type(OperationType::Step)
+            .action(OperationAction::Succeed)
             .payload("x".repeat(4096))
             .build()
             .expect("all required OperationUpdate fields set");
@@ -584,8 +620,8 @@ mod tests {
     fn estimated_size_counts_payload_and_error_strings() {
         let with_payload = OperationUpdate::builder()
             .id("p".to_owned())
-            .r#type(aws_sdk_lambda::types::OperationType::Step)
-            .action(aws_sdk_lambda::types::OperationAction::Succeed)
+            .r#type(OperationType::Step)
+            .action(OperationAction::Succeed)
             .payload("y".repeat(500))
             .build()
             .expect("all required OperationUpdate fields set");
@@ -625,8 +661,8 @@ mod tests {
         let quote_update = |id: &str| {
             OperationUpdate::builder()
                 .id(id.to_owned())
-                .r#type(aws_sdk_lambda::types::OperationType::Step)
-                .action(aws_sdk_lambda::types::OperationAction::Succeed)
+                .r#type(OperationType::Step)
+                .action(OperationAction::Succeed)
                 .payload("\"".repeat(1000))
                 .build()
                 .expect("all required OperationUpdate fields set")
@@ -648,16 +684,16 @@ mod tests {
     fn estimated_size_uses_escaped_bytes_for_all_string_fields() {
         let escaped = OperationUpdate::builder()
             .id("\"\"".to_owned())
-            .r#type(aws_sdk_lambda::types::OperationType::Step)
-            .action(aws_sdk_lambda::types::OperationAction::Succeed)
+            .r#type(OperationType::Step)
+            .action(OperationAction::Succeed)
             .name("\\\\".to_owned())
             .payload("\n\n".to_owned())
             .build()
             .expect("all required OperationUpdate fields set");
         let plain = OperationUpdate::builder()
             .id("xx".to_owned())
-            .r#type(aws_sdk_lambda::types::OperationType::Step)
-            .action(aws_sdk_lambda::types::OperationAction::Succeed)
+            .r#type(OperationType::Step)
+            .action(OperationAction::Succeed)
             .name("xx".to_owned())
             .payload("xx".to_owned())
             .build()
@@ -711,10 +747,12 @@ mod tests {
         coalescer.record_failed_flush(
             ClientError::from_retryable("first failure".to_owned()),
             vec![dummy_update("a")],
+            false,
         );
         coalescer.record_failed_flush(
             ClientError::new_non_retryable("second failure"),
             vec![dummy_update("b")],
+            false,
         );
 
         let latched = coalescer.latched_failure().expect("latch is set");

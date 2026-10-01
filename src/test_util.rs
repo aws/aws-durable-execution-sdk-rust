@@ -428,6 +428,14 @@ pub struct LocalRunner {
     /// fault; the runner re-invokes) rather than non-retryable (terminal
     /// `FAIL` then execution failure).
     checkpoint_failures_retryable: bool,
+    /// Number of upcoming checkpoint calls the backend answers with a
+    /// token-less response (fault injection; see
+    /// [`withdraw_checkpoints_after`](Self::withdraw_checkpoints_after)).
+    checkpoint_withdrawals: usize,
+    /// Number of checkpoint calls to let through before the injected
+    /// token-less responses start (see
+    /// [`withdraw_checkpoints_after`](Self::withdraw_checkpoints_after)).
+    checkpoint_withdrawal_skip: usize,
 }
 
 impl Default for LocalRunner {
@@ -466,6 +474,8 @@ impl LocalRunner {
             checkpoint_failures: 0,
             checkpoint_failure_skip: 0,
             checkpoint_failures_retryable: false,
+            checkpoint_withdrawals: 0,
+            checkpoint_withdrawal_skip: 0,
         }
     }
 
@@ -648,6 +658,28 @@ impl LocalRunner {
         self
     }
 
+    /// Like [`fail_checkpoints_after`](Self::fail_checkpoints_after), but
+    /// lets the first `skip` checkpoint calls through before answering the
+    /// following `count` with a token-less response, simulating a
+    /// checkpoint response that carries no checkpoint token: the SDK must
+    /// stop checkpointing this invocation and report `PENDING`, without
+    /// retrying or failing anything.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().withdraw_checkpoints_after(1, 1);
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn withdraw_checkpoints_after(mut self, skip: usize, count: usize) -> Self {
+        self.checkpoint_withdrawal_skip = skip;
+        self.checkpoint_withdrawals = count;
+        self
+    }
+
     /// Enables checkpoint batching, exactly as [`Options`](crate::Options)'s
     /// [`checkpoint_batching`](crate::OptionsBuilder::checkpoint_batching)
     /// does in production: checkpoint writes go through a single ordered
@@ -768,6 +800,14 @@ impl LocalRunner {
         );
         backend.checkpoint_failures_retryable.store(
             self.checkpoint_failures_retryable,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        backend.checkpoint_withdrawals_remaining.store(
+            self.checkpoint_withdrawals,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        backend.checkpoint_withdrawals_skip.store(
+            self.checkpoint_withdrawal_skip,
             std::sync::atomic::Ordering::SeqCst,
         );
         self.run_on_backend(backend, handler, event).await
@@ -1691,6 +1731,13 @@ struct Backend {
     /// Whether injected checkpoint failures are retryable (see
     /// [`LocalRunner::fail_checkpoints_after_retryable`]).
     checkpoint_failures_retryable: std::sync::atomic::AtomicBool,
+    /// Number of upcoming `checkpoint` calls to answer with a token-less
+    /// response, before touching any state (fault injection; see
+    /// [`LocalRunner::withdraw_checkpoints_after`]).
+    checkpoint_withdrawals_remaining: std::sync::atomic::AtomicUsize,
+    /// Number of `checkpoint` calls to let through before the injected
+    /// token-less responses begin.
+    checkpoint_withdrawals_skip: std::sync::atomic::AtomicUsize,
     /// Per-call checkpoint plan (in-crate test seam): while non-empty,
     /// each `checkpoint` call pops and obeys the front entry instead of
     /// the counter-based injection (see
@@ -1731,6 +1778,8 @@ impl Backend {
             checkpoint_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
             checkpoint_failures_skip: std::sync::atomic::AtomicUsize::new(0),
             checkpoint_failures_retryable: std::sync::atomic::AtomicBool::new(false),
+            checkpoint_withdrawals_remaining: std::sync::atomic::AtomicUsize::new(0),
+            checkpoint_withdrawals_skip: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             checkpoint_plan: Mutex::new(std::collections::VecDeque::new()),
         }
@@ -1778,6 +1827,30 @@ impl Backend {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // Arms-and-consumes the counters `LocalRunner::withdraw_checkpoints_after`
+    // sets: after `skip` calls pass through, the next `count` calls answer with
+    // no checkpoint token. Split out of `checkpoint` so that function stays
+    // under `clippy::too_many_lines`.
+    fn take_injected_withdrawal(&self) -> bool {
+        let skipped = self
+            .checkpoint_withdrawals_skip
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok();
+        !skipped
+            && self
+                .checkpoint_withdrawals_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
     }
 
     /// The current checkpoint token string.
@@ -2089,6 +2162,19 @@ impl ExecutionClient for Backend {
                         "injected checkpoint failure (LocalRunner::fail_next_checkpoints)",
                     ))
                 }
+            });
+        }
+        // Injected fault (`LocalRunner::withdraw_checkpoints_after`): after
+        // letting `skip` calls through, answer with a response that did not
+        // include a checkpoint token. The SDK must stop checkpointing and
+        // report `PENDING`, never retrying or failing anything.
+        if self.take_injected_withdrawal() {
+            return Box::pin(async move {
+                Err(ClientError::suspended_by_service(
+                    "injected token-less checkpoint response \
+                     (LocalRunner::withdraw_checkpoints_after)"
+                        .to_owned(),
+                ))
             });
         }
         let updated_ops: Vec<Operation> = {

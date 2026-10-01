@@ -18,7 +18,8 @@ use crate::builders::{
     WaitForCallbackBuilder, WaitForConditionBuilder, WithRetryBuilder,
 };
 use crate::checkpoint_coalescer::{
-    BatchLimits, CheckpointBatch, CheckpointCoalescer, TrackedUpdate, split_into_requests,
+    BatchLimits, CheckpointBatch, CheckpointCoalescer, TrackedUpdate,
+    chunk_carries_execution_terminal, split_into_requests,
 };
 use crate::client::{CheckpointOutput, ClientError, ExecutionClient};
 use crate::driver::{SuspensionSignal, TaskOwnership};
@@ -51,11 +52,16 @@ struct Inner {
     task_ownership: Arc<TaskOwnership>,
     /// Execution client for checkpointing (None in test contexts without a client).
     execution_client: Option<Arc<dyn ExecutionClient>>,
-    /// Mutable checkpoint token rotated on each checkpoint call.
+    /// Mutable checkpoint token rotated on each checkpoint call, or `None`
+    /// once a checkpoint response has carried no token (see
+    /// [`DurableContext::checkpoint_direct_with_events`]). `None` makes
+    /// "no further call may present a token" a state the type system
+    /// enforces rather than a convention: there is no valid `&str` to hand
+    /// the client once the slot is `None`.
     /// Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) because the lock
     /// must be held across `await` points in [`DurableContext::checkpoint_updates`],
     /// serializing all concurrent checkpoint callers through one critical section.
-    checkpoint_token: Arc<Mutex<String>>,
+    checkpoint_token: Arc<Mutex<Option<String>>>,
     /// Checkpoint-write coalescer, present only when
     /// [`Options`](crate::Options) configured a `checkpoint_delay` and/or
     /// `checkpoint_batching`. Shared with every child context so updates
@@ -152,13 +158,44 @@ pub(crate) struct FlushFailure {
 }
 
 impl FlushFailure {
+    /// Whether any of the failures is a checkpoint response with no
+    /// checkpoint token. Checked with priority over
+    /// [`Self::any_non_retryable`] at every call site: a missing token
+    /// means the current invocation must report PENDING, which is not the
+    /// "permanent rejection" this flush point otherwise assumes a
+    /// non-retryable failure to be.
+    pub(crate) fn any_suspended_by_service(&self) -> bool {
+        self.failures
+            .iter()
+            .any(|f| f.error.is_suspended_by_service())
+    }
+
     /// Whether any of the failures is non-retryable. Non-retryable wins
     /// the classification: re-invoking on a deterministic rejection would
     /// loop until the execution timeout (issue #43 defect 1), so a single
     /// non-retryable failure routes the whole flush through the
-    /// terminal-FAIL-then-fail-the-execution path.
+    /// terminal-FAIL-then-fail-the-execution path. Excludes a
+    /// service-withdrawn token: that scope is neither retryable nor a
+    /// permanent rejection (see [`Self::any_suspended_by_service`]).
     pub(crate) fn any_non_retryable(&self) -> bool {
-        self.failures.iter().any(|f| !f.error.is_retryable())
+        self.failures
+            .iter()
+            .any(|f| !f.error.is_retryable() && !f.error.is_suspended_by_service())
+    }
+
+    /// Whether an earlier chunk of some failed batch already carried the
+    /// execution's own terminal `EXECUTION`/`Succeed` update and was
+    /// accepted by the service, before a later chunk hit this flush
+    /// failure.
+    ///
+    /// Checked with priority over every other classification at its call
+    /// sites: once the service has recorded the execution as `SUCCEEDED`,
+    /// nothing a later chunk's missing token, or any other failure in the
+    /// same flush, does can retract that. Reporting `PENDING` or failing
+    /// the execution here would contradict what the service already
+    /// recorded.
+    pub(crate) fn any_terminal_accepted(&self) -> bool {
+        self.failures.iter().any(|f| f.terminal_accepted)
     }
 
     /// The error to report: the first non-retryable failure when one
@@ -172,7 +209,7 @@ impl FlushFailure {
     pub(crate) fn primary_error(&self) -> &ClientError {
         self.failures
             .iter()
-            .find(|f| !f.error.is_retryable())
+            .find(|f| !f.error.is_retryable() && !f.error.is_suspended_by_service())
             .or_else(|| self.failures.first())
             .map_or_else(
                 || unreachable!("FlushFailure is never constructed empty"),
@@ -204,7 +241,7 @@ impl DurableContext {
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
-                checkpoint_token: Arc::new(Mutex::new(String::new())),
+                checkpoint_token: Arc::new(Mutex::new(Some(String::new()))),
                 coalescer: None,
                 parent_wire_id: None,
                 replay_span,
@@ -236,7 +273,7 @@ impl DurableContext {
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
-                checkpoint_token: Arc::new(Mutex::new(String::new())),
+                checkpoint_token: Arc::new(Mutex::new(Some(String::new()))),
                 coalescer: None,
                 parent_wire_id: None,
                 replay_span,
@@ -268,7 +305,7 @@ impl DurableContext {
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
-                checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
+                checkpoint_token: Arc::new(Mutex::new(Some(checkpoint_token))),
                 coalescer: None,
                 parent_wire_id: None,
                 replay_span,
@@ -305,7 +342,7 @@ impl DurableContext {
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
-                checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
+                checkpoint_token: Arc::new(Mutex::new(Some(checkpoint_token))),
                 coalescer: checkpoint_buffer_window.map(|d| Arc::new(CheckpointCoalescer::new(d))),
                 parent_wire_id: None,
                 replay_span,
@@ -339,7 +376,7 @@ impl DurableContext {
                 suspension_signal: Arc::new(SuspensionSignal::new()),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
-                checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
+                checkpoint_token: Arc::new(Mutex::new(Some(checkpoint_token))),
                 coalescer: Some(Arc::new(coalescer)),
                 parent_wire_id: None,
                 replay_span,
@@ -913,9 +950,16 @@ impl DurableContext {
     /// error: a handler that catches it branches on a decision no
     /// checkpoint records, which replay cannot reproduce. Instead the
     /// failure's classification (see
-    /// [`ClientError::is_retryable`](crate::client::ClientError)) picks
-    /// the recovery scope:
+    /// [`ClientError::is_retryable`](crate::client::ClientError) and
+    /// [`ClientError::is_suspended_by_service`](crate::client::ClientError))
+    /// picks the recovery scope, checked in this fixed order:
     ///
+    /// - **Suspended by service** (the checkpoint response carried no
+    ///   token): not a failure of either scope below. This
+    ///   scope's own [`Self::request_suspend`] is called instead of
+    ///   recording a fatal, so the driver reports `PENDING` through the
+    ///   ordinary suspension path (the same one `Self::suspend_now` uses),
+    ///   with no error ever reaching plugins or the customer handler.
     /// - **Retryable** (exhausted transient failure, stale token): the
     ///   write channel is down, so a follow-up write would fail the same
     ///   way. Nothing more is written; the invocation fails with a Lambda
@@ -932,11 +976,18 @@ impl DurableContext {
     ///   either way). Then the execution fails with
     ///   [`CHECKPOINT_FAILED_ERROR_TYPE`](crate::error::CHECKPOINT_FAILED_ERROR_TYPE).
     ///
-    /// Like [`Self::suspend_now`], the returned future never resolves: the
-    /// fatal slot is recorded and the invocation driver, which checks it
-    /// with priority over completion and suspension, from any scope in the
-    /// tree, drops the handler at its current await point, so user code
-    /// can neither catch nor ignore the failure.
+    /// Like [`Self::suspend_now`], the returned future never resolves. On
+    /// the two failure scopes, the fatal slot is recorded and the
+    /// invocation driver, which checks it with priority over completion
+    /// and suspension, from any scope in the tree, drops the handler at
+    /// its current await point, so user code can neither catch nor ignore
+    /// the failure. On the suspension scope no fatal is recorded, so a
+    /// handler that already resolved (returned or threw) while this write
+    /// was in flight still reports `PENDING`: the scope's quiescence gate
+    /// defers the suspend request until every sibling operation this scope
+    /// owns has settled (see [`crate::driver::SuspensionSignal::park_owner`]),
+    /// exactly the case of an unfinished map/parallel branch racing ahead
+    /// of a checkpoint it never awaited.
     pub(crate) async fn checkpoint_failure_unrecoverable<T>(
         &self,
         op_wire_id: &str,
@@ -944,7 +995,13 @@ impl DurableContext {
         terminal_fail: Option<OperationUpdate>,
     ) -> T {
         let message = format!("checkpoint write failed for operation {op_wire_id}: {err}");
-        if err.is_retryable() {
+        if err.is_suspended_by_service() {
+            // Not a failure: the checkpoint call already logged the single
+            // WARN naming the condition (client.rs). Suspending here, not
+            // recording a fatal, is what keeps this scope's outcome
+            // PENDING instead of FAILED/SUCCEEDED.
+            self.request_suspend();
+        } else if err.is_retryable() {
             tracing::error!(
                 operation_id = %op_wire_id,
                 error = %err,
@@ -1167,16 +1224,20 @@ impl DurableContext {
                 // took. The latch is set by the failing flusher while it
                 // holds this same lock, so the check cannot race it.
                 if let Some(prior) = coalescer.latched_failure() {
+                    // No write was attempted here: the channel was already
+                    // down before this flusher reached the lock, so this
+                    // batch cannot have accepted the terminal update.
                     coalescer.record_failed_flush(
                         prior.clone(),
                         updates.into_iter().map(|t| t.update).collect(),
+                        false,
                     );
                     batch.publish(Err(prior));
                     return;
                 }
                 let result = match ctx.write_batched_updates(updates, coalescer.limits()).await {
                     Ok(output) => Ok(output),
-                    Err((error, unwritten)) => {
+                    Err((error, unwritten, terminal_accepted)) => {
                         // Retain the failure for the end-of-invocation
                         // flush point (issue #43): every contributor of
                         // this batch may already be dropped (a lost
@@ -1184,8 +1245,11 @@ impl DurableContext {
                         // `DurableFuture`), and a failure published to
                         // nobody would otherwise be fully discarded,
                         // leaving the affected operations' records
-                        // claiming less than what executed.
-                        coalescer.record_failed_flush(error.clone(), unwritten);
+                        // claiming less than what executed. `terminal_accepted`
+                        // travels with it so the flush point still answers
+                        // SUCCEEDED if an earlier chunk's terminal update
+                        // was already accepted.
+                        coalescer.record_failed_flush(error.clone(), unwritten, terminal_accepted);
                         Err(error)
                     }
                 };
@@ -1218,28 +1282,42 @@ impl DurableContext {
         &self,
         updates: Vec<TrackedUpdate>,
         limits: BatchLimits,
-    ) -> Result<CheckpointOutput, (ClientError, Vec<OperationUpdate>)> {
+    ) -> Result<CheckpointOutput, (ClientError, Vec<OperationUpdate>, bool)> {
         if updates.is_empty() {
             // An empty seal (possible only defensively) still performs one
             // call so a waiting contributor receives a published result.
             return self
                 .checkpoint_updates_direct(Vec::new())
                 .await
-                .map_err(|e| (e, Vec::new()));
+                .map_err(|e| (e, Vec::new(), false));
         }
         let mut chunks = split_into_requests(updates, &limits).into_iter();
         let mut last = None;
+        // Sticky once set: the execution's own terminal update, once
+        // accepted in an earlier chunk, stays accepted no matter what a
+        // later chunk in this same sealed batch does. Nothing guarantees
+        // the terminal update is the LAST chunk a split produces, so this
+        // is tracked explicitly across every chunk rather than inferred
+        // from which chunk happens to fail (see
+        // crate::checkpoint_coalescer::FailedFlush::terminal_accepted).
+        let mut terminal_accepted = false;
         while let Some(chunk) = chunks.next() {
             // Snapshot the chunk before the write consumes it: on
             // rejection this chunk is the unwritten head, and the
             // remaining chunks the unwritten tail.
             let snapshot: Vec<OperationUpdate> = chunk.iter().map(|t| t.update.clone()).collect();
+            let chunk_carries_terminal = chunk_carries_execution_terminal(&chunk);
             match self.write_tracked_direct(chunk).await {
-                Ok(output) => last = Some(output),
+                Ok(output) => {
+                    if chunk_carries_terminal {
+                        terminal_accepted = true;
+                    }
+                    last = Some(output);
+                }
                 Err(err) => {
                     let mut unwritten = snapshot;
                     unwritten.extend(chunks.flatten().map(|t| t.update));
-                    return Err((err, unwritten));
+                    return Err((err, unwritten, terminal_accepted));
                 }
             }
         }
@@ -1247,6 +1325,7 @@ impl DurableContext {
             (
                 ClientError::new_non_retryable("internal: batched checkpoint produced no requests"),
                 Vec::new(),
+                false,
             )
         })
     }
@@ -1303,6 +1382,10 @@ impl DurableContext {
                 failures.push(crate::checkpoint_coalescer::FailedFlush {
                     error,
                     unwritten: updates.into_iter().map(|t| t.update).collect(),
+                    // No write was attempted here: a chunk already claimed
+                    // by this drain never reached the backend, so it
+                    // cannot have accepted the terminal update.
+                    terminal_accepted: false,
                 });
                 continue;
             }
@@ -1311,10 +1394,14 @@ impl DurableContext {
                 .await
             {
                 Ok(output) => batch.publish(Ok(output)),
-                Err((error, unwritten)) => {
+                Err((error, unwritten, terminal_accepted)) => {
                     batch.publish(Err(error.clone()));
                     prior = Some(error.clone());
-                    failures.push(crate::checkpoint_coalescer::FailedFlush { error, unwritten });
+                    failures.push(crate::checkpoint_coalescer::FailedFlush {
+                        error,
+                        unwritten,
+                        terminal_accepted,
+                    });
                 }
             }
         }
@@ -1516,9 +1603,36 @@ impl DurableContext {
         // in checkpointer.checkpoint().
         let mut token_guard = self.inner.checkpoint_token.lock().await;
 
-        let output = client
-            .checkpoint(&self.inner.execution_arn, &token_guard, updates)
-            .await?;
+        // Once a checkpoint response has carried no token (the slot is
+        // `None`), no further call, checkpoint OR
+        // GetDurableExecutionState pagination, may present it again. A
+        // caller that lost the race to observe this (this lock serializes
+        // concurrent branch checkpoints, so at most the caller right after
+        // the one that observed it can still land here) gets the same
+        // suspension error the service would have produced, without
+        // spending a network call to hear it again.
+        let Some(current_token) = token_guard.as_deref() else {
+            return Err(ClientError::suspended_by_service(
+                "the checkpoint response did not include a checkpoint token".to_owned(),
+            ));
+        };
+
+        let output = match client
+            .checkpoint(&self.inner.execution_arn, current_token, updates)
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                // Latch the withdrawal while still holding the lock, so
+                // the next caller through this function (if any) takes the
+                // short-circuit above instead of presenting this token
+                // again.
+                if err.is_suspended_by_service() {
+                    *token_guard = None;
+                }
+                return Err(err);
+            }
+        };
 
         // The service has recorded the transitions: emit their lifecycle
         // events now, before the fallible pagination hydration below can
@@ -1527,8 +1641,16 @@ impl DurableContext {
             event.emit(self.execution_arn(), &self.lambda_context().request_id);
         }
 
-        // Rotate the token while still holding the lock.
-        token_guard.clone_from(&output.checkpoint_token);
+        // Rotate the token while still holding the lock. An empty token
+        // here means the batch carried the execution's own terminal
+        // update and the response had no new token: the execution is
+        // already finished, so withdraw the slot too — there is no valid
+        // future call to make with it either way.
+        *token_guard = if output.checkpoint_token.is_empty() {
+            None
+        } else {
+            Some(output.checkpoint_token.clone())
+        };
 
         // Merge updated operations into the checkpoint log so that
         // subsequent reads (e.g. reading callback_id after START) see
@@ -1546,14 +1668,16 @@ impl DurableContext {
         // a concurrent branch checkpoint and rotate the token, leaving this
         // get_state call with a stale token.
         if output.next_marker.is_some() {
-            let full_state = client
-                .get_state(&self.inner.execution_arn, &token_guard)
-                .await?;
-            if !full_state.operations.is_empty() {
-                crate::client::merge_operations_into_log(
-                    &self.inner.engine.checkpoint_log,
-                    &full_state.operations,
-                );
+            // A marker on the execution-finished response (no new token)
+            // must not be paginated with a token that no longer exists.
+            if let Some(token) = token_guard.as_deref() {
+                let full_state = client.get_state(&self.inner.execution_arn, token).await?;
+                if !full_state.operations.is_empty() {
+                    crate::client::merge_operations_into_log(
+                        &self.inner.engine.checkpoint_log,
+                        &full_state.operations,
+                    );
+                }
             }
         }
 
@@ -3611,6 +3735,18 @@ mod tests {
             .expect("all required OperationUpdate fields set")
     }
 
+    /// Helper: builds the execution's own terminal `EXECUTION`/`Succeed`
+    /// update (the shape the oversized-result path sends after the handler
+    /// returns).
+    fn make_execution_terminal_update(id: &str) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(id.to_owned())
+            .r#type(aws_sdk_lambda::types::OperationType::Execution)
+            .action(aws_sdk_lambda::types::OperationAction::Succeed)
+            .build()
+            .expect("all required OperationUpdate fields set")
+    }
+
     /// Two concurrent checkpoint calls inside the delay window coalesce
     /// into ONE client call carrying both updates.
     #[tokio::test(start_paused = true)]
@@ -3637,6 +3773,242 @@ mod tests {
             ids,
             vec!["op-a".to_owned(), "op-b".to_owned()],
             "the single call carries both updates in join order"
+        );
+    }
+
+    /// A token-less checkpoint response (simulated here via
+    /// `TestResponse::SuspendedByService`) must not surface as a plain
+    /// retryable/non-retryable failure; the call propagates the suspended
+    /// error, latches the token (`None`), and a second call
+    /// short-circuits without reaching the client again.
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_without_token_latches_and_short_circuits() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        client
+            .enqueue_checkpoint_response(TestResponse::SuspendedByService("withdrawn".to_owned()));
+        let ctx = coalescing_ctx(client.clone(), Duration::from_millis(0));
+
+        let first = ctx.checkpoint_updates(vec![make_update("op-a")]).await;
+        let first_err = first.expect_err("token-less response must not report success");
+        assert!(first_err.is_suspended_by_service());
+
+        let second = ctx.checkpoint_updates(vec![make_update("op-b")]).await;
+        let second_err = second.expect_err("latched withdrawal must reject, not resend");
+        assert!(second_err.is_suspended_by_service());
+
+        let call_count = *client.checkpoint_call_count.lock().unwrap();
+        assert_eq!(
+            call_count, 1,
+            "the second call must short-circuit on the latch, never reaching the client              with a spent token"
+        );
+    }
+
+    /// REGRESSION (R2, issue #67 review): a sealed batch can split into
+    /// several requests, and nothing guarantees the execution's own
+    /// terminal `EXECUTION`/`Succeed` update is in the LAST one. When an
+    /// earlier chunk carrying that update is accepted, and only a LATER,
+    /// ordinary chunk's response carries no checkpoint token, the flush
+    /// failure must still report that the terminal update was accepted:
+    /// the execution is already `SUCCEEDED`, and nothing a later chunk's
+    /// missing token does can retract that.
+    #[tokio::test(start_paused = true)]
+    async fn flush_pending_checkpoints_keeps_terminal_accepted_despite_later_chunk_suspension() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        // First chunk (the terminal update): default response, a real
+        // token, i.e. accepted normally. Second chunk (the ordinary
+        // update): no token.
+        client.enqueue_checkpoint_response(TestResponse::Success(Vec::new()));
+        client.enqueue_checkpoint_response(TestResponse::SuspendedByService(
+            "missing token".to_owned(),
+        ));
+        let limits = BatchLimits {
+            max_operations: 1,
+            max_payload_bytes: usize::MAX,
+        };
+        // A long delay: this test drives the flush itself via
+        // `flush_pending_checkpoints`, matching
+        // `flush_pending_checkpoints_classifies_dropped_contributors_withdrawal_as_suspended`
+        // below, so no scheduled flusher races it.
+        let ctx = DurableContext::new_root_with_client_and_coalescer(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+            CheckpointCoalescer::with_limits(Duration::from_hours(1), limits),
+        );
+
+        {
+            let mut fut = Box::pin(ctx.checkpoint_updates(vec![
+                make_execution_terminal_update("exec-op"),
+                make_update("op-ordinary"),
+            ]));
+            let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+                "the buffered contributor must be awaiting the batch"
+            );
+        } // `fut` dropped here, before any flush: nobody awaits the write.
+
+        let err = ctx
+            .flush_pending_checkpoints()
+            .await
+            .expect_err("the later chunk's missing token must still surface as a flush failure");
+        assert!(
+            err.any_suspended_by_service(),
+            "the surfaced failure is still the later chunk's missing-token response"
+        );
+        assert!(
+            err.any_terminal_accepted(),
+            "the execution's terminal update was accepted in an earlier chunk, so the \
+             invocation must report SUCCEEDED despite the later chunk's missing token; \
+             got {err:?}"
+        );
+
+        let ids: Vec<String> = client
+            .recorded_updates()
+            .iter()
+            .map(|u| u.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["exec-op".to_owned(), "op-ordinary".to_owned()],
+            "both chunks must have been attempted, in order"
+        );
+    }
+
+    /// REGRESSION (R2, issue #67 review): the inverse of the test above.
+    /// When an EARLIER, ordinary chunk's response carries no token, the
+    /// batch aborts before the LATER chunk carrying the execution's own
+    /// terminal update is ever attempted. The terminal update is truly
+    /// abandoned (never sent), so the flush failure must not report it as
+    /// accepted, and the invocation must still answer PENDING.
+    #[tokio::test(start_paused = true)]
+    async fn flush_pending_checkpoints_reports_pending_when_terminal_chunk_never_attempted() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        // First chunk (the ordinary update): no token. The batch aborts
+        // here, so no second checkpoint call is ever made for the terminal
+        // chunk.
+        client.enqueue_checkpoint_response(TestResponse::SuspendedByService(
+            "missing token".to_owned(),
+        ));
+        let limits = BatchLimits {
+            max_operations: 1,
+            max_payload_bytes: usize::MAX,
+        };
+        let ctx = DurableContext::new_root_with_client_and_coalescer(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+            CheckpointCoalescer::with_limits(Duration::from_hours(1), limits),
+        );
+
+        {
+            let mut fut = Box::pin(ctx.checkpoint_updates(vec![
+                make_update("op-ordinary"),
+                make_execution_terminal_update("exec-op"),
+            ]));
+            let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+                "the buffered contributor must be awaiting the batch"
+            );
+        }
+
+        let err = ctx
+            .flush_pending_checkpoints()
+            .await
+            .expect_err("the first chunk's missing token must surface as a flush failure");
+        assert!(err.any_suspended_by_service());
+        assert!(
+            !err.any_terminal_accepted(),
+            "the terminal chunk was never attempted, so it was never accepted; the \
+             invocation must still answer PENDING"
+        );
+
+        let ids: Vec<String> = client
+            .recorded_updates()
+            .iter()
+            .map(|u| u.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["op-ordinary".to_owned()],
+            "only the first, rejected chunk was ever attempted"
+        );
+    }
+
+    /// [`DurableContext::flush_pending_checkpoints`] is the function the
+    /// end-of-invocation driver actually calls on its success/pending
+    /// path. A token-less response hit by a contributor that is dropped
+    /// before the write resolves (a lost `race`/`select_ok` branch) must
+    /// still surface through THIS function as a flush failure classified
+    /// `any_suspended_by_service`, not `any_non_retryable`: that ordering
+    /// is what lets the driver answer PENDING instead of falling through
+    /// to the permanent-rejection path.
+    #[tokio::test(start_paused = true)]
+    async fn flush_pending_checkpoints_classifies_dropped_contributors_withdrawal_as_suspended() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        client
+            .enqueue_checkpoint_response(TestResponse::SuspendedByService("withdrawn".to_owned()));
+        // A long coalescing delay means the batch is never flushed by its
+        // own scheduled flusher; the only write this test triggers is the
+        // one `flush_pending_checkpoints` performs itself below.
+        let ctx = coalescing_ctx(client.clone(), Duration::from_hours(1));
+
+        {
+            let mut fut = Box::pin(ctx.checkpoint_updates(vec![make_update("op-dropped")]));
+            let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+                "the buffered contributor must be awaiting the batch"
+            );
+        } // `fut` dropped here, before any flush: nobody awaits the write.
+
+        let err = ctx
+            .flush_pending_checkpoints()
+            .await
+            .expect_err("a token-less response must surface as a flush failure");
+        assert!(
+            err.any_suspended_by_service(),
+            "the retained failure must classify as suspended-by-service"
+        );
+        assert!(
+            !err.any_non_retryable(),
+            "a token-less response must never classify as non-retryable: that \
+             would route the driver through the permanent-rejection path \
+             instead of PENDING"
+        );
+    }
+
+    /// `checkpoint_failure_unrecoverable` on a suspended-by-service error
+    /// requests suspension without recording a fatal, so the scope's
+    /// outcome is `PENDING`, not `FAILED`.
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_failure_unrecoverable_suspends_on_service_withdrawal() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = coalescing_ctx(client.clone(), Duration::from_millis(0));
+
+        let err = ClientError::suspended_by_service("withdrawn".to_owned());
+        tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                let _: () = ctx
+                    .checkpoint_failure_unrecoverable("op-a", err, None)
+                    .await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        assert!(
+            ctx.inner.suspension_signal.is_suspend_requested(),
+            "a suspended-by-service error must request suspension"
+        );
+        assert!(
+            ctx.inner.suspension_signal.fatal_error().is_none(),
+            "suspension, not a fatal, is what must be recorded: a fatal would              override PENDING with FAILED for the whole tree"
         );
     }
 
