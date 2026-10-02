@@ -1035,3 +1035,269 @@ async fn late_token_withdrawal_after_handler_returns_reports_pending() {
         orphan_op.status()
     );
 }
+
+/// `LocalRunner::session` pause/resume (experimental): a checkpoint
+/// response without a token means the invocation may checkpoint no
+/// further, so pausing before the first checkpoint call suspends the
+/// invocation with PENDING at that very first attempt. The accepted
+/// call's updates are still recorded; everything after it is never even
+/// attempted, so it replays once the session resumes.
+#[tokio::test]
+async fn session_pause_before_run_suspends_and_resume_replays_the_execution() {
+    let a_runs = Arc::new(AtomicU32::new(0));
+    let b_runs = Arc::new(AtomicU32::new(0));
+
+    let session = LocalRunner::new().session();
+    assert!(!session.is_paused());
+    session.pause();
+    assert!(session.is_paused());
+
+    let handler = {
+        let a_runs = Arc::clone(&a_runs);
+        let b_runs = Arc::clone(&b_runs);
+        move |_event: serde_json::Value, ctx: durable::DurableContext| {
+            let a_runs = Arc::clone(&a_runs);
+            let b_runs = Arc::clone(&b_runs);
+            async move {
+                let a = ctx
+                    .step(move |_| {
+                        let a_runs = Arc::clone(&a_runs);
+                        async move {
+                            a_runs.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, durable::BoxError>(1_i32)
+                        }
+                    })
+                    .name("a")
+                    .await?;
+                let b = ctx
+                    .step(move |_| {
+                        let b_runs = Arc::clone(&b_runs);
+                        async move {
+                            b_runs.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, durable::BoxError>(2_i32)
+                        }
+                    })
+                    .name("b")
+                    .await?;
+                Ok::<_, durable::BoxError>(a + b)
+            }
+        }
+    };
+
+    let result = session.run(handler.clone(), serde_json::Value::Null).await;
+
+    assert!(
+        result.is_suspended(),
+        "a checkpoint response withheld before any work was attempted \
+         must suspend the invocation with PENDING, not fail it: {:?} / {:?}",
+        result.error_type(),
+        result.error_message()
+    );
+    assert_eq!(result.output(), None);
+    assert!(!result.is_failure());
+    assert_eq!(
+        a_runs.load(Ordering::SeqCst),
+        0,
+        "the paused response arrived before step a's body could run, so \
+         the body never ran this invocation"
+    );
+    assert_eq!(
+        b_runs.load(Ordering::SeqCst),
+        0,
+        "step b's write was never attempted once the invocation suspended \
+         on step a's withheld token"
+    );
+    assert!(
+        !result.operations().is_empty(),
+        "the accepted checkpoint's updates must be recorded even though \
+         its response withheld the token"
+    );
+    assert!(
+        result.operations().iter().any(|op| op.name() == Some("a")),
+        "step a's accepted START write survives the pause"
+    );
+    assert!(
+        !result.operations().iter().any(|op| op.name() == Some("b")),
+        "step b was never attempted, so it has no recorded operation"
+    );
+
+    session.resume();
+    assert!(!session.is_paused());
+    session.resume();
+    assert!(
+        !session.is_paused(),
+        "resuming an already-resumed session has no effect"
+    );
+
+    let result = session.run(handler, serde_json::Value::Null).await;
+
+    assert!(
+        result.is_success(),
+        "resuming lets the next run drive the execution to completion: \
+         {:?} / {:?}",
+        result.error_type(),
+        result.error_message()
+    );
+    assert_eq!(result.output(), Some(&3));
+    assert_eq!(
+        a_runs.load(Ordering::SeqCst),
+        1,
+        "step a's accepted START write was not re-sent; its body ran \
+         exactly once, on the resumed invocation"
+    );
+    assert_eq!(
+        b_runs.load(Ordering::SeqCst),
+        1,
+        "step b runs exactly once, on the resumed invocation"
+    );
+}
+
+/// Pausing an already-paused session, and `is_paused` immediately after
+/// each call, with no execution in progress: the latch is idempotent and
+/// observable on its own, independent of any `run` call.
+#[test]
+fn session_pause_resume_are_idempotent_and_is_paused_reflects_state() {
+    let session = LocalRunner::new().session();
+    assert!(!session.is_paused());
+
+    session.pause();
+    assert!(session.is_paused());
+    session.pause();
+    assert!(session.is_paused(), "pausing twice stays paused");
+
+    session.resume();
+    assert!(!session.is_paused());
+    session.resume();
+    assert!(!session.is_paused(), "resuming twice stays resumed");
+}
+
+/// Pausing while a step's completion write is still sitting in the
+/// `checkpoint_delay` coalescing buffer: the write is accepted once it
+/// flushes, and its outcome is recorded in the backend's state, but the
+/// response carries no token, so the current invocation still suspends.
+/// The resumed invocation reuses the recorded outcome rather than
+/// rerunning the step's body.
+///
+/// Synchronization note: the watcher's 10ms sleep only has to win a race
+/// against the buffer's OWN 150ms flush timer, not against an immediate
+/// write, so this is far less timing-sensitive than racing a live
+/// checkpoint call directly. It can still in principle under-wait and let
+/// the test pass without exercising the intended race; it cannot
+/// false-fail (a pause that lands before the buffer flushes is still a
+/// pause).
+#[tokio::test]
+async fn session_pause_mid_flight_keeps_accepted_write_and_replays_the_rest() {
+    let body_runs = Arc::new(AtomicU32::new(0));
+    let body_runs_h = Arc::clone(&body_runs);
+
+    let session = Arc::new(
+        LocalRunner::new()
+            .checkpoint_delay(Duration::from_millis(150))
+            .session(),
+    );
+    let session_watcher = Arc::clone(&session);
+    let watcher = tokio::spawn(async move {
+        while body_runs_h.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        session_watcher.pause();
+    });
+
+    let body_runs_handler = Arc::clone(&body_runs);
+    let result = session
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let body_runs = Arc::clone(&body_runs_handler);
+                async move {
+                    let outcome = ctx
+                        .step(move |_| {
+                            let body_runs = Arc::clone(&body_runs);
+                            async move {
+                                body_runs.fetch_add(1, Ordering::SeqCst);
+                                Ok("step-outcome".to_owned())
+                            }
+                        })
+                        .name("the-step")
+                        .await?;
+                    Ok::<_, durable::BoxError>(outcome)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await;
+
+    watcher.await.expect("watcher task does not panic");
+
+    assert!(
+        result.is_suspended(),
+        "the step's SUCCEED write was accepted once the coalescing buffer \
+         flushed, but the paused response carried no token, so the \
+         invocation must suspend with PENDING, not report the step's \
+         own outcome: {:?} / {:?}",
+        result.error_type(),
+        result.error_message()
+    );
+    assert_eq!(result.output(), None);
+    assert_eq!(
+        body_runs.load(Ordering::SeqCst),
+        1,
+        "the step's body ran exactly once before the pause took effect"
+    );
+    let step_op = result
+        .operations()
+        .iter()
+        .find(|op| op.name() == Some("the-step"))
+        .expect(
+            "the step's accepted updates are recorded even though the \
+             response carried no token",
+        );
+    assert_eq!(
+        step_op.status(),
+        "Succeeded",
+        "a paused checkpoint still applies the accepted update to the \
+         backend's state, it just answers without a token: {}",
+        step_op.status()
+    );
+
+    session.resume();
+
+    let second_body_runs = Arc::clone(&body_runs);
+    let result = session
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let body_runs = Arc::clone(&second_body_runs);
+                async move {
+                    let outcome = ctx
+                        .step(move |_| {
+                            let body_runs = Arc::clone(&body_runs);
+                            async move {
+                                body_runs.fetch_add(1, Ordering::SeqCst);
+                                Ok("step-outcome".to_owned())
+                            }
+                        })
+                        .name("the-step")
+                        .await?;
+                    Ok::<_, durable::BoxError>(outcome)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await;
+
+    assert!(
+        result.is_success(),
+        "resuming the session lets the next run drive the suspended \
+         execution to completion: {:?} / {:?}",
+        result.error_type(),
+        result.error_message()
+    );
+    assert_eq!(result.output(), Some(&"step-outcome".to_owned()));
+    assert_eq!(
+        body_runs.load(Ordering::SeqCst),
+        1,
+        "the step's SUCCEED update was already applied to the backend's \
+         state while paused, so the resumed replay reuses the recorded \
+         outcome instead of rerunning the body"
+    );
+}

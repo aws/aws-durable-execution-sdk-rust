@@ -8,7 +8,7 @@ use std::pin::Pin;
 #[cfg(test)]
 use std::sync::Mutex;
 
-use aws_sdk_lambda::types::{Operation, OperationAction, OperationType, OperationUpdate};
+use aws_sdk_lambda::types::{Operation, OperationType, OperationUpdate};
 
 use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
 
@@ -217,9 +217,9 @@ impl ExecutionClient for LambdaExecutionClient {
             // (`DurableContext::write_batched_updates`), which tracks
             // acceptance explicitly across every chunk instead of
             // re-deriving it here.
-            let carries_execution_terminal = updates.iter().any(|u| {
-                u.r#type == OperationType::Execution && u.action == OperationAction::Succeed
-            });
+            let carries_execution_terminal = updates
+                .iter()
+                .any(crate::checkpoint_coalescer::is_execution_terminal);
 
             let result = self
                 .client
@@ -513,6 +513,9 @@ impl InMemoryExecutionClient {
             .clone()
     }
 }
+
+#[cfg(test)]
+use aws_sdk_lambda::types::OperationAction;
 
 #[cfg(test)]
 impl ExecutionClient for InMemoryExecutionClient {

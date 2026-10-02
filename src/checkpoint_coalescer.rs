@@ -292,9 +292,16 @@ pub(crate) struct FailedFlush {
 /// function must be revisited to decide whether it also counts as
 /// execution-already-finished.
 pub(crate) fn chunk_carries_execution_terminal(chunk: &[TrackedUpdate]) -> bool {
-    chunk.iter().any(|t| {
-        t.update.r#type == OperationType::Execution && t.update.action == OperationAction::Succeed
-    })
+    chunk.iter().any(|t| is_execution_terminal(&t.update))
+}
+
+/// Whether `update` is the execution's own terminal update. The single
+/// definition of that predicate: the production client
+/// ([`crate::client::LambdaExecutionClient`]) and the in-memory test
+/// backend both read it from here, so a paused test session and the real
+/// service cannot disagree on the one case the missing-token rule exempts.
+pub(crate) fn is_execution_terminal(update: &OperationUpdate) -> bool {
+    update.r#type == OperationType::Execution && update.action == OperationAction::Succeed
 }
 
 /// The rendezvous for one coalesced checkpoint call: contributors await its
