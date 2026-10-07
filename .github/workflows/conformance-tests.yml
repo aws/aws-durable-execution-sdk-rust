@@ -48,7 +48,11 @@ permissions:
 jobs:
   discover_suites:
     name: discover conformance suites
-    runs-on: ubuntu-latest
+    # CodeBuild-hosted runner in the Rust testing account (EC2 compute); the label
+    # must match the CodeBuild project name. Pull requests from forks are routed
+    # to GitHub-hosted runners. This is routing, not a trust boundary: the fork
+    # boundary is the repository's approval setting for fork workflows.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     outputs:
       suites: ${{ steps.discover.outputs.suites }}
     steps:
@@ -72,12 +76,15 @@ jobs:
 
   build_handlers:
     name: build conformance handlers
-    runs-on: ubuntu-latest
+    # Same routing as above.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     defaults:
       run:
         working-directory: conformance
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: |
@@ -124,7 +131,8 @@ jobs:
   conformance:
     name: conformance (${{ matrix.suite }})
     needs: [discover_suites, build_handlers]
-    runs-on: ubuntu-latest
+    # Same routing as above.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     permissions:
       contents: read
       id-token: write # Required for AWS OIDC credentials
