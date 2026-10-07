@@ -1,0 +1,36 @@
+name: Ensure rustup
+description: >-
+  Make `rustup` available on the job PATH. GitHub-hosted runners preinstall it;
+  the CodeBuild standard image does not. When it is absent, install a pinned
+  rustup-init (version and sha256 below) with no default toolchain, so the
+  workflow's own `rustup toolchain install` lines keep deciding which toolchain
+  is used. No-op when rustup is already present.
+
+runs:
+  using: composite
+  steps:
+    - name: Install rustup if missing
+      shell: bash
+      env:
+        RUSTUP_INIT_VERSION: 1.29.1
+        RUSTUP_INIT_SHA256: dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+      run: |
+        set -euo pipefail
+        if command -v rustup >/dev/null 2>&1; then
+          echo "rustup present: $(command -v rustup)"
+          exit 0
+        fi
+        if [ "$(uname -m)" != "x86_64" ]; then
+          echo "::error::ensure-rustup only pins the x86_64 rustup-init; runner is $(uname -m)"
+          exit 1
+        fi
+        tmp="$(mktemp -d)"
+        curl -fsSL --proto '=https' --tlsv1.2 \
+          "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+          -o "$tmp/rustup-init"
+        echo "${RUSTUP_INIT_SHA256}  $tmp/rustup-init" | sha256sum -c -
+        chmod +x "$tmp/rustup-init"
+        "$tmp/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none
+        rm -rf "$tmp"
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        "$HOME/.cargo/bin/rustup" --version

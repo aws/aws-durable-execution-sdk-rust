@@ -2056,6 +2056,11 @@ impl ExecutionClient for Backend {
         // calls through, reject BEFORE touching any state, so the
         // rejected write persists nothing, exactly like a service-side
         // rejection.
+        //
+        // `fetch_update` is deprecated since Rust 1.99 in favour of
+        // `try_update`, which is only stable from 1.95; switch once the
+        // MSRV (1.94.1) moves past it.
+        #[allow(deprecated)]
         let skipped = self
             .checkpoint_failures_skip
             .fetch_update(
@@ -2064,7 +2069,8 @@ impl ExecutionClient for Backend {
                 |remaining| remaining.checked_sub(1),
             )
             .is_ok();
-        if !skipped
+        #[allow(deprecated)]
+        let remaining_failure = !skipped
             && self
                 .checkpoint_failures_remaining
                 .fetch_update(
@@ -2072,8 +2078,8 @@ impl ExecutionClient for Backend {
                     std::sync::atomic::Ordering::SeqCst,
                     |remaining| remaining.checked_sub(1),
                 )
-                .is_ok()
-        {
+                .is_ok();
+        if remaining_failure {
             let retryable = self
                 .checkpoint_failures_retryable
                 .load(std::sync::atomic::Ordering::SeqCst);
