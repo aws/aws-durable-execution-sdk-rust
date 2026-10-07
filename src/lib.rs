@@ -1003,12 +1003,45 @@ where
             if matches!(outcome, driver::InvocationOutcome::Fault { .. }) {
                 // No flush of pending writes on a failed channel, but
                 // classify retained failures (see above).
-                if let Some(retained) = flush_ctx.take_retained_flush_failures().await
-                    && retained.any_non_retryable()
-                {
-                    return flush_failure_response(&retained, outcome, &flush_ctx).await;
+                if let Some(retained) = flush_ctx.take_retained_flush_failures().await {
+                    // The missing-token classification outranks every
+                    // other classification. A retained failure this deep
+                    // into the invocation (contributors already dropped)
+                    // still means the service will not accept this token
+                    // again, so the only truthful outcome is PENDING, not
+                    // a Fault the runtime would retry with a token the
+                    // service already rejected.
+                    if retained.any_suspended_by_service() {
+                        return outcome_envelope(driver::InvocationOutcome::Pending, &flush_ctx);
+                    }
+                    if retained.any_non_retryable() {
+                        return flush_failure_response(&retained, outcome, &flush_ctx).await;
+                    }
                 }
             } else if let Err(flush) = flush_ctx.flush_pending_checkpoints().await {
+                // The terminal flush (including the final SUCCEED written
+                // after the handler returns) must report the service's own
+                // answer instead of the outcome the driver already
+                // decided. A missing token here means that write, and
+                // everything queued behind it, was abandoned: answer
+                // PENDING promptly rather than reporting an outcome the
+                // service never recorded.
+                //
+                // Checked FIRST: a sealed batch can split into several
+                // requests, and nothing guarantees the execution's own
+                // terminal update is in the last one. Once an earlier
+                // chunk's terminal update was accepted, the service has
+                // already recorded this execution SUCCEEDED, and no later
+                // chunk's missing token, or any other failure in this same
+                // flush, can retract that; the outcome the driver already
+                // decided (not a derived PENDING or FAILED) is the service's
+                // own answer here.
+                if flush.any_terminal_accepted() {
+                    return outcome_envelope(outcome, &flush_ctx);
+                }
+                if flush.any_suspended_by_service() {
+                    return outcome_envelope(driver::InvocationOutcome::Pending, &flush_ctx);
+                }
                 return flush_failure_response(&flush, outcome, &flush_ctx).await;
             }
 

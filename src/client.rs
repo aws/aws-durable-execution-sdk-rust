@@ -12,6 +12,35 @@ use aws_sdk_lambda::types::{Operation, OperationType, OperationUpdate};
 
 use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
 
+/// Recovery scope of a client failure: which unit of work the SDK gives
+/// up on.
+///
+/// A `bool` (`retryable`) encoded this as a two-way choice: fail the
+/// invocation and let the durable service re-invoke, or fail the
+/// execution with a permanent rejection. A checkpoint response with no
+/// checkpoint token introduces a third scope that fits neither: the
+/// current invocation must stop checkpointing and report `PENDING`
+/// without anything having failed. A second `bool` would leave two of
+/// the four resulting states meaningless, so the scope is an enum: the
+/// three real cases are the only ones representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryScope {
+    /// Fails this invocation; the durable service re-invokes and replay
+    /// resumes from the recorded state. The same recovery as an
+    /// interruption.
+    Invocation,
+    /// Permanent rejection: persist a terminal `FAIL` for the operation,
+    /// then fail the execution. Re-invoking would replay into the same
+    /// deterministic rejection.
+    Execution,
+    /// The checkpoint response carried no checkpoint token
+    /// (`CheckpointDurableExecution` responded with none), so this
+    /// invocation must stop checkpointing: nothing is retried and
+    /// nothing is failed. The invocation must suspend and report
+    /// `PENDING`, and must never present the missing token again.
+    SuspendedByService,
+}
+
 /// Checkpoint client error type wrapping the underlying cause.
 ///
 /// `Clone` because a coalesced checkpoint batch publishes one result to
@@ -19,18 +48,11 @@ use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
 #[derive(Debug, Clone)]
 pub(crate) struct ClientError {
     message: String,
-    /// Whether the underlying failure was classified retryable.
-    ///
-    /// The production client relies on the aws-sdk's standard retry, so by
-    /// the time an error carries this flag the SDK has already exhausted
-    /// its transport-level attempts. The flag decides the *recovery scope*
-    /// (see [`classify_checkpoint_error`]): a retryable failure fails the
-    /// invocation, the durable service re-invokes, which is the same
-    /// recovery as an interruption, while a non-retryable failure is a
-    /// permanent rejection that persists a terminal `FAIL` for the
-    /// operation and then fails the execution
-    /// ([`DurableContext::checkpoint_failure_unrecoverable`](crate::context::DurableContext::checkpoint_failure_unrecoverable)).
-    retryable: bool,
+    /// Which unit of work this failure gives up on. See
+    /// [`classify_checkpoint_error`] for how a modeled service error maps
+    /// here, and [`ExecutionClient::checkpoint`]'s token handling for how a
+    /// token-less response maps to [`RecoveryScope::SuspendedByService`].
+    scope: RecoveryScope,
 }
 
 impl std::fmt::Display for ClientError {
@@ -43,16 +65,26 @@ impl std::error::Error for ClientError {}
 
 impl ClientError {
     /// Whether this error was classified retryable: the invocation fails
-    /// and the durable service re-invokes. `false` means a permanent
-    /// rejection: the terminal-`FAIL`-then-fail-the-execution path.
+    /// and the durable service re-invokes. `false` covers both the
+    /// permanent-rejection and the suspended-by-service scopes; callers
+    /// that need to tell those two apart use [`Self::is_suspended_by_service`]
+    /// first (see [`crate::context::DurableContext::checkpoint_failure_unrecoverable`]).
     pub(crate) fn is_retryable(&self) -> bool {
-        self.retryable
+        matches!(self.scope, RecoveryScope::Invocation)
+    }
+
+    /// Whether a checkpoint response carried no checkpoint token. Checked
+    /// with priority over [`Self::is_retryable`] everywhere both are
+    /// consulted: this is not a failure of either scope, so it must not be
+    /// retried or treated as a permanent rejection.
+    pub(crate) fn is_suspended_by_service(&self) -> bool {
+        matches!(self.scope, RecoveryScope::SuspendedByService)
     }
 
     pub(crate) fn non_retryable(message: String) -> Self {
         Self {
             message,
-            retryable: false,
+            scope: RecoveryScope::Execution,
         }
     }
 
@@ -60,14 +92,25 @@ impl ClientError {
     pub(crate) fn new_non_retryable(message: &str) -> Self {
         Self {
             message: message.to_owned(),
-            retryable: false,
+            scope: RecoveryScope::Execution,
         }
     }
 
     pub(crate) fn from_retryable(message: String) -> Self {
         Self {
             message,
-            retryable: true,
+            scope: RecoveryScope::Invocation,
+        }
+    }
+
+    /// Creates an error recording that a checkpoint response carried no
+    /// checkpoint token. Not a failure of either the invocation or the
+    /// execution: the caller must suspend and report `PENDING` instead of
+    /// retrying or failing.
+    pub(crate) fn suspended_by_service(message: String) -> Self {
+        Self {
+            message,
+            scope: RecoveryScope::SuspendedByService,
         }
     }
 }
@@ -153,6 +196,31 @@ impl ExecutionClient for LambdaExecutionClient {
         let arn = execution_arn.to_owned();
         let token = checkpoint_token.to_owned();
         Box::pin(async move {
+            // Capture BEFORE `updates` moves into the request builder
+            // below. If THIS request carries the execution's own terminal
+            // update (the oversized-result SUCCEED the SDK sends after the
+            // handler returns), the execution is already finished even if
+            // the response carries no new token, so that case must still
+            // report success instead of PENDING. Checked on `Succeed`
+            // specifically because every current construction site for an
+            // EXECUTION-type update always sets `Succeed` (the
+            // oversized-result path); if an EXECUTION-type `Fail` update is
+            // ever introduced, this check must be revisited to decide
+            // whether it also counts as execution-already-finished.
+            //
+            // This call only sees ONE request of a sealed batch that may
+            // have been split into several (see
+            // `crate::checkpoint_coalescer::split_into_requests`); it has no
+            // visibility into the other chunks. The complementary case,
+            // the terminal update accepted in an EARLIER chunk while a
+            // LATER chunk's token is withdrawn, is handled by the caller
+            // (`DurableContext::write_batched_updates`), which tracks
+            // acceptance explicitly across every chunk instead of
+            // re-deriving it here.
+            let carries_execution_terminal = updates
+                .iter()
+                .any(crate::checkpoint_coalescer::is_execution_terminal);
+
             let result = self
                 .client
                 .checkpoint_durable_execution()
@@ -163,26 +231,55 @@ impl ExecutionClient for LambdaExecutionClient {
                 .await;
 
             match result {
-                Ok(output) => {
-                    let new_token = output.checkpoint_token.unwrap_or_default();
-                    if new_token.is_empty() {
-                        return Err(ClientError::non_retryable(
-                            "backend returned no checkpoint token".to_owned(),
-                        ));
+                Ok(output) => match output.checkpoint_token {
+                    Some(new_token) if !new_token.is_empty() => {
+                        let (updated_ops, next_marker) = match output.new_execution_state {
+                            Some(state) => (
+                                state.operations.unwrap_or_default(),
+                                state.next_marker.filter(|m| !m.is_empty()),
+                            ),
+                            None => (Vec::new(), None),
+                        };
+                        Ok(CheckpointOutput {
+                            checkpoint_token: new_token,
+                            updated_operations: updated_ops,
+                            next_marker,
+                        })
                     }
-                    let (updated_ops, next_marker) = match output.new_execution_state {
-                        Some(state) => (
-                            state.operations.unwrap_or_default(),
-                            state.next_marker.filter(|m| !m.is_empty()),
-                        ),
-                        None => (Vec::new(), None),
-                    };
-                    Ok(CheckpointOutput {
-                        checkpoint_token: new_token,
-                        updated_operations: updated_ops,
-                        next_marker,
-                    })
-                }
+                    _ if carries_execution_terminal => {
+                        // The execution's own terminal update was in this
+                        // batch, so the execution is already finished.
+                        // Report success normally; no further checkpoint
+                        // call will ever use this token.
+                        let updated_ops = output
+                            .new_execution_state
+                            .and_then(|state| state.operations)
+                            .unwrap_or_default();
+                        Ok(CheckpointOutput {
+                            checkpoint_token: String::new(),
+                            updated_operations: updated_ops,
+                            next_marker: None,
+                        })
+                    }
+                    _ => {
+                        // The response carried no checkpoint token: this
+                        // invocation must stop checkpointing and report
+                        // PENDING. Log once, and do not surface
+                        // `new_execution_state`: applying it, or
+                        // paginating from it, would issue another
+                        // checkpoint the service has already stopped
+                        // accepting from this invocation.
+                        tracing::warn!(
+                            execution_arn = %arn,
+                            "the checkpoint response did not include a checkpoint token; \
+                             the SDK will stop checkpointing and report the invocation \
+                             as PENDING"
+                        );
+                        Err(ClientError::suspended_by_service(
+                            "the checkpoint response did not include a checkpoint token".to_owned(),
+                        ))
+                    }
+                },
                 // The SDK's standard retry has already retried everything
                 // transient; the final error is classified into a recovery
                 // scope (invocation vs execution): see
@@ -341,6 +438,9 @@ pub(crate) enum TestResponse {
     RetryableError(String),
     /// Return a non-retryable failure.
     NonRetryableError(String),
+    /// Return a token-less response: the service did not include a
+    /// checkpoint token, so this invocation may not checkpoint again.
+    SuspendedByService(String),
 }
 
 /// In-memory test double for `ExecutionClient`.
@@ -415,6 +515,9 @@ impl InMemoryExecutionClient {
 }
 
 #[cfg(test)]
+use aws_sdk_lambda::types::OperationAction;
+
+#[cfg(test)]
 impl ExecutionClient for InMemoryExecutionClient {
     fn checkpoint(
         &self,
@@ -438,8 +541,7 @@ impl ExecutionClient for InMemoryExecutionClient {
         let auto_ops: Vec<Operation> = updates
             .iter()
             .filter(|u| {
-                u.r#type() == &OperationType::Callback
-                    && u.action() == &aws_sdk_lambda::types::OperationAction::Start
+                u.r#type() == &OperationType::Callback && u.action() == &OperationAction::Start
             })
             .map(|u| {
                 let mut counter = self
@@ -487,6 +589,9 @@ impl ExecutionClient for InMemoryExecutionClient {
             match response {
                 Some(TestResponse::RetryableError(msg)) => Err(ClientError::from_retryable(msg)),
                 Some(TestResponse::NonRetryableError(msg)) => Err(ClientError::non_retryable(msg)),
+                Some(TestResponse::SuspendedByService(msg)) => {
+                    Err(ClientError::suspended_by_service(msg))
+                }
                 Some(TestResponse::Success(ops)) => {
                     let mut counter = self
                         .token_counter
@@ -877,10 +982,14 @@ mod tests {
         assert_eq!(rule.num_calls(), 1);
     }
 
-    /// A checkpoint response without a token is a protocol violation and
-    /// maps to a non-retryable `ClientError`.
+    /// A checkpoint response without a token, and with no EXECUTION-type
+    /// terminal SUCCEED update in the batch, is the service's signal that
+    /// this invocation must stop checkpointing: the client must
+    /// classify it as suspended-by-service, not retryable and not a plain
+    /// non-retryable failure, so the caller suspends with PENDING instead
+    /// of retrying or failing the execution.
     #[tokio::test]
-    async fn checkpoint_without_token_is_non_retryable() {
+    async fn checkpoint_without_token_suspends_by_service() {
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
             .then_output(|| CheckpointDurableExecutionOutput::builder().build());
         let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
@@ -889,9 +998,36 @@ mod tests {
         let err = client
             .checkpoint("arn:test", "tok", Vec::new())
             .await
-            .expect_err("missing token must fail");
+            .expect_err("missing token must suspend, not succeed");
+        assert!(err.is_suspended_by_service());
         assert!(!err.is_retryable());
-        assert!(err.to_string().contains("no checkpoint token"));
+    }
+
+    /// When the batch carries the execution's own EXECUTION-type terminal
+    /// SUCCEED update, a token-less response is not a suspend signal: the
+    /// execution is already finished, so the call reports success
+    /// instead.
+    #[tokio::test]
+    async fn checkpoint_without_token_but_with_execution_terminal_succeeds() {
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
+            .then_output(|| CheckpointDurableExecutionOutput::builder().build());
+        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
+        let client = LambdaExecutionClient::new(sdk_client);
+
+        let update = OperationUpdate::builder()
+            .id("exec-op")
+            .r#type(OperationType::Execution)
+            .action(OperationAction::Succeed)
+            .build()
+            .expect("valid operation update");
+
+        let output = client
+            .checkpoint("arn:test", "tok", vec![update])
+            .await
+            .expect("execution terminal succeed must not suspend");
+        assert_eq!(output.checkpoint_token, "");
+        assert_eq!(output.updated_operations.len(), 0);
+        assert_eq!(output.next_marker, None);
     }
 
     /// A checkpoint call whose final outcome is a modeled parameter
