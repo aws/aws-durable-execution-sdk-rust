@@ -17,6 +17,8 @@
 #![cfg(feature = "test-util")]
 #![expect(clippy::expect_used, clippy::indexing_slicing)] // reason: test assertions
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -27,6 +29,29 @@ use durable::test_util::LocalRunner;
 /// The wire error type a checkpoint-write failure records: internal to
 /// the SDK, asserted here through the public `TestResult` surface.
 const CHECKPOINT_FAILED: &str = "CheckpointFailedError";
+
+type StepOutcomeFuture = Pin<Box<dyn Future<Output = Result<String, durable::BoxError>> + Send>>;
+
+fn step_outcome_handler(
+    body_runs: Arc<AtomicU32>,
+) -> impl Fn(serde_json::Value, durable::DurableContext) -> StepOutcomeFuture {
+    move |_event, ctx| {
+        let body_runs = Arc::clone(&body_runs);
+        Box::pin(async move {
+            let outcome = ctx
+                .step(move |_| {
+                    let body_runs = Arc::clone(&body_runs);
+                    async move {
+                        body_runs.fetch_add(1, Ordering::SeqCst);
+                        Ok("step-outcome".to_owned())
+                    }
+                })
+                .name("the-step")
+                .await?;
+            Ok::<_, durable::BoxError>(outcome)
+        })
+    }
+}
 
 /// Issue #43 acceptance test 1: a step whose result the service
 /// permanently rejects fails the execution after one body execution, not
@@ -1196,38 +1221,19 @@ async fn session_pause_mid_flight_keeps_accepted_write_and_replays_the_rest() {
             .session(),
     );
     let session_watcher = Arc::clone(&session);
-    let watcher = tokio::spawn(async move {
+    let pause_after_step_body_runs = async move {
         while body_runs_h.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
         session_watcher.pause();
-    });
+    };
 
-    let body_runs_handler = Arc::clone(&body_runs);
-    let result = session
-        .run(
-            move |_event: serde_json::Value, ctx: durable::DurableContext| {
-                let body_runs = Arc::clone(&body_runs_handler);
-                async move {
-                    let outcome = ctx
-                        .step(move |_| {
-                            let body_runs = Arc::clone(&body_runs);
-                            async move {
-                                body_runs.fetch_add(1, Ordering::SeqCst);
-                                Ok("step-outcome".to_owned())
-                            }
-                        })
-                        .name("the-step")
-                        .await?;
-                    Ok::<_, durable::BoxError>(outcome)
-                }
-            },
-            serde_json::Value::Null,
-        )
-        .await;
-
-    watcher.await.expect("watcher task does not panic");
+    let run_until_pause = session.run(
+        step_outcome_handler(Arc::clone(&body_runs)),
+        serde_json::Value::Null,
+    );
+    let (result, ()) = tokio::join!(run_until_pause, pause_after_step_body_runs);
 
     assert!(
         result.is_suspended(),
@@ -1262,25 +1268,9 @@ async fn session_pause_mid_flight_keeps_accepted_write_and_replays_the_rest() {
 
     session.resume();
 
-    let second_body_runs = Arc::clone(&body_runs);
     let result = session
         .run(
-            move |_event: serde_json::Value, ctx: durable::DurableContext| {
-                let body_runs = Arc::clone(&second_body_runs);
-                async move {
-                    let outcome = ctx
-                        .step(move |_| {
-                            let body_runs = Arc::clone(&body_runs);
-                            async move {
-                                body_runs.fetch_add(1, Ordering::SeqCst);
-                                Ok("step-outcome".to_owned())
-                            }
-                        })
-                        .name("the-step")
-                        .await?;
-                    Ok::<_, durable::BoxError>(outcome)
-                }
-            },
+            step_outcome_handler(Arc::clone(&body_runs)),
             serde_json::Value::Null,
         )
         .await;

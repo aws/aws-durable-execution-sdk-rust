@@ -1026,7 +1026,7 @@ mod tests {
             .await
             .expect("execution terminal succeed must not suspend");
         assert_eq!(output.checkpoint_token, "");
-        assert!(output.updated_operations.is_empty());
+        assert_eq!(output.updated_operations.len(), 0);
         assert_eq!(output.next_marker, None);
     }
 

@@ -4928,7 +4928,7 @@ mod tests {
         assert_eq!(result.status(), BatchStatus::Succeeded);
         assert_eq!(result.success_count(), 2);
         assert_eq!(result.failure_count(), 0);
-        assert!(result.errors().is_empty());
+        assert_eq!(result.errors(), []);
     }
 
     /// `BatchStatus` must render exactly the strings the old string-typed
@@ -5096,7 +5096,7 @@ mod tests {
         assert_eq!(ok.result, Some(7));
         assert!(ok.error_type.is_none());
         assert!(ok.error_data.is_none());
-        assert!(ok.stack_trace.is_empty());
+        assert_eq!(ok.stack_trace, Vec::<String>::new());
     }
 
     /// A failed item that recorded no error type (a live item defaults to
@@ -5144,7 +5144,7 @@ mod tests {
         // A payload written before `errData`/`stackTrace` existed replays
         // with an empty failure payload rather than a fabricated one.
         assert_eq!(item.error_data, None);
-        assert!(item.stack_trace.is_empty());
+        assert_eq!(item.stack_trace, Vec::<String>::new());
         assert_eq!(replayed.errors()[0].error_type, None);
     }
 

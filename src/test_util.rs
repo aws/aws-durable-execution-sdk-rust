@@ -1900,6 +1900,22 @@ const PAUSED_CHECKPOINT_MESSAGE: &str =
 type CheckpointFuture =
     std::pin::Pin<Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send>>;
 
+fn atomic_decrement_if_positive(counter: &std::sync::atomic::AtomicUsize) -> bool {
+    let mut current = counter.load(std::sync::atomic::Ordering::SeqCst);
+    while current > 0 {
+        match counter.compare_exchange(
+            current,
+            current - 1,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
+}
+
 /// Mutable state of the in-memory backend, guarded by a single mutex.
 #[derive(Debug)]
 struct BackendState {
@@ -2049,23 +2065,8 @@ impl Backend {
     // no checkpoint token. Split out of `checkpoint` so that function stays
     // under `clippy::too_many_lines`.
     fn take_injected_withdrawal(&self) -> bool {
-        let skipped = self
-            .checkpoint_withdrawals_skip
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok();
-        !skipped
-            && self
-                .checkpoint_withdrawals_remaining
-                .fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |remaining| remaining.checked_sub(1),
-                )
-                .is_ok()
+        let skipped = atomic_decrement_if_positive(&self.checkpoint_withdrawals_skip);
+        !skipped && atomic_decrement_if_positive(&self.checkpoint_withdrawals_remaining)
     }
 
     /// Marks the execution paused: see [`LocalSession::pause`].
@@ -2392,24 +2393,8 @@ impl ExecutionClient for Backend {
         // calls through, reject BEFORE touching any state, so the
         // rejected write persists nothing, exactly like a service-side
         // rejection.
-        let skipped = self
-            .checkpoint_failures_skip
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok();
-        if !skipped
-            && self
-                .checkpoint_failures_remaining
-                .fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |remaining| remaining.checked_sub(1),
-                )
-                .is_ok()
-        {
+        let skipped = atomic_decrement_if_positive(&self.checkpoint_failures_skip);
+        if !skipped && atomic_decrement_if_positive(&self.checkpoint_failures_remaining) {
             let retryable = self
                 .checkpoint_failures_retryable
                 .load(std::sync::atomic::Ordering::SeqCst);
