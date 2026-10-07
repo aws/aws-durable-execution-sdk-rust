@@ -1864,7 +1864,7 @@ mod tests {
         assert_eq!(second.error_type(), Some("TypeB"));
         assert_eq!(second.error_message(), Some("boom-b"));
         assert_eq!(second.error_data(), None);
-        assert!(second.stack_trace().is_empty());
+        assert_eq!(second.stack_trace(), Vec::<String>::new());
     }
 
     /// An `AllFailed` record WITHOUT a losers payload (written before the
@@ -2095,7 +2095,7 @@ mod tests {
         assert_eq!(err.status(), Some("FAILED"));
         let wire = err.wire().expect("live EmptyInput carries wire record");
         assert_eq!(wire.error_type(), Some("CombinatorError.EmptyInput"));
-        assert!(!wire.stack_trace().is_empty());
+        assert_ne!(wire.stack_trace(), Vec::<String>::new());
     }
 
     #[tokio::test]
