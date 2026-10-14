@@ -663,7 +663,8 @@ impl LocalRunner {
     /// following `count` with a token-less response, simulating a
     /// checkpoint response that carries no checkpoint token: the SDK must
     /// stop checkpointing this invocation and report `PENDING`, without
-    /// retrying or failing anything.
+    /// retrying or failing anything. The selected calls still record their
+    /// updates, so a resumed invocation replays their accepted outcomes.
     ///
     /// # Examples
     ///
@@ -1896,7 +1897,7 @@ const PAUSED_CHECKPOINT_MESSAGE: &str =
     "checkpoint response withheld its token (LocalSession::pause)";
 
 /// Boxed future a `checkpoint` call returns, named to keep
-/// [`Backend::paused_checkpoint_response`]'s signature readable.
+/// [`Backend::withdrawn_checkpoint_response`]'s signature readable.
 type CheckpointFuture =
     std::pin::Pin<Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send>>;
 
@@ -1957,7 +1958,7 @@ struct Backend {
     /// [`LocalRunner::fail_checkpoints_after_retryable`]).
     checkpoint_failures_retryable: std::sync::atomic::AtomicBool,
     /// Number of upcoming `checkpoint` calls to answer with a token-less
-    /// response, before touching any state (fault injection; see
+    /// response, after recording their updates (fault injection; see
     /// [`LocalRunner::withdraw_checkpoints_after`]).
     checkpoint_withdrawals_remaining: std::sync::atomic::AtomicUsize,
     /// Number of `checkpoint` calls to let through before the injected
@@ -2085,14 +2086,20 @@ impl Backend {
         self.paused.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// If paused, applies `updates` to the stored state (the call is
-    /// accepted) and returns the token-less response `checkpoint` must
-    /// give back. Split out of `checkpoint` so that function stays under
-    /// `clippy::too_many_lines`.
-    fn paused_checkpoint_response(&self, updates: &[OperationUpdate]) -> Option<CheckpointFuture> {
-        if !self.is_paused() {
+    /// Applies accepted updates before withholding the token, for both
+    /// injected withdrawal and session pause. Returns `None` when the
+    /// checkpoint should proceed normally.
+    fn withdrawn_checkpoint_response(
+        &self,
+        updates: &[OperationUpdate],
+    ) -> Option<CheckpointFuture> {
+        let message = if self.take_injected_withdrawal() {
+            "injected token-less checkpoint response (LocalRunner::withdraw_checkpoints_after)"
+        } else if self.is_paused() {
+            PAUSED_CHECKPOINT_MESSAGE
+        } else {
             return None;
-        }
+        };
         // The service exempts a batch carrying the execution's own terminal
         // update: that write finishes the execution, so there is nothing
         // left to suspend and the call answers normally even without a new
@@ -2111,9 +2118,7 @@ impl Backend {
             state.apply_update(update);
         }
         Some(Box::pin(async move {
-            Err(ClientError::suspended_by_service(
-                PAUSED_CHECKPOINT_MESSAGE.to_owned(),
-            ))
+            Err(ClientError::suspended_by_service(message.to_owned()))
         }))
     }
 
@@ -2412,22 +2417,8 @@ impl ExecutionClient for Backend {
                 }
             });
         }
-        // Injected fault (`LocalRunner::withdraw_checkpoints_after`): after
-        // letting `skip` calls through, answer with a response that did not
-        // include a checkpoint token. The SDK must stop checkpointing and
-        // report `PENDING`, never retrying or failing anything.
-        if self.take_injected_withdrawal() {
-            return Box::pin(async move {
-                Err(ClientError::suspended_by_service(
-                    "injected token-less checkpoint response \
-                     (LocalRunner::withdraw_checkpoints_after)"
-                        .to_owned(),
-                ))
-            });
-        }
-        // Latched pause (`LocalSession::pause`): accepted and applied, but
-        // answered without a token, unlike the one-shot withdrawal above.
-        if let Some(response) = self.paused_checkpoint_response(&updates) {
+        // Withdrawal ends checkpointing but still accepts this call's updates.
+        if let Some(response) = self.withdrawn_checkpoint_response(&updates) {
             return response;
         }
         let updated_ops: Vec<Operation> = {
@@ -4247,52 +4238,105 @@ mod tests {
         assert_eq!(result.output(), Some(&3));
     }
 
-    /// A paused session withholds the checkpoint token on every call but
-    /// the one the service itself exempts: a batch carrying the execution's
-    /// own terminal `EXECUTION`/`Succeed` update finishes the execution, so
-    /// it is accepted with a token and reports success. Without the
-    /// exemption, a paused harness would answer PENDING for an execution
-    /// the real service has already recorded as SUCCEEDED, and so would
-    /// disagree with `LambdaExecutionClient::checkpoint`.
+    /// An injected withdrawal accepts every update in the request. The
+    /// counter applies only after the configured calls have passed through.
     #[tokio::test]
-    async fn backend_paused_still_accepts_the_execution_terminal_update() {
-        let backend = Arc::new(Backend::new(Vec::new(), None));
-        backend.pause();
-
-        let ordinary = vec![
+    async fn backend_injected_withdrawal_records_updates_and_expires() {
+        let backend = LocalRunner::new()
+            .withdraw_checkpoints_after(1, 1)
+            .new_backend();
+        let update = |id: &str, action, payload: Option<String>| {
             OperationUpdate::builder()
-                .id("op-1")
+                .id(id)
                 .r#type(OperationType::Step)
-                .action(OperationAction::Start)
+                .action(action)
+                .set_payload(payload)
                 .build()
-                .unwrap(),
-        ];
-        let error = backend
-            .checkpoint("arn:test", "token-0", ordinary)
+                .unwrap()
+        };
+        let start = backend
+            .checkpoint(
+                "arn:test",
+                "token-0",
+                vec![update("a", OperationAction::Start, None)],
+            )
             .await
-            .expect_err("a paused session answers an ordinary checkpoint without a token");
-        assert!(
-            error.is_suspended_by_service(),
-            "a token-less response to an ordinary checkpoint classifies as \
-             suspended-by-service: {error:?}"
-        );
+            .expect("the skipped call succeeds normally");
+        assert_ne!(start.checkpoint_token, "");
 
-        let terminal = vec![
-            OperationUpdate::builder()
-                .id("exec-op")
-                .r#type(OperationType::Execution)
-                .action(OperationAction::Succeed)
-                .build()
-                .unwrap(),
-        ];
-        let output = backend
-            .checkpoint("arn:test", "token-0", terminal)
+        let error = backend
+            .checkpoint(
+                "arn:test",
+                &start.checkpoint_token,
+                vec![
+                    update("a", OperationAction::Succeed, Some("42".to_owned())),
+                    update("b", OperationAction::Start, None),
+                ],
+            )
             .await
-            .expect("the execution's own terminal update is accepted even while paused");
-        assert!(
-            !output.checkpoint_token.is_empty(),
-            "the exempt call answers with a token, exactly as the service does"
-        );
+            .expect_err("the selected call withholds its token");
+        assert!(error.is_suspended_by_service());
+        let operations = backend.build_operations();
+        let a = operations.iter().find(|op| op.id() == "a").unwrap();
+        assert_eq!(a.status(), &OperationStatus::Succeeded);
+        assert_eq!(a.step_details().and_then(|step| step.result()), Some("42"));
+        let b = operations.iter().find(|op| op.id() == "b").unwrap();
+        assert_eq!(b.status(), &OperationStatus::Started);
+
+        let next = backend
+            .checkpoint("arn:test", "resumed-token", Vec::new())
+            .await
+            .expect("the one-shot withdrawal has been consumed");
+        assert_ne!(next.checkpoint_token, "");
+        assert_eq!(backend.checkpoint_call_count(), 3);
+    }
+
+    /// Both withdrawal modes preserve the execution-terminal exemption.
+    #[tokio::test]
+    async fn backend_withdrawal_still_accepts_the_execution_terminal_update() {
+        for injected in [false, true] {
+            let backend = LocalRunner::new()
+                .withdraw_checkpoints_after(0, if injected { 2 } else { 0 })
+                .new_backend();
+            if !injected {
+                backend.pause();
+            }
+
+            let ordinary = vec![
+                OperationUpdate::builder()
+                    .id("op-1")
+                    .r#type(OperationType::Step)
+                    .action(OperationAction::Start)
+                    .build()
+                    .unwrap(),
+            ];
+            let error = backend
+                .checkpoint("arn:test", "token-0", ordinary)
+                .await
+                .expect_err("an ordinary checkpoint withholds its token");
+            assert!(
+                error.is_suspended_by_service(),
+                "a token-less response to an ordinary checkpoint classifies as \
+                 suspended-by-service: {error:?}"
+            );
+
+            let terminal = vec![
+                OperationUpdate::builder()
+                    .id("exec-op")
+                    .r#type(OperationType::Execution)
+                    .action(OperationAction::Succeed)
+                    .build()
+                    .unwrap(),
+            ];
+            let output = backend
+                .checkpoint("arn:test", "token-0", terminal)
+                .await
+                .expect("the execution terminal update succeeds despite withdrawal");
+            assert!(
+                !output.checkpoint_token.is_empty(),
+                "the exempt call uses the normal accepted response"
+            );
+        }
     }
 
     /// Tests that the Backend with `checkpoint_page_size` returns a

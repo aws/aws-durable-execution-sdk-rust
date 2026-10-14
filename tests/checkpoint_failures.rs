@@ -955,9 +955,8 @@ async fn retryable_flush_failure_fails_invocation_and_reinvocation_converges() {
 
 /// A checkpoint response that did not include a checkpoint token must
 /// stop checkpointing and report `PENDING`, even when it is discovered only
-/// AFTER the handler itself already returned a value: the handler's own
-/// completed outcome must never be reported once its outcome write was
-/// withdrawn.
+/// AFTER the handler itself already returned a value. The step's accepted
+/// outcome survives, but the invocation must still report `PENDING`.
 ///
 /// `withdraw_checkpoints_after(1, 1)` lets the step's START write through
 /// and answers its SUCCEED write (the batched outcome, flushed at
@@ -1053,12 +1052,78 @@ async fn late_token_withdrawal_after_handler_returns_reports_pending() {
         .expect("the orphaned step's operation record exists");
     assert_eq!(
         orphan_op.status(),
-        "Started",
-        "the orphan's outcome write was withdrawn, so it must remain in its \
-         replay-safe non-terminal state (not Succeeded, and not any other \
-         terminal state either, which would equally prevent replay); got {}",
+        "Succeeded",
+        "the accepted outcome must survive token withdrawal; got {}",
         orphan_op.status()
     );
+}
+
+/// A withdrawn token stops the invocation, but its accepted step result
+/// survives. A later invocation replays that result without repeating work.
+#[tokio::test]
+async fn injected_withdrawal_replays_accepted_result_without_rerunning_step() {
+    for batching in [false, true] {
+        let body_runs = Arc::new(AtomicU32::new(0));
+        let runner = LocalRunner::new().withdraw_checkpoints_after(1, 1);
+        let session = if batching {
+            runner.checkpoint_batching()
+        } else {
+            runner
+        }
+        .session();
+        let handler = {
+            let body_runs = Arc::clone(&body_runs);
+            move |(): (), ctx: durable::DurableContext| {
+                let body_runs = Arc::clone(&body_runs);
+                async move {
+                    let value = ctx
+                        .step(move |_| {
+                            let body_runs = Arc::clone(&body_runs);
+                            async move {
+                                body_runs.fetch_add(1, Ordering::SeqCst);
+                                Ok(42_i32)
+                            }
+                        })
+                        .name("accepted")
+                        .await?;
+                    let next = ctx
+                        .step(move |_| async move { Ok(value + 1) })
+                        .name("after-withdrawal")
+                        .await?;
+                    Ok::<_, durable::BoxError>(next)
+                }
+            }
+        };
+
+        let suspended = session.run(handler.clone(), ()).await;
+        assert!(suspended.is_suspended(), "{suspended:?}");
+        assert_eq!(suspended.invocation_count(), 1);
+        assert_eq!(suspended.output(), None);
+        let accepted = suspended
+            .operations()
+            .iter()
+            .find(|op| op.name() == Some("accepted"))
+            .expect("the accepted step is recorded");
+        assert!(accepted.succeeded(), "{accepted:?}");
+        assert!(
+            !suspended
+                .operations()
+                .iter()
+                .any(|op| op.name() == Some("after-withdrawal")),
+            "no further operation starts after withdrawal"
+        );
+        assert_eq!(body_runs.load(Ordering::SeqCst), 1);
+
+        let resumed = session.run(handler, ()).await;
+        assert!(resumed.is_success(), "{resumed:?}");
+        assert_eq!(resumed.output(), Some(&43));
+        assert_eq!(resumed.invocation_count(), 1);
+        assert_eq!(
+            body_runs.load(Ordering::SeqCst),
+            1,
+            "replay uses the accepted result"
+        );
+    }
 }
 
 /// `LocalRunner::session` pause/resume (experimental): a checkpoint
