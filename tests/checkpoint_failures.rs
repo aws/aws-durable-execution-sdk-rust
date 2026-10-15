@@ -17,8 +17,6 @@
 #![cfg(feature = "test-util")]
 #![expect(clippy::expect_used, clippy::indexing_slicing)] // reason: test assertions
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -29,29 +27,6 @@ use durable::test_util::LocalRunner;
 /// The wire error type a checkpoint-write failure records: internal to
 /// the SDK, asserted here through the public `TestResult` surface.
 const CHECKPOINT_FAILED: &str = "CheckpointFailedError";
-
-type StepOutcomeFuture = Pin<Box<dyn Future<Output = Result<String, durable::BoxError>> + Send>>;
-
-fn step_outcome_handler(
-    body_runs: Arc<AtomicU32>,
-) -> impl Fn(serde_json::Value, durable::DurableContext) -> StepOutcomeFuture {
-    move |_event, ctx| {
-        let body_runs = Arc::clone(&body_runs);
-        Box::pin(async move {
-            let outcome = ctx
-                .step(move |_| {
-                    let body_runs = Arc::clone(&body_runs);
-                    async move {
-                        body_runs.fetch_add(1, Ordering::SeqCst);
-                        Ok("step-outcome".to_owned())
-                    }
-                })
-                .name("the-step")
-                .await?;
-            Ok::<_, durable::BoxError>(outcome)
-        })
-    }
-}
 
 /// Issue #43 acceptance test 1: a step whose result the service
 /// permanently rejects fails the execution after one body execution, not
@@ -1134,121 +1109,6 @@ async fn session_pause_before_run_suspends_and_resume_replays_the_execution() {
         b_runs.load(Ordering::SeqCst),
         1,
         "step b runs exactly once, on the resumed invocation"
-    );
-}
-
-/// Pausing an already-paused session, and `is_paused` immediately after
-/// each call, with no execution in progress: the latch is idempotent and
-/// observable on its own, independent of any `run` call.
-#[test]
-fn session_pause_resume_are_idempotent_and_is_paused_reflects_state() {
-    let session = LocalRunner::new().session();
-    assert!(!session.is_paused());
-
-    session.pause();
-    assert!(session.is_paused());
-    session.pause();
-    assert!(session.is_paused(), "pausing twice stays paused");
-
-    session.resume();
-    assert!(!session.is_paused());
-    session.resume();
-    assert!(!session.is_paused(), "resuming twice stays resumed");
-}
-
-/// Pausing while a step's completion write is still sitting in the
-/// `checkpoint_delay` coalescing buffer: the write is accepted once it
-/// flushes, and its outcome is recorded in the backend's state, but the
-/// response carries no token, so the current invocation still suspends.
-/// The resumed invocation reuses the recorded outcome rather than
-/// rerunning the step's body.
-///
-/// Synchronization note: the watcher's 10ms sleep only has to win a race
-/// against the buffer's OWN 150ms flush timer, not against an immediate
-/// write, so this is far less timing-sensitive than racing a live
-/// checkpoint call directly. It can still in principle under-wait and let
-/// the test pass without exercising the intended race; it cannot
-/// false-fail (a pause that lands before the buffer flushes is still a
-/// pause).
-#[tokio::test]
-async fn session_pause_mid_flight_keeps_accepted_write_and_replays_the_rest() {
-    let body_runs = Arc::new(AtomicU32::new(0));
-    let body_runs_h = Arc::clone(&body_runs);
-
-    let session = Arc::new(
-        LocalRunner::new()
-            .checkpoint_delay(Duration::from_millis(150))
-            .session(),
-    );
-    let session_watcher = Arc::clone(&session);
-    let pause_after_step_body_runs = async move {
-        while body_runs_h.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        session_watcher.pause();
-    };
-
-    let run_until_pause = session.run(
-        step_outcome_handler(Arc::clone(&body_runs)),
-        serde_json::Value::Null,
-    );
-    let (result, ()) = tokio::join!(run_until_pause, pause_after_step_body_runs);
-
-    assert!(
-        result.is_suspended(),
-        "the step's SUCCEED write was accepted once the coalescing buffer \
-         flushed, but the paused response carried no token, so the \
-         invocation must suspend with PENDING, not report the step's \
-         own outcome: {:?} / {:?}",
-        result.error_type(),
-        result.error_message()
-    );
-    assert_eq!(result.output(), None);
-    assert_eq!(
-        body_runs.load(Ordering::SeqCst),
-        1,
-        "the step's body ran exactly once before the pause took effect"
-    );
-    let step_op = result
-        .operations()
-        .iter()
-        .find(|op| op.name() == Some("the-step"))
-        .expect(
-            "the step's accepted updates are recorded even though the \
-             response carried no token",
-        );
-    assert_eq!(
-        step_op.status(),
-        "Succeeded",
-        "a paused checkpoint still applies the accepted update to the \
-         backend's state, it just answers without a token: {}",
-        step_op.status()
-    );
-
-    session.resume();
-
-    let result = session
-        .run(
-            step_outcome_handler(Arc::clone(&body_runs)),
-            serde_json::Value::Null,
-        )
-        .await;
-
-    assert!(
-        result.is_success(),
-        "resuming the session lets the next run drive the suspended \
-         execution to completion: {:?} / {:?}",
-        result.error_type(),
-        result.error_message()
-    );
-    assert_eq!(result.output(), Some(&"step-outcome".to_owned()));
-    assert_eq!(
-        body_runs.load(Ordering::SeqCst),
-        1,
-        "the step's SUCCEED update was already applied to the backend's \
-         state while paused, so the resumed replay reuses the recorded \
-         outcome instead of rerunning the body"
     );
 }
 

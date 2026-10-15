@@ -191,7 +191,7 @@ impl FlushFailure {
     /// Checked with priority over every other classification at its call
     /// sites: once the service has recorded the execution as `SUCCEEDED`,
     /// nothing a later chunk's missing token, or any other failure in the
-    /// same flush, does can retract that. Reporting `PENDING` or failing
+    /// same flush, can retract that. Reporting `PENDING` or failing
     /// the execution here would contradict what the service already
     /// recorded.
     pub(crate) fn any_terminal_accepted(&self) -> bool {
@@ -3736,8 +3736,9 @@ mod tests {
     }
 
     /// Helper: builds the execution's own terminal `EXECUTION`/`Succeed`
-    /// update (the shape the oversized-result path sends after the handler
-    /// returns).
+    /// update. No production code in this SDK constructs one today (see
+    /// `crate::checkpoint_coalescer::is_execution_terminal`); these tests
+    /// hand-build it to exercise the exemption.
     fn make_execution_terminal_update(id: &str) -> OperationUpdate {
         OperationUpdate::builder()
             .id(id.to_owned())
@@ -3799,7 +3800,13 @@ mod tests {
         let call_count = *client.checkpoint_call_count.lock().unwrap();
         assert_eq!(
             call_count, 1,
-            "the second call must short-circuit on the latch, never reaching the client              with a spent token"
+            "the second call must short-circuit on the latch, never reaching the client \
+             with a spent token"
+        );
+        assert!(
+            ctx.inner.suspension_signal.fatal_error().is_none(),
+            "a token-less response is a suspend, not a failure: no fatal may be recorded, \
+             or the driver would answer FAILED instead of PENDING"
         );
     }
 
@@ -3810,7 +3817,7 @@ mod tests {
     /// ordinary chunk's response carries no checkpoint token, the flush
     /// failure must still report that the terminal update was accepted:
     /// the execution is already `SUCCEEDED`, and nothing a later chunk's
-    /// missing token does can retract that.
+    /// missing token can retract that.
     #[tokio::test(start_paused = true)]
     async fn flush_pending_checkpoints_keeps_terminal_accepted_despite_later_chunk_suspension() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
@@ -4008,7 +4015,8 @@ mod tests {
         );
         assert!(
             ctx.inner.suspension_signal.fatal_error().is_none(),
-            "suspension, not a fatal, is what must be recorded: a fatal would              override PENDING with FAILED for the whole tree"
+            "suspension, not a fatal, is what must be recorded: a fatal would \
+             override PENDING with FAILED for the whole tree"
         );
     }
 

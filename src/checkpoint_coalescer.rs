@@ -283,23 +283,34 @@ pub(crate) struct FailedFlush {
 }
 
 /// Whether any update in `chunk` is the execution's own terminal
-/// `EXECUTION`/`Succeed` update (the oversized-result write
-/// `withDurableExecution` sends after the handler returns).
-///
-/// Checked on `Succeed` specifically because every current construction
-/// site for an EXECUTION-type update always sets `Succeed`; if an
-/// EXECUTION-type `Fail` update is ever introduced, every caller of this
-/// function must be revisited to decide whether it also counts as
-/// execution-already-finished.
+/// `EXECUTION`/`Succeed` update. See [`is_execution_terminal`] for what
+/// that update is and why no production request carries one today.
 pub(crate) fn chunk_carries_execution_terminal(chunk: &[TrackedUpdate]) -> bool {
     chunk.iter().any(|t| is_execution_terminal(&t.update))
 }
 
-/// Whether `update` is the execution's own terminal update. The single
-/// definition of that predicate: the production client
+/// Whether `update` is the execution's own terminal update: type
+/// `EXECUTION`, action `Succeed`. A checkpoint carrying it finishes the
+/// execution, so a token-less response to that checkpoint still means
+/// SUCCEEDED rather than PENDING (the one case the missing-token rule
+/// exempts).
+///
+/// No production code in this SDK constructs such an update today: the
+/// handler's result always travels in the response envelope
+/// (`outcome_envelope` in `lib.rs`). The JS SDK writes one when a result
+/// exceeds the Lambda response size limit. The predicate and every check
+/// built on it exist so a future Rust port of that write inherits the
+/// correct answer; until then only tests construct the update.
+///
+/// Checked on `Succeed` specifically because the JS producer only ever
+/// sets `Succeed`; if an EXECUTION-type `Fail` update is ever introduced,
+/// every caller of this function must be revisited to decide whether it
+/// also counts as execution-already-finished.
+///
+/// This is the single definition of the predicate: the production client
 /// ([`crate::client::LambdaExecutionClient`]) and the in-memory test
 /// backend both read it from here, so a paused test session and the real
-/// service cannot disagree on the one case the missing-token rule exempts.
+/// service cannot disagree on the exempt case.
 pub(crate) fn is_execution_terminal(update: &OperationUpdate) -> bool {
     update.r#type == OperationType::Execution && update.action == OperationAction::Succeed
 }

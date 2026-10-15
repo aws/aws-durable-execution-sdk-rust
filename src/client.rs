@@ -198,15 +198,18 @@ impl ExecutionClient for LambdaExecutionClient {
         Box::pin(async move {
             // Capture BEFORE `updates` moves into the request builder
             // below. If THIS request carries the execution's own terminal
-            // update (the oversized-result SUCCEED the SDK sends after the
-            // handler returns), the execution is already finished even if
-            // the response carries no new token, so that case must still
-            // report success instead of PENDING. Checked on `Succeed`
-            // specifically because every current construction site for an
-            // EXECUTION-type update always sets `Succeed` (the
-            // oversized-result path); if an EXECUTION-type `Fail` update is
-            // ever introduced, this check must be revisited to decide
-            // whether it also counts as execution-already-finished.
+            // `EXECUTION`/`Succeed` update, the execution is already
+            // finished even if the response carries no new token, so that
+            // case must still report success instead of PENDING.
+            //
+            // No production code in this SDK constructs such an update
+            // today: the handler's result always travels in the response
+            // envelope (see `outcome_envelope` in `lib.rs`). The JS SDK
+            // writes one when a result exceeds the Lambda response size
+            // limit, and this branch exists so that a future Rust port of
+            // that write inherits the correct answer. Until then only tests
+            // reach it. See `crate::checkpoint_coalescer::is_execution_terminal`
+            // for why `Succeed` alone is checked.
             //
             // This call only sees ONE request of a sealed batch that may
             // have been split into several (see

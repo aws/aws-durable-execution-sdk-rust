@@ -1019,23 +1019,31 @@ where
                     }
                 }
             } else if let Err(flush) = flush_ctx.flush_pending_checkpoints().await {
-                // The terminal flush (including the final SUCCEED written
-                // after the handler returns) must report the service's own
-                // answer instead of the outcome the driver already
-                // decided. A missing token here means that write, and
-                // everything queued behind it, was abandoned: answer
-                // PENDING promptly rather than reporting an outcome the
-                // service never recorded.
+                // The end-of-invocation flush must report the service's own
+                // answer instead of the outcome the driver already decided.
+                // A missing token here means the buffered writes this flush
+                // sent, and everything queued behind them, were abandoned:
+                // answer PENDING promptly rather than reporting an outcome
+                // the service never recorded.
                 //
-                // Checked FIRST: a sealed batch can split into several
-                // requests, and nothing guarantees the execution's own
-                // terminal update is in the last one. Once an earlier
-                // chunk's terminal update was accepted, the service has
-                // already recorded this execution SUCCEEDED, and no later
-                // chunk's missing token, or any other failure in this same
-                // flush, can retract that; the outcome the driver already
-                // decided (not a derived PENDING or FAILED) is the service's
-                // own answer here.
+                // Checked FIRST: whether an earlier chunk of this flush
+                // carried the execution's own terminal `EXECUTION`/`Succeed`
+                // update and the service accepted it. A sealed batch can
+                // split into several requests, and nothing guarantees that
+                // update is in the last one, so acceptance is tracked per
+                // chunk (`FailedFlush::terminal_accepted`). Once that update
+                // is accepted, the service has recorded this execution
+                // SUCCEEDED, and no later chunk's missing token, or any
+                // other failure in this same flush, can retract that; the
+                // outcome the driver already decided (not a derived PENDING
+                // or FAILED) is the service's own answer here.
+                //
+                // No production code in this SDK constructs such an update
+                // today: the handler's result always travels in the response
+                // envelope below. The check is in place so that a future
+                // oversized-result write (the JS SDK's behaviour) inherits
+                // the correct answer; see
+                // `crate::checkpoint_coalescer::is_execution_terminal`.
                 if flush.any_terminal_accepted() {
                     return outcome_envelope(outcome, &flush_ctx);
                 }
