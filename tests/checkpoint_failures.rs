@@ -927,3 +927,318 @@ async fn retryable_flush_failure_fails_invocation_and_reinvocation_converges() {
          (AtLeastOncePerRetry): nothing further was written for it"
     );
 }
+
+/// A withdrawn token stops the invocation, but its accepted step result
+/// survives. A later invocation replays that result without repeating work.
+#[tokio::test]
+async fn injected_withdrawal_replays_accepted_result_without_rerunning_step() {
+    for batching in [false, true] {
+        let body_runs = Arc::new(AtomicU32::new(0));
+        let runner = LocalRunner::new().withdraw_checkpoints_after(1, 1);
+        let session = if batching {
+            runner.checkpoint_batching()
+        } else {
+            runner
+        }
+        .session();
+        let handler = {
+            let body_runs = Arc::clone(&body_runs);
+            move |(): (), ctx: durable::DurableContext| {
+                let body_runs = Arc::clone(&body_runs);
+                async move {
+                    let value = ctx
+                        .step(move |_| {
+                            let body_runs = Arc::clone(&body_runs);
+                            async move {
+                                body_runs.fetch_add(1, Ordering::SeqCst);
+                                Ok(42_i32)
+                            }
+                        })
+                        .name("accepted")
+                        .await?;
+                    let next = ctx
+                        .step(move |_| async move { Ok(value + 1) })
+                        .name("after-withdrawal")
+                        .await?;
+                    Ok::<_, durable::BoxError>(next)
+                }
+            }
+        };
+
+        let suspended = session.run(handler.clone(), ()).await;
+        assert!(suspended.is_suspended(), "{suspended:?}");
+        assert_eq!(suspended.invocation_count(), 1);
+        assert_eq!(suspended.output(), None);
+        let accepted = suspended
+            .operations()
+            .iter()
+            .find(|op| op.name() == Some("accepted"))
+            .expect("the accepted step is recorded");
+        assert!(accepted.succeeded(), "{accepted:?}");
+        assert!(
+            !suspended
+                .operations()
+                .iter()
+                .any(|op| op.name() == Some("after-withdrawal")),
+            "no further operation starts after withdrawal"
+        );
+        assert_eq!(body_runs.load(Ordering::SeqCst), 1);
+
+        let resumed = session.run(handler, ()).await;
+        assert!(resumed.is_success(), "{resumed:?}");
+        assert_eq!(resumed.output(), Some(&43));
+        assert_eq!(resumed.invocation_count(), 1);
+        assert_eq!(
+            body_runs.load(Ordering::SeqCst),
+            1,
+            "replay uses the accepted result"
+        );
+    }
+}
+
+/// `LocalRunner::session` pause/resume (experimental): a checkpoint
+/// response without a token means the invocation may checkpoint no
+/// further, so pausing before the first checkpoint call suspends the
+/// invocation with PENDING at that very first attempt. The accepted
+/// call's updates are still recorded; everything after it is never even
+/// attempted, so it replays once the session resumes.
+#[tokio::test]
+async fn session_pause_before_run_suspends_and_resume_replays_the_execution() {
+    let a_runs = Arc::new(AtomicU32::new(0));
+    let b_runs = Arc::new(AtomicU32::new(0));
+
+    let session = LocalRunner::new().session();
+    assert!(!session.is_paused());
+    session.pause();
+    assert!(session.is_paused());
+
+    let handler = {
+        let a_runs = Arc::clone(&a_runs);
+        let b_runs = Arc::clone(&b_runs);
+        move |_event: serde_json::Value, ctx: durable::DurableContext| {
+            let a_runs = Arc::clone(&a_runs);
+            let b_runs = Arc::clone(&b_runs);
+            async move {
+                let a = ctx
+                    .step(move |_| {
+                        let a_runs = Arc::clone(&a_runs);
+                        async move {
+                            a_runs.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, durable::BoxError>(1_i32)
+                        }
+                    })
+                    .name("a")
+                    .await?;
+                let b = ctx
+                    .step(move |_| {
+                        let b_runs = Arc::clone(&b_runs);
+                        async move {
+                            b_runs.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, durable::BoxError>(2_i32)
+                        }
+                    })
+                    .name("b")
+                    .await?;
+                Ok::<_, durable::BoxError>(a + b)
+            }
+        }
+    };
+
+    let result = session.run(handler.clone(), serde_json::Value::Null).await;
+
+    assert!(
+        result.is_suspended(),
+        "a checkpoint response withheld before any work was attempted \
+         must suspend the invocation with PENDING, not fail it: {:?} / {:?}",
+        result.error_type(),
+        result.error_message()
+    );
+    assert_eq!(result.output(), None);
+    assert!(!result.is_failure());
+    assert_eq!(
+        a_runs.load(Ordering::SeqCst),
+        0,
+        "the paused response arrived before step a's body could run, so \
+         the body never ran this invocation"
+    );
+    assert_eq!(
+        b_runs.load(Ordering::SeqCst),
+        0,
+        "step b's write was never attempted once the invocation suspended \
+         on step a's withheld token"
+    );
+    assert!(
+        !result.operations().is_empty(),
+        "the accepted checkpoint's updates must be recorded even though \
+         its response withheld the token"
+    );
+    assert!(
+        result.operations().iter().any(|op| op.name() == Some("a")),
+        "step a's accepted START write survives the pause"
+    );
+    assert!(
+        !result.operations().iter().any(|op| op.name() == Some("b")),
+        "step b was never attempted, so it has no recorded operation"
+    );
+
+    session.resume();
+    assert!(!session.is_paused());
+    session.resume();
+    assert!(
+        !session.is_paused(),
+        "resuming an already-resumed session has no effect"
+    );
+
+    let result = session.run(handler, serde_json::Value::Null).await;
+
+    assert!(
+        result.is_success(),
+        "resuming lets the next run drive the execution to completion: \
+         {:?} / {:?}",
+        result.error_type(),
+        result.error_message()
+    );
+    assert_eq!(result.output(), Some(&3));
+    assert_eq!(
+        a_runs.load(Ordering::SeqCst),
+        1,
+        "step a's accepted START write was not re-sent; its body ran \
+         exactly once, on the resumed invocation"
+    );
+    assert_eq!(
+        b_runs.load(Ordering::SeqCst),
+        1,
+        "step b runs exactly once, on the resumed invocation"
+    );
+}
+
+#[derive(Default)]
+struct MapWithdrawalProbe {
+    step_runs: [AtomicU32; 2],
+    branch_runs: [AtomicU32; 2],
+    b_step_saved: tokio::sync::Notify,
+    a_settled: tokio::sync::Notify,
+    release_b: tokio::sync::Notify,
+}
+
+async fn concurrent_withdrawal_map(
+    ctx: durable::DurableContext,
+    probe: Arc<MapWithdrawalProbe>,
+) -> Result<Vec<i32>, durable::BoxError> {
+    let observer = Arc::clone(&probe);
+    let completion = durable::builders::map_parallel::CompletionConfig::builder()
+        .tolerated_failure_count(0)
+        .completion_predicate(move |stats| {
+            // This notification observes settlement for the test only.
+            // The completion decision remains independent of mutable state.
+            if stats.succeeded() == 1 {
+                observer.a_settled.notify_one();
+            }
+            false
+        })
+        .build()
+        .expect("valid completion config");
+    Ok(ctx
+        .map(vec![10_i32, 20], move |child, value, index| {
+            let probe = Arc::clone(&probe);
+            async move {
+                probe.branch_runs[index].fetch_add(1, Ordering::SeqCst);
+                let step_probe = Arc::clone(&probe);
+                let result = child
+                    .step(move |_| {
+                        let probe = Arc::clone(&step_probe);
+                        async move {
+                            probe.step_runs[index].fetch_add(1, Ordering::SeqCst);
+                            Ok(value)
+                        }
+                    })
+                    .name(if index == 0 { "a-step" } else { "b-step" })
+                    .await?;
+                // Both step results must be durable before A settles.
+                // B stays active until A settles and the session pauses.
+                if index == 0 {
+                    probe.b_step_saved.notified().await;
+                } else {
+                    probe.b_step_saved.notify_one();
+                    probe.release_b.notified().await;
+                }
+                Ok::<_, durable::BoxError>(result)
+            }
+        })
+        .name("items")
+        .max_concurrency(2)
+        .completion(completion)
+        .await?)
+}
+
+/// Withdrawal at a concurrent map branch's SUCCEED checkpoint suspends the
+/// invocation. Both accepted branch results survive replay without rerunning
+/// branch closures or step side effects.
+#[tokio::test]
+async fn concurrent_map_item_checkpoint_accepted_before_withdrawal_survives_replay() {
+    for batching in [false, true] {
+        let runner = LocalRunner::new();
+        let session = if batching {
+            runner.checkpoint_batching()
+        } else {
+            runner
+        }
+        .session();
+        let probe = Arc::new(MapWithdrawalProbe::default());
+        let handler_probe = Arc::clone(&probe);
+        let handler = move |(), ctx| concurrent_withdrawal_map(ctx, Arc::clone(&handler_probe));
+        let controller = async {
+            probe.a_settled.notified().await;
+            session.pause();
+            probe.release_b.notify_one();
+        };
+        let (paused, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(session.run(handler.clone(), ()), controller)
+        })
+        .await
+        .expect("map must suspend after branch B's checkpoint withdraws the token");
+        assert!(paused.is_suspended(), "{:?}", paused.error_message());
+        assert_eq!(paused.error_type(), None);
+        assert_eq!(paused.output(), None);
+        assert_eq!(paused.invocation_count(), 1);
+        let parent = paused
+            .operations()
+            .iter()
+            .find(|op| op.name() == Some("items"))
+            .expect("map parent exists");
+        assert_eq!(parent.status(), "Started");
+        let branches: Vec<_> = paused
+            .operations()
+            .iter()
+            .filter(|op| op.sub_type() == Some("MapIteration"))
+            .collect();
+        assert_eq!(branches.len(), 2);
+        for branch in branches {
+            assert!(branch.succeeded(), "{}", branch.status());
+            assert_eq!(branch.error_type(), None);
+        }
+        for name in ["a-step", "b-step"] {
+            let step = paused
+                .operations()
+                .iter()
+                .find(|op| op.name() == Some(name))
+                .expect("accepted step exists");
+            assert!(step.succeeded());
+        }
+        for index in 0..2 {
+            assert_eq!(probe.branch_runs[index].load(Ordering::SeqCst), 1);
+            assert_eq!(probe.step_runs[index].load(Ordering::SeqCst), 1);
+        }
+        session.resume();
+        let resumed = tokio::time::timeout(Duration::from_secs(5), session.run(handler, ()))
+            .await
+            .expect("map replay must complete");
+        assert!(resumed.is_success(), "{:?}", resumed.error_message());
+        assert_eq!(resumed.output(), Some(&vec![10, 20]));
+        assert_eq!(resumed.invocation_count(), 1);
+        for index in 0..2 {
+            assert_eq!(probe.branch_runs[index].load(Ordering::SeqCst), 1);
+            assert_eq!(probe.step_runs[index].load(Ordering::SeqCst), 1);
+        }
+    }
+}

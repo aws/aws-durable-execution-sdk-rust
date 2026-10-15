@@ -428,6 +428,14 @@ pub struct LocalRunner {
     /// fault; the runner re-invokes) rather than non-retryable (terminal
     /// `FAIL` then execution failure).
     checkpoint_failures_retryable: bool,
+    /// Number of upcoming checkpoint calls the backend answers with a
+    /// token-less response (fault injection; see
+    /// [`withdraw_checkpoints_after`](Self::withdraw_checkpoints_after)).
+    checkpoint_withdrawals: usize,
+    /// Number of checkpoint calls to let through before the injected
+    /// token-less responses start (see
+    /// [`withdraw_checkpoints_after`](Self::withdraw_checkpoints_after)).
+    checkpoint_withdrawal_skip: usize,
 }
 
 impl Default for LocalRunner {
@@ -466,6 +474,8 @@ impl LocalRunner {
             checkpoint_failures: 0,
             checkpoint_failure_skip: 0,
             checkpoint_failures_retryable: false,
+            checkpoint_withdrawals: 0,
+            checkpoint_withdrawal_skip: 0,
         }
     }
 
@@ -648,6 +658,29 @@ impl LocalRunner {
         self
     }
 
+    /// Like [`fail_checkpoints_after`](Self::fail_checkpoints_after), but
+    /// lets the first `skip` checkpoint calls through before answering the
+    /// following `count` with a token-less response, simulating a
+    /// checkpoint response that carries no checkpoint token: the SDK must
+    /// stop checkpointing this invocation and report `PENDING`, without
+    /// retrying or failing anything. The selected calls still record their
+    /// updates, so a resumed invocation replays their accepted outcomes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().withdraw_checkpoints_after(1, 1);
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn withdraw_checkpoints_after(mut self, skip: usize, count: usize) -> Self {
+        self.checkpoint_withdrawal_skip = skip;
+        self.checkpoint_withdrawals = count;
+        self
+    }
+
     /// Enables checkpoint batching, exactly as [`Options`](crate::Options)'s
     /// [`checkpoint_batching`](crate::OptionsBuilder::checkpoint_batching)
     /// does in production: checkpoint writes go through a single ordered
@@ -754,6 +787,15 @@ impl LocalRunner {
         F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send,
     {
+        self.run_on_backend(self.new_backend(), handler, event)
+            .await
+    }
+
+    /// Builds a fresh backend configured with this runner's fault
+    /// injection settings. Split out of `run` so [`session`](Self::session)
+    /// can build the one backend a session's calls share, instead of
+    /// duplicating the field-by-field setup.
+    fn new_backend(&self) -> Arc<Backend> {
         let backend = Arc::new(Backend::new(
             self.callback_outcomes.clone(),
             self.checkpoint_page_size,
@@ -770,7 +812,51 @@ impl LocalRunner {
             self.checkpoint_failures_retryable,
             std::sync::atomic::Ordering::SeqCst,
         );
-        self.run_on_backend(backend, handler, event).await
+        backend.checkpoint_withdrawals_remaining.store(
+            self.checkpoint_withdrawals,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        backend.checkpoint_withdrawals_skip.store(
+            self.checkpoint_withdrawal_skip,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        backend
+    }
+
+    /// Starts a session whose `run` calls share one backend, so recorded
+    /// state accumulates across them instead of each call starting a fresh
+    /// execution. This is what makes [`LocalSession::pause`] and
+    /// [`LocalSession::resume`] meaningful: a test can run a handler until
+    /// it suspends, pause it, run it again to observe the suspend, resume,
+    /// then run it again to drive it to completion.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::test_util::LocalRunner;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let session = LocalRunner::new().session();
+    /// let result = session
+    ///     .run(
+    ///         |_e: (), _ctx: durable::DurableContext| async move {
+    ///             Ok::<_, durable::BoxError>("hi".to_owned())
+    ///         },
+    ///         (),
+    ///     )
+    ///     .await;
+    /// assert!(result.is_success());
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn session(self) -> LocalSession {
+        let backend = self.new_backend();
+        LocalSession {
+            runner: self,
+            backend,
+        }
     }
 
     /// The invoke → parse → advance loop over an externally supplied
@@ -926,6 +1012,23 @@ impl LocalRunner {
                     };
                 }
                 Some("PENDING") => {
+                    // Drive-loop guard: a paused execution answers every
+                    // checkpoint without a token, so the SDK suspends with
+                    // PENDING on its very next checkpoint attempt. Without
+                    // this check the loop would advance the backend and
+                    // re-invoke anyway, spinning until `max_invocations`
+                    // instead of reporting the clean suspend the pause
+                    // asked for.
+                    if backend.is_paused() {
+                        return TestResult {
+                            disposition: Disposition::Suspended,
+                            output: None,
+                            error_type: None,
+                            error_message: None,
+                            operations: backend.snapshot_operations(),
+                            invocations,
+                        };
+                    }
                     // Advance the simulated backend (timers, retries,
                     // callbacks). If nothing can advance, the execution is
                     // genuinely stuck.
@@ -958,6 +1061,143 @@ impl LocalRunner {
                 }
             }
         }
+    }
+}
+
+/// A [`LocalRunner`] bound to one shared backend: experimental; may change
+/// or be removed in a future release.
+///
+/// [`LocalRunner::run`] builds a fresh backend every call, so a test
+/// written against it always starts a new execution. A session is the
+/// supported way to drive the SAME execution across multiple `run` calls:
+/// recorded operations persist between them, and [`pause`](Self::pause) /
+/// [`resume`](Self::resume) let a test suspend an execution deliberately,
+/// observe the suspend, and then drive the execution to completion.
+///
+/// Create one with [`LocalRunner::session`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct LocalSession {
+    runner: LocalRunner,
+    backend: Arc<Backend>,
+}
+
+impl LocalSession {
+    /// Drives `handler` to a terminal outcome against this session's
+    /// shared backend, continuing any state recorded by an earlier `run`
+    /// call on the same session. See [`LocalRunner::run`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::test_util::LocalRunner;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let session = LocalRunner::new().session();
+    /// session.pause();
+    /// let result = session
+    ///     .run(
+    ///         |n: u32, ctx: durable::DurableContext| async move {
+    ///             let v = ctx.step(move |_| async move { Ok(n + 1) }).await?;
+    ///             Ok::<_, durable::BoxError>(v)
+    ///         },
+    ///         41_u32,
+    ///     )
+    ///     .await;
+    /// assert!(result.is_suspended());
+    ///
+    /// session.resume();
+    /// let result = session
+    ///     .run(
+    ///         |n: u32, ctx: durable::DurableContext| async move {
+    ///             let v = ctx.step(move |_| async move { Ok(n + 1) }).await?;
+    ///             Ok::<_, durable::BoxError>(v)
+    ///         },
+    ///         41_u32,
+    ///     )
+    ///     .await;
+    /// assert_eq!(result.output(), Some(&42));
+    /// # }
+    /// ```
+    pub async fn run<E, O, F, Fut>(&self, handler: F, event: E) -> TestResult<O>
+    where
+        E: Serialize + DeserializeOwned + Send + 'static,
+        O: Serialize + DeserializeOwned + Send + 'static,
+        F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send,
+    {
+        self.runner
+            .run_on_backend(Arc::clone(&self.backend), handler, event)
+            .await
+    }
+
+    /// Makes the backend answer every checkpoint for this execution
+    /// without a token, until [`resume`](Self::resume): experimental; may
+    /// change or be removed in a future release.
+    ///
+    /// A checkpoint response without a token means the invocation may
+    /// checkpoint no further, so the running invocation suspends with
+    /// PENDING at its next checkpoint. The checkpoint that receives the
+    /// token-less response is still accepted; its updates are recorded.
+    /// Only work the invocation had not yet sent is abandoned, to replay
+    /// on the next [`run`](Self::run) call.
+    ///
+    /// Idempotent: pausing an already-paused session has no further
+    /// effect.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
+    ///
+    /// let session = LocalRunner::new().session();
+    /// session.pause();
+    /// assert!(session.is_paused());
+    /// ```
+    pub fn pause(&self) {
+        self.backend.pause();
+    }
+
+    /// Clears a paused state set by [`pause`](Self::pause): experimental;
+    /// may change or be removed in a future release.
+    ///
+    /// Checkpoints answer with a token again from this call on. It does
+    /// not, by itself, drive the execution forward: the next
+    /// [`run`](Self::run) call does that.
+    ///
+    /// Idempotent: resuming a session that is not paused has no effect.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
+    ///
+    /// let session = LocalRunner::new().session();
+    /// session.pause();
+    /// session.resume();
+    /// assert!(!session.is_paused());
+    /// ```
+    pub fn resume(&self) {
+        self.backend.resume();
+    }
+
+    /// Whether the session is currently paused (see
+    /// [`pause`](Self::pause)): experimental; may change or be removed in
+    /// a future release.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
+    ///
+    /// let session = LocalRunner::new().session();
+    /// assert!(!session.is_paused());
+    /// ```
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.backend.is_paused()
     }
 }
 
@@ -1651,6 +1891,32 @@ fn new_started_op(id: String, op_type: OperationType, sub_type: Option<String>) 
     }
 }
 
+/// Message a paused checkpoint response carries, as the `ClientError`
+/// returned by `checkpoint` while [`Backend::pause`] is in effect.
+const PAUSED_CHECKPOINT_MESSAGE: &str =
+    "checkpoint response withheld its token (LocalSession::pause)";
+
+/// Boxed future a `checkpoint` call returns, named to keep
+/// [`Backend::withdrawn_checkpoint_response`]'s signature readable.
+type CheckpointFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send>>;
+
+fn atomic_decrement_if_positive(counter: &std::sync::atomic::AtomicUsize) -> bool {
+    let mut current = counter.load(std::sync::atomic::Ordering::SeqCst);
+    while current > 0 {
+        match counter.compare_exchange(
+            current,
+            current - 1,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
+}
+
 /// Mutable state of the in-memory backend, guarded by a single mutex.
 #[derive(Debug)]
 struct BackendState {
@@ -1691,6 +1957,18 @@ struct Backend {
     /// Whether injected checkpoint failures are retryable (see
     /// [`LocalRunner::fail_checkpoints_after_retryable`]).
     checkpoint_failures_retryable: std::sync::atomic::AtomicBool,
+    /// Number of upcoming `checkpoint` calls to answer with a token-less
+    /// response, after recording their updates (fault injection; see
+    /// [`LocalRunner::withdraw_checkpoints_after`]).
+    checkpoint_withdrawals_remaining: std::sync::atomic::AtomicUsize,
+    /// Number of `checkpoint` calls to let through before the injected
+    /// token-less responses begin.
+    checkpoint_withdrawals_skip: std::sync::atomic::AtomicUsize,
+    /// Latched pause state (see [`LocalSession::pause`]). Unlike the
+    /// one-shot withdrawal counters above, every checkpoint call answers
+    /// without a token for as long as this is set, and does not clear
+    /// itself after any number of calls.
+    paused: std::sync::atomic::AtomicBool,
     /// Per-call checkpoint plan (in-crate test seam): while non-empty,
     /// each `checkpoint` call pops and obeys the front entry instead of
     /// the counter-based injection (see
@@ -1714,6 +1992,12 @@ enum PlannedCheckpoint {
     FailNonRetryable {
         gate: Option<Arc<tokio::sync::Semaphore>>,
     },
+    /// Accepts updates and signals `entered`. Withholds the withdrawal
+    /// response until `release` so tests can order events without sleeps.
+    WithdrawGated {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    },
 }
 
 impl Backend {
@@ -1731,6 +2015,9 @@ impl Backend {
             checkpoint_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
             checkpoint_failures_skip: std::sync::atomic::AtomicUsize::new(0),
             checkpoint_failures_retryable: std::sync::atomic::AtomicBool::new(false),
+            checkpoint_withdrawals_remaining: std::sync::atomic::AtomicUsize::new(0),
+            checkpoint_withdrawals_skip: std::sync::atomic::AtomicUsize::new(0),
+            paused: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             checkpoint_plan: Mutex::new(std::collections::VecDeque::new()),
         }
@@ -1778,6 +2065,67 @@ impl Backend {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // Arms-and-consumes the counters `LocalRunner::withdraw_checkpoints_after`
+    // sets: after `skip` calls pass through, the next `count` calls answer with
+    // no checkpoint token. Split out of `checkpoint` so that function stays
+    // under `clippy::too_many_lines`.
+    fn take_injected_withdrawal(&self) -> bool {
+        let skipped = atomic_decrement_if_positive(&self.checkpoint_withdrawals_skip);
+        !skipped && atomic_decrement_if_positive(&self.checkpoint_withdrawals_remaining)
+    }
+
+    /// Marks the execution paused: see [`LocalSession::pause`].
+    fn pause(&self) {
+        self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Clears a pause set by [`Backend::pause`]: see [`LocalSession::resume`].
+    fn resume(&self) {
+        self.paused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Backend::pause`] is in effect.
+    fn is_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Applies accepted updates before withholding the token, for both
+    /// injected withdrawal and session pause. Returns `None` when the
+    /// checkpoint should proceed normally.
+    fn withdrawn_checkpoint_response(
+        &self,
+        updates: &[OperationUpdate],
+    ) -> Option<CheckpointFuture> {
+        let message = if self.take_injected_withdrawal() {
+            "injected token-less checkpoint response (LocalRunner::withdraw_checkpoints_after)"
+        } else if self.is_paused() {
+            PAUSED_CHECKPOINT_MESSAGE
+        } else {
+            return None;
+        };
+        // The service exempts a batch carrying the execution's own terminal
+        // update: that write finishes the execution, so there is nothing
+        // left to suspend and the call answers normally even without a new
+        // token (`LambdaExecutionClient::checkpoint`). Answering `None`
+        // here falls through to the normal accepted-with-token path, so a
+        // paused session reports the same outcome the real service would
+        // for the one exempt case.
+        if updates
+            .iter()
+            .any(crate::checkpoint_coalescer::is_execution_terminal)
+        {
+            return None;
+        }
+        let mut state = self.lock();
+        for update in updates {
+            state.apply_update(update);
+        }
+        Some(Box::pin(async move {
+            Err(ClientError::suspended_by_service(message.to_owned()))
+        }))
     }
 
     /// The current checkpoint token string.
@@ -2049,6 +2397,23 @@ impl ExecutionClient for Backend {
                         ))
                     });
                 }
+                PlannedCheckpoint::WithdrawGated { entered, release } => {
+                    // Withdrawal still accepts the request's updates.
+                    // Record them before allowing the test to continue.
+                    {
+                        let mut state = self.lock();
+                        for update in &updates {
+                            state.apply_update(update);
+                        }
+                    }
+                    entered.notify_one();
+                    return Box::pin(async move {
+                        release.notified().await;
+                        Err(ClientError::suspended_by_service(
+                            "planned token-less checkpoint response (test plan)".to_owned(),
+                        ))
+                    });
+                }
             }
         }
         // Injected fault (`LocalRunner::fail_next_checkpoints` /
@@ -2056,24 +2421,8 @@ impl ExecutionClient for Backend {
         // calls through, reject BEFORE touching any state, so the
         // rejected write persists nothing, exactly like a service-side
         // rejection.
-        let skipped = self
-            .checkpoint_failures_skip
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok();
-        if !skipped
-            && self
-                .checkpoint_failures_remaining
-                .fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |remaining| remaining.checked_sub(1),
-                )
-                .is_ok()
-        {
+        let skipped = atomic_decrement_if_positive(&self.checkpoint_failures_skip);
+        if !skipped && atomic_decrement_if_positive(&self.checkpoint_failures_remaining) {
             let retryable = self
                 .checkpoint_failures_retryable
                 .load(std::sync::atomic::Ordering::SeqCst);
@@ -2090,6 +2439,10 @@ impl ExecutionClient for Backend {
                     ))
                 }
             });
+        }
+        // Withdrawal ends checkpointing but still accepts this call's updates.
+        if let Some(response) = self.withdrawn_checkpoint_response(&updates) {
+            return response;
         }
         let updated_ops: Vec<Operation> = {
             let mut state = self.lock();
@@ -2378,7 +2731,7 @@ mod tests {
     use crate::builders::map_parallel::CompletionConfig;
     use crate::{RetryDecision, StepError};
     use serde::{Deserialize, Serialize};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     // 1. step success
 
@@ -3908,6 +4261,107 @@ mod tests {
         assert_eq!(result.output(), Some(&3));
     }
 
+    /// An injected withdrawal accepts every update in the request. The
+    /// counter applies only after the configured calls have passed through.
+    #[tokio::test]
+    async fn backend_injected_withdrawal_records_updates_and_expires() {
+        let backend = LocalRunner::new()
+            .withdraw_checkpoints_after(1, 1)
+            .new_backend();
+        let update = |id: &str, action, payload: Option<String>| {
+            OperationUpdate::builder()
+                .id(id)
+                .r#type(OperationType::Step)
+                .action(action)
+                .set_payload(payload)
+                .build()
+                .unwrap()
+        };
+        let start = backend
+            .checkpoint(
+                "arn:test",
+                "token-0",
+                vec![update("a", OperationAction::Start, None)],
+            )
+            .await
+            .expect("the skipped call succeeds normally");
+        assert_ne!(start.checkpoint_token, "");
+
+        let error = backend
+            .checkpoint(
+                "arn:test",
+                &start.checkpoint_token,
+                vec![
+                    update("a", OperationAction::Succeed, Some("42".to_owned())),
+                    update("b", OperationAction::Start, None),
+                ],
+            )
+            .await
+            .expect_err("the selected call withholds its token");
+        assert!(error.is_suspended_by_service());
+        let operations = backend.build_operations();
+        let a = operations.iter().find(|op| op.id() == "a").unwrap();
+        assert_eq!(a.status(), &OperationStatus::Succeeded);
+        assert_eq!(a.step_details().and_then(|step| step.result()), Some("42"));
+        let b = operations.iter().find(|op| op.id() == "b").unwrap();
+        assert_eq!(b.status(), &OperationStatus::Started);
+
+        let next = backend
+            .checkpoint("arn:test", "resumed-token", Vec::new())
+            .await
+            .expect("the one-shot withdrawal has been consumed");
+        assert_ne!(next.checkpoint_token, "");
+        assert_eq!(backend.checkpoint_call_count(), 3);
+    }
+
+    /// Both withdrawal modes preserve the execution-terminal exemption.
+    #[tokio::test]
+    async fn backend_withdrawal_still_accepts_the_execution_terminal_update() {
+        for injected in [false, true] {
+            let backend = LocalRunner::new()
+                .withdraw_checkpoints_after(0, if injected { 2 } else { 0 })
+                .new_backend();
+            if !injected {
+                backend.pause();
+            }
+
+            let ordinary = vec![
+                OperationUpdate::builder()
+                    .id("op-1")
+                    .r#type(OperationType::Step)
+                    .action(OperationAction::Start)
+                    .build()
+                    .unwrap(),
+            ];
+            let error = backend
+                .checkpoint("arn:test", "token-0", ordinary)
+                .await
+                .expect_err("an ordinary checkpoint withholds its token");
+            assert!(
+                error.is_suspended_by_service(),
+                "a token-less response to an ordinary checkpoint classifies as \
+                 suspended-by-service: {error:?}"
+            );
+
+            let terminal = vec![
+                OperationUpdate::builder()
+                    .id("exec-op")
+                    .r#type(OperationType::Execution)
+                    .action(OperationAction::Succeed)
+                    .build()
+                    .unwrap(),
+            ];
+            let output = backend
+                .checkpoint("arn:test", "token-0", terminal)
+                .await
+                .expect("the execution terminal update succeeds despite withdrawal");
+            assert!(
+                !output.checkpoint_token.is_empty(),
+                "the exempt call uses the normal accepted response"
+            );
+        }
+    }
+
     /// Tests that the Backend with `checkpoint_page_size` returns a
     /// `next_marker` when operations exceed the page size, simulating
     /// a two-page checkpoint response. The caller (`DurableContext`)
@@ -4526,6 +4980,94 @@ mod tests {
             "a terminal FAIL must be recorded for the operation whose \
              retained outcome rejection was classified at the flush point"
         );
+    }
+
+    /// Hold an accepted checkpoint response until the handler returns and the
+    /// wrapper awaits its final flush. Withdrawal must then override success.
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_token_withdrawal_after_handler_returns_reports_pending() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let runner = LocalRunner::new().checkpoint_batching().max_invocations(1);
+        let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
+        backend.plan_checkpoint_calls(vec![
+            PlannedCheckpoint::Pass,
+            PlannedCheckpoint::WithdrawGated {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+        ]);
+        let finished_h = Arc::clone(&finished);
+        let mut invocation = Box::pin(runner.run_on_backend(
+            Arc::clone(&backend),
+            move |(), ctx: DurableContext| {
+                let entered = Arc::clone(&entered);
+                let finished = Arc::clone(&finished_h);
+                let mut handler = Box::pin(async move {
+                    let orphan = ctx
+                        .step(|_| async { Ok("orphaned-outcome".to_owned()) })
+                        .name("orphan")
+                        .spawn();
+                    entered.notified().await;
+                    drop(orphan);
+                    Ok::<_, BoxError>("handler-done".to_owned())
+                });
+                std::future::poll_fn(move |cx| {
+                    let outcome = handler.as_mut().poll(cx);
+                    if outcome.is_ready() {
+                        finished.store(true, Ordering::SeqCst);
+                    }
+                    outcome
+                })
+            },
+            (),
+        ));
+        // Observe handler Ready and outer Pending in the same poll.
+        // The response gate stays closed until that poll has returned.
+        let premature = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            std::future::poll_fn(|cx| match invocation.as_mut().poll(cx) {
+                std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+                std::task::Poll::Pending if finished.load(Ordering::SeqCst) => {
+                    std::task::Poll::Ready(None)
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }),
+        )
+        .await
+        .expect("handler must return while the final flush remains pending");
+        assert!(
+            premature.is_none(),
+            "invocation returned before its checkpoint response"
+        );
+        assert_eq!(backend.checkpoint_call_count(), 2);
+        release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), invocation)
+            .await
+            .expect("withdrawal must finish the invocation");
+        assert!(result.is_suspended(), "{:?}", result.error_message());
+        assert_eq!(
+            result.error_type(),
+            None,
+            "withdrawal must not fault the invocation"
+        );
+        assert_eq!(result.output(), None);
+        assert_eq!(result.invocation_count(), 1);
+        assert_eq!(
+            backend.checkpoint_call_count(),
+            2,
+            "no writes after withdrawal"
+        );
+        assert_eq!(result.operations().len(), 1);
+        let orphan = result
+            .operations()
+            .iter()
+            .find(|op| op.name() == Some("orphan"))
+            .expect("accepted step exists");
+        assert!(orphan.succeeded());
+        assert_eq!(orphan.error_type(), None);
+        assert_eq!(orphan.result(), Some("\"orphaned-outcome\""));
     }
 
     // Harness fidelity: production wire-error mapping
