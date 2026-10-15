@@ -1992,6 +1992,12 @@ enum PlannedCheckpoint {
     FailNonRetryable {
         gate: Option<Arc<tokio::sync::Semaphore>>,
     },
+    /// Accepts updates and signals `entered`. Withholds the withdrawal
+    /// response until `release` so tests can order events without sleeps.
+    WithdrawGated {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    },
 }
 
 impl Backend {
@@ -2391,6 +2397,23 @@ impl ExecutionClient for Backend {
                         ))
                     });
                 }
+                PlannedCheckpoint::WithdrawGated { entered, release } => {
+                    // Withdrawal still accepts the request's updates.
+                    // Record them before allowing the test to continue.
+                    {
+                        let mut state = self.lock();
+                        for update in &updates {
+                            state.apply_update(update);
+                        }
+                    }
+                    entered.notify_one();
+                    return Box::pin(async move {
+                        release.notified().await;
+                        Err(ClientError::suspended_by_service(
+                            "planned token-less checkpoint response (test plan)".to_owned(),
+                        ))
+                    });
+                }
             }
         }
         // Injected fault (`LocalRunner::fail_next_checkpoints` /
@@ -2708,7 +2731,7 @@ mod tests {
     use crate::builders::map_parallel::CompletionConfig;
     use crate::{RetryDecision, StepError};
     use serde::{Deserialize, Serialize};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     // 1. step success
 
@@ -4957,6 +4980,94 @@ mod tests {
             "a terminal FAIL must be recorded for the operation whose \
              retained outcome rejection was classified at the flush point"
         );
+    }
+
+    /// Hold an accepted checkpoint response until the handler returns and the
+    /// wrapper awaits its final flush. Withdrawal must then override success.
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_token_withdrawal_after_handler_returns_reports_pending() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let runner = LocalRunner::new().checkpoint_batching().max_invocations(1);
+        let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
+        backend.plan_checkpoint_calls(vec![
+            PlannedCheckpoint::Pass,
+            PlannedCheckpoint::WithdrawGated {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+        ]);
+        let finished_h = Arc::clone(&finished);
+        let mut invocation = Box::pin(runner.run_on_backend(
+            Arc::clone(&backend),
+            move |(), ctx: DurableContext| {
+                let entered = Arc::clone(&entered);
+                let finished = Arc::clone(&finished_h);
+                let mut handler = Box::pin(async move {
+                    let orphan = ctx
+                        .step(|_| async { Ok("orphaned-outcome".to_owned()) })
+                        .name("orphan")
+                        .spawn();
+                    entered.notified().await;
+                    drop(orphan);
+                    Ok::<_, BoxError>("handler-done".to_owned())
+                });
+                std::future::poll_fn(move |cx| {
+                    let outcome = handler.as_mut().poll(cx);
+                    if outcome.is_ready() {
+                        finished.store(true, Ordering::SeqCst);
+                    }
+                    outcome
+                })
+            },
+            (),
+        ));
+        // Observe handler Ready and outer Pending in the same poll.
+        // The response gate stays closed until that poll has returned.
+        let premature = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            std::future::poll_fn(|cx| match invocation.as_mut().poll(cx) {
+                std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+                std::task::Poll::Pending if finished.load(Ordering::SeqCst) => {
+                    std::task::Poll::Ready(None)
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }),
+        )
+        .await
+        .expect("handler must return while the final flush remains pending");
+        assert!(
+            premature.is_none(),
+            "invocation returned before its checkpoint response"
+        );
+        assert_eq!(backend.checkpoint_call_count(), 2);
+        release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), invocation)
+            .await
+            .expect("withdrawal must finish the invocation");
+        assert!(result.is_suspended(), "{:?}", result.error_message());
+        assert_eq!(
+            result.error_type(),
+            None,
+            "withdrawal must not fault the invocation"
+        );
+        assert_eq!(result.output(), None);
+        assert_eq!(result.invocation_count(), 1);
+        assert_eq!(
+            backend.checkpoint_call_count(),
+            2,
+            "no writes after withdrawal"
+        );
+        assert_eq!(result.operations().len(), 1);
+        let orphan = result
+            .operations()
+            .iter()
+            .find(|op| op.name() == Some("orphan"))
+            .expect("accepted step exists");
+        assert!(orphan.succeeded());
+        assert_eq!(orphan.error_type(), None);
+        assert_eq!(orphan.result(), Some("\"orphaned-outcome\""));
     }
 
     // Harness fidelity: production wire-error mapping

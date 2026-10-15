@@ -953,111 +953,6 @@ async fn retryable_flush_failure_fails_invocation_and_reinvocation_converges() {
     );
 }
 
-/// A checkpoint response that did not include a checkpoint token must
-/// stop checkpointing and report `PENDING`, even when it is discovered only
-/// AFTER the handler itself already returned a value. The step's accepted
-/// outcome survives, but the invocation must still report `PENDING`.
-///
-/// `withdraw_checkpoints_after(1, 1)` lets the step's START write through
-/// and answers its SUCCEED write (the batched outcome, flushed at
-/// end-of-invocation) with a token-less response.
-#[tokio::test]
-async fn late_token_withdrawal_after_handler_returns_reports_pending() {
-    let body_runs = Arc::new(AtomicU32::new(0));
-    let body_runs_h = Arc::clone(&body_runs);
-
-    let result = LocalRunner::new()
-        .checkpoint_batching()
-        .withdraw_checkpoints_after(1, 1)
-        .run(
-            move |_event: serde_json::Value, ctx: durable::DurableContext| {
-                let body_runs = Arc::clone(&body_runs_h);
-                async move {
-                    let runs_at_entry = body_runs.load(Ordering::SeqCst);
-                    let body_runs_step = Arc::clone(&body_runs);
-                    // Start the step eagerly and never await it, exactly as
-                    // a `race` starts its branches; the handler returns its
-                    // own result below while this background step's
-                    // outcome write is still in flight.
-                    let orphan = ctx
-                        .step(move |_| {
-                            let body_runs = Arc::clone(&body_runs_step);
-                            async move {
-                                body_runs.fetch_add(1, Ordering::SeqCst);
-                                Ok("orphaned-outcome".to_owned())
-                            }
-                        })
-                        .name("orphan")
-                        .spawn();
-
-                    // Wait for the body to have run, then give its
-                    // SUCCEED write time to join the coalescing buffer
-                    // before the handler returns its own value.
-                    //
-                    // The 30ms sleep below is a synchronization assumption,
-                    // not a proof: it assumes the orphan step's SUCCEED
-                    // write reaches the coalescing buffer within that
-                    // window. `LocalRunner`/`InMemoryExecutionClient` expose
-                    // no deterministic hook for pending-buffer occupancy
-                    // (that state is crate-private, `#[cfg(test)]`-only, and
-                    // not reachable from this integration test's crate), so
-                    // there is nothing stabler to poll here today. Under
-                    // contention this can under-wait and let the test pass
-                    // without exercising the intended race; it cannot
-                    // false-fail (a withdrawal injected before the write
-                    // joins the buffer is still a withdrawal).
-                    while body_runs.load(Ordering::SeqCst) == runs_at_entry {
-                        tokio::time::sleep(Duration::from_millis(2)).await;
-                    }
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    drop(orphan);
-
-                    Ok::<_, durable::BoxError>("handler-done".to_owned())
-                }
-            },
-            serde_json::Value::Null,
-        )
-        .await;
-
-    assert!(
-        result.is_suspended(),
-        "a token-less checkpoint response must stop checkpointing this invocation \
-         and report PENDING instead of the handler's own completed outcome: \
-         {:?} / {:?}",
-        result.error_type(),
-        result.error_message()
-    );
-    assert_eq!(
-        result.output(),
-        None,
-        "the handler's own return value must never be reported once its \
-         checkpointing was withdrawn"
-    );
-    assert!(
-        !result.is_failure(),
-        "a withdrawn token is not a failure of either the invocation or the \
-         execution"
-    );
-    assert_eq!(
-        result.invocation_count(),
-        1,
-        "the withdrawn invocation reports PENDING with nothing further to \
-         advance, so the runner must not keep re-invoking it"
-    );
-
-    let orphan_op = result
-        .operations()
-        .iter()
-        .find(|op| op.name() == Some("orphan"))
-        .expect("the orphaned step's operation record exists");
-    assert_eq!(
-        orphan_op.status(),
-        "Succeeded",
-        "the accepted outcome must survive token withdrawal; got {}",
-        orphan_op.status()
-    );
-}
-
 /// A withdrawn token stops the invocation, but its accepted step result
 /// survives. A later invocation replays that result without repeating work.
 #[tokio::test]
@@ -1355,4 +1250,135 @@ async fn session_pause_mid_flight_keeps_accepted_write_and_replays_the_rest() {
          state while paused, so the resumed replay reuses the recorded \
          outcome instead of rerunning the body"
     );
+}
+
+#[derive(Default)]
+struct MapWithdrawalProbe {
+    step_runs: [AtomicU32; 2],
+    branch_runs: [AtomicU32; 2],
+    b_step_saved: tokio::sync::Notify,
+    a_settled: tokio::sync::Notify,
+    release_b: tokio::sync::Notify,
+}
+
+async fn concurrent_withdrawal_map(
+    ctx: durable::DurableContext,
+    probe: Arc<MapWithdrawalProbe>,
+) -> Result<Vec<i32>, durable::BoxError> {
+    let observer = Arc::clone(&probe);
+    let completion = durable::builders::map_parallel::CompletionConfig::builder()
+        .tolerated_failure_count(0)
+        .completion_predicate(move |stats| {
+            // This notification observes settlement for the test only.
+            // The completion decision remains independent of mutable state.
+            if stats.succeeded() == 1 {
+                observer.a_settled.notify_one();
+            }
+            false
+        })
+        .build()
+        .expect("valid completion config");
+    Ok(ctx
+        .map(vec![10_i32, 20], move |child, value, index| {
+            let probe = Arc::clone(&probe);
+            async move {
+                probe.branch_runs[index].fetch_add(1, Ordering::SeqCst);
+                let step_probe = Arc::clone(&probe);
+                let result = child
+                    .step(move |_| {
+                        let probe = Arc::clone(&step_probe);
+                        async move {
+                            probe.step_runs[index].fetch_add(1, Ordering::SeqCst);
+                            Ok(value)
+                        }
+                    })
+                    .name(if index == 0 { "a-step" } else { "b-step" })
+                    .await?;
+                // Both step results must be durable before A settles.
+                // B stays active until A settles and the session pauses.
+                if index == 0 {
+                    probe.b_step_saved.notified().await;
+                } else {
+                    probe.b_step_saved.notify_one();
+                    probe.release_b.notified().await;
+                }
+                Ok::<_, durable::BoxError>(result)
+            }
+        })
+        .name("items")
+        .max_concurrency(2)
+        .completion(completion)
+        .await?)
+}
+
+/// Withdrawal at a concurrent map branch's SUCCEED checkpoint suspends the
+/// invocation. Both accepted branch results survive replay without rerunning
+/// branch closures or step side effects.
+#[tokio::test]
+async fn concurrent_map_item_checkpoint_accepted_before_withdrawal_survives_replay() {
+    for batching in [false, true] {
+        let runner = LocalRunner::new();
+        let session = if batching {
+            runner.checkpoint_batching()
+        } else {
+            runner
+        }
+        .session();
+        let probe = Arc::new(MapWithdrawalProbe::default());
+        let handler_probe = Arc::clone(&probe);
+        let handler = move |(), ctx| concurrent_withdrawal_map(ctx, Arc::clone(&handler_probe));
+        let controller = async {
+            probe.a_settled.notified().await;
+            session.pause();
+            probe.release_b.notify_one();
+        };
+        let (paused, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(session.run(handler.clone(), ()), controller)
+        })
+        .await
+        .expect("map must suspend after branch B's checkpoint withdraws the token");
+        assert!(paused.is_suspended(), "{:?}", paused.error_message());
+        assert_eq!(paused.error_type(), None);
+        assert_eq!(paused.output(), None);
+        assert_eq!(paused.invocation_count(), 1);
+        let parent = paused
+            .operations()
+            .iter()
+            .find(|op| op.name() == Some("items"))
+            .expect("map parent exists");
+        assert_eq!(parent.status(), "Started");
+        let branches: Vec<_> = paused
+            .operations()
+            .iter()
+            .filter(|op| op.sub_type() == Some("MapIteration"))
+            .collect();
+        assert_eq!(branches.len(), 2);
+        for branch in branches {
+            assert!(branch.succeeded(), "{}", branch.status());
+            assert_eq!(branch.error_type(), None);
+        }
+        for name in ["a-step", "b-step"] {
+            let step = paused
+                .operations()
+                .iter()
+                .find(|op| op.name() == Some(name))
+                .expect("accepted step exists");
+            assert!(step.succeeded());
+        }
+        for index in 0..2 {
+            assert_eq!(probe.branch_runs[index].load(Ordering::SeqCst), 1);
+            assert_eq!(probe.step_runs[index].load(Ordering::SeqCst), 1);
+        }
+        session.resume();
+        let resumed = tokio::time::timeout(Duration::from_secs(5), session.run(handler, ()))
+            .await
+            .expect("map replay must complete");
+        assert!(resumed.is_success(), "{:?}", resumed.error_message());
+        assert_eq!(resumed.output(), Some(&vec![10, 20]));
+        assert_eq!(resumed.invocation_count(), 1);
+        for index in 0..2 {
+            assert_eq!(probe.branch_runs[index].load(Ordering::SeqCst), 1);
+            assert_eq!(probe.step_runs[index].load(Ordering::SeqCst), 1);
+        }
+    }
 }
