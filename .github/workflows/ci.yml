@@ -21,9 +21,15 @@ jobs:
   # `dependencies` job, and the `msrv` job so a failure names itself.
   check:
     name: check (sdk)
-    runs-on: ubuntu-latest
+    # CodeBuild-hosted runner in the Rust testing account (EC2 compute); the label
+    # must match the CodeBuild project name. Pull requests from forks are routed
+    # to GitHub-hosted runners. This is routing, not a trust boundary: the fork
+    # boundary is the repository's approval setting for fork workflows.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: |
@@ -59,9 +65,12 @@ jobs:
   # would then be wrong rather than protective.
   msrv:
     name: check (msrv 1.94.1)
-    runs-on: ubuntu-latest
+    # Same routing as above.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: |
@@ -78,9 +87,12 @@ jobs:
   # direct-dependency allowlist that keeps the production graph closed.
   dependencies:
     name: dependencies
-    runs-on: ubuntu-latest
+    # Same routing as above.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -103,9 +115,12 @@ jobs:
   # two together.
   external-types:
     name: public API (external types)
-    runs-on: ubuntu-latest
+    # Same routing as above.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: |
@@ -145,13 +160,16 @@ jobs:
   semver:
     name: public API (semver)
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    # Same routing as above.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # cargo-semver-checks materializes the baseline from git history;
           # the default depth-1 checkout does not contain the base branch.
           fetch-depth: 0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -170,9 +188,12 @@ jobs:
   # build rather than assumed to (issue #39).
   feature-powerset:
     name: feature powerset
-    runs-on: ubuntu-latest
+    # Same routing as above.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -191,7 +212,8 @@ jobs:
   # CI still compiles both so a public API change cannot silently break them.
   workspaces:
     name: build (${{ matrix.workspace }})
-    runs-on: ubuntu-latest
+    # Same routing as above.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
     strategy:
       fail-fast: false
       matrix:
@@ -203,8 +225,13 @@ jobs:
       # (the examples build has died linking with "no space left"); reclaim
       # the space taken by preinstalled toolchains we never use.
       - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        # Only the hosted image is short on disk; the CodeBuild image has a large
+        # volume and a different package set.
+        if: runner.environment == 'github-hosted'
         with:
           tool-cache: false
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable

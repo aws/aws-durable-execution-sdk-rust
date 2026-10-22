@@ -2089,7 +2089,7 @@ mod tests {
         // wire name because the top error is an OperationError.
         assert_eq!(wire.error_type(), Some("StepError"));
         // A fresh failure captures a stack trace.
-        assert!(!wire.stack_trace().is_empty());
+        assert_ne!(wire.stack_trace(), Vec::<String>::new());
         // No error_data anywhere in the chain: none synthesized.
         assert_eq!(wire.error_data(), None);
     }
