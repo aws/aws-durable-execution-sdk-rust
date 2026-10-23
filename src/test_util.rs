@@ -1651,6 +1651,29 @@ fn new_started_op(id: String, op_type: OperationType, sub_type: Option<String>) 
     }
 }
 
+/// Decrements `counter` by one if it is above zero, and returns whether it
+/// did.
+///
+/// `AtomicUsize::fetch_update` does this in one call. Rust 1.99 deprecates
+/// it, and CI denies warnings. Its replacement, `try_update`, is unstable
+/// on the 1.94.1 MSRV. So this function uses a `compare_exchange` loop,
+/// which compiles without warnings on both toolchains.
+fn atomic_decrement_if_positive(counter: &std::sync::atomic::AtomicUsize) -> bool {
+    let mut current = counter.load(std::sync::atomic::Ordering::SeqCst);
+    while current > 0 {
+        match counter.compare_exchange(
+            current,
+            current - 1,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
+}
+
 /// Mutable state of the in-memory backend, guarded by a single mutex.
 #[derive(Debug)]
 struct BackendState {
@@ -2056,24 +2079,8 @@ impl ExecutionClient for Backend {
         // calls through, reject BEFORE touching any state, so the
         // rejected write persists nothing, exactly like a service-side
         // rejection.
-        let skipped = self
-            .checkpoint_failures_skip
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok();
-        if !skipped
-            && self
-                .checkpoint_failures_remaining
-                .fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |remaining| remaining.checked_sub(1),
-                )
-                .is_ok()
-        {
+        let skipped = atomic_decrement_if_positive(&self.checkpoint_failures_skip);
+        if !skipped && atomic_decrement_if_positive(&self.checkpoint_failures_remaining) {
             let retryable = self
                 .checkpoint_failures_retryable
                 .load(std::sync::atomic::Ordering::SeqCst);
