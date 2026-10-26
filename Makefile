@@ -1,18 +1,40 @@
-.PHONY: check
+.PHONY: check ci check-sdk msrv dependencies external-types feature-powerset \
+	workspaces test-role conformance conformance-build conformance-run cloud-tests
 
-# Single quality-gate entry point. Every command must pass for the
-# build to be considered green. Runs: format check, lints, tests
-# (including doctests), documentation build, dependency policy, and an
-# MSRV compile check matching CI's msrv job (the version comes from the
-# root Cargo.toml's rust-version, the same source of truth that
-# scripts/check-msrv-consistency.sh enforces).
+# Every target calls a script in scripts/, which holds the commands.
+# CONTRIBUTING.md describes the targets and their inputs.
+
+# The quality gate for every change: the check-sdk, dependencies and msrv
+# jobs of ci.yml.
 check:
-	cargo fmt --check
-	cargo clippy --all-targets --all-features -- -D warnings
-	cargo test
-	cargo test --all-features
-	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-	cargo deny check
-	sh scripts/check-direct-deps.sh
-	sh scripts/check-msrv-consistency.sh
-	sh scripts/check-msrv.sh
+	sh scripts/ci.sh check-sdk dependencies msrv
+
+# Every ci.yml job that runs on a push to main, with CI's environment.
+ci:
+	sh scripts/ci.sh ci
+
+# One target per ci.yml job. ci.yml calls these.
+check-sdk:
+	sh scripts/ci.sh check-sdk
+msrv:
+	sh scripts/ci.sh msrv
+dependencies:
+	sh scripts/ci.sh dependencies
+external-types:
+	sh scripts/ci.sh external-types
+feature-powerset:
+	sh scripts/ci.sh feature-powerset
+workspaces:
+	sh scripts/ci.sh workspaces
+
+# Targets that deploy to AWS. They need TEST_ACCOUNT_ID.
+test-role:
+	sh scripts/test-role.sh
+conformance:
+	sh scripts/conformance.sh all
+conformance-build:
+	sh scripts/conformance.sh build
+conformance-run:
+	sh scripts/conformance.sh run
+cloud-tests:
+	sh scripts/cloud-tests.sh run

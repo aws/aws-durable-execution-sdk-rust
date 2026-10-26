@@ -78,7 +78,10 @@ dependency policy section below explains what adding to it involves.
 ## `make check`
 
 `make check` is the single entry point, and it must pass before you push. It
-runs nine commands in order, and any one of them failing fails the run:
+runs nine commands in three groups, named after the `ci.yml` jobs that run them:
+`check-sdk`, `dependencies` and `msrv`. Inside a group, the first failing
+command ends the group. The next group still runs. A summary lists each group's
+result, and any failure fails the run:
 
 | Command | Rejects |
 | --- | --- |
@@ -87,10 +90,10 @@ runs nine commands in order, and any one of them failing fails the run:
 | `cargo test` | a failing unit test or doctest in the default feature set |
 | `cargo test --all-features` | a failing test behind a feature gate (`test-util`, `replay-filter`), including the integration tests those features unlock |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | a broken intra-doc link or malformed rustdoc markup anywhere in the documented surface, including feature-gated items |
-| `cargo deny check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source |
-| `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlists do not name, in either the default-feature or the all-features graph |
 | `sh scripts/check-msrv-consistency.sh` | a `rust-version` declaration (in any manifest, the `msrv` CI job, or the README) that disagrees with the root `Cargo.toml`'s |
-| `sh scripts/check-msrv.sh` | code that does not compile warning-free on the declared minimum supported Rust version, matching CI's `msrv` job; if that toolchain is not installed, it fails with a `rustup toolchain install` hint rather than running on the wrong compiler |
+| `cargo deny --all-features check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source, in the graph with every feature enabled |
+| `sh scripts/check-direct-deps.sh` | a direct production dependency the allowlists do not name, in either the default-feature or the all-features graph |
+| `sh scripts/check-msrv.sh` | code that does not compile warning-free on the declared minimum supported Rust version |
 
 Two of those are stricter than their defaults. Clippy normally reports warnings
 and exits zero; `-D warnings` turns every one into an error, so a `pedantic`
@@ -109,20 +112,42 @@ workspaces omit those. A lint policy change that you intend to apply across the
 project must update all applicable `Cargo.toml` files, and the pull request should
 say why.
 
-`make check` deliberately leaves out one thing that CI still runs: it covers
-the SDK workspace only. Both feature-gated surfaces are already inside it:
-`cargo test --all-features` runs the `test-util` and `replay-filter`
-tests, so there is no separate feature-testing step to remember.
+`make check` covers the SDK workspace only, and it keeps your environment, so
+your incremental build cache survives it. `make ci` runs everything `ci.yml`
+runs on a push to `main`, and it needs no AWS:
 
-`conformance/` and `examples/` are separate cargo workspaces whose heavier
-dependency graph `make check` deliberately excludes so it stays fast. CI
-compiles and lints both, which catches a public API change that breaks them.
-Do the same locally when you change the public surface:
+- the three `make check` groups;
+- `external-types`, which rejects a foreign type in the public API that the
+  allowlist under `[package.metadata.cargo_check_external_types]` in
+  `Cargo.toml` does not name;
+- `feature-powerset`, which compiles every feature combination with
+  cargo-hack;
+- `workspaces`, which builds and lints the `conformance` and `examples`
+  workspaces, so a public API change that breaks them fails;
+- `pins`, which fails when `scripts/tools.sh` and a workflow name different
+  versions of a pinned tool.
 
-```sh
-(cd conformance && cargo build --all-targets && cargo clippy --all-targets -- -D warnings)
-(cd examples   && cargo build --all-targets && cargo clippy --all-targets -- -D warnings)
-```
+`make ci` sets `RUSTFLAGS="-D warnings"` and `CARGO_PROFILE_DEV_DEBUG=0`, as
+`ci.yml` does, so a warning that `make check` lets through fails it. Run it
+before a push that CI must not fail. Each group is also a target of its own:
+`make check-sdk`, `make msrv`, `make dependencies`, `make external-types`,
+`make feature-powerset` and `make workspaces`. Each `ci.yml` job calls its
+target, so CI and a local run execute the same commands, from `scripts/ci.sh`.
+
+Every target checks its tools before it runs anything. A missing tool, or a
+tool at another version than the one CI pins, fails the target with the
+command that installs the right one. `scripts/tools.sh` holds the pins. Stable
+Rust is not pinned, because CI installs the newest stable on every run, so run
+`rustup update stable` before `make ci`.
+
+`make check` and `make ci` set no time limit. A change to suspension or
+concurrency code can make a test wait forever. So when nobody watches the
+run, for example in a script or an agent, wrap it in a time limit:
+`timeout 3600 make ci`.
+
+The AWS targets need GNU `timeout`, because they bound each step so that
+teardown still runs after a hang. On macOS, install coreutils and put its
+`gnubin` directory on `PATH`.
 
 ## Dependency policy
 
@@ -185,32 +210,25 @@ durable execution contract, which is how we know the Rust implementation
 satisfies the service specification rather than merely passing its own tests.
 Each suite has a SAM template at `conformance/template_<suite>.yaml`.
 `conformance/template_smoke.yaml` is a single hello handler that checks a
-deployment works at all, so the runner does not validate it and CI skips it.
+deployment works at all, so the runner does not validate it and the targets
+skip it.
 
 Running the suite costs real time and real resources. A cold build of all
 handlers produces roughly two gigabytes of artifacts, and each suite deploys a
 CloudFormation stack of Lambda functions and runs executions that include
-timers. CI splits the nine suites across parallel jobs; on a workstation, build
-and run one suite at a time.
+timers.
 
 You need a Rust toolchain,
 [cargo-lambda](https://www.cargo-lambda.info/), the
 [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html),
-Python, an AWS account you can deploy to, and the ARN of a Lambda execution role
-in that account. The quickest way to get one is the template this repository
-ships: a one-time deploy with IAM-capable credentials; the test stacks
-themselves never create IAM resources, so day-to-day runs need no IAM
-permissions:
-
-```sh
-aws cloudformation deploy \
-    --template-file scripts/test-execution-role.yaml \
-    --stack-name durable-sdk-test-execution-role \
-    --capabilities CAPABILITY_IAM
-```
-
-Its `RoleArn` output is what you pass as `ExecutionRoleArn` below. If you build
-the role yourself instead, it needs the union of what all suites use:
+the AWS CLI, Python 3, an AWS account you can deploy to, and a Lambda execution
+role in that account. `make test-role` deploys the role this repository ships,
+`scripts/test-execution-role.yaml`, as the stack
+`durable-sdk-test-execution-role`, and prints its `RoleArn` output. It needs
+IAM-capable credentials once; the test stacks themselves never create IAM
+resources, so day-to-day runs need no IAM permissions. Running it again
+changes nothing. If you build the role yourself instead, it needs the union of
+what all suites use:
 
 - CloudWatch Logs write access (to receive handler output).
 - `lambda:CheckpointDurableExecution` and `lambda:GetDurableExecutionState`
@@ -223,32 +241,39 @@ the role yourself instead, it needs the union of what all suites use:
   child suites deploy a DynamoDB table and their retry handlers record attempt
   counts through it).
 
-CI pins cargo-lambda to an exact version; match it if you are chasing a
-difference between a local run and a CI run.
-
-Use cargo-lambda rather than `cargo build`. It builds through cargo-zigbuild,
-which pins the glibc version the handler links against, so the binary starts on
-the `provided.al2023` runtime whatever host built it. A natively linked binary
-from a modern host dies at startup instead.
+The targets build with cargo-lambda rather than `cargo build`. It builds through
+cargo-zigbuild, which pins the glibc version the handler links against, so the
+binary starts on the `provided.al2023` runtime whatever host built it. A
+natively linked binary from a modern host dies at startup instead.
 
 ```sh
-pip3 install cargo-lambda
-pip install "git+https://github.com/aws/aws-durable-execution-conformance-tests.git@main#subdirectory=packages/aws-durable-execution-conformance-tests"
-
-cd conformance
-./build_examples.sh step          # build one suite; omit the argument to build every template
-
-python -m aws_durable_execution_conformance_tests.app \
-    --template template_step.yaml \
-    --language rust \
-    --suite step \
-    --name conf-rust-step-local \
-    --region us-west-2 \
-    --parameter-overrides ExecutionRoleArn=arn:aws:iam::111122223333:role/your-lambda-execution-role \
-    --history-dir history-step \
-    --report junit \
-    --report-file report-step
+make conformance AWS_PROFILE=<profile> TEST_ACCOUNT_ID=<account-id>
+make conformance AWS_PROFILE=<profile> TEST_ACCOUNT_ID=<account-id> SUITES="step wait"
 ```
+
+`make conformance` builds the handlers of the selected suites once, then runs
+every suite in parallel, as CI's matrix does. `SUITES` selects suites; the
+default is every template except `template_smoke.yaml`. `make
+conformance-build` only builds, and `make conformance-run` only runs, which is
+how the workflow splits them. The AWS targets take these inputs:
+
+| Input | Meaning |
+| --- | --- |
+| credentials | the standard AWS chain, such as `AWS_PROFILE`; never pass keys as arguments |
+| `TEST_ACCOUNT_ID` | required; the target stops before any deploy when the credentials belong to another account |
+| `AWS_REGION` | default `us-west-2` |
+| `EXECUTION_ROLE_ARN` | default: the `RoleArn` output of `durable-sdk-test-execution-role` |
+| `RUN_ID` | default `local-<UTC yyyymmddHHMMSS>`; part of every stack name the run creates |
+
+The runner installs into a virtualenv under `target/`, from the conformance
+test repository's `main` branch, together with `./conformance/conformance_ext`.
+Each suite writes `conformance/report-<suite>.xml`,
+`conformance/history-<suite>/` and the runner's output in
+`conformance/history-<suite>/runner.log`. Each suite deploys the stack
+`conformance-tests-conf-rust-<suite>-<RUN_ID>`, with `_` in the suite name
+written as `-`. When the suites finish, the target deletes those stacks, even
+when a runner was killed before its own cleanup, then prints the log of each
+failed suite and a summary.
 
 `build_examples.sh` skips the build when git HEAD is unchanged, the tree is
 clean, and no source file is newer than the last run, so a repeat invocation
@@ -268,37 +293,15 @@ The prerequisites match the conformance suite, plus `jq`. The whole run takes
 tens of minutes because several examples wait on real timers; the CI job caps it
 at 90.
 
-Build and deploy all three family stacks, then run the harness:
-
 ```sh
-cd examples
-./build_examples.sh
-
-ROLE=arn:aws:iam::111122223333:role/your-lambda-execution-role
-
-sam deploy --template-file template_basics.yaml \
-    --stack-name dex-rust-examples-basics \
-    --resolve-s3 --region us-west-2 --no-confirm-changeset \
-    --parameter-overrides ExecutionRoleArn=$ROLE
-
-sam deploy --template-file template_coordination.yaml \
-    --stack-name dex-rust-examples-coordination \
-    --resolve-s3 --region us-west-2 --no-confirm-changeset \
-    --parameter-overrides ExecutionRoleArn=$ROLE
-
-sam deploy --template-file template_external.yaml \
-    --stack-name dex-rust-examples-external \
-    --resolve-s3 --region us-west-2 --no-confirm-changeset \
-    --parameter-overrides ExecutionRoleArn=$ROLE
-
-./cloud/run_cloud_tests.sh
+make cloud-tests AWS_PROFILE=<profile> TEST_ACCOUNT_ID=<account-id>
 ```
 
-The harness reads the stack names from environment variables
-`STACK_BASICS`, `STACK_COORDINATION`, and `STACK_EXTERNAL`, defaulting to the
-`dex-rust-examples-<family>` pattern shown above. Override them if you deploy
-under different names. Delete the stacks when you finish; they hold live Lambda
-functions. `examples/README.md` documents the family layout and the per-example
+`make cloud-tests` takes the inputs in the table above. It builds the examples,
+deploys the three family stacks as `rust-examples-<RUN_ID>-<family>`, runs the
+harness against them, and deletes the stacks on every exit path: success, a
+failed step, a timeout, and Ctrl-C. A summary of the steps follows.
+`examples/README.md` documents the family layout and the per-example
 expectations.
 
 ## Raising a pull request

@@ -2,3 +2,7 @@
 publish/
 target/
 .aws-sam/
+
+# Conformance run output (scripts/conformance.sh).
+history-*/
+report-*.xml

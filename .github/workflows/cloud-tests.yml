@@ -21,9 +21,9 @@ on:
 
 env:
   AWS_REGION: ${{ github.event.inputs.region || 'us-west-2' }}
-  STACK_BASICS: rust-examples-ci-basics
-  STACK_COORDINATION: rust-examples-ci-coordination
-  STACK_EXTERNAL: rust-examples-ci-external
+  # The stacks are rust-examples-ci-<family>; the concurrency group below
+  # keeps two runs from sharing them.
+  RUN_ID: ci
 
 permissions:
   contents: read
@@ -39,6 +39,9 @@ jobs:
     concurrency:
       group: rust-cloud-tests
       cancel-in-progress: false
+    env:
+      TEST_ACCOUNT_ID: ${{ secrets.TEST_ACCOUNT_ID }}
+      EXECUTION_ROLE_ARN: ${{ secrets.TEST_LAMBDA_EXECUTION_ROLE_ARN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -72,58 +75,16 @@ jobs:
           role-session-name: rustExamplesGitHubCloudTest
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify AWS test account
-        env:
-          TEST_ACCOUNT_ID: ${{ secrets.TEST_ACCOUNT_ID }}
-        run: |
-          ACTUAL_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          if [ "$ACTUAL_ACCOUNT_ID" != "$TEST_ACCOUNT_ID" ]; then
-            echo "Expected AWS account $TEST_ACCOUNT_ID but assumed into $ACTUAL_ACCOUNT_ID"
-            exit 1
-          fi
-          echo "Using AWS test account $ACTUAL_ACCOUNT_ID"
-
       - name: Setup SAM CLI
         uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
 
-      - name: Build examples
-        working-directory: examples
-        run: ./build_examples.sh
+      # Checks the account, builds the examples, deploys the three family
+      # stacks, runs examples/cloud/run_cloud_tests.sh, and deletes the
+      # stacks.
+      - name: Build, deploy, test, tear down
+        run: make cloud-tests
 
-      - name: Deploy example stacks with SAM
-        working-directory: examples
-        env:
-          EXECUTION_ROLE_ARN: ${{ secrets.TEST_LAMBDA_EXECUTION_ROLE_ARN }}
-        run: |
-          deploy_family() {
-            family=$1
-            stack=$2
-            sam build --template-file "template_${family}.yaml" \
-              --build-dir ".aws-sam/build-${family}"
-            sam deploy \
-              --template-file ".aws-sam/build-${family}/template.yaml" \
-              --stack-name "$stack" \
-              --resolve-s3 \
-              --no-confirm-changeset \
-              --no-fail-on-empty-changeset \
-              --region "$AWS_REGION" \
-              --parameter-overrides ExecutionRoleArn="$EXECUTION_ROLE_ARN"
-          }
-          deploy_family basics "$STACK_BASICS"
-          deploy_family coordination "$STACK_COORDINATION"
-          deploy_family external "$STACK_EXTERNAL"
-
-      - name: Run cloud tests
-        working-directory: examples
-        run: ./cloud/run_cloud_tests.sh
-
+      # A cancelled job never reaches the cleanup of the step above.
       - name: Tear down example stacks
         if: always()
-        run: |
-          for stack in "$STACK_BASICS" "$STACK_COORDINATION" "$STACK_EXTERNAL"; do
-            echo "Deleting stack $stack"
-            aws cloudformation delete-stack --stack-name "$stack" || true
-          done
-          for stack in "$STACK_BASICS" "$STACK_COORDINATION" "$STACK_EXTERNAL"; do
-            aws cloudformation wait stack-delete-complete --stack-name "$stack" || true
-          done
+        run: sh scripts/cloud-tests.sh teardown

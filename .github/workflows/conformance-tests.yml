@@ -9,6 +9,9 @@ name: Conformance Tests
 # The handlers are built EXACTLY ONCE, in build_handlers, and shipped to the
 # suite jobs as an artifact. The suite jobs deploy and test only: they carry
 # no Rust toolchain and never invoke cargo.
+#
+# Every command step calls a make target or scripts/conformance.sh, so a
+# local `make conformance` runs the same commands.
 
 on:
   push:
@@ -49,6 +52,7 @@ jobs:
   discover_suites:
     name: discover conformance suites
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       suites: ${{ steps.discover.outputs.suites }}
     steps:
@@ -56,26 +60,15 @@ jobs:
 
       - name: Discover suites from templates
         id: discover
-        working-directory: conformance
         run: |
-          # template_smoke.yaml is a single hello handler used to verify that
-          # a build deploys and runs; it is not one of the conformance
-          # validator's suites, so it is excluded here.
-          suites=$(for t in template_*.yaml; do
-            s=${t#template_}
-            s=${s%.yaml}
-            [ "$s" = "smoke" ] && continue
-            printf '%s\n' "$s"
-          done | jq -R . | jq -s -c .)
+          suites=$(sh scripts/conformance.sh suites | jq -R . | jq -s -c .)
           echo "Discovered suites: $suites"
           echo "suites=$suites" >> "$GITHUB_OUTPUT"
 
   build_handlers:
     name: build conformance handlers
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: conformance
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -103,7 +96,7 @@ jobs:
         run: pip install "cargo-lambda==1.8.6"
 
       - name: Build conformance handlers
-        run: ./build_examples.sh
+        run: make conformance-build
 
       # tar, not a bare artifact upload: actions/upload-artifact does not
       # preserve the executable bit, and a non-executable bootstrap cannot be
@@ -111,6 +104,7 @@ jobs:
       # gzipped; one upload plus one download per suite is still far cheaper
       # than rebuilding the whole workspace in each of the 10 suite jobs.
       - name: Package handlers
+        working-directory: conformance
         run: tar -czf handlers.tar.gz publish
 
       - name: Upload handlers
@@ -125,6 +119,7 @@ jobs:
     name: conformance (${{ matrix.suite }})
     needs: [discover_suites, build_handlers]
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: read
       id-token: write # Required for AWS OIDC credentials
@@ -132,9 +127,11 @@ jobs:
       fail-fast: false
       matrix:
         suite: ${{ fromJSON(needs.discover_suites.outputs.suites) }}
-    defaults:
-      run:
-        working-directory: conformance
+    env:
+      SUITES: ${{ matrix.suite }}
+      RUN_ID: ${{ github.run_id }}
+      TEST_ACCOUNT_ID: ${{ secrets.TEST_ACCOUNT_ID }}
+      EXECUTION_ROLE_ARN: ${{ secrets.TEST_LAMBDA_EXECUTION_ROLE_ARN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -145,6 +142,7 @@ jobs:
           path: conformance
 
       - name: Unpack handlers
+        working-directory: conformance
         run: |
           tar -xzf handlers.tar.gz
           rm handlers.tar.gz
@@ -169,52 +167,19 @@ jobs:
           role-session-name: rustConformanceTest
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify AWS test account
-        env:
-          TEST_ACCOUNT_ID: ${{ secrets.TEST_ACCOUNT_ID }}
-        run: |
-          ACTUAL_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          if [ "$ACTUAL_ACCOUNT_ID" != "$TEST_ACCOUNT_ID" ]; then
-            echo "Expected AWS account $TEST_ACCOUNT_ID but assumed into $ACTUAL_ACCOUNT_ID"
-            exit 1
-          fi
-          echo "Using AWS test account $ACTUAL_ACCOUNT_ID"
-
       - name: Setup SAM CLI
         uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
 
-      # Installed from main, matching the peer SDK repos: the released
-      # versions do not accept --parameter-overrides.
-      - name: Install conformance runner
-        run: |
-          pip install "git+https://github.com/aws/aws-durable-execution-conformance-tests.git@main#subdirectory=packages/aws-durable-execution-conformance-tests"
-
-      # The history, nondeterminism, and combinator suites are contributed
-      # by this repo's extension package (conformance/conformance_ext); the
-      # runner discovers them through its extension entry point.
-      - name: Install Rust SDK conformance extension
-        run: pip install ./conformance_ext
-
-      - name: Compute stack-safe suite slug
-        run: |
-          # CloudFormation stack names allow only [a-zA-Z][-a-zA-Z0-9]*;
-          # suite names like wait_for_condition contain underscores.
-          echo "SUITE_SLUG=$(echo '${{ matrix.suite }}' | tr '_' '-')" >> "$GITHUB_ENV"
-
+      # Checks the account, installs the runner from main and
+      # ./conformance/conformance_ext into a virtualenv under target/, runs
+      # the suite, and deletes its stack.
       - name: Run conformance suite
-        env:
-          EXECUTION_ROLE_ARN: ${{ secrets.TEST_LAMBDA_EXECUTION_ROLE_ARN }}
-        run: |
-          python -m aws_durable_execution_conformance_tests.app \
-            --template template_${{ matrix.suite }}.yaml \
-            --language rust \
-            --suite ${{ matrix.suite }} \
-            --name conf-rust-${SUITE_SLUG}-${{ github.run_id }} \
-            --region ${{ env.AWS_REGION }} \
-            --parameter-overrides ExecutionRoleArn="$EXECUTION_ROLE_ARN" \
-            --history-dir history-${{ matrix.suite }} \
-            --report junit \
-            --report-file report-${{ matrix.suite }}
+        run: make conformance-run
+
+      # A cancelled job never reaches the cleanup of the step above.
+      - name: Delete the suite's stack
+        if: always()
+        run: sh scripts/conformance.sh teardown
 
       - name: Upload conformance report
         if: always()

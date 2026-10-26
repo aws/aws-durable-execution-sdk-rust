@@ -146,9 +146,13 @@ in that repository.
   follow its [rules for every change](CONTRIBUTING.md#rules-for-every-change).
   Run `make check` before you push. It is the single quality gate, and
   CONTRIBUTING.md lists what it runs.
-- `make check` covers only the root workspace. After a public API change,
-  also build and lint `conformance/` and `examples/`. CONTRIBUTING.md gives
-  the commands.
+- `make check` covers only the root workspace. `make ci` runs every
+  `ci.yml` job, including the `conformance/` and `examples/` builds, with
+  CI's flags; run it after a public API change. `make conformance` and
+  `make cloud-tests` run the AWS suites. CONTRIBUTING.md gives their inputs.
+- Run every `make` target under `timeout`, for example
+  `timeout 3600 make ci`. A change to suspension or concurrency code can
+  make a test wait forever, and nothing else stops it.
 - Build a deployable binary with cargo-lambda, not with `cargo build`. The
   `build_examples.sh` scripts in `conformance/` and `examples/` call it.
   `cargo build` links against the build host's glibc. A binary linked
