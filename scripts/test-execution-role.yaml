@@ -34,6 +34,9 @@ Resources:
       ManagedPolicyArns:
         # CloudWatch Logs write access, so handler output is visible.
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # X-Ray: write traces, and read them, for tests that turn on active tracing.
+        - arn:aws:iam::aws:policy/AWSXrayReadOnlyAccess
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
       Policies:
         - PolicyName: DurableExecutionTestPolicy
           PolicyDocument:
@@ -52,13 +55,13 @@ Resources:
                 Action:
                   - lambda:InvokeFunction
                 Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
-              # Callback completion and heartbeats, used by callback handlers.
+              # Callback completion and heartbeats on functions in this account, used by callback handlers.
               - Effect: Allow
                 Action:
                   - lambda:SendDurableExecutionCallbackSuccess
                   - lambda:SendDurableExecutionCallbackFailure
                   - lambda:SendDurableExecutionCallbackHeartbeat
-                Resource: '*'
+                Resource: !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:*'
               # The step and child conformance suites deploy a DynamoDB
               # Attempts table; their retry handlers record attempt counts.
               - Effect: Allow

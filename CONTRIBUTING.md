@@ -231,6 +231,7 @@ changes nothing. If you build the role yourself instead, it needs the union of
 what all suites use:
 
 - CloudWatch Logs write access (to receive handler output).
+- X-Ray trace write and read access (for tests that turn on active tracing).
 - `lambda:CheckpointDurableExecution` and `lambda:GetDurableExecutionState`
   (the two durable execution service actions the SDK calls).
 - `lambda:InvokeFunction` on your test functions (the invoke suite and the
