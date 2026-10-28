@@ -6,9 +6,9 @@ first so your change arrives in a shape we can review quickly.
 The [README](README.md) documents the SDK itself: the handler signature, the
 operations, and how to deploy a durable function. This guide covers the rest of
 the repository, the checks that guard it, and how a change gets from a branch to
-`alpha`.
+`main`.
 
-All work targets the `alpha` branch. Branch from it and open your pull request
+All work targets the `main` branch. Branch from it and open your pull request
 against it.
 
 ## Standards and where they come from
@@ -307,8 +307,8 @@ expectations.
 
 ## Raising a pull request
 
-Branch from `alpha`, keep the change focused on one thing, and open the pull
-request against `alpha`. Discuss anything substantial in an issue first so you do
+Branch from `main`, keep the change focused on one thing, and open the pull
+request against `main`. Discuss anything substantial in an issue first so you do
 not spend a weekend on a design we cannot take.
 
 Run `make check` before you push, and run the two extra workspace builds when
