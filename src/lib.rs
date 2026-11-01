@@ -919,20 +919,33 @@ where
             // supplied via Options).
             let exec_client = provider.get().await;
 
-            // If the initial state was paginated, fetch remaining pages.
-            let checkpoint_log = StdArc::new(
-                client::resolve_bootstrap_log(
-                    exec_client.as_ref(),
-                    &execution_arn,
-                    &checkpoint_token,
-                    checkpoint_log,
-                    initial_marker.as_deref(),
-                )
-                .await
-                .map_err(|e| {
-                    lambda_runtime::Error::from(format!("failed to paginate initial state: {e}"))
-                })?,
-            );
+            // If the initial state was paginated, fetch remaining pages. A
+            // retryable error fails the invocation, so the service
+            // re-invokes. A non-retryable error (a KMS misconfiguration)
+            // fails the same way on every invocation, so it fails the
+            // execution before the handler runs, as in JS.
+            let checkpoint_log = match client::resolve_bootstrap_log(
+                exec_client.as_ref(),
+                &execution_arn,
+                &checkpoint_token,
+                checkpoint_log,
+                initial_marker.as_deref(),
+            )
+            .await
+            {
+                Ok(log) => StdArc::new(log),
+                Err(e) if e.is_retryable() => {
+                    return Err(lambda_runtime::Error::from(format!(
+                        "failed to paginate initial state: {e}"
+                    )));
+                }
+                Err(e) => {
+                    return Ok(failed_envelope(&WireError::new(
+                        Some(error::EXECUTION_CLIENT_ERROR_TYPE),
+                        Some(e.message().to_owned()),
+                    )));
+                }
+            };
 
             let ctx = DurableContext::new_root_with_client_and_defaults(
                 execution_arn,
@@ -1145,34 +1158,38 @@ fn outcome_envelope(
             // which is the same recovery as an interruption.
             Err(lambda_runtime::Error::from(message))
         }
-        driver::InvocationOutcome::Failed { error } => {
-            let mut error_map = serde_json::Map::new();
-            error_map.insert(
-                "ErrorType".to_owned(),
-                serde_json::Value::String(error.error_type().unwrap_or("Error").to_owned()),
-            );
-            error_map.insert(
-                "ErrorMessage".to_owned(),
-                serde_json::Value::String(error.error_message().unwrap_or_default().to_owned()),
-            );
-            if let Some(data) = error.error_data() {
-                error_map.insert(
-                    "ErrorData".to_owned(),
-                    serde_json::Value::String(data.to_owned()),
-                );
-            }
-            if !error.stack_trace().is_empty() {
-                error_map.insert(
-                    "StackTrace".to_owned(),
-                    serde_json::json!(error.stack_trace()),
-                );
-            }
-            Ok(InvocationResponse(serde_json::json!({
-                "Status": "FAILED",
-                "Error": serde_json::Value::Object(error_map)
-            })))
-        }
+        driver::InvocationOutcome::Failed { error } => Ok(failed_envelope(&error)),
     }
+}
+
+/// Builds the `FAILED` envelope that records `error` as the execution's
+/// failure.
+fn failed_envelope(error: &WireError) -> InvocationResponse {
+    let mut error_map = serde_json::Map::new();
+    error_map.insert(
+        "ErrorType".to_owned(),
+        serde_json::Value::String(error.error_type().unwrap_or("Error").to_owned()),
+    );
+    error_map.insert(
+        "ErrorMessage".to_owned(),
+        serde_json::Value::String(error.error_message().unwrap_or_default().to_owned()),
+    );
+    if let Some(data) = error.error_data() {
+        error_map.insert(
+            "ErrorData".to_owned(),
+            serde_json::Value::String(data.to_owned()),
+        );
+    }
+    if !error.stack_trace().is_empty() {
+        error_map.insert(
+            "StackTrace".to_owned(),
+            serde_json::json!(error.stack_trace()),
+        );
+    }
+    InvocationResponse(serde_json::json!({
+        "Status": "FAILED",
+        "Error": serde_json::Value::Object(error_map)
+    }))
 }
 
 /// Resolves the base Lambda client from the caller's [`Options`].
@@ -1426,6 +1443,115 @@ mod tests {
             .expect("Result should be a serialized JSON string");
         let echoed: serde_json::Value = serde_json::from_str(result_json).unwrap();
         assert_eq!(echoed, serde_json::json!({ "count": 42 }));
+    }
+
+    // Bootstrap state read errors
+
+    /// An envelope with the input operation and a `NextMarker`, so the
+    /// service must read the next page with `GetDurableExecutionState`.
+    fn paginated_envelope() -> serde_json::Value {
+        serde_json::json!({
+            "DurableExecutionArn": "arn:aws:lambda:us-east-1:1:function:test",
+            "CheckpointToken": "token-abc",
+            "InitialExecutionState": {
+                "Operations": [{
+                    "Id": "root",
+                    "Type": "Execution",
+                    "Status": "STARTED",
+                    "ExecutionDetails": { "InputPayload": "{}" }
+                }],
+                "NextMarker": "page-2"
+            }
+        })
+    }
+
+    /// Invokes a `wrap` service whose Lambda client is `sdk_client` with
+    /// [`paginated_envelope`]. Returns the result and whether the handler
+    /// ran.
+    async fn invoke_paginated(
+        sdk_client: aws_sdk_lambda::Client,
+    ) -> (Result<serde_json::Value, lambda_runtime::Error>, bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let handler_ran = std::sync::Arc::clone(&ran);
+        let service = wrap(
+            move |_event: serde_json::Value, _ctx: DurableContext| {
+                handler_ran.store(true, Ordering::SeqCst);
+                async move { Ok::<(), BoxError>(()) }
+            },
+            Options::builder()
+                .lambda_client(sdk_client)
+                .build()
+                .expect("options build"),
+        );
+        let event = lambda_runtime::LambdaEvent::new(
+            InvocationPayload(paginated_envelope()),
+            lambda_runtime::Context::default(),
+        );
+        let result = service(event).await.map(|response| response.0);
+        (result, ran.load(Ordering::SeqCst))
+    }
+
+    /// A KMS error on the bootstrap state read fails the execution with a
+    /// `FAILED` envelope, as in JS, and the handler does not run.
+    #[tokio::test]
+    async fn bootstrap_kms_error_returns_failed_envelope() {
+        use aws_sdk_lambda::operation::get_durable_execution_state::GetDurableExecutionStateError;
+        use aws_smithy_mocks::{mock, mock_client};
+
+        let rule = mock!(aws_sdk_lambda::Client::get_durable_execution_state).then_error(|| {
+            GetDurableExecutionStateError::KmsAccessDeniedException(
+                aws_sdk_lambda::types::error::KmsAccessDeniedException::builder()
+                    .message("kms denied")
+                    .build(),
+            )
+        });
+        let (result, ran) = invoke_paginated(mock_client!(aws_sdk_lambda, [&rule])).await;
+
+        let response = result.expect("a KMS error returns an envelope");
+        assert_eq!(
+            response.get("Status").and_then(serde_json::Value::as_str),
+            Some("FAILED"),
+            "unexpected response: {response}"
+        );
+        let error = response
+            .get("Error")
+            .expect("a FAILED envelope has an Error");
+        assert_eq!(
+            error.get("ErrorType").and_then(serde_json::Value::as_str),
+            Some("DurableExecutionClientError")
+        );
+        let message = error
+            .get("ErrorMessage")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(message.contains("KMSAccessDeniedException"), "{message}");
+        assert!(!message.starts_with("durable: client: "), "{message}");
+        assert!(!ran, "the handler must not run");
+    }
+
+    /// A retryable error on the bootstrap state read, a persistent 503 or a
+    /// plain 403, fails the invocation, as in JS.
+    #[tokio::test]
+    async fn bootstrap_retryable_error_fails_the_invocation() {
+        use aws_smithy_mocks::{mock, mock_client};
+
+        for status in [503, 403] {
+            let rule = mock!(aws_sdk_lambda::Client::get_durable_execution_state)
+                .sequence()
+                .http_status(status, None)
+                .repeatedly()
+                .build();
+            let (result, ran) = invoke_paginated(mock_client!(aws_sdk_lambda, [&rule])).await;
+
+            let err = result.expect_err("a retryable error fails the invocation");
+            assert!(
+                err.to_string().contains("failed to paginate initial state"),
+                "status {status}: {err}"
+            );
+            assert!(!ran, "the handler must not run");
+        }
     }
 
     // Status parsing tests (issue #45)

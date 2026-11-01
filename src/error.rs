@@ -530,6 +530,12 @@ pub(crate) fn wire_error_with_type(err: &(dyn Error + 'static), error_type: &str
 /// handler through the unrecoverable path (issue #43).
 pub(crate) const CHECKPOINT_FAILED_ERROR_TYPE: &str = "CheckpointFailedError";
 
+/// The wire `ErrorType` recorded on the `FAILED` envelope when the
+/// execution client fails permanently before the handler runs: a
+/// non-retryable error of the bootstrap state read. It is the type JS
+/// records for its `DurableExecutionClientError`.
+pub(crate) const EXECUTION_CLIENT_ERROR_TYPE: &str = "DurableExecutionClientError";
+
 /// The wire `ErrorType` recorded on the terminal `FAIL` an operation
 /// persists when its result (or carried state) failed LOCAL serialization
 /// before the outcome write (issue #43).

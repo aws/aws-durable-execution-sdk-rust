@@ -49,6 +49,12 @@ impl ClientError {
         self.retryable
     }
 
+    /// The error's message, without the `durable: client: ` prefix that
+    /// `Display` adds.
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
     pub(crate) fn non_retryable(message: String) -> Self {
         Self {
             message,
@@ -192,6 +198,9 @@ impl ExecutionClient for LambdaExecutionClient {
         })
     }
 
+    /// Final errors are classified by [`classify_get_state_error`]: the
+    /// four KMS errors are non-retryable, and every other error, a plain
+    /// 4xx included, is retryable, as in JS.
     fn get_state(
         &self,
         execution_arn: &str,
@@ -215,12 +224,12 @@ impl ExecutionClient for LambdaExecutionClient {
                 }
 
                 // As with `checkpoint`, the SDK's standard retry owns the
-                // transient-failure retry; the final error maps into a
-                // retryable `ClientError`.
+                // transient-failure retry; the final error is classified by
+                // `classify_get_state_error`.
                 let output = builder
                     .send()
                     .await
-                    .map_err(|err| ClientError::from_retryable(format!("{err}")))?;
+                    .map_err(|err| classify_get_state_error(&err))?;
 
                 all_operations.extend(output.operations);
 
@@ -257,32 +266,44 @@ const STALE_TOKEN_MESSAGE_PREFIX: &str = "Invalid checkpoint token";
 /// - **Retryable**: fail the invocation; the durable service re-invokes
 ///   and replay resumes from the recorded state. This is the same recovery
 ///   as an interruption. Applied to transport-level failures (dispatch,
-///   timeout, malformed response), throttling, 5xx, and the stale-token
-///   carve-out ([`STALE_TOKEN_MESSAGE_PREFIX`]).
+///   timeout, a malformed response without a 4xx status), throttling (any
+///   429), 5xx, and the stale-token carve-out
+///   ([`STALE_TOKEN_MESSAGE_PREFIX`]).
 /// - **Non-retryable**: the service permanently rejected this write (for
-///   example an oversized payload). Re-invoking re-runs the body and hits
+///   example an oversized payload, a KMS misconfiguration, or any other
+///   4xx except 429). Re-invoking re-runs the body and hits
 ///   the same rejection, so the caller persists a small terminal `FAIL`
 ///   for the operation and fails the execution instead.
 ///
-/// **Unknown errors default to retryable.** The original classification
+/// After the modeled variants, the classifier reads the HTTP status of the
+/// raw response, as JS reads `$metadata.httpStatusCode`. A status from 400
+/// to 499 other than 429 is non-retryable: the service rejected the
+/// request, so the same write fails the same way on every invocation. This
+/// covers an unmodeled service error, such as a 403
+/// `AccessDeniedException` when the role lacks
+/// `lambda:CheckpointDurableExecution`, and a response the SDK could not
+/// parse. Every other status, and an error without a raw response
+/// (dispatch failure, timeout, construction failure), is retryable.
+///
+/// **An unmodeled error is retryable unless its status is a 4xx other
+/// than 429.** The original classification
 /// (pre-#43) defaulted unknown to non-retryable, with the rationale, from
 /// the r3726032098 review thread, that the surfaced error only failed the
 /// invocation and the service re-invoked anyway, so the default was
 /// harmless. That rationale belongs to the old model: under this model a
 /// non-retryable classification fails the *execution*, so a novel
 /// transient error variant defaulting to non-retryable would kill
-/// executions. Java and Python default unknown to retryable for the same
-/// reason. The `checkpoint_error_variant_canary` test pins the variant set
-/// this function classifies explicitly, so a new upstream variant fails CI
-/// for reclassification instead of falling silently into the default.
-///
-/// Generic over the response type `R` so tests can classify a
-/// `SdkError::service_error(err, ())` without constructing an HTTP
-/// response.
-fn classify_checkpoint_error<R: std::fmt::Debug>(
+/// executions. A novel transient error arrives as 429, 5xx or a transport
+/// failure, and those stay retryable; a 4xx other than 429 is a permanent
+/// rejection, which JS also fails the execution on. Java and Python
+/// default unknown to retryable for the same reason. The
+/// `checkpoint_error_variant_canary` test pins the variant set this
+/// function classifies explicitly, so a new upstream variant fails CI for
+/// reclassification instead of falling silently into the status rule.
+fn classify_checkpoint_error(
     err: &aws_sdk_lambda::error::SdkError<
         aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError,
-        R,
+        aws_sdk_lambda::config::http::HttpResponse,
     >,
 ) -> ClientError {
     use aws_sdk_lambda::error::SdkError;
@@ -290,40 +311,74 @@ fn classify_checkpoint_error<R: std::fmt::Debug>(
 
     let message = format!("{}", aws_sdk_lambda::error::DisplayErrorContext(err));
 
-    let SdkError::ServiceError(service_err) = err else {
-        // Dispatch failures, timeouts, and malformed responses are
-        // channel-level: nothing was permanently rejected.
-        return ClientError::from_retryable(message);
-    };
-
-    match service_err.err() {
-        // Throttling and service-side 5xx: transient by definition.
-        E::TooManyRequestsException(_) | E::ServiceException(_) => {
-            ClientError::from_retryable(message)
-        }
-        // A parameter rejection is deterministic, the same write fails the
-        // same way on every lap, EXCEPT the stale-token rejection, which a
-        // re-invocation resolves with a fresh token.
-        E::InvalidParameterValueException(inner) => {
-            if inner
-                .message()
-                .is_some_and(|m| m.starts_with(STALE_TOKEN_MESSAGE_PREFIX))
-            {
-                ClientError::from_retryable(message)
-            } else {
-                ClientError::non_retryable(message)
+    if let SdkError::ServiceError(service_err) = err {
+        match service_err.err() {
+            // Throttling and service-side 5xx: transient by definition.
+            E::TooManyRequestsException(_) | E::ServiceException(_) => {
+                return ClientError::from_retryable(message);
             }
+            // A parameter rejection is deterministic, the same write fails
+            // the same way on every lap, EXCEPT the stale-token rejection,
+            // which a re-invocation resolves with a fresh token.
+            E::InvalidParameterValueException(inner) => {
+                return if inner
+                    .message()
+                    .is_some_and(|m| m.starts_with(STALE_TOKEN_MESSAGE_PREFIX))
+                {
+                    ClientError::from_retryable(message)
+                } else {
+                    ClientError::non_retryable(message)
+                };
+            }
+            // KMS misconfiguration on the function: deterministic until an
+            // operator fixes the key, so re-invoking loops without progress.
+            E::KmsAccessDeniedException(_)
+            | E::KmsDisabledException(_)
+            | E::KmsInvalidStateException(_)
+            | E::KmsNotFoundException(_) => return ClientError::non_retryable(message),
+            // Unmodeled errors fall through to the status rule. The variant
+            // canary test keeps this arm from silently absorbing new modeled
+            // variants.
+            _ => {}
         }
-        // KMS misconfiguration on the function: deterministic until an
-        // operator fixes the key, so re-invoking loops without progress.
-        E::KmsAccessDeniedException(_)
-        | E::KmsDisabledException(_)
-        | E::KmsInvalidStateException(_)
-        | E::KmsNotFoundException(_) => ClientError::non_retryable(message),
-        // Unknown errors are RETRYABLE: see the function docs for why the
-        // pre-#43 non-retryable default (r3726032098) no longer applies.
-        // The variant canary test keeps this arm from silently absorbing
-        // new modeled variants.
+    }
+
+    // The status rule: see the function docs. Errors without a raw response
+    // (dispatch failure, timeout, construction failure) are channel-level:
+    // nothing was rejected.
+    match err.raw_response().map(|r| r.status().as_u16()) {
+        Some(status) if (400..500).contains(&status) && status != 429 => {
+            ClientError::non_retryable(message)
+        }
+        _ => ClientError::from_retryable(message),
+    }
+}
+
+/// Classifies a final `GetDurableExecutionState` error into a recovery
+/// scope, carried as [`ClientError::is_retryable`].
+///
+/// The four KMS errors are non-retryable: the function's key is
+/// misconfigured, so every re-invocation fails the same way. Every other
+/// error is retryable, a plain 4xx included, because JS rethrows every
+/// other error of its bootstrap state read and so fails only the
+/// invocation. The message is the `DisplayErrorContext` text, so it names
+/// the exception.
+fn classify_get_state_error(
+    err: &aws_sdk_lambda::error::SdkError<
+        aws_sdk_lambda::operation::get_durable_execution_state::GetDurableExecutionStateError,
+        aws_sdk_lambda::config::http::HttpResponse,
+    >,
+) -> ClientError {
+    use aws_sdk_lambda::operation::get_durable_execution_state::GetDurableExecutionStateError as E;
+
+    let message = format!("{}", aws_sdk_lambda::error::DisplayErrorContext(err));
+    match err.as_service_error() {
+        Some(
+            E::KmsAccessDeniedException(_)
+            | E::KmsDisabledException(_)
+            | E::KmsInvalidStateException(_)
+            | E::KmsNotFoundException(_),
+        ) => ClientError::non_retryable(message),
         _ => ClientError::from_retryable(message),
     }
 }
@@ -1033,6 +1088,107 @@ mod tests {
         assert!(err.is_retryable());
     }
 
+    /// An unmodeled 403 on a checkpoint, such as an `AccessDeniedException`
+    /// when the role lacks `lambda:CheckpointDurableExecution`, fails the
+    /// execution. Standard retry does not retry it.
+    #[tokio::test]
+    async fn checkpoint_unmodeled_403_fails_the_execution() {
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
+            .sequence()
+            .http_status(403, None)
+            .repeatedly()
+            .build();
+        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
+        let client = LambdaExecutionClient::new(sdk_client);
+
+        let err = client
+            .checkpoint("arn:test", "tok", Vec::new())
+            .await
+            .expect_err("a 403 must fail the call");
+        assert!(!err.is_retryable());
+        assert_eq!(rule.num_calls(), 1, "a 403 is not retried");
+    }
+
+    /// The four KMS errors of `GetDurableExecutionState` are a function
+    /// misconfiguration that a re-invocation cannot fix, so each one is
+    /// non-retryable, and the message names the exception.
+    #[tokio::test]
+    async fn get_state_kms_errors_classify_non_retryable() {
+        use aws_sdk_lambda::types::error::{
+            KmsAccessDeniedException, KmsDisabledException, KmsInvalidStateException,
+            KmsNotFoundException,
+        };
+        type Make = fn() -> GetDurableExecutionStateError;
+        let cases: [(Make, &str); 4] = [
+            (
+                || {
+                    GetDurableExecutionStateError::KmsAccessDeniedException(
+                        KmsAccessDeniedException::builder().build(),
+                    )
+                },
+                "KMSAccessDeniedException",
+            ),
+            (
+                || {
+                    GetDurableExecutionStateError::KmsDisabledException(
+                        KmsDisabledException::builder().build(),
+                    )
+                },
+                "KMSDisabledException",
+            ),
+            (
+                || {
+                    GetDurableExecutionStateError::KmsInvalidStateException(
+                        KmsInvalidStateException::builder().build(),
+                    )
+                },
+                "KMSInvalidStateException",
+            ),
+            (
+                || {
+                    GetDurableExecutionStateError::KmsNotFoundException(
+                        KmsNotFoundException::builder().build(),
+                    )
+                },
+                "KMSNotFoundException",
+            ),
+        ];
+        for (make, wire_name) in cases {
+            let rule = mock!(aws_sdk_lambda::Client::get_durable_execution_state).then_error(make);
+            let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
+            let client = LambdaExecutionClient::new(sdk_client);
+
+            let err = client
+                .get_state("arn:test", "tok")
+                .await
+                .expect_err("a KMS error must fail the call");
+            assert!(!err.is_retryable(), "{wire_name} must be non-retryable");
+            assert!(
+                err.to_string().contains(wire_name),
+                "message must name {wire_name}, got: {err}"
+            );
+        }
+    }
+
+    /// A plain 4xx on the state read stays retryable, as in JS, which
+    /// rethrows it and so fails only the invocation.
+    #[tokio::test]
+    async fn get_state_plain_4xx_stays_retryable() {
+        let rule = mock!(aws_sdk_lambda::Client::get_durable_execution_state)
+            .sequence()
+            .http_status(403, None)
+            .repeatedly()
+            .build();
+        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
+        let client = LambdaExecutionClient::new(sdk_client);
+
+        let err = client
+            .get_state("arn:test", "tok")
+            .await
+            .expect_err("a 403 must fail the call");
+        assert!(err.is_retryable());
+    }
+
     // Test double behavior
 
     #[tokio::test]
@@ -1470,11 +1626,23 @@ mod tests {
 
     // Checkpoint error classification
 
+    use aws_sdk_lambda::config::http::HttpResponse;
     use aws_sdk_lambda::error::SdkError;
     use aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError as CkptErr;
+    use aws_smithy_runtime_api::http::StatusCode;
+    use aws_smithy_types::body::SdkBody;
 
-    fn classify<E: Into<CkptErr>>(err: E) -> ClientError {
-        classify_checkpoint_error(&SdkError::service_error(err.into(), ()))
+    /// A raw HTTP response with the given status and an empty body.
+    fn raw_response(status: u16) -> HttpResponse {
+        HttpResponse::new(
+            StatusCode::try_from(status).expect("valid HTTP status"),
+            SdkBody::empty(),
+        )
+    }
+
+    /// Classifies `err` as a service error whose raw response has `status`.
+    fn classify<E: Into<CkptErr>>(err: E, status: u16) -> ClientError {
+        classify_checkpoint_error(&SdkError::service_error(err.into(), raw_response(status)))
     }
 
     fn invalid_parameter(message: Option<&str>) -> CkptErr {
@@ -1487,69 +1655,120 @@ mod tests {
 
     #[test]
     fn throttling_and_5xx_classify_retryable() {
-        let throttled = classify(CkptErr::TooManyRequestsException(
-            aws_sdk_lambda::types::error::TooManyRequestsException::builder().build(),
-        ));
+        let throttled = classify(
+            CkptErr::TooManyRequestsException(
+                aws_sdk_lambda::types::error::TooManyRequestsException::builder().build(),
+            ),
+            429,
+        );
         assert!(throttled.is_retryable());
 
-        let server = classify(CkptErr::ServiceException(
-            aws_sdk_lambda::types::error::ServiceException::builder().build(),
-        ));
+        let server = classify(
+            CkptErr::ServiceException(
+                aws_sdk_lambda::types::error::ServiceException::builder().build(),
+            ),
+            500,
+        );
         assert!(server.is_retryable());
     }
 
     #[test]
     fn invalid_parameter_classifies_non_retryable() {
-        assert!(!classify(invalid_parameter(Some("payload too large"))).is_retryable());
+        assert!(!classify(invalid_parameter(Some("payload too large")), 400).is_retryable());
         // No message at all: no stale-token evidence, permanent rejection.
-        assert!(!classify(invalid_parameter(None)).is_retryable());
+        assert!(!classify(invalid_parameter(None), 400).is_retryable());
     }
 
     /// The stale-token carve-out: `InvalidParameterValueException` whose
     /// message starts with `Invalid checkpoint token` resolves on
     /// re-invocation (the service issues a fresh token), so it is
     /// retryable. Prefix match only: a stale-token mention elsewhere in
-    /// the message does not qualify.
+    /// the message does not qualify. The carve-out precedes the status
+    /// rule, so the 400 status does not make it non-retryable.
     #[test]
     fn stale_token_rejection_classifies_retryable() {
-        let stale = classify(invalid_parameter(Some(
-            "Invalid checkpoint token: token has been superseded",
-        )));
+        let stale = classify(
+            invalid_parameter(Some("Invalid checkpoint token: token has been superseded")),
+            400,
+        );
         assert!(stale.is_retryable());
 
-        let not_prefix = classify(invalid_parameter(Some(
-            "field X rejected (not an Invalid checkpoint token case)",
-        )));
+        let not_prefix = classify(
+            invalid_parameter(Some(
+                "field X rejected (not an Invalid checkpoint token case)",
+            )),
+            400,
+        );
         assert!(!not_prefix.is_retryable());
 
-        let wrong_case = classify(invalid_parameter(Some(
-            "Invalid Checkpoint Token: old non-service spelling",
-        )));
+        let wrong_case = classify(
+            invalid_parameter(Some("Invalid Checkpoint Token: old non-service spelling")),
+            400,
+        );
         assert!(!wrong_case.is_retryable());
     }
 
     #[test]
     fn kms_misconfiguration_classifies_non_retryable() {
-        let kms = classify(CkptErr::KmsAccessDeniedException(
-            aws_sdk_lambda::types::error::KmsAccessDeniedException::builder().build(),
-        ));
+        let kms = classify(
+            CkptErr::KmsAccessDeniedException(
+                aws_sdk_lambda::types::error::KmsAccessDeniedException::builder().build(),
+            ),
+            502,
+        );
         assert!(!kms.is_retryable());
     }
 
-    /// Unknown checkpoint API errors default to RETRYABLE. Under the #43
-    /// model a non-retryable classification fails the execution, so a
-    /// novel transient error variant must not kill executions by default
-    /// (the pre-#43 non-retryable default relied on the old model, where
-    /// the surfaced error only failed the invocation: r3726032098).
+    /// An unmodeled 4xx other than 429 is the service rejecting the
+    /// request, so the same write fails the same way on every invocation:
+    /// it fails the execution, as in JS.
     #[test]
-    fn unknown_error_classifies_retryable() {
-        let unknown = classify(CkptErr::unhandled("some new service error"));
-        assert!(unknown.is_retryable());
+    fn unhandled_4xx_classifies_non_retryable() {
+        for status in [400, 403, 404, 409, 413] {
+            let err = classify(CkptErr::unhandled("unmodeled rejection"), status);
+            assert!(!err.is_retryable(), "status {status} must be non-retryable");
+        }
+    }
+
+    /// An unmodeled 429 is throttling, so it stays retryable.
+    #[test]
+    fn unhandled_429_classifies_retryable() {
+        assert!(classify(CkptErr::unhandled("throttled"), 429).is_retryable());
+    }
+
+    /// Unmodeled 5xx errors stay RETRYABLE. Under the #43 model a
+    /// non-retryable classification fails the execution, so a novel
+    /// transient error must not kill executions by default (the pre-#43
+    /// non-retryable default relied on the old model, where the surfaced
+    /// error only failed the invocation: r3726032098).
+    #[test]
+    fn unhandled_5xx_classifies_retryable() {
+        for status in [500, 502, 503] {
+            let err = classify(CkptErr::unhandled("some new service error"), status);
+            assert!(err.is_retryable(), "status {status} must be retryable");
+        }
+    }
+
+    /// A 4xx response whose body the SDK could not parse is a service
+    /// rejection too, so it fails the execution.
+    #[test]
+    fn response_error_4xx_classifies_non_retryable() {
+        let err: SdkError<CkptErr, HttpResponse> =
+            SdkError::response_error("unparseable body", raw_response(403));
+        assert!(!classify_checkpoint_error(&err).is_retryable());
+    }
+
+    /// An unparseable 200 response is a channel fault, not a rejection.
+    #[test]
+    fn response_error_200_classifies_retryable() {
+        let err: SdkError<CkptErr, HttpResponse> =
+            SdkError::response_error("unparseable body", raw_response(200));
+        assert!(classify_checkpoint_error(&err).is_retryable());
     }
 
     #[test]
     fn transport_failures_classify_retryable() {
-        let timeout: SdkError<CkptErr, ()> = SdkError::timeout_error("connect timed out");
+        let timeout: SdkError<CkptErr, HttpResponse> = SdkError::timeout_error("connect timed out");
         assert!(classify_checkpoint_error(&timeout).is_retryable());
     }
 
