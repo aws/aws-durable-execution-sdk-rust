@@ -449,12 +449,11 @@ async fn step_serialization_failure_kind_is_replay_equivalent() {
 }
 
 /// An ordinary terminal step failure classifies as
-/// `StepErrorKind::RetriesExhausted` on the live path, and replay must
-/// reconstruct the SAME kind carrying the SAME attempt count from the
-/// recorded FAIL: a handler that branches on the kind (or the attempt)
-/// creates the same operations live and replayed.
+/// `StepErrorKind::ExecutionFailed` on the live path, and replay must
+/// reconstruct the SAME kind from the recorded FAIL: a handler that
+/// branches on the kind creates the same operations live and replayed.
 #[tokio::test]
-async fn step_retries_exhausted_kind_is_replay_equivalent() {
+async fn step_execution_failed_kind_is_replay_equivalent() {
     let kinds = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let kinds_h = Arc::clone(&kinds);
 
@@ -477,9 +476,8 @@ async fn step_retries_exhausted_kind_is_replay_equivalent() {
                         })
                         .await;
                     let err = step_result.expect_err("the step must fail terminally");
-                    // The full Debug rendering carries both the variant and
-                    // its attempt payload, so equality across invocations
-                    // asserts kind AND attempt equivalence.
+                    // The Debug rendering names the variant, so equality
+                    // across invocations asserts kind equivalence.
                     kinds
                         .lock()
                         .expect("test mutex")
@@ -502,16 +500,8 @@ async fn step_retries_exhausted_kind_is_replay_equivalent() {
         "need one live and at least one replayed observation, got {kinds:?}"
     );
     assert!(
-        kinds[0].contains("RetriesExhausted"),
-        "the live kind must be RetriesExhausted: {kinds:?}"
-    );
-    assert!(
-        kinds[0].contains("attempts: 2"),
-        "the live kind must carry the failing attempt: {kinds:?}"
-    );
-    assert!(
-        kinds.windows(2).all(|w| w[0] == w[1]),
-        "live and replayed kinds (including attempts) must match: {kinds:?}"
+        kinds.iter().all(|k| k.contains("ExecutionFailed")),
+        "the live and every replayed kind must be ExecutionFailed: {kinds:?}"
     );
 }
 

@@ -120,11 +120,11 @@ pub use self::tracing_layer::ReplayFilterLayer;
 pub use self::context::{DurableContext, StepContext};
 pub use self::error::{
     CallbackError, CallbackErrorKind, ChildContextError, ChildContextErrorKind, CombinatorError,
-    CombinatorErrorKind, FunctionNotFound, InvokeError, InvokeErrorKind, JoinFailed,
-    MaxChecksExceeded, NonDeterministicExecutionError, NonDeterministicExecutionErrorKind,
-    OperationError, OperationErrorKind, OperationMismatch, ReplayedFailure, RetriesExhausted,
-    StepError, StepErrorKind, TypedError, UnexpectedStatus, UnrecognizedStatus, WaitError,
-    WaitErrorKind, WaitForConditionError, WaitForConditionErrorKind, WireError,
+    CombinatorErrorKind, InvokeError, InvokeErrorKind, JoinFailed, MaxChecksExceeded,
+    NonDeterministicExecutionError, NonDeterministicExecutionErrorKind, OperationError,
+    OperationErrorKind, OperationMismatch, ReplayedFailure, StepError, StepErrorKind, TypedError,
+    UnexpectedStatus, UnrecognizedStatus, WaitError, WaitErrorKind, WaitForConditionError,
+    WaitForConditionErrorKind, WireError,
 };
 pub use self::future::{Branch, DurableFuture, Settled};
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
@@ -451,15 +451,25 @@ where
 
 /// Derives the wire failure record from a handler-level `BoxError`.
 ///
-/// Attempts to downcast to `OperationError` for structured extraction;
-/// falls back to `HandlerError` for unknown types. The message is the
-/// error's flattened chain, built by the module-wide single flattening
-/// site (see [`error::wire_error_for`]).
+/// Attempts to downcast to `OperationError` for structured extraction.
+/// Any other error records the type `Error`, as the JS SDK records a
+/// plain `Error`, unless a `TypedError` in its chain names the type. The
+/// message is the error's flattened chain, built by the module-wide
+/// single flattening site (see [`error::wire_error_for`]).
 fn wire_error_from_box_error(err: BoxError) -> WireError {
     match err.downcast::<OperationError>() {
         Ok(op_err) => wire_error_from_operation_error(&op_err),
-        Err(other) => error::wire_error_for(&*other, "HandlerError"),
+        Err(other) => error::wire_error_for(&*other, "Error"),
     }
+}
+
+/// Serializes the handler's `Ok` value for the `SUCCEEDED` envelope.
+///
+/// A value that fails to serialize records the type `Error` and the
+/// `serde_json::Error` message, the same rule as an untyped handler
+/// error.
+fn serialize_handler_result<T: Serialize>(result: &T) -> Result<String, WireError> {
+    serde_json::to_string(result).map_err(|e| error::wire_error_for(&e, "Error"))
 }
 
 /// Derives the wire failure record from an `OperationError`.
@@ -961,8 +971,7 @@ where
             let outcome = driver::drive_invocation(
                 async {
                     match (handler)(customer_input, ctx).await {
-                        Ok(result) => serde_json::to_string(&result)
-                            .map_err(|e| error::wire_error_for(&e, "HandlerError")),
+                        Ok(result) => serialize_handler_result(&result),
                         Err(e) => Err(wire_error_from_box_error(e)),
                     }
                 }
@@ -1230,6 +1239,48 @@ mod tests {
     use std::future::IntoFuture;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct PlainUserError;
+
+    impl std::fmt::Display for PlainUserError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "plain user failure")
+        }
+    }
+
+    impl std::error::Error for PlainUserError {}
+
+    #[test]
+    fn handler_error_records_no_stack_trace() {
+        let wire = wire_error_from_box_error(Box::new(PlainUserError));
+        assert_eq!(wire.error_type(), Some("Error"));
+        assert_eq!(wire.error_message(), Some("plain user failure"));
+        assert_eq!(wire.stack_trace(), [] as [String; 0]);
+    }
+
+    /// A value whose `Serialize` implementation always fails.
+    struct Refuse;
+
+    impl Serialize for Refuse {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(<S::Error as serde::ser::Error>::custom("refused"))
+        }
+    }
+
+    #[test]
+    fn handler_result_serialization_failure_records_error() {
+        let Err(wire) = serialize_handler_result(&Refuse) else {
+            unreachable!("a refusing value must not serialize");
+        };
+        assert_eq!(wire.error_type(), Some("Error"));
+        assert!(
+            wire.error_message().unwrap_or_default().contains("refused"),
+            "{:?}",
+            wire.error_message()
+        );
+        assert_eq!(wire.stack_trace(), [] as [String; 0]);
+    }
 
     /// Verifies that `tokio::join!` accepts `IntoFuture` operands directly.
     ///

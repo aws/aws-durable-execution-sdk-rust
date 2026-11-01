@@ -279,8 +279,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
             // discriminator with the failed input's index appended, so
             // replay reconstructs the same variant and index; the message,
             // `error_data`, and `stack_trace` derive from the loser itself
-            // (pass-through, with a fresh capture only when the chain
-            // recorded none).
+            // (pass-through; a chain that recorded no frames records
+            // none).
             let wire = crate::error::wire_error_with_type(
                 &op_err,
                 &format!("{JOIN_FAILED_ERROR_TYPE_PREFIX}{failed_index}"),
@@ -614,9 +614,9 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         // explicitly with `EmptyInput` (matching `race`) rather than an
         // `AllFailed` carrying zero errors.
         if self.futures.is_empty() {
-            let wire = crate::error::wire_error_manual(
-                EMPTY_INPUT_ERROR_TYPE,
-                "select_ok called with no futures",
+            let wire = crate::error::WireError::new(
+                Some(EMPTY_INPUT_ERROR_TYPE),
+                Some("select_ok called with no futures"),
             );
             checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
             // Attach the checkpointed context so the live error matches
@@ -728,9 +728,12 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                 SerializedLoser::from_wire(&wire)
             })
             .collect();
-        let wire = crate::error::wire_error_manual(
-            ALL_FAILED_ERROR_TYPE,
-            format!("all {} futures failed: {loser_summary}", losers.len()),
+        let wire = crate::error::WireError::new(
+            Some(ALL_FAILED_ERROR_TYPE),
+            Some(format!(
+                "all {} futures failed: {loser_summary}",
+                losers.len()
+            )),
         )
         // A payload of plain optional strings cannot fail JSON
         // serialization in practice; if it ever did, the record simply
@@ -822,9 +825,9 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
         // Empty input: there is no future that could settle. Fail
         // explicitly with `EmptyInput` (matching `select_ok`).
         if self.futures.is_empty() {
-            let wire = crate::error::wire_error_manual(
-                EMPTY_INPUT_ERROR_TYPE,
-                "race called with no futures",
+            let wire = crate::error::WireError::new(
+                Some(EMPTY_INPUT_ERROR_TYPE),
+                Some("race called with no futures"),
             );
             checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
             // Attach the checkpointed context so the live error matches
@@ -877,8 +880,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                     // the wire `error_type` carries the discriminator so
                     // replay reproduces the same variant, while the message,
                     // `error_data`, and `stack_trace` derive from the loser
-                    // itself (pass-through, with a fresh capture only when
-                    // the chain recorded none).
+                    // itself (pass-through; a chain that recorded no frames
+                    // records none).
                     let wire = crate::error::wire_error_with_type(
                         &op_err,
                         FIRST_SETTLED_FAILED_ERROR_TYPE,
@@ -894,9 +897,9 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                     .with_wire(wire));
                 }
                 Err(join_err) => {
-                    let wire = crate::error::wire_error_manual(
-                        COMBINATOR_ERROR_TYPE,
-                        format!("task join failed: {join_err}"),
+                    let wire = crate::error::WireError::new(
+                        Some(COMBINATOR_ERROR_TYPE),
+                        Some(format!("task join failed: {join_err}")),
                     );
                     checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
                     // Attach the checkpointed context so the live error
@@ -1985,16 +1988,16 @@ mod tests {
             other => panic!("expected Combinator, got: {other:?}"),
         }
         // The recorded first-settled failure derives from the loser: the
-        // discriminator names the variant, and a stack trace is present
-        // (pass-through from the loser, or captured at the record site).
+        // discriminator names the variant. The loser recorded no frames,
+        // and the SDK captures none.
         let wire = err.wire().expect("first-settled failure carries wire");
         assert_eq!(
             wire.error_type(),
             Some("CombinatorError.FirstSettledFailed")
         );
         assert!(
-            !wire.stack_trace().is_empty(),
-            "first-settled failure record must carry a stack trace"
+            wire.stack_trace().is_empty(),
+            "the SDK captures no stack trace for a first-settled failure"
         );
     }
 
@@ -2063,8 +2066,8 @@ mod tests {
         let wire = err.wire().expect("live EmptyInput carries wire record");
         assert_eq!(wire.error_type(), Some("CombinatorError.EmptyInput"));
         assert!(
-            !wire.stack_trace().is_empty(),
-            "manually constructed live failure records capture a stack"
+            wire.stack_trace().is_empty(),
+            "the SDK captures no stack trace for an empty input"
         );
     }
 
@@ -2095,7 +2098,7 @@ mod tests {
         assert_eq!(err.status(), Some("FAILED"));
         let wire = err.wire().expect("live EmptyInput carries wire record");
         assert_eq!(wire.error_type(), Some("CombinatorError.EmptyInput"));
-        assert_ne!(wire.stack_trace(), &[] as &[String]);
+        assert_eq!(wire.stack_trace(), [] as [String; 0]);
     }
 
     #[tokio::test]

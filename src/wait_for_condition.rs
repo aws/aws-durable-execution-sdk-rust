@@ -481,9 +481,9 @@ where
                         // discriminator so replay reconstructs the same
                         // `MaxChecksExceeded` classification (see
                         // `replay_terminal_failure`).
-                        let wire = crate::error::wire_error_manual(
-                            crate::error::WFC_EXHAUSTED_ERROR_TYPE,
-                            reason.as_str(),
+                        let wire = crate::error::WireError::new(
+                            Some(crate::error::WFC_EXHAUSTED_ERROR_TYPE),
+                            Some(reason.as_str()),
                         );
                         let update = build_wfc_fail_update(
                             &self.wire_id,
@@ -1102,9 +1102,9 @@ mod tests {
             },
             other => panic!("expected WaitForCondition error, got: {other:?}"),
         }
-        // The exhaustion record is constructed at a fixed-discriminator
-        // site with no escaping error to walk: the stack is captured at
-        // the construction site rather than left empty.
+        // The SDK builds the exhaustion record with `WireError::new`.
+        // `WireError::new` carries no stack frames. So the recorded
+        // stack trace is empty.
         let wire = err.wire().unwrap();
         assert_eq!(
             wire.error_type(),
@@ -1112,8 +1112,8 @@ mod tests {
         );
         assert_eq!(wire.error_message(), Some("max attempts exceeded"));
         assert!(
-            !wire.stack_trace().is_empty(),
-            "exhaustion failure record must carry a stack trace"
+            wire.stack_trace().is_empty(),
+            "the SDK captures no stack trace for an exhaustion"
         );
     }
 

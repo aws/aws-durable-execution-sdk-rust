@@ -709,12 +709,15 @@ fn extract_wire_error(err: &OperationError) -> crate::error::WireError {
     if let OperationErrorKind::Callback(cb_err) = err.kind() {
         match cb_err.kind() {
             CallbackErrorKind::TimedOut => {
-                return crate::error::wire_error_manual("Callback.Timeout", "callback timed out");
+                return crate::error::WireError::new(
+                    Some("Callback.Timeout"),
+                    Some("callback timed out"),
+                );
             }
             CallbackErrorKind::HeartbeatTimedOut => {
-                return crate::error::wire_error_manual(
-                    "Callback.Heartbeat",
-                    "heartbeat timed out",
+                return crate::error::WireError::new(
+                    Some("Callback.Heartbeat"),
+                    Some("heartbeat timed out"),
                 );
             }
             CallbackErrorKind::ExternalFailure => {

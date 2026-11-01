@@ -886,25 +886,11 @@ impl LocalRunner {
                     };
                 }
                 Some("FAILED") => {
-                    let error = response.get("Error");
-                    let error_type = error
-                        .and_then(|e| e.get("ErrorType"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("HandlerError")
-                        .to_owned();
-                    let error_message = error
-                        .and_then(|e| e.get("ErrorMessage"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    return TestResult {
-                        disposition: Disposition::Failed,
-                        output: None,
-                        error_type: Some(error_type),
-                        error_message: Some(error_message),
-                        operations: backend.snapshot_operations(),
+                    return failed_envelope_result(
+                        &response,
+                        backend.snapshot_operations(),
                         invocations,
-                    };
+                    );
                 }
                 Some("PENDING") => {
                     // Advance the simulated backend (timers, retries,
@@ -2355,6 +2341,36 @@ fn operation_status_wire_str(s: &OperationStatus) -> &'static str {
     }
 }
 
+/// Builds the result of a `FAILED` envelope.
+///
+/// An envelope `Error` object without an `ErrorType` reads as the type
+/// `Error`, the type the SDK records for an untyped handler error.
+fn failed_envelope_result<O>(
+    response: &serde_json::Value,
+    operations: Vec<TestOperation>,
+    invocations: usize,
+) -> TestResult<O> {
+    let error = response.get("Error");
+    let error_type = error
+        .and_then(|e| e.get("ErrorType"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Error")
+        .to_owned();
+    let error_message = error
+        .and_then(|e| e.get("ErrorMessage"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    TestResult {
+        disposition: Disposition::Failed,
+        output: None,
+        error_type: Some(error_type),
+        error_message: Some(error_message),
+        operations,
+        invocations,
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::indexing_slicing)]
 // reason: test assertions index known-length op vectors
@@ -2367,6 +2383,18 @@ mod tests {
     use crate::{RetryDecision, StepError};
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn local_runner_failed_envelope_without_type_reads_error() {
+        let response = serde_json::json!({
+            "Status": "FAILED",
+            "Error": { "ErrorMessage": "boom" },
+        });
+        let result: TestResult<()> = failed_envelope_result(&response, Vec::new(), 1);
+        assert!(result.is_failure());
+        assert_eq!(result.error_type(), Some("Error"));
+        assert_eq!(result.error_message(), Some("boom"));
+    }
 
     // 1. step success
 

@@ -342,11 +342,7 @@ where
                         .ctx
                         .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Ok(StepPrelude::Done(Err(replay_failure(
-                        wire,
-                        &wire_id,
-                        view.attempt,
-                    ))));
+                    return Ok(StepPrelude::Done(Err(replay_failure(wire, &wire_id))));
                 }
                 CheckpointStatus::Pending => {
                     // Retry timer hasn't fired yet: suspend.
@@ -566,8 +562,8 @@ async fn handle_failure<O>(
 ) -> Result<O, OperationError> {
     // Derive the wire failure record from the escaping error before it is
     // moved into the step error: message flattening, `error_type`
-    // pass-through, `error_data` chain walk, and stack capture all happen
-    // here, at the single wire-derivation site.
+    // pass-through, and the `error_data` and `stack_trace` chain walk all
+    // happen here, at the single wire-derivation site.
     let wire = crate::error::wire_error_for(&*err, STEP_FALLBACK_ERROR_TYPE);
     let step_err = StepError::new(StepErrorKind::ExecutionFailed, Some(err));
 
@@ -621,15 +617,13 @@ async fn handle_failure<O>(
                     .await;
             }
 
-            // The escaping error stays reachable through `source()`; the
-            // attempt count is the kind's structural fact.
+            // The step returns the body's error, as the JS SDK does: the
+            // kind stays `ExecutionFailed`, and the escaping error stays
+            // reachable through `source()`.
             Err(
-                OperationError::from_kind(OperationErrorKind::Step(StepError::new(
-                    StepErrorKind::RetriesExhausted(crate::error::RetriesExhausted::new(attempt)),
-                    step_err.into_source(),
-                )))
-                .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
-                .with_wire(wire),
+                OperationError::from_kind(OperationErrorKind::Step(step_err))
+                    .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+                    .with_wire(wire),
             )
         }
     }
@@ -812,24 +806,14 @@ async fn replay_success<O, S: Serdes<O>>(
 /// `StepErrorKind::SerializationFailed`, the kind the live path yielded
 /// after persisting that record (issue #43). Every other record is an
 /// ordinary terminal step failure, which the live path yields as
-/// `StepErrorKind::RetriesExhausted` after its retry strategy stopped,
-/// so replay reconstructs the SAME kind: a handler that branches on the
-/// kind takes the same path live and replayed. The attempt count is
-/// derived from the record exactly as [`DurableContext::get_attempt`]
-/// reads it: the record stores completed retries, so the failing attempt
-/// is `recorded_attempt + 1` (the same derivation
-/// `wait_for_condition`'s exhaustion replay uses).
-fn replay_failure(
-    wire: crate::error::WireError,
-    wire_id: &str,
-    recorded_attempt: u32,
-) -> OperationError {
+/// `StepErrorKind::ExecutionFailed` after its retry strategy stopped, so
+/// replay reconstructs the SAME kind: a handler that branches on the
+/// kind takes the same path live and replayed.
+fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
     let kind = if wire.error_type() == Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) {
         StepErrorKind::SerializationFailed
     } else {
-        StepErrorKind::RetriesExhausted(crate::error::RetriesExhausted::new(
-            recorded_attempt.saturating_add(1),
-        ))
+        StepErrorKind::ExecutionFailed
     };
     OperationError::from_kind(OperationErrorKind::Step(StepError::new(
         kind,
@@ -886,18 +870,16 @@ mod tests {
     #[test]
     fn replay_failure_keeps_kind_and_wire_fields_apart() {
         let wire = crate::error::WireError::new(Some("TypeError"), Some("bad input"));
-        let err = replay_failure(wire, "wire-1", 2);
+        let err = replay_failure(wire, "wire-1");
         // kind() is meaningful after a replay: an ordinary terminal step
-        // failure replays as RetriesExhausted, the kind the live path
-        // yielded, with the failing attempt derived from the record
-        // (completed retries + 1).
+        // failure replays as ExecutionFailed, the kind the live path
+        // yielded.
         let OperationErrorKind::Step(step_err) = err.kind() else {
             unreachable!("replay builds a step error");
         };
-        let StepErrorKind::RetriesExhausted(details) = step_err.kind() else {
-            unreachable!("ordinary failures replay as RetriesExhausted");
+        let StepErrorKind::ExecutionFailed = step_err.kind() else {
+            unreachable!("ordinary failures replay as ExecutionFailed");
         };
-        assert_eq!(details.attempts(), 3);
         // The type is NOT folded into the message: the frame stays clean...
         assert_eq!(err.to_string(), "operation error: step");
         // ...and the recorded fields are programmatically recoverable.
@@ -926,7 +908,7 @@ mod tests {
 
     #[test]
     fn replay_failure_empty_record_displays_unknown() {
-        let err = replay_failure(crate::error::WireError::default(), "wire-1", 0);
+        let err = replay_failure(crate::error::WireError::default(), "wire-1");
         let chain = format!("{err:#}");
         assert!(chain.contains("unknown error"), "got: {chain}");
     }
@@ -937,7 +919,7 @@ mod tests {
             Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE),
             Some("bad payload"),
         );
-        let err = replay_failure(wire, "wire-1", 0);
+        let err = replay_failure(wire, "wire-1");
         let OperationErrorKind::Step(step_err) = err.kind() else {
             unreachable!("replay builds a step error");
         };
@@ -1314,6 +1296,215 @@ mod tests {
         );
     }
 
+    /// Builds a step record for the first operation of a root context.
+    fn step_record(
+        status: CheckpointStatus,
+        attempt: u32,
+        error: Option<&crate::error::WireError>,
+    ) -> (String, crate::engine::CheckpointRecord) {
+        let wire_key = crate::engine::compute_wire_id_public("1");
+        let record = crate::engine::CheckpointRecord {
+            id: wire_key.clone(),
+            status,
+            result: None,
+            error_type: error
+                .and_then(crate::error::WireError::error_type)
+                .map(str::to_owned),
+            error_message: error
+                .and_then(crate::error::WireError::error_message)
+                .map(str::to_owned),
+            error_data: error
+                .and_then(crate::error::WireError::error_data)
+                .map(str::to_owned),
+            stack_trace: None,
+            attempt,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        };
+        (wire_key, record)
+    }
+
+    /// Builds a root context over `records` that writes to a fresh
+    /// in-memory client.
+    fn context_over(
+        records: Vec<(String, crate::engine::CheckpointRecord)>,
+    ) -> (DurableContext, Arc<crate::client::InMemoryExecutionClient>) {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(records)),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+        );
+        (ctx, client)
+    }
+
+    /// The `FAIL` update a test context recorded, as a wire record.
+    fn recorded_fail(client: &crate::client::InMemoryExecutionClient) -> crate::error::WireError {
+        let updates = client.recorded_updates();
+        let fail = updates
+            .iter()
+            .find(|u| matches!(u.action(), OperationAction::Fail))
+            .expect("a FAIL update must be recorded");
+        let error = fail
+            .error()
+            .expect("the FAIL update carries an error object");
+        assert!(
+            error.stack_trace().is_empty(),
+            "the SDK captures no stack trace: {error:?}"
+        );
+        crate::error::WireError::new(error.error_type(), error.error_message())
+            .with_error_data(error.error_data())
+    }
+
+    /// A step body that fails with a typed error carrying error data.
+    async fn typed_failing_body(_: StepContext) -> Result<i32, BoxError> {
+        Err(Box::new(
+            crate::error::TypedError::with_type("PaymentError", "declined")
+                .with_error_data(r#"{"code":42}"#),
+        ))
+    }
+
+    #[tokio::test]
+    async fn step_failure_records_typed_error_data() {
+        // Live: the FAIL update carries the type and the data.
+        let (ctx, client) = context_over(Vec::new());
+        let op_id = ctx.mint_id();
+        let exec = StepExecution {
+            ctx,
+            op_id,
+            name: None,
+            retry_strategy: Some(Box::new(|_err: &StepError, _attempt: u32| {
+                RetryDecision::Stop
+            })),
+            serdes: crate::serdes::JsonSerdes,
+            semantics: StepSemantics::default(),
+            closure: typed_failing_body,
+            _marker: std::marker::PhantomData,
+        };
+        let live = exec.execute().await.expect_err("the step must fail");
+        let recorded = recorded_fail(&client);
+        assert_eq!(recorded.error_type(), Some("PaymentError"));
+        assert_eq!(recorded.error_data(), Some(r#"{"code":42}"#));
+        assert_eq!(
+            live.wire().and_then(crate::error::WireError::error_data),
+            Some(r#"{"code":42}"#)
+        );
+
+        // Replay: the recorded data is reachable through `wire()`.
+        let replayed_wire = crate::error::WireError::new(Some("PaymentError"), Some("declined"))
+            .with_error_data(Some(r#"{"code":42}"#));
+        let (ctx, _client) = context_over(vec![step_record(
+            CheckpointStatus::Failed,
+            0,
+            Some(&replayed_wire),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec = StepExecution {
+            ctx,
+            op_id,
+            name: None,
+            retry_strategy: None,
+            serdes: crate::serdes::JsonSerdes,
+            semantics: StepSemantics::default(),
+            closure: typed_failing_body,
+            _marker: std::marker::PhantomData,
+        };
+        let err = exec
+            .execute()
+            .await
+            .expect_err("the replayed step must fail");
+        assert_eq!(
+            err.wire().and_then(crate::error::WireError::error_data),
+            Some(r#"{"code":42}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn step_stop_returns_execution_failed_live_and_replay() {
+        fn retry_once() -> RetryStrategy {
+            Box::new(|_err: &StepError, attempt: u32| {
+                if attempt >= 2 {
+                    RetryDecision::Stop
+                } else {
+                    RetryDecision::Retry {
+                        delay: Duration::from_secs(1),
+                    }
+                }
+            })
+        }
+        fn execution(ctx: DurableContext) -> impl Future<Output = Result<i32, OperationError>> {
+            let op_id = ctx.mint_id();
+            StepExecution {
+                ctx,
+                op_id,
+                name: None,
+                retry_strategy: Some(retry_once()),
+                serdes: crate::serdes::JsonSerdes,
+                semantics: StepSemantics::default(),
+                closure: |_: StepContext| async { Err::<i32, BoxError>("boom".into()) },
+                _marker: std::marker::PhantomData,
+            }
+            .execute()
+        }
+        fn assert_execution_failed(err: &OperationError) {
+            let OperationErrorKind::Step(step_err) = err.kind() else {
+                unreachable!("a step builds a step error: {err:?}");
+            };
+            assert!(
+                matches!(step_err.kind(), StepErrorKind::ExecutionFailed),
+                "unexpected kind: {:?}",
+                step_err.kind()
+            );
+            let rendered = format!("{err:#}");
+            assert!(rendered.ends_with("boom"), "got: {rendered}");
+            assert!(!rendered.contains("retries exhausted"), "got: {rendered}");
+        }
+
+        // Attempt 1: the strategy retries, so the step suspends.
+        let (ctx, client) = context_over(Vec::new());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let outcome = crate::driver::test_support::outcome_of(signal, execution(ctx)).await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+        assert!(
+            client
+                .recorded_updates()
+                .iter()
+                .any(|u| matches!(u.action(), OperationAction::Retry)),
+            "attempt 1 records a RETRY"
+        );
+
+        // Attempt 2 (one completed retry): the strategy stops.
+        let (ctx, client) = context_over(vec![step_record(CheckpointStatus::Ready, 1, None)]);
+        let live = execution(ctx).await.expect_err("the step must fail");
+        assert_execution_failed(&live);
+        assert_eq!(
+            format!("{live:#}"),
+            "operation error: step: execution failed: boom"
+        );
+
+        // Replay of the recorded FAIL: the same kind and the same chain end.
+        let recorded = recorded_fail(&client);
+        let (ctx, _client) = context_over(vec![step_record(
+            CheckpointStatus::Failed,
+            1,
+            Some(&recorded),
+        )]);
+        let replayed = execution(ctx)
+            .await
+            .expect_err("the replayed step must fail");
+        assert_execution_failed(&replayed);
+    }
+
     /// Acceptance (issue #41): on the live path, an operation failure
     /// exposes the caller's concrete error type through a `source()`
     /// downcast: the escaping error is carried, not stringified.
@@ -1386,8 +1577,8 @@ mod tests {
             "wire message flattens the chain: {wire:?}"
         );
         assert!(
-            !wire.stack_trace().is_empty(),
-            "a live failure captures a stack trace"
+            wire.stack_trace().is_empty(),
+            "the SDK captures no stack trace for a live failure"
         );
     }
 

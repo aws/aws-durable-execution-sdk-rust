@@ -608,6 +608,48 @@ mod tests {
     use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
     use std::sync::Arc;
 
+    #[tokio::test]
+    async fn child_failure_keeps_typed_error_data() {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+        );
+
+        let result: Result<i32, OperationError> = ctx
+            .run_in_child_context(|child| async move {
+                let value = child
+                    .step(|_| async {
+                        Err::<i32, crate::BoxError>(Box::new(
+                            crate::TypedError::with_type("PaymentError", "declined")
+                                .with_error_data(r#"{"code":42}"#),
+                        ))
+                    })
+                    .retry_strategy(|_err, _attempt| crate::RetryDecision::Stop)
+                    .await?;
+                Ok(value)
+            })
+            .await;
+        assert!(result.is_err(), "the child must fail");
+
+        let updates = client.recorded_updates();
+        let fail = updates
+            .iter()
+            .find(|u| {
+                matches!(u.action(), OperationAction::Fail)
+                    && matches!(u.r#type(), OperationType::Context)
+            })
+            .expect("the child records a FAIL update");
+        let error = fail
+            .error()
+            .expect("the FAIL update carries an error object");
+        assert_eq!(error.error_data(), Some(r#"{"code":42}"#));
+        assert!(error.stack_trace().is_empty(), "{error:?}");
+    }
+
     /// Helper to create a test context with the given checkpoint log.
     fn test_ctx(log: CheckpointLog) -> DurableContext {
         DurableContext::new_root(

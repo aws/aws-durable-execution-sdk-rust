@@ -287,6 +287,35 @@ body on resume if the previous attempt started but recorded no outcome.
 retry strategy, so a non-idempotent body never runs twice for the same
 attempt.
 
+A step records the error its body returns. An unwrapped error records the
+type `Error`, because Rust erases the concrete type when the error is
+boxed. Wrap the error in `TypedError` to record a type of your choice, and
+add `with_error_data` to record an opaque payload as the error data. When
+the retry strategy stops, the step returns `StepErrorKind::ExecutionFailed`,
+and its `source()` is the body's error. After a replay,
+`OperationError::wire()` returns the recorded type and data.
+
+```rust ignore
+let result = ctx
+    .step(|_| async {
+        let err = charge_card().await.unwrap_err();
+        Err::<(), durable::BoxError>(Box::new(
+            durable::TypedError::with_type("PaymentError", err)
+                .with_error_data(r#"{"code":42}"#),
+        ))
+    })
+    .name("charge")
+    .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+    .await;
+
+if let Err(err) = result {
+    let wire = err.wire();
+    // Some("PaymentError") and Some(r#"{"code":42}"#), live and after a replay.
+    let error_type = wire.and_then(durable::WireError::error_type);
+    let error_data = wire.and_then(durable::WireError::error_data);
+}
+```
+
 ### wait
 
 ```rust ignore

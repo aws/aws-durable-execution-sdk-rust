@@ -34,14 +34,13 @@ use std::fmt;
 pub(crate) type Source = Box<dyn Error + Send + Sync + 'static>;
 
 /// Maximum number of source-chain links walked when extracting wire
-/// identity (`error_data`, `stack_trace`) from an escaping error.
+/// identity (the `TypedError` type name, `error_data`, `stack_trace`)
+/// from an escaping error.
 ///
-/// Matches the JS SDK's ten-link cause-chain walk, so a payload survives
-/// the same nesting depth across SDKs.
-const CHAIN_WALK_LIMIT: usize = 10;
-
-/// Maximum number of captured backtrace frames written to the wire.
-const STACK_TRACE_FRAME_LIMIT: usize = 64;
+/// The walk reads the error itself and up to 10 causes, as the JS SDK
+/// does: it checks the error's own data, then up to 10 causes. So a
+/// payload survives the same nesting depth across SDKs.
+const CHAIN_WALK_LIMIT: usize = 11;
 
 /// Writes `frame` followed by every frame of `source`'s chain, separated
 /// by `": "`.
@@ -153,8 +152,13 @@ impl WireError {
 
     /// The wire `StackTrace` frames, stored and exposed verbatim.
     ///
-    /// A Rust [`std::backtrace::Backtrace`] cannot be reconstructed from
-    /// recorded frames, so these are store-and-expose only.
+    /// The SDK never captures frames. This field exposes the frames a
+    /// recorded record already carries: an external callback failure, a
+    /// remote invoke, or a replayed record. A failure the SDK records
+    /// live carries frames only when an error in its source chain
+    /// already carried them. A Rust [`std::backtrace::Backtrace`] cannot
+    /// be reconstructed from recorded frames, so these are
+    /// store-and-expose only.
     pub fn stack_trace(&self) -> &[String] {
         &self.stack_trace
     }
@@ -308,6 +312,18 @@ impl Error for ContextualError {
 /// // The step that fails with `err` records ErrorType "PaymentDeclined".
 /// ```
 ///
+/// [`with_error_data`](Self::with_error_data) attaches an opaque payload,
+/// recorded as the wire `ErrorData`. The SDK never parses it, and it
+/// never appears in the recorded message:
+///
+/// ```
+/// use aws_durable_execution_sdk::TypedError;
+///
+/// let err = TypedError::with_type("PaymentError", "declined").with_error_data(r#"{"code":42}"#);
+/// assert_eq!(err.error_type(), "PaymentError");
+/// assert_eq!(err.error_data(), Some(r#"{"code":42}"#));
+/// ```
+///
 /// The wrapper is one chain layer: its `Display` frame is the recorded
 /// type name, and its [`source()`](std::error::Error::source) is the
 /// wrapped error itself, so the concrete error stays reachable through
@@ -318,6 +334,7 @@ impl Error for ContextualError {
 pub struct TypedError {
     error_type: String,
     inner: Source,
+    error_data: Option<String>,
 }
 
 impl TypedError {
@@ -328,6 +345,7 @@ impl TypedError {
         Self {
             error_type: short_type_name(std::any::type_name::<E>()),
             inner: Box::new(err),
+            error_data: None,
         }
     }
 
@@ -337,7 +355,24 @@ impl TypedError {
         Self {
             error_type: error_type.into(),
             inner: err.into(),
+            error_data: None,
         }
+    }
+
+    /// Attaches an opaque payload, recorded as the wire `ErrorData`.
+    ///
+    /// The SDK passes the payload through unparsed. It does not appear in
+    /// this error's `Display` or in the recorded `ErrorMessage`.
+    #[must_use]
+    pub fn with_error_data(mut self, error_data: impl Into<String>) -> Self {
+        self.error_data = Some(error_data.into());
+        self
+    }
+
+    /// The payload attached with [`with_error_data`](Self::with_error_data),
+    /// if any.
+    pub fn error_data(&self) -> Option<&str> {
+        self.error_data.as_deref()
     }
 
     /// The wire `ErrorType` recorded for this error.
@@ -405,11 +440,14 @@ fn short_type_name(full: &str) -> String {
 ///   concrete type is erased when the caller boxes it), so it records
 ///   `fallback_type`.
 /// - `error_data` is passed through from the first error in the source
-///   chain (up to [`CHAIN_WALK_LIMIT`] links) that carries one, so an
-///   externally supplied payload survives child-context and map
-///   boundaries. It is never synthesized and never parsed.
-/// - `stack_trace` is passed through from the chain when recorded, and
-///   captured fresh at this site otherwise.
+///   chain (up to [`CHAIN_WALK_LIMIT`] links) that carries one: an
+///   [`OperationError`] or [`ReplayedFailure`] whose record has data, or
+///   a [`TypedError`] with [`TypedError::error_data`] set. So a payload
+///   survives child-context and map boundaries. It is never synthesized
+///   and never parsed.
+/// - `stack_trace` is passed through from the first [`OperationError`] or
+///   [`ReplayedFailure`] in the chain that carries frames. The SDK never
+///   captures frames, so a chain with no recorded frames records none.
 pub(crate) fn wire_error_for(err: &(dyn Error + 'static), fallback_type: &str) -> WireError {
     let error_type = if let Some(op) = err.downcast_ref::<OperationError>() {
         // An operation error's own recorded identity wins: the attached
@@ -467,34 +505,22 @@ pub(crate) fn wire_error_with_type(err: &(dyn Error + 'static), error_type: &str
             if stack_trace.is_empty() {
                 stack_trace = w.stack_trace().to_vec();
             }
-            if error_data.is_some() && !stack_trace.is_empty() {
-                break;
-            }
+        } else if let Some(typed) = e.downcast_ref::<TypedError>()
+            && error_data.is_none()
+        {
+            // A `TypedError` supplies data only; it carries no frames.
+            error_data = typed.error_data().map(str::to_owned);
+        }
+        if error_data.is_some() && !stack_trace.is_empty() {
+            break;
         }
         link = e.source();
         walked += 1;
     }
 
-    if stack_trace.is_empty() {
-        stack_trace = capture_stack_trace();
-    }
-
     WireError::new(Some(error_type), Some(chain_string(err)))
         .with_error_data(error_data)
         .with_stack_trace(stack_trace)
-}
-
-/// Creates a live failure record from a caller-fixed `error_type` and
-/// message, capturing the stack at the construction site.
-///
-/// This is the constructor for live failure records that have no
-/// escaping error to walk: protocol-discriminator failures such as a
-/// combinator's empty input, a wait-for-condition strategy exhaustion,
-/// or a callback timeout. A bare [`WireError::new`] at such a site would
-/// emit no `stack_trace`; routing through this helper centralizes the
-/// capture so every live-written record carries one.
-pub(crate) fn wire_error_manual(error_type: &str, message: impl Into<String>) -> WireError {
-    WireError::new(Some(error_type), Some(message.into())).with_stack_trace(capture_stack_trace())
 }
 
 /// The wire `ErrorType` recorded when a checkpoint write itself failed:
@@ -540,7 +566,7 @@ pub(crate) fn serialization_failure_wire(err: &(dyn Error + 'static)) -> WireErr
 /// by matching this type, so a handler that branches on the kind (or
 /// reads [`MaxChecksExceeded::checks`]) takes the same path live and
 /// replayed. It is a protocol discriminator written via
-/// [`wire_error_manual`], never derived from a user error's own identity.
+/// [`WireError::new`], never derived from a user error's own identity.
 ///
 /// [`WaitDecision::Exhausted`]: crate::builders::wait_for_condition::WaitDecision::Exhausted
 pub(crate) const WFC_EXHAUSTED_ERROR_TYPE: &str = "WaitForCondition.MaxChecksExceeded";
@@ -553,9 +579,9 @@ pub(crate) const WFC_EXHAUSTED_ERROR_TYPE: &str = "WaitForCondition.MaxChecksExc
 /// few hundred bytes and goes through on a channel that rejected only
 /// the payload, ending the re-execution loop after one lap.
 pub(crate) fn checkpoint_failure_wire(err: &impl fmt::Display) -> WireError {
-    wire_error_manual(
-        CHECKPOINT_FAILED_ERROR_TYPE,
-        format!("checkpoint write failed: {err}"),
+    WireError::new(
+        Some(CHECKPOINT_FAILED_ERROR_TYPE),
+        Some(format!("checkpoint write failed: {err}")),
     )
 }
 
@@ -569,20 +595,6 @@ fn wire_identity<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a WireError> {
         return Some(replayed.wire());
     }
     None
-}
-
-/// Captures the current backtrace as wire frames, one line per frame,
-/// capped at [`STACK_TRACE_FRAME_LIMIT`].
-///
-/// Uses `force_capture` so the failure record is populated regardless of
-/// `RUST_BACKTRACE`; the cost is paid on the failure path only.
-fn capture_stack_trace() -> Vec<String> {
-    let backtrace = std::backtrace::Backtrace::force_capture();
-    format!("{backtrace}")
-        .lines()
-        .take(STACK_TRACE_FRAME_LIMIT)
-        .map(str::to_owned)
-        .collect()
 }
 
 /// The top-level error type returned by [`DurableFuture`](crate::DurableFuture).
@@ -829,10 +841,9 @@ impl fmt::Display for OperationErrorKind {
 ///
 /// fn describe(err: &StepError) -> String {
 ///     match err.kind() {
-///         StepErrorKind::RetriesExhausted(details) => {
-///             format!("gave up after {} attempts", details.attempts())
-///         }
-///         // `{:#}` flattens the frame and its source chain.
+///         // The body's error, also when the retry strategy stopped. Its
+///         // `source()` is that error, and `{:#}` flattens the chain.
+///         StepErrorKind::ExecutionFailed { .. } => format!("body failed: {err:#}"),
 ///         _ => format!("{err:#}"),
 ///     }
 /// }
@@ -887,21 +898,19 @@ impl Error for StepError {
 /// ```
 /// use aws_durable_execution_sdk::StepErrorKind;
 ///
-/// fn attempts_used(kind: &StepErrorKind) -> Option<u32> {
-///     match kind {
-///         StepErrorKind::RetriesExhausted(details) => Some(details.attempts()),
-///         _ => None,
-///     }
+/// fn body_failed(kind: &StepErrorKind) -> bool {
+///     // Unit kind variants are `#[non_exhaustive]`: match them with
+///     // `{ .. }` so a future field cannot break the pattern.
+///     matches!(kind, StepErrorKind::ExecutionFailed { .. })
 /// }
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StepErrorKind {
-    /// The step body returned an error.
+    /// The step body returned an error, and the retry strategy stopped.
+    /// The error's `source()` is the body's error.
     #[non_exhaustive]
     ExecutionFailed,
-    /// The step exceeded its maximum retry attempts.
-    RetriesExhausted(RetriesExhausted),
     /// A serialization or deserialization error occurred.
     #[non_exhaustive]
     SerializationFailed,
@@ -911,34 +920,8 @@ impl fmt::Display for StepErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ExecutionFailed => write!(f, "execution failed"),
-            Self::RetriesExhausted(details) => write!(f, "{details}"),
             Self::SerializationFailed => write!(f, "serialization failed"),
         }
-    }
-}
-
-/// Details of a [`StepErrorKind::RetriesExhausted`] failure.
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct RetriesExhausted {
-    attempts: u32,
-}
-
-impl RetriesExhausted {
-    /// Creates the payload (internal).
-    pub(crate) fn new(attempts: u32) -> Self {
-        Self { attempts }
-    }
-
-    /// The number of attempts made before giving up.
-    pub fn attempts(&self) -> u32 {
-        self.attempts
-    }
-}
-
-impl fmt::Display for RetriesExhausted {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "retries exhausted after {} attempts", self.attempts)
     }
 }
 
@@ -1058,11 +1041,16 @@ impl fmt::Display for UnexpectedStatus {
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk::{InvokeError, InvokeErrorKind};
+/// use std::error::Error as _;
 ///
-/// fn missing_function(err: &InvokeError) -> Option<&str> {
+/// use aws_durable_execution_sdk::{InvokeError, InvokeErrorKind, ReplayedFailure};
+///
+/// fn remote_error_type(err: &InvokeError) -> Option<&str> {
 ///     match err.kind() {
-///         InvokeErrorKind::FunctionNotFound(details) => Some(details.function_id()),
+///         InvokeErrorKind::FunctionFailed { .. } => err
+///             .source()?
+///             .downcast_ref::<ReplayedFailure>()?
+///             .error_type(),
 ///         _ => None,
 ///     }
 /// }
@@ -1121,8 +1109,6 @@ pub enum InvokeErrorKind {
     /// The invoked function returned an error.
     #[non_exhaustive]
     FunctionFailed,
-    /// The function could not be found or accessed.
-    FunctionNotFound(FunctionNotFound),
     /// A serialization or deserialization error occurred.
     #[non_exhaustive]
     SerializationFailed,
@@ -1132,41 +1118,8 @@ impl fmt::Display for InvokeErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FunctionFailed => write!(f, "function failed"),
-            Self::FunctionNotFound(details) => write!(f, "{details}"),
             Self::SerializationFailed => write!(f, "serialization failed"),
         }
-    }
-}
-
-/// Details of an [`InvokeErrorKind::FunctionNotFound`] failure.
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct FunctionNotFound {
-    function_id: String,
-}
-
-impl FunctionNotFound {
-    /// Creates the payload (internal).
-    ///
-    /// No production path constructs this variant today (the invoke
-    /// replay path cannot distinguish a missing function from a failed
-    /// one on the wire); tests and future classification use it.
-    #[cfg_attr(not(test), expect(dead_code))] // reason: constructed only by tests today; kept for future invoke classification
-    pub(crate) fn new(function_id: impl Into<String>) -> Self {
-        Self {
-            function_id: function_id.into(),
-        }
-    }
-
-    /// The function identifier that was not found.
-    pub fn function_id(&self) -> &str {
-        &self.function_id
-    }
-}
-
-impl fmt::Display for FunctionNotFound {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "function not found: {}", self.function_id)
     }
 }
 
@@ -1893,13 +1846,11 @@ const _: () = {
     assert_send_sync_static::<OperationErrorKind>();
     assert_send_sync_static::<StepError>();
     assert_send_sync_static::<StepErrorKind>();
-    assert_send_sync_static::<RetriesExhausted>();
     assert_send_sync_static::<WaitError>();
     assert_send_sync_static::<WaitErrorKind>();
     assert_send_sync_static::<UnexpectedStatus>();
     assert_send_sync_static::<InvokeError>();
     assert_send_sync_static::<InvokeErrorKind>();
-    assert_send_sync_static::<FunctionNotFound>();
     assert_send_sync_static::<CallbackError>();
     assert_send_sync_static::<CallbackErrorKind>();
     assert_send_sync_static::<WaitForConditionError>();
@@ -2056,10 +2007,82 @@ mod tests {
         // No structured identity in the chain: falls back to the kind's
         // wire name because the top error is an OperationError.
         assert_eq!(wire.error_type(), Some("StepError"));
-        // A fresh failure captures a stack trace.
-        assert_ne!(wire.stack_trace(), &[] as &[String]);
+        // No link carries frames, and the SDK captures none.
+        assert_eq!(wire.stack_trace(), [] as [String; 0]);
         // No error_data anywhere in the chain: none synthesized.
         assert_eq!(wire.error_data(), None);
+    }
+
+    #[test]
+    fn wire_error_passes_through_recorded_frames() {
+        let err = ContextualError::source_from(
+            "ctx",
+            ReplayedFailure::source_from(
+                WireError::new(Some("T"), Some("m"))
+                    .with_stack_trace(vec!["frame-a".into(), "frame-b".into()]),
+            ),
+        );
+        let wire = wire_error_for(&*err, "Error");
+        assert_eq!(
+            wire.stack_trace(),
+            &["frame-a".to_owned(), "frame-b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn typed_error_error_data_precedence() {
+        fn boom() -> UserBoom {
+            UserBoom { detail: "x" }
+        }
+        fn replayed(d: &str) -> Source {
+            ReplayedFailure::source_from(
+                WireError::new(Some("Inner"), Some("inner")).with_error_data(Some(d)),
+            )
+        }
+        fn row1() -> Source {
+            Box::new(TypedError::with_type("PaymentError", boom()).with_error_data("data-a"))
+        }
+        fn layered(layers: usize) -> Source {
+            let mut inner = row1();
+            for i in 0..layers {
+                inner = ContextualError::source_from(format!("layer {i}"), inner);
+            }
+            inner
+        }
+
+        let rows: Vec<(usize, Source, Option<&str>)> = vec![
+            (1, row1(), Some("data-a")),
+            (
+                2,
+                Box::new(TypedError::with_type("P", replayed("data-b")).with_error_data("data-a")),
+                Some("data-a"),
+            ),
+            (
+                3,
+                Box::new(TypedError::with_type("P", replayed("data-b"))),
+                Some("data-b"),
+            ),
+            (4, layered(1), Some("data-a")),
+            (5, Box::new(TypedError::with_type("P", boom())), None),
+            // The `TypedError` is link 10.
+            (6, layered(9), Some("data-a")),
+            // The `TypedError` is link 11, the last error the walk reads.
+            (7, layered(10), Some("data-a")),
+            // The `TypedError` is link 12, past the walk.
+            (8, layered(11), None),
+        ];
+        for (row, err, expected) in &rows {
+            let wire = wire_error_for(&**err, "Error");
+            assert_eq!(wire.error_data(), *expected, "row {row}");
+            if *row == 1 {
+                assert_eq!(wire.error_type(), Some("PaymentError"));
+                assert!(
+                    !wire.error_message().unwrap_or_default().contains("data-a"),
+                    "the data never appears in the message: {:?}",
+                    wire.error_message()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2129,12 +2152,9 @@ mod tests {
 
     #[test]
     fn step_error_kind_accessor() {
-        let err = StepError::new(
-            StepErrorKind::RetriesExhausted(RetriesExhausted::new(3)),
-            Some(Source::from("fail")),
-        );
+        let err = StepError::new(StepErrorKind::ExecutionFailed, Some(Source::from("fail")));
         match err.kind() {
-            StepErrorKind::RetriesExhausted(details) => assert_eq!(details.attempts(), 3),
+            StepErrorKind::ExecutionFailed => {}
             other => unreachable!("unexpected kind: {other:?}"),
         }
     }
@@ -2223,7 +2243,7 @@ mod tests {
             ),
             (
                 OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::new(
-                    InvokeErrorKind::FunctionNotFound(FunctionNotFound::new("f")),
+                    InvokeErrorKind::FunctionFailed,
                     None,
                 ))),
                 "invoke",
