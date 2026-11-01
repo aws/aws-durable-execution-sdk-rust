@@ -4570,10 +4570,10 @@ mod tests {
 
         assert!(result.is_failure());
         // The execution record re-records the child-context record's own
-        // recorded identity ("ChildFnError", the boundary's fallback for a
+        // recorded identity ("Error", the body error's fallback type for a
         // plain boxed error) rather than degrading it to the outer kind's
         // registry name: recorded identity passes through boundaries.
-        assert_eq!(result.error_type(), Some("ChildFnError"));
+        assert_eq!(result.error_type(), Some("Error"));
         let msg = result.error_message().unwrap_or_default();
         assert!(
             msg.contains("boom-child"),

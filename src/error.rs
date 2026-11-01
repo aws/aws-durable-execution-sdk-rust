@@ -1801,6 +1801,17 @@ impl ChildFnError {
     pub(crate) fn into_source(self) -> Source {
         self.source
     }
+
+    /// The wire record a failed child, map item or branch writes: derived
+    /// from the error the body returned, with fallback type `"Error"`.
+    ///
+    /// The record is derived from the body error, not from this carrier.
+    /// The carrier is an internal Rust type. Deriving from it would record
+    /// its name as the type and prefix its own text to the message. So the
+    /// record follows [`wire_error_for`]'s rule applied to the body error.
+    pub(crate) fn failure_wire(&self) -> WireError {
+        wire_error_for(&*self.source, "Error")
+    }
 }
 
 impl fmt::Display for ChildFnError {
@@ -2107,7 +2118,7 @@ mod tests {
 
         // ...escapes through a child-context boundary.
         let child_fn = ChildFnError::from(inner);
-        let wire = wire_error_for(&child_fn, "ChildFnError");
+        let wire = child_fn.failure_wire();
 
         // The opaque payload survives the boundary via the cause chain.
         assert_eq!(wire.error_data(), Some("opaque-payload"));
@@ -2361,7 +2372,7 @@ mod tests {
         // ...including through intermediate carriers (a child boundary).
         let child =
             ChildFnError::new(Box::new(TypedError::new(UserBoom { detail: "deep" })) as Source);
-        let wire = wire_error_for(&child, "ChildFnError");
+        let wire = child.failure_wire();
         assert_eq!(wire.error_type(), Some("UserBoom"));
     }
 

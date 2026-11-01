@@ -54,12 +54,6 @@ const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 /// through to normal re-execution instead of short-circuiting.
 const REPLAY_CHILDREN_SENTINEL: &str = "__replay_children_reexecute__";
 
-/// The error type identifier recorded for a batch item whose body failed.
-///
-/// Matches the `errorType` the per-child FAIL checkpoint carries, so the
-/// batch summary payload and the child records agree on error identity.
-const CHILD_FN_ERROR_TYPE: &str = "ChildFnError";
-
 /// The status of one item or branch in a batch operation.
 ///
 /// Each item in a [`BatchResult`] has a status indicating whether it
@@ -117,8 +111,9 @@ pub struct BatchItem<O> {
     pub error_message: Option<String>,
     /// Error type identifier (only meaningful when status is Failed).
     ///
-    /// Carries the `errType` recorded in the batch checkpoint payload
-    /// (`"ChildFnError"` for a failed item body), so error identity
+    /// Carries the `errType` recorded in the batch checkpoint payload: the
+    /// recorded type of the error the item body returned (`"Error"` for an
+    /// untyped error), so error identity
     /// survives checkpoint replay alongside the message. `None` when the
     /// payload recorded no type (a payload written before error typing).
     pub error_type: Option<String>,
@@ -267,7 +262,7 @@ impl std::fmt::Display for BatchStatus {
 ///         BatchItemStatus::Failed,
 ///         None,
 ///         Some("boom".into()),
-///         Some("ChildFnError".into()),
+///         Some("Error".into()),
 ///     )],
 ///     CompletionReason::AllCompleted,
 /// );
@@ -275,7 +270,7 @@ impl std::fmt::Display for BatchStatus {
 /// assert_eq!(errors[0].index, 2);
 /// assert_eq!(errors[0].name, "branch-c");
 /// assert_eq!(errors[0].message, "boom");
-/// assert_eq!(errors[0].error_type, Some("ChildFnError"));
+/// assert_eq!(errors[0].error_type, Some("Error"));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -288,7 +283,8 @@ pub struct BatchError<'a> {
     /// The error message the item failed with.
     pub message: &'a str,
     /// The error type identifier the item failed with, as recorded in the
-    /// batch checkpoint payload (`"ChildFnError"` for a failed item body).
+    /// batch checkpoint payload: the recorded type of the error the item
+    /// body returned (`"Error"` for an untyped error).
     /// `None` when the payload recorded no type (a payload written before
     /// error typing).
     pub error_type: Option<&'a str>,
@@ -549,7 +545,7 @@ impl<'a> BatchStats<'a> {
 ///             BatchItemStatus::Failed,
 ///             None,
 ///             Some("oops".into()),
-///             Some("ChildFnError".into()),
+///             Some("Error".into()),
 ///         ),
 ///     ],
 ///     CompletionReason::FailureToleranceExceeded,
@@ -1076,9 +1072,10 @@ where
                 }
             }
             ScopeOutcome::Completed(Err(child_err)) => {
-                // The recorded message is the flattened chain, built at
-                // the single flattening site.
-                let wire = crate::error::wire_error_for(&child_err, CHILD_FN_ERROR_TYPE);
+                // The wire record is derived from the error the body
+                // returned: its recorded type, and its flattened chain as
+                // the message.
+                let wire = child_err.failure_wire();
                 Ok(ItemOutcome::Terminal(BatchItem::failed_from_wire(
                     req.index,
                     req.item_name.clone(),
@@ -1227,9 +1224,10 @@ where
             }
 
             // Checkpoint failure. The wire record is derived from the
-            // carried error, so the message is the flattened chain and
+            // error the body returned, so the type is the body error's
+            // recorded type, the message is its flattened chain, and
             // `error_data`/`stack_trace` pass through the boundary.
-            let wire = crate::error::wire_error_for(&child_err, CHILD_FN_ERROR_TYPE);
+            let wire = child_err.failure_wire();
             let builder = OperationUpdate::builder()
                 .id(child_wire.clone())
                 .r#type(OperationType::Context)
@@ -1556,7 +1554,7 @@ where
                 // walk, so its wire record is just the type and message;
                 // the checkpointed child FAIL and the settled item carry
                 // the SAME record, keeping live and replay identical.
-                let wire = crate::error::WireError::new(Some(CHILD_FN_ERROR_TYPE), Some(message));
+                let wire = crate::error::WireError::new(Some("ChildFnError"), Some(message));
 
                 // Child FAIL checkpoint for the panicked/cancelled branch.
                 // Skipped in FLAT mode, which emits no child-context
@@ -3458,9 +3456,7 @@ where
             status: status_str.to_owned(),
             result: result_str,
             err_type: if status == BatchItemStatus::Failed {
-                error_type
-                    .clone()
-                    .unwrap_or_else(|| CHILD_FN_ERROR_TYPE.to_owned())
+                error_type.clone().unwrap_or_else(|| "Error".to_owned())
             } else {
                 String::new()
             },
@@ -3971,10 +3967,11 @@ mod tests {
             "structured error must carry the branch's message: {:?}",
             errors[0].message
         );
-        // Live execution grades a failed branch body as ChildFnError, and
-        // the structured view exposes that identity alongside the message.
-        assert_eq!(errors[0].error_type, Some(CHILD_FN_ERROR_TYPE));
-        assert_eq!(by_index(1).error_type.as_deref(), Some(CHILD_FN_ERROR_TYPE));
+        // Live execution records the body error's type: an untyped body
+        // error records "Error", and the structured view exposes that
+        // identity alongside the message.
+        assert_eq!(errors[0].error_type, Some("Error"));
+        assert_eq!(by_index(1).error_type.as_deref(), Some("Error"));
     }
 
     /// Partial replay must not discard branch names: when a branch reached a
@@ -4054,7 +4051,99 @@ mod tests {
             "structured errors must name the replayed failed branch"
         );
         assert_eq!(errors[0].message, "recorded failure");
-        assert_eq!(errors[0].error_type, Some(CHILD_FN_ERROR_TYPE));
+        assert_eq!(errors[0].error_type, Some("ChildFnError"));
+    }
+
+    /// The batch summary payload the parent recorded: the first recorded
+    /// update whose payload decodes as a [`BatchSummary`].
+    fn recorded_batch_summary(client: &crate::client::InMemoryExecutionClient) -> BatchSummary {
+        client
+            .recorded_updates()
+            .iter()
+            .filter(|u| u.parent_id().is_none())
+            .filter_map(|u| u.payload())
+            .find_map(|p| serde_json::from_str::<BatchSummary>(p).ok())
+            .expect("the parent records a batch summary payload")
+    }
+
+    /// A failed map item records the type of the error its body returned
+    /// (`"Error"` for an untyped error), and the four views of the failure
+    /// agree: the child FAIL record, `BatchItem::error_type`,
+    /// `BatchError::error_type` and the summary `errType`.
+    #[tokio::test]
+    async fn map_item_failure_records_body_error_type() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = ctx
+            .map(vec![1_i32], |_child, _item, _idx| async move {
+                Err::<i32, BoxError>("plain boom".into())
+            })
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(0),
+            )
+            .await_batch()
+            .await
+            .expect("await_batch reports a failed item as a batch result");
+
+        let fail = client
+            .recorded_updates()
+            .into_iter()
+            .find(|u| {
+                matches!(u.action(), OperationAction::Fail)
+                    && matches!(u.r#type(), OperationType::Context)
+            })
+            .expect("the failed item records a child FAIL update");
+        let error = fail
+            .error()
+            .expect("the FAIL update carries an error object");
+        assert_eq!(error.error_type(), Some("Error"));
+        assert_eq!(error.error_message(), Some("plain boom"));
+
+        let item = batch
+            .items
+            .iter()
+            .find(|i| i.index == 0)
+            .expect("the batch reports the failed item");
+        assert_eq!(item.status, BatchItemStatus::Failed);
+        assert_eq!(item.error_type.as_deref(), Some("Error"));
+        assert_eq!(batch.errors()[0].error_type, Some("Error"));
+
+        let summary = recorded_batch_summary(&client);
+        assert_eq!(
+            summary.results.first().map(|r| r.err_type.as_str()),
+            Some("Error")
+        );
+    }
+
+    /// The same as [`map_item_failure_records_body_error_type`] for
+    /// [`NestingMode::Flat`], which writes no child records.
+    #[tokio::test]
+    async fn flat_item_failure_records_body_error_type() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = ctx
+            .map(vec![1_i32], |_child, _item, _idx| async move {
+                Err::<i32, BoxError>("plain boom".into())
+            })
+            .nesting(NestingMode::Flat)
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(0),
+            )
+            .await_batch()
+            .await
+            .expect("await_batch reports a failed item as a batch result");
+
+        let item = batch
+            .items
+            .iter()
+            .find(|i| i.index == 0)
+            .expect("the batch reports the failed item");
+        assert_eq!(item.status, BatchItemStatus::Failed);
+        assert_eq!(item.error_type.as_deref(), Some("Error"));
+
+        let summary = recorded_batch_summary(&client);
+        assert_eq!(
+            summary.results.first().map(|r| r.err_type.as_str()),
+            Some("Error")
+        );
     }
 
     /// `await_batch` surfaces a tolerance-exceeded batch as-is: the reason
@@ -4934,7 +5023,7 @@ mod tests {
                     BatchItemStatus::Failed,
                     None,
                     Some("err".into()),
-                    Some("ChildFnError".into()),
+                    Some("Error".into()),
                 ),
                 BatchItem::new(
                     2,
@@ -4957,7 +5046,7 @@ mod tests {
         assert_eq!(errors[0].index, 1);
         assert_eq!(errors[0].name, "");
         assert_eq!(errors[0].message, "err");
-        assert_eq!(errors[0].error_type, Some("ChildFnError"));
+        assert_eq!(errors[0].error_type, Some("Error"));
         assert_eq!(result.results(), vec![&10, &30]);
         assert_eq!(result.reason, CompletionReason::FailureToleranceExceeded);
     }
@@ -5040,7 +5129,7 @@ mod tests {
                     BatchItemStatus::Failed,
                     None,
                     Some("first failure".into()),
-                    Some("ChildFnError".into()),
+                    Some("Error".into()),
                 ),
                 BatchItem::new(
                     2,
@@ -5067,7 +5156,7 @@ mod tests {
         assert_eq!(errors[0].index, 1);
         assert_eq!(errors[0].name, "b");
         assert_eq!(errors[0].message, "first failure");
-        assert_eq!(errors[0].error_type, Some("ChildFnError"));
+        assert_eq!(errors[0].error_type, Some("Error"));
         assert_eq!(errors[1].index, 4);
         assert_eq!(errors[1].name, "e");
         assert_eq!(errors[1].message, "second failure");
@@ -5200,7 +5289,7 @@ mod tests {
         .expect("serializing a batch result must succeed");
         assert_eq!(
             payload.results.first().map(|r| r.err_type.as_str()),
-            Some(CHILD_FN_ERROR_TYPE)
+            Some("Error")
         );
     }
 
@@ -5290,7 +5379,7 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].index, 1);
         assert_eq!(errors[0].message, "boom");
-        assert_eq!(errors[0].error_type, Some(CHILD_FN_ERROR_TYPE));
+        assert_eq!(errors[0].error_type, Some("ChildFnError"));
     }
 
     // Gap 3: NestingMode tests

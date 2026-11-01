@@ -491,11 +491,11 @@ async fn checkpoint_live_failure(
     wire_id: &str,
     child_err: ChildFnError,
 ) -> OperationError {
-    // Derive the wire failure from the carried error: the message is the
-    // flattened chain, and `error_data`/`stack_trace` pass through from
-    // the cause chain, so an inner failure's payload survives this
-    // boundary.
-    let wire = crate::error::wire_error_for(&child_err, "ChildFnError");
+    // Derive the wire failure from the error the body returned: the type
+    // is the body error's recorded type, the message is its flattened
+    // chain, and `error_data`/`stack_trace` pass through from its cause
+    // chain, so an inner failure's payload survives this boundary.
+    let wire = child_err.failure_wire();
     let update = build_child_fail_update(wire_id, name, ctx, &wire);
 
     // A rejected FAIL write routes unrecoverable: discarding it would
@@ -691,6 +691,116 @@ mod tests {
             .expect("the FAIL update carries an error object");
         assert_eq!(error.error_data(), Some(r#"{"code":42}"#));
         assert!(error.stack_trace().is_empty(), "{error:?}");
+    }
+
+    /// Runs `body` as a child context against a fresh in-memory client and
+    /// returns the `ErrorType` and `ErrorMessage` of the child FAIL update.
+    async fn child_fail_record<F, Fut>(body: F) -> (Option<String>, Option<String>)
+    where
+        F: FnOnce(DurableContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<i32, crate::BoxError>> + Send + 'static,
+    {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+        );
+        let result: Result<i32, OperationError> = ctx.run_in_child_context(body).await;
+        assert!(result.is_err(), "the child must fail");
+        let updates = client.recorded_updates();
+        let fail = updates
+            .iter()
+            .find(|u| {
+                matches!(u.action(), OperationAction::Fail)
+                    && matches!(u.r#type(), OperationType::Context)
+            })
+            .expect("the child records a FAIL update");
+        let error = fail
+            .error()
+            .expect("the FAIL update carries an error object");
+        (
+            error.error_type().map(str::to_owned),
+            error.error_message().map(str::to_owned),
+        )
+    }
+
+    /// A failed child records the type and message of the error its body
+    /// returned, not of the SDK's internal carrier. One row per case: a
+    /// plain error, a `TypedError`, a propagated step failure (untyped and
+    /// typed), and a propagated external callback failure.
+    #[tokio::test]
+    async fn child_failure_records_body_error_type() {
+        // Row 1: a plain error records the fallback type "Error".
+        let (ty, msg) = child_fail_record(|_child| async { Err("plain boom".into()) }).await;
+        assert_eq!(ty.as_deref(), Some("Error"));
+        assert_eq!(msg.as_deref(), Some("plain boom"));
+
+        // Row 2: a TypedError records the user's type.
+        let (ty, msg) = child_fail_record(|_child| async {
+            Err(crate::TypedError::with_type("PaymentError", "declined").into())
+        })
+        .await;
+        assert_eq!(ty.as_deref(), Some("PaymentError"));
+        assert_eq!(msg.as_deref(), Some("PaymentError: declined"));
+
+        // Row 3: a propagated untyped step failure records the step's
+        // recorded type, "Error".
+        let (ty, msg) = child_fail_record(|child| async move {
+            let v = child
+                .step(|_| async { Err::<i32, crate::BoxError>("step boom".into()) })
+                .retry_strategy(|_err, _attempt| crate::RetryDecision::Stop)
+                .await?;
+            Ok(v)
+        })
+        .await;
+        assert_eq!(ty.as_deref(), Some("Error"));
+        assert_eq!(
+            msg.as_deref(),
+            Some("operation error: step: execution failed: step boom")
+        );
+
+        // Row 4: a propagated typed step failure records the user's type.
+        let (ty, msg) = child_fail_record(|child| async move {
+            let v = child
+                .step(|_| async {
+                    Err::<i32, crate::BoxError>(Box::new(crate::TypedError::with_type(
+                        "PaymentError",
+                        "declined",
+                    )))
+                })
+                .retry_strategy(|_err, _attempt| crate::RetryDecision::Stop)
+                .await?;
+            Ok(v)
+        })
+        .await;
+        assert_eq!(ty.as_deref(), Some("PaymentError"));
+        assert_eq!(
+            msg.as_deref(),
+            Some("operation error: step: execution failed: PaymentError: declined")
+        );
+
+        // Row 5: a propagated external callback failure records the type
+        // the callback failure carries.
+        let (ty, msg) = child_fail_record(|_child| async {
+            let wire = crate::error::WireError::new(Some("VendorError"), Some("denied"));
+            let err = OperationError::from_kind(OperationErrorKind::Callback(
+                crate::error::CallbackError::new(
+                    crate::error::CallbackErrorKind::ExternalFailure,
+                    Some(crate::error::ReplayedFailure::source_from(wire.clone())),
+                ),
+            ))
+            .with_wire(wire);
+            Err(err.into())
+        })
+        .await;
+        assert_eq!(ty.as_deref(), Some("VendorError"));
+        assert_eq!(
+            msg.as_deref(),
+            Some("operation error: callback: external failure: denied")
+        );
     }
 
     /// Helper to create a test context with the given checkpoint log.
