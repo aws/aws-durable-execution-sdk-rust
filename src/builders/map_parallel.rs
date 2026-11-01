@@ -938,19 +938,16 @@ impl CompletionConfig {
     }
 
     /// Returns the minimum-success threshold, if set.
-    #[must_use]
     pub fn min_successful(&self) -> Option<usize> {
         self.min_successful
     }
 
     /// Returns the count-based failure tolerance, if set.
-    #[must_use]
     pub fn tolerated_failure_count(&self) -> Option<usize> {
         self.tolerated_failure_count
     }
 
     /// Returns the percentage-based failure tolerance, if set.
-    #[must_use]
     pub fn tolerated_failure_percentage(&self) -> Option<usize> {
         self.tolerated_failure_percentage
     }
@@ -960,7 +957,6 @@ impl CompletionConfig {
     /// The predicate itself is not exposed: its boxing is an implementation
     /// detail, matching how the crate stores other user closures (for
     /// example retry strategies).
-    #[must_use]
     pub fn has_completion_predicate(&self) -> bool {
         self.completion_predicate.is_some()
     }

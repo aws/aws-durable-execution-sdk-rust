@@ -417,13 +417,11 @@ impl SettledOutcome {
     }
 
     /// Returns the item's zero-based position in the original input.
-    #[must_use]
     pub fn index(&self) -> usize {
         self.index
     }
 
     /// Returns whether the item succeeded or failed.
-    #[must_use]
     pub fn status(&self) -> BatchItemStatus {
         self.status
     }
@@ -496,13 +494,11 @@ impl<'a> BatchStats<'a> {
     }
 
     /// Returns the count of committed items that have succeeded so far.
-    #[must_use]
     pub fn succeeded(&self) -> usize {
         self.succeeded
     }
 
     /// Returns the count of committed items that have failed so far.
-    #[must_use]
     pub fn failed(&self) -> usize {
         self.failed
     }
@@ -512,13 +508,11 @@ impl<'a> BatchStats<'a> {
     /// Because outcomes commit strictly in input order, this is also the
     /// length of the committed prefix: the items `0..settled()` are exactly
     /// the ones whose outcomes [`outcomes`](Self::outcomes) holds.
-    #[must_use]
     pub fn settled(&self) -> usize {
         self.succeeded + self.failed
     }
 
     /// Returns the total number of items in the batch.
-    #[must_use]
     pub fn total_items(&self) -> usize {
         self.total_items
     }
@@ -526,7 +520,6 @@ impl<'a> BatchStats<'a> {
     /// Returns the committed per-item settled outcomes, strictly in input
     /// order: the outcome at position `i` belongs to item `i` (see
     /// [`SettledOutcome`] for why the SDK canonicalizes the order).
-    #[must_use]
     pub fn outcomes(&self) -> &'a [SettledOutcome] {
         self.outcomes
     }
@@ -587,7 +580,6 @@ impl<O> BatchResult<O> {
     /// Returns successful results in input order.
     ///
     /// Failed or not-started items are omitted.
-    #[must_use]
     pub fn results(&self) -> Vec<&O> {
         self.items
             .iter()
@@ -602,7 +594,6 @@ impl<O> BatchResult<O> {
     }
 
     /// Returns the count of successes.
-    #[must_use]
     pub fn success_count(&self) -> usize {
         self.items
             .iter()
@@ -611,7 +602,6 @@ impl<O> BatchResult<O> {
     }
 
     /// Returns the count of failures.
-    #[must_use]
     pub fn failure_count(&self) -> usize {
         self.items
             .iter()
@@ -620,7 +610,6 @@ impl<O> BatchResult<O> {
     }
 
     /// Reports whether any item failed.
-    #[must_use]
     pub fn has_failure(&self) -> bool {
         self.items
             .iter()
@@ -629,7 +618,6 @@ impl<O> BatchResult<O> {
 
     /// Returns [`BatchStatus::Succeeded`] if no item failed,
     /// [`BatchStatus::Failed`] otherwise.
-    #[must_use]
     pub fn status(&self) -> BatchStatus {
         if self.has_failure() {
             BatchStatus::Failed
@@ -639,7 +627,6 @@ impl<O> BatchResult<O> {
     }
 
     /// Returns the total number of items that were started.
-    #[must_use]
     pub fn total_count(&self) -> usize {
         self.items.len()
     }
@@ -649,7 +636,6 @@ impl<O> BatchResult<O> {
     /// Each [`BatchError`] carries the failed item's index, display name,
     /// error type identifier, and error message, so a caller can tell
     /// which input produced which failure and what kind of error it was.
-    #[must_use]
     pub fn errors(&self) -> Vec<BatchError<'_>> {
         self.items
             .iter()

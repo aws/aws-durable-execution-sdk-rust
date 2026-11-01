@@ -125,13 +125,11 @@ impl WireError {
 
     /// The wire `ErrorType`: the name of the error type that failed the
     /// operation, as recorded in the execution history.
-    #[must_use]
     pub fn error_type(&self) -> Option<&str> {
         self.error_type.as_deref()
     }
 
     /// The wire `ErrorMessage`: the flattened, human-readable message.
-    #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         self.error_message.as_deref()
     }
@@ -149,7 +147,6 @@ impl WireError {
     /// failure fields; combinator replay decodes it defensively (a
     /// malformed payload falls back to synthetic losers) and only stores
     /// and re-exposes the decoded strings, never branching on them.
-    #[must_use]
     pub fn error_data(&self) -> Option<&str> {
         self.error_data.as_deref()
     }
@@ -158,7 +155,6 @@ impl WireError {
     ///
     /// A Rust [`std::backtrace::Backtrace`] cannot be reconstructed from
     /// recorded frames, so these are store-and-expose only.
-    #[must_use]
     pub fn stack_trace(&self) -> &[String] {
         &self.stack_trace
     }
@@ -220,19 +216,16 @@ impl ReplayedFailure {
     }
 
     /// The recorded wire `ErrorType`.
-    #[must_use]
     pub fn error_type(&self) -> Option<&str> {
         self.wire.error_type()
     }
 
     /// The recorded wire `ErrorMessage`.
-    #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         self.wire.error_message()
     }
 
     /// The full recorded wire failure record.
-    #[must_use]
     pub fn wire(&self) -> &WireError {
         &self.wire
     }
@@ -348,13 +341,11 @@ impl TypedError {
     }
 
     /// The wire `ErrorType` recorded for this error.
-    #[must_use]
     pub fn error_type(&self) -> &str {
         &self.error_type
     }
 
     /// The wrapped error.
-    #[must_use]
     pub fn inner(&self) -> &(dyn Error + 'static) {
         &*self.inner
     }
@@ -652,20 +643,17 @@ impl OperationError {
     ///     assert!(matches!(step_err.kind(), StepErrorKind::ExecutionFailed { .. }));
     /// }
     /// ```
-    #[must_use]
     pub fn kind(&self) -> &OperationErrorKind {
         &self.kind
     }
 
     /// The wire ID of the operation that failed, when known.
-    #[must_use]
     pub fn operation_id(&self) -> Option<&str> {
         self.context.as_ref()?.operation_id.as_deref()
     }
 
     /// The operation's wire status (for example `FAILED` or `TIMED_OUT`),
     /// when known.
-    #[must_use]
     pub fn status(&self) -> Option<&str> {
         self.context.as_ref()?.status.as_deref()
     }
@@ -676,7 +664,6 @@ impl OperationError {
     /// execution history; on a live failure it is the record the SDK
     /// wrote. `None` for errors that never reached the wire (for example
     /// a serialization failure before checkpointing).
-    #[must_use]
     pub fn wire(&self) -> Option<&WireError> {
         self.context.as_ref()?.wire.as_ref()
     }
@@ -859,7 +846,6 @@ pub struct StepError {
 
 impl StepError {
     /// Returns the specific kind of step error.
-    #[must_use]
     pub fn kind(&self) -> &StepErrorKind {
         &self.kind
     }
@@ -945,7 +931,6 @@ impl RetriesExhausted {
     }
 
     /// The number of attempts made before giving up.
-    #[must_use]
     pub fn attempts(&self) -> u32 {
         self.attempts
     }
@@ -984,7 +969,6 @@ pub struct WaitError {
 
 impl WaitError {
     /// Returns the specific kind of wait error.
-    #[must_use]
     pub fn kind(&self) -> &WaitErrorKind {
         &self.kind
     }
@@ -1058,7 +1042,6 @@ impl UnexpectedStatus {
     }
 
     /// The unexpected status found in the checkpoint log.
-    #[must_use]
     pub fn status(&self) -> &str {
         &self.status
     }
@@ -1093,7 +1076,6 @@ pub struct InvokeError {
 
 impl InvokeError {
     /// Returns the specific kind of invoke error.
-    #[must_use]
     pub fn kind(&self) -> &InvokeErrorKind {
         &self.kind
     }
@@ -1177,7 +1159,6 @@ impl FunctionNotFound {
     }
 
     /// The function identifier that was not found.
-    #[must_use]
     pub fn function_id(&self) -> &str {
         &self.function_id
     }
@@ -1222,7 +1203,6 @@ pub struct CallbackError {
 
 impl CallbackError {
     /// Returns the specific kind of callback error.
-    #[must_use]
     pub fn kind(&self) -> &CallbackErrorKind {
         &self.kind
     }
@@ -1328,7 +1308,6 @@ pub struct WaitForConditionError {
 
 impl WaitForConditionError {
     /// Returns the specific kind of wait-for-condition error.
-    #[must_use]
     pub fn kind(&self) -> &WaitForConditionErrorKind {
         &self.kind
     }
@@ -1403,7 +1382,6 @@ impl MaxChecksExceeded {
     }
 
     /// The number of checks performed.
-    #[must_use]
     pub fn checks(&self) -> u32 {
         self.checks
     }
@@ -1435,7 +1413,6 @@ pub struct ChildContextError {
 
 impl ChildContextError {
     /// Returns the specific kind of child context error.
-    #[must_use]
     pub fn kind(&self) -> &ChildContextErrorKind {
         &self.kind
     }
@@ -1529,7 +1506,6 @@ impl CombinatorError {
     }
 
     /// Returns the specific kind of combinator error.
-    #[must_use]
     pub fn kind(&self) -> &CombinatorErrorKind {
         &self.kind
     }
@@ -1541,7 +1517,6 @@ impl CombinatorError {
     /// losing error; for [`CombinatorErrorKind::AllFailed`] it holds every
     /// loser in input order. After a replay, each entry is a
     /// [`ReplayedFailure`] rebuilt from the recorded wire fields.
-    #[must_use]
     pub fn failures(&self) -> &[Box<dyn Error + Send + Sync + 'static>] {
         &self.failures
     }
@@ -1635,7 +1610,6 @@ impl JoinFailed {
     }
 
     /// The index of the first failed future in the combinator's input.
-    #[must_use]
     pub fn failed_index(&self) -> usize {
         self.failed_index
     }
@@ -1692,7 +1666,6 @@ pub struct NonDeterministicExecutionError {
 
 impl NonDeterministicExecutionError {
     /// Returns the specific kind of non-determinism error.
-    #[must_use]
     pub fn kind(&self) -> &NonDeterministicExecutionErrorKind {
         &self.kind
     }
@@ -1780,19 +1753,16 @@ impl OperationMismatch {
     }
 
     /// The wire ID (SHA-256 hex) of the positional slot that mismatched.
-    #[must_use]
     pub fn wire_id(&self) -> &str {
         &self.wire_id
     }
 
     /// Human-readable description of what the checkpoint log expected.
-    #[must_use]
     pub fn expected(&self) -> &str {
         &self.expected
     }
 
     /// Human-readable description of what the handler claimed.
-    #[must_use]
     pub fn actual(&self) -> &str {
         &self.actual
     }
@@ -1829,13 +1799,11 @@ impl UnrecognizedStatus {
 
     /// The wire ID (SHA-256 hex) of the operation whose record carries the
     /// unrecognized status.
-    #[must_use]
     pub fn wire_id(&self) -> &str {
         &self.wire_id
     }
 
     /// The raw status value the service reported, verbatim.
-    #[must_use]
     pub fn status(&self) -> &str {
         &self.status
     }

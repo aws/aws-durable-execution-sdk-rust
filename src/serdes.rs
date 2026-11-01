@@ -370,19 +370,16 @@ impl SerdesContext {
     }
 
     /// Returns the operation ID.
-    #[must_use]
     pub fn operation_id(&self) -> &str {
         &self.operation_id
     }
 
     /// Returns the durable execution ARN.
-    #[must_use]
     pub fn durable_execution_arn(&self) -> &str {
         &self.durable_execution_arn
     }
 
     /// Returns where the payload being deserialized came from.
-    #[must_use]
     pub fn origin(&self) -> PayloadOrigin {
         self.origin
     }

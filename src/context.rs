@@ -1604,7 +1604,6 @@ impl DurableContext {
     ///     Ok(())
     /// }
     /// ```
-    #[must_use]
     pub fn execution_arn(&self) -> &str {
         &self.inner.execution_arn
     }
@@ -1628,7 +1627,6 @@ impl DurableContext {
     ///     Ok(())
     /// }
     /// ```
-    #[must_use]
     pub fn lambda_context(&self) -> &lambda_runtime::Context {
         &self.inner.lambda_context
     }
@@ -1658,7 +1656,6 @@ impl DurableContext {
     ///     Ok(())
     /// }
     /// ```
-    #[must_use]
     pub fn is_replaying(&self) -> bool {
         self.inner.engine.is_replaying()
     }
@@ -2287,7 +2284,6 @@ impl StepContext {
 
     /// Returns the current attempt number, starting at 1 for the first
     /// attempt.
-    #[must_use]
     pub fn attempt(&self) -> u32 {
         self.attempt
     }

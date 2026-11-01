@@ -266,33 +266,28 @@ impl RetryStrategyConfig {
     }
 
     /// Returns the total number of attempts (initial attempt plus retries).
-    #[must_use]
     pub fn max_attempts(&self) -> u32 {
         self.max_attempts
     }
 
     /// Returns the delay before the first retry, prior to jitter.
-    #[must_use]
     pub fn initial_delay(&self) -> Duration {
         self.initial_delay
     }
 
     /// Returns the upper bound on the computed backoff delay, prior to
     /// jitter.
-    #[must_use]
     pub fn max_delay(&self) -> Duration {
         self.max_delay
     }
 
     /// Returns the multiplier applied to the delay after each failed
     /// attempt.
-    #[must_use]
     pub fn backoff_rate(&self) -> f64 {
         self.backoff_rate
     }
 
     /// Returns the jitter applied to each computed delay.
-    #[must_use]
     pub fn jitter(&self) -> JitterStrategy {
         self.jitter
     }

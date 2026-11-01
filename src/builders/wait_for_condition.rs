@@ -434,31 +434,26 @@ impl<S> WaitStrategy<S> {
 
     /// Returns the total number of checks allowed before the operation
     /// exhausts.
-    #[must_use]
     pub fn max_attempts(&self) -> u32 {
         self.max_attempts
     }
 
     /// Returns the initial delay between condition checks.
-    #[must_use]
     pub fn initial_delay(&self) -> Duration {
         self.initial_delay
     }
 
     /// Returns the maximum delay between condition checks.
-    #[must_use]
     pub fn max_delay(&self) -> Duration {
         self.max_delay
     }
 
     /// Returns the backoff multiplier applied after each check.
-    #[must_use]
     pub fn backoff_rate(&self) -> f64 {
         self.backoff_rate
     }
 
     /// Returns the jitter applied to each computed delay.
-    #[must_use]
     pub fn jitter(&self) -> crate::builders::JitterStrategy {
         self.jitter
     }

@@ -513,7 +513,6 @@ impl<O: Send + 'static> Branch<O> {
     }
 
     /// Returns the branch name.
-    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -610,7 +609,6 @@ impl<O: Send + 'static> Callback<O> {
     ///     Ok(())
     /// }
     /// ```
-    #[must_use]
     pub fn id(&self) -> &str {
         &self.id
     }

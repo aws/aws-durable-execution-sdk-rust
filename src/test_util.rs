@@ -176,58 +176,49 @@ pub struct TestOperation {
 
 impl TestOperation {
     /// The operation's wire ID (the SHA-256 hex of its positional path).
-    #[must_use]
     pub fn id(&self) -> &str {
         &self.id
     }
 
     /// The operation type, e.g. `"Step"`, `"Wait"`, `"Context"`,
     /// `"Callback"`.
-    #[must_use]
     pub fn op_type(&self) -> &str {
         &self.op_type
     }
 
     /// The operation sub-type, e.g. `"Step"`, `"Wait"`, `"Map"`,
     /// `"WaitForCondition"`, or `None` if the operation carried none.
-    #[must_use]
     pub fn sub_type(&self) -> Option<&str> {
         self.sub_type.as_deref()
     }
 
     /// The terminal-or-current status, e.g. `"Succeeded"`, `"Failed"`,
     /// `"Pending"`, `"TimedOut"`.
-    #[must_use]
     pub fn status(&self) -> &str {
         &self.status
     }
 
     /// Returns `true` if the operation completed successfully.
-    #[must_use]
     pub fn succeeded(&self) -> bool {
         self.status == "Succeeded"
     }
 
     /// Returns `true` if the operation ended in a failed status.
-    #[must_use]
     pub fn failed(&self) -> bool {
         self.status == "Failed"
     }
 
     /// The serialized result payload, if the operation stored one.
-    #[must_use]
     pub fn result(&self) -> Option<&str> {
         self.result.as_deref()
     }
 
     /// The recorded error type, if the operation failed.
-    #[must_use]
     pub fn error_type(&self) -> Option<&str> {
         self.error_type.as_deref()
     }
 
     /// The recorded error message, if the operation failed.
-    #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         self.error_message.as_deref()
     }
@@ -235,13 +226,11 @@ impl TestOperation {
     /// The number of completed retries recorded for this operation
     /// (`0` when never retried). [`LocalRunner`] and [`CloudRunner`] report
     /// this value identically.
-    #[must_use]
     pub fn attempt(&self) -> u32 {
         self.attempt
     }
 
     /// The operation's caller-assigned name, if any.
-    #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
@@ -293,13 +282,11 @@ pub struct TestResult<O> {
 
 impl<O> TestResult<O> {
     /// Returns `true` if the handler completed successfully.
-    #[must_use]
     pub fn is_success(&self) -> bool {
         self.disposition == Disposition::Succeeded
     }
 
     /// Returns `true` if the handler returned an error.
-    #[must_use]
     pub fn is_failure(&self) -> bool {
         self.disposition == Disposition::Failed
     }
@@ -307,13 +294,11 @@ impl<O> TestResult<O> {
     /// Returns `true` if the handler suspended and never reached a terminal
     /// outcome within the invocation budget (e.g. it awaits a callback the
     /// test never delivered, or it never terminates).
-    #[must_use]
     pub fn is_suspended(&self) -> bool {
         self.disposition == Disposition::Suspended
     }
 
     /// The deserialized handler output on success, or `None` otherwise.
-    #[must_use]
     pub fn output(&self) -> Option<&O> {
         self.output.as_ref()
     }
@@ -325,19 +310,16 @@ impl<O> TestResult<O> {
     }
 
     /// The wire error type on failure (e.g. `"StepError"`), or `None`.
-    #[must_use]
     pub fn error_type(&self) -> Option<&str> {
         self.error_type.as_deref()
     }
 
     /// The wire error message on failure, or `None`.
-    #[must_use]
     pub fn error_message(&self) -> Option<&str> {
         self.error_message.as_deref()
     }
 
     /// The recorded operation history, in first-checkpoint order.
-    #[must_use]
     pub fn operations(&self) -> &[TestOperation] {
         &self.operations
     }
@@ -347,7 +329,6 @@ impl<O> TestResult<O> {
     /// For [`LocalRunner`] this is the count of simulated invocations; for
     /// [`CloudRunner`] it is the number of recorded `InvocationCompleted`
     /// events (falling back to the poll count when none are recorded).
-    #[must_use]
     pub fn invocation_count(&self) -> usize {
         self.invocations
     }

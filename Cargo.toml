@@ -81,6 +81,15 @@ multiple_crate_versions = { level = "allow", priority = 1 }
 # serverless category; the aws-sdk crates ship without registry metadata
 # for the same reason). Keywords are still set voluntarily in [package].
 cargo_common_metadata = { level = "allow", priority = 1 }
+# `#[must_use]` goes on constructors, builders, futures, consuming
+# transformations, conversions (`as_*`, `to_*`, `into_*`) and decisions:
+# a value whose drop is almost always a bug. It does not go on a passive
+# getter, which returns a field or a read-only view of fields, because
+# calling it again gives the same value. It does not go on a function
+# whose return type is already must-use, such as `Result`
+# (`clippy::double_must_use` rejects that). This lint would ask for the
+# attribute on every getter, so it is allowed (#54).
+must_use_candidate = { level = "allow", priority = 1 }
 # Panic-policy restriction lints (not covered by all/pedantic; added explicitly).
 # A panic in the SDK kills the customer's Lambda invocation.
 unwrap_used = "deny"
