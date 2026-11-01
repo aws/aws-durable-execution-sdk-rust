@@ -346,6 +346,60 @@ pub trait ExecutionClient: Send + Sync {
 /// The page size of a `GetDurableExecutionState` request, as in JS.
 const GET_STATE_MAX_ITEMS: i32 = 1000;
 
+/// The token the SDK adds to the `User-Agent` header of its own requests.
+///
+/// The name is a literal because the crate is named
+/// `aws-durable-execution-sdk`, and the durable execution SDKs for the other
+/// languages send `aws-durable-execution-sdk-<language>/<version>`. The
+/// version is the crate version, so the token always matches it.
+const USER_AGENT_TOKEN: &str =
+    concat!("aws-durable-execution-sdk-rust/", env!("CARGO_PKG_VERSION"));
+
+/// Appends [`USER_AGENT_TOKEN`] to the `User-Agent` header of one request.
+///
+/// The AWS SDK writes `User-Agent` in `modify_before_signing`. This
+/// interceptor runs later, in `modify_before_transmit`. `SigV4` leaves
+/// `user-agent` out of the signature, so the change keeps the signature
+/// valid. The runtime rewinds the request before each retry attempt, so
+/// each attempt appends the token once to a freshly written header.
+///
+/// `framework_metadata` on the client config is not used, because it
+/// writes the token with a `lib/` prefix.
+#[derive(Debug)]
+struct UserAgentTokenInterceptor;
+
+impl aws_sdk_lambda::config::Intercept for UserAgentTokenInterceptor {
+    fn name(&self) -> &'static str {
+        "UserAgentTokenInterceptor"
+    }
+
+    fn modify_before_transmit(
+        &self,
+        context: &mut aws_sdk_lambda::config::interceptors::BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &aws_sdk_lambda::config::RuntimeComponents,
+        _cfg: &mut aws_sdk_lambda::config::ConfigBag,
+    ) -> Result<(), aws_sdk_lambda::error::BoxError> {
+        let headers = context.request_mut().headers_mut();
+        let value = user_agent_with_token(headers.get("user-agent"));
+        // `insert` replaces the value. `append` would add a second
+        // `User-Agent` header. The value is the current valid header value,
+        // a space and an ASCII token, so it is a valid header value.
+        headers.insert("user-agent", value);
+        Ok(())
+    }
+}
+
+/// Returns `current` followed by a space and [`USER_AGENT_TOKEN`], or the
+/// token alone when the request has no `User-Agent` header. The AWS SDK
+/// always writes the header, but an interceptor on a caller's client can
+/// remove it.
+fn user_agent_with_token(current: Option<&str>) -> String {
+    match current {
+        Some(current) => format!("{current} {USER_AGENT_TOKEN}"),
+        None => USER_AGENT_TOKEN.to_owned(),
+    }
+}
+
 /// The transport the SDK uses when `execution_client` is not set. Wrap it
 /// to decorate the default.
 ///
@@ -357,6 +411,11 @@ const GET_STATE_MAX_ITEMS: i32 = 1000;
 /// handler, which is the recovery path: longer in-process retry would
 /// only delay it. Callers who need a different retry policy supply a
 /// preconfigured client.
+///
+/// Every request it sends carries the token
+/// `aws-durable-execution-sdk-rust/<version>` as one more space-separated
+/// part of its `User-Agent` header, where `<version>` is the crate version.
+/// The token is added to each request, so the wrapped client is not changed.
 ///
 /// Every final error carries the final `SdkError` as its
 /// [`source`](std::error::Error::source).
@@ -414,6 +473,8 @@ impl ExecutionClient for LambdaExecutionClient {
                 .durable_execution_arn(&arn)
                 .checkpoint_token(&token)
                 .set_updates(Some(updates))
+                .customize()
+                .interceptor(UserAgentTokenInterceptor)
                 .send()
                 .await;
 
@@ -462,6 +523,8 @@ impl ExecutionClient for LambdaExecutionClient {
                 .checkpoint_token(&token)
                 .set_marker(marker)
                 .max_items(GET_STATE_MAX_ITEMS)
+                .customize()
+                .interceptor(UserAgentTokenInterceptor)
                 .send()
                 .await
                 .map_err(classify_get_state_error)?;
@@ -1795,7 +1858,11 @@ mod tests {
 
         let (input, markers) = resolve_input_from_pages(vec![
             ("m-1", vec![make_step_op("s1", "1")], Some("m-2")),
-            ("m-2", vec![make_execution_op("execution", None)], Some("m-3")),
+            (
+                "m-2",
+                vec![make_execution_op("execution", None)],
+                Some("m-3"),
+            ),
             (
                 "m-3",
                 vec![make_execution_op("late", Some(r#"{"late":1}"#))],
@@ -2921,5 +2988,233 @@ mod tests {
                 Some(ident)
             })
             .collect()
+    }
+
+    // User-Agent token
+    //
+    // These tests send requests through `LambdaExecutionClient` over a
+    // `StaticReplayClient`, which records the headers of every attempt.
+    // They build the expected token from the literal and the crate version,
+    // not from `USER_AGENT_TOKEN`, so a wrong constant fails them.
+
+    use aws_sdk_lambda::config::{AppName, BehaviorVersion, Credentials, Region};
+    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+    use aws_smithy_types::retry::RetryConfig;
+
+    fn expected_token() -> String {
+        format!(
+            "aws-durable-execution-sdk-rust/{}",
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+
+    fn replay_event(status: u16, body: &'static str) -> ReplayEvent {
+        let response = HttpResponse::new(
+            StatusCode::try_from(status).expect("valid status"),
+            SdkBody::from(body),
+        );
+        ReplayEvent::new(HttpRequest::new(SdkBody::empty()), response)
+    }
+
+    /// Builds a `LambdaExecutionClient` over `http`, with a near-zero retry
+    /// backoff so the retry test does not sleep.
+    fn replay_lambda_client(
+        http: &StaticReplayClient,
+        app_name: Option<AppName>,
+    ) -> LambdaExecutionClient {
+        let mut config = aws_sdk_lambda::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("akid", "secret", None, None, "test"))
+            .retry_config(
+                RetryConfig::standard().with_initial_backoff(std::time::Duration::from_millis(1)),
+            )
+            .http_client(http.clone());
+        config.set_app_name(app_name);
+        LambdaExecutionClient::new(aws_sdk_lambda::Client::from_conf(config.build()))
+    }
+
+    /// The `User-Agent` values of every recorded attempt, one entry per
+    /// header, so a request with two `User-Agent` headers is visible.
+    fn user_agent_headers(http: &StaticReplayClient) -> Vec<Vec<String>> {
+        http.actual_requests()
+            .map(|req| {
+                req.headers()
+                    .get_all("user-agent")
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Asserts criterion 1 on one attempt: exactly one `User-Agent` header,
+    /// and exactly one of its space-separated parts equals the token.
+    fn assert_one_token(headers: &[String]) {
+        assert_eq!(
+            headers.len(),
+            1,
+            "exactly one User-Agent header: {headers:?}"
+        );
+        let value = headers.first().expect("one header");
+        let token = expected_token();
+        let count = value.split(' ').filter(|part| *part == token).count();
+        assert_eq!(count, 1, "exactly one {token} part in {value:?}");
+    }
+
+    #[tokio::test]
+    async fn user_agent_token_on_checkpoint() {
+        let http = StaticReplayClient::new(vec![replay_event(200, r#"{"CheckpointToken":"t-1"}"#)]);
+        let client = replay_lambda_client(&http, None);
+
+        let output = client
+            .checkpoint("arn:test", "tok", Vec::new())
+            .await
+            .expect("replayed checkpoint succeeds");
+        assert_eq!(output.checkpoint_token(), Some("t-1"));
+
+        let attempts = user_agent_headers(&http);
+        assert_eq!(attempts.len(), 1);
+        for headers in &attempts {
+            assert_one_token(headers);
+        }
+    }
+
+    #[tokio::test]
+    async fn user_agent_token_on_get_state() {
+        let http = StaticReplayClient::new(vec![replay_event(200, r#"{"Operations":[]}"#)]);
+        let client = replay_lambda_client(&http, None);
+
+        let output = client
+            .get_state("arn:test", "tok", None)
+            .await
+            .expect("replayed state read succeeds");
+        assert_eq!(output.next_marker(), None);
+
+        let attempts = user_agent_headers(&http);
+        assert_eq!(attempts.len(), 1, "one get_state call sends one request");
+        for headers in &attempts {
+            assert_one_token(headers);
+        }
+    }
+
+    #[tokio::test]
+    async fn user_agent_token_once_per_retry_attempt() {
+        let http = StaticReplayClient::new(vec![
+            replay_event(503, "{}"),
+            replay_event(200, r#"{"CheckpointToken":"t-1"}"#),
+        ]);
+        let client = replay_lambda_client(&http, None);
+
+        client
+            .checkpoint("arn:test", "tok", Vec::new())
+            .await
+            .expect("the retry succeeds");
+
+        let attempts = user_agent_headers(&http);
+        assert_eq!(attempts.len(), 2, "the 503 is retried once");
+        for headers in &attempts {
+            assert_one_token(headers);
+        }
+    }
+
+    #[tokio::test]
+    async fn user_agent_keeps_app_name() {
+        let http = StaticReplayClient::new(vec![replay_event(200, r#"{"CheckpointToken":"t-1"}"#)]);
+        let app_name = AppName::new("my-app").expect("valid app name");
+        let client = replay_lambda_client(&http, Some(app_name));
+
+        client
+            .checkpoint("arn:test", "tok", Vec::new())
+            .await
+            .expect("replayed checkpoint succeeds");
+
+        let token = expected_token();
+        let requests: Vec<_> = http.actual_requests().collect();
+        assert_eq!(requests.len(), 1);
+        for req in requests {
+            let user_agent = req.headers().get("user-agent").expect("User-Agent header");
+            assert!(
+                user_agent.split(' ').any(|part| part == "app/my-app"),
+                "the app name stays in {user_agent:?}"
+            );
+            let amz_user_agent = req
+                .headers()
+                .get("x-amz-user-agent")
+                .expect("x-amz-user-agent header");
+            assert!(
+                !amz_user_agent.contains(&token),
+                "x-amz-user-agent stays unchanged: {amz_user_agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_agent_with_token_appends_or_starts() {
+        let token = expected_token();
+        assert_eq!(
+            user_agent_with_token(Some("aws-sdk-rust/1.3.0 os/linux")),
+            format!("aws-sdk-rust/1.3.0 os/linux {token}")
+        );
+        assert_eq!(user_agent_with_token(None), token);
+    }
+
+    /// A number with no leading zero.
+    fn is_version_number(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'))
+    }
+
+    /// `X.Y.Z`, optionally followed by `-alpha`, `-beta` or `-rc` and an
+    /// optional `.N`, with no leading zero in any number.
+    fn has_supported_version_form(version: &str) -> bool {
+        let (core, pre_release) = match version.split_once('-') {
+            Some((core, pre_release)) => (core, Some(pre_release)),
+            None => (version, None),
+        };
+        let numbers: Vec<&str> = core.split('.').collect();
+        if numbers.len() != 3 || !numbers.iter().all(|n| is_version_number(n)) {
+            return false;
+        }
+        let Some(pre_release) = pre_release else {
+            return true;
+        };
+        let (label, number) = match pre_release.split_once('.') {
+            Some((label, number)) => (label, Some(number)),
+            None => (pre_release, None),
+        };
+        matches!(label, "alpha" | "beta" | "rc") && number.is_none_or(is_version_number)
+    }
+
+    #[test]
+    fn crate_version_has_the_supported_form() {
+        for version in [
+            "0.1.0",
+            "1.0.0",
+            "1.1.0-alpha",
+            "1.1.0-beta.2",
+            "1.1.0-rc.1",
+        ] {
+            assert!(has_supported_version_form(version), "{version} must fit");
+        }
+        for version in [
+            "1.0.0-rc1",
+            "1.0.0-preview",
+            "1.0.0-RC.1",
+            "1.0.0+build.1",
+            "v1.0.0",
+            "1.0",
+            "01.0.0",
+            "1.0.0-rc.01",
+        ] {
+            assert!(
+                !has_supported_version_form(version),
+                "{version} must not fit"
+            );
+        }
+        assert!(
+            has_supported_version_form(env!("CARGO_PKG_VERSION")),
+            "the crate version {} has an unsupported form",
+            env!("CARGO_PKG_VERSION")
+        );
     }
 }

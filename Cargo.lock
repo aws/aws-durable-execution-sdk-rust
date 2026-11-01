@@ -109,6 +109,7 @@ dependencies = [
  "aws-config",
  "aws-durable-execution-sdk",
  "aws-sdk-lambda",
+ "aws-smithy-http-client",
  "aws-smithy-mocks",
  "aws-smithy-runtime-api",
  "aws-smithy-types",

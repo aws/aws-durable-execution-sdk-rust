@@ -49,7 +49,11 @@ impl std::error::Error for OptionsValidationError {}
 /// retry policy, timeouts, endpoint, credentials, build the client (or an
 /// `aws_config::SdkConfig`) yourself and supply it via
 /// [`lambda_client`](OptionsBuilder::lambda_client) (or
-/// [`sdk_config`](OptionsBuilder::sdk_config)); the SDK uses it as-is.
+/// [`sdk_config`](OptionsBuilder::sdk_config)). The SDK uses that client's
+/// configuration unchanged, with one addition: it adds the token
+/// `aws-durable-execution-sdk-rust/<version>` to the `User-Agent` header of
+/// each of its own requests, including requests sent through a client you
+/// supply. `<version>` is the crate version.
 ///
 /// To replace the transport itself, supply an
 /// [`ExecutionClient`](crate::ExecutionClient) via
@@ -215,6 +219,11 @@ impl OptionsBuilder {
     /// a 55 s attempt timeout. A client built from a config supplied here
     /// keeps the config's own timeouts, and the SDK adds none.
     ///
+    /// The SDK adds the token `aws-durable-execution-sdk-rust/<version>` to
+    /// the `User-Agent` header of each of its own requests sent through the
+    /// client it builds from this config, where `<version>` is the crate
+    /// version.
+    ///
     /// The parameter type is re-exported at the crate root as
     /// [`SdkConfig`](crate::SdkConfig), so callers can name it without
     /// depending on `aws-config` directly.
@@ -251,7 +260,12 @@ impl OptionsBuilder {
     /// This is the supported path for customizing how the SDK talks to the
     /// durable execution service: configure retry, timeouts, endpoint, or
     /// credentials on the client (or use
-    /// [`sdk_config`](Self::sdk_config)) and the SDK uses it verbatim.
+    /// [`sdk_config`](Self::sdk_config)) and the SDK uses its
+    /// configuration unchanged. The SDK adds the token
+    /// `aws-durable-execution-sdk-rust/<version>` to the `User-Agent` header
+    /// of each of its own requests sent through this client, where
+    /// `<version>` is the crate version. It adds the token to each request,
+    /// so the client itself is not changed.
     /// Transient-failure retry of the service calls is the client's own
     /// standard retry; the SDK adds no retry layer of its own.
     ///
@@ -294,6 +308,11 @@ impl OptionsBuilder {
     /// together with [`lambda_client`](Self::lambda_client) or
     /// [`sdk_config`](Self::sdk_config): [`build`](Self::build) rejects
     /// that combination.
+    ///
+    /// The transport owns its own request headers. The SDK adds its
+    /// `User-Agent` token only to requests that
+    /// [`LambdaExecutionClient`](crate::LambdaExecutionClient) sends, so a
+    /// transport that wraps it keeps the token.
     ///
     /// # Examples
     ///
