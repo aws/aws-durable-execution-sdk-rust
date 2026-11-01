@@ -168,6 +168,7 @@ pub mod lambda_types {
 
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+use std::time::Duration;
 use tracing::Instrument as _;
 
 /// Boxed error type: `Box<dyn std::error::Error + Send + Sync>`.
@@ -215,7 +216,7 @@ pub enum RetryDecision {
     /// Retry after the specified delay.
     Retry {
         /// Duration to wait before retrying.
-        delay: std::time::Duration,
+        delay: Duration,
     },
     /// Do not retry; propagate the error.
     Stop,
@@ -440,43 +441,68 @@ fn parse_envelope(
     }))
 }
 
-/// Extracts the customer's original event from the durable invocation
-/// envelope.
+/// Reads the input payload of the inline EXECUTION operation.
 ///
-/// The service embeds the customer payload in
-/// `InitialExecutionState.Operations[0].ExecutionDetails.InputPayload`
-/// as a JSON string.
+/// The service embeds the customer payload as a JSON string in
+/// `ExecutionDetails.InputPayload` of the EXECUTION operation in
+/// `InitialExecutionState.Operations`. This function reads the first
+/// operation of that list whose `Type` is `EXECUTION`.
 ///
-/// The envelope is always required: [`run`] and [`wrap`] reject an
-/// envelope-free payload before reaching this function, and there is no
-/// raw-payload fallback. Local testing goes through
-/// [`LocalRunner`](test_util::LocalRunner), which invokes the
-/// [`wrap`]-produced service with synthesized envelopes, so this function
-/// runs on the local path exactly as it does in production.
-fn extract_customer_input<E>(payload: &serde_json::Value) -> Result<E, lambda_runtime::Error>
-where
-    E: for<'de> Deserialize<'de>,
-{
-    let input_str = payload
+/// - No such operation returns `Ok(None)`. The operation may be on a later
+///   page, which [`client::resolve_bootstrap_log`] fetches.
+/// - An absent or JSON `null` `InputPayload` returns `Ok(Some(None))`.
+/// - A string `InputPayload` returns `Ok(Some(Some(value)))`.
+/// - Any other `InputPayload` fails the invocation. So a malformed
+///   envelope fails before pagination or the handler runs.
+fn inline_input_payload(
+    payload: &serde_json::Value,
+) -> Result<Option<Option<String>>, lambda_runtime::Error> {
+    let execution_op = payload
         .get("InitialExecutionState")
         .and_then(|s| s.get("Operations"))
         .and_then(serde_json::Value::as_array)
-        .and_then(|ops| ops.first())
-        .and_then(|op| op.get("ExecutionDetails"))
+        .and_then(|ops| {
+            ops.iter().find(|op| {
+                op.get("Type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("EXECUTION"))
+            })
+        });
+    let Some(op) = execution_op else {
+        return Ok(None);
+    };
+    match op
+        .get("ExecutionDetails")
         .and_then(|d| d.get("InputPayload"))
-        .and_then(serde_json::Value::as_str);
-
-    if let Some(input_json) = input_str {
-        // InputPayload is a JSON string: parse the customer's event from it.
-        serde_json::from_str(input_json)
-            .map_err(|e| lambda_runtime::Error::from(format!("deserialize customer input: {e}")))
-    } else {
-        Err(lambda_runtime::Error::from(
-            "malformed invocation envelope: could not extract customer input from \
-             InitialExecutionState.Operations[0].ExecutionDetails.InputPayload"
-                .to_owned(),
-        ))
+    {
+        None | Some(serde_json::Value::Null) => Ok(Some(None)),
+        Some(serde_json::Value::String(value)) => Ok(Some(Some(value.clone()))),
+        Some(_) => Err(lambda_runtime::Error::from(
+            "malformed invocation envelope: InputPayload is not a string".to_owned(),
+        )),
     }
+}
+
+/// Parses the customer's original event from the execution input payload.
+///
+/// `input_payload` is the `InputPayload` of the first EXECUTION operation
+/// of the whole execution state, which [`client::resolve_bootstrap_log`]
+/// returns after it follows the pagination marker. An absent payload parses
+/// as `{}`, as the JS SDK does. A payload that does not parse fails the
+/// invocation.
+///
+/// The envelope is always required: [`run`] and [`wrap`] reject an
+/// envelope-free payload in `parse_envelope`, before this function runs.
+/// Local testing goes through [`LocalRunner`](test_util::LocalRunner),
+/// which invokes the [`wrap`]-produced service with synthesized envelopes,
+/// so this function runs on the local path exactly as it does in
+/// production.
+fn extract_customer_input<E>(input_payload: Option<&str>) -> Result<E, lambda_runtime::Error>
+where
+    E: for<'de> Deserialize<'de>,
+{
+    serde_json::from_str(input_payload.unwrap_or("{}"))
+        .map_err(|e| lambda_runtime::Error::from(format!("deserialize customer input: {e}")))
 }
 
 /// Derives the wire failure record from a handler-level `BoxError`.
@@ -853,7 +879,7 @@ where
     // off without a delay means immediate writes.
     let checkpoint_buffer_window = match (checkpoint_delay, checkpoint_batching) {
         (Some(delay), _) => Some(delay),
-        (None, true) => Some(std::time::Duration::ZERO),
+        (None, true) => Some(Duration::ZERO),
         (None, false) => None,
     };
     // A supplied transport replaces the Lambda transport; `build()` already
@@ -877,7 +903,7 @@ where
 fn wrap_with_provider<F, E, Fut, O>(
     handler: F,
     provider: ClientProvider,
-    checkpoint_buffer_window: Option<std::time::Duration>,
+    checkpoint_buffer_window: Option<Duration>,
 ) -> impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture + Send + Sync
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
@@ -910,10 +936,9 @@ where
             let execution_arn = envelope.execution_arn;
             let checkpoint_token = envelope.checkpoint_token;
 
-            let customer_input: E = extract_customer_input(&raw_payload)?;
-
-            // Parse the initial execution state into a checkpoint log,
-            // then paginate if the backend indicates more pages.
+            // Read the inline input and the inline page. A non-string
+            // `InputPayload` fails here, before pagination or the handler.
+            let first_page_input = inline_input_payload(&raw_payload)?;
             let (checkpoint_log, initial_marker) = parse_inline_operations(&raw_payload);
 
             // Reuse the execution client resolved once at wrap time (built
@@ -926,16 +951,17 @@ where
             // re-invokes. A non-retryable error (a KMS misconfiguration)
             // fails the same way on every invocation, so it fails the
             // execution before the handler runs, as in JS.
-            let checkpoint_log = match client::resolve_bootstrap_log(
+            let (checkpoint_log, input_payload) = match client::resolve_bootstrap_log(
                 exec_client.as_ref(),
                 &execution_arn,
                 &checkpoint_token,
                 checkpoint_log,
+                first_page_input,
                 initial_marker.as_deref(),
             )
             .await
             {
-                Ok(log) => StdArc::new(log),
+                Ok((log, input_payload)) => (StdArc::new(log), input_payload),
                 Err(e) if e.is_retryable() => {
                     return Err(lambda_runtime::Error::from(format!(
                         "failed to paginate initial state: {e}"
@@ -948,6 +974,10 @@ where
                     )));
                 }
             };
+
+            // The input is parsed after pagination, because it may be on a
+            // later page. An absent payload parses as `{}`.
+            let customer_input: E = extract_customer_input(input_payload.as_deref())?;
 
             let ctx = DurableContext::new_root_with_client_and_defaults(
                 execution_arn,
@@ -1210,6 +1240,38 @@ pub(crate) fn base_lambda_client_from_options(
     }
 }
 
+/// Connect timeout of the Lambda client the SDK builds by default, as in
+/// the JS SDK.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read timeout of the Lambda client the SDK builds by default, as in the
+/// JS SDK.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(50);
+/// Attempt timeout of the Lambda client the SDK builds by default, as the
+/// JS SDK's request timeout.
+const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(55);
+
+/// Builds the Lambda client the SDK uses when the caller supplies neither
+/// a client nor a config.
+///
+/// The client takes every setting from `config` and adds three timeouts.
+/// A read timeout restarts on every byte received, so it does not bound a
+/// response that arrives slowly. The attempt timeout bounds it. So a lost
+/// or slow checkpoint response fails the call after 55 s, rather than
+/// blocking until the Lambda function times out.
+fn default_lambda_client(config: &SdkConfig) -> aws_sdk_lambda::Client {
+    use aws_sdk_lambda::config::timeout::TimeoutConfig;
+    let conf = aws_sdk_lambda::config::Builder::from(config)
+        .timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                .read_timeout(DEFAULT_READ_TIMEOUT)
+                .operation_attempt_timeout(DEFAULT_ATTEMPT_TIMEOUT)
+                .build(),
+        )
+        .build();
+    aws_sdk_lambda::Client::from_conf(conf)
+}
+
 /// Supplies the execution client for every invocation of a [`wrap`]-ed
 /// handler, building it at most once and reusing it thereafter.
 ///
@@ -1244,7 +1306,7 @@ impl ClientProvider {
             .get_or_init(|| async {
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-                let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
+                let lambda_client = default_lambda_client(&aws_config);
                 StdArc::new(LambdaExecutionClient::new(lambda_client))
                     as StdArc<dyn ExecutionClient>
             })
@@ -1934,18 +1996,35 @@ mod tests {
             .unwrap()
     }
 
+    /// Helper to build an Execution operation carrying `input`.
+    fn make_test_execution_op(input: &str) -> aws_sdk_lambda::types::Operation {
+        aws_sdk_lambda::types::Operation::builder()
+            .id("execution")
+            .r#type(aws_sdk_lambda::types::OperationType::Execution)
+            .status(aws_sdk_lambda::types::OperationStatus::Started)
+            .start_timestamp(aws_sdk_lambda::primitives::DateTime::from_secs(0))
+            .execution_details(
+                aws_sdk_lambda::types::ExecutionDetails::builder()
+                    .input_payload(input)
+                    .build(),
+            )
+            .build()
+            .unwrap()
+    }
+
     /// When `initial_marker` is `Some`, `resolve_bootstrap_log` calls
     /// `get_state` (count == 1) and returns a log built from the full
-    /// paginated state.
+    /// paginated state, and the input of the fetched Execution operation.
     #[tokio::test]
     async fn resolve_bootstrap_log_paginates_when_marker_present() {
         let all_ops = vec![
+            make_test_execution_op("{\"fetched\":true}"),
             make_test_step_op("step-1", "\"r1\""),
             make_test_step_op("step-2", "\"r2\""),
         ];
         let client = client::InMemoryExecutionClient::new(all_ops);
 
-        // Inline log is empty (first page only had the Execution op).
+        // The inline page is empty and holds no Execution operation.
         let inline_log = engine::CheckpointLog::empty();
 
         let result = client::resolve_bootstrap_log(
@@ -1953,12 +2032,22 @@ mod tests {
             "arn:test",
             "token",
             inline_log,
+            None,
             Some("page-2-marker"),
         )
         .await;
 
         assert!(result.is_ok());
-        let log = result.unwrap();
+        let (log, input) = result.unwrap();
+        assert_eq!(
+            input.as_deref(),
+            Some("{\"fetched\":true}"),
+            "the input must come from the fetched Execution operation"
+        );
+        assert!(
+            log.get("execution").is_none(),
+            "the Execution operation must not enter the log"
+        );
         // Full state from get_state is used.
         assert!(log.get("step-1").is_some(), "step-1 must be in the log");
         assert!(
@@ -2006,11 +2095,20 @@ mod tests {
             },
         );
 
-        let result =
-            client::resolve_bootstrap_log(&client, "arn:test", "token", inline_log, None).await;
+        let result = client::resolve_bootstrap_log(
+            &client,
+            "arn:test",
+            "token",
+            inline_log,
+            Some(Some("\"inline-input\"".to_owned())),
+            None,
+        )
+        .await;
 
         assert!(result.is_ok());
-        let log = result.unwrap();
+        let (log, input) = result.unwrap();
+        // The inline input is returned unchanged.
+        assert_eq!(input.as_deref(), Some("\"inline-input\""));
         // The inline log is returned as-is.
         assert!(
             log.get("existing-op").is_some(),
@@ -2185,49 +2283,381 @@ mod tests {
             "CheckpointToken": "tok",
             "InitialExecutionState": {
                 "Operations": [{
+                    "Id": "execution",
+                    "Type": "EXECUTION",
                     "ExecutionDetails": {
                         "InputPayload": "\"hello\""
                     }
                 }]
             }
         });
-        let result: Result<String, _> = extract_customer_input(&payload);
+        let input = inline_input_payload(&payload).unwrap().flatten();
+        let result: Result<String, _> = extract_customer_input(input.as_deref());
         assert_eq!(result.unwrap(), "hello");
     }
 
     #[test]
-    fn extract_customer_input_envelope_without_input_payload_errors() {
-        // Envelope shape is present (has DurableExecutionArn) but the
-        // InitialExecutionState path is incomplete: should error, not
-        // fall back to treating the envelope as the customer event.
+    fn extract_customer_input_defaults_to_empty_object() {
+        // An envelope whose Execution operation has no InputPayload parses
+        // as `{}`, as the JS SDK does.
         let payload = serde_json::json!({
             "DurableExecutionArn": "arn:test",
             "CheckpointToken": "tok",
-            "InitialExecutionState": { "Operations": [] }
+            "InitialExecutionState": {
+                "Operations": [{ "Id": "execution", "Type": "EXECUTION" }]
+            }
         });
-        let result: Result<serde_json::Value, _> = extract_customer_input(&payload);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
+        let input = inline_input_payload(&payload).unwrap();
+        assert_eq!(input, Some(None));
+        let result: serde_json::Value = extract_customer_input(input.flatten().as_deref()).unwrap();
+        assert_eq!(result, serde_json::json!({}));
+    }
+
+    /// The `InputPayload` cases of `inline_input_payload`: no Execution
+    /// operation, a `null`, a string, and a non-string value.
+    #[test]
+    fn inline_input_payload_cases() {
+        let envelope = |ops: serde_json::Value| {
+            serde_json::json!({
+                "DurableExecutionArn": "arn:test",
+                "CheckpointToken": "tok",
+                "InitialExecutionState": { "Operations": ops }
+            })
+        };
+        let step_only = envelope(serde_json::json!([{ "Id": "s1", "Type": "STEP" }]));
+        assert_eq!(inline_input_payload(&step_only).unwrap(), None);
+        let no_operations = serde_json::json!({
+            "DurableExecutionArn": "arn:test",
+            "CheckpointToken": "tok",
+            "InitialExecutionState": { "NextMarker": "m-1" }
+        });
+        assert_eq!(inline_input_payload(&no_operations).unwrap(), None);
+        // The first EXECUTION operation is read, wherever it sits.
+        let later = envelope(serde_json::json!([
+            { "Id": "s1", "Type": "STEP", "ExecutionDetails": { "InputPayload": "\"wrong\"" } },
+            { "Id": "e", "Type": "EXECUTION", "ExecutionDetails": { "InputPayload": "\"right\"" } }
+        ]));
+        assert_eq!(
+            inline_input_payload(&later).unwrap(),
+            Some(Some("\"right\"".to_owned()))
+        );
+        let null = envelope(serde_json::json!([
+            { "Id": "e", "Type": "EXECUTION", "ExecutionDetails": { "InputPayload": null } }
+        ]));
+        assert_eq!(inline_input_payload(&null).unwrap(), Some(None));
+        let number = envelope(serde_json::json!([
+            { "Id": "e", "Type": "EXECUTION", "ExecutionDetails": { "InputPayload": 5 } }
+        ]));
+        let err = inline_input_payload(&number).unwrap_err();
         assert!(
-            msg.contains("InputPayload"),
-            "error should mention InputPayload, got: {msg}"
+            err.to_string().contains("InputPayload is not a string"),
+            "got: {err}"
         );
     }
 
     #[test]
-    fn extract_customer_input_no_envelope_errors() {
-        // A payload with no envelope shape at all is an error: there is no
-        // raw-payload fallback, with or without `test-util`. Local testing
-        // uses `LocalRunner`, which drives the `wrap`-produced service and
-        // therefore routes through this function with well-formed
-        // synthesized envelopes.
-        let payload = serde_json::json!({ "count": 42 });
-        let result: Result<serde_json::Value, _> = extract_customer_input(&payload);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
+    fn extract_customer_input_parse_failure_errors() {
+        let err = extract_customer_input::<serde_json::Value>(Some("not json")).unwrap_err();
         assert!(
-            msg.contains("InputPayload"),
-            "error should mention the envelope input path, got: {msg}"
+            err.to_string().contains("deserialize customer input"),
+            "got: {err}"
         );
+    }
+
+    // Bootstrap input cases, driven through `wrap`.
+
+    /// A test transport that returns configured pages by marker and records
+    /// each `get_state` call's marker.
+    struct PagedTransport {
+        pages: std::collections::HashMap<String, GetStateOutput>,
+        markers: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl PagedTransport {
+        fn new(pages: Vec<(&str, Vec<aws_sdk_lambda::types::Operation>, Option<&str>)>) -> Self {
+            Self {
+                pages: pages
+                    .into_iter()
+                    .map(|(marker, ops, next)| {
+                        (
+                            marker.to_owned(),
+                            GetStateOutput::new(ops, next.map(str::to_owned)),
+                        )
+                    })
+                    .collect(),
+                markers: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn markers(&self) -> Vec<Option<String>> {
+            self.markers.lock().unwrap().clone()
+        }
+    }
+
+    impl ExecutionClient for PagedTransport {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _updates: Vec<aws_sdk_lambda::types::OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Ok(CheckpointOutput::new(
+                    Some("token-next".to_owned()),
+                    Vec::new(),
+                    None,
+                ))
+            })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            self.markers.lock().unwrap().push(marker.map(str::to_owned));
+            let page = marker
+                .and_then(|m| self.pages.get(m))
+                .map(|p| {
+                    GetStateOutput::new(p.operations.clone(), p.next_marker().map(str::to_owned))
+                })
+                .unwrap_or_else(|| GetStateOutput::new(Vec::new(), None));
+            Box::pin(async move { Ok(page) })
+        }
+    }
+
+    /// Drives the `wrap`-produced echo service over `transport` and
+    /// reports the response and whether the handler ran.
+    async fn invoke_echo_over(
+        payload: serde_json::Value,
+        transport: std::sync::Arc<dyn ExecutionClient>,
+    ) -> (
+        Result<serde_json::Value, lambda_runtime::Error>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_in_handler = std::sync::Arc::clone(&ran);
+        let options = Options::builder()
+            .execution_client(transport)
+            .build()
+            .expect("options build");
+        let service = wrap(
+            move |event: serde_json::Value, _ctx: DurableContext| {
+                let ran = std::sync::Arc::clone(&ran_in_handler);
+                async move {
+                    ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<serde_json::Value, BoxError>(event)
+                }
+            },
+            options,
+        );
+        let event = lambda_runtime::LambdaEvent::new(
+            InvocationPayload(payload),
+            lambda_runtime::Context::default(),
+        );
+        (service(event).await.map(|response| response.0), ran)
+    }
+
+    fn bootstrap_envelope(state: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "DurableExecutionArn": "arn:aws:lambda:us-east-1:1:function:test",
+            "CheckpointToken": "token-abc",
+            "InitialExecutionState": state
+        })
+    }
+
+    fn assert_succeeded_with(response: &serde_json::Value, expected: &serde_json::Value) {
+        assert_eq!(
+            response.get("Status").and_then(serde_json::Value::as_str),
+            Some("SUCCEEDED"),
+            "unexpected response: {response}"
+        );
+        let result: serde_json::Value = serde_json::from_str(
+            response
+                .get("Result")
+                .and_then(serde_json::Value::as_str)
+                .expect("a Result string"),
+        )
+        .expect("the Result parses");
+        assert_eq!(&result, expected, "unexpected response: {response}");
+    }
+
+    /// Rows 1 and 5: an absent or `null` `InputPayload` runs the handler
+    /// on `{}`.
+    #[tokio::test]
+    async fn absent_input_payload_runs_on_empty_object() {
+        for details in [
+            serde_json::json!({}),
+            serde_json::json!({ "InputPayload": null }),
+        ] {
+            let payload = bootstrap_envelope(serde_json::json!({
+                "Operations": [{
+                    "Id": "execution",
+                    "Type": "EXECUTION",
+                    "Status": "STARTED",
+                    "ExecutionDetails": details
+                }]
+            }));
+            let transport = std::sync::Arc::new(PagedTransport::new(Vec::new()));
+            let (response, _) =
+                invoke_echo_over(payload, std::sync::Arc::clone(&transport) as _).await;
+            assert_succeeded_with(&response.expect("must succeed"), &serde_json::json!({}));
+            assert!(transport.markers().is_empty(), "no marker, no get_state");
+        }
+    }
+
+    /// Row 2: the input is read from a later page.
+    #[tokio::test]
+    async fn input_payload_found_after_pagination() {
+        let payload = bootstrap_envelope(serde_json::json!({ "NextMarker": "m-1" }));
+        let transport = std::sync::Arc::new(PagedTransport::new(vec![(
+            "m-1",
+            vec![make_test_execution_op("{\"count\":1}")],
+            None,
+        )]));
+        let (response, _) = invoke_echo_over(payload, std::sync::Arc::clone(&transport) as _).await;
+        assert_succeeded_with(
+            &response.expect("must succeed"),
+            &serde_json::json!({ "count": 1 }),
+        );
+        assert_eq!(transport.markers(), vec![Some("m-1".to_owned())]);
+    }
+
+    /// Row 3: an inline input is kept when later pages are fetched.
+    #[tokio::test]
+    async fn paginated_input_matches_first_page() {
+        let payload = bootstrap_envelope(serde_json::json!({
+            "Operations": [{
+                "Id": "execution",
+                "Type": "EXECUTION",
+                "Status": "STARTED",
+                "ExecutionDetails": { "InputPayload": "{\"a\":1}" }
+            }],
+            "NextMarker": "m-1"
+        }));
+        let transport = std::sync::Arc::new(PagedTransport::new(vec![(
+            "m-1",
+            vec![make_test_step_op("s1", "\"r1\"")],
+            None,
+        )]));
+        let (response, _) = invoke_echo_over(payload, std::sync::Arc::clone(&transport) as _).await;
+        assert_succeeded_with(
+            &response.expect("must succeed"),
+            &serde_json::json!({ "a": 1 }),
+        );
+        assert_eq!(transport.markers(), vec![Some("m-1".to_owned())]);
+    }
+
+    /// Rows 4 and 6: an input that does not parse, and a non-string input,
+    /// fail the invocation before the handler runs.
+    #[tokio::test]
+    async fn malformed_input_payload_fails_the_invocation() {
+        for (input, expected) in [
+            (serde_json::json!("not json"), "deserialize customer input"),
+            (serde_json::json!(5), "InputPayload is not a string"),
+        ] {
+            let payload = bootstrap_envelope(serde_json::json!({
+                "Operations": [{
+                    "Id": "execution",
+                    "Type": "EXECUTION",
+                    "Status": "STARTED",
+                    "ExecutionDetails": { "InputPayload": input }
+                }]
+            }));
+            let transport = std::sync::Arc::new(PagedTransport::new(Vec::new()));
+            let (response, ran) =
+                invoke_echo_over(payload, std::sync::Arc::clone(&transport) as _).await;
+            let err = response.expect_err("must fail");
+            assert!(err.to_string().contains(expected), "got: {err}");
+            assert!(
+                !ran.load(std::sync::atomic::Ordering::SeqCst),
+                "the handler must not run"
+            );
+            assert!(transport.markers().is_empty(), "no marker, no get_state");
+        }
+    }
+
+    /// Row 1's envelope without a `CheckpointToken` fails in
+    /// `parse_envelope`, before the input defaults to `{}`.
+    #[tokio::test]
+    async fn missing_checkpoint_token_fails_before_input_default() {
+        let payload = serde_json::json!({
+            "DurableExecutionArn": "arn:aws:lambda:us-east-1:1:function:test",
+            "InitialExecutionState": {
+                "Operations": [{
+                    "Id": "execution",
+                    "Type": "EXECUTION",
+                    "Status": "STARTED",
+                    "ExecutionDetails": {}
+                }]
+            }
+        });
+        let transport = std::sync::Arc::new(PagedTransport::new(Vec::new()));
+        let (response, ran) = invoke_echo_over(payload, transport).await;
+        let err = response.expect_err("must fail");
+        assert!(err.to_string().contains("CheckpointToken"), "got: {err}");
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run"
+        );
+    }
+
+    // Default client timeouts
+
+    #[test]
+    fn default_client_sets_connect_and_read_timeouts() {
+        let config = SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .build();
+        let client = default_lambda_client(&config);
+        let timeouts = client
+            .config()
+            .timeout_config()
+            .expect("the default client has a timeout config");
+        assert_eq!(timeouts.connect_timeout(), Some(Duration::from_secs(5)));
+        assert_eq!(timeouts.read_timeout(), Some(Duration::from_secs(50)));
+        assert_eq!(
+            timeouts.operation_attempt_timeout(),
+            Some(Duration::from_secs(55))
+        );
+    }
+
+    #[test]
+    fn supplied_config_keeps_its_timeouts() {
+        use aws_sdk_lambda::config::timeout::TimeoutConfig;
+        let config = SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .connect_timeout(Duration::from_secs(1))
+                    .build(),
+            )
+            .build();
+        let client = base_lambda_client_from_options(Some(config), None)
+            .expect("sdk_config must yield a client");
+        let timeouts = client.config().timeout_config().expect("a timeout config");
+        assert_eq!(timeouts.connect_timeout(), Some(Duration::from_secs(1)));
+        assert_eq!(timeouts.read_timeout(), None);
+
+        let conf = aws_sdk_lambda::config::Config::builder()
+            .behavior_version(aws_sdk_lambda::config::BehaviorVersion::latest())
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .read_timeout(Duration::from_secs(7))
+                    .build(),
+            )
+            .build();
+        let supplied = aws_sdk_lambda::Client::from_conf(conf);
+        let client = base_lambda_client_from_options(None, Some(supplied))
+            .expect("lambda_client must be returned");
+        let timeouts = client.config().timeout_config().expect("a timeout config");
+        assert_eq!(timeouts.read_timeout(), Some(Duration::from_secs(7)));
+        assert_eq!(timeouts.connect_timeout(), None);
+        assert_eq!(timeouts.operation_attempt_timeout(), None);
     }
 }

@@ -970,7 +970,10 @@ fn operation_type_to_string(op_type: &OperationType) -> String {
 
 /// Converts SDK `Operation` records into a `CheckpointLog`.
 ///
-/// Keyed by wire ID (the operation's `id` field from the service).
+/// Keyed by wire ID (the operation's `id` field from the service). Only
+/// tests build a log this way: bootstrap merges the fetched pages into the
+/// inline log in [`resolve_bootstrap_log`].
+#[cfg(test)]
 pub(crate) fn operations_to_checkpoint_log(operations: &[Operation]) -> CheckpointLog {
     let records: Vec<(String, CheckpointRecord)> = operations
         .iter()
@@ -994,28 +997,66 @@ pub(crate) fn merge_operations_into_log(log: &CheckpointLog, operations: &[Opera
     }
 }
 
-/// Resolves the bootstrap checkpoint log, following the pagination marker.
+/// Resolves the bootstrap checkpoint log and the execution input, following
+/// the pagination marker.
 ///
-/// This is the single production decision point for bootstrap pagination:
-/// when the initial execution state carried a `NextMarker`, the inline
-/// first page is incomplete, so the complete state is fetched through
-/// [`get_full_state`], which follows the markers of
-/// [`ExecutionClient::get_state`] until they are exhausted.
-/// Without a marker the inline page already holds the full history and is
-/// used as-is. Both `run`/`wrap` and the `test-util` `LocalRunner` call
-/// this helper, so tests exercise exactly the code production runs.
+/// This is the single production decision point for bootstrap pagination.
+/// `first_page` is the log parsed from the inline
+/// `InitialExecutionState`, and `next_marker` is its `NextMarker`.
+/// `first_page_input` is `None` when the inline page holds no EXECUTION
+/// operation, and `Some(input)` when it holds one, with `input` that
+/// operation's `InputPayload`.
+///
+/// - Without a marker the inline page is the whole state. The function
+///   returns `first_page` and the inline input unchanged, and calls nothing.
+/// - With a marker the function keeps `first_page`. It calls
+///   [`ExecutionClient::get_state`] with the inline marker, merges each
+///   returned page into the log, and calls again with each returned marker
+///   until a page has none. It never reads the first page again.
+///
+/// The returned input is the inline input when the inline page holds the
+/// EXECUTION operation. Otherwise it is the `InputPayload` of the first
+/// EXECUTION operation of the fetched pages, in page order, or `None`
+/// when no page holds one. The caller parses it after this function
+/// returns, so an input on a later page reaches the handler.
 pub(crate) async fn resolve_bootstrap_log(
     client: &dyn ExecutionClient,
     execution_arn: &str,
     checkpoint_token: &str,
     first_page: CheckpointLog,
+    first_page_input: Option<Option<String>>,
     next_marker: Option<&str>,
-) -> Result<CheckpointLog, ExecutionClientError> {
-    if next_marker.is_none() {
-        return Ok(first_page);
+) -> Result<(CheckpointLog, Option<String>), ExecutionClientError> {
+    let mut input = first_page_input;
+    let mut marker = next_marker.map(str::to_owned);
+    while let Some(current) = marker {
+        let page = client
+            .get_state(execution_arn, checkpoint_token, Some(&current))
+            .await?;
+        marker = page.next_marker().map(str::to_owned);
+        // The checkpoint log skips EXECUTION operations, so the input is
+        // read from the raw page before the page is merged.
+        if input.is_none() {
+            input = page
+                .operations
+                .iter()
+                .find(|op| op.r#type == OperationType::Execution)
+                .map(|op| {
+                    op.execution_details
+                        .as_ref()
+                        .and_then(|d| d.input_payload.clone())
+                });
+        }
+        for op in page
+            .operations
+            .iter()
+            .filter(|op| op.r#type != OperationType::Execution)
+        {
+            let (wire_id, record) = operation_to_record(op);
+            first_page.insert(wire_id, record);
+        }
     }
-    let operations = get_full_state(client, execution_arn, checkpoint_token).await?;
-    Ok(operations_to_checkpoint_log(&operations))
+    Ok((first_page, input.flatten()))
 }
 
 /// Maps SDK `OperationStatus` to internal `CheckpointStatus`.
@@ -1541,6 +1582,229 @@ mod tests {
             markers,
             [None, Some("p-2".to_owned()), Some("p-3".to_owned())]
         );
+    }
+
+    /// A transport that serves page 2 for marker `m-1` and page 3 for
+    /// marker `m-2`, and records the marker of every call. A call without
+    /// a marker, a re-read of the first page, gets a step `s0` that the
+    /// test then finds in the log.
+    struct InlineContinuationClient {
+        markers: Mutex<Vec<Option<String>>>,
+    }
+
+    impl ExecutionClient for InlineContinuationClient {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _updates: Vec<OperationUpdate>,
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(CheckpointOutput::new(Some("t".to_owned()), vec![], None)) })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            marker: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
+            self.markers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(marker.map(str::to_owned));
+            let page = match marker {
+                Some("m-1") => {
+                    GetStateOutput::new(vec![make_step_op("s2", "2")], Some("m-2".to_owned()))
+                }
+                Some("m-2") => GetStateOutput::new(vec![make_step_op("s3", "3")], None),
+                _ => GetStateOutput::new(vec![make_step_op("s0", "0")], None),
+            };
+            Box::pin(async move { Ok(page) })
+        }
+    }
+
+    /// Bootstrap keeps the inline page and continues from its marker: it
+    /// never re-reads the first page, and the merged log holds the inline
+    /// step and the steps of both fetched pages.
+    #[tokio::test]
+    async fn bootstrap_keeps_inline_page_and_continues_from_marker() {
+        let client = InlineContinuationClient {
+            markers: Mutex::new(Vec::new()),
+        };
+        let execution = Operation::builder()
+            .id("execution")
+            .r#type(OperationType::Execution)
+            .status(aws_sdk_lambda::types::OperationStatus::Started)
+            .start_timestamp(aws_sdk_lambda::primitives::DateTime::from_secs(0))
+            .execution_details(
+                aws_sdk_lambda::types::ExecutionDetails::builder()
+                    .input_payload("{}")
+                    .build(),
+            )
+            .build()
+            .expect("id, type, status and start timestamp are set");
+        let first_page = operations_to_checkpoint_log(&[execution, make_step_op("s1", "1")]);
+
+        let (log, input) = resolve_bootstrap_log(
+            &client,
+            "arn:test",
+            "tok",
+            first_page,
+            Some(Some("{}".to_owned())),
+            Some("m-1"),
+        )
+        .await
+        .expect("bootstrap succeeds");
+
+        let markers = client
+            .markers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(markers, [Some("m-1".to_owned()), Some("m-2".to_owned())]);
+        for id in ["s1", "s2", "s3"] {
+            assert!(log.get(id).is_some(), "{id} must be in the merged log");
+        }
+        assert!(
+            log.get("s0").is_none(),
+            "the first page must not be re-read"
+        );
+        assert_eq!(input.as_deref(), Some("{}"));
+    }
+
+    /// Builds an EXECUTION operation with the given `InputPayload`, or with
+    /// none when `input` is `None`.
+    fn make_execution_op(id: &str, input: Option<&str>) -> Operation {
+        let mut details = aws_sdk_lambda::types::ExecutionDetails::builder();
+        if let Some(input) = input {
+            details = details.input_payload(input);
+        }
+        Operation::builder()
+            .id(id)
+            .r#type(OperationType::Execution)
+            .status(aws_sdk_lambda::types::OperationStatus::Started)
+            .start_timestamp(aws_sdk_lambda::primitives::DateTime::from_secs(0))
+            .execution_details(details.build())
+            .build()
+            .expect("id, type, status and start timestamp are set")
+    }
+
+    /// A transport that serves a fixed page for each marker and records the
+    /// marker of every call. A marker it does not know gets an empty last
+    /// page.
+    struct MarkerPagesClient {
+        pages: Vec<(&'static str, Vec<Operation>, Option<&'static str>)>,
+        markers: Mutex<Vec<Option<String>>>,
+    }
+
+    impl ExecutionClient for MarkerPagesClient {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _updates: Vec<OperationUpdate>,
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(CheckpointOutput::new(Some("t".to_owned()), vec![], None)) })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            marker: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
+            self.markers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(marker.map(str::to_owned));
+            let page = self
+                .pages
+                .iter()
+                .find(|(key, _, _)| Some(*key) == marker)
+                .map_or_else(
+                    || GetStateOutput::new(vec![], None),
+                    |(_, ops, next)| GetStateOutput::new(ops.clone(), next.map(str::to_owned)),
+                );
+            Box::pin(async move { Ok(page) })
+        }
+    }
+
+    /// Resolves a bootstrap whose inline page holds no operation and has
+    /// marker `m-1`, against the given fetched pages. Returns the input and
+    /// the recorded markers.
+    async fn resolve_input_from_pages(
+        pages: Vec<(&'static str, Vec<Operation>, Option<&'static str>)>,
+    ) -> (Option<String>, Vec<Option<String>>) {
+        let client = MarkerPagesClient {
+            pages,
+            markers: Mutex::new(Vec::new()),
+        };
+        let (_, input) = resolve_bootstrap_log(
+            &client,
+            "arn:test",
+            "tok",
+            operations_to_checkpoint_log(&[]),
+            None,
+            Some("m-1"),
+        )
+        .await
+        .expect("bootstrap succeeds");
+        let markers = client
+            .markers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (input, markers)
+    }
+
+    /// When the inline page holds no EXECUTION operation, the input comes
+    /// from the first EXECUTION operation of the fetched pages, in page
+    /// order. The search continues past a fetched page that holds none.
+    /// The first EXECUTION operation decides the input even when its
+    /// `InputPayload` is absent, so a later page's payload does not replace
+    /// it.
+    #[tokio::test]
+    async fn bootstrap_input_comes_from_first_fetched_execution_operation() {
+        let (input, markers) = resolve_input_from_pages(vec![
+            ("m-1", vec![make_step_op("s1", "1")], Some("m-2")),
+            (
+                "m-2",
+                vec![make_execution_op("execution", Some(r#"{"count":1}"#))],
+                Some("m-3"),
+            ),
+            (
+                "m-3",
+                vec![make_execution_op("late", Some(r#"{"late":1}"#))],
+                None,
+            ),
+        ])
+        .await;
+        assert_eq!(input.as_deref(), Some(r#"{"count":1}"#));
+        assert_eq!(
+            markers,
+            [
+                Some("m-1".to_owned()),
+                Some("m-2".to_owned()),
+                Some("m-3".to_owned())
+            ]
+        );
+
+        let (input, markers) = resolve_input_from_pages(vec![
+            ("m-1", vec![make_step_op("s1", "1")], Some("m-2")),
+            ("m-2", vec![make_execution_op("execution", None)], Some("m-3")),
+            (
+                "m-3",
+                vec![make_execution_op("late", Some(r#"{"late":1}"#))],
+                None,
+            ),
+        ])
+        .await;
+        assert_eq!(input, None, "an absent first payload must not be replaced");
+        assert_eq!(markers.len(), 3, "pagination still reaches the last page");
     }
 
     /// The accessors of a transport's output read an empty token or an

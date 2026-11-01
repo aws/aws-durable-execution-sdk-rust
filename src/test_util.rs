@@ -3994,10 +3994,12 @@ mod tests {
             "arn:test",
             "token",
             operations_to_checkpoint_log(&first_page),
+            Some(Some("{}".to_owned())),
             Some("marker-1"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert!(
             log.get("step-1").is_some(),
@@ -4030,10 +4032,12 @@ mod tests {
             "arn:test",
             "token",
             operations_to_checkpoint_log(&first_page),
+            Some(Some("{}".to_owned())),
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert!(log.get("step-1").is_some());
         assert!(
@@ -4394,7 +4398,10 @@ mod tests {
     async fn sequential_handler_sends_one_request_per_checkpoint() {
         let handler = |(), ctx: DurableContext| async move {
             let a = ctx.step(|_| async { Ok(1_i32) }).name("a").await?;
-            let b = ctx.step(move |_| async move { Ok(a + 1) }).name("b").await?;
+            let b = ctx
+                .step(move |_| async move { Ok(a + 1) })
+                .name("b")
+                .await?;
             Ok::<_, BoxError>(b)
         };
         let default_calls = checkpoint_calls(&LocalRunner::new().single_page(), handler).await;

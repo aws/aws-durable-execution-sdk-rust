@@ -210,7 +210,10 @@ impl OptionsBuilder {
     /// By default, when neither this nor
     /// [`lambda_client`](Self::lambda_client) is set, the SDK loads the
     /// ambient environment configuration
-    /// (`aws_config::load_defaults`) and builds a client from it.
+    /// (`aws_config::load_defaults`) and builds a client from it. That
+    /// default client uses a 5 s connect timeout, a 50 s read timeout and
+    /// a 55 s attempt timeout. A client built from a config supplied here
+    /// keeps the config's own timeouts, and the SDK adds none.
     ///
     /// The parameter type is re-exported at the crate root as
     /// [`SdkConfig`](crate::SdkConfig), so callers can name it without
@@ -241,7 +244,9 @@ impl OptionsBuilder {
     /// from the SDK config. By default, when neither this nor
     /// [`sdk_config`](Self::sdk_config) is set, the SDK builds a client
     /// from the ambient environment configuration
-    /// (`aws_config::load_defaults`).
+    /// (`aws_config::load_defaults`), with a 5 s connect timeout, a 50 s
+    /// read timeout and a 55 s attempt timeout. A client supplied here
+    /// keeps its own timeouts, and the SDK adds none.
     ///
     /// This is the supported path for customizing how the SDK talks to the
     /// durable execution service: configure retry, timeouts, endpoint, or
