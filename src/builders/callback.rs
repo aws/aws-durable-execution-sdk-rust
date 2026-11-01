@@ -479,7 +479,7 @@ mod tests {
     /// The callback submitter retry setter likewise takes a bare closure.
     #[test]
     fn submitter_retry_setter_accepts_bare_closure() {
-        let ctx = DurableContext::__test_context();
+        let ctx = DurableContext::test_context();
 
         let builder = ctx
             .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })

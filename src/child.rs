@@ -18,7 +18,7 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use tracing::Instrument as _;
 
 use crate::Serdes;
-use crate::context::DurableContext;
+use crate::context::{ActiveBody, DurableContext, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     ChildContextError, ChildContextErrorKind, ChildFnError, OperationError, OperationErrorKind,
@@ -96,8 +96,12 @@ where
                 // live, and the child span's isReplay flag (kept current by
                 // the child's own mints) is what lets a filter suppress the
                 // body's pre-wait log lines exactly once.
+                //
+                // The scope encloses the closure call, so code the closure
+                // runs before it returns its future is checked too.
                 let child_span = child_ctx.replay_span();
-                let result = (closure)(child_ctx)
+                let body = ActiveBody::Context(child_ctx.prefix().to_owned());
+                let result = run_body(body, async move { (closure)(child_ctx).await })
                     .instrument(child_span)
                     .await
                     .map_err(Into::into);

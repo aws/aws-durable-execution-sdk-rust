@@ -811,7 +811,7 @@ mod tests {
     /// the installed closure exactly as `decide` produces them.
     #[test]
     fn wait_strategy_installs_config_derived_strategy() {
-        let ctx = DurableContext::__test_context();
+        let ctx = DurableContext::test_context();
 
         let builder = ctx
             .wait_for_condition(|_sc, state: i32| async move { Ok(state) }, 0_i32)

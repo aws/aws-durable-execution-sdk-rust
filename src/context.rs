@@ -35,6 +35,41 @@ use crate::future::{Branch, DurableFuture};
 use aws_sdk_lambda::types::OperationUpdate;
 use tokio::sync::Mutex;
 
+/// The user-code body the SDK is polling on the current task.
+///
+/// [`DurableContext::claim_operation_id`] compares it with the context an
+/// operation is called on.
+#[derive(Debug, Clone)]
+pub(crate) enum ActiveBody {
+    /// A body that runs on a `DurableContext`: the handler or a child body.
+    /// Holds that context's positional prefix ("" for the root).
+    Context(String),
+    /// A body that may not call durable operations: a step body or a
+    /// `wait_for_condition` check. Holds the operation's positional ID.
+    Step(String),
+}
+
+tokio::task_local! {
+    /// The body the SDK is polling. `LocalKey::scope` holds the value only
+    /// while the wrapped future is polled. So a parent future joined with a
+    /// child body on one task does not see the child's value, and a task
+    /// the SDK spawns starts without a value.
+    static ACTIVE_BODY: ActiveBody;
+}
+
+/// Polls `fut` with `body` as the active body.
+///
+/// Callers pass a future that calls the user closure inside it, so code
+/// the closure runs before it returns its future is checked too.
+pub(crate) fn run_body<F: Future>(body: ActiveBody, fut: F) -> impl Future<Output = F::Output> {
+    ACTIVE_BODY.scope(body, fut)
+}
+
+/// Shows a context prefix in a context usage error: `root` for the root.
+fn display_prefix(prefix: &str) -> &str {
+    if prefix.is_empty() { "root" } else { prefix }
+}
+
 /// Shared inner state for a durable execution context.
 struct Inner {
     execution_arn: String,
@@ -184,12 +219,10 @@ impl FlushFailure {
 }
 
 impl DurableContext {
-    /// Returns a new context for testing purposes.
-    ///
-    /// This is NOT part of the public API: used only in doctests.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn __test_context() -> Self {
+    /// Builds a context for unit tests: a root context with an empty
+    /// checkpoint log and no execution client.
+    #[cfg(test)]
+    pub(crate) fn test_context() -> Self {
         let execution_arn = String::from("arn:aws:lambda:us-east-1:123456789012:function:test");
         let lambda_context = lambda_runtime::Context::default();
         let engine = Arc::new(EngineState::new_root(Arc::new(CheckpointLog::empty())));
@@ -395,6 +428,64 @@ impl DurableContext {
             self.inner.engine.is_replaying(),
         );
         id
+    }
+
+    /// Returns this context's positional prefix: `""` for the root context,
+    /// the positional ID of the operation that created it for a child.
+    pub(crate) fn prefix(&self) -> &str {
+        self.inner.engine.id_counter.prefix()
+    }
+
+    /// Claims the next operation ID for the public operation `method`, and
+    /// checks that the caller may claim it on this context.
+    ///
+    /// The SDK records which body it is polling in [`ACTIVE_BODY`]. The
+    /// check compares that body with this context. The outcomes are:
+    ///
+    /// - No body is active: the check does nothing.
+    /// - The body of this context is active: the claim passes.
+    /// - The body of another context is active: the execution fails with a
+    ///   context usage error that names both contexts.
+    /// - A step body or a `wait_for_condition` check is active: the
+    ///   execution fails with a context usage error that names the
+    ///   operation.
+    ///
+    /// The failure is recorded as an execution-fatal error, so the
+    /// invocation answers `FAILED` on the first invocation. Without the
+    /// check, the misuse surfaces one invocation later as a
+    /// non-determinism error that does not name the cause. The ID is
+    /// claimed in every case, so the caller builds its builder as usual.
+    ///
+    /// Only the public operation methods call this. The SDK's own internal
+    /// claims (inside `wait_for_callback`, `map` and `parallel`) call
+    /// [`Self::mint_id`], because they run on the composite's context
+    /// while a child body may be active.
+    pub(crate) fn claim_operation_id(&self, method: &'static str) -> OperationId {
+        let message = ACTIVE_BODY
+            .try_with(|active| match active {
+                ActiveBody::Context(prefix) if prefix == self.prefix() => None,
+                ActiveBody::Context(prefix) => Some(format!(
+                    "context usage error in \"{method}\": the operation was called on context \
+                     \"{calling}\", but the SDK is running the body of context \"{active}\". \
+                     Inside run_in_child_context, with_retry, map and parallel, call operations \
+                     on the context passed to the closure.",
+                    calling = display_prefix(self.prefix()),
+                    active = display_prefix(prefix),
+                )),
+                ActiveBody::Step(id) => Some(format!(
+                    "context usage error in \"{method}\": the operation was called inside the \
+                     body of operation \"{id}\". A step body or a wait_for_condition check \
+                     cannot call durable operations; use run_in_child_context to group \
+                     operations."
+                )),
+            })
+            .ok()
+            .flatten();
+        if let Some(message) = message {
+            self.suspension_signal()
+                .record_fatal("Error".to_owned(), message);
+        }
+        self.mint_id()
     }
 
     /// Returns this namespace's `durable_execution` span. The handler future
@@ -1765,7 +1856,7 @@ impl DurableContext {
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
         O: Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("step");
         // The closure is stored unerased; the single erasure point is the
         // builder's `.future()` / `.await`, producing one DurableFuture box.
         StepBuilder::new_internal(self.clone(), op_id, f)
@@ -1797,7 +1888,7 @@ impl DurableContext {
         #[expect(clippy::cast_possible_truncation)]
         // reason: duration ≤ i32::MAX for practical timers
         let secs = (duration.as_secs_f64().ceil() as i64).min(i64::from(i32::MAX)) as i32;
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("wait");
         WaitBuilder::new_internal(self.clone(), op_id, secs)
     }
 
@@ -1833,7 +1924,7 @@ impl DurableContext {
         I: Send + 'static,
         O: Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("invoke");
         // The input is carried TYPED into the builder: the payload serdes
         // receives the owned value directly at execution time (a write-only
         // transfer), so no intermediate representation is constructed here.
@@ -1869,7 +1960,7 @@ impl DurableContext {
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
         O: Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("run_in_child_context");
         // The closure is stored unerased; the child execution converts the
         // BoxError into the internal child-error carrier at the boundary,
         // and the single erasure point is the builder's `.future()` /
@@ -1941,7 +2032,7 @@ impl DurableContext {
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
         O: Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("with_retry");
         WithRetryBuilder::new_internal(self.clone(), op_id, f)
     }
 
@@ -1991,7 +2082,7 @@ impl DurableContext {
         Fut: Future<Output = Result<S, BoxError>> + Send + 'static,
         S: Clone + Send + Sync + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("wait_for_condition");
         WaitForConditionBuilder::new_internal(self.clone(), op_id, initial_state, check)
     }
 
@@ -2026,7 +2117,7 @@ impl DurableContext {
     where
         O: Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("create_callback");
         CreateCallbackBuilder::new_internal(self.clone(), op_id)
     }
 
@@ -2066,7 +2157,7 @@ impl DurableContext {
         Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
         O: DeserializeOwned + Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("wait_for_callback");
         WaitForCallbackBuilder::new_internal(self.clone(), op_id, submitter)
     }
 
@@ -2112,7 +2203,7 @@ impl DurableContext {
         I: Send + 'static,
         O: Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("map");
         // The closure is stored unerased; at execution it is shared as
         // `Arc<F>` and every item produces a concrete future, so the
         // internal JoinSet holds unboxed futures. The single erasure point
@@ -2151,7 +2242,7 @@ impl DurableContext {
         Branches: IntoIterator<Item = Branch<O>>,
         O: Serialize + DeserializeOwned + Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("parallel");
         let branch_tuples: Vec<_> = branches.into_iter().map(Branch::into_parts).collect();
         ParallelBuilder::new_internal(self.clone(), op_id, branch_tuples)
     }
@@ -2190,7 +2281,7 @@ impl DurableContext {
     where
         O: Serialize + DeserializeOwned + Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("try_join_all");
         TryJoinAllBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
     }
 
@@ -2228,7 +2319,7 @@ impl DurableContext {
     where
         O: Serialize + DeserializeOwned + Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("join_all");
         JoinAllBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
     }
 
@@ -2269,7 +2360,7 @@ impl DurableContext {
     where
         O: Serialize + DeserializeOwned + Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("select_ok");
         SelectOkBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
     }
 
@@ -2309,7 +2400,7 @@ impl DurableContext {
     where
         O: Serialize + DeserializeOwned + Send + 'static,
     {
-        let op_id = self.mint_id();
+        let op_id = self.claim_operation_id("race");
         RaceBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
     }
 }
@@ -2499,6 +2590,71 @@ mod tests {
     use crate::engine::{CheckpointLog, CheckpointStatus};
     use aws_sdk_lambda::types::Operation;
     use std::sync::Arc;
+
+    /// A claim outside any `run_body` scope does no check.
+    #[test]
+    fn claim_without_active_body_records_nothing() {
+        let ctx = DurableContext::test_context();
+        let id = ctx.claim_operation_id("step");
+        assert_eq!(id.positional(), "1");
+        assert!(ctx.suspension_signal().fatal_error().is_none());
+    }
+
+    /// A claim on the context whose body is active passes.
+    #[tokio::test]
+    async fn claim_in_own_body_records_nothing() {
+        let ctx = DurableContext::test_context();
+        let id = run_body(ActiveBody::Context(String::new()), async {
+            ctx.claim_operation_id("step")
+        })
+        .await;
+        assert_eq!(id.positional(), "1");
+        assert!(ctx.suspension_signal().fatal_error().is_none());
+    }
+
+    /// A claim on another context than the active body records message A
+    /// and still claims the ID.
+    #[tokio::test]
+    async fn claim_in_other_body_records_fatal() {
+        let ctx = DurableContext::test_context();
+        let id = run_body(ActiveBody::Context("3".to_owned()), async {
+            ctx.claim_operation_id("wait")
+        })
+        .await;
+        assert_eq!(id.positional(), "1");
+        let fatal = ctx
+            .suspension_signal()
+            .fatal_error()
+            .expect("fatal recorded");
+        assert_eq!(fatal.error_type, "Error");
+        assert_eq!(
+            fatal.error_message,
+            "context usage error in \"wait\": the operation was called on context \"root\", \
+             but the SDK is running the body of context \"3\". Inside run_in_child_context, \
+             with_retry, map and parallel, call operations on the context passed to the closure."
+        );
+    }
+
+    /// A claim inside a step body records message B.
+    #[tokio::test]
+    async fn claim_in_step_body_records_fatal() {
+        let ctx = DurableContext::test_context();
+        let _id = run_body(ActiveBody::Step("4".to_owned()), async {
+            ctx.claim_operation_id("map")
+        })
+        .await;
+        let fatal = ctx
+            .suspension_signal()
+            .fatal_error()
+            .expect("fatal recorded");
+        assert_eq!(fatal.error_type, "Error");
+        assert_eq!(
+            fatal.error_message,
+            "context usage error in \"map\": the operation was called inside the body of \
+             operation \"4\". A step body or a wait_for_condition check cannot call durable \
+             operations; use run_in_child_context to group operations."
+        );
+    }
 
     /// Helper: builds a Step operation.
     fn make_step_op(id: &str, result: &str) -> Operation {

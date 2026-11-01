@@ -331,7 +331,7 @@ mod tests {
     /// strategy returns that closure's decisions.
     #[test]
     fn retry_strategy_setter_accepts_bare_closure() {
-        let ctx = DurableContext::__test_context();
+        let ctx = DurableContext::test_context();
 
         let builder = ctx
             .step(|_| async { Ok(1_i32) })

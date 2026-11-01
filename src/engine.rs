@@ -355,6 +355,7 @@ pub(crate) struct CheckpointLog {
 
 impl CheckpointLog {
     /// Creates an empty checkpoint log (first-ever invocation).
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             records: RwLock::new(HashMap::new()),

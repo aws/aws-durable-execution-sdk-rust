@@ -29,7 +29,7 @@ use tracing::Instrument as _;
 
 use crate::BoxError;
 use crate::Serdes;
-use crate::context::DurableContext;
+use crate::context::{ActiveBody, DurableContext, run_body};
 use crate::driver::{ScopeOutcome, drive_scope};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
@@ -1295,8 +1295,11 @@ where
             let scope = Arc::clone(child_ctx.suspension_signal());
             let span = child_ctx.replay_span();
             let index = req.index;
+            // The scope encloses the closure call, so code the closure runs
+            // before it returns its future is checked too.
+            let body = ActiveBody::Context(child_ctx.prefix().to_owned());
             let outcome = drive_scope(
-                run_item(child_ctx, index).instrument(span),
+                run_body(body, async move { run_item(child_ctx, index).await }).instrument(span),
                 Arc::clone(&scope),
             )
             .await;
@@ -1326,7 +1329,14 @@ where
                     // `start` injects the child context and returns the
                     // branch's single erased future, polled here under the
                     // branch driver exactly like a map item's body.
-                    drive_scope(body.start(child_ctx).instrument(span), Arc::clone(&scope)).await
+                    // The factory closure runs inside the erased future, so
+                    // wrapping the future encloses the closure call.
+                    let active = ActiveBody::Context(child_ctx.prefix().to_owned());
+                    drive_scope(
+                        run_body(active, body.start(child_ctx)).instrument(span),
+                        Arc::clone(&scope),
+                    )
+                    .await
                 }
                 Err(err) => ScopeOutcome::Completed(Err(err)),
             };

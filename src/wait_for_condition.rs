@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 
-use crate::context::{DurableContext, StepContext};
+use crate::context::{ActiveBody, DurableContext, StepContext, run_body};
 use crate::engine::CheckpointStatus;
 use crate::engine::OperationId;
 use crate::error::{
@@ -144,6 +144,9 @@ where
             serdes,
             check,
         } = self;
+        // The check runs as a `Step` body: an operation claimed inside it
+        // fails the execution with a context usage error.
+        let body = ActiveBody::Step(op_id.positional().to_owned());
         let core = WfcCore {
             ctx,
             op_id,
@@ -161,7 +164,8 @@ where
             } => {
                 // Execute the check function.
                 let step_ctx = StepContext::new(attempt);
-                let check_result = (check)(step_ctx, state).await;
+                let check_result =
+                    run_body(body, async move { (check)(step_ctx, state).await }).await;
                 after.settle(attempt, check_result).await
             }
         }

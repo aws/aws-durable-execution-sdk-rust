@@ -54,11 +54,14 @@ again on every replay. This implies four rules:
 2. **Never call durable operations inside a step.** `StepContext`, the
    argument of a step body, has no operation methods. A `DurableContext`
    clone moved into the step closure still compiles. Do not do that. On
-   replay the step body does not run, so every later operation gets a
-   different ID than in the first invocation. Later operations then
-   receive the wrong recorded results, or the execution fails with
-   `NonDeterministicExecutionError`. Use `ctx.run_in_child_context` to
-   group operations.
+   replay the step body does not run, so every later operation would get a
+   different ID than in the first invocation. So the SDK fails the
+   execution on the first invocation with a context usage error when an
+   operation is called inside a step body or a `wait_for_condition` check.
+   It does the same when an operation is called on the wrong context, such
+   as a parent context used inside a child body. Use
+   `ctx.run_in_child_context` to group operations, and call operations on
+   the context passed to the closure.
 3. **Mutations inside steps are lost on replay.** A step closure is
    `'static`, so it cannot borrow a local variable. The body can still
    change shared state through an `Arc<Mutex<_>>` or an atomic. That change

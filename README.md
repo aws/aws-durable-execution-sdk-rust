@@ -209,7 +209,9 @@ body may read the clock, generate a random ID, or call a service, because only
 its recorded result takes part in replay. `StepContext`, the argument a step
 body receives, exposes just `attempt()` and no operation methods, so calling a
 durable operation inside a step body fails to compile rather than failing at
-run time.
+run time. A `DurableContext` clone that a step body, a `wait_for_condition`
+check, or a child body uses for an operation it does not own fails the
+execution on the first invocation with a context usage error.
 
 Two more constraints follow from how suspension works. Use `ctx.race` or
 `ctx.select_ok` rather than `tokio::select!` over durable futures, so the SDK

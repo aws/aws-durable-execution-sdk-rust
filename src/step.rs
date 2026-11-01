@@ -14,7 +14,7 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use tracing::Instrument;
 
 use crate::builders::{JitterStrategy, RetryStrategyConfig};
-use crate::context::{DurableContext, StepContext};
+use crate::context::{ActiveBody, DurableContext, StepContext, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
 use crate::serdes::SerdesContext;
@@ -221,6 +221,9 @@ where
             closure,
             _marker,
         } = self;
+        // The step body runs as a `Step` body: an operation claimed inside
+        // it fails the execution with a context usage error.
+        let body = ActiveBody::Step(op_id.positional().to_owned());
         let core = StepCore {
             ctx,
             op_id,
@@ -240,7 +243,9 @@ where
                 // Execute the step body inside a tracing span carrying the
                 // structured-log field contract.
                 let step_ctx = StepContext::new(attempt);
-                let result = async { (closure)(step_ctx).await }.instrument(span).await;
+                let result = run_body(body, async move { (closure)(step_ctx).await })
+                    .instrument(span)
+                    .await;
                 live.settle(attempt, result).await
             }
         }

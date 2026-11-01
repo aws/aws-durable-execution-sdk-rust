@@ -1013,13 +1013,17 @@ where
             // The handler future is instrumented with the handler-level span
             // so user log events between operations carry the execution ARN
             // and the live `isReplay` flag.
+            //
+            // The handler runs as the root context's body, so an operation
+            // called on a child context that escaped its closure fails the
+            // execution with a context usage error.
             let outcome = driver::drive_invocation(
-                async {
+                context::run_body(context::ActiveBody::Context(String::new()), async {
                     match (handler)(customer_input, ctx).await {
                         Ok(result) => serialize_handler_result(&result),
                         Err(e) => Err(wire_error_from_box_error(e)),
                     }
-                }
+                })
                 .instrument(replay_span),
                 suspension_signal,
             )
@@ -1372,7 +1376,7 @@ mod tests {
     async fn tokio_join_accepts_into_future() {
         // Verify compilation: IntoFuture is accepted by tokio::join!
         fn check_into_future<T: IntoFuture>(_t: T) {}
-        let ctx = DurableContext::__test_context();
+        let ctx = DurableContext::test_context();
         check_into_future(ctx.step(|_| async { Ok(1i32) }));
         // NOTE: cannot actually tokio::join! the builders because they
         // todo!() at runtime, but the type-level verification above

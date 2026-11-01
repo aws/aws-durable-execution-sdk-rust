@@ -440,7 +440,7 @@ mod tests {
             vec![Branch::new("branch", |_ctx| async move { Ok(1_i32) })]
         }
 
-        let ctx = DurableContext::__test_context();
+        let ctx = DurableContext::test_context();
 
         // StepBuilder
         let _step_f = ctx.step(|_| async { Ok(1_i32) }).name("step").future();
