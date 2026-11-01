@@ -151,6 +151,11 @@ pub use lambda_runtime::{self, Context as LambdaContext};
 /// [`OperationUpdate`] name in their fields, directly or nested, and
 /// [`DateTime`], the type of their timestamp fields.
 ///
+/// With the `test-util` feature, the module also re-exports `Event`, the
+/// service's history event that `test_util::TestResult::history_events`
+/// returns, and every type that `Event` names in its fields, directly or
+/// nested.
+///
 /// These types are those of the `aws-sdk-lambda` release this crate
 /// depends on. They change when the crate moves to a new `aws-sdk-lambda`
 /// release.
@@ -165,6 +170,17 @@ pub mod lambda_types {
         ContextDetails, ContextOptions, ErrorObject, ExecutionDetails, Operation, OperationAction,
         OperationStatus, OperationType, OperationUpdate, StepDetails, StepOptions, WaitDetails,
         WaitOptions,
+    };
+    #[cfg(feature = "test-util")]
+    pub use aws_sdk_lambda::types::{
+        CallbackFailedDetails, CallbackStartedDetails, CallbackSucceededDetails,
+        CallbackTimedOutDetails, ChainedInvokeFailedDetails, ChainedInvokeStartedDetails,
+        ChainedInvokeStoppedDetails, ChainedInvokeSucceededDetails, ChainedInvokeTimedOutDetails,
+        ContextFailedDetails, ContextStartedDetails, ContextSucceededDetails, Event, EventError,
+        EventInput, EventResult, EventType, ExecutionFailedDetails, ExecutionStartedDetails,
+        ExecutionStoppedDetails, ExecutionSucceededDetails, ExecutionTimedOutDetails,
+        InvocationCompletedDetails, RetryDetails, StepFailedDetails, StepStartedDetails,
+        StepSucceededDetails, WaitCancelledDetails, WaitStartedDetails, WaitSucceededDetails,
     };
 }
 

@@ -76,6 +76,11 @@
 //! - Each invocation input carries `UpdatedOperationIds`: the operations
 //!   the backend changed between invocations, such as a fired wait, a
 //!   retry that became ready, or a callback that received a reply.
+//! - The backend records a history event for each operation update it
+//!   accepts, for each wait, callback and chained invoke it settles, for
+//!   each invocation, and for the start and the end of the execution (see
+//!   [`TestResult::history_events`]). Invocation `n` has the request ID
+//!   `local-invocation-{n}`.
 //!
 //! # Runner divergences
 //!
@@ -147,10 +152,11 @@ use serde::de::DeserializeOwned;
 use aws_sdk_lambda::primitives::{Blob, DateTime};
 use aws_sdk_lambda::types::{
     CallbackDetails as WireCallbackDetails, ChainedInvokeDetails,
-    ContextDetails as WireContextDetails, ContextOptions, ErrorObject, Event, EventType,
-    ExecutionStatus as WireExecutionStatus, InvocationType as WireInvocationType, Operation,
-    OperationAction, OperationStatus as WireOperationStatus, OperationType, OperationUpdate,
-    StepDetails as WireStepDetails,
+    ContextDetails as WireContextDetails, ContextOptions, ErrorObject, Event, EventError,
+    EventInput, EventResult, EventType, ExecutionStatus as WireExecutionStatus,
+    InvocationCompletedDetails, InvocationType as WireInvocationType, Operation, OperationAction,
+    OperationStatus as WireOperationStatus, OperationType, OperationUpdate, RetryDetails,
+    StepDetails as WireStepDetails, builders::EventBuilder,
 };
 
 use crate::client::{CheckpointOutput, ExecutionClient, ExecutionClientError, GetStateOutput};
@@ -220,6 +226,9 @@ pub struct TestOperation {
     wait: WaitDetails,
     callback: CallbackDetails,
     context: ContextDetails,
+    /// The history events whose `id` is this operation's ID, in history
+    /// order.
+    events: Vec<Event>,
 }
 
 impl TestOperation {
@@ -249,12 +258,20 @@ impl TestOperation {
             context: ContextDetails {
                 replay_children: false,
             },
+            events: Vec::new(),
         }
     }
 
     /// The operation's wire ID (the SHA-256 hex of its positional path).
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The history events of this operation: the events of
+    /// [`TestResult::history_events`] whose `id` is this operation's
+    /// [`id`](Self::id), in history order.
+    pub fn events(&self) -> &[Event] {
+        &self.events
     }
 
     /// The operation kind, such as [`OperationKind::Step`] or
@@ -626,9 +643,46 @@ pub struct TestResult<O> {
     error: Option<crate::WireError>,
     operations: Vec<TestOperation>,
     invocations: usize,
+    history_events: Vec<Event>,
+    invocation_records: Vec<TestInvocation>,
 }
 
 impl<O> TestResult<O> {
+    /// A result whose operations, history events and invocation records
+    /// come from `operations` and `history_events`: each operation gets the
+    /// events with its ID, and each `InvocationCompleted` event becomes a
+    /// [`TestInvocation`].
+    fn with_history(
+        status: ExecutionStatus,
+        output: Option<O>,
+        error: Option<crate::WireError>,
+        mut operations: Vec<TestOperation>,
+        invocations: usize,
+        history_events: Vec<Event>,
+    ) -> Self {
+        for op in &mut operations {
+            op.events = history_events
+                .iter()
+                .filter(|event| event.id() == Some(op.id.as_str()))
+                .cloned()
+                .collect();
+        }
+        let invocation_records = history_events
+            .iter()
+            .filter(|event| event.event_type() == Some(&EventType::InvocationCompleted))
+            .map(TestInvocation::from_event)
+            .collect();
+        Self {
+            status,
+            output,
+            error,
+            operations,
+            invocations,
+            history_events,
+            invocation_records,
+        }
+    }
+
     /// The status of the execution.
     ///
     /// Under [`LocalRunner`], a run that ends because nothing can advance,
@@ -738,6 +792,69 @@ impl<O> TestResult<O> {
         self.invocations
     }
 
+    /// The history events of the execution, in history order, as the
+    /// service's `Event` model type.
+    ///
+    /// [`CloudRunner`] returns the events of `GetDurableExecutionHistory`
+    /// unchanged. [`LocalRunner`] synthesizes the events. They follow the
+    /// service's event types and order: one event for each operation update
+    /// the backend accepts, for each wait, callback and chained invoke the
+    /// backend settles, for each invocation (`InvocationCompleted`), and for
+    /// the start and the end of the execution. The local events are a model
+    /// of the service's history. The `history` conformance suite is the
+    /// check against the service.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::lambda_types::EventType;
+    /// use durable::test_util::LocalRunner;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), durable::BoxError> {
+    /// let result = LocalRunner::new()
+    ///     .run(
+    ///         |_e: (), ctx: durable::DurableContext| async move {
+    ///             ctx.step(|_| async { Ok(1_i32) }).await?;
+    ///             Ok::<_, durable::BoxError>(())
+    ///         },
+    ///         (),
+    ///     )
+    ///     .await?;
+    ///
+    /// let types: Vec<_> = result
+    ///     .history_events()
+    ///     .iter()
+    ///     .filter_map(|event| event.event_type().cloned())
+    ///     .collect();
+    /// assert_eq!(
+    ///     types,
+    ///     [
+    ///         EventType::ExecutionStarted,
+    ///         EventType::StepStarted,
+    ///         EventType::StepSucceeded,
+    ///         EventType::InvocationCompleted,
+    ///         EventType::ExecutionSucceeded,
+    ///     ]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn history_events(&self) -> &[Event] {
+        &self.history_events
+    }
+
+    /// One record per handler invocation: one per `InvocationCompleted`
+    /// event of [`history_events`](Self::history_events), in history order.
+    ///
+    /// Under [`LocalRunner`], invocation `n` (counting from 1) has the
+    /// request ID `local-invocation-{n}`, and the list has
+    /// [`invocation_count`](Self::invocation_count) records.
+    pub fn invocations(&self) -> &[TestInvocation] {
+        &self.invocation_records
+    }
+
     /// The operations as a table with the columns `columns` enables.
     ///
     /// [`Display`](std::fmt::Display) for `TestResult` prints this table
@@ -799,6 +916,90 @@ impl<O> std::fmt::Display for TestResult<O> {
     /// Prints [`display_with`](Self::display_with) with every column.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.display_with(PrintColumns::default()).fmt(f)
+    }
+}
+
+/// One handler invocation of an execution, read from its
+/// `InvocationCompleted` history event.
+///
+/// Returned in order by [`TestResult::invocations`].
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk as durable;
+/// use durable::test_util::LocalRunner;
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), durable::BoxError> {
+/// let result = LocalRunner::new()
+///     .run(
+///         |_e: (), _ctx: durable::DurableContext| async move {
+///             Ok::<_, durable::BoxError>(())
+///         },
+///         (),
+///     )
+///     .await?;
+///
+/// let invocation = &result.invocations()[0];
+/// assert_eq!(invocation.request_id(), Some("local-invocation-1"));
+/// assert!(invocation.error().is_none());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TestInvocation {
+    start_time: Option<std::time::SystemTime>,
+    end_time: Option<std::time::SystemTime>,
+    request_id: Option<String>,
+    error: Option<crate::WireError>,
+}
+
+impl TestInvocation {
+    /// The record of an `InvocationCompleted` event, with the fields of its
+    /// `InvocationCompletedDetails`. An event without details gives a
+    /// record with every field absent.
+    fn from_event(event: &Event) -> Self {
+        let details = event.invocation_completed_details();
+        let time = |t: &DateTime| std::time::SystemTime::try_from(*t).ok();
+        Self {
+            start_time: details.and_then(|d| time(d.start_timestamp())),
+            end_time: details.and_then(|d| time(d.end_timestamp())),
+            request_id: details.map(|d| d.request_id().to_owned()),
+            error: details
+                .and_then(InvocationCompletedDetails::error)
+                .and_then(EventError::payload)
+                .map(wire_error_from_object),
+        }
+    }
+
+    /// The time the invocation started, or `None` when it lies outside the
+    /// range of `SystemTime`.
+    pub fn start_time(&self) -> Option<std::time::SystemTime> {
+        self.start_time
+    }
+
+    /// The time the invocation ended, or `None` when it lies outside the
+    /// range of `SystemTime`.
+    pub fn end_time(&self) -> Option<std::time::SystemTime> {
+        self.end_time
+    }
+
+    /// The request ID of the invocation.
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    /// The error the invocation ended with, or `None` when it returned a
+    /// `SUCCEEDED` or `PENDING` result.
+    ///
+    /// Under [`LocalRunner`], an invocation fault (the invocation itself
+    /// failed, for example on a retryable checkpoint error) has no error
+    /// type and its message is the fault's text. A `FAILED` result has the
+    /// result's error type, message, error data and stack trace.
+    pub fn error(&self) -> Option<&crate::WireError> {
+        self.error.as_ref()
     }
 }
 
@@ -2040,6 +2241,7 @@ impl LocalRunner {
     /// The invoke → parse → advance loop of [`drive`](Self::drive), with the
     /// service function as a parameter. Internal seam: a unit test passes a
     /// service that returns an envelope `wrap` never produces.
+    #[expect(clippy::too_many_lines)] // reason: one loop over the invocations reads better as one flow
     async fn drive_service<S>(
         &self,
         backend: Arc<Backend>,
@@ -2060,6 +2262,7 @@ impl LocalRunner {
         // faults reports the fault rather than a generic budget message.
         let mut last_invocation_fault: Option<String> = None;
 
+        backend.record_execution_started(&event_json);
         loop {
             invocations += 1;
             if invocations > self.max_invocations {
@@ -2086,13 +2289,17 @@ impl LocalRunner {
                     },
                     operations: backend.snapshot_operations(),
                     invocations: invocations - 1,
+                    events: backend.events(),
                 });
             }
 
             let payload = build_envelope(&backend, &event_json, self.initial_page_size);
+            let mut context = lambda_runtime::Context::default();
+            context.request_id = format!("local-invocation-{invocations}");
+            let started_at = backend.now();
             let lambda_event = lambda_runtime::LambdaEvent::new(
                 crate::InvocationPayload(payload),
-                lambda_runtime::Context::default(),
+                context.clone(),
             );
 
             // Await the service future INLINE, never on a spawned task.
@@ -2109,12 +2316,26 @@ impl LocalRunner {
                     // bootstrap failure. The durable service re-invokes
                     // on an invocation fault, so the runner does too;
                     // `max_invocations` bounds a persistent fault.
-                    last_invocation_fault = Some(e.to_string());
+                    let fault = e.to_string();
+                    backend.record_invocation_completed(
+                        started_at,
+                        &context.request_id,
+                        Some(&crate::WireError::new(None::<String>, Some(fault.as_str()))),
+                    );
+                    last_invocation_fault = Some(fault);
                     continue;
                 }
             };
 
-            let end = match response.get("Status").and_then(serde_json::Value::as_str) {
+            let status = response.get("Status").and_then(serde_json::Value::as_str);
+            backend.record_invocation_completed(
+                started_at,
+                &context.request_id,
+                (status == Some("FAILED"))
+                    .then(|| envelope_wire_error(&response))
+                    .as_ref(),
+            );
+            let end = match status {
                 Some("SUCCEEDED") => RawEnd::Succeeded(
                     response
                         .get("Result")
@@ -2149,10 +2370,12 @@ impl LocalRunner {
                     ));
                 }
             };
+            backend.record_execution_end(&end);
             return Ok(RawRun {
                 end,
                 operations: backend.snapshot_operations(),
                 invocations,
+                events: backend.events(),
             });
         }
     }
@@ -2185,6 +2408,8 @@ struct RawRun {
     end: RawEnd,
     operations: Vec<TestOperation>,
     invocations: usize,
+    /// The history events the backend recorded.
+    events: Vec<Event>,
 }
 
 /// The end of a driven execution (see [`RawRun`]).
@@ -2208,6 +2433,7 @@ impl RawRun {
             end,
             operations,
             invocations,
+            events,
         } = self;
         let (status, output, error) = match end {
             RawEnd::Succeeded(raw) => {
@@ -2235,13 +2461,14 @@ impl RawRun {
                 Some(crate::WireError::new(error_type, Some(message))),
             ),
         };
-        Ok(TestResult {
+        Ok(TestResult::with_history(
             status,
             output,
             error,
             operations,
             invocations,
-        })
+            events,
+        ))
     }
 
     /// The outcome a nested durable run records on the caller's invoke.
@@ -2301,7 +2528,7 @@ fn build_envelope(
 
     let mut operations = Vec::with_capacity(page.len() + 1);
     operations.push(serde_json::json!({
-        "Id": "execution",
+        "Id": EXECUTION_OPERATION_ID,
         "Type": "EXECUTION",
         "Status": "STARTED",
         "ExecutionDetails": { "InputPayload": event_json }
@@ -2723,18 +2950,19 @@ impl CloudRunner {
         let terminal = loop {
             if self.max_poll_attempts.is_some_and(|limit| polls >= limit) {
                 let events = fetch_history(api, &execution_arn).await?;
-                return Ok(TestResult {
-                    status: ExecutionStatus::Running,
-                    output: None,
-                    error: Some(crate::WireError::new(
+                return Ok(TestResult::with_history(
+                    ExecutionStatus::Running,
+                    None,
+                    Some(crate::WireError::new(
                         None::<String>,
                         Some(format!(
                             "execution {execution_arn} still running after {polls} polls"
                         )),
                     )),
-                    operations: fold_history(&events),
-                    invocations: polls,
-                });
+                    fold_history(&events),
+                    polls,
+                    events,
+                ));
             }
             polls += 1;
             tokio::time::sleep(self.poll_interval).await;
@@ -2793,13 +3021,14 @@ impl CloudRunner {
             );
             (None, Some(error))
         };
-        Ok(TestResult {
+        Ok(TestResult::with_history(
             status,
             output,
             error,
-            operations: fold_history(&events),
+            fold_history(&events),
             invocations,
-        })
+            events,
+        ))
     }
 
     /// The `Invoke` request for `payload`, with this runner's function,
@@ -2881,7 +3110,7 @@ fn terminal_event_error(event: &Event) -> Option<&ErrorObject> {
             .and_then(aws_sdk_lambda::types::ExecutionStoppedDetails::error),
         _ => None,
     };
-    error.and_then(aws_sdk_lambda::types::EventError::payload)
+    error.and_then(EventError::payload)
 }
 
 /// Deserializes the handler output from the terminal result
@@ -2993,7 +3222,7 @@ fn apply_event_transition(op: &mut TestOperation, event: &Event) {
                 // `None`, so the value never describes an older retry.
                 if let Some(delay) = details
                     .retry_details()
-                    .and_then(aws_sdk_lambda::types::RetryDetails::next_attempt_delay_seconds)
+                    .and_then(RetryDetails::next_attempt_delay_seconds)
                 {
                     op.step.next_attempt_time = next_attempt_time(event, delay);
                 }
@@ -3055,7 +3284,7 @@ fn next_attempt_time(event: &Event, delay_seconds: i32) -> Option<std::time::Sys
 /// `ChainedInvokeFailed`, `ChainedInvokeTimedOut` and `ChainedInvokeStopped`.
 /// Every one of them is read here, in one place. So a transition arm cannot
 /// set the status of an error-bearing event and drop its error record.
-fn operation_event_error(event: &Event) -> Option<&aws_sdk_lambda::types::EventError> {
+fn operation_event_error(event: &Event) -> Option<&EventError> {
     match event.event_type()? {
         EventType::StepFailed => event.step_failed_details()?.error(),
         EventType::WaitCancelled => event.wait_cancelled_details()?.error(),
@@ -3070,10 +3299,8 @@ fn operation_event_error(event: &Event) -> Option<&aws_sdk_lambda::types::EventE
 }
 
 /// Extracts the JSON payload string from an optional `EventResult`.
-fn event_result_payload(result: Option<&aws_sdk_lambda::types::EventResult>) -> Option<String> {
-    result
-        .and_then(aws_sdk_lambda::types::EventResult::payload)
-        .map(ToOwned::to_owned)
+fn event_result_payload(result: Option<&EventResult>) -> Option<String> {
+    result.and_then(EventResult::payload).map(ToOwned::to_owned)
 }
 
 /// Records the error of the current event onto the op: its type, message,
@@ -3084,9 +3311,9 @@ fn event_result_payload(result: Option<&aws_sdk_lambda::types::EventResult>) -> 
 /// without one. Keeping the earlier error would report a succeeded step with
 /// the error of a failed attempt. So an event without an error clears it, as
 /// `LocalRunner` clears a stored error when a retry starts.
-fn set_error(op: &mut TestOperation, error: Option<&aws_sdk_lambda::types::EventError>) {
+fn set_error(op: &mut TestOperation, error: Option<&EventError>) {
     op.error = error
-        .and_then(aws_sdk_lambda::types::EventError::payload)
+        .and_then(EventError::payload)
         .map(wire_error_from_object);
 }
 
@@ -3105,7 +3332,7 @@ fn wire_error_from_object(obj: &ErrorObject) -> crate::WireError {
 /// success reports `0`). The two are reconciled here so both runners agree.
 /// `saturating_sub` guards the conversion: a non-positive `current_attempt`
 /// maps to `0` without underflow.
-fn set_attempt(op: &mut TestOperation, retry: Option<&aws_sdk_lambda::types::RetryDetails>) {
+fn set_attempt(op: &mut TestOperation, retry: Option<&RetryDetails>) {
     if let Some(details) = retry {
         let one_based = u32::try_from(details.current_attempt().max(0)).unwrap_or(0);
         op.step.attempt = one_based.saturating_sub(1);
@@ -3300,6 +3527,11 @@ struct BackendState {
     /// `UpdatedOperationIds` and clears them (see
     /// [`Backend::take_updated_ids`]). A checkpoint call never adds to it.
     updated_ids: Vec<String>,
+    /// The history events, in the order of their causes (see
+    /// [`BackendState::push_event`]).
+    events: Vec<Event>,
+    /// The event ID of the last event in `events`, or 0 before the first.
+    last_event_id: i32,
 }
 
 /// The in-memory execution client. Shared (via `Arc`) between the runner and
@@ -3374,6 +3606,8 @@ impl Backend {
                 now: 0,
                 base: std::time::SystemTime::now(),
                 updated_ids: Vec::new(),
+                events: Vec::new(),
+                last_event_id: 0,
             }),
             checkpoint_page_size,
             get_state_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -3476,6 +3710,76 @@ impl Backend {
             .collect()
     }
 
+    /// The virtual time.
+    fn now(&self) -> u64 {
+        self.lock().now
+    }
+
+    /// The recorded history events.
+    fn events(&self) -> Vec<Event> {
+        self.lock().events.clone()
+    }
+
+    /// Records `ExecutionStarted`, with `input` as its input payload.
+    fn record_execution_started(&self, input: &str) {
+        // `ExecutionStartedDetails` requires `ExecutionTimeout`. The local
+        // backend has no execution timeout, so the event records 0.
+        #[expect(clippy::expect_used)] // reason: the one required field is set
+        let details = aws_sdk_lambda::types::ExecutionStartedDetails::builder()
+            .input(EventInput::builder().payload(input).build())
+            .execution_timeout(0)
+            .build()
+            .expect("the execution timeout is set");
+        self.lock().push_event(
+            execution_event(EventType::ExecutionStarted).execution_started_details(details),
+        );
+    }
+
+    /// Records `InvocationCompleted` for an invocation that started at the
+    /// virtual time `started_at` and ends now, with `error` as its error.
+    fn record_invocation_completed(
+        &self,
+        started_at: u64,
+        request_id: &str,
+        error: Option<&crate::WireError>,
+    ) {
+        let mut state = self.lock();
+        #[expect(clippy::expect_used)] // reason: the three required fields are set
+        let details = InvocationCompletedDetails::builder()
+            .start_timestamp(state.event_time(started_at))
+            .end_timestamp(state.event_time(state.now))
+            .request_id(request_id)
+            .set_error(error.map(event_error))
+            .build()
+            .expect("the timestamps and the request ID are set");
+        state.push_event(
+            Event::builder()
+                .event_type(EventType::InvocationCompleted)
+                .invocation_completed_details(details),
+        );
+    }
+
+    /// Records `ExecutionSucceeded` or `ExecutionFailed` for a run that
+    /// ended with `end`. A suspended run records nothing.
+    fn record_execution_end(&self, end: &RawEnd) {
+        let event = match end {
+            RawEnd::Succeeded(result) => execution_event(EventType::ExecutionSucceeded)
+                .execution_succeeded_details(
+                    aws_sdk_lambda::types::ExecutionSucceededDetails::builder()
+                        .set_result(event_result(result.as_deref()))
+                        .build(),
+                ),
+            RawEnd::Failed(wire) => execution_event(EventType::ExecutionFailed)
+                .execution_failed_details(
+                    aws_sdk_lambda::types::ExecutionFailedDetails::builder()
+                        .error(event_error(wire))
+                        .build(),
+                ),
+            RawEnd::Suspended { .. } => return,
+        };
+        self.lock().push_event(event);
+    }
+
     /// Snapshots the recorded operations as public [`TestOperation`]s.
     fn snapshot_operations(&self) -> Vec<TestOperation> {
         let state = self.lock();
@@ -3487,11 +3791,7 @@ impl Backend {
                 out.sub_type.clone_from(&op.sub_type);
                 out.status = op.status;
                 out.result.clone_from(&op.result);
-                out.error = has_error_fields(op).then(|| {
-                    crate::WireError::new(op.error_type.as_deref(), op.error_message.as_deref())
-                        .with_error_data(op.error_data.as_deref())
-                        .with_stack_trace(op.stack_trace.clone())
-                });
+                out.error = stored_wire_error(op);
                 out.name.clone_from(&op.name);
                 out.parent_id.clone_from(&op.parent_id);
                 out.start_time = state.local_time(op.start_at);
@@ -3556,6 +3856,8 @@ impl Backend {
 
         // A named reply can match through the parent record, so the
         // matching pass reads `ops` while the delivery pass writes it.
+        // The events of the settled records, appended after the pass.
+        let mut events = Vec::new();
         let deliveries = take_callback_deliveries(ops, callback_replies);
         if deliveries.iter().any(Option::is_some) {
             // `deliveries` holds one entry per record, in record order, so
@@ -3564,25 +3866,29 @@ impl Backend {
                 if let Some(reply) = reply {
                     reply.deliver_to(op, *now);
                     updated_ids.push(op.id.clone());
+                    events.extend(settled_event(op));
                 }
             }
-            return true;
-        }
-
-        let Some(next) = ops.iter().filter_map(timed_due_at).min() else {
-            return false;
-        };
-        *now = next;
-        for op in ops.iter_mut() {
-            if timed_due_at(op).is_some_and(|due| due <= next) {
-                let fired = if op.kind == OperationKind::Wait {
-                    OperationStatus::Succeeded
-                } else {
-                    OperationStatus::Ready
-                };
-                op.set_status(fired, next);
-                updated_ids.push(op.id.clone());
+        } else {
+            let Some(next) = ops.iter().filter_map(timed_due_at).min() else {
+                return false;
+            };
+            *now = next;
+            for op in ops.iter_mut() {
+                if timed_due_at(op).is_some_and(|due| due <= next) {
+                    let fired = if op.kind == OperationKind::Wait {
+                        OperationStatus::Succeeded
+                    } else {
+                        OperationStatus::Ready
+                    };
+                    op.set_status(fired, next);
+                    updated_ids.push(op.id.clone());
+                    events.extend(settled_event(op));
+                }
             }
+        }
+        for event in events {
+            state.push_event(event);
         }
         true
     }
@@ -3663,6 +3969,11 @@ impl Backend {
             NestedOutcome::Suspended => return false,
         }
         updated_ids.push(op.id.clone());
+        // A recorded outcome is `Succeeded` or `Failed`, so the invoke has
+        // a settled event.
+        if let Some(event) = settled_event(op) {
+            state.push_event(event);
+        }
         true
     }
 
@@ -3793,6 +4104,151 @@ impl BackendState {
     /// `t` seconds. A sum past the range of `SystemTime` reports `None`.
     fn local_time(&self, t: u64) -> Option<std::time::SystemTime> {
         self.base.checked_add(std::time::Duration::from_secs(t))
+    }
+
+    /// The event timestamp of the virtual time `t`: the run's start time
+    /// plus `t` seconds, as [`local_time`](Self::local_time) reports it.
+    ///
+    /// `DateTime` counts seconds in an `i64`, so the sum cannot leave its
+    /// range: `t` is a sum of `i32` wait and retry durations.
+    fn event_time(&self, t: u64) -> DateTime {
+        let base = DateTime::from(self.base);
+        DateTime::from_secs_and_nanos(
+            base.secs().saturating_add(t.cast_signed()),
+            base.subsec_nanos(),
+        )
+    }
+
+    /// Appends the event `builder` describes, with the next event ID
+    /// (counting from 1) and the current virtual time as its timestamp.
+    fn push_event(&mut self, builder: EventBuilder) {
+        self.last_event_id = self.last_event_id.saturating_add(1);
+        let event = builder
+            .event_id(self.last_event_id)
+            .event_timestamp(self.event_time(self.now))
+            .build();
+        self.events.push(event);
+    }
+
+    /// The history event of an accepted `update` of the stored op `op`, as
+    /// the table of [`TestResult::history_events`] states, or `None` when
+    /// the update has no event of its own (an `EXECUTION` update, or an
+    /// action the table does not list).
+    #[expect(clippy::too_many_lines)] // reason: one arm per row of the table
+    fn update_event(&self, op: &StoredOp, update: &OperationUpdate) -> Option<EventBuilder> {
+        let error = || stored_wire_error(op).as_ref().map(event_error);
+        let result = || event_result(op.result.as_deref());
+        let event = match (op.kind, update.action()) {
+            (OperationKind::Step, OperationAction::Start) => op_event(op, EventType::StepStarted)
+                .step_started_details(aws_sdk_lambda::types::StepStartedDetails::builder().build()),
+            // `attempt` counts completed retries, and `CurrentAttempt` is
+            // 1-based.
+            (OperationKind::Step, OperationAction::Succeed) => {
+                op_event(op, EventType::StepSucceeded).step_succeeded_details(
+                    aws_sdk_lambda::types::StepSucceededDetails::builder()
+                        .set_result(result())
+                        .retry_details(retry_details(op.attempt.saturating_add(1), None))
+                        .build(),
+                )
+            }
+            (OperationKind::Step, OperationAction::Fail) => op_event(op, EventType::StepFailed)
+                .step_failed_details(
+                    aws_sdk_lambda::types::StepFailedDetails::builder()
+                        .set_error(error())
+                        .retry_details(retry_details(op.attempt.saturating_add(1), None))
+                        .build(),
+                ),
+            // A `RETRY` has already counted the failed attempt in
+            // `attempt`, so `attempt` is the 1-based number of that attempt.
+            (OperationKind::Step, OperationAction::Retry) => op_event(op, EventType::StepFailed)
+                .step_failed_details(
+                    aws_sdk_lambda::types::StepFailedDetails::builder()
+                        .set_error(error())
+                        .retry_details(retry_details(
+                            op.attempt,
+                            update.step_options().and_then(
+                                aws_sdk_lambda::types::StepOptions::next_attempt_delay_seconds,
+                            ),
+                        ))
+                        .build(),
+                ),
+            (OperationKind::Context, OperationAction::Start) => {
+                op_event(op, EventType::ContextStarted).context_started_details(
+                    aws_sdk_lambda::types::ContextStartedDetails::builder().build(),
+                )
+            }
+            (OperationKind::Context, OperationAction::Succeed) => {
+                op_event(op, EventType::ContextSucceeded).context_succeeded_details(
+                    aws_sdk_lambda::types::ContextSucceededDetails::builder()
+                        .set_result(result())
+                        .build(),
+                )
+            }
+            (OperationKind::Context, OperationAction::Fail) => {
+                op_event(op, EventType::ContextFailed).context_failed_details(
+                    aws_sdk_lambda::types::ContextFailedDetails::builder()
+                        .set_error(error())
+                        .build(),
+                )
+            }
+            (OperationKind::Wait, OperationAction::Start) => {
+                // A missing duration counts as 0, as the stored due time
+                // does (see [`whole_seconds`]).
+                let duration = op.wait_seconds.unwrap_or(0);
+                #[expect(clippy::expect_used)] // reason: both required fields are set
+                let details = aws_sdk_lambda::types::WaitStartedDetails::builder()
+                    .duration(duration)
+                    .scheduled_end_timestamp(
+                        self.event_time(self.now.saturating_add(whole_seconds(Some(duration)))),
+                    )
+                    .build()
+                    .expect("the duration and the scheduled end are set");
+                op_event(op, EventType::WaitStarted).wait_started_details(details)
+            }
+            (OperationKind::Wait, OperationAction::Cancel) => {
+                op_event(op, EventType::WaitCancelled).wait_cancelled_details(
+                    aws_sdk_lambda::types::WaitCancelledDetails::builder()
+                        .set_error(error())
+                        .build(),
+                )
+            }
+            (OperationKind::Callback, OperationAction::Start) => {
+                let options = update.callback_options();
+                // A callback `START` assigns the callback ID when the
+                // record has none (see `apply_update`).
+                #[expect(clippy::expect_used)] // reason: the callback ID is set
+                let details = aws_sdk_lambda::types::CallbackStartedDetails::builder()
+                    .set_callback_id(op.callback_id.clone())
+                    .set_timeout(
+                        options.map(aws_sdk_lambda::types::CallbackOptions::timeout_seconds),
+                    )
+                    .set_heartbeat_timeout(
+                        options
+                            .map(aws_sdk_lambda::types::CallbackOptions::heartbeat_timeout_seconds),
+                    )
+                    .build()
+                    .expect("a callback START sets the callback ID");
+                op_event(op, EventType::CallbackStarted).callback_started_details(details)
+            }
+            (OperationKind::ChainedInvoke, OperationAction::Start) => {
+                // A `START` without `ChainedInvokeOptions` names no
+                // function, and records the empty name.
+                #[expect(clippy::expect_used)] // reason: the function name is set
+                let details = aws_sdk_lambda::types::ChainedInvokeStartedDetails::builder()
+                    .function_name(op.invoke_function.clone().unwrap_or_default())
+                    .set_input(
+                        op.invoke_input
+                            .as_deref()
+                            .map(|p| EventInput::builder().payload(p).build()),
+                    )
+                    .build()
+                    .expect("the function name is set");
+                op_event(op, EventType::ChainedInvokeStarted)
+                    .chained_invoke_started_details(details)
+            }
+            _ => return None,
+        };
+        Some(event)
     }
 
     /// Finds a stored op by wire ID.
@@ -3936,7 +4392,11 @@ impl BackendState {
             _ => {}
         }
 
-        Some(op.clone())
+        let stored = op.clone();
+        if let Some(event) = self.update_event(&stored, update) {
+            self.push_event(event);
+        }
+        Some(stored)
     }
 }
 
@@ -4132,27 +4592,129 @@ fn has_error_fields(stored: &StoredOp) -> bool {
         || !stored.stack_trace.is_empty()
 }
 
+/// The error a stored op carries, or `None` when it has no error field
+/// (see [`has_error_fields`]).
+fn stored_wire_error(stored: &StoredOp) -> Option<crate::WireError> {
+    has_error_fields(stored).then(|| {
+        crate::WireError::new(
+            stored.error_type.as_deref(),
+            stored.error_message.as_deref(),
+        )
+        .with_error_data(stored.error_data.as_deref())
+        .with_stack_trace(stored.stack_trace.clone())
+    })
+}
+
+/// The service `ErrorObject` of a wire error, with every field it has.
+fn error_object(wire: &crate::WireError) -> ErrorObject {
+    let mut builder = ErrorObject::builder()
+        .set_error_type(wire.error_type().map(ToOwned::to_owned))
+        .set_error_message(wire.error_message().map(ToOwned::to_owned))
+        .set_error_data(wire.error_data().map(ToOwned::to_owned));
+    for frame in wire.stack_trace() {
+        builder = builder.stack_trace(frame);
+    }
+    builder.build()
+}
+
+/// The `EventError` of a history event that carries `wire`.
+fn event_error(wire: &crate::WireError) -> EventError {
+    EventError::builder().payload(error_object(wire)).build()
+}
+
+/// The `EventResult` of a history event that carries `payload`.
+fn event_result(payload: Option<&str>) -> Option<EventResult> {
+    payload.map(|p| EventResult::builder().payload(p).build())
+}
+
+/// The ID of the execution operation of every synthesized envelope.
+const EXECUTION_OPERATION_ID: &str = "execution";
+
+/// An execution-level history event of `event_type`, with the ID of the
+/// execution operation.
+fn execution_event(event_type: EventType) -> EventBuilder {
+    Event::builder()
+        .event_type(event_type)
+        .id(EXECUTION_OPERATION_ID)
+}
+
+/// A history event of `event_type` for the stored op `op`, with its ID,
+/// name, sub-type and parent ID.
+fn op_event(op: &StoredOp, event_type: EventType) -> EventBuilder {
+    Event::builder()
+        .event_type(event_type)
+        .id(&op.id)
+        .set_name(op.name.clone())
+        .set_sub_type(op.sub_type.clone())
+        .set_parent_id(op.parent_id.clone())
+}
+
+/// The retry details of a step event: the 1-based `current_attempt` and
+/// the retry delay.
+fn retry_details(current_attempt: i32, next_attempt_delay_seconds: Option<i32>) -> RetryDetails {
+    RetryDetails::builder()
+        .current_attempt(current_attempt)
+        .set_next_attempt_delay_seconds(next_attempt_delay_seconds)
+        .build()
+}
+
+/// The history event of a record the backend settled between invocations:
+/// a fired wait, a callback that received a reply, or a chained invoke whose
+/// target returned. A step whose retry delay elapsed (`Ready`) has none.
+fn settled_event(op: &StoredOp) -> Option<EventBuilder> {
+    let error = || stored_wire_error(op).as_ref().map(event_error);
+    let result = || event_result(op.result.as_deref());
+    let event = match (op.kind, op.status) {
+        (OperationKind::Wait, OperationStatus::Succeeded) => op_event(op, EventType::WaitSucceeded)
+            .wait_succeeded_details(
+                aws_sdk_lambda::types::WaitSucceededDetails::builder()
+                    .set_duration(op.wait_seconds)
+                    .build(),
+            ),
+        (OperationKind::Callback, OperationStatus::Succeeded) => {
+            op_event(op, EventType::CallbackSucceeded).callback_succeeded_details(
+                aws_sdk_lambda::types::CallbackSucceededDetails::builder()
+                    .set_result(result())
+                    .build(),
+            )
+        }
+        (OperationKind::Callback, OperationStatus::Failed) => {
+            op_event(op, EventType::CallbackFailed).callback_failed_details(
+                aws_sdk_lambda::types::CallbackFailedDetails::builder()
+                    .set_error(error())
+                    .build(),
+            )
+        }
+        (OperationKind::Callback, OperationStatus::TimedOut) => {
+            op_event(op, EventType::CallbackTimedOut).callback_timed_out_details(
+                aws_sdk_lambda::types::CallbackTimedOutDetails::builder()
+                    .set_error(error())
+                    .build(),
+            )
+        }
+        (OperationKind::ChainedInvoke, OperationStatus::Succeeded) => {
+            op_event(op, EventType::ChainedInvokeSucceeded).chained_invoke_succeeded_details(
+                aws_sdk_lambda::types::ChainedInvokeSucceededDetails::builder()
+                    .set_result(result())
+                    .build(),
+            )
+        }
+        (OperationKind::ChainedInvoke, OperationStatus::Failed) => {
+            op_event(op, EventType::ChainedInvokeFailed).chained_invoke_failed_details(
+                aws_sdk_lambda::types::ChainedInvokeFailedDetails::builder()
+                    .set_error(error())
+                    .build(),
+            )
+        }
+        _ => return None,
+    };
+    Some(event)
+}
+
 /// Builds an SDK `Operation` from a stored op, placing result/error in the
 /// details bucket the SDK reads for that operation type.
 fn build_operation(stored: &StoredOp) -> Option<Operation> {
-    let error_obj = if has_error_fields(stored) {
-        let mut eb = ErrorObject::builder();
-        if let Some(t) = &stored.error_type {
-            eb = eb.error_type(t);
-        }
-        if let Some(m) = &stored.error_message {
-            eb = eb.error_message(m);
-        }
-        if let Some(d) = &stored.error_data {
-            eb = eb.error_data(d);
-        }
-        for frame in &stored.stack_trace {
-            eb = eb.stack_trace(frame);
-        }
-        Some(eb.build())
-    } else {
-        None
-    };
+    let error_obj = stored_wire_error(stored).map(|wire| error_object(&wire));
 
     let mut builder = Operation::builder()
         .id(&stored.id)
@@ -4561,6 +5123,7 @@ mod tests {
             end: RawEnd::Failed(envelope_wire_error(&response)),
             operations: Vec::new(),
             invocations: 1,
+            events: Vec::new(),
         }
         .into_test_result()
         .expect("runner");
@@ -4575,6 +5138,7 @@ mod tests {
             end: RawEnd::Failed(envelope_wire_error(&response)),
             operations: Vec::new(),
             invocations: 1,
+            events: Vec::new(),
         }
         .into_test_result()
         .expect("runner");
@@ -8043,6 +8607,9 @@ mod tests {
                 op.end_time = None;
                 op.step.next_attempt_time = None;
                 op.wait.scheduled_end_time = None;
+                for event in &mut op.events {
+                    event.event_timestamp = None;
+                }
                 op
             })
             .collect()
@@ -11422,6 +11989,7 @@ mod tests {
             end: RawEnd::Failed(envelope_wire_error(&response)),
             operations: Vec::new(),
             invocations: 1,
+            events: Vec::new(),
         }
         .into_test_result()
         .expect("runner");
@@ -11666,6 +12234,8 @@ mod tests {
             error: None,
             operations,
             invocations: 0,
+            history_events: Vec::new(),
+            invocation_records: Vec::new(),
         }
     }
 
@@ -12291,5 +12861,1202 @@ mod tests {
     #[test]
     fn print_columns_default_enables_every_column() {
         assert_eq!(PrintColumns::default(), columns_without(&[]));
+    }
+
+    // History events and invocation records.
+
+    /// The event types of `events`, in order.
+    fn event_types(events: &[Event]) -> Vec<EventType> {
+        events
+            .iter()
+            .filter_map(|event| event.event_type().cloned())
+            .collect()
+    }
+
+    /// The history events and the operations of a result.
+    fn history_of<O>(result: &TestResult<O>) -> (Vec<Event>, Vec<TestOperation>) {
+        (
+            result.history_events().to_vec(),
+            result.operations().to_vec(),
+        )
+    }
+
+    /// Two steps: each step's `events()` holds only its own events.
+    #[tokio::test]
+    async fn operation_events_are_filtered_by_id() {
+        let result = LocalRunner::new()
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_u32) }).name("a").await?;
+                    ctx.step(|_| async { Ok(2_u32) }).name("b").await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        for name in ["a", "b"] {
+            let op = result.operation(name).expect("the step");
+            assert_eq!(
+                event_types(op.events()),
+                [EventType::StepStarted, EventType::StepSucceeded],
+                "{name}"
+            );
+            assert!(
+                op.events().iter().all(|e| e.id() == Some(op.id())),
+                "{name}"
+            );
+        }
+    }
+
+    /// A synthetic event of `event_type` for the operation `id`, at `secs`.
+    fn synthetic_event(event_id: i32, event_type: EventType, id: Option<&str>, secs: i64) -> Event {
+        Event::builder()
+            .event_id(event_id)
+            .event_type(event_type)
+            .set_id(id.map(ToOwned::to_owned))
+            .event_timestamp(DateTime::from_secs(secs))
+            .build()
+    }
+
+    /// An `ExecutionSucceeded` event whose result is `1`.
+    fn execution_succeeded_event(event_id: i32) -> Event {
+        Event::builder()
+            .event_id(event_id)
+            .event_type(EventType::ExecutionSucceeded)
+            .execution_succeeded_details(
+                aws_sdk_lambda::types::ExecutionSucceededDetails::builder()
+                    .result(EventResult::builder().payload("1").build())
+                    .build(),
+            )
+            .build()
+    }
+
+    /// `CloudRunner` returns the fetched history unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn fold_history_keeps_service_events() {
+        let events = vec![
+            synthetic_event(1, EventType::ExecutionStarted, Some("execution"), 0),
+            synthetic_event(2, EventType::StepStarted, Some("s"), 1),
+            execution_succeeded_event(3),
+        ];
+        let api = FakeApi::new()
+            .with_execution(Ok(execution_output(
+                WireExecutionStatus::Succeeded,
+                Some("1"),
+            )))
+            .with_history(Ok(events.clone()));
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(result.history_events(), events.as_slice());
+        let step = result.operations().first().expect("the step");
+        assert_eq!(step.events(), events.get(1..2).expect("the step event"));
+    }
+
+    /// `CloudRunner` returns the events of every history page, in page
+    /// order.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_history_keeps_all_pages() {
+        let events = vec![
+            synthetic_event(1, EventType::ExecutionStarted, Some("execution"), 0),
+            synthetic_event(2, EventType::StepStarted, Some("s"), 1),
+            synthetic_event(3, EventType::StepSucceeded, Some("s"), 2),
+            synthetic_event(4, EventType::InvocationCompleted, None, 3),
+            execution_succeeded_event(5),
+        ];
+        let page = |range: std::ops::Range<usize>| events.get(range).expect("a page").to_vec();
+        let api = FakeApi::new()
+            .with_execution(Ok(execution_output(
+                WireExecutionStatus::Succeeded,
+                Some("1"),
+            )))
+            .with_history_pages(vec![
+                Ok((page(0..2), Some("m1".to_owned()))),
+                Ok((page(2..4), Some("m2".to_owned()))),
+                Ok((page(4..5), None)),
+            ]);
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(result.history_events(), events.as_slice());
+        let markers: Vec<Option<String>> = api
+            .history_calls()
+            .into_iter()
+            .map(|call| call.marker)
+            .collect();
+        assert_eq!(
+            markers,
+            [None, Some("m1".to_owned()), Some("m2".to_owned())]
+        );
+    }
+
+    /// An `InvocationCompleted` event with details.
+    fn invocation_completed_event(
+        event_id: i32,
+        start: i64,
+        end: i64,
+        request_id: &str,
+        error: Option<&crate::WireError>,
+    ) -> Event {
+        Event::builder()
+            .event_id(event_id)
+            .event_type(EventType::InvocationCompleted)
+            .invocation_completed_details(
+                InvocationCompletedDetails::builder()
+                    .start_timestamp(DateTime::from_secs(start))
+                    .end_timestamp(DateTime::from_secs(end))
+                    .request_id(request_id)
+                    .set_error(error.map(event_error))
+                    .build()
+                    .expect("details"),
+            )
+            .build()
+    }
+
+    /// `CloudRunner` builds one record per `InvocationCompleted` event, in
+    /// history order, and ignores the other events.
+    #[tokio::test(start_paused = true)]
+    async fn fold_history_builds_invocations() {
+        let failure = crate::WireError::new(Some("Bad"), Some("no"));
+        let events = vec![
+            synthetic_event(1, EventType::ExecutionStarted, Some("execution"), 0),
+            invocation_completed_event(2, 10, 11, "r1", None),
+            invocation_completed_event(3, 20, 22, "r2", Some(&failure)),
+            execution_succeeded_event(4),
+        ];
+        let api = FakeApi::new()
+            .with_execution(Ok(execution_output(
+                WireExecutionStatus::Succeeded,
+                Some("1"),
+            )))
+            .with_history(Ok(events));
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect("runner");
+        let at = |secs: u64| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        let records: Vec<_> = result
+            .invocations()
+            .iter()
+            .map(|r| {
+                (
+                    r.start_time(),
+                    r.end_time(),
+                    r.request_id().map(ToOwned::to_owned),
+                    r.error().cloned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            records,
+            [
+                (at(10), at(11), Some("r1".to_owned()), None),
+                (at(20), at(22), Some("r2".to_owned()), Some(failure)),
+            ]
+        );
+        assert_eq!(result.invocation_count(), 2);
+    }
+
+    /// An `InvocationCompleted` event without details gives a record with
+    /// every field absent.
+    #[test]
+    fn invocation_without_details_has_no_fields() {
+        let record = TestInvocation::from_event(&synthetic_event(
+            1,
+            EventType::InvocationCompleted,
+            None,
+            0,
+        ));
+        assert_eq!(record.start_time(), None);
+        assert_eq!(record.end_time(), None);
+        assert_eq!(record.request_id(), None);
+        assert_eq!(record.error(), None);
+    }
+
+    /// One wait: a pending invocation, then a succeeded one, one second
+    /// later.
+    #[tokio::test]
+    async fn invocations_record_pending_then_succeeded() {
+        let result = LocalRunner::new()
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    ctx.wait(std::time::Duration::from_secs(1)).await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let records = result.invocations();
+        let ids: Vec<_> = records.iter().map(TestInvocation::request_id).collect();
+        assert_eq!(
+            ids,
+            [Some("local-invocation-1"), Some("local-invocation-2")]
+        );
+        let first = records.first().expect("the first record");
+        let second = records.get(1).expect("the second record");
+        assert_eq!(
+            second.start_time(),
+            first
+                .start_time()
+                .map(|t| t + std::time::Duration::from_secs(1))
+        );
+        assert!(records.iter().all(|r| r.error().is_none()));
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(result.invocation_count(), records.len());
+    }
+
+    /// An invocation fault records its message and no error type.
+    #[tokio::test]
+    async fn invocations_record_retrying_fault() {
+        let result = LocalRunner::new()
+            .fail_checkpoints_after_retryable(1, 1)
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_u32) }).name("a").await?;
+                    ctx.step(|_| async { Ok(2_u32) }).name("b").await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{:?}", result.error());
+        let errors: Vec<_> = result
+            .invocations()
+            .iter()
+            .filter_map(TestInvocation::error)
+            .collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let fault = errors.first().expect("the fault");
+        assert!(
+            fault
+                .error_message()
+                .is_some_and(|m| m.contains("injected retryable checkpoint failure")),
+            "{fault:?}"
+        );
+        assert_eq!(fault.error_type(), None);
+        assert_eq!(result.invocation_count(), result.invocations().len());
+    }
+
+    /// A `FAILED` invocation records the handler's error.
+    #[tokio::test]
+    async fn invocations_record_failed() {
+        let result = LocalRunner::new()
+            .run(
+                |(): (), _ctx: DurableContext| async move { Err::<(), BoxError>("boom".into()) },
+                (),
+            )
+            .await
+            .expect("runner");
+        let records = result.invocations();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records
+                .first()
+                .and_then(TestInvocation::error)
+                .and_then(crate::WireError::error_message),
+            Some("boom")
+        );
+    }
+
+    /// A `FAILED` envelope's stack trace reaches both the
+    /// `InvocationCompleted` event and the invocation record.
+    #[tokio::test]
+    async fn invocations_record_failed_stack_trace() {
+        let result = LocalRunner::new()
+            .run(
+                |(): (), _ctx: DurableContext| async move {
+                    Err::<(), BoxError>(error_with_stack_trace())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let frames = ["frame-1".to_owned(), "frame-2".to_owned()];
+        let event_frames = result
+            .history_events()
+            .iter()
+            .find(|e| e.event_type() == Some(&EventType::InvocationCompleted))
+            .and_then(Event::invocation_completed_details)
+            .and_then(InvocationCompletedDetails::error)
+            .and_then(crate::lambda_types::EventError::payload)
+            .map(|payload| payload.stack_trace().to_vec());
+        assert_eq!(event_frames.as_deref(), Some(frames.as_slice()));
+        let records = result.invocations();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records
+                .first()
+                .and_then(TestInvocation::error)
+                .map(crate::WireError::stack_trace),
+            Some(frames.as_slice())
+        );
+    }
+
+    /// A run that reaches `max_invocations` with work pending has no
+    /// execution end event.
+    #[tokio::test]
+    async fn max_invocations_run_has_no_execution_end_event() {
+        let result = LocalRunner::new()
+            .max_invocations(1)
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    ctx.wait(std::time::Duration::from_secs(1)).await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_suspended());
+        let message = result.error_message().unwrap_or_default();
+        assert!(
+            message.contains("did not terminate within 1 invocations"),
+            "{message}"
+        );
+        let types = event_types(result.history_events());
+        assert!(
+            !types.contains(&EventType::ExecutionSucceeded)
+                && !types.contains(&EventType::ExecutionFailed),
+            "{types:?}"
+        );
+        assert_eq!(types.first(), Some(&EventType::ExecutionStarted));
+        assert_eq!(result.invocation_count(), 1);
+    }
+
+    /// The handler sees the local request ID of its invocation.
+    #[tokio::test]
+    async fn handler_sees_local_request_id() {
+        let result = LocalRunner::new()
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    Ok::<_, BoxError>(ctx.lambda_context().request_id.clone())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert_eq!(
+            result.output().map(String::as_str),
+            Some("local-invocation-1")
+        );
+    }
+
+    /// A run that ends with work still pending has no execution end event.
+    #[tokio::test]
+    async fn suspended_run_has_no_execution_end_event() {
+        let result = LocalRunner::new()
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let cb = ctx.create_callback::<u32>().await?;
+                    cb.result().await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_suspended());
+        assert_eq!(
+            event_types(result.history_events()),
+            [
+                EventType::ExecutionStarted,
+                EventType::CallbackStarted,
+                EventType::InvocationCompleted,
+            ]
+        );
+        // A callback without a timeout or a heartbeat sends no options.
+        let details = result
+            .history_events()
+            .get(1)
+            .and_then(Event::callback_started_details)
+            .expect("callback started details");
+        assert_eq!(details.timeout(), None);
+        assert_eq!(details.heartbeat_timeout(), None);
+    }
+
+    /// The events a direct checkpoint of `updates` records.
+    async fn checkpoint_events(updates: Vec<OperationUpdate>) -> Vec<Event> {
+        let backend = Backend::new(QueuedReplies::default(), None);
+        backend
+            .checkpoint("arn", "token", updates)
+            .await
+            .expect("checkpoint accepted");
+        backend.events()
+    }
+
+    /// An `EXECUTION` update produces no event of its own.
+    #[tokio::test]
+    async fn execution_update_has_no_event() {
+        let update = OperationUpdate::builder()
+            .id("execution")
+            .r#type(OperationType::Execution)
+            .action(OperationAction::Succeed)
+            .payload("1")
+            .build()
+            .expect("valid update");
+        assert_eq!(checkpoint_events(vec![update]).await, []);
+    }
+
+    /// A WAIT `START` without wait options records a duration of 0.
+    #[tokio::test]
+    async fn wait_start_without_duration_records_zero() {
+        let update = OperationUpdate::builder()
+            .id("w")
+            .r#type(OperationType::Wait)
+            .action(OperationAction::Start)
+            .build()
+            .expect("valid update");
+        let events = checkpoint_events(vec![update]).await;
+        let event = events.first().expect("the event");
+        let details = event.wait_started_details().expect("wait started details");
+        assert_eq!(details.duration(), 0);
+        assert_eq!(
+            Some(details.scheduled_end_timestamp()),
+            event.event_timestamp()
+        );
+    }
+
+    /// A `CHAINED_INVOKE` `START` without options records the empty function
+    /// name.
+    #[tokio::test]
+    async fn invoke_start_without_options_records_no_function() {
+        let update = OperationUpdate::builder()
+            .id("i")
+            .r#type(OperationType::ChainedInvoke)
+            .action(OperationAction::Start)
+            .build()
+            .expect("valid update");
+        let events = checkpoint_events(vec![update]).await;
+        let details = events
+            .first()
+            .and_then(Event::chained_invoke_started_details)
+            .expect("chained invoke started details");
+        assert_eq!(details.function_name(), "");
+        assert_eq!(details.input(), None);
+    }
+
+    /// The owner of a row's event: the execution, an invocation, or the
+    /// operation with a name.
+    #[derive(Debug, Clone, Copy)]
+    enum Owner {
+        Execution,
+        Invocation,
+        Op(&'static str),
+    }
+
+    /// One event a row selects: the first event of `event_type`, its owner,
+    /// and the expected detail fields given the owner's operation.
+    struct EventCheck {
+        event_type: EventType,
+        owner: Owner,
+        expected: fn(Option<&TestOperation>) -> serde_json::Value,
+    }
+
+    type RowFuture = Pin<Box<dyn Future<Output = (Vec<Event>, Vec<TestOperation>)>>>;
+
+    /// One row of the table: its number, its setup, and its checks.
+    struct EventRow {
+        row: usize,
+        setup: fn() -> RowFuture,
+        checks: Vec<EventCheck>,
+    }
+
+    /// Renders an `EventInput` as JSON.
+    fn input_json(input: Option<&EventInput>) -> serde_json::Value {
+        input.map_or(
+            serde_json::Value::Null,
+            |i| serde_json::json!({ "payload": i.payload(), "truncated": i.truncated() }),
+        )
+    }
+
+    /// Renders an `EventResult` as JSON.
+    fn result_json(result: Option<&EventResult>) -> serde_json::Value {
+        result.map_or(
+            serde_json::Value::Null,
+            |r| serde_json::json!({ "payload": r.payload(), "truncated": r.truncated() }),
+        )
+    }
+
+    /// Renders an `EventError` as JSON.
+    fn error_json(error: Option<&EventError>) -> serde_json::Value {
+        error.map_or(serde_json::Value::Null, |e| {
+            serde_json::json!({
+                "payload": e.payload().map(|p| serde_json::json!({
+                    "type": p.error_type(),
+                    "message": p.error_message(),
+                    "data": p.error_data(),
+                    "stack": p.stack_trace(),
+                })),
+                "truncated": e.truncated(),
+            })
+        })
+    }
+
+    /// Renders `RetryDetails` as JSON.
+    fn retry_json(retry: Option<&RetryDetails>) -> serde_json::Value {
+        retry.map_or(serde_json::Value::Null, |r| {
+            serde_json::json!({
+                "current_attempt": r.current_attempt(),
+                "next_attempt_delay_seconds": r.next_attempt_delay_seconds(),
+            })
+        })
+    }
+
+    /// The seconds from the event's timestamp to `t`.
+    fn secs_after(event: &Event, t: &DateTime) -> i64 {
+        t.secs() - event.event_timestamp().expect("a timestamp").secs()
+    }
+
+    /// Every field of the detail struct of the event's type, as JSON. A
+    /// timestamp renders as the seconds after the event's timestamp.
+    #[expect(clippy::too_many_lines)] // reason: one arm per event type
+    fn details_json(event: &Event) -> serde_json::Value {
+        use serde_json::json;
+        match event.event_type().expect("an event type") {
+            EventType::ExecutionStarted => {
+                let d = event.execution_started_details().expect("details");
+                {
+                    json!({ "input": input_json(d.input()), "execution_timeout": d.execution_timeout() })
+                }
+            }
+            EventType::ExecutionSucceeded => {
+                let d = event.execution_succeeded_details().expect("details");
+                json!({ "result": result_json(d.result()) })
+            }
+            EventType::ExecutionFailed => {
+                let d = event.execution_failed_details().expect("details");
+                json!({ "error": error_json(d.error()) })
+            }
+            EventType::StepStarted => {
+                event.step_started_details().expect("details");
+                json!({})
+            }
+            EventType::StepSucceeded => {
+                let d = event.step_succeeded_details().expect("details");
+                {
+                    json!({ "result": result_json(d.result()), "retry_details": retry_json(d.retry_details()) })
+                }
+            }
+            EventType::StepFailed => {
+                let d = event.step_failed_details().expect("details");
+                {
+                    json!({ "error": error_json(d.error()), "retry_details": retry_json(d.retry_details()) })
+                }
+            }
+            EventType::ContextStarted => {
+                event.context_started_details().expect("details");
+                json!({})
+            }
+            EventType::ContextSucceeded => {
+                let d = event.context_succeeded_details().expect("details");
+                json!({ "result": result_json(d.result()) })
+            }
+            EventType::ContextFailed => {
+                let d = event.context_failed_details().expect("details");
+                json!({ "error": error_json(d.error()) })
+            }
+            EventType::WaitStarted => {
+                let d = event.wait_started_details().expect("details");
+                {
+                    json!({
+                        "duration": d.duration(),
+                        "scheduled_end_after": secs_after(event, d.scheduled_end_timestamp()),
+                    })
+                }
+            }
+            EventType::WaitSucceeded => {
+                let d = event.wait_succeeded_details().expect("details");
+                json!({ "duration": d.duration() })
+            }
+            EventType::WaitCancelled => {
+                let d = event.wait_cancelled_details().expect("details");
+                json!({ "error": error_json(d.error()) })
+            }
+            EventType::CallbackStarted => {
+                let d = event.callback_started_details().expect("details");
+                {
+                    json!({
+                        "callback_id": d.callback_id(),
+                        "timeout": d.timeout(),
+                        "heartbeat_timeout": d.heartbeat_timeout(),
+                    })
+                }
+            }
+            EventType::CallbackSucceeded => {
+                let d = event.callback_succeeded_details().expect("details");
+                json!({ "result": result_json(d.result()) })
+            }
+            EventType::CallbackFailed => {
+                let d = event.callback_failed_details().expect("details");
+                json!({ "error": error_json(d.error()) })
+            }
+            EventType::CallbackTimedOut => {
+                let d = event.callback_timed_out_details().expect("details");
+                json!({ "error": error_json(d.error()) })
+            }
+            EventType::ChainedInvokeStarted => {
+                let d = event.chained_invoke_started_details().expect("details");
+                {
+                    json!({
+                        "function_name": d.function_name(),
+                        "tenant_id": d.tenant_id(),
+                        "input": input_json(d.input()),
+                        "executed_version": d.executed_version(),
+                        "durable_execution_arn": d.durable_execution_arn(),
+                    })
+                }
+            }
+            EventType::ChainedInvokeSucceeded => {
+                let d = event.chained_invoke_succeeded_details().expect("details");
+                json!({ "result": result_json(d.result()) })
+            }
+            EventType::ChainedInvokeFailed => {
+                let d = event.chained_invoke_failed_details().expect("details");
+                json!({ "error": error_json(d.error()) })
+            }
+            EventType::InvocationCompleted => {
+                let d = event.invocation_completed_details().expect("details");
+                {
+                    json!({
+                        "start_after": secs_after(event, d.start_timestamp()),
+                        "end_after": secs_after(event, d.end_timestamp()),
+                        "request_id": d.request_id(),
+                        "error": error_json(d.error()),
+                    })
+                }
+            }
+            // The local backend records no other type, so the comparison
+            // with the expected fields fails.
+            _ => serde_json::Value::Null,
+        }
+    }
+
+    /// The number of `*_details()` getters of `event` that return a value.
+    fn details_count(event: &Event) -> usize {
+        [
+            event.execution_started_details().is_some(),
+            event.execution_succeeded_details().is_some(),
+            event.execution_failed_details().is_some(),
+            event.execution_timed_out_details().is_some(),
+            event.execution_stopped_details().is_some(),
+            event.context_started_details().is_some(),
+            event.context_succeeded_details().is_some(),
+            event.context_failed_details().is_some(),
+            event.wait_started_details().is_some(),
+            event.wait_succeeded_details().is_some(),
+            event.wait_cancelled_details().is_some(),
+            event.step_started_details().is_some(),
+            event.step_succeeded_details().is_some(),
+            event.step_failed_details().is_some(),
+            event.chained_invoke_started_details().is_some(),
+            event.chained_invoke_succeeded_details().is_some(),
+            event.chained_invoke_failed_details().is_some(),
+            event.chained_invoke_timed_out_details().is_some(),
+            event.chained_invoke_stopped_details().is_some(),
+            event.callback_started_details().is_some(),
+            event.callback_succeeded_details().is_some(),
+            event.callback_failed_details().is_some(),
+            event.callback_timed_out_details().is_some(),
+            event.invocation_completed_details().is_some(),
+        ]
+        .into_iter()
+        .filter(|set| *set)
+        .count()
+    }
+
+    /// The JSON of an error payload with these fields and no stack trace.
+    fn error_payload(
+        error_type: Option<&str>,
+        message: Option<&str>,
+        data: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "payload": { "type": error_type, "message": message, "data": data, "stack": [] },
+            "truncated": null,
+        })
+    }
+
+    /// The JSON of an `EventResult` or `EventInput` with `payload`.
+    fn payload(payload: &str) -> serde_json::Value {
+        serde_json::json!({ "payload": payload, "truncated": null })
+    }
+
+    /// The JSON of retry details.
+    fn retry(current_attempt: i32, delay: Option<i32>) -> serde_json::Value {
+        serde_json::json!({ "current_attempt": current_attempt, "next_attempt_delay_seconds": delay })
+    }
+
+    /// The message the SDK records for [`bad_no`]: the error chain, the
+    /// type name and then the message.
+    const BAD_NO_MESSAGE: &str = "Bad: no";
+
+    /// The error `Bad` / `no`.
+    fn bad_no() -> BoxError {
+        crate::TypedError::with_type("Bad", "no").into()
+    }
+
+    /// A callback `cb` with a 60 s timeout and a 10 s heartbeat, run with
+    /// `reply` queued.
+    fn callback_row(reply: CallbackReply) -> RowFuture {
+        Box::pin(async move {
+            let result = LocalRunner::new()
+                .callback(reply)
+                .run(
+                    |(): (), ctx: DurableContext| async move {
+                        let cb = ctx
+                            .create_callback::<u32>()
+                            .name("cb")
+                            .timeout(std::time::Duration::from_secs(60))
+                            .heartbeat(std::time::Duration::from_secs(10))
+                            .await?;
+                        Ok::<_, BoxError>(cb.result().await?)
+                    },
+                    (),
+                )
+                .await
+                .expect("runner");
+            history_of(&result)
+        })
+    }
+
+    /// A handler run once on a fresh runner, with event `()`.
+    fn handler_row<O, F, Fut>(handler: F) -> RowFuture
+    where
+        O: Serialize + DeserializeOwned + Send + 'static,
+        F: Fn((), DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    {
+        Box::pin(async move {
+            let result = LocalRunner::new().run(handler, ()).await.expect("runner");
+            history_of(&result)
+        })
+    }
+
+    /// The table of rule 5: one row per cause, with the detail fields of
+    /// rule 4.
+    #[expect(clippy::too_many_lines)] // reason: one entry per row of the table
+    fn event_rows() -> Vec<EventRow> {
+        use serde_json::json;
+        vec![
+            EventRow {
+                row: 1,
+                setup: || {
+                    Box::pin(async {
+                        let result = LocalRunner::new()
+                            .run(
+                                |_e: serde_json::Value, _ctx: DurableContext| async move {
+                                    Ok::<_, BoxError>(1_u32)
+                                },
+                                json!({ "k": 1 }),
+                            )
+                            .await
+                            .expect("runner");
+                        history_of(&result)
+                    })
+                },
+                checks: vec![
+                    EventCheck {
+                        event_type: EventType::ExecutionStarted,
+                        owner: Owner::Execution,
+                        expected: |_| json!({ "input": payload("{\"k\":1}"), "execution_timeout": 0 }),
+                    },
+                    EventCheck {
+                        event_type: EventType::ExecutionSucceeded,
+                        owner: Owner::Execution,
+                        expected: |_| json!({ "result": payload("1") }),
+                    },
+                ],
+            },
+            EventRow {
+                row: 2,
+                setup: || {
+                    handler_row(|(), ctx: DurableContext| async move {
+                        Ok(ctx.step(|_| async { Ok(7_u32) }).name("s").await?)
+                    })
+                },
+                checks: vec![
+                    EventCheck {
+                        event_type: EventType::StepStarted,
+                        owner: Owner::Op("s"),
+                        expected: |_| json!({}),
+                    },
+                    EventCheck {
+                        event_type: EventType::StepSucceeded,
+                        owner: Owner::Op("s"),
+                        expected: |_| json!({ "result": payload("7"), "retry_details": retry(1, None) }),
+                    },
+                ],
+            },
+            EventRow {
+                row: 3,
+                setup: || {
+                    handler_row(|(), ctx: DurableContext| async move {
+                        ctx.step(|_| async { Err::<u32, BoxError>(bad_no()) })
+                            .name("s")
+                            .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                            .await?;
+                        Ok(())
+                    })
+                },
+                checks: vec![EventCheck {
+                    event_type: EventType::StepFailed,
+                    owner: Owner::Op("s"),
+                    expected: |_| {
+                        json!({
+                            "error": error_payload(Some("Bad"), Some(BAD_NO_MESSAGE), None),
+                            "retry_details": retry(1, None),
+                        })
+                    },
+                }],
+            },
+            EventRow {
+                row: 4,
+                setup: || {
+                    handler_row(|(), ctx: DurableContext| async move {
+                        Ok(ctx
+                            .step(|step| async move {
+                                if step.attempt() == 1 {
+                                    return Err::<u32, BoxError>(bad_no());
+                                }
+                                Ok(1)
+                            })
+                            .name("s")
+                            .retry_strategy(|_err, _attempt| RetryDecision::Retry {
+                                delay: std::time::Duration::from_secs(5),
+                            })
+                            .await?)
+                    })
+                },
+                checks: vec![EventCheck {
+                    event_type: EventType::StepFailed,
+                    owner: Owner::Op("s"),
+                    expected: |_| {
+                        json!({
+                            "error": error_payload(Some("Bad"), Some(BAD_NO_MESSAGE), None),
+                            "retry_details": retry(1, Some(5)),
+                        })
+                    },
+                }],
+            },
+            EventRow {
+                row: 5,
+                setup: || {
+                    handler_row(|(), ctx: DurableContext| async move {
+                        Ok(ctx
+                            .run_in_child_context(|_child| async move { Ok(2_u32) })
+                            .name("c")
+                            .await?)
+                    })
+                },
+                checks: vec![
+                    EventCheck {
+                        event_type: EventType::ContextStarted,
+                        owner: Owner::Op("c"),
+                        expected: |_| json!({}),
+                    },
+                    EventCheck {
+                        event_type: EventType::ContextSucceeded,
+                        owner: Owner::Op("c"),
+                        expected: |_| json!({ "result": payload("2") }),
+                    },
+                ],
+            },
+            EventRow {
+                row: 6,
+                setup: || {
+                    handler_row(|(), ctx: DurableContext| async move {
+                        Ok(ctx
+                            .run_in_child_context(
+                                |_child| async move { Err::<u32, BoxError>(bad_no()) },
+                            )
+                            .name("c")
+                            .await?)
+                    })
+                },
+                checks: vec![EventCheck {
+                    event_type: EventType::ContextFailed,
+                    owner: Owner::Op("c"),
+                    expected: |_| json!({ "error": error_payload(Some("Bad"), Some(BAD_NO_MESSAGE), None) }),
+                }],
+            },
+            EventRow {
+                row: 7,
+                setup: || {
+                    handler_row(|(), ctx: DurableContext| async move {
+                        Ok(ctx
+                            .wait(std::time::Duration::from_secs(3))
+                            .name("w")
+                            .await?)
+                    })
+                },
+                checks: vec![
+                    EventCheck {
+                        event_type: EventType::WaitStarted,
+                        owner: Owner::Op("w"),
+                        expected: |_| json!({ "duration": 3, "scheduled_end_after": 3 }),
+                    },
+                    EventCheck {
+                        event_type: EventType::WaitSucceeded,
+                        owner: Owner::Op("w"),
+                        expected: |_| json!({ "duration": 3 }),
+                    },
+                ],
+            },
+            EventRow {
+                row: 8,
+                setup: || {
+                    Box::pin(async {
+                        let backend = Backend::new(QueuedReplies::default(), None);
+                        let start = OperationUpdate::builder()
+                            .id("w")
+                            .name("w")
+                            .r#type(OperationType::Wait)
+                            .action(OperationAction::Start)
+                            .wait_options(
+                                aws_sdk_lambda::types::WaitOptions::builder()
+                                    .wait_seconds(3)
+                                    .build(),
+                            )
+                            .build()
+                            .expect("valid update");
+                        let cancel = OperationUpdate::builder()
+                            .id("w")
+                            .name("w")
+                            .r#type(OperationType::Wait)
+                            .action(OperationAction::Cancel)
+                            .build()
+                            .expect("valid update");
+                        for update in [start, cancel] {
+                            backend
+                                .checkpoint("arn", "token", vec![update])
+                                .await
+                                .expect("checkpoint accepted");
+                        }
+                        (backend.events(), backend.snapshot_operations())
+                    })
+                },
+                checks: vec![EventCheck {
+                    event_type: EventType::WaitCancelled,
+                    owner: Owner::Op("w"),
+                    expected: |_| json!({ "error": null }),
+                }],
+            },
+            EventRow {
+                row: 9,
+                setup: || callback_row(CallbackReply::success(&4_u32).expect("encodes")),
+                checks: vec![
+                    EventCheck {
+                        event_type: EventType::CallbackStarted,
+                        owner: Owner::Op("cb"),
+                        expected: |op| {
+                            let callback_id = match op.expect("the callback").details() {
+                                TestOperationDetails::Callback(c) => {
+                                    c.callback_id().map(ToOwned::to_owned)
+                                }
+                                _ => None,
+                            };
+                            json!({ "callback_id": callback_id, "timeout": 60, "heartbeat_timeout": 10 })
+                        },
+                    },
+                    EventCheck {
+                        event_type: EventType::CallbackSucceeded,
+                        owner: Owner::Op("cb"),
+                        expected: |_| json!({ "result": payload("4") }),
+                    },
+                ],
+            },
+            EventRow {
+                row: 10,
+                setup: || callback_row(CallbackReply::raw("\"r\"")),
+                checks: vec![EventCheck {
+                    event_type: EventType::CallbackSucceeded,
+                    owner: Owner::Op("cb"),
+                    expected: |_| json!({ "result": payload("\"r\"") }),
+                }],
+            },
+            EventRow {
+                row: 11,
+                setup: || {
+                    callback_row(CallbackReply::failure(
+                        CallbackFailure::new("Declined", "no").with_error_data("d"),
+                    ))
+                },
+                checks: vec![EventCheck {
+                    event_type: EventType::CallbackFailed,
+                    owner: Owner::Op("cb"),
+                    expected: |_| json!({ "error": error_payload(Some("Declined"), Some("no"), Some("d")) }),
+                }],
+            },
+            EventRow {
+                row: 12,
+                setup: || callback_row(CallbackReply::timeout()),
+                checks: vec![EventCheck {
+                    event_type: EventType::CallbackTimedOut,
+                    owner: Owner::Op("cb"),
+                    expected: |_| json!({ "error": error_payload(None, Some("Callback timed out"), None) }),
+                }],
+            },
+            EventRow {
+                row: 13,
+                setup: || callback_row(CallbackReply::heartbeat_timeout()),
+                checks: vec![EventCheck {
+                    event_type: EventType::CallbackTimedOut,
+                    owner: Owner::Op("cb"),
+                    expected: |_| {
+                        json!({
+                            "error": error_payload(
+                                Some("Callback.Heartbeat"),
+                                Some("Callback timed out on heartbeat"),
+                                None,
+                            ),
+                        })
+                    },
+                }],
+            },
+            EventRow {
+                row: 14,
+                setup: || {
+                    Box::pin(async {
+                        let result = LocalRunner::new()
+                            .register_function("target", |_x: i32| async move {
+                                Ok::<_, BoxError>(6_i32)
+                            })
+                            .run(
+                                |(): (), ctx: DurableContext| async move {
+                                    Ok(ctx.invoke::<i32, _>("target", 5).name("call").await?)
+                                },
+                                (),
+                            )
+                            .await
+                            .expect("runner");
+                        history_of(&result)
+                    })
+                },
+                checks: vec![
+                    EventCheck {
+                        event_type: EventType::ChainedInvokeStarted,
+                        owner: Owner::Op("call"),
+                        expected: |_| {
+                            json!({
+                                "function_name": "target",
+                                "tenant_id": null,
+                                "input": payload("5"),
+                                "executed_version": null,
+                                "durable_execution_arn": null,
+                            })
+                        },
+                    },
+                    EventCheck {
+                        event_type: EventType::ChainedInvokeSucceeded,
+                        owner: Owner::Op("call"),
+                        expected: |_| json!({ "result": payload("6") }),
+                    },
+                ],
+            },
+            EventRow {
+                row: 15,
+                setup: || {
+                    Box::pin(async {
+                        let result = LocalRunner::new()
+                            .register_function("target", |_x: i32| async move {
+                                Err::<i32, BoxError>(bad_no())
+                            })
+                            .run(
+                                |(): (), ctx: DurableContext| async move {
+                                    Ok(ctx.invoke::<i32, _>("target", 5).name("call").await?)
+                                },
+                                (),
+                            )
+                            .await
+                            .expect("runner");
+                        history_of(&result)
+                    })
+                },
+                checks: vec![EventCheck {
+                    event_type: EventType::ChainedInvokeFailed,
+                    owner: Owner::Op("call"),
+                    expected: |_| json!({ "error": error_payload(Some("Bad"), Some(BAD_NO_MESSAGE), None) }),
+                }],
+            },
+            EventRow {
+                row: 16,
+                setup: || {
+                    handler_row(|(), _ctx: DurableContext| async move {
+                        Err::<(), BoxError>(
+                            crate::TypedError::with_type("Bad", "no")
+                                .with_error_data("d")
+                                .into(),
+                        )
+                    })
+                },
+                checks: vec![
+                    EventCheck {
+                        event_type: EventType::InvocationCompleted,
+                        owner: Owner::Invocation,
+                        expected: |_| {
+                            json!({
+                                "start_after": 0,
+                                "end_after": 0,
+                                "request_id": "local-invocation-1",
+                                "error": error_payload(Some("Bad"), Some(BAD_NO_MESSAGE), Some("d")),
+                            })
+                        },
+                    },
+                    EventCheck {
+                        event_type: EventType::ExecutionFailed,
+                        owner: Owner::Execution,
+                        expected: |_| json!({ "error": error_payload(Some("Bad"), Some(BAD_NO_MESSAGE), Some("d")) }),
+                    },
+                ],
+            },
+        ]
+    }
+
+    /// Each cause of rule 5 records its event, with the operation's
+    /// identity and exactly the detail fields of rule 4.
+    #[tokio::test]
+    async fn local_events_cover_every_cause_and_detail() {
+        let rows = event_rows();
+        assert_eq!(rows.len(), 16);
+        for EventRow { row, setup, checks } in rows {
+            let (events, operations) = setup().await;
+            for check in checks {
+                let context = format!("row {row}, {:?}", check.event_type);
+                let event = events
+                    .iter()
+                    .find(|e| e.event_type() == Some(&check.event_type))
+                    .expect("the row records the event");
+                let op = match check.owner {
+                    Owner::Op(name) => Some(
+                        operations
+                            .iter()
+                            .find(|op| op.name() == Some(name))
+                            .expect("the row records the operation"),
+                    ),
+                    Owner::Execution | Owner::Invocation => None,
+                };
+                let identity = (
+                    event.id(),
+                    event.name(),
+                    event.sub_type(),
+                    event.parent_id(),
+                );
+                let expected_identity = match (check.owner, op) {
+                    (Owner::Op(_), Some(op)) => {
+                        (Some(op.id()), op.name(), op.sub_type(), op.parent_id())
+                    }
+                    (Owner::Execution, _) => (Some(EXECUTION_OPERATION_ID), None, None, None),
+                    _ => (None, None, None, None),
+                };
+                assert_eq!(identity, expected_identity, "{context}");
+                assert_eq!(details_json(event), (check.expected)(op), "{context}");
+                assert_eq!(details_count(event), 1, "{context}");
+            }
+        }
     }
 }

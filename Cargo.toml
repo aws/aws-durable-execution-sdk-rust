@@ -69,6 +69,39 @@ allowed_external_types = [
     "aws_sdk_lambda::types::_wait_details::WaitDetails",
     "aws_sdk_lambda::types::_wait_options::WaitOptions",
     "aws_smithy_types::date_time::DateTime",
+    # The `test-util` history event model: `TestResult::history_events`
+    # returns the service `Event`, re-exported from `lambda_types` with
+    # every type it names in its fields, directly or nested.
+    "aws_sdk_lambda::types::_callback_failed_details::CallbackFailedDetails",
+    "aws_sdk_lambda::types::_callback_started_details::CallbackStartedDetails",
+    "aws_sdk_lambda::types::_callback_succeeded_details::CallbackSucceededDetails",
+    "aws_sdk_lambda::types::_callback_timed_out_details::CallbackTimedOutDetails",
+    "aws_sdk_lambda::types::_chained_invoke_failed_details::ChainedInvokeFailedDetails",
+    "aws_sdk_lambda::types::_chained_invoke_started_details::ChainedInvokeStartedDetails",
+    "aws_sdk_lambda::types::_chained_invoke_stopped_details::ChainedInvokeStoppedDetails",
+    "aws_sdk_lambda::types::_chained_invoke_succeeded_details::ChainedInvokeSucceededDetails",
+    "aws_sdk_lambda::types::_chained_invoke_timed_out_details::ChainedInvokeTimedOutDetails",
+    "aws_sdk_lambda::types::_context_failed_details::ContextFailedDetails",
+    "aws_sdk_lambda::types::_context_started_details::ContextStartedDetails",
+    "aws_sdk_lambda::types::_context_succeeded_details::ContextSucceededDetails",
+    "aws_sdk_lambda::types::_event::Event",
+    "aws_sdk_lambda::types::_event_error::EventError",
+    "aws_sdk_lambda::types::_event_input::EventInput",
+    "aws_sdk_lambda::types::_event_result::EventResult",
+    "aws_sdk_lambda::types::_event_type::EventType",
+    "aws_sdk_lambda::types::_execution_failed_details::ExecutionFailedDetails",
+    "aws_sdk_lambda::types::_execution_started_details::ExecutionStartedDetails",
+    "aws_sdk_lambda::types::_execution_stopped_details::ExecutionStoppedDetails",
+    "aws_sdk_lambda::types::_execution_succeeded_details::ExecutionSucceededDetails",
+    "aws_sdk_lambda::types::_execution_timed_out_details::ExecutionTimedOutDetails",
+    "aws_sdk_lambda::types::_invocation_completed_details::InvocationCompletedDetails",
+    "aws_sdk_lambda::types::_retry_details::RetryDetails",
+    "aws_sdk_lambda::types::_step_failed_details::StepFailedDetails",
+    "aws_sdk_lambda::types::_step_started_details::StepStartedDetails",
+    "aws_sdk_lambda::types::_step_succeeded_details::StepSucceededDetails",
+    "aws_sdk_lambda::types::_wait_cancelled_details::WaitCancelledDetails",
+    "aws_sdk_lambda::types::_wait_started_details::WaitStartedDetails",
+    "aws_sdk_lambda::types::_wait_succeeded_details::WaitSucceededDetails",
     # `test_util::TestRunnerError` (feature `test-util`) carries the
     # serde_json error of a failed event or output conversion.
     "serde_json::error::Error",
@@ -210,4 +243,8 @@ required-features = ["test-util"]
 
 [[test]]
 name = "test_result_records"
+required-features = ["test-util"]
+
+[[test]]
+name = "test_events"
 required-features = ["test-util"]
