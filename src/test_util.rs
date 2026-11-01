@@ -66,6 +66,13 @@
 //!   context from the invocation input and from `GetDurableExecutionState`,
 //!   as the service does, unless the context recorded `ReplayChildren`.
 //!   Checkpoint responses and [`TestResult::operations`] keep every record.
+//! - The backend rejects a checkpoint that exceeds a service size limit or
+//!   a delay range, with the service's message. It does not check the rest
+//!   of the service's update model: ID and name patterns, parent existence
+//!   and action order.
+//! - Each invocation input carries `UpdatedOperationIds`: the operations
+//!   the backend changed between invocations, such as a fired wait, a
+//!   retry that became ready, or a callback that received a reply.
 //!
 //! # Runner divergences
 //!
@@ -1260,6 +1267,9 @@ const LOCAL_EXECUTION_ARN: &str = "arn:aws:lambda:us-west-2:000000000000:functio
 /// [`wrap`](crate::wrap) parses: `DurableExecutionArn`, `CheckpointToken`,
 /// and `InitialExecutionState.Operations` with the customer input embedded
 /// in the leading `Execution` operation's `ExecutionDetails.InputPayload`.
+/// `UpdatedOperationIds` lists the records the backend changed between
+/// invocations, and building the envelope clears that list (see
+/// [`Backend::take_updated_ids`]).
 ///
 /// When `initial_page_size` is set and the recorded history exceeds it,
 /// only the first page of history rides inline and
@@ -1301,6 +1311,7 @@ fn build_envelope(
         "DurableExecutionArn": LOCAL_EXECUTION_ARN,
         "CheckpointToken": backend.current_token(),
         "InitialExecutionState": initial_state,
+        "UpdatedOperationIds": backend.take_updated_ids(),
     })
 }
 
@@ -1993,6 +2004,11 @@ struct BackendState {
     /// The virtual time in seconds. It starts at 0 and moves only in
     /// [`Backend::advance`], between invocations.
     now: u64,
+    /// The IDs of the records [`Backend::advance`] changed since the last
+    /// envelope, in change order. The next envelope sends them as
+    /// `UpdatedOperationIds` and clears them (see
+    /// [`Backend::take_updated_ids`]). A checkpoint call never adds to it.
+    updated_ids: Vec<String>,
 }
 
 /// The in-memory execution client. Shared (via `Arc`) between the runner and
@@ -2062,6 +2078,7 @@ impl Backend {
                 callback_counter: 0,
                 callback_replies,
                 now: 0,
+                updated_ids: Vec::new(),
             }),
             checkpoint_page_size,
             get_state_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -2123,6 +2140,12 @@ impl Backend {
     fn current_token(&self) -> String {
         let state = self.lock();
         format!("local-token-{}", state.token_counter)
+    }
+
+    /// Returns the IDs [`Backend::advance`] changed since the last call, in
+    /// change order, and leaves the list empty.
+    fn take_updated_ids(&self) -> Vec<String> {
+        std::mem::take(&mut self.lock().updated_ids)
     }
 
     /// Builds `Operation` records for the current state (used to seed the
@@ -2194,6 +2217,10 @@ impl Backend {
     ///    `Succeeded` and a pending retry becomes `Ready`, so the next
     ///    invocation re-executes the body.
     ///
+    /// The ID of each record whose status changes is appended to
+    /// `BackendState::updated_ids`. An advance changes each record at most
+    /// once, so the list has no duplicates.
+    ///
     /// Backend-behaviour anchors (this crate's own replay logic):
     /// - `wait`: `src/wait.rs` replay returns at once for `Succeeded` and
     ///   suspends for `Started`.
@@ -2210,6 +2237,7 @@ impl Backend {
             ops,
             callback_replies,
             now,
+            updated_ids,
             ..
         } = &mut *state;
 
@@ -2222,6 +2250,7 @@ impl Backend {
             for (op, reply) in ops.iter_mut().zip(deliveries) {
                 if let Some(reply) = reply {
                     reply.deliver_to(op);
+                    updated_ids.push(op.id.clone());
                 }
             }
             return true;
@@ -2238,6 +2267,7 @@ impl Backend {
                 } else {
                     OperationStatus::Ready
                 };
+                updated_ids.push(op.id.clone());
             }
         }
         true
@@ -2550,6 +2580,13 @@ impl Backend {
                     ))
                 }
             });
+        }
+        // The service rejects a request that breaks a size limit or a
+        // delay range before it changes any state. So the check runs before
+        // the state lock, and a rejected request stores nothing and keeps
+        // the token.
+        if let Err(message) = validate_service_limits(updates) {
+            return Box::pin(async move { Err(ExecutionClientError::new_non_retryable(&message)) });
         }
         let updated_ops: Vec<Operation> = {
             let mut state = self.lock();
@@ -2943,6 +2980,184 @@ fn prune_replay_children(ops: &[StoredOp]) -> Vec<&StoredOp> {
         false
     };
     ops.iter().filter(|op| !omitted(op)).collect()
+}
+
+/// The smallest delay, in seconds, the service accepts for
+/// `WaitOptions.WaitSeconds` and `StepOptions.NextAttemptDelaySeconds`.
+const MIN_DELAY_SECONDS: i32 = 1;
+
+/// The largest delay, in seconds, the service accepts for the same fields.
+const MAX_DELAY_SECONDS: i32 = 31_622_400;
+
+/// The most delay violations one rejection message lists.
+const MAX_REPORTED_VIOLATIONS: usize = 10;
+
+/// The largest rendering of an update that carries an error.
+const ERROR_OBJECT_LIMIT: usize = 262_144;
+
+/// Checks a checkpoint request against the service limits, and returns the
+/// service's rejection message for the first failed check.
+///
+/// The check has two passes, in the order the service runs them.
+///
+/// 1. The model pass checks every delay field of every update against the
+///    range 1 to 31 622 400. It collects every violation and reports at
+///    most 10 of them in one message. When it finds any violation, the
+///    second pass does not run.
+/// 2. The size pass visits the updates in request order and stops at the
+///    first violation. An update that carries an error is measured as a
+///    whole (see [`render_update`]), as the JS checkpoint server measures
+///    it. Then a payload is measured in bytes against the limit of its
+///    operation type (see [`payload_limit`]).
+fn validate_service_limits(updates: &[OperationUpdate]) -> Result<(), String> {
+    let mut entries = Vec::new();
+    for (index, update) in updates.iter().enumerate() {
+        let pos = index + 1;
+        let delays = [
+            (
+                "waitOptions.waitSeconds",
+                update
+                    .wait_options()
+                    .and_then(aws_sdk_lambda::types::WaitOptions::wait_seconds),
+            ),
+            (
+                "stepOptions.nextAttemptDelaySeconds",
+                update
+                    .step_options()
+                    .and_then(aws_sdk_lambda::types::StepOptions::next_attempt_delay_seconds),
+            ),
+        ];
+        for (path, value) in delays {
+            let Some(value) = value else { continue };
+            let constraint = if value < MIN_DELAY_SECONDS {
+                "greater than or equal to 1"
+            } else if value > MAX_DELAY_SECONDS {
+                "less than or equal to 31622400"
+            } else {
+                continue;
+            };
+            entries.push(format!(
+                "Value '{value}' at 'updates.{pos}.member.{path}' failed to satisfy \
+                 constraint: Member must have value {constraint}"
+            ));
+        }
+    }
+    if !entries.is_empty() {
+        entries.truncate(MAX_REPORTED_VIOLATIONS);
+        let count = if entries.len() == 1 {
+            "1 validation error detected".to_owned()
+        } else {
+            format!("{} validation errors detected", entries.len())
+        };
+        return Err(format!("{count}: {}", entries.join("; ")));
+    }
+
+    for update in updates {
+        if update.error().is_some() && render_update(update).len() > ERROR_OBJECT_LIMIT {
+            return Err("Error object size must be less than or equal to 262144 bytes.".to_owned());
+        }
+        if let (Some(payload), Some((limit, what))) =
+            (update.payload(), payload_limit(update.r#type()))
+            && payload.len() > limit
+        {
+            return Err(format!(
+                "{what} size must be less than or equal to {limit} bytes."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The payload limit in bytes for an operation type, and the name the
+/// service's message uses for that payload. WAIT and CALLBACK payloads
+/// have no limit.
+fn payload_limit(op_type: &OperationType) -> Option<(usize, &'static str)> {
+    match op_type {
+        OperationType::Step => Some((262_144, "STEP output payload")),
+        OperationType::Context => Some((262_144, "CONTEXT output payload")),
+        OperationType::ChainedInvoke => Some((1_048_576, "CHAINED_INVOKE input payload")),
+        OperationType::Execution => Some((6_291_456, "Execution output payload")),
+        _ => None,
+    }
+}
+
+/// Renders `update` as the JSON object the service model describes, with
+/// every absent member omitted and every enum as its wire string.
+///
+/// `OperationUpdate` has no serializer, so the object is built from its
+/// getters. The size pass of [`validate_service_limits`] measures this
+/// rendering for an update that carries an error.
+fn render_update(update: &OperationUpdate) -> String {
+    use serde_json::{Map, Value};
+
+    fn insert<T: Into<Value>>(map: &mut Map<String, Value>, key: &str, value: Option<T>) {
+        if let Some(value) = value {
+            map.insert(key.to_owned(), value.into());
+        }
+    }
+
+    // A present error or options object stays in the rendering even when
+    // all its members are absent, as `JSON.stringify` keeps an empty object.
+    let mut out = Map::new();
+    insert(&mut out, "Id", Some(update.id()));
+    insert(&mut out, "ParentId", update.parent_id());
+    insert(&mut out, "Name", update.name());
+    insert(&mut out, "Type", Some(update.r#type().as_str()));
+    insert(&mut out, "SubType", update.sub_type());
+    insert(&mut out, "Action", Some(update.action().as_str()));
+    insert(&mut out, "Payload", update.payload());
+    if let Some(error) = update.error() {
+        let mut map = Map::new();
+        insert(&mut map, "ErrorType", error.error_type());
+        insert(&mut map, "ErrorMessage", error.error_message());
+        insert(&mut map, "ErrorData", error.error_data());
+        insert(&mut map, "StackTrace", error.stack_trace.clone());
+        out.insert("Error".to_owned(), Value::Object(map));
+    }
+    if let Some(options) = update.context_options() {
+        let mut map = Map::new();
+        insert(&mut map, "ReplayChildren", options.replay_children());
+        out.insert("ContextOptions".to_owned(), Value::Object(map));
+    }
+    if let Some(options) = update.step_options() {
+        let mut map = Map::new();
+        insert(
+            &mut map,
+            "NextAttemptDelaySeconds",
+            options.next_attempt_delay_seconds(),
+        );
+        out.insert("StepOptions".to_owned(), Value::Object(map));
+    }
+    if let Some(options) = update.wait_options() {
+        let mut map = Map::new();
+        insert(&mut map, "WaitSeconds", options.wait_seconds());
+        out.insert("WaitOptions".to_owned(), Value::Object(map));
+    }
+    if let Some(options) = update.callback_options() {
+        let mut map = Map::new();
+        // The model types these fields as `i32` with 0 meaning "not
+        // specified", and the wire serializer omits a 0. So the rendering
+        // omits a 0 too.
+        let nonzero = |value: i32| (value != 0).then_some(value);
+        insert(
+            &mut map,
+            "TimeoutSeconds",
+            nonzero(options.timeout_seconds()),
+        );
+        insert(
+            &mut map,
+            "HeartbeatTimeoutSeconds",
+            nonzero(options.heartbeat_timeout_seconds()),
+        );
+        out.insert("CallbackOptions".to_owned(), Value::Object(map));
+    }
+    if let Some(options) = update.chained_invoke_options() {
+        let mut map = Map::new();
+        insert(&mut map, "FunctionName", Some(options.function_name()));
+        insert(&mut map, "TenantId", options.tenant_id());
+        out.insert("ChainedInvokeOptions".to_owned(), Value::Object(map));
+    }
+    Value::Object(out).to_string()
 }
 
 #[cfg(test)]
@@ -6673,5 +6888,469 @@ mod tests {
             ]
         );
         assert_eq!(ops[0]["Status"], "STARTED");
+    }
+
+    /// An update of `op_type` and `action` with id `id`, carrying `payload`
+    /// when given (service-limit tests).
+    fn limit_update(
+        id: &str,
+        op_type: OperationType,
+        action: OperationAction,
+        payload: Option<String>,
+    ) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(id)
+            .r#type(op_type)
+            .action(action)
+            .set_payload(payload)
+            .build()
+            .expect("valid update")
+    }
+
+    /// A STEP `FAIL` update whose error message is `message`, carrying
+    /// `payload` when given.
+    fn step_fail_with(id: &str, message: String, payload: Option<String>) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(id)
+            .r#type(OperationType::Step)
+            .action(OperationAction::Fail)
+            .set_payload(payload)
+            .error(ErrorObject::builder().error_message(message).build())
+            .build()
+            .expect("valid update")
+    }
+
+    /// The model-pass entry for the value `value` at update `pos` and
+    /// field `path`.
+    fn delay_entry(pos: usize, path: &str, value: i32) -> String {
+        let constraint = if value < 1 {
+            "greater than or equal to 1"
+        } else {
+            "less than or equal to 31622400"
+        };
+        format!(
+            "Value '{value}' at 'updates.{pos}.member.{path}' failed to satisfy \
+             constraint: Member must have value {constraint}"
+        )
+    }
+
+    const WAIT_PATH: &str = "waitOptions.waitSeconds";
+    const RETRY_PATH: &str = "stepOptions.nextAttemptDelaySeconds";
+
+    /// The single-entry message of the model pass.
+    fn one_error(entry: &str) -> String {
+        format!("1 validation error detected: {entry}")
+    }
+
+    /// A STEP `FAIL` update with a 1 000-byte error and a payload that
+    /// makes the whole rendering `total` bytes.
+    fn step_fail_rendered_at(total: usize) -> OperationUpdate {
+        let message = "e".repeat(1_000);
+        let base = render_update(&step_fail_with("f", message.clone(), Some(String::new()))).len();
+        let update = step_fail_with("f", message, Some("x".repeat(total - base)));
+        assert_eq!(render_update(&update).len(), total);
+        update
+    }
+
+    /// Sends `updates` in one checkpoint call to a fresh backend. With
+    /// `expected` set, asserts the rejection message, that nothing was
+    /// stored and that the token did not change. Without it, asserts the
+    /// call succeeded and stored one record per distinct update ID.
+    async fn check_limit_row(row: usize, updates: Vec<OperationUpdate>, expected: Option<String>) {
+        let backend = seeded_backend(Vec::new(), 0, &[]);
+        let token = backend.current_token();
+        let ids: std::collections::HashSet<String> =
+            updates.iter().map(|u| u.id().to_owned()).collect();
+        let result =
+            ExecutionClient::checkpoint(&backend, LOCAL_EXECUTION_ARN, &token, updates).await;
+        let error = result.err().map(|err| err.to_string());
+        if let Some(expected) = expected {
+            assert_eq!(
+                error,
+                Some(format!("durable: client: {expected}")),
+                "row {row}"
+            );
+            assert!(backend.snapshot_operations().is_empty(), "row {row}");
+            assert_eq!(backend.current_token(), token, "row {row}");
+        } else {
+            assert_eq!(error, None, "row {row}");
+            assert_eq!(backend.snapshot_operations().len(), ids.len(), "row {row}");
+        }
+    }
+
+    /// The delay rows of the case table: rows 1 to 7 and 19 to 21.
+    fn delay_rows() -> Vec<(usize, Vec<OperationUpdate>, Option<String>)> {
+        let retry_with_wait = OperationUpdate::builder()
+            .id("r")
+            .r#type(OperationType::Step)
+            .action(OperationAction::Retry)
+            .wait_options(
+                aws_sdk_lambda::types::WaitOptions::builder()
+                    .wait_seconds(0)
+                    .build(),
+            )
+            .step_options(
+                aws_sdk_lambda::types::StepOptions::builder()
+                    .next_attempt_delay_seconds(0)
+                    .build(),
+            )
+            .build()
+            .expect("valid update");
+        let eleven: Vec<OperationUpdate> =
+            (1..=11).map(|i| wait_start(&format!("w{i}"), 0)).collect();
+        let ten: Vec<String> = (1..=10).map(|pos| delay_entry(pos, WAIT_PATH, 0)).collect();
+        let step_start = limit_update("s", OperationType::Step, OperationAction::Start, None);
+        let big_step = limit_update(
+            "s",
+            OperationType::Step,
+            OperationAction::Succeed,
+            Some("x".repeat(262_145)),
+        );
+        vec![
+            (
+                1,
+                vec![wait_start("w", 0)],
+                Some(one_error(&delay_entry(1, WAIT_PATH, 0))),
+            ),
+            (2, vec![wait_start("w", 1)], None),
+            (3, vec![wait_start("w", 31_622_400)], None),
+            (
+                4,
+                vec![wait_start("w", 31_622_401)],
+                Some(one_error(&delay_entry(1, WAIT_PATH, 31_622_401))),
+            ),
+            (
+                5,
+                vec![step_retry("r", Some(0))],
+                Some(one_error(&delay_entry(1, RETRY_PATH, 0))),
+            ),
+            (
+                6,
+                vec![step_start, wait_start("w", 0)],
+                Some(one_error(&delay_entry(2, WAIT_PATH, 0))),
+            ),
+            (
+                7,
+                vec![big_step, wait_start("w", 0)],
+                Some(one_error(&delay_entry(2, WAIT_PATH, 0))),
+            ),
+            (
+                19,
+                vec![wait_start("a", 0), wait_start("b", 31_622_401)],
+                Some(format!(
+                    "2 validation errors detected: {}; {}",
+                    delay_entry(1, WAIT_PATH, 0),
+                    delay_entry(2, WAIT_PATH, 31_622_401)
+                )),
+            ),
+            (
+                20,
+                eleven,
+                Some(format!("10 validation errors detected: {}", ten.join("; "))),
+            ),
+            (
+                21,
+                vec![retry_with_wait],
+                Some(format!(
+                    "2 validation errors detected: {}; {}",
+                    delay_entry(1, WAIT_PATH, 0),
+                    delay_entry(1, RETRY_PATH, 0)
+                )),
+            ),
+        ]
+    }
+
+    /// The size rows of the case table: rows 8 to 18.
+    fn size_rows() -> Vec<(usize, Vec<OperationUpdate>, Option<String>)> {
+        let step = |payload: String| {
+            vec![limit_update(
+                "s",
+                OperationType::Step,
+                OperationAction::Succeed,
+                Some(payload),
+            )]
+        };
+        let step_message =
+            "STEP output payload size must be less than or equal to 262144 bytes.".to_owned();
+        let error_message =
+            "Error object size must be less than or equal to 262144 bytes.".to_owned();
+        let one = |op_type: OperationType, action: OperationAction, len: usize| {
+            vec![limit_update("o", op_type, action, Some("x".repeat(len)))]
+        };
+        vec![
+            (8, step("x".repeat(262_144)), None),
+            (9, step("x".repeat(262_145)), Some(step_message.clone())),
+            (10, step("é".repeat(131_073)), Some(step_message)),
+            (
+                11,
+                one(OperationType::Context, OperationAction::Succeed, 262_145),
+                Some("CONTEXT output payload size must be less than or equal to 262144 bytes.".to_owned()),
+            ),
+            (12, one(OperationType::ChainedInvoke, OperationAction::Start, 1_048_576), None),
+            (
+                13,
+                one(OperationType::ChainedInvoke, OperationAction::Start, 1_048_577),
+                Some(
+                    "CHAINED_INVOKE input payload size must be less than or equal to 1048576 bytes."
+                        .to_owned(),
+                ),
+            ),
+            (
+                14,
+                one(OperationType::Execution, OperationAction::Succeed, 6_291_457),
+                Some("Execution output payload size must be less than or equal to 6291456 bytes.".to_owned()),
+            ),
+            (
+                15,
+                vec![step_fail_with("f", "e".repeat(262_145), None)],
+                Some(error_message.clone()),
+            ),
+            (16, one(OperationType::Callback, OperationAction::Start, 300_000), None),
+            (17, vec![step_fail_rendered_at(262_145)], Some(error_message)),
+            (18, vec![step_fail_rendered_at(262_144)], None),
+        ]
+    }
+
+    /// The backend applies the service limits: one call per row of the
+    /// case table in the issue.
+    #[tokio::test]
+    async fn service_limits_reject_each_case() {
+        let mut rows = delay_rows();
+        rows.extend(size_rows());
+        rows.sort_by_key(|(row, _, _)| *row);
+        assert_eq!(
+            rows.iter().map(|(row, _, _)| *row).collect::<Vec<_>>(),
+            (1..=21).collect::<Vec<_>>()
+        );
+        for (row, updates, expected) in rows {
+            check_limit_row(row, updates, expected).await;
+        }
+    }
+
+    /// Row 17: the error alone is under the limit, but the whole update is
+    /// measured, so the update is rejected.
+    #[tokio::test]
+    async fn error_under_limit_whole_update_over_is_rejected() {
+        check_limit_row(
+            17,
+            vec![step_fail_rendered_at(262_145)],
+            Some("Error object size must be less than or equal to 262144 bytes.".to_owned()),
+        )
+        .await;
+    }
+
+    /// Row 18: a whole update of exactly the limit is accepted.
+    #[tokio::test]
+    async fn whole_update_at_limit_is_accepted() {
+        check_limit_row(18, vec![step_fail_rendered_at(262_144)], None).await;
+    }
+
+    /// A step result over the STEP payload limit fails the execution with
+    /// the service's message.
+    #[tokio::test]
+    async fn oversized_step_result_fails_execution() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let out = ctx.step(|_| async { Ok("x".repeat(300_000)) }).await?;
+                    Ok::<_, BoxError>(out.len())
+                },
+                (),
+            )
+            .await;
+        assert!(result.is_failure(), "{:?}", result.error_message());
+        let message = result.error_message().unwrap_or_default();
+        assert!(
+            message
+                .contains("STEP output payload size must be less than or equal to 262144 bytes."),
+            "{message}"
+        );
+    }
+
+    /// A step result whose JSON is exactly the STEP payload limit succeeds.
+    #[tokio::test]
+    async fn step_result_at_the_limit_succeeds() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let out = ctx.step(|_| async { Ok("x".repeat(262_142)) }).await?;
+                    Ok::<_, BoxError>(out.len())
+                },
+                (),
+            )
+            .await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+    }
+
+    /// The rendering of rule 3.1 holds every present member under its wire
+    /// name, keeps an empty options object, and omits absent members and a
+    /// callback timeout of 0.
+    #[test]
+    fn render_update_renders_every_present_member() {
+        let full = OperationUpdate::builder()
+            .id("i")
+            .parent_id("p")
+            .name("n")
+            .r#type(OperationType::Step)
+            .sub_type("st")
+            .action(OperationAction::Fail)
+            .payload("pl")
+            .error(
+                ErrorObject::builder()
+                    .error_type("et")
+                    .error_message("em")
+                    .error_data("ed")
+                    .stack_trace("s1")
+                    .build(),
+            )
+            .context_options(ContextOptions::builder().replay_children(true).build())
+            .step_options(
+                aws_sdk_lambda::types::StepOptions::builder()
+                    .next_attempt_delay_seconds(2)
+                    .build(),
+            )
+            .wait_options(
+                aws_sdk_lambda::types::WaitOptions::builder()
+                    .wait_seconds(3)
+                    .build(),
+            )
+            .callback_options(
+                aws_sdk_lambda::types::CallbackOptions::builder()
+                    .timeout_seconds(4)
+                    .heartbeat_timeout_seconds(5)
+                    .build(),
+            )
+            .chained_invoke_options(
+                aws_sdk_lambda::types::ChainedInvokeOptions::builder()
+                    .function_name("fn")
+                    .tenant_id("t")
+                    .build()
+                    .expect("valid options"),
+            )
+            .build()
+            .expect("valid update");
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_update(&full)).expect("rendering is JSON");
+        assert_eq!(
+            rendered,
+            serde_json::json!({
+                "Id": "i", "ParentId": "p", "Name": "n", "Type": "STEP",
+                "SubType": "st", "Action": "FAIL", "Payload": "pl",
+                "Error": {
+                    "ErrorType": "et", "ErrorMessage": "em",
+                    "ErrorData": "ed", "StackTrace": ["s1"]
+                },
+                "ContextOptions": { "ReplayChildren": true },
+                "StepOptions": { "NextAttemptDelaySeconds": 2 },
+                "WaitOptions": { "WaitSeconds": 3 },
+                "CallbackOptions": { "TimeoutSeconds": 4, "HeartbeatTimeoutSeconds": 5 },
+                "ChainedInvokeOptions": { "FunctionName": "fn", "TenantId": "t" }
+            })
+        );
+
+        let sparse = OperationUpdate::builder()
+            .id("i")
+            .r#type(OperationType::Callback)
+            .action(OperationAction::Start)
+            .error(ErrorObject::builder().build())
+            .context_options(ContextOptions::builder().build())
+            .step_options(aws_sdk_lambda::types::StepOptions::builder().build())
+            .wait_options(aws_sdk_lambda::types::WaitOptions::builder().build())
+            .callback_options(aws_sdk_lambda::types::CallbackOptions::builder().build())
+            .chained_invoke_options(
+                aws_sdk_lambda::types::ChainedInvokeOptions::builder()
+                    .function_name("fn")
+                    .build()
+                    .expect("valid options"),
+            )
+            .build()
+            .expect("valid update");
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_update(&sparse)).expect("rendering is JSON");
+        assert_eq!(
+            rendered,
+            serde_json::json!({
+                "Id": "i", "Type": "CALLBACK", "Action": "START", "Error": {},
+                "ContextOptions": {}, "StepOptions": {}, "WaitOptions": {},
+                "CallbackOptions": {}, "ChainedInvokeOptions": { "FunctionName": "fn" }
+            })
+        );
+    }
+
+    /// Sends `updates` in one checkpoint call, which must succeed.
+    async fn checkpoint_ok(backend: &Backend, updates: Vec<OperationUpdate>) {
+        let token = backend.current_token();
+        let result =
+            ExecutionClient::checkpoint(backend, LOCAL_EXECUTION_ARN, &token, updates).await;
+        assert_eq!(result.err().map(|err| err.to_string()), None);
+    }
+
+    /// The `UpdatedOperationIds` of a freshly built envelope.
+    fn envelope_updated_ids(backend: &Backend) -> serde_json::Value {
+        build_envelope(backend, "{}", None)["UpdatedOperationIds"].clone()
+    }
+
+    #[tokio::test]
+    async fn updated_ids_empty_on_first_envelope() {
+        let backend = seeded_backend(Vec::new(), 0, &[]);
+        checkpoint_ok(&backend, vec![wait_start("w", 5)]).await;
+        assert_eq!(envelope_updated_ids(&backend), serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn updated_ids_list_fired_wait() {
+        let backend = seeded_backend(Vec::new(), 0, &[]);
+        checkpoint_ok(&backend, vec![wait_start("w", 5)]).await;
+        assert!(backend.advance());
+        assert_eq!(envelope_updated_ids(&backend), serde_json::json!(["w"]));
+    }
+
+    #[tokio::test]
+    async fn updated_ids_cleared_after_envelope() {
+        let backend = seeded_backend(Vec::new(), 0, &[]);
+        checkpoint_ok(&backend, vec![wait_start("w", 5)]).await;
+        assert!(backend.advance());
+        assert_eq!(envelope_updated_ids(&backend), serde_json::json!(["w"]));
+        assert_eq!(envelope_updated_ids(&backend), serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn updated_ids_list_readied_retry_and_delivered_callback() {
+        let backend = seeded_backend(vec![CallbackReply::raw("\"ok\"")], 0, &[]);
+        checkpoint_ok(
+            &backend,
+            vec![step_retry("s", Some(5)), callback_start("c")],
+        )
+        .await;
+        assert!(backend.advance(), "delivers the reply");
+        assert_eq!(envelope_updated_ids(&backend), serde_json::json!(["c"]));
+        assert!(backend.advance(), "fires the retry");
+        assert_eq!(envelope_updated_ids(&backend), serde_json::json!(["s"]));
+    }
+
+    #[tokio::test]
+    async fn updated_ids_skip_checkpoint_changes() {
+        let backend = seeded_backend(Vec::new(), 0, &[]);
+        checkpoint_ok(
+            &backend,
+            vec![limit_update(
+                "s",
+                OperationType::Step,
+                OperationAction::Start,
+                None,
+            )],
+        )
+        .await;
+        checkpoint_ok(
+            &backend,
+            vec![limit_update(
+                "s",
+                OperationType::Step,
+                OperationAction::Succeed,
+                Some("1".to_owned()),
+            )],
+        )
+        .await;
+        assert_eq!(envelope_updated_ids(&backend), serde_json::json!([]));
     }
 }
