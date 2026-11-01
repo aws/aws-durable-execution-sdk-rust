@@ -5589,7 +5589,7 @@ mod tests {
                 dyn Future<
                         Output = Result<
                             crate::client::CheckpointOutput,
-                            crate::client::ClientError,
+                            crate::client::ExecutionClientError,
                         >,
                     > + Send
                     + '_,
@@ -5612,7 +5612,7 @@ mod tests {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     *stale += 1;
-                    return Err(crate::client::ClientError::non_retryable(format!(
+                    return Err(crate::client::ExecutionClientError::non_retryable(format!(
                         "stale checkpoint token: expected {}, got {}",
                         *current, submitted_token
                     )));
@@ -5634,7 +5634,7 @@ mod tests {
                 *success += 1;
 
                 Ok(crate::client::CheckpointOutput {
-                    checkpoint_token: new_token,
+                    checkpoint_token: Some(new_token),
                     updated_operations: Vec::new(),
                     next_marker: None,
                 })
@@ -5645,19 +5645,19 @@ mod tests {
             &self,
             _execution_arn: &str,
             _checkpoint_token: &str,
+            _marker: Option<&str>,
         ) -> Pin<
             Box<
                 dyn Future<
-                        Output = Result<crate::client::GetStateOutput, crate::client::ClientError>,
+                        Output = Result<
+                            crate::client::GetStateOutput,
+                            crate::client::ExecutionClientError,
+                        >,
                     > + Send
                     + '_,
             >,
         > {
-            Box::pin(async {
-                Ok(crate::client::GetStateOutput {
-                    operations: Vec::new(),
-                })
-            })
+            Box::pin(async { Ok(crate::client::GetStateOutput::new(Vec::new(), None)) })
         }
     }
 

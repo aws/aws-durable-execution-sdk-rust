@@ -20,7 +20,7 @@ use crate::builders::{
 use crate::checkpoint_coalescer::{
     BatchLimits, CheckpointBatch, CheckpointCoalescer, TrackedUpdate, split_into_requests,
 };
-use crate::client::{CheckpointOutput, ClientError, ExecutionClient};
+use crate::client::{CheckpointOutput, ExecutionClient, ExecutionClientError};
 use crate::driver::{SuspensionSignal, TaskOwnership};
 use crate::engine::{
     CheckpointLog, CheckpointRecord, CheckpointStatus, CheckpointStatusView, EngineState,
@@ -169,7 +169,7 @@ impl FlushFailure {
     ///
     /// Never in practice: `flush_pending_checkpoints` only constructs a
     /// `FlushFailure` with at least one failure.
-    pub(crate) fn primary_error(&self) -> &ClientError {
+    pub(crate) fn primary_error(&self) -> &ExecutionClientError {
         self.failures
             .iter()
             .find(|f| !f.error.is_retryable())
@@ -913,7 +913,7 @@ impl DurableContext {
     /// error: a handler that catches it branches on a decision no
     /// checkpoint records, which replay cannot reproduce. Instead the
     /// failure's classification (see
-    /// [`ClientError::is_retryable`](crate::client::ClientError)) picks
+    /// [`ExecutionClientError::is_retryable`](crate::client::ExecutionClientError)) picks
     /// the recovery scope:
     ///
     /// - **Retryable** (exhausted transient failure, stale token): the
@@ -929,8 +929,9 @@ impl DurableContext {
     ///   outcome, that small terminal `FAIL` is written first (it goes
     ///   through on a channel that rejected only the payload; a failure
     ///   here is logged, not propagated, because the execution dies
-    ///   either way). Then the execution fails with
-    ///   [`CHECKPOINT_FAILED_ERROR_TYPE`](crate::error::CHECKPOINT_FAILED_ERROR_TYPE).
+    ///   either way). Then the execution fails with the record of
+    ///   [`checkpoint_execution_failure_wire`](crate::error::checkpoint_execution_failure_wire):
+    ///   `CheckpointUnrecoverableExecutionError`, as in JS.
     ///
     /// Like [`Self::suspend_now`], the returned future never resolves: the
     /// fatal slot is recorded and the invocation driver, which checks it
@@ -940,7 +941,7 @@ impl DurableContext {
     pub(crate) async fn checkpoint_failure_unrecoverable<T>(
         &self,
         op_wire_id: &str,
-        err: ClientError,
+        err: ExecutionClientError,
         terminal_fail: Option<OperationUpdate>,
     ) -> T {
         let message = format!("checkpoint write failed for operation {op_wire_id}: {err}");
@@ -974,9 +975,10 @@ impl DurableContext {
                     );
                 }
             }
+            let wire = crate::error::checkpoint_execution_failure_wire(&err);
             self.inner.suspension_signal.record_fatal(
-                crate::error::CHECKPOINT_FAILED_ERROR_TYPE.to_owned(),
-                message,
+                wire.error_type().unwrap_or_default().to_owned(),
+                wire.error_message().unwrap_or_default().to_owned(),
             );
         }
         std::future::pending::<T>().await
@@ -1050,7 +1052,7 @@ impl DurableContext {
     pub(crate) async fn checkpoint_updates(
         &self,
         updates: Vec<OperationUpdate>,
-    ) -> Result<CheckpointOutput, ClientError> {
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
         self.checkpoint_with_urgency(updates, false).await
     }
 
@@ -1067,7 +1069,7 @@ impl DurableContext {
     pub(crate) async fn checkpoint_updates_urgent(
         &self,
         updates: Vec<OperationUpdate>,
-    ) -> Result<CheckpointOutput, ClientError> {
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
         self.checkpoint_with_urgency(updates, true).await
     }
 
@@ -1079,7 +1081,7 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
         urgent: bool,
-    ) -> Result<CheckpointOutput, ClientError> {
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
         // Lifecycle events (see `crate::observability`): every operation
         // transition the SDK records passes through here, so this one site
         // covers `operation_started` / `operation_succeeded` /
@@ -1131,7 +1133,7 @@ impl DurableContext {
         &self,
         updates: Vec<TrackedUpdate>,
         urgent: bool,
-    ) -> Result<CheckpointOutput, ClientError> {
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
         let Some(coalescer) = self.inner.coalescer.clone() else {
             return self.write_tracked_direct(updates).await;
         };
@@ -1177,7 +1179,7 @@ impl DurableContext {
     async fn write_tracked_direct(
         &self,
         tracked: Vec<TrackedUpdate>,
-    ) -> Result<CheckpointOutput, ClientError> {
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
         let (updates, events): (Vec<_>, Vec<_>) =
             tracked.into_iter().map(|t| (t.update, t.event)).unzip();
         self.checkpoint_direct_with_events(updates, &events).await
@@ -1275,7 +1277,7 @@ impl DurableContext {
         &self,
         updates: Vec<TrackedUpdate>,
         limits: BatchLimits,
-    ) -> Result<CheckpointOutput, (ClientError, Vec<OperationUpdate>)> {
+    ) -> Result<CheckpointOutput, (ExecutionClientError, Vec<OperationUpdate>)> {
         if updates.is_empty() {
             // An empty seal (possible only defensively) still performs one
             // call so a waiting contributor receives a published result.
@@ -1302,7 +1304,9 @@ impl DurableContext {
         }
         last.ok_or_else(|| {
             (
-                ClientError::new_non_retryable("internal: batched checkpoint produced no requests"),
+                ExecutionClientError::new_non_retryable(
+                    "internal: batched checkpoint produced no requests",
+                ),
                 Vec::new(),
             )
         })
@@ -1346,7 +1350,7 @@ impl DurableContext {
         // the channel for the rest of the invocation. Seed the drain's
         // "already failed" state from it, so pending batches are published
         // the prior error and retained as unwritten instead of written.
-        let mut prior: Option<ClientError> = coalescer.latched_failure();
+        let mut prior: Option<ExecutionClientError> = coalescer.latched_failure();
         let mut failures: Vec<crate::checkpoint_coalescer::FailedFlush> = Vec::new();
         while let Some((batch, updates)) = coalescer.take_any() {
             if let Some(error) = prior.clone() {
@@ -1447,7 +1451,7 @@ impl DurableContext {
         struct PerOp {
             start: Option<OperationUpdate>,
             outcome: Option<OperationUpdate>,
-            error: ClientError,
+            error: ExecutionClientError,
         }
         let mut order: Vec<String> = Vec::new();
         let mut per_op: std::collections::HashMap<String, PerOp> = std::collections::HashMap::new();
@@ -1544,7 +1548,7 @@ impl DurableContext {
     pub(crate) async fn checkpoint_updates_direct(
         &self,
         updates: Vec<OperationUpdate>,
-    ) -> Result<CheckpointOutput, ClientError> {
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
         self.checkpoint_direct_with_events(updates, &[]).await
     }
 
@@ -1560,12 +1564,10 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
-    ) -> Result<CheckpointOutput, ClientError> {
-        let client = self
-            .inner
-            .execution_client
-            .as_ref()
-            .ok_or_else(|| ClientError::new_non_retryable("no execution client configured"))?;
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
+        let client = self.inner.execution_client.as_ref().ok_or_else(|| {
+            ExecutionClientError::new_non_retryable("no execution client configured")
+        })?;
 
         // Hold the async mutex across the entire checkpoint call to
         // serialize concurrent branch checkpoints. This is the Rust
@@ -1576,6 +1578,16 @@ impl DurableContext {
         let output = client
             .checkpoint(&self.inner.execution_arn, &token_guard, updates)
             .await?;
+        // A transport reports a tokenless response as `None`. Until the
+        // SDK gives that response its own meaning, it is the non-retryable
+        // error the Lambda transport returned before the token check moved
+        // here, so the behavior does not change.
+        let Some(next_token) = output.checkpoint_token() else {
+            return Err(ExecutionClientError::new_non_retryable(
+                "backend returned no checkpoint token",
+            ));
+        };
+        let next_token = next_token.to_owned();
 
         // The service has recorded the transitions: emit their lifecycle
         // events now, before the fallible pagination hydration below can
@@ -1585,7 +1597,7 @@ impl DurableContext {
         }
 
         // Rotate the token while still holding the lock.
-        token_guard.clone_from(&output.checkpoint_token);
+        *token_guard = next_token;
 
         // Merge updated operations into the checkpoint log so that
         // subsequent reads (e.g. reading callback_id after START) see
@@ -1603,13 +1615,16 @@ impl DurableContext {
         // a concurrent branch checkpoint and rotate the token, leaving this
         // get_state call with a stale token.
         if output.next_marker.is_some() {
-            let full_state = client
-                .get_state(&self.inner.execution_arn, &token_guard)
-                .await?;
-            if !full_state.operations.is_empty() {
+            let full_state = crate::client::get_full_state(
+                client.as_ref(),
+                &self.inner.execution_arn,
+                &token_guard,
+            )
+            .await?;
+            if !full_state.is_empty() {
                 crate::client::merge_operations_into_log(
                     &self.inner.engine.checkpoint_log,
-                    &full_state.operations,
+                    &full_state,
                 );
             }
         }
@@ -2583,7 +2598,7 @@ mod tests {
             checkpoint_token: &str,
             _updates: Vec<OperationUpdate>,
         ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>,
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
         > {
             let submitted = checkpoint_token.to_owned();
             Box::pin(async move {
@@ -2596,7 +2611,7 @@ mod tests {
                 if *current != submitted {
                     self.stale_checkpoint_tokens
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    return Err(ClientError::non_retryable(format!(
+                    return Err(ExecutionClientError::non_retryable(format!(
                         "stale checkpoint token: expected {current}, got {submitted}"
                     )));
                 }
@@ -2607,7 +2622,7 @@ mod tests {
                 current.clone_from(&next);
                 drop(current);
                 Ok(CheckpointOutput {
-                    checkpoint_token: next,
+                    checkpoint_token: Some(next),
                     updated_operations: Vec::new(),
                     // Every response paginated: forces the marker-triggered
                     // get_state on every checkpoint.
@@ -2620,8 +2635,10 @@ mod tests {
             &self,
             _execution_arn: &str,
             checkpoint_token: &str,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
-        {
+            _marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
             let submitted = checkpoint_token.to_owned();
             Box::pin(async move {
                 self.get_state_calls
@@ -2640,9 +2657,7 @@ mod tests {
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 drop(current);
-                Ok(GetStateOutput {
-                    operations: Vec::new(),
-                })
+                Ok(GetStateOutput::new(Vec::new(), None))
             })
         }
     }
@@ -2745,7 +2760,7 @@ mod tests {
         let client: Arc<dyn ExecutionClient> = Arc::new(InMemoryExecutionClient::new(all_ops));
 
         // The full log comes from get_state when the initial state is paginated.
-        let full_state = client.get_state("arn:test", "token").await;
+        let full_state = client.get_state("arn:test", "token", None).await;
         assert!(full_state.is_ok());
         let full_state = full_state.unwrap();
 
@@ -3817,18 +3832,16 @@ mod tests {
             checkpoint_token: &str,
             updates: Vec<OperationUpdate>,
         ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>,
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
         > {
             let arn = execution_arn.to_owned();
             let token = checkpoint_token.to_owned();
             Box::pin(async move {
                 // Block until the test releases the gate. The permit is
                 // consumed (forgotten) so each call needs its own release.
-                let permit = self
-                    .gate
-                    .acquire()
-                    .await
-                    .map_err(|e| ClientError::non_retryable(format!("gate closed: {e}")))?;
+                let permit = self.gate.acquire().await.map_err(|e| {
+                    ExecutionClientError::non_retryable(format!("gate closed: {e}"))
+                })?;
                 permit.forget();
                 self.calls
                     .lock()
@@ -3842,9 +3855,12 @@ mod tests {
             &self,
             execution_arn: &str,
             checkpoint_token: &str,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
-        {
-            self.inner.get_state(execution_arn, checkpoint_token)
+            marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            self.inner
+                .get_state(execution_arn, checkpoint_token, marker)
         }
     }
 
@@ -3956,7 +3972,7 @@ mod tests {
             _checkpoint_token: &str,
             updates: Vec<OperationUpdate>,
         ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>,
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
         > {
             Box::pin(async move {
                 self.calls
@@ -3971,7 +3987,7 @@ mod tests {
                         permit.forget();
                     }
                 }
-                Err(ClientError::from_retryable(
+                Err(ExecutionClientError::from_retryable(
                     "injected retryable checkpoint failure".to_owned(),
                 ))
             })
@@ -3981,10 +3997,12 @@ mod tests {
             &self,
             _execution_arn: &str,
             _checkpoint_token: &str,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
-        {
+            _marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
             Box::pin(async {
-                Err(ClientError::new_non_retryable(
+                Err(ExecutionClientError::new_non_retryable(
                     "get_state not used in this test",
                 ))
             })
@@ -4356,7 +4374,7 @@ mod tests {
             checkpoint_token: &str,
             updates: Vec<OperationUpdate>,
         ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>,
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
         > {
             let arn = execution_arn.to_owned();
             let token = checkpoint_token.to_owned();
@@ -4370,7 +4388,7 @@ mod tests {
                     *calls
                 };
                 if call_index >= 2 {
-                    return Err(ClientError::new_non_retryable(
+                    return Err(ExecutionClientError::new_non_retryable(
                         "injected failure on the second chunk",
                     ));
                 }
@@ -4382,9 +4400,12 @@ mod tests {
             &self,
             execution_arn: &str,
             checkpoint_token: &str,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
-        {
-            self.inner.get_state(execution_arn, checkpoint_token)
+            marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            self.inner
+                .get_state(execution_arn, checkpoint_token, marker)
         }
     }
 

@@ -28,6 +28,11 @@ use durable::test_util::LocalRunner;
 /// the SDK, asserted here through the public `TestResult` surface.
 const CHECKPOINT_FAILED: &str = "CheckpointFailedError";
 
+/// The wire `ErrorType` of the execution's `FAILED` record after a
+/// non-retryable checkpoint failure, as JS records it. The operation's
+/// terminal `FAIL` keeps [`CHECKPOINT_FAILED`].
+const CHECKPOINT_EXECUTION_FAILED: &str = "CheckpointUnrecoverableExecutionError";
+
 /// Issue #43 acceptance test 1: a step whose result the service
 /// permanently rejects fails the execution after one body execution, not
 /// at the execution timeout.
@@ -81,8 +86,8 @@ async fn permanently_rejected_result_fails_execution_after_one_body_run() {
     assert!(result.is_failure(), "the execution must fail");
     assert_eq!(
         result.error_type(),
-        Some(CHECKPOINT_FAILED),
-        "the FAILED envelope carries the checkpoint-failure type"
+        Some(CHECKPOINT_EXECUTION_FAILED),
+        "the FAILED envelope carries the unrecoverable-execution type"
     );
 
     // The terminal FAIL persisted: the step's record claims exactly what
@@ -158,7 +163,7 @@ async fn catch_cannot_observe_checkpoint_api_failure() {
         result.is_failure(),
         "the execution fails; the handler's 'recovered' value must not win"
     );
-    assert_eq!(result.error_type(), Some(CHECKPOINT_FAILED));
+    assert_eq!(result.error_type(), Some(CHECKPOINT_EXECUTION_FAILED));
 }
 
 /// A serdes whose serialize side always fails: the local, deterministic
@@ -836,7 +841,7 @@ async fn nonretryable_flush_failure_terminalizes_dropped_contributor_and_fails_e
         "the execution must fail — the handler's completion must not win \
          while the orphaned operation's record claims less than executed"
     );
-    assert_eq!(result.error_type(), Some(CHECKPOINT_FAILED));
+    assert_eq!(result.error_type(), Some(CHECKPOINT_EXECUTION_FAILED));
 
     // The terminal FAIL persisted for the orphaned operation.
     let orphan_op = result

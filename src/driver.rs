@@ -1541,9 +1541,9 @@ mod suspension_containment_and_task_ownership {
             InvocationOutcome::Failed { error } => {
                 assert_eq!(
                     error.error_type(),
-                    Some(crate::error::CHECKPOINT_FAILED_ERROR_TYPE),
+                    Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE),
                     "a non-retryable checkpoint failure fails the execution \
-                     with the checkpoint-failure type"
+                     with the unrecoverable-execution type"
                 );
                 assert!(
                     error.error_message().is_some_and(|m| m.contains("kaboom")),

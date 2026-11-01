@@ -113,7 +113,7 @@ use aws_sdk_lambda::types::{
 };
 
 use crate::BoxError;
-use crate::client::{CheckpointOutput, ClientError, ExecutionClient, GetStateOutput};
+use crate::client::{CheckpointOutput, ExecutionClient, ExecutionClientError, GetStateOutput};
 use crate::context::DurableContext;
 
 /// Default cap on the number of invocations the runner will drive before
@@ -2013,8 +2013,9 @@ impl ExecutionClient for Backend {
         _execution_arn: &str,
         _checkpoint_token: &str,
         updates: Vec<OperationUpdate>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
+    > {
         self.checkpoint_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // In-crate test seam: a per-call plan (see
@@ -2034,7 +2035,7 @@ impl ExecutionClient for Backend {
                             let permit = gate.acquire().await;
                             drop(permit);
                         }
-                        Err(ClientError::new_non_retryable(
+                        Err(ExecutionClientError::new_non_retryable(
                             "planned non-retryable checkpoint failure (test plan)",
                         ))
                     });
@@ -2053,13 +2054,13 @@ impl ExecutionClient for Backend {
                 .load(std::sync::atomic::Ordering::SeqCst);
             return Box::pin(async move {
                 if retryable {
-                    Err(ClientError::from_retryable(
+                    Err(ExecutionClientError::from_retryable(
                         "injected retryable checkpoint failure \
                          (LocalRunner::fail_checkpoints_after_retryable)"
                             .to_owned(),
                     ))
                 } else {
-                    Err(ClientError::new_non_retryable(
+                    Err(ExecutionClientError::new_non_retryable(
                         "injected checkpoint failure (LocalRunner::fail_next_checkpoints)",
                     ))
                 }
@@ -2104,7 +2105,7 @@ impl ExecutionClient for Backend {
 
         Box::pin(async move {
             Ok(CheckpointOutput {
-                checkpoint_token: token,
+                checkpoint_token: Some(token),
                 updated_operations: response_ops,
                 next_marker,
             })
@@ -2115,12 +2116,14 @@ impl ExecutionClient for Backend {
         &self,
         _execution_arn: &str,
         _checkpoint_token: &str,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
-    {
+        _marker: Option<&str>,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+    > {
         self.get_state_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let operations = self.build_operations();
-        Box::pin(async move { Ok(GetStateOutput { operations }) })
+        Box::pin(async move { Ok(GetStateOutput::new(operations, None)) })
     }
 }
 
@@ -3957,7 +3960,7 @@ mod tests {
         );
 
         // Verify that get_state returns all operations (used for pagination).
-        let full_state = backend.get_state("arn:test", "token-0").await;
+        let full_state = backend.get_state("arn:test", "token-0", None).await;
         assert!(full_state.is_ok());
         let full_state = full_state.unwrap();
         assert_eq!(
@@ -4528,7 +4531,7 @@ mod tests {
         );
         assert_eq!(
             result.error_type(),
-            Some(crate::error::CHECKPOINT_FAILED_ERROR_TYPE)
+            Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
         );
 
         // The terminal FAIL persisted for the orphaned operation.

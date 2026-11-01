@@ -60,7 +60,7 @@ use aws_sdk_lambda::types::OperationUpdate;
 use tokio::sync::Notify;
 use tokio::sync::futures::Notified;
 
-use crate::client::{CheckpointOutput, ClientError};
+use crate::client::{CheckpointOutput, ExecutionClientError};
 use crate::tracing_layer::PendingTransitionEvent;
 
 /// An operation update paired with the lifecycle event describing the
@@ -254,7 +254,7 @@ struct CoalescerState {
     /// [`CheckpointCoalescer::take_failed_flushes`] drains the retained
     /// failures but never clears the latch: the coalescer lives for one
     /// invocation, and its write channel does not come back within it.
-    latched: Option<ClientError>,
+    latched: Option<ExecutionClientError>,
 }
 
 /// One checkpoint write failure retained by the coalescer: the error plus
@@ -262,7 +262,7 @@ struct CoalescerState {
 #[derive(Debug)]
 pub(crate) struct FailedFlush {
     /// The client error the write failed with.
-    pub(crate) error: ClientError,
+    pub(crate) error: ExecutionClientError,
     /// The updates that were NOT persisted by the failed write: the
     /// rejected chunk and everything after it, never a chunk that already
     /// succeeded (a terminal `FAIL` must not be written over a persisted
@@ -275,13 +275,13 @@ pub(crate) struct FailedFlush {
 #[derive(Debug, Default)]
 pub(crate) struct CheckpointBatch {
     notify: Notify,
-    result: Mutex<Option<Result<CheckpointOutput, ClientError>>>,
+    result: Mutex<Option<Result<CheckpointOutput, ExecutionClientError>>>,
 }
 
 impl CheckpointBatch {
     /// Returns a clone of the published batch result, if the flush has
     /// completed.
-    pub(crate) fn result_clone(&self) -> Option<Result<CheckpointOutput, ClientError>> {
+    pub(crate) fn result_clone(&self) -> Option<Result<CheckpointOutput, ExecutionClientError>> {
         self.result
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -289,7 +289,7 @@ impl CheckpointBatch {
     }
 
     /// Publishes the flush result and wakes every waiting contributor.
-    pub(crate) fn publish(&self, result: Result<CheckpointOutput, ClientError>) {
+    pub(crate) fn publish(&self, result: Result<CheckpointOutput, ExecutionClientError>) {
         *self.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
         self.notify.notify_waiters();
     }
@@ -378,7 +378,11 @@ impl CheckpointCoalescer {
     /// not persist. Also latches the failure (first error wins) so no
     /// later buffered write reaches the backend this invocation: see
     /// [`CoalescerState::latched`].
-    pub(crate) fn record_failed_flush(&self, error: ClientError, unwritten: Vec<OperationUpdate>) {
+    pub(crate) fn record_failed_flush(
+        &self,
+        error: ExecutionClientError,
+        unwritten: Vec<OperationUpdate>,
+    ) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.latched.is_none() {
             state.latched = Some(error.clone());
@@ -391,7 +395,7 @@ impl CheckpointCoalescer {
     /// observes it (under the writer lock) must not call the backend: it
     /// publishes this error to its contributors and retains its updates
     /// via [`Self::record_failed_flush`] instead.
-    pub(crate) fn latched_failure(&self) -> Option<ClientError> {
+    pub(crate) fn latched_failure(&self) -> Option<ExecutionClientError> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.latched.clone()
     }
@@ -430,7 +434,7 @@ mod tests {
 
     fn dummy_output() -> CheckpointOutput {
         CheckpointOutput {
-            checkpoint_token: "token-1".to_owned(),
+            checkpoint_token: Some("token-1".to_owned()),
             updated_operations: Vec::new(),
             next_marker: None,
         }
@@ -690,8 +694,8 @@ mod tests {
         batch.publish(Ok(dummy_output()));
         let result = waiter.await.expect("waiter task completes");
         assert_eq!(
-            result.expect("published Ok").checkpoint_token,
-            "token-1",
+            result.expect("published Ok").checkpoint_token(),
+            Some("token-1"),
             "waiter observes the published result"
         );
     }
@@ -709,11 +713,11 @@ mod tests {
         );
 
         coalescer.record_failed_flush(
-            ClientError::from_retryable("first failure".to_owned()),
+            ExecutionClientError::from_retryable("first failure".to_owned()),
             vec![dummy_update("a")],
         );
         coalescer.record_failed_flush(
-            ClientError::new_non_retryable("second failure"),
+            ExecutionClientError::new_non_retryable("second failure"),
             vec![dummy_update("b")],
         );
 

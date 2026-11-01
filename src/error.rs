@@ -591,6 +591,30 @@ pub(crate) fn checkpoint_failure_wire(err: &impl fmt::Display) -> WireError {
     )
 }
 
+/// The wire `ErrorType` of the execution's `FAILED` record after a
+/// non-retryable checkpoint failure. It is the type JS records for its
+/// `CheckpointUnrecoverableExecutionError`. The operation's own terminal
+/// `FAIL` keeps [`CHECKPOINT_FAILED_ERROR_TYPE`].
+pub(crate) const CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE: &str =
+    "CheckpointUnrecoverableExecutionError";
+
+/// Builds the execution's `FAILED` record after a non-retryable
+/// checkpoint failure: [`CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE`] and the
+/// message `[Unrecoverable Execution] Checkpoint failed: {m}`, as JS
+/// writes. `{m}` is the record message of
+/// [`client_error_record_message`](crate::client::client_error_record_message).
+pub(crate) fn checkpoint_execution_failure_wire(
+    err: &crate::client::ExecutionClientError,
+) -> WireError {
+    WireError::new(
+        Some(CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE),
+        Some(format!(
+            "[Unrecoverable Execution] Checkpoint failed: {}",
+            crate::client::client_error_record_message(err)
+        )),
+    )
+}
+
 /// Returns the wire record carried by `err`, when `err` is one of the
 /// SDK's own wire-record-carrying types.
 fn wire_identity<'a>(err: &'a (dyn Error + 'static)) -> Option<&'a WireError> {

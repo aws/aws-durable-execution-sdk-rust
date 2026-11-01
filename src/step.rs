@@ -892,8 +892,7 @@ const STEP_INTERRUPTED_ERROR_TYPE: &str = "StepInterruptedError";
 
 /// The wire `ErrorMessage` recorded for an interrupted `AtMostOncePerRetry`
 /// attempt. It is the message the JS SDK records.
-const STEP_INTERRUPTED_MESSAGE: &str =
-    "The step execution process was initiated but failed to reach completion due to an interruption.";
+const STEP_INTERRUPTED_MESSAGE: &str = "The step execution process was initiated but failed to reach completion due to an interruption.";
 
 #[cfg(test)]
 #[expect(clippy::panic)]
@@ -2001,7 +2000,10 @@ mod tests {
             _marker: std::marker::PhantomData,
         };
 
-        let err = exec.execute().await.expect_err("the replayed step must fail");
+        let err = exec
+            .execute()
+            .await
+            .expect_err("the replayed step must fail");
 
         let OperationErrorKind::Step(step_err) = err.kind() else {
             panic!("expected a step error, got {err:?}");

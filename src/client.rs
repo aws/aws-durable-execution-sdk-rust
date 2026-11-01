@@ -1,10 +1,9 @@
-//! Execution client abstraction for checkpoint operations.
-//!
-//! This module provides the internal trait that the engine calls to
-//! checkpoint operation results and retrieve execution state. The
-//! production implementation is backed by `aws-sdk-lambda`.
+//! The checkpoint transport: the trait the SDK calls to checkpoint
+//! operation updates and read execution state, its error type, and the
+//! default transport backed by `aws-sdk-lambda`.
 
 use std::pin::Pin;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -12,41 +11,124 @@ use aws_sdk_lambda::types::{Operation, OperationType, OperationUpdate};
 
 use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
 
-/// Checkpoint client error type wrapping the underlying cause.
+/// The recovery scope of an [`ExecutionClientError`].
 ///
-/// `Clone` because a coalesced checkpoint batch publishes one result to
-/// every operation that contributed updates to it.
-#[derive(Debug, Clone)]
-pub(crate) struct ClientError {
-    message: String,
-    /// Whether the underlying failure was classified retryable.
-    ///
-    /// The production client relies on the aws-sdk's standard retry, so by
-    /// the time an error carries this flag the SDK has already exhausted
-    /// its transport-level attempts. The flag decides the *recovery scope*
-    /// (see [`classify_checkpoint_error`]): a retryable failure fails the
-    /// invocation, the durable service re-invokes, which is the same
-    /// recovery as an interruption, while a non-retryable failure is a
-    /// permanent rejection that persists a terminal `FAIL` for the
-    /// operation and then fails the execution
-    /// ([`DurableContext::checkpoint_failure_unrecoverable`](crate::context::DurableContext::checkpoint_failure_unrecoverable)).
-    retryable: bool,
+/// The scope decides what the SDK does with a transport failure. See the
+/// [`ExecutionClient`] contract for each case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecutionClientErrorScope {
+    /// The invocation fails; the service re-invokes and replay resumes.
+    Invocation,
+    /// The execution fails.
+    Execution,
 }
 
-impl std::fmt::Display for ClientError {
+/// The terminal outcome a transport returns: a scope, a message and,
+/// when the transport has one, the error that caused it.
+///
+/// [`source()`](std::error::Error::source) returns the error passed to
+/// [`with_source`](Self::with_source).
+///
+/// A transport puts the detail a log needs into the message. The built-in
+/// [`LambdaExecutionClient`] keeps the full `DisplayErrorContext` text of
+/// the AWS SDK error in the message, and passes the final `SdkError` as the
+/// source.
+///
+/// The name of this type is not a wire `ErrorType`, and its `Display` text
+/// is not a wire `ErrorMessage`. An [`Execution`](ExecutionClientErrorScope::Execution)-scoped
+/// error that ends the bootstrap state read records the AWS error code when
+/// the Lambda transport supplied it, and `DurableExecutionClientError`
+/// otherwise. A recorded message is the AWS error's message when the Lambda
+/// transport supplied one, and the message passed to [`new`](Self::new) or
+/// [`with_source`](Self::with_source) otherwise.
+///
+/// `Clone` because a coalesced checkpoint batch publishes one result to
+/// every operation that contributed updates to it. The source is held in an
+/// `Arc` for that reason.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ExecutionClientError {
+    scope: ExecutionClientErrorScope,
+    message: String,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::fmt::Display for ExecutionClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "durable: client: {}", self.message)
     }
 }
 
-impl std::error::Error for ClientError {}
+impl std::error::Error for ExecutionClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|s| s as &(dyn std::error::Error + 'static))
+    }
+}
 
-impl ClientError {
-    /// Whether this error was classified retryable: the invocation fails
-    /// and the durable service re-invokes. `false` means a permanent
+impl ExecutionClientError {
+    /// Creates an error with the given scope and message, and no source.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::{ExecutionClientError, ExecutionClientErrorScope};
+    ///
+    /// let err = ExecutionClientError::new(ExecutionClientErrorScope::Execution, "rejected");
+    /// assert_eq!(err.scope(), ExecutionClientErrorScope::Execution);
+    /// assert_eq!(err.to_string(), "durable: client: rejected");
+    /// ```
+    #[must_use]
+    pub fn new(scope: ExecutionClientErrorScope, message: impl Into<String>) -> Self {
+        Self {
+            scope,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Creates an error with the given scope and message, keeping `source`
+    /// as the error that caused it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::error::Error as _;
+    /// use aws_durable_execution_sdk::{ExecutionClientError, ExecutionClientErrorScope};
+    ///
+    /// let cause = std::io::Error::other("connection reset");
+    /// let err = ExecutionClientError::with_source(
+    ///     ExecutionClientErrorScope::Invocation,
+    ///     "checkpoint failed",
+    ///     cause,
+    /// );
+    /// assert!(err.source().is_some());
+    /// ```
+    #[must_use]
+    pub fn with_source(
+        scope: ExecutionClientErrorScope,
+        message: impl Into<String>,
+        source: impl Into<crate::BoxError>,
+    ) -> Self {
+        Self {
+            scope,
+            message: message.into(),
+            source: Some(Arc::from(source.into())),
+        }
+    }
+
+    /// The recovery scope of this error.
+    pub fn scope(&self) -> ExecutionClientErrorScope {
+        self.scope
+    }
+
+    /// Whether this error fails only the invocation: `true` exactly for
+    /// [`ExecutionClientErrorScope::Invocation`]. `false` means a permanent
     /// rejection: the terminal-`FAIL`-then-fail-the-execution path.
     pub(crate) fn is_retryable(&self) -> bool {
-        self.retryable
+        self.scope == ExecutionClientErrorScope::Invocation
     }
 
     /// The error's message, without the `durable: client: ` prefix that
@@ -55,34 +137,97 @@ impl ClientError {
         &self.message
     }
 
+    /// Creates a non-retryable error from an owned message. Only test
+    /// doubles call it: the Lambda transport builds every error with a
+    /// source.
+    #[cfg(test)]
     pub(crate) fn non_retryable(message: String) -> Self {
-        Self {
-            message,
-            retryable: false,
-        }
+        Self::new(ExecutionClientErrorScope::Execution, message)
     }
 
     /// Creates a non-retryable error from a string slice (convenience).
     pub(crate) fn new_non_retryable(message: &str) -> Self {
-        Self {
-            message: message.to_owned(),
-            retryable: false,
-        }
+        Self::new(ExecutionClientErrorScope::Execution, message)
     }
 
+    /// Creates an `Invocation`-scoped error from an owned message. Only
+    /// test doubles call it: the Lambda transport builds every error with a
+    /// source.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn from_retryable(message: String) -> Self {
-        Self {
-            message,
-            retryable: true,
-        }
+        Self::new(ExecutionClientErrorScope::Invocation, message)
     }
 }
 
-/// The output from a successful checkpoint call.
+/// The message the SDK records for a transport error: the service's
+/// message when the Lambda transport supplied an AWS error, and the
+/// transport's own message otherwise.
+///
+/// It reads, in this order:
+///
+/// 1. The `message()` of the AWS error, when the source is the final
+///    `SdkError` of `CheckpointDurableExecution` or
+///    `GetDurableExecutionState` and that error has a message. JS reads
+///    `awsError.message` the same way.
+/// 2. Otherwise [`ExecutionClientError::message`], without the
+///    `durable: client: ` prefix of `Display`, as JS reads the `message` of
+///    the error the transport threw.
+pub(crate) fn client_error_record_message(err: &ExecutionClientError) -> String {
+    use aws_sdk_lambda::error::ProvideErrorMetadata;
+    use std::error::Error as _;
+
+    if let Some(source) = err.source() {
+        if let Some(sdk) = source.downcast_ref::<CheckpointSdkError>()
+            && let Some(m) = sdk.message()
+        {
+            return m.to_owned();
+        }
+        if let Some(sdk) = source.downcast_ref::<GetStateSdkError>()
+            && let Some(m) = sdk.message()
+        {
+            return m.to_owned();
+        }
+    }
+    err.message().to_owned()
+}
+
+/// The wire `ErrorType` of the bootstrap `FAILED` record for `err`.
+///
+/// When the source is the final `SdkError` of `GetDurableExecutionState`
+/// and it carries an AWS error code, the type is that code, as JS records
+/// the AWS error's `name`. Otherwise the type is
+/// [`EXECUTION_CLIENT_ERROR_TYPE`](crate::error::EXECUTION_CLIENT_ERROR_TYPE),
+/// as JS records for its `DurableExecutionClientError`.
+pub(crate) fn bootstrap_error_type(err: &ExecutionClientError) -> String {
+    use aws_sdk_lambda::error::ProvideErrorMetadata;
+    use std::error::Error as _;
+
+    err.source()
+        .and_then(|s| s.downcast_ref::<GetStateSdkError>())
+        .and_then(ProvideErrorMetadata::code)
+        .unwrap_or(crate::error::EXECUTION_CLIENT_ERROR_TYPE)
+        .to_owned()
+}
+
+/// The final error of a `CheckpointDurableExecution` call.
+type CheckpointSdkError = aws_sdk_lambda::error::SdkError<
+    aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError,
+    aws_sdk_lambda::config::http::HttpResponse,
+>;
+
+/// The final error of a `GetDurableExecutionState` call.
+type GetStateSdkError = aws_sdk_lambda::error::SdkError<
+    aws_sdk_lambda::operation::get_durable_execution_state::GetDurableExecutionStateError,
+    aws_sdk_lambda::config::http::HttpResponse,
+>;
+
+/// The output of a successful [`ExecutionClient::checkpoint`] call.
 #[derive(Debug, Clone)]
-pub(crate) struct CheckpointOutput {
-    /// The new checkpoint token for subsequent calls.
-    pub(crate) checkpoint_token: String,
+#[non_exhaustive]
+pub struct CheckpointOutput {
+    /// The new checkpoint token for subsequent calls. `None` when the
+    /// service returned no token.
+    pub(crate) checkpoint_token: Option<String>,
     /// Updated operations from the backend (may be empty).
     pub(crate) updated_operations: Vec<Operation>,
     /// Pagination marker: if present, more operations are available via
@@ -90,44 +235,119 @@ pub(crate) struct CheckpointOutput {
     pub(crate) next_marker: Option<String>,
 }
 
-/// The output from loading execution state.
-#[derive(Debug)]
-pub(crate) struct GetStateOutput {
-    /// All operations returned from the backend (paginated internally).
-    pub(crate) operations: Vec<Operation>,
+impl CheckpointOutput {
+    /// Creates a checkpoint output.
+    ///
+    /// `checkpoint_token` is the token for the next request, or `None` when
+    /// the service returned none. `next_marker` is the pagination marker of
+    /// the returned state, or `None` when `updated_operations` is complete.
+    #[must_use]
+    pub fn new(
+        checkpoint_token: Option<String>,
+        updated_operations: Vec<Operation>,
+        next_marker: Option<String>,
+    ) -> Self {
+        Self {
+            checkpoint_token,
+            updated_operations,
+            next_marker,
+        }
+    }
+
+    /// The token for the next request. An empty token reads as `None`.
+    pub fn checkpoint_token(&self) -> Option<&str> {
+        self.checkpoint_token.as_deref().filter(|t| !t.is_empty())
+    }
 }
 
-/// The internal abstraction over checkpoint API operations.
+/// One page of execution state, returned by [`ExecutionClient::get_state`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct GetStateOutput {
+    /// The operations of this page.
+    pub(crate) operations: Vec<Operation>,
+    /// The marker of the next page, `None` on the last page.
+    pub(crate) next_marker: Option<String>,
+}
+
+impl GetStateOutput {
+    /// Creates one page of execution state. `next_marker` is the marker of
+    /// the next page, or `None` on the last page.
+    #[must_use]
+    pub fn new(operations: Vec<Operation>, next_marker: Option<String>) -> Self {
+        Self {
+            operations,
+            next_marker,
+        }
+    }
+
+    /// The marker of the next page. An empty marker reads as `None`.
+    pub fn next_marker(&self) -> Option<&str> {
+        self.next_marker.as_deref().filter(|m| !m.is_empty())
+    }
+}
+
+/// The transport for the two durable execution service calls.
 ///
-/// The engine calls this trait for persisting operation updates and
-/// retrieving execution state. The production implementation uses
-/// `aws-sdk-lambda`; the test double uses an in-memory store.
+/// The SDK uses [`LambdaExecutionClient`] unless
+/// [`OptionsBuilder::execution_client`](crate::OptionsBuilder::execution_client)
+/// supplies another implementation. The trait is object-safe, so a
+/// transport is passed as `Arc<dyn ExecutionClient>`.
 ///
-/// Object-safe (no generics, no `Self: Sized` constraints) so it can be
-/// stored as `Box<dyn ExecutionClient>`.
-pub(crate) trait ExecutionClient: Send + Sync + std::fmt::Debug {
-    /// Checkpoints operation updates, rotating the token.
-    ///
-    /// Transient-failure retry is the transport's responsibility: the
-    /// production implementation relies on the aws-sdk's standard retry,
-    /// and an error returned here is final for this invocation.
+/// # Contract
+///
+/// 1. [`checkpoint`](Self::checkpoint) sends `updates` in order in one
+///    request. It returns the new token, the operations the backend
+///    returned, and the pagination marker of the returned state.
+/// 2. The returned token is `None` when the service accepted the request
+///    and returned no token for the next one. An empty token is reported
+///    as `None`.
+/// 3. [`get_state`](Self::get_state) returns one page of the execution's
+///    operations and the marker of the next page, or `None` on the last
+///    page. The SDK follows the marker.
+/// 4. Transient retry is the transport's job. An error the method returns
+///    is final for the invocation.
+/// 5. An error's [`scope`](ExecutionClientError::scope) decides the
+///    outcome:
+///    - [`Invocation`](ExecutionClientErrorScope::Invocation) fails the
+///      invocation; the service re-invokes and replay resumes.
+///    - [`Execution`](ExecutionClientErrorScope::Execution) from
+///      `checkpoint` records a terminal `FAIL` for the operation and fails
+///      the execution. The operation's terminal `FAIL` has `ErrorType`
+///      `CheckpointFailedError`, the record that replay reads if the
+///      invocation runs again. The execution's `FAILED` record has
+///      `ErrorType` `CheckpointUnrecoverableExecutionError` and
+///      `ErrorMessage` `[Unrecoverable Execution] Checkpoint failed: {m}`.
+///      `{m}` is the AWS error's message when the Lambda transport supplied
+///      one, and the error's own message otherwise.
+///    - `Execution` from the bootstrap `get_state` returns a `FAILED`
+///      response. Its `ErrorType` is the AWS error code when the Lambda
+///      transport supplied one, and `DurableExecutionClientError`
+///      otherwise. Its `ErrorMessage` is `{m}` as above.
+pub trait ExecutionClient: Send + Sync {
+    /// Checkpoints operation updates and returns the next token.
     fn checkpoint(
         &self,
         execution_arn: &str,
         checkpoint_token: &str,
         updates: Vec<OperationUpdate>,
-    ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>;
 
-    /// Retrieves the full execution state (all operations), following
-    /// pagination internally.
+    /// Reads one page of the execution state. `None` reads the first page,
+    /// and `Some(m)` reads the page after marker `m`.
     fn get_state(
         &self,
         execution_arn: &str,
         checkpoint_token: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>;
+        marker: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>;
 }
 
-/// Production `ExecutionClient` backed by `aws_sdk_lambda::Client`.
+/// The page size of a `GetDurableExecutionState` request, as in JS.
+const GET_STATE_MAX_ITEMS: i32 = 1000;
+
+/// The transport the SDK uses when `execution_client` is not set. Wrap it
+/// to decorate the default.
 ///
 /// Retry is delegated entirely to the wrapped SDK client's own retry
 /// strategy (standard retry by default: jittered exponential backoff, 3
@@ -136,15 +356,43 @@ pub(crate) trait ExecutionClient: Send + Sync + std::fmt::Debug {
 /// fails the invocation; the durable execution service re-invokes the
 /// handler, which is the recovery path: longer in-process retry would
 /// only delay it. Callers who need a different retry policy supply a
-/// preconfigured client via [`Options`](crate::Options)'s `lambda_client`.
-#[derive(Debug, Clone)]
-pub(crate) struct LambdaExecutionClient {
+/// preconfigured client.
+///
+/// Every final error carries the final `SdkError` as its
+/// [`source`](std::error::Error::source).
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use aws_durable_execution_sdk::{
+///     ExecutionClient, LambdaClient, LambdaExecutionClient, Options, SdkConfig,
+/// };
+///
+/// let client = LambdaClient::new(&SdkConfig::builder().build());
+/// let transport: Arc<dyn ExecutionClient> = Arc::new(LambdaExecutionClient::new(client));
+/// let options = Options::builder()
+///     .execution_client(transport)
+///     .build()
+///     .expect("valid config");
+/// # drop(options);
+/// ```
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct LambdaExecutionClient {
     client: aws_sdk_lambda::Client,
 }
 
+impl std::fmt::Debug for LambdaExecutionClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LambdaExecutionClient")
+    }
+}
+
 impl LambdaExecutionClient {
-    /// Creates a new client wrapping the provided Lambda SDK client.
-    pub(crate) fn new(client: aws_sdk_lambda::Client) -> Self {
+    /// Creates a transport that calls the service through `client`.
+    #[must_use]
+    pub fn new(client: crate::LambdaClient) -> Self {
         Self { client }
     }
 }
@@ -155,7 +403,8 @@ impl ExecutionClient for LambdaExecutionClient {
         execution_arn: &str,
         checkpoint_token: &str,
         updates: Vec<OperationUpdate>,
-    ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+    {
         let arn = execution_arn.to_owned();
         let token = checkpoint_token.to_owned();
         Box::pin(async move {
@@ -170,12 +419,7 @@ impl ExecutionClient for LambdaExecutionClient {
 
             match result {
                 Ok(output) => {
-                    let new_token = output.checkpoint_token.unwrap_or_default();
-                    if new_token.is_empty() {
-                        return Err(ClientError::non_retryable(
-                            "backend returned no checkpoint token".to_owned(),
-                        ));
-                    }
+                    let new_token = output.checkpoint_token.filter(|t| !t.is_empty());
                     let (updated_ops, next_marker) = match output.new_execution_state {
                         Some(state) => (
                             state.operations.unwrap_or_default(),
@@ -183,68 +427,73 @@ impl ExecutionClient for LambdaExecutionClient {
                         ),
                         None => (Vec::new(), None),
                     };
-                    Ok(CheckpointOutput {
-                        checkpoint_token: new_token,
-                        updated_operations: updated_ops,
-                        next_marker,
-                    })
+                    Ok(CheckpointOutput::new(new_token, updated_ops, next_marker))
                 }
                 // The SDK's standard retry has already retried everything
                 // transient; the final error is classified into a recovery
                 // scope (invocation vs execution): see
                 // `classify_checkpoint_error`.
-                Err(err) => Err(classify_checkpoint_error(&err)),
+                Err(err) => Err(classify_checkpoint_error(err)),
             }
         })
     }
 
-    /// Final errors are classified by [`classify_get_state_error`]: the
-    /// four KMS errors are non-retryable, and every other error, a plain
-    /// 4xx included, is retryable, as in JS.
+    /// Sends one `GetDurableExecutionState` request with `MaxItems` 1000.
+    /// The four KMS errors are `Execution`-scoped, and every other final
+    /// error, a plain 4xx included, is `Invocation`-scoped, as in JS.
     fn get_state(
         &self,
         execution_arn: &str,
         checkpoint_token: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>> {
+        marker: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+    {
         let arn = execution_arn.to_owned();
         let token = checkpoint_token.to_owned();
+        let marker = marker.map(str::to_owned);
         Box::pin(async move {
-            let mut all_operations = Vec::new();
-            let mut marker: Option<String> = None;
+            // As with `checkpoint`, the SDK's standard retry owns the
+            // transient-failure retry; the final error is classified by
+            // `classify_get_state_error`.
+            let output = self
+                .client
+                .get_durable_execution_state()
+                .durable_execution_arn(&arn)
+                .checkpoint_token(&token)
+                .set_marker(marker)
+                .max_items(GET_STATE_MAX_ITEMS)
+                .send()
+                .await
+                .map_err(classify_get_state_error)?;
 
-            loop {
-                let mut builder = self
-                    .client
-                    .get_durable_execution_state()
-                    .durable_execution_arn(&arn)
-                    .checkpoint_token(&token);
-
-                if let Some(ref m) = marker {
-                    builder = builder.marker(m.as_str());
-                }
-
-                // As with `checkpoint`, the SDK's standard retry owns the
-                // transient-failure retry; the final error is classified by
-                // `classify_get_state_error`.
-                let output = builder
-                    .send()
-                    .await
-                    .map_err(|err| classify_get_state_error(&err))?;
-
-                all_operations.extend(output.operations);
-
-                match output.next_marker {
-                    Some(ref m) if !m.is_empty() => {
-                        marker = Some(m.clone());
-                    }
-                    _ => break,
-                }
-            }
-
-            Ok(GetStateOutput {
-                operations: all_operations,
-            })
+            Ok(GetStateOutput::new(
+                output.operations,
+                output.next_marker.filter(|m| !m.is_empty()),
+            ))
         })
+    }
+}
+
+/// Reads the whole execution state: calls [`ExecutionClient::get_state`]
+/// with no marker, then with each returned marker until
+/// [`GetStateOutput::next_marker`] is `None`, and concatenates the pages.
+pub(crate) async fn get_full_state(
+    client: &dyn ExecutionClient,
+    execution_arn: &str,
+    checkpoint_token: &str,
+) -> Result<Vec<Operation>, ExecutionClientError> {
+    let mut operations = Vec::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let page = client
+            .get_state(execution_arn, checkpoint_token, marker.as_deref())
+            .await?;
+        let next = page.next_marker().map(str::to_owned);
+        operations.extend(page.operations);
+        match next {
+            Some(m) => marker = Some(m),
+            None => return Ok(operations),
+        }
     }
 }
 
@@ -257,7 +506,8 @@ impl ExecutionClient for LambdaExecutionClient {
 const STALE_TOKEN_MESSAGE_PREFIX: &str = "Invalid checkpoint token";
 
 /// Classifies a final `CheckpointDurableExecution` error into a recovery
-/// scope, carried as [`ClientError::is_retryable`].
+/// scope, carried as [`ExecutionClientError::scope`]. The final error is
+/// kept as the source.
 ///
 /// By the time this runs, the aws-sdk's standard retry has exhausted its
 /// transport-level attempts, so the question is no longer "try again now"
@@ -300,23 +550,23 @@ const STALE_TOKEN_MESSAGE_PREFIX: &str = "Invalid checkpoint token";
 /// `checkpoint_error_variant_canary` test pins the variant set this
 /// function classifies explicitly, so a new upstream variant fails CI for
 /// reclassification instead of falling silently into the status rule.
-fn classify_checkpoint_error(
-    err: &aws_sdk_lambda::error::SdkError<
-        aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError,
-        aws_sdk_lambda::config::http::HttpResponse,
-    >,
-) -> ClientError {
+fn classify_checkpoint_error(err: CheckpointSdkError) -> ExecutionClientError {
+    let message = format!("{}", aws_sdk_lambda::error::DisplayErrorContext(&err));
+    let scope = checkpoint_error_scope(&err);
+    ExecutionClientError::with_source(scope, message, err)
+}
+
+/// The recovery scope of a final `CheckpointDurableExecution` error: see
+/// [`classify_checkpoint_error`].
+fn checkpoint_error_scope(err: &CheckpointSdkError) -> ExecutionClientErrorScope {
+    use ExecutionClientErrorScope::{Execution, Invocation};
     use aws_sdk_lambda::error::SdkError;
     use aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionError as E;
-
-    let message = format!("{}", aws_sdk_lambda::error::DisplayErrorContext(err));
 
     if let SdkError::ServiceError(service_err) = err {
         match service_err.err() {
             // Throttling and service-side 5xx: transient by definition.
-            E::TooManyRequestsException(_) | E::ServiceException(_) => {
-                return ClientError::from_retryable(message);
-            }
+            E::TooManyRequestsException(_) | E::ServiceException(_) => return Invocation,
             // A parameter rejection is deterministic, the same write fails
             // the same way on every lap, EXCEPT the stale-token rejection,
             // which a re-invocation resolves with a fresh token.
@@ -325,9 +575,9 @@ fn classify_checkpoint_error(
                     .message()
                     .is_some_and(|m| m.starts_with(STALE_TOKEN_MESSAGE_PREFIX))
                 {
-                    ClientError::from_retryable(message)
+                    Invocation
                 } else {
-                    ClientError::non_retryable(message)
+                    Execution
                 };
             }
             // KMS misconfiguration on the function: deterministic until an
@@ -335,7 +585,7 @@ fn classify_checkpoint_error(
             E::KmsAccessDeniedException(_)
             | E::KmsDisabledException(_)
             | E::KmsInvalidStateException(_)
-            | E::KmsNotFoundException(_) => return ClientError::non_retryable(message),
+            | E::KmsNotFoundException(_) => return Execution,
             // Unmodeled errors fall through to the status rule. The variant
             // canary test keeps this arm from silently absorbing new modeled
             // variants.
@@ -347,15 +597,14 @@ fn classify_checkpoint_error(
     // (dispatch failure, timeout, construction failure) are channel-level:
     // nothing was rejected.
     match err.raw_response().map(|r| r.status().as_u16()) {
-        Some(status) if (400..500).contains(&status) && status != 429 => {
-            ClientError::non_retryable(message)
-        }
-        _ => ClientError::from_retryable(message),
+        Some(status) if (400..500).contains(&status) && status != 429 => Execution,
+        _ => Invocation,
     }
 }
 
 /// Classifies a final `GetDurableExecutionState` error into a recovery
-/// scope, carried as [`ClientError::is_retryable`].
+/// scope, carried as [`ExecutionClientError::scope`]. The final error is
+/// kept as the source.
 ///
 /// The four KMS errors are non-retryable: the function's key is
 /// misconfigured, so every re-invocation fails the same way. Every other
@@ -363,24 +612,44 @@ fn classify_checkpoint_error(
 /// other error of its bootstrap state read and so fails only the
 /// invocation. The message is the `DisplayErrorContext` text, so it names
 /// the exception.
-fn classify_get_state_error(
-    err: &aws_sdk_lambda::error::SdkError<
-        aws_sdk_lambda::operation::get_durable_execution_state::GetDurableExecutionStateError,
-        aws_sdk_lambda::config::http::HttpResponse,
-    >,
-) -> ClientError {
+fn classify_get_state_error(err: GetStateSdkError) -> ExecutionClientError {
     use aws_sdk_lambda::operation::get_durable_execution_state::GetDurableExecutionStateError as E;
 
-    let message = format!("{}", aws_sdk_lambda::error::DisplayErrorContext(err));
-    match err.as_service_error() {
+    let message = format!("{}", aws_sdk_lambda::error::DisplayErrorContext(&err));
+    let scope = match err.as_service_error() {
         Some(
             E::KmsAccessDeniedException(_)
             | E::KmsDisabledException(_)
             | E::KmsInvalidStateException(_)
             | E::KmsNotFoundException(_),
-        ) => ClientError::non_retryable(message),
-        _ => ClientError::from_retryable(message),
-    }
+        ) => ExecutionClientErrorScope::Execution,
+        _ => ExecutionClientErrorScope::Invocation,
+    };
+    ExecutionClientError::with_source(scope, message, err)
+}
+
+/// An HTTP error response as the service sends it: the AWS error code in
+/// the `x-amzn-errortype` header and the message in the JSON body. The
+/// generated deserializer reads both into the error's metadata, which a
+/// modeled error built in a test does not carry.
+#[cfg(test)]
+pub(crate) fn mock_aws_error_response(
+    status: u16,
+    code: &str,
+    message: &str,
+) -> aws_sdk_lambda::config::http::HttpResponse {
+    let body = serde_json::json!({ "Type": "User", "message": message }).to_string();
+    let mut response = aws_sdk_lambda::config::http::HttpResponse::new(
+        aws_smithy_runtime_api::http::StatusCode::try_from(status).expect("valid HTTP status"),
+        aws_smithy_types::body::SdkBody::from(body),
+    );
+    response
+        .headers_mut()
+        .insert("x-amzn-errortype", code.to_owned());
+    response
+        .headers_mut()
+        .insert("content-type", "application/json");
+    response
 }
 
 /// Injection point for controlling test double behavior per call.
@@ -476,7 +745,8 @@ impl ExecutionClient for InMemoryExecutionClient {
         _execution_arn: &str,
         _checkpoint_token: &str,
         updates: Vec<OperationUpdate>,
-    ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+    {
         {
             let mut count = self
                 .checkpoint_call_count
@@ -540,8 +810,12 @@ impl ExecutionClient for InMemoryExecutionClient {
 
         Box::pin(async move {
             match response {
-                Some(TestResponse::RetryableError(msg)) => Err(ClientError::from_retryable(msg)),
-                Some(TestResponse::NonRetryableError(msg)) => Err(ClientError::non_retryable(msg)),
+                Some(TestResponse::RetryableError(msg)) => {
+                    Err(ExecutionClientError::from_retryable(msg))
+                }
+                Some(TestResponse::NonRetryableError(msg)) => {
+                    Err(ExecutionClientError::non_retryable(msg))
+                }
                 Some(TestResponse::Success(ops)) => {
                     let mut counter = self
                         .token_counter
@@ -549,7 +823,7 @@ impl ExecutionClient for InMemoryExecutionClient {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     *counter += 1;
                     Ok(CheckpointOutput {
-                        checkpoint_token: format!("token-{counter}"),
+                        checkpoint_token: Some(format!("token-{counter}")),
                         updated_operations: ops,
                         next_marker: None,
                     })
@@ -561,7 +835,7 @@ impl ExecutionClient for InMemoryExecutionClient {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     *counter += 1;
                     Ok(CheckpointOutput {
-                        checkpoint_token: format!("token-{counter}"),
+                        checkpoint_token: Some(format!("token-{counter}")),
                         updated_operations: ops,
                         next_marker: Some(marker),
                     })
@@ -573,7 +847,7 @@ impl ExecutionClient for InMemoryExecutionClient {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     *counter += 1;
                     Ok(CheckpointOutput {
-                        checkpoint_token: format!("token-{counter}"),
+                        checkpoint_token: Some(format!("token-{counter}")),
                         updated_operations: auto_ops,
                         next_marker: None,
                     })
@@ -586,7 +860,9 @@ impl ExecutionClient for InMemoryExecutionClient {
         &self,
         _execution_arn: &str,
         _checkpoint_token: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>> {
+        _marker: Option<&str>,
+    ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+    {
         {
             let mut count = self
                 .get_state_call_count
@@ -601,7 +877,7 @@ impl ExecutionClient for InMemoryExecutionClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(message) = failure {
-            return Box::pin(async move { Err(ClientError::non_retryable(message)) });
+            return Box::pin(async move { Err(ExecutionClientError::non_retryable(message)) });
         }
 
         let ops = self
@@ -610,7 +886,7 @@ impl ExecutionClient for InMemoryExecutionClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
-        Box::pin(async move { Ok(GetStateOutput { operations: ops }) })
+        Box::pin(async move { Ok(GetStateOutput::new(ops, None)) })
     }
 }
 
@@ -723,7 +999,8 @@ pub(crate) fn merge_operations_into_log(log: &CheckpointLog, operations: &[Opera
 /// This is the single production decision point for bootstrap pagination:
 /// when the initial execution state carried a `NextMarker`, the inline
 /// first page is incomplete, so the complete state is fetched through
-/// [`ExecutionClient::get_state`] (which follows markers until exhausted).
+/// [`get_full_state`], which follows the markers of
+/// [`ExecutionClient::get_state`] until they are exhausted.
 /// Without a marker the inline page already holds the full history and is
 /// used as-is. Both `run`/`wrap` and the `test-util` `LocalRunner` call
 /// this helper, so tests exercise exactly the code production runs.
@@ -733,12 +1010,12 @@ pub(crate) async fn resolve_bootstrap_log(
     checkpoint_token: &str,
     first_page: CheckpointLog,
     next_marker: Option<&str>,
-) -> Result<CheckpointLog, ClientError> {
+) -> Result<CheckpointLog, ExecutionClientError> {
     if next_marker.is_none() {
         return Ok(first_page);
     }
-    let full_state = client.get_state(execution_arn, checkpoint_token).await?;
-    Ok(operations_to_checkpoint_log(&full_state.operations))
+    let operations = get_full_state(client, execution_arn, checkpoint_token).await?;
+    Ok(operations_to_checkpoint_log(&operations))
 }
 
 /// Maps SDK `OperationStatus` to internal `CheckpointStatus`.
@@ -865,7 +1142,7 @@ mod tests {
     // These tests mock the Lambda SDK client at the HTTP layer and pin the
     // per-operation request mapping of `LambdaExecutionClient`: what the
     // client puts on the wire, how it maps responses back, and how the
-    // final error (after the SDK's own retry) maps into `ClientError`.
+    // final error (after the SDK's own retry) maps into `ExecutionClientError`.
 
     use aws_sdk_lambda::operation::checkpoint_durable_execution::{
         CheckpointDurableExecutionError, CheckpointDurableExecutionOutput,
@@ -922,7 +1199,7 @@ mod tests {
             .await
             .expect("mocked checkpoint succeeds");
 
-        assert_eq!(output.checkpoint_token, "tok-out");
+        assert_eq!(output.checkpoint_token(), Some("tok-out"));
         assert_eq!(output.updated_operations.len(), 1);
         assert_eq!(
             output.updated_operations.first().map(Operation::id),
@@ -932,21 +1209,166 @@ mod tests {
         assert_eq!(rule.num_calls(), 1);
     }
 
-    /// A checkpoint response without a token is a protocol violation and
-    /// maps to a non-retryable `ClientError`.
+    /// The wire ID of the first root operation: the SHA-256 of `"1"`.
+    const FIRST_ROOT_WIRE_ID: &str =
+        "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b";
+
+    /// Drives `wrap` over `sdk_client` with a one-step handler whose step
+    /// the initial state already records as `STARTED`, so the step writes
+    /// no START and its first request is its SUCCEED. Returns the response.
+    async fn invoke_started_step(sdk_client: aws_sdk_lambda::Client) -> serde_json::Value {
+        let service = crate::wrap(
+            |_event: serde_json::Value, ctx: crate::DurableContext| async move {
+                let value: u32 = ctx.step(|_| async { Ok(7_u32) }).name("one").await?;
+                Ok::<u32, crate::BoxError>(value)
+            },
+            crate::Options::builder()
+                .execution_client(Arc::new(LambdaExecutionClient::new(sdk_client)))
+                .build()
+                .expect("options build"),
+        );
+        let event = lambda_runtime::LambdaEvent::new(
+            crate::InvocationPayload(serde_json::json!({
+                "DurableExecutionArn": "arn:aws:lambda:us-east-1:1:function:test",
+                "CheckpointToken": "token-abc",
+                "InitialExecutionState": {
+                    "Operations": [
+                        {
+                            "Id": "root",
+                            "Type": "Execution",
+                            "Status": "STARTED",
+                            "ExecutionDetails": { "InputPayload": "{}" }
+                        },
+                        {
+                            "Id": FIRST_ROOT_WIRE_ID,
+                            "Type": "Step",
+                            "SubType": "Step",
+                            "Name": "one",
+                            "Status": "STARTED",
+                            "StepDetails": { "Attempt": 1 }
+                        }
+                    ]
+                }
+            })),
+            lambda_runtime::Context::default(),
+        );
+        service(event)
+            .await
+            .map(|response| response.0)
+            .expect("a tokenless response fails the execution, not the invocation")
+    }
+
+    /// Every mocked checkpoint response has no `CheckpointToken`. The
+    /// transport reports `None`, and `DurableContext` maps it to the
+    /// non-retryable error the transport returned before, which fails the
+    /// execution after the step's terminal `FAIL`.
     #[tokio::test]
-    async fn checkpoint_without_token_is_non_retryable() {
+    async fn checkpoint_output_without_token_is_non_retryable_until_withdrawal_lands() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
             .then_output(|| CheckpointDurableExecutionOutput::builder().build());
-        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
-        let client = LambdaExecutionClient::new(sdk_client);
+        let client = LambdaExecutionClient::new(mock_client!(aws_sdk_lambda, [&rule]));
+        let output = client
+            .checkpoint("arn:test", "tok", Vec::new())
+            .await
+            .expect("a tokenless response is Ok");
+        assert_eq!(output.checkpoint_token(), None);
 
+        // Capture each request's updates, so the terminal FAIL can be read
+        // from the second request.
+        let requests: Arc<StdMutex<Vec<Vec<OperationUpdate>>>> = Arc::default();
+        let seen = Arc::clone(&requests);
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
+            .match_requests(move |req| {
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(req.updates().to_vec());
+                true
+            })
+            .then_output(|| CheckpointDurableExecutionOutput::builder().build());
+        let response =
+            invoke_started_step(mock_client!(aws_sdk_lambda, RuleMode::MatchAny, [&rule])).await;
+
+        assert_eq!(
+            response.get("Status").and_then(serde_json::Value::as_str),
+            Some("FAILED"),
+            "unexpected response: {response}"
+        );
+        let error = response
+            .get("Error")
+            .expect("a FAILED envelope has an Error");
+        assert_eq!(
+            error.get("ErrorType").and_then(serde_json::Value::as_str),
+            Some("CheckpointUnrecoverableExecutionError")
+        );
+        assert_eq!(
+            error
+                .get("ErrorMessage")
+                .and_then(serde_json::Value::as_str),
+            Some(
+                "[Unrecoverable Execution] Checkpoint failed: backend returned no checkpoint token"
+            )
+        );
+
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let fail = requests
+            .get(1)
+            .and_then(|second| second.iter().find(|u| u.action() == &OperationAction::Fail))
+            .expect("the second request carries the step's terminal FAIL");
+        assert_eq!(fail.id(), FIRST_ROOT_WIRE_ID);
+        assert_eq!(fail.r#type(), &OperationType::Step);
+        assert_eq!(
+            fail.error().and_then(|e| e.error_type()),
+            Some(crate::error::CHECKPOINT_FAILED_ERROR_TYPE)
+        );
+    }
+
+    /// `ExecutionClientError::new` keeps the scope and the message, has no
+    /// source, and `is_retryable` derives from the scope.
+    #[test]
+    fn execution_client_error_new_keeps_scope_and_message() {
+        use std::error::Error as _;
+
+        let err = ExecutionClientError::new(ExecutionClientErrorScope::Execution, "x");
+        assert_eq!(err.scope(), ExecutionClientErrorScope::Execution);
+        assert!(!err.is_retryable());
+        assert!(err.source().is_none());
+        assert_eq!(err.to_string(), "durable: client: x");
+
+        let err = ExecutionClientError::new(ExecutionClientErrorScope::Invocation, "x");
+        assert_eq!(err.scope(), ExecutionClientErrorScope::Invocation);
+        assert!(err.is_retryable());
+    }
+
+    /// The Lambda transport keeps the final `SdkError` as the source, and
+    /// keeps today's `DisplayErrorContext` text as the message.
+    #[tokio::test]
+    async fn lambda_transport_error_source_downcasts_to_sdk_error() {
+        use std::error::Error as _;
+
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
+            .sequence()
+            .http_status(403, None)
+            .build();
+        let client = LambdaExecutionClient::new(mock_client!(aws_sdk_lambda, [&rule]));
         let err = client
             .checkpoint("arn:test", "tok", Vec::new())
             .await
-            .expect_err("missing token must fail");
-        assert!(!err.is_retryable());
-        assert!(err.to_string().contains("no checkpoint token"));
+            .expect_err("a 403 fails the call");
+
+        let source = err.source().expect("the transport keeps the SdkError");
+        let sdk = source
+            .downcast_ref::<CheckpointSdkError>()
+            .expect("the source is the final SdkError");
+        let text = format!("{}", aws_sdk_lambda::error::DisplayErrorContext(sdk));
+        assert_eq!(err.message(), text);
+        assert_eq!(format!("{err:#}"), format!("durable: client: {text}"));
+        assert_eq!(err.scope(), ExecutionClientErrorScope::Execution);
     }
 
     /// A checkpoint call whose final outcome is a modeled parameter
@@ -1001,7 +1423,7 @@ mod tests {
     /// nothing else: a persistent 503 is attempted exactly the SDK's
     /// default 3 times, not 9, which the deleted hand-rolled outer loop
     /// used to multiply it to, and the exhausted call maps to a retryable
-    /// `ClientError`.
+    /// `ExecutionClientError`.
     #[tokio::test]
     async fn checkpoint_retry_is_the_sdk_standard_retry_alone() {
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
@@ -1024,52 +1446,219 @@ mod tests {
         );
     }
 
-    /// `get_state` maps ARN and token onto the request, sends no marker on
-    /// the first page, echoes the response's `next_marker` as the next
-    /// request's `marker`, and concatenates the pages in order.
+    /// `get_state` sends one request with the given marker and `MaxItems`
+    /// 1000, and returns that page and its `NextMarker`.
     #[tokio::test]
-    async fn get_state_paginates_with_marker() {
-        let first_page = mock!(aws_sdk_lambda::Client::get_durable_execution_state)
+    async fn get_state_returns_one_page_with_marker() {
+        let rule = mock!(aws_sdk_lambda::Client::get_durable_execution_state)
             .match_requests(|req| {
                 req.durable_execution_arn() == Some("arn:test")
                     && req.checkpoint_token() == Some("tok")
-                    && req.marker().is_none()
+                    && req.marker() == Some("m-1")
+                    && req.max_items() == Some(1000)
             })
             .then_output(|| {
                 GetDurableExecutionStateOutput::builder()
                     .operations(make_step_op("op-1", r#""p1""#))
-                    .next_marker("page-2")
-                    .build()
-                    .expect("operations is set")
-            });
-        let second_page = mock!(aws_sdk_lambda::Client::get_durable_execution_state)
-            .match_requests(|req| req.marker() == Some("page-2"))
-            .then_output(|| {
-                GetDurableExecutionStateOutput::builder()
                     .operations(make_step_op("op-2", r#""p2""#))
+                    .next_marker("m-2")
                     .build()
                     .expect("operations is set")
             });
-        let sdk_client = mock_client!(
-            aws_sdk_lambda,
-            RuleMode::Sequential,
-            [&first_page, &second_page]
-        );
+        let sdk_client = mock_client!(aws_sdk_lambda, [&rule]);
         let client = LambdaExecutionClient::new(sdk_client);
 
-        let state = client
-            .get_state("arn:test", "tok")
+        let page = client
+            .get_state("arn:test", "tok", Some("m-1"))
             .await
-            .expect("paginated get_state succeeds");
+            .expect("get_state succeeds");
 
-        assert_eq!(state.operations.len(), 2);
-        assert_eq!(state.operations.first().map(Operation::id), Some("op-1"));
-        assert_eq!(state.operations.get(1).map(Operation::id), Some("op-2"));
-        assert_eq!(first_page.num_calls(), 1);
-        assert_eq!(second_page.num_calls(), 1);
+        assert_eq!(rule.num_calls(), 1);
+        assert_eq!(page.operations.len(), 2);
+        assert_eq!(page.operations.first().map(Operation::id), Some("op-1"));
+        assert_eq!(page.operations.get(1).map(Operation::id), Some("op-2"));
+        assert_eq!(page.next_marker(), Some("m-2"));
     }
 
-    /// A `get_state` failure maps into a retryable `ClientError` exactly
+    /// A transport that returns three pages, the last without a marker,
+    /// and records the marker of every call.
+    struct ThreePageClient {
+        markers: Mutex<Vec<Option<String>>>,
+    }
+
+    impl ExecutionClient for ThreePageClient {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _updates: Vec<OperationUpdate>,
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(CheckpointOutput::new(Some("t".to_owned()), vec![], None)) })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            marker: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
+            self.markers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(marker.map(str::to_owned));
+            let page = match marker {
+                None => GetStateOutput::new(vec![make_step_op("a", "1")], Some("p-2".to_owned())),
+                Some("p-2") => {
+                    GetStateOutput::new(vec![make_step_op("b", "2")], Some("p-3".to_owned()))
+                }
+                Some(_) => GetStateOutput::new(vec![make_step_op("c", "3")], None),
+            };
+            Box::pin(async move { Ok(page) })
+        }
+    }
+
+    /// The whole-state helper follows each marker until the last page and
+    /// concatenates the pages in order.
+    #[tokio::test]
+    async fn sdk_loops_get_state_until_marker_empty() {
+        let client = ThreePageClient {
+            markers: Mutex::new(Vec::new()),
+        };
+        let operations = get_full_state(&client, "arn:test", "tok")
+            .await
+            .expect("whole state");
+
+        let ids: Vec<&str> = operations.iter().map(Operation::id).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        let markers = client
+            .markers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            markers,
+            [None, Some("p-2".to_owned()), Some("p-3".to_owned())]
+        );
+    }
+
+    /// The accessors of a transport's output read an empty token or an
+    /// empty marker as `None`, so a custom transport that passes the
+    /// service's empty string through behaves like an absent value.
+    #[test]
+    fn output_accessors_read_empty_values_as_none() {
+        let output = CheckpointOutput::new(Some(String::new()), vec![], None);
+        assert_eq!(output.checkpoint_token(), None);
+        let page = GetStateOutput::new(vec![], Some(String::new()));
+        assert_eq!(page.next_marker(), None);
+    }
+
+    /// A transport whose first page carries an empty marker.
+    struct EmptyMarkerClient {
+        calls: Mutex<u32>,
+    }
+
+    impl ExecutionClient for EmptyMarkerClient {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _updates: Vec<OperationUpdate>,
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(CheckpointOutput::new(Some("t".to_owned()), vec![], None)) })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _marker: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            let page = GetStateOutput::new(vec![make_step_op("a", "1")], Some(String::new()));
+            Box::pin(async move { Ok(page) })
+        }
+    }
+
+    /// The whole-state helper treats an empty marker as the last page: it
+    /// makes one call and returns that page.
+    #[tokio::test]
+    async fn sdk_stops_paginating_on_empty_marker() {
+        let client = EmptyMarkerClient {
+            calls: Mutex::new(0),
+        };
+        let operations = get_full_state(&client, "arn:test", "tok")
+            .await
+            .expect("whole state");
+
+        let ids: Vec<&str> = operations.iter().map(Operation::id).collect();
+        assert_eq!(ids, ["a"]);
+        assert_eq!(
+            *client
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            1
+        );
+    }
+
+    /// `checkpoint` stores an empty `CheckpointToken` and an empty
+    /// `NextMarker` as `None`. `DurableContext` reads the marker field
+    /// directly to decide whether to paginate, so the transport itself must
+    /// normalize it.
+    #[tokio::test]
+    async fn checkpoint_maps_empty_token_and_marker_to_none() {
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution).then_output(|| {
+            CheckpointDurableExecutionOutput::builder()
+                .checkpoint_token("")
+                .new_execution_state(
+                    CheckpointUpdatedExecutionState::builder()
+                        .operations(make_step_op("op-1", r#""r1""#))
+                        .next_marker("")
+                        .build(),
+                )
+                .build()
+        });
+        let client = LambdaExecutionClient::new(mock_client!(aws_sdk_lambda, [&rule]));
+
+        let output = client
+            .checkpoint("arn:test", "tok", Vec::new())
+            .await
+            .expect("mocked checkpoint succeeds");
+
+        assert_eq!(output.checkpoint_token, None);
+        assert_eq!(output.next_marker, None);
+        assert_eq!(output.updated_operations.len(), 1);
+    }
+
+    /// `get_state` stores an empty `NextMarker` as `None`.
+    #[tokio::test]
+    async fn get_state_maps_empty_marker_to_none() {
+        let rule = mock!(aws_sdk_lambda::Client::get_durable_execution_state).then_output(|| {
+            GetDurableExecutionStateOutput::builder()
+                .operations(make_step_op("op-1", r#""p1""#))
+                .next_marker("")
+                .build()
+                .expect("operations is set")
+        });
+        let client = LambdaExecutionClient::new(mock_client!(aws_sdk_lambda, [&rule]));
+
+        let page = client
+            .get_state("arn:test", "tok", None)
+            .await
+            .expect("get_state succeeds");
+
+        assert_eq!(page.next_marker, None);
+        assert_eq!(page.operations.len(), 1);
+    }
+
+    /// A `get_state` failure maps into a retryable `ExecutionClientError` exactly
     /// like a checkpoint failure.
     #[tokio::test]
     async fn get_state_final_error_maps_to_retryable_client_error() {
@@ -1082,7 +1671,7 @@ mod tests {
         let client = LambdaExecutionClient::new(sdk_client);
 
         let err = client
-            .get_state("arn:test", "tok")
+            .get_state("arn:test", "tok", None)
             .await
             .expect_err("modeled error must fail the call");
         assert!(err.is_retryable());
@@ -1159,7 +1748,7 @@ mod tests {
             let client = LambdaExecutionClient::new(sdk_client);
 
             let err = client
-                .get_state("arn:test", "tok")
+                .get_state("arn:test", "tok", None)
                 .await
                 .expect_err("a KMS error must fail the call");
             assert!(!err.is_retryable(), "{wire_name} must be non-retryable");
@@ -1183,7 +1772,7 @@ mod tests {
         let client = LambdaExecutionClient::new(sdk_client);
 
         let err = client
-            .get_state("arn:test", "tok")
+            .get_state("arn:test", "tok", None)
             .await
             .expect_err("a 403 must fail the call");
         assert!(err.is_retryable());
@@ -1223,7 +1812,11 @@ mod tests {
 
         assert!(result.is_ok());
         let output = result.unwrap();
-        assert!(output.checkpoint_token.starts_with("token-"));
+        assert!(
+            output
+                .checkpoint_token()
+                .is_some_and(|t| t.starts_with("token-"))
+        );
     }
 
     // Checkpoint log population
@@ -1441,7 +2034,7 @@ mod tests {
         ];
 
         let client = InMemoryExecutionClient::new(ops);
-        let result = client.get_state("arn:test", "token-0").await;
+        let result = client.get_state("arn:test", "token-0", None).await;
 
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -1561,7 +2154,7 @@ mod tests {
         ];
         let client = InMemoryExecutionClient::new(ops);
 
-        let state = client.get_state("arn:test", "token-0").await;
+        let state = client.get_state("arn:test", "token-0", None).await;
         assert!(state.is_ok());
         let state = state.unwrap();
         assert_eq!(state.operations.len(), 3);
@@ -1593,7 +2186,13 @@ mod tests {
         assert_eq!(output.next_marker, Some("marker-page-2".to_owned()));
 
         // Caller should then call get_state to get all operations.
-        let full_state = client.get_state("arn:test", &output.checkpoint_token).await;
+        let full_state = client
+            .get_state(
+                "arn:test",
+                output.checkpoint_token().unwrap_or_default(),
+                None,
+            )
+            .await;
         assert!(full_state.is_ok());
         let full_state = full_state.unwrap();
         assert_eq!(full_state.operations.len(), 3);
@@ -1641,8 +2240,8 @@ mod tests {
     }
 
     /// Classifies `err` as a service error whose raw response has `status`.
-    fn classify<E: Into<CkptErr>>(err: E, status: u16) -> ClientError {
-        classify_checkpoint_error(&SdkError::service_error(err.into(), raw_response(status)))
+    fn classify<E: Into<CkptErr>>(err: E, status: u16) -> ExecutionClientError {
+        classify_checkpoint_error(SdkError::service_error(err.into(), raw_response(status)))
     }
 
     fn invalid_parameter(message: Option<&str>) -> CkptErr {
@@ -1755,7 +2354,7 @@ mod tests {
     fn response_error_4xx_classifies_non_retryable() {
         let err: SdkError<CkptErr, HttpResponse> =
             SdkError::response_error("unparseable body", raw_response(403));
-        assert!(!classify_checkpoint_error(&err).is_retryable());
+        assert!(!classify_checkpoint_error(err).is_retryable());
     }
 
     /// An unparseable 200 response is a channel fault, not a rejection.
@@ -1763,13 +2362,13 @@ mod tests {
     fn response_error_200_classifies_retryable() {
         let err: SdkError<CkptErr, HttpResponse> =
             SdkError::response_error("unparseable body", raw_response(200));
-        assert!(classify_checkpoint_error(&err).is_retryable());
+        assert!(classify_checkpoint_error(err).is_retryable());
     }
 
     #[test]
     fn transport_failures_classify_retryable() {
         let timeout: SdkError<CkptErr, HttpResponse> = SdkError::timeout_error("connect timed out");
-        assert!(classify_checkpoint_error(&timeout).is_retryable());
+        assert!(classify_checkpoint_error(timeout).is_retryable());
     }
 
     /// Canary: pins the variant set of `CheckpointDurableExecutionError`,

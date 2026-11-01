@@ -47,6 +47,28 @@ allowed_external_types = [
     # client (both re-exported from the crate root; see #38).
     "aws_types::sdk_config::SdkConfig",
     "aws_sdk_lambda::client::Client",
+    # The public transport trait (`ExecutionClient`) speaks these service
+    # model types, re-exported from `lambda_types`: the types `Operation`
+    # and `OperationUpdate` name in their fields, and their `DateTime`.
+    # Each entry is the defining path the check reports.
+    "aws_sdk_lambda::types::_callback_details::CallbackDetails",
+    "aws_sdk_lambda::types::_callback_options::CallbackOptions",
+    "aws_sdk_lambda::types::_chained_invoke_details::ChainedInvokeDetails",
+    "aws_sdk_lambda::types::_chained_invoke_options::ChainedInvokeOptions",
+    "aws_sdk_lambda::types::_context_details::ContextDetails",
+    "aws_sdk_lambda::types::_context_options::ContextOptions",
+    "aws_sdk_lambda::types::_error_object::ErrorObject",
+    "aws_sdk_lambda::types::_execution_details::ExecutionDetails",
+    "aws_sdk_lambda::types::_operation::Operation",
+    "aws_sdk_lambda::types::_operation_action::OperationAction",
+    "aws_sdk_lambda::types::_operation_status::OperationStatus",
+    "aws_sdk_lambda::types::_operation_type::OperationType",
+    "aws_sdk_lambda::types::_operation_update::OperationUpdate",
+    "aws_sdk_lambda::types::_step_details::StepDetails",
+    "aws_sdk_lambda::types::_step_options::StepOptions",
+    "aws_sdk_lambda::types::_wait_details::WaitDetails",
+    "aws_sdk_lambda::types::_wait_options::WaitOptions",
+    "aws_smithy_types::date_time::DateTime",
     # The `replay-filter` feature exists to implement tracing-subscriber's
     # `Filter` trait, which necessarily names these types in the impl.
     "tracing_subscriber::layer::Filter",

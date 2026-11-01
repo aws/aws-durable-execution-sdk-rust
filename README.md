@@ -213,6 +213,38 @@ records which branch won. And when an execution suspends, the SDK drops your
 handler future, so never make correctness between operations depend on `Drop`
 order.
 
+### Replacing the transport
+
+The SDK makes two durable execution service calls: it checkpoints
+operation updates, and it reads the execution state one page at a time.
+By default it makes them through `LambdaExecutionClient`, which wraps an
+`aws-sdk-lambda` client. Implement the `ExecutionClient` trait to send
+them somewhere else, for example to another compute platform or to a test
+fake, and pass it to `OptionsBuilder::execution_client`. The trait speaks
+the service model types that `durable::lambda_types` re-exports.
+
+A transport returns an `ExecutionClientError` with one of two scopes.
+`ExecutionClientErrorScope::Invocation` fails the invocation, so the
+service invokes the function again and replay resumes.
+`ExecutionClientErrorScope::Execution` fails the execution. Transient
+retry is the transport's job: the SDK treats every error as final for the
+invocation.
+
+`execution_client` replaces the Lambda transport, so `build()` rejects it
+together with `lambda_client` or `sdk_config`. To decorate the default
+transport, for example to add metrics, build it with
+`LambdaExecutionClient::new` and wrap it in your own `ExecutionClient`.
+
+```rust ignore
+let client = durable::LambdaClient::new(&sdk_config);
+let transport = MeteredTransport::new(durable::LambdaExecutionClient::new(client));
+
+let options = durable::Options::builder()
+    .execution_client(std::sync::Arc::new(transport))
+    .build()?;
+durable::wrap(handler, options);
+```
+
 ## Operations
 
 | Operation | Behavior |

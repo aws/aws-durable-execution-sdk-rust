@@ -117,6 +117,10 @@ pub use self::tracing_layer::ReplayFilterLayer;
 #[cfg(all(test, not(feature = "replay-filter")))]
 pub use self::tracing_layer::ReplayFilterLayer;
 
+pub use self::client::{
+    CheckpointOutput, ExecutionClient, ExecutionClientError, ExecutionClientErrorScope,
+    GetStateOutput, LambdaExecutionClient,
+};
 pub use self::context::{DurableContext, StepContext};
 pub use self::error::{
     CallbackError, CallbackErrorKind, ChildContextError, ChildContextErrorKind, CombinatorError,
@@ -135,6 +139,32 @@ pub use self::step::StepSemantics;
 pub use aws_config::SdkConfig;
 pub use aws_sdk_lambda::Client as LambdaClient;
 pub use lambda_runtime::{self, Context as LambdaContext};
+
+/// The service model types of the checkpoint transport.
+///
+/// [`ExecutionClient`] speaks the service model types of `aws-sdk-lambda`
+/// on purpose: the SDK already depends on that crate, and a transport for
+/// another backend builds the same records the service returns. This
+/// module re-exports exactly the types that [`Operation`] and
+/// [`OperationUpdate`] name in their fields, directly or nested, and
+/// [`DateTime`], the type of their timestamp fields.
+///
+/// These types are those of the `aws-sdk-lambda` release this crate
+/// depends on. They change when the crate moves to a new `aws-sdk-lambda`
+/// release.
+///
+/// [`Operation`]: lambda_types::Operation
+/// [`OperationUpdate`]: lambda_types::OperationUpdate
+/// [`DateTime`]: lambda_types::DateTime
+pub mod lambda_types {
+    pub use aws_sdk_lambda::primitives::DateTime;
+    pub use aws_sdk_lambda::types::{
+        CallbackDetails, CallbackOptions, ChainedInvokeDetails, ChainedInvokeOptions,
+        ContextDetails, ContextOptions, ErrorObject, ExecutionDetails, Operation, OperationAction,
+        OperationStatus, OperationType, OperationUpdate, StepDetails, StepOptions, WaitDetails,
+        WaitOptions,
+    };
+}
 
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -813,6 +843,7 @@ where
     let Options {
         sdk_config,
         lambda_client,
+        execution_client,
         checkpoint_delay,
         checkpoint_batching,
     } = options;
@@ -825,11 +856,12 @@ where
         (None, true) => Some(std::time::Duration::ZERO),
         (None, false) => None,
     };
-    let preset_client: Option<StdArc<dyn client::ExecutionClient>> =
-        base_lambda_client_from_options(sdk_config, lambda_client).map(|c| {
-            StdArc::new(client::LambdaExecutionClient::new(c))
-                as StdArc<dyn client::ExecutionClient>
-        });
+    // A supplied transport replaces the Lambda transport; `build()` already
+    // rejected it together with `lambda_client` or `sdk_config`.
+    let preset_client: Option<StdArc<dyn ExecutionClient>> = execution_client.or_else(|| {
+        base_lambda_client_from_options(sdk_config, lambda_client)
+            .map(|c| StdArc::new(LambdaExecutionClient::new(c)) as StdArc<dyn ExecutionClient>)
+    });
     wrap_with_provider(
         handler,
         ClientProvider::new(preset_client),
@@ -851,7 +883,7 @@ where
 #[cfg(feature = "test-util")]
 pub(crate) fn wrap_with_execution_client<F, E, Fut, O>(
     handler: F,
-    exec_client: std::sync::Arc<dyn client::ExecutionClient>,
+    exec_client: std::sync::Arc<dyn ExecutionClient>,
     checkpoint_buffer_window: Option<std::time::Duration>,
 ) -> impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture + Send + Sync
 where
@@ -941,8 +973,8 @@ where
                 }
                 Err(e) => {
                     return Ok(failed_envelope(&WireError::new(
-                        Some(error::EXECUTION_CLIENT_ERROR_TYPE),
-                        Some(e.message().to_owned()),
+                        Some(client::bootstrap_error_type(&e)),
+                        Some(client::client_error_record_message(&e)),
                     )));
                 }
             };
@@ -1109,7 +1141,7 @@ async fn flush_failure_response(
     let failed = match outcome {
         driver::InvocationOutcome::Failed { .. } => outcome,
         _ => driver::InvocationOutcome::Failed {
-            error: error::checkpoint_failure_wire(error),
+            error: error::checkpoint_execution_failure_wire(error),
         },
     };
     outcome_envelope(failed, ctx)
@@ -1216,14 +1248,14 @@ pub(crate) fn base_lambda_client_from_options(
 /// is loaded lazily on the first invocation and the resulting client is
 /// cached, so no per-invocation client construction or config load occurs.
 pub(crate) struct ClientProvider {
-    preset: Option<std::sync::Arc<dyn client::ExecutionClient>>,
-    default_cell: tokio::sync::OnceCell<std::sync::Arc<dyn client::ExecutionClient>>,
+    preset: Option<std::sync::Arc<dyn ExecutionClient>>,
+    default_cell: tokio::sync::OnceCell<std::sync::Arc<dyn ExecutionClient>>,
 }
 
 impl ClientProvider {
     /// Creates a provider. `preset` is the client resolved from `Options`, or
     /// `None` to defer to the ambient default on first use.
-    pub(crate) fn new(preset: Option<std::sync::Arc<dyn client::ExecutionClient>>) -> Self {
+    pub(crate) fn new(preset: Option<std::sync::Arc<dyn ExecutionClient>>) -> Self {
         Self {
             preset,
             default_cell: tokio::sync::OnceCell::new(),
@@ -1232,7 +1264,7 @@ impl ClientProvider {
 
     /// Returns the shared execution client, building the ambient-default one
     /// exactly once when no client was preset.
-    pub(crate) async fn get(&self) -> std::sync::Arc<dyn client::ExecutionClient> {
+    pub(crate) async fn get(&self) -> std::sync::Arc<dyn ExecutionClient> {
         use std::sync::Arc as StdArc;
         if let Some(preset) = &self.preset {
             return StdArc::clone(preset);
@@ -1243,8 +1275,8 @@ impl ClientProvider {
                 let aws_config =
                     aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
-                StdArc::new(client::LambdaExecutionClient::new(lambda_client))
-                    as StdArc<dyn client::ExecutionClient>
+                StdArc::new(LambdaExecutionClient::new(lambda_client))
+                    as StdArc<dyn ExecutionClient>
             })
             .await;
         StdArc::clone(client)
@@ -1471,6 +1503,21 @@ mod tests {
     async fn invoke_paginated(
         sdk_client: aws_sdk_lambda::Client,
     ) -> (Result<serde_json::Value, lambda_runtime::Error>, bool) {
+        invoke_paginated_with(
+            Options::builder()
+                .lambda_client(sdk_client)
+                .build()
+                .expect("options build"),
+        )
+        .await
+    }
+
+    /// Invokes a `wrap` service built from `options` with
+    /// [`paginated_envelope`]. Returns the result and whether the handler
+    /// ran.
+    async fn invoke_paginated_with(
+        options: Options,
+    ) -> (Result<serde_json::Value, lambda_runtime::Error>, bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let ran = std::sync::Arc::new(AtomicBool::new(false));
@@ -1480,10 +1527,7 @@ mod tests {
                 handler_ran.store(true, Ordering::SeqCst);
                 async move { Ok::<(), BoxError>(()) }
             },
-            Options::builder()
-                .lambda_client(sdk_client)
-                .build()
-                .expect("options build"),
+            options,
         );
         let event = lambda_runtime::LambdaEvent::new(
             InvocationPayload(paginated_envelope()),
@@ -1497,16 +1541,12 @@ mod tests {
     /// `FAILED` envelope, as in JS, and the handler does not run.
     #[tokio::test]
     async fn bootstrap_kms_error_returns_failed_envelope() {
-        use aws_sdk_lambda::operation::get_durable_execution_state::GetDurableExecutionStateError;
         use aws_smithy_mocks::{mock, mock_client};
 
-        let rule = mock!(aws_sdk_lambda::Client::get_durable_execution_state).then_error(|| {
-            GetDurableExecutionStateError::KmsAccessDeniedException(
-                aws_sdk_lambda::types::error::KmsAccessDeniedException::builder()
-                    .message("kms denied")
-                    .build(),
-            )
-        });
+        let rule =
+            mock!(aws_sdk_lambda::Client::get_durable_execution_state).then_http_response(|| {
+                client::mock_aws_error_response(400, "KMSAccessDeniedException", "kms denied")
+            });
         let (result, ran) = invoke_paginated(mock_client!(aws_sdk_lambda, [&rule])).await;
 
         let response = result.expect("a KMS error returns an envelope");
@@ -1520,15 +1560,130 @@ mod tests {
             .expect("a FAILED envelope has an Error");
         assert_eq!(
             error.get("ErrorType").and_then(serde_json::Value::as_str),
-            Some("DurableExecutionClientError")
+            Some("KMSAccessDeniedException")
         );
-        let message = error
-            .get("ErrorMessage")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        assert!(message.contains("KMSAccessDeniedException"), "{message}");
-        assert!(!message.starts_with("durable: client: "), "{message}");
+        assert_eq!(
+            error
+                .get("ErrorMessage")
+                .and_then(serde_json::Value::as_str),
+            Some("kms denied")
+        );
         assert!(!ran, "the handler must not run");
+    }
+
+    /// The KMS scenario through the public `LambdaExecutionClient` passed as
+    /// `execution_client`: the `FAILED` record carries the AWS error code
+    /// and the service's message, read from the `SdkError` source.
+    #[tokio::test]
+    async fn bootstrap_kms_error_records_aws_error_code() {
+        use aws_smithy_mocks::{mock, mock_client};
+
+        let rule =
+            mock!(aws_sdk_lambda::Client::get_durable_execution_state).then_http_response(|| {
+                client::mock_aws_error_response(400, "KMSAccessDeniedException", "kms denied")
+            });
+        let client = mock_client!(aws_sdk_lambda, [&rule]);
+        let (result, ran) = invoke_paginated_with(
+            Options::builder()
+                .execution_client(std::sync::Arc::new(LambdaExecutionClient::new(client)))
+                .build()
+                .expect("options build"),
+        )
+        .await;
+
+        let response = result.expect("a KMS error returns an envelope");
+        assert_eq!(
+            response.get("Status").and_then(serde_json::Value::as_str),
+            Some("FAILED"),
+            "unexpected response: {response}"
+        );
+        let error = response
+            .get("Error")
+            .expect("a FAILED envelope has an Error");
+        assert_eq!(
+            error.get("ErrorType").and_then(serde_json::Value::as_str),
+            Some("KMSAccessDeniedException")
+        );
+        assert_eq!(
+            error
+                .get("ErrorMessage")
+                .and_then(serde_json::Value::as_str),
+            Some("kms denied")
+        );
+        assert!(!ran, "the handler must not run");
+    }
+
+    /// A non-retryable checkpoint rejection through the public
+    /// `LambdaExecutionClient` records the execution's error as
+    /// `CheckpointUnrecoverableExecutionError` with the service's message.
+    #[tokio::test]
+    async fn lambda_checkpoint_rejection_records_the_service_message() {
+        use aws_sdk_lambda::operation::checkpoint_durable_execution::CheckpointDurableExecutionOutput;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+        let rejected = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
+            .then_http_response(|| {
+                client::mock_aws_error_response(
+                    400,
+                    "InvalidParameterValueException",
+                    "bad payload",
+                )
+            });
+        let accepted =
+            mock!(aws_sdk_lambda::Client::checkpoint_durable_execution).then_output(|| {
+                CheckpointDurableExecutionOutput::builder()
+                    .checkpoint_token("tok-2")
+                    .build()
+            });
+        let client = mock_client!(aws_sdk_lambda, RuleMode::Sequential, [&rejected, &accepted]);
+        let service = wrap(
+            |_event: serde_json::Value, ctx: DurableContext| async move {
+                let value: u32 = ctx.step(|_| async { Ok(7_u32) }).name("one").await?;
+                Ok::<u32, BoxError>(value)
+            },
+            Options::builder()
+                .execution_client(std::sync::Arc::new(LambdaExecutionClient::new(client)))
+                .build()
+                .expect("options build"),
+        );
+        let event = lambda_runtime::LambdaEvent::new(
+            InvocationPayload(serde_json::json!({
+                "DurableExecutionArn": "arn:aws:lambda:us-east-1:1:function:test",
+                "CheckpointToken": "token-abc",
+                "InitialExecutionState": {
+                    "Operations": [{
+                        "Id": "root",
+                        "Type": "Execution",
+                        "Status": "STARTED",
+                        "ExecutionDetails": { "InputPayload": "{}" }
+                    }]
+                }
+            })),
+            lambda_runtime::Context::default(),
+        );
+        let response = service(event)
+            .await
+            .map(|response| response.0)
+            .expect("a rejected checkpoint returns an envelope");
+
+        assert_eq!(
+            response.get("Status").and_then(serde_json::Value::as_str),
+            Some("FAILED"),
+            "unexpected response: {response}"
+        );
+        let error = response
+            .get("Error")
+            .expect("a FAILED envelope has an Error");
+        assert_eq!(
+            error.get("ErrorType").and_then(serde_json::Value::as_str),
+            Some("CheckpointUnrecoverableExecutionError")
+        );
+        assert_eq!(
+            error
+                .get("ErrorMessage")
+                .and_then(serde_json::Value::as_str),
+            Some("[Unrecoverable Execution] Checkpoint failed: bad payload")
+        );
     }
 
     /// A retryable error on the bootstrap state read, a persistent 503 or a
@@ -1952,7 +2107,7 @@ mod tests {
         use crate::client::InMemoryExecutionClient;
         use std::sync::Arc as StdArc;
 
-        let preset: StdArc<dyn client::ExecutionClient> =
+        let preset: StdArc<dyn ExecutionClient> =
             StdArc::new(InMemoryExecutionClient::new(Vec::new()));
         let provider = ClientProvider::new(Some(StdArc::clone(&preset)));
 

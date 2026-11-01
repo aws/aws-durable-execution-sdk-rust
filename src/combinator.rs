@@ -1342,7 +1342,9 @@ mod tests {
 
     /// Helper to create a test context backed by a mock client (for live paths).
     fn test_ctx_with_client(log: CheckpointLog) -> DurableContext {
-        use crate::client::{CheckpointOutput, ClientError, ExecutionClient, GetStateOutput};
+        use crate::client::{
+            CheckpointOutput, ExecutionClient, ExecutionClientError, GetStateOutput,
+        };
         use std::future::Future;
         use std::pin::Pin;
 
@@ -1355,11 +1357,14 @@ mod tests {
                 _arn: &str,
                 _token: &str,
                 _updates: Vec<aws_sdk_lambda::types::OperationUpdate>,
-            ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ClientError>> + Send + '_>>
-            {
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_,
+                >,
+            > {
                 Box::pin(async {
                     Ok(CheckpointOutput {
-                        checkpoint_token: "token-2".to_owned(),
+                        checkpoint_token: Some("token-2".to_owned()),
                         updated_operations: vec![],
                         next_marker: None,
                     })
@@ -1370,9 +1375,11 @@ mod tests {
                 &self,
                 _arn: &str,
                 _token: &str,
-            ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ClientError>> + Send + '_>>
-            {
-                Box::pin(async { Ok(GetStateOutput { operations: vec![] }) })
+                _marker: Option<&str>,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(GetStateOutput::new(vec![], None)) })
             }
         }
 
