@@ -55,7 +55,8 @@ async fn plain_target_result_survives_replay() {
             },
             20_i32,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&41), "{:?}", result.error_message());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -91,7 +92,8 @@ async fn plain_target_typed_error_reaches_caller() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(
         result.output(),
@@ -125,7 +127,8 @@ async fn durable_target_runs_as_its_own_execution() {
             },
             1_u32,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&4), "{:?}", result.error_message());
     assert_eq!(result.invocation_count(), 2);
@@ -152,7 +155,8 @@ async fn suspended_durable_target_names_the_pending_invoke() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_suspended(), "{:?}", result.error_message());
     assert_eq!(
@@ -178,7 +182,8 @@ async fn unregistered_target_fails_the_run() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_failure(), "{:?}", result.error_message());
     let message = result.error_message().expect("a failure message");

@@ -4,6 +4,7 @@
 //! operation order across invocations and raises a clear error.
 
 #![cfg(feature = "test-util")]
+#![expect(clippy::expect_used)] // reason: test assertions
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -52,7 +53,8 @@ async fn reordered_steps_detected() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -100,7 +102,8 @@ async fn type_change_detected() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -144,7 +147,8 @@ async fn deterministic_handler_replays_successfully() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -193,7 +197,8 @@ async fn context_vs_step_type_mismatch_detected() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -234,7 +239,8 @@ async fn error_type_is_identifiable() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_failure());
     // The error type should be the concrete non-determinism error type.
@@ -290,7 +296,8 @@ async fn step_to_map_swap_detected() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -346,7 +353,8 @@ async fn removed_operation_detected() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -417,7 +425,8 @@ async fn join_all_mismatch_fails_execution() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -505,7 +514,8 @@ async fn select_ok_mismatch_fails_execution_despite_sibling_success() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -562,7 +572,7 @@ async fn tolerated_map_branch_mismatch_fails_execution() {
             },
             (),
         )
-        .await;
+        .await.expect("runner");
 
     assert!(
         result.is_failure(),
@@ -608,7 +618,8 @@ async fn handler_swallowed_mismatch_still_fails_execution() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -689,7 +700,8 @@ async fn select_ok_immediate_winner_still_detects_loser_mismatch() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -758,7 +770,8 @@ async fn race_immediate_winner_still_detects_loser_mismatch() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -816,7 +829,8 @@ async fn try_join_all_sibling_failure_still_detects_mismatch() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -877,7 +891,8 @@ async fn unpolled_dropped_future_mismatch_still_detected() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -924,7 +939,8 @@ async fn empty_map_item_name_replays_successfully() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -964,7 +980,8 @@ async fn empty_parallel_branch_name_replays_successfully() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),

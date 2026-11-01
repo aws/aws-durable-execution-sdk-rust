@@ -50,7 +50,8 @@ async fn race_between_waits_returns_the_shorter_wait() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     assert_eq!(result.output().map(String::as_str), Some("fast"));
@@ -99,7 +100,8 @@ async fn retry_delay_is_ordered_against_a_wait() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     assert_eq!(result.output().map(String::as_str), Some("waited"));
@@ -125,7 +127,8 @@ async fn queued_callback_reply_arrives_before_the_clock_moves() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     assert_eq!(result.output().map(String::as_str), Some("cb"));
@@ -153,10 +156,11 @@ async fn checkpoint_latency_delays_responses_and_changes_nothing_else() {
     let delayed = unbatched()
         .checkpoint_latency(latency)
         .run(one_step, ())
-        .await;
+        .await
+        .expect("runner");
     let elapsed = started.elapsed();
 
-    let baseline = unbatched().run(one_step, ()).await;
+    let baseline = unbatched().run(one_step, ()).await.expect("runner");
 
     assert!(delayed.is_success(), "{:?}", delayed.error_message());
     assert!(

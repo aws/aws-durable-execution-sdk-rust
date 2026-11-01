@@ -89,7 +89,8 @@ async fn failed_attempt_reruns_whole_block_with_fresh_namespace() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -196,7 +197,8 @@ async fn recorded_result_replays_across_invocations() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -264,7 +266,8 @@ async fn exhaustion_surfaces_last_error() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_failure(),
@@ -326,7 +329,8 @@ async fn retry_strategy_config_shapes_block_retries() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),

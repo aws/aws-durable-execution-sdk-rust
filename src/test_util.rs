@@ -81,25 +81,34 @@
 //!
 //! [`LocalRunner`] and [`CloudRunner`] return the same types, and a test can
 //! be re-pointed between them by swapping the runner. The two agree on
-//! operation type, status, result, error, [`TestOperation::attempt`] (both
-//! report completed retries), and success/failure disposition. A few
-//! behaviours still differ because one runner observes an in-memory model and
-//! the other observes the recorded execution history; assert around these
-//! when a test targets both runners:
+//! operation type, status, result, error, parent, [`StepDetails::attempt`]
+//! (both report completed retries), [`WaitDetails::duration`],
+//! [`CallbackDetails::callback_id`], and the [`ExecutionStatus`] of a
+//! succeeded or failed execution. A few behaviours still differ because one
+//! runner observes an in-memory model and the other observes the recorded
+//! execution history; assert around these when a test targets both runners:
 //!
 //! - **Truncated results.** When a result exceeds the recorded-history inline
 //!   size limit, [`CloudRunner`] reports [`TestOperation::result`] as `None`
 //!   (the payload is withheld); [`LocalRunner`] always holds the full
 //!   in-memory result.
-//! - **Timed-out / stopped executions.** [`CloudRunner`] maps a terminal
-//!   `TimedOut` or `Stopped` execution to [`TestResult::is_failure`] with the
-//!   status name (or the recorded error) as the error type; [`LocalRunner`]
-//!   has no execution-level timed-out or stopped disposition (it reports
-//!   success, failure, or suspended).
+//! - **Timed-out / stopped executions.** [`CloudRunner`] reports a terminal
+//!   `TimedOut` or `Stopped` execution as [`ExecutionStatus::TimedOut`] or
+//!   [`ExecutionStatus::Stopped`], with the status name (or the recorded
+//!   error) as the error type; [`LocalRunner`] has no execution timeout and
+//!   no stop, so it reports only `Succeeded`, `Failed` or `Running`.
 //! - **Transient operation statuses.** [`LocalRunner`] may surface the
 //!   intermediate [`OperationStatus::Ready`] status it uses to model an
 //!   elapsed retry delay; [`CloudRunner`]'s status vocabulary comes from the
 //!   event stream and does not include [`OperationStatus::Ready`].
+//! - **Replay children.** [`ContextDetails::replay_children`] is reported
+//!   only by [`LocalRunner`]. No history event carries it, so under
+//!   [`CloudRunner`] it is `false`.
+//!
+//! Runner failures (serialization, an unexpected envelope, an AWS error) are
+//! returned as [`TestRunnerError`]. A [`TestResult`] always describes the
+//! durable execution, including one that is still
+//! [`Running`](ExecutionStatus::Running).
 //!
 //! # Examples
 //!
@@ -117,7 +126,7 @@
 //!         },
 //!         21_i32,
 //!     )
-//!     .await;
+//!     .await.expect("runner");
 //!
 //! assert!(result.is_success());
 //! assert_eq!(result.output(), Some(&42));
@@ -133,9 +142,11 @@ use serde::de::DeserializeOwned;
 
 use aws_sdk_lambda::primitives::{Blob, DateTime};
 use aws_sdk_lambda::types::{
-    CallbackDetails, ChainedInvokeDetails, ContextDetails, ContextOptions, ErrorObject, Event,
-    EventType, ExecutionStatus, InvocationType, Operation, OperationAction,
-    OperationStatus as WireOperationStatus, OperationType, OperationUpdate, StepDetails,
+    CallbackDetails as WireCallbackDetails, ChainedInvokeDetails,
+    ContextDetails as WireContextDetails, ContextOptions, ErrorObject, Event, EventType,
+    ExecutionStatus as WireExecutionStatus, InvocationType as WireInvocationType, Operation,
+    OperationAction, OperationStatus as WireOperationStatus, OperationType, OperationUpdate,
+    StepDetails as WireStepDetails,
 };
 
 use crate::client::{CheckpointOutput, ExecutionClient, ExecutionClientError, GetStateOutput};
@@ -176,7 +187,7 @@ const DEFAULT_STATE_PAGE_SIZE: usize = 1;
 ///         },
 ///         (),
 ///     )
-///     .await;
+///     .await.expect("runner");
 ///
 /// let ops = result.operations();
 /// assert_eq!(ops.len(), 1);
@@ -193,13 +204,40 @@ pub struct TestOperation {
     sub_type: Option<String>,
     status: OperationStatus,
     result: Option<String>,
-    error_type: Option<String>,
-    error_message: Option<String>,
-    attempt: u32,
+    error: Option<crate::WireError>,
     name: Option<String>,
+    parent_id: Option<String>,
+    // The detail of every kind is stored, and `details()` returns the one
+    // of `kind`. So a runner fills a kind's field without matching on the
+    // kind first.
+    step: StepDetails,
+    wait: WaitDetails,
+    callback: CallbackDetails,
+    context: ContextDetails,
 }
 
 impl TestOperation {
+    /// A record of `kind` with no result, error or detail, in status
+    /// `Started`.
+    fn started(id: String, kind: OperationKind) -> Self {
+        Self {
+            id,
+            kind,
+            sub_type: None,
+            status: OperationStatus::Started,
+            result: None,
+            error: None,
+            name: None,
+            parent_id: None,
+            step: StepDetails { attempt: 0 },
+            wait: WaitDetails { duration: None },
+            callback: CallbackDetails { callback_id: None },
+            context: ContextDetails {
+                replay_children: false,
+            },
+        }
+    }
+
     /// The operation's wire ID (the SHA-256 hex of its positional path).
     pub fn id(&self) -> &str {
         &self.id
@@ -238,48 +276,276 @@ impl TestOperation {
         self.result.as_deref()
     }
 
-    /// The recorded error type, if the operation failed.
+    /// The recorded error, if the operation stored one: its type, message,
+    /// error data and stack trace.
+    pub fn error(&self) -> Option<&crate::WireError> {
+        self.error.as_ref()
+    }
+
+    /// The recorded error type, if the operation failed. Reads
+    /// [`error`](Self::error).
     pub fn error_type(&self) -> Option<&str> {
-        self.error_type.as_deref()
+        self.error.as_ref().and_then(crate::WireError::error_type)
     }
 
-    /// The recorded error message, if the operation failed.
+    /// The recorded error message, if the operation failed. Reads
+    /// [`error`](Self::error).
     pub fn error_message(&self) -> Option<&str> {
-        self.error_message.as_deref()
-    }
-
-    /// The number of completed retries recorded for this operation
-    /// (`0` when never retried). [`LocalRunner`] and [`CloudRunner`] report
-    /// this value identically.
-    pub fn attempt(&self) -> u32 {
-        self.attempt
+        self.error
+            .as_ref()
+            .and_then(crate::WireError::error_message)
     }
 
     /// The operation's caller-assigned name, if any.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+
+    /// The [`id`](Self::id) of the operation that contains this one, or
+    /// `None` for a top-level operation.
+    pub fn parent_id(&self) -> Option<&str> {
+        self.parent_id.as_deref()
+    }
+
+    /// The detail of this operation's kind. The variant matches
+    /// [`kind`](Self::kind): [`OperationKind::Step`] gives
+    /// [`TestOperationDetails::Step`], and so on.
+    pub fn details(&self) -> TestOperationDetails<'_> {
+        match self.kind {
+            OperationKind::Execution => TestOperationDetails::Execution,
+            OperationKind::Context => TestOperationDetails::Context(&self.context),
+            OperationKind::Step => TestOperationDetails::Step(&self.step),
+            OperationKind::Wait => TestOperationDetails::Wait(&self.wait),
+            OperationKind::Callback => TestOperationDetails::Callback(&self.callback),
+            OperationKind::ChainedInvoke => TestOperationDetails::ChainedInvoke,
+        }
+    }
 }
 
-/// Terminal disposition of a [`LocalRunner`] run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Disposition {
+/// The detail of one [`TestOperation`], by kind. Returned by
+/// [`TestOperation::details`].
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use aws_durable_execution_sdk as durable;
+/// use durable::test_util::{LocalRunner, TestOperationDetails};
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), durable::BoxError> {
+/// let result = LocalRunner::new()
+///     .run(
+///         |_e: (), ctx: durable::DurableContext| async move {
+///             ctx.wait(Duration::from_secs(10)).name("pause").await?;
+///             Ok::<_, durable::BoxError>(())
+///         },
+///         (),
+///     )
+///     .await?;
+///
+/// let wait = result.operation("pause").ok_or("no wait")?;
+/// assert!(matches!(
+///     wait.details(),
+///     TestOperationDetails::Wait(w) if w.duration() == Some(Duration::from_secs(10))
+/// ));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum TestOperationDetails<'a> {
+    /// The execution itself.
+    Execution,
+    /// A child context.
+    Context(&'a ContextDetails),
+    /// A step.
+    Step(&'a StepDetails),
+    /// A wait.
+    Wait(&'a WaitDetails),
+    /// A callback.
+    Callback(&'a CallbackDetails),
+    /// A chained invoke.
+    ChainedInvoke,
+}
+
+/// The detail of a step [`TestOperation`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct StepDetails {
+    attempt: u32,
+}
+
+impl StepDetails {
+    /// The number of completed retries recorded for this step (`0` when
+    /// never retried). [`LocalRunner`] and [`CloudRunner`] report this
+    /// value identically.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+}
+
+/// The detail of a wait [`TestOperation`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct WaitDetails {
+    duration: Option<std::time::Duration>,
+}
+
+impl WaitDetails {
+    /// The recorded wait duration, in whole seconds, or `None` when no
+    /// duration was recorded.
+    pub fn duration(&self) -> Option<std::time::Duration> {
+        self.duration
+    }
+}
+
+/// The detail of a callback [`TestOperation`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CallbackDetails {
+    callback_id: Option<String>,
+}
+
+impl CallbackDetails {
+    /// The callback ID the backend assigned, the ID the handler sees, or
+    /// `None` when none was recorded.
+    pub fn callback_id(&self) -> Option<&str> {
+        self.callback_id.as_deref()
+    }
+}
+
+/// The detail of a child context [`TestOperation`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ContextDetails {
+    replay_children: bool,
+}
+
+impl ContextDetails {
+    /// Whether the context closed with the `ReplayChildren` option. Only
+    /// [`LocalRunner`] reports it; under [`CloudRunner`] it is `false`.
+    pub fn replay_children(&self) -> bool {
+        self.replay_children
+    }
+}
+
+/// The status of the durable execution a [`TestResult`] describes, as the
+/// service reports it.
+///
+/// [`Display`](std::fmt::Display) writes the variant name, such as
+/// `TimedOut`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExecutionStatus {
+    /// The execution has not ended.
+    Running,
+    /// The handler returned a value.
     Succeeded,
+    /// The handler returned an error.
     Failed,
-    Suspended,
+    /// The execution exceeded its execution timeout.
+    TimedOut,
+    /// The execution was stopped.
+    Stopped,
 }
 
-/// The outcome of a [`LocalRunner::run`], including the deserialized handler
-/// output (on success) and the recorded operation history.
+impl std::fmt::Display for ExecutionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Running => "Running",
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+            Self::TimedOut => "TimedOut",
+            Self::Stopped => "Stopped",
+        })
+    }
+}
+
+impl ExecutionStatus {
+    /// Converts the service's status. A status this enum does not list
+    /// ended the execution in a way the runner cannot name, so it maps to
+    /// `Failed`.
+    fn from_wire(status: &WireExecutionStatus) -> Self {
+        match status {
+            WireExecutionStatus::Running => Self::Running,
+            WireExecutionStatus::Succeeded => Self::Succeeded,
+            WireExecutionStatus::TimedOut => Self::TimedOut,
+            WireExecutionStatus::Stopped => Self::Stopped,
+            _ => Self::Failed,
+        }
+    }
+}
+
+/// A failure of the test runner itself, not of the durable execution.
+///
+/// [`LocalRunner::run`] and [`CloudRunner::run`] return it when they cannot
+/// describe the execution. A durable execution that fails is not a runner
+/// error: it is an `Ok` [`TestResult`] with [`ExecutionStatus::Failed`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum TestRunnerError {
+    /// The event did not serialize to JSON.
+    EventSerialization(Arc<serde_json::Error>),
+    /// The handler output did not decode into the output type.
+    OutputDeserialization(Arc<serde_json::Error>),
+    /// A response envelope carried a status other than `SUCCEEDED`,
+    /// `FAILED` and `PENDING`. The value is the status, or `None` when the
+    /// envelope carried no string status.
+    UnexpectedEnvelope(Option<String>),
+    /// A Lambda API call failed.
+    Aws(Arc<dyn std::error::Error + Send + Sync>),
+    /// The invoke response carried no `DurableExecutionArn`.
+    NoExecutionArn,
+}
+
+impl std::fmt::Display for TestRunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EventSerialization(e) => {
+                write!(f, "durable: test runner: event serialization failed: {e}")
+            }
+            Self::OutputDeserialization(e) => {
+                write!(
+                    f,
+                    "durable: test runner: output deserialization failed: {e}"
+                )
+            }
+            Self::UnexpectedEnvelope(status) => write!(
+                f,
+                "durable: test runner: unexpected response envelope status: {status:?}"
+            ),
+            Self::Aws(e) => write!(f, "durable: test runner: AWS call failed: {e}"),
+            Self::NoExecutionArn => f.write_str(
+                "durable: test runner: the invoke response carried no DurableExecutionArn",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TestRunnerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::EventSerialization(e) | Self::OutputDeserialization(e) => Some(e.as_ref()),
+            Self::Aws(e) => Some(e.as_ref()),
+            Self::UnexpectedEnvelope(_) | Self::NoExecutionArn => None,
+        }
+    }
+}
+
+/// The outcome of a [`LocalRunner::run`] or [`CloudRunner::run`]: the
+/// execution status, the deserialized handler output (on success) and the
+/// recorded operation history.
 ///
 /// # Examples
 ///
 /// ```
 /// use aws_durable_execution_sdk as durable;
-/// use durable::test_util::LocalRunner;
+/// use durable::test_util::{ExecutionStatus, LocalRunner};
 ///
 /// # #[tokio::main]
-/// # async fn main() {
+/// # async fn main() -> Result<(), durable::BoxError> {
 /// let result = LocalRunner::new()
 ///     .run(
 ///         |_e: (), _ctx: durable::DurableContext| async move {
@@ -287,40 +553,58 @@ enum Disposition {
 ///         },
 ///         (),
 ///     )
-///     .await;
+///     .await?;
 ///
+/// assert_eq!(result.status(), ExecutionStatus::Succeeded);
 /// assert!(result.is_success());
 /// assert_eq!(result.output().map(String::as_str), Some("hi"));
 /// assert_eq!(result.invocation_count(), 1);
+/// # Ok(())
 /// # }
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct TestResult<O> {
-    disposition: Disposition,
+    status: ExecutionStatus,
     output: Option<O>,
-    error_type: Option<String>,
-    error_message: Option<String>,
+    error: Option<crate::WireError>,
     operations: Vec<TestOperation>,
     invocations: usize,
 }
 
 impl<O> TestResult<O> {
-    /// Returns `true` if the handler completed successfully.
+    /// The status of the execution.
+    ///
+    /// Under [`LocalRunner`], a run that ends because nothing can advance,
+    /// or because [`max_invocations`](LocalRunner::max_invocations) is
+    /// reached, is [`ExecutionStatus::Running`]. Under [`CloudRunner`], the
+    /// service status maps one to one, and a run that reaches a configured
+    /// [`max_poll_attempts`](CloudRunner::max_poll_attempts) is
+    /// [`ExecutionStatus::Running`].
+    pub fn status(&self) -> ExecutionStatus {
+        self.status
+    }
+
+    /// Returns `true` if the status is [`ExecutionStatus::Succeeded`].
     pub fn is_success(&self) -> bool {
-        self.disposition == Disposition::Succeeded
+        self.status == ExecutionStatus::Succeeded
     }
 
-    /// Returns `true` if the handler returned an error.
+    /// Returns `true` if the status is [`ExecutionStatus::Failed`],
+    /// [`ExecutionStatus::TimedOut`] or [`ExecutionStatus::Stopped`].
     pub fn is_failure(&self) -> bool {
-        self.disposition == Disposition::Failed
+        matches!(
+            self.status,
+            ExecutionStatus::Failed | ExecutionStatus::TimedOut | ExecutionStatus::Stopped
+        )
     }
 
-    /// Returns `true` if the handler suspended and never reached a terminal
-    /// outcome within the invocation budget (e.g. it awaits a callback the
-    /// test never delivered, or it never terminates).
+    /// Returns `true` if the status is [`ExecutionStatus::Running`]: the
+    /// handler suspended and never reached a terminal outcome within the
+    /// runner's budget (e.g. it awaits a callback the test never delivered,
+    /// or it never terminates).
     pub fn is_suspended(&self) -> bool {
-        self.disposition == Disposition::Suspended
+        self.status == ExecutionStatus::Running
     }
 
     /// The deserialized handler output on success, or `None` otherwise.
@@ -334,19 +618,59 @@ impl<O> TestResult<O> {
         self.output
     }
 
-    /// The wire error type on failure (e.g. `"StepError"`), or `None`.
-    pub fn error_type(&self) -> Option<&str> {
-        self.error_type.as_deref()
+    /// The execution's error: on failure, the recorded error with its type,
+    /// message and error data; while running, the reason the run ended.
+    /// `None` on success.
+    pub fn error(&self) -> Option<&crate::WireError> {
+        self.error.as_ref()
     }
 
-    /// The wire error message on failure, or `None`.
+    /// The wire error type on failure (e.g. `"StepError"`), or `None`.
+    /// Reads [`error`](Self::error).
+    pub fn error_type(&self) -> Option<&str> {
+        self.error.as_ref().and_then(crate::WireError::error_type)
+    }
+
+    /// The wire error message on failure, or `None`. Reads
+    /// [`error`](Self::error).
     pub fn error_message(&self) -> Option<&str> {
-        self.error_message.as_deref()
+        self.error
+            .as_ref()
+            .and_then(crate::WireError::error_message)
     }
 
     /// The recorded operation history, in first-checkpoint order.
     pub fn operations(&self) -> &[TestOperation] {
         &self.operations
+    }
+
+    /// The first operation in [`operations`](Self::operations) order whose
+    /// [`name`](TestOperation::name) is `name`.
+    pub fn operation(&self, name: &str) -> Option<&TestOperation> {
+        self.operations.iter().find(|op| op.name() == Some(name))
+    }
+
+    /// Every operation whose [`name`](TestOperation::name) is `name`, in
+    /// [`operations`](Self::operations) order.
+    pub fn operations_named<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a TestOperation> + 'a {
+        self.operations
+            .iter()
+            .filter(move |op| op.name() == Some(name))
+    }
+
+    /// Every operation whose [`parent_id`](TestOperation::parent_id) is the
+    /// [`id`](TestOperation::id) of `parent`, in
+    /// [`operations`](Self::operations) order.
+    pub fn children<'a>(
+        &'a self,
+        parent: &'a TestOperation,
+    ) -> impl Iterator<Item = &'a TestOperation> + 'a {
+        self.operations
+            .iter()
+            .filter(move |op| op.parent_id() == Some(parent.id()))
     }
 
     /// The number of invocations that drove this execution.
@@ -391,7 +715,7 @@ impl<O> TestResult<O> {
 ///         },
 ///         (),
 ///     )
-///     .await;
+///     .await?;
 ///
 /// assert_eq!(result.output(), Some(&(true, false)));
 /// # Ok(())
@@ -725,7 +1049,7 @@ impl NestedOutcome {
 ///         },
 ///         (),
 ///     )
-///     .await;
+///     .await?;
 ///
 /// assert_eq!(result.output(), Some(&true));
 ///
@@ -742,7 +1066,7 @@ impl NestedOutcome {
 ///         },
 ///         (),
 ///     )
-///     .await;
+///     .await?;
 ///
 /// assert_eq!(result.output(), Some(&7));
 /// # Ok(())
@@ -1134,7 +1458,7 @@ impl LocalRunner {
     ///         },
     ///         21_i32,
     ///     )
-    ///     .await;
+    ///     .await.expect("runner");
     ///
     /// assert_eq!(result.output(), Some(&42));
     /// # }
@@ -1222,7 +1546,7 @@ impl LocalRunner {
     ///         },
     ///         1_u32,
     ///     )
-    ///     .await;
+    ///     .await.expect("runner");
     ///
     /// assert_eq!(result.output(), Some(&4));
     /// # }
@@ -1245,7 +1569,7 @@ impl LocalRunner {
             Box::pin(async move {
                 let backend = Arc::new(runner.new_backend());
                 let nested = move |event: E, ctx: DurableContext| handler(event, ctx);
-                runner.drive(backend, nested, input).await.nested_outcome()
+                runner.drive_nested(backend, nested, input).await
             })
         });
         self.functions
@@ -1281,6 +1605,18 @@ impl LocalRunner {
     /// envelope, mirroring the way the service re-delivers the input
     /// payload on every re-invocation.
     ///
+    /// # Errors
+    ///
+    /// - [`TestRunnerError::EventSerialization`] when `event` does not
+    ///   serialize.
+    /// - [`TestRunnerError::OutputDeserialization`] when the output of a
+    ///   succeeded execution does not decode into `O`.
+    /// - [`TestRunnerError::UnexpectedEnvelope`] when a response envelope
+    ///   has a status other than `SUCCEEDED`, `FAILED` and `PENDING`.
+    ///
+    /// An invocation fault is not a runner error: the runner invokes again,
+    /// as the service does.
+    ///
     /// # Examples
     ///
     /// ```
@@ -1288,7 +1624,7 @@ impl LocalRunner {
     /// use durable::test_util::LocalRunner;
     ///
     /// # #[tokio::main]
-    /// # async fn main() {
+    /// # async fn main() -> Result<(), durable::BoxError> {
     /// let result = LocalRunner::new()
     ///     .run(
     ///         |n: u32, ctx: durable::DurableContext| async move {
@@ -1297,11 +1633,16 @@ impl LocalRunner {
     ///         },
     ///         41_u32,
     ///     )
-    ///     .await;
+    ///     .await?;
     /// assert_eq!(result.output(), Some(&42));
+    /// # Ok(())
     /// # }
     /// ```
-    pub async fn run<E, O, F, Fut>(&self, handler: F, event: E) -> TestResult<O>
+    pub async fn run<E, O, F, Fut>(
+        &self,
+        handler: F,
+        event: E,
+    ) -> Result<TestResult<O>, TestRunnerError>
     where
         E: Serialize + DeserializeOwned + Send + 'static,
         O: Serialize + DeserializeOwned + Send + 'static,
@@ -1310,19 +1651,8 @@ impl LocalRunner {
     {
         // Serialize the event once; the envelope re-delivers it per
         // invocation.
-        let event_json = match serde_json::to_string(&event) {
-            Ok(json) => json,
-            Err(e) => {
-                return TestResult {
-                    disposition: Disposition::Failed,
-                    output: None,
-                    error_type: Some("SerializationFailed".to_owned()),
-                    error_message: Some(format!("serialize event: {e}")),
-                    operations: Vec::new(),
-                    invocations: 0,
-                };
-            }
-        };
+        let event_json = serde_json::to_string(&event)
+            .map_err(|e| TestRunnerError::EventSerialization(Arc::new(e)))?;
         self.run_on_backend(Arc::new(self.new_backend()), handler, event_json)
             .await
     }
@@ -1359,7 +1689,7 @@ impl LocalRunner {
         backend: Arc<Backend>,
         handler: F,
         event_json: String,
-    ) -> TestResult<O>
+    ) -> Result<TestResult<O>, TestRunnerError>
     where
         E: Serialize + DeserializeOwned + Send + 'static,
         O: Serialize + DeserializeOwned + Send + 'static,
@@ -1367,7 +1697,7 @@ impl LocalRunner {
         Fut: Future<Output = Result<O, BoxError>> + Send,
     {
         self.drive(backend, handler, event_json)
-            .await
+            .await?
             .into_test_result()
     }
 
@@ -1379,7 +1709,7 @@ impl LocalRunner {
         backend: Arc<Backend>,
         handler: F,
         event_json: String,
-    ) -> RawRun
+    ) -> Result<RawRun, TestRunnerError>
     where
         E: Serialize + DeserializeOwned + Send + 'static,
         O: Serialize + DeserializeOwned + Send + 'static,
@@ -1398,7 +1728,48 @@ impl LocalRunner {
         options.lambda_client = None;
         options.execution_client = Some(client);
         let service = crate::wrap(handler, options);
+        self.drive_service(backend, service, event_json).await
+    }
 
+    /// Drives a nested durable run and returns its outcome.
+    async fn drive_nested<E, O, F, Fut>(
+        &self,
+        backend: Arc<Backend>,
+        handler: F,
+        event_json: String,
+    ) -> NestedOutcome
+    where
+        E: Serialize + DeserializeOwned + Send + 'static,
+        O: Serialize + DeserializeOwned + Send + 'static,
+        F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send,
+    {
+        // `drive` runs the handler behind `crate::wrap`. Every envelope
+        // `wrap` returns has the status SUCCEEDED, FAILED or PENDING. The
+        // only runner error `drive_service` returns is `UnexpectedEnvelope`,
+        // for any other status. So `drive` returns no runner error here.
+        #[expect(clippy::expect_used)]
+        let run = self
+            .drive(backend, handler, event_json)
+            .await
+            .expect("a run behind `wrap` returns no runner error");
+        run.nested_outcome()
+    }
+
+    /// The invoke → parse → advance loop of [`drive`](Self::drive), with the
+    /// service function as a parameter. Internal seam: a unit test passes a
+    /// service that returns an envelope `wrap` never produces.
+    async fn drive_service<S>(
+        &self,
+        backend: Arc<Backend>,
+        service: S,
+        event_json: String,
+    ) -> Result<RawRun, TestRunnerError>
+    where
+        S: Fn(
+            lambda_runtime::LambdaEvent<crate::InvocationPayload>,
+        ) -> crate::BoxedInvocationFuture,
+    {
         // A nested durable run uses the settings this run starts with.
         let nested = self.nested_settings();
 
@@ -1411,7 +1782,7 @@ impl LocalRunner {
         loop {
             invocations += 1;
             if invocations > self.max_invocations {
-                return RawRun {
+                return Ok(RawRun {
                     end: RawEnd::Suspended {
                         error_type: last_invocation_fault
                             .is_some()
@@ -1434,7 +1805,7 @@ impl LocalRunner {
                     },
                     operations: backend.snapshot_operations(),
                     invocations: invocations - 1,
-                };
+                });
             }
 
             let payload = build_envelope(&backend, &event_json, self.initial_page_size);
@@ -1491,16 +1862,17 @@ impl LocalRunner {
                         ),
                     }
                 }
-                other => RawEnd::Failed(crate::WireError::new(
-                    Some("RuntimeError"),
-                    Some(format!("unexpected response envelope status: {other:?}")),
-                )),
+                other => {
+                    return Err(TestRunnerError::UnexpectedEnvelope(
+                        other.map(ToOwned::to_owned),
+                    ));
+                }
             };
-            return RawRun {
+            return Ok(RawRun {
                 end,
                 operations: backend.snapshot_operations(),
                 invocations,
-            };
+            });
         }
     }
 
@@ -1539,9 +1911,7 @@ struct RawRun {
 enum RawEnd {
     /// A `SUCCEEDED` envelope, with its raw `Result` string.
     Succeeded(Option<String>),
-    /// A `FAILED` envelope, with the wire error of its `Error` object. An
-    /// envelope with an unexpected status ends here too, with the type
-    /// `RuntimeError`.
+    /// A `FAILED` envelope, with the wire error of its `Error` object.
     Failed(crate::WireError),
     /// The execution did not terminate.
     Suspended {
@@ -1552,45 +1922,45 @@ enum RawEnd {
 
 impl RawRun {
     /// The [`TestResult`] of a top-level run: the output decoded into `O`.
-    fn into_test_result<O: DeserializeOwned>(self) -> TestResult<O> {
+    fn into_test_result<O: DeserializeOwned>(self) -> Result<TestResult<O>, TestRunnerError> {
         let Self {
             end,
             operations,
             invocations,
         } = self;
-        let (disposition, output, error_type, error_message) = match end {
+        let (status, output, error) = match end {
             RawEnd::Succeeded(raw) => {
-                let output = serde_json::from_str::<O>(raw.as_deref().unwrap_or("null")).ok();
-                if output.is_some() {
-                    (Disposition::Succeeded, output, None, None)
-                } else {
-                    (
-                        Disposition::Failed,
-                        None,
-                        Some("SerializationFailed".to_owned()),
-                        Some("could not deserialize handler output".to_owned()),
-                    )
-                }
+                let output = serde_json::from_str::<O>(raw.as_deref().unwrap_or("null"))
+                    .map_err(|e| TestRunnerError::OutputDeserialization(Arc::new(e)))?;
+                (ExecutionStatus::Succeeded, Some(output), None)
             }
-            RawEnd::Failed(wire) => (
-                Disposition::Failed,
-                None,
-                Some(wire.error_type().unwrap_or("Error").to_owned()),
-                Some(wire.error_message().unwrap_or_default().to_owned()),
-            ),
+            RawEnd::Failed(wire) => {
+                // A missing `ErrorType` reads `Error`, the fallback the
+                // handler mapping uses.
+                let error = crate::WireError::new(
+                    Some(wire.error_type().unwrap_or("Error")),
+                    Some(wire.error_message().unwrap_or_default()),
+                )
+                .with_error_data(wire.error_data())
+                .with_stack_trace(wire.stack_trace().to_vec());
+                (ExecutionStatus::Failed, None, Some(error))
+            }
             RawEnd::Suspended {
                 error_type,
                 message,
-            } => (Disposition::Suspended, None, error_type, Some(message)),
+            } => (
+                ExecutionStatus::Running,
+                None,
+                Some(crate::WireError::new(error_type, Some(message))),
+            ),
         };
-        TestResult {
-            disposition,
+        Ok(TestResult {
+            status,
             output,
-            error_type,
-            error_message,
+            error,
             operations,
             invocations,
-        }
+        })
     }
 
     /// The outcome a nested durable run records on the caller's invoke.
@@ -1673,39 +2043,149 @@ fn build_envelope(
     })
 }
 
-/// Default seconds between execution-status polls.
-const DEFAULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Default delay between execution-status polls, as JS.
+const DEFAULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Default cap on status polls before the runner reports the execution as
-/// still running (suspended). 150 × 2 s ≈ 5 minutes.
-const DEFAULT_MAX_POLL_ATTEMPTS: usize = 150;
+/// How [`CloudRunner`] invokes the function.
+///
+/// `DryRun` is not offered: it returns no execution ARN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum InvocationType {
+    /// A synchronous invoke. It returns after the execution ended or the
+    /// invocation reached its timeout.
+    #[default]
+    RequestResponse,
+    /// An asynchronous invoke. It returns once the execution started.
+    Event,
+}
 
-/// `error_type` used on a [`TestResult`] when a `CloudRunner` infrastructure
-/// step fails (invoke error, missing execution ARN, poll-budget exhaustion,
-/// or history retrieval). Distinct from a durable execution `FAILED`, whose
-/// `error_type` carries the service-recorded error.
-const CLOUD_RUNNER_ERROR: &str = "CloudRunnerError";
+impl InvocationType {
+    /// The service model value of this invocation type.
+    fn to_wire(self) -> WireInvocationType {
+        match self {
+            Self::RequestResponse => WireInvocationType::RequestResponse,
+            Self::Event => WireInvocationType::Event,
+        }
+    }
+}
+
+/// The fields of one `Invoke` request that [`CloudRunner`] sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InvokeRequest {
+    function_name: String,
+    qualifier: String,
+    invocation_type: WireInvocationType,
+    payload: Vec<u8>,
+}
+
+/// The three Lambda calls [`CloudRunner::run`] makes. `run` calls only this
+/// trait, so a unit test can supply a fake that returns scripted outputs
+/// and errors.
+trait CloudApi {
+    /// Sends `Invoke`.
+    fn send_invoke(
+        &self,
+        request: InvokeRequest,
+    ) -> impl Future<Output = Result<aws_sdk_lambda::operation::invoke::InvokeOutput, BoxError>> + Send;
+
+    /// Sends `GetDurableExecution` with the execution data.
+    fn send_get_durable_execution(
+        &self,
+        execution_arn: &str,
+    ) -> impl Future<
+        Output = Result<
+            aws_sdk_lambda::operation::get_durable_execution::GetDurableExecutionOutput,
+            BoxError,
+        >,
+    > + Send;
+
+    /// Sends `GetDurableExecutionHistory` with the execution data, for the
+    /// page that `marker` names.
+    fn send_get_durable_execution_history(
+        &self,
+        execution_arn: &str,
+        marker: Option<&str>,
+    ) -> impl Future<
+        Output = Result<
+            aws_sdk_lambda::operation::get_durable_execution_history::GetDurableExecutionHistoryOutput,
+            BoxError,
+        >,
+    > + Send;
+}
+
+impl CloudApi for crate::LambdaClient {
+    async fn send_invoke(
+        &self,
+        request: InvokeRequest,
+    ) -> Result<aws_sdk_lambda::operation::invoke::InvokeOutput, BoxError> {
+        Ok(self
+            .invoke()
+            .function_name(request.function_name)
+            .invocation_type(request.invocation_type)
+            .qualifier(request.qualifier)
+            .payload(Blob::new(request.payload))
+            .send()
+            .await?)
+    }
+
+    async fn send_get_durable_execution(
+        &self,
+        execution_arn: &str,
+    ) -> Result<aws_sdk_lambda::operation::get_durable_execution::GetDurableExecutionOutput, BoxError>
+    {
+        Ok(self
+            .get_durable_execution()
+            .durable_execution_arn(execution_arn)
+            .include_execution_data(true)
+            .send()
+            .await?)
+    }
+
+    async fn send_get_durable_execution_history(
+        &self,
+        execution_arn: &str,
+        marker: Option<&str>,
+    ) -> Result<
+        aws_sdk_lambda::operation::get_durable_execution_history::GetDurableExecutionHistoryOutput,
+        BoxError,
+    > {
+        Ok(self
+            .get_durable_execution_history()
+            .durable_execution_arn(execution_arn)
+            .include_execution_data(true)
+            .set_marker(marker.map(ToOwned::to_owned))
+            .send()
+            .await?)
+    }
+}
+
+/// The [`TestRunnerError::Aws`] of a failed Lambda call.
+fn aws_error(err: BoxError) -> TestRunnerError {
+    TestRunnerError::Aws(Arc::from(err))
+}
 
 /// Drives a durable function against **real AWS** and returns the same
 /// [`TestResult`] / [`TestOperation`] types [`LocalRunner`] returns.
 ///
-/// `CloudRunner` invokes a deployed durable function (`InvocationType=Event`),
-/// polls [`GetDurableExecution`] until the execution reaches a terminal state,
-/// then folds the recorded [`GetDurableExecutionHistory`] event stream into
-/// per-operation [`TestOperation`]s. Because both runners return the same
-/// types, a test can be re-pointed from in-memory to real AWS by swapping the
-/// runner.
+/// `CloudRunner` invokes a deployed durable function, with the
+/// [`invocation_type`](Self::invocation_type) `RequestResponse` by default,
+/// polls [`GetDurableExecution`] until the execution reaches a terminal
+/// state, then folds the recorded [`GetDurableExecutionHistory`] event
+/// stream into per-operation [`TestOperation`]s. Because both runners return
+/// the same types, a test can be re-pointed from in-memory to real AWS by
+/// swapping the runner. The runner reads only `DurableExecutionArn` from the
+/// invoke response and ignores its `FunctionError` and `Payload`: the
+/// history is the source of the result.
 ///
-/// The AWS client is built internally from the ambient credentials and region
-/// (the same way the production entry point builds it), so no AWS type appears
-/// in any public signature. Configure the region explicitly with
-/// [`region`](Self::region) when the environment does not supply one.
+/// By default the Lambda client is built from the ambient credentials and
+/// region (the same way the production entry point builds it). Configure the
+/// region with [`region`](Self::region), or supply the client with
+/// [`lambda_client`](Self::lambda_client).
 ///
-/// Infrastructure failures (invoke error, no execution ARN, poll-budget
-/// exhaustion, deserialization) surface through the returned [`TestResult`]:
-/// [`is_failure`](TestResult::is_failure) with `error_type() ==
-/// "CloudRunnerError"`, or [`is_suspended`](TestResult::is_suspended) when the
-/// execution is still running at the poll budget.
+/// A failed Lambda call or an invoke response without an execution ARN
+/// is a [`TestRunnerError`]. A durable execution that fails, times out or
+/// stops is an `Ok` [`TestResult`] with that [`ExecutionStatus`].
 ///
 /// [`GetDurableExecution`]: https://docs.aws.amazon.com/lambda/latest/api/API_GetDurableExecution.html
 /// [`GetDurableExecutionHistory`]: https://docs.aws.amazon.com/lambda/latest/api/API_GetDurableExecutionHistory.html
@@ -1718,12 +2198,12 @@ const CLOUD_RUNNER_ERROR: &str = "CloudRunnerError";
 /// use std::time::Duration;
 ///
 /// # #[tokio::main]
-/// # async fn main() {
+/// # async fn main() -> Result<(), durable::BoxError> {
 /// let result = CloudRunner::new("my-durable-function")
 ///     .region("us-west-2")
 ///     .poll_interval(Duration::from_secs(3))
 ///     .run::<_, i32>(21_i32)
-///     .await;
+///     .await?;
 ///
 /// if result.is_success() {
 ///     assert_eq!(result.output(), Some(&42));
@@ -1731,6 +2211,7 @@ const CLOUD_RUNNER_ERROR: &str = "CloudRunnerError";
 ///         println!("{} {} {}", op.id(), op.kind(), op.status());
 ///     }
 /// }
+/// # Ok(())
 /// # }
 /// ```
 #[derive(Debug, Clone)]
@@ -1740,7 +2221,9 @@ pub struct CloudRunner {
     region: Option<String>,
     qualifier: String,
     poll_interval: std::time::Duration,
-    max_poll_attempts: usize,
+    max_poll_attempts: Option<usize>,
+    invocation_type: InvocationType,
+    lambda_client: Option<crate::LambdaClient>,
 }
 
 impl CloudRunner {
@@ -1765,14 +2248,17 @@ impl CloudRunner {
             region: None,
             qualifier: String::from("$LATEST"),
             poll_interval: DEFAULT_POLL_INTERVAL,
-            max_poll_attempts: DEFAULT_MAX_POLL_ATTEMPTS,
+            max_poll_attempts: None,
+            invocation_type: InvocationType::default(),
+            lambda_client: None,
         }
     }
 
     /// Sets the AWS region used to build the Lambda client.
     ///
     /// When unset, the region is resolved from the ambient environment
-    /// (`AWS_REGION`, profile, or instance metadata).
+    /// (`AWS_REGION`, profile, or instance metadata). Ignored when
+    /// [`lambda_client`](Self::lambda_client) is set.
     ///
     /// # Examples
     ///
@@ -1808,6 +2294,8 @@ impl CloudRunner {
 
     /// Sets the delay between execution-status polls.
     ///
+    /// Defaults to 1 second.
+    ///
     /// # Examples
     ///
     /// ```
@@ -1823,8 +2311,12 @@ impl CloudRunner {
         self
     }
 
-    /// Sets the maximum number of status polls before the runner reports the
-    /// execution as still running (a suspended [`TestResult`]).
+    /// Sets the maximum number of `GetDurableExecution` polls. A run that
+    /// reaches it while the execution still runs returns a [`TestResult`]
+    /// with [`ExecutionStatus::Running`]. A value of `0` counts as `1`.
+    ///
+    /// By default there is no limit: the runner polls until the execution
+    /// ends or a Lambda call fails.
     ///
     /// # Examples
     ///
@@ -1836,7 +2328,49 @@ impl CloudRunner {
     /// ```
     #[must_use]
     pub fn max_poll_attempts(mut self, max: usize) -> Self {
-        self.max_poll_attempts = max.max(1);
+        self.max_poll_attempts = Some(max.max(1));
+        self
+    }
+
+    /// Sets how the runner invokes the function.
+    ///
+    /// Default `RequestResponse`, as JS. A test that answers callbacks while the
+    /// execution runs sets `InvocationType::Event`, as every JS callback example does.
+    /// Under `RequestResponse`, waiting for an operation's data and the live
+    /// callback controls return an error and make no Lambda call.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::{CloudRunner, InvocationType};
+    ///
+    /// let runner = CloudRunner::new("f").invocation_type(InvocationType::Event);
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn invocation_type(mut self, invocation_type: InvocationType) -> Self {
+        self.invocation_type = invocation_type;
+        self
+    }
+
+    /// Use this client for every call. `region` is then ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::test_util::CloudRunner;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let config = aws_config::load_from_env().await;
+    /// let runner = CloudRunner::new("f").lambda_client(durable::LambdaClient::new(&config));
+    /// # drop(runner);
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn lambda_client(mut self, client: crate::LambdaClient) -> Self {
+        self.lambda_client = Some(client);
         self
     }
 
@@ -1846,223 +2380,238 @@ impl CloudRunner {
     /// The event is serialized to JSON and delivered as the invocation
     /// payload. The handler output (on success) is deserialized into `O`.
     ///
-    /// This method never panics: every AWS or serialization failure is
-    /// reported through the returned [`TestResult`] (see [`CloudRunner`]).
+    /// # Errors
+    ///
+    /// - [`TestRunnerError::EventSerialization`] when `event` does not
+    ///   serialize.
+    /// - [`TestRunnerError::Aws`] when `Invoke`, `GetDurableExecution` or
+    ///   `GetDurableExecutionHistory` fails.
+    /// - [`TestRunnerError::NoExecutionArn`] when the invoke response has no
+    ///   execution ARN.
+    /// - [`TestRunnerError::OutputDeserialization`] when the output of a
+    ///   succeeded execution does not decode into `O`.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// use aws_durable_execution_sdk::test_util::CloudRunner;
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::test_util::CloudRunner;
     ///
     /// # #[tokio::main]
-    /// # async fn main() {
+    /// # async fn main() -> Result<(), durable::BoxError> {
     /// let result = CloudRunner::new("echo-fn")
     ///     .run::<_, String>("hello".to_owned())
-    ///     .await;
+    ///     .await?;
     /// assert!(result.is_success() || result.is_failure() || result.is_suspended());
+    /// # Ok(())
     /// # }
     /// ```
-    #[expect(clippy::too_many_lines)] // reason: the invoke → poll → history → fold flow reads better as one sequence
-    pub async fn run<E, O>(&self, event: E) -> TestResult<O>
+    pub async fn run<E, O>(&self, event: E) -> Result<TestResult<O>, TestRunnerError>
     where
         E: Serialize,
         O: DeserializeOwned,
     {
-        let payload = match serde_json::to_vec(&event) {
-            Ok(bytes) => bytes,
-            Err(e) => return cloud_failure(format!("serialize event: {e}")),
-        };
+        let payload = serde_json::to_vec(&event)
+            .map_err(|e| TestRunnerError::EventSerialization(Arc::new(e)))?;
+        let client = self.resolve_client().await;
+        self.run_with(&client, payload).await
+    }
 
-        let client = self.build_client().await;
+    /// The invoke → poll → history → fold flow of [`run`](Self::run), over
+    /// any [`CloudApi`].
+    async fn run_with<A: CloudApi, O: DeserializeOwned>(
+        &self,
+        api: &A,
+        payload: Vec<u8>,
+    ) -> Result<TestResult<O>, TestRunnerError> {
+        // 1. Invoke: start the durable execution and capture its ARN. The
+        // `FunctionError` and `Payload` of a synchronous invoke are ignored;
+        // the history is the source of the result.
+        let invoke_output = api
+            .send_invoke(self.build_invoke(payload))
+            .await
+            .map_err(aws_error)?;
+        let execution_arn = invoke_output
+            .durable_execution_arn()
+            .ok_or(TestRunnerError::NoExecutionArn)?
+            .to_owned();
 
-        // 1. Invoke (async): start the durable execution and capture its ARN.
-        let invoke_result = client
-            .invoke()
-            .function_name(&self.function_name)
-            .invocation_type(InvocationType::Event)
-            .qualifier(&self.qualifier)
-            .payload(Blob::new(payload))
-            .send()
-            .await;
-        let invoke_output = match invoke_result {
-            Ok(out) => out,
-            Err(e) => return cloud_failure(format!("invoke {}: {e}", self.function_name)),
-        };
-        let Some(execution_arn) = invoke_output.durable_execution_arn().map(ToOwned::to_owned)
-        else {
-            return cloud_failure(
-                "invoke response carried no DurableExecutionArn (is the target a durable \
-                 function invoked with a qualifier?)"
-                    .to_owned(),
-            );
-        };
-
-        // 2. Poll GetDurableExecution until terminal or the budget is spent.
+        // 2. Poll GetDurableExecution until terminal, or until a configured
+        // limit is spent.
         let mut polls = 0_usize;
         let terminal = loop {
-            if polls >= self.max_poll_attempts {
-                let operations = self.fetch_operations(&client, &execution_arn).await;
-                return TestResult {
-                    disposition: Disposition::Suspended,
+            if self.max_poll_attempts.is_some_and(|limit| polls >= limit) {
+                let events = fetch_history(api, &execution_arn).await?;
+                return Ok(TestResult {
+                    status: ExecutionStatus::Running,
                     output: None,
-                    error_type: None,
-                    error_message: Some(format!(
-                        "execution {execution_arn} still running after {polls} polls"
+                    error: Some(crate::WireError::new(
+                        None::<String>,
+                        Some(format!(
+                            "execution {execution_arn} still running after {polls} polls"
+                        )),
                     )),
-                    operations,
+                    operations: fold_history(&events),
                     invocations: polls,
-                };
+                });
             }
             polls += 1;
             tokio::time::sleep(self.poll_interval).await;
-            match client
-                .get_durable_execution()
-                .durable_execution_arn(&execution_arn)
-                .include_execution_data(true)
-                .send()
+            let out = api
+                .send_get_durable_execution(&execution_arn)
                 .await
-            {
-                Ok(out) if matches!(out.status(), ExecutionStatus::Running) => {}
-                Ok(out) => break out,
-                Err(e) => return cloud_failure(format!("get_durable_execution: {e}")),
+                .map_err(aws_error)?;
+            if !matches!(out.status(), WireExecutionStatus::Running) {
+                break out;
             }
         };
 
         // 3. Retrieve the recorded history and fold it into operations.
-        let (operations, invocation_events) =
-            match self.fetch_history(&client, &execution_arn).await {
-                Ok(events) => (fold_history(&events), invocations_from_history(&events)),
-                Err(msg) => return cloud_failure(msg),
-            };
+        let events = fetch_history(api, &execution_arn).await?;
+        let invocation_events = invocations_from_history(&events);
         let invocations = if invocation_events == 0 {
             polls
         } else {
             invocation_events
         };
 
-        // 4. Map the terminal status into a TestResult disposition.
-        match terminal.status() {
-            ExecutionStatus::Succeeded => match deserialize_output::<O>(terminal.result()) {
-                Ok(output) => TestResult {
-                    disposition: Disposition::Succeeded,
-                    output: Some(output),
-                    error_type: None,
-                    error_message: None,
-                    operations,
-                    invocations,
+        // 4. Map the terminal status into the result. The history's terminal
+        // execution event is the source of the output and the error. The
+        // `GetDurableExecution` output is used only when the history holds
+        // no terminal execution event.
+        let status = ExecutionStatus::from_wire(terminal.status());
+        let history_end = terminal_execution_event(&events);
+        let (output, error) = if status == ExecutionStatus::Succeeded {
+            let payload = match history_end.and_then(Event::execution_succeeded_details) {
+                Some(details) => event_result_payload(details.result()),
+                None => terminal.result().map(ToOwned::to_owned),
+            };
+            let output = deserialize_output::<O>(payload.as_deref())
+                .map_err(|e| TestRunnerError::OutputDeserialization(Arc::new(e)))?;
+            (Some(output), None)
+        } else {
+            let status_name = status.to_string();
+            let error_object = history_end
+                .and_then(terminal_event_error)
+                .or_else(|| terminal.error());
+            let error = error_object.map_or_else(
+                || {
+                    crate::WireError::new(
+                        Some(status_name.as_str()),
+                        Some(format!("execution ended with status {status_name}")),
+                    )
                 },
-                Err(msg) => TestResult {
-                    disposition: Disposition::Failed,
-                    output: None,
-                    error_type: Some("SerializationFailed".to_owned()),
-                    error_message: Some(msg),
-                    operations,
-                    invocations,
+                |err| {
+                    crate::WireError::new(
+                        Some(err.error_type().unwrap_or(&status_name)),
+                        Some(err.error_message().unwrap_or_default()),
+                    )
+                    .with_error_data(err.error_data())
+                    .with_stack_trace(err.stack_trace().to_vec())
                 },
-            },
-            other => {
-                let status_name = execution_status_str(other);
-                let (error_type, error_message) = terminal.error().map_or_else(
-                    || {
-                        (
-                            status_name.to_owned(),
-                            format!("execution ended with status {status_name}"),
-                        )
-                    },
-                    |err| {
-                        (
-                            err.error_type().unwrap_or(status_name).to_owned(),
-                            err.error_message().unwrap_or_default().to_owned(),
-                        )
-                    },
-                );
-                TestResult {
-                    disposition: Disposition::Failed,
-                    output: None,
-                    error_type: Some(error_type),
-                    error_message: Some(error_message),
-                    operations,
-                    invocations,
-                }
-            }
+            );
+            (None, Some(error))
+        };
+        Ok(TestResult {
+            status,
+            output,
+            error,
+            operations: fold_history(&events),
+            invocations,
+        })
+    }
+
+    /// The `Invoke` request for `payload`, with this runner's function,
+    /// qualifier and invocation type.
+    fn build_invoke(&self, payload: Vec<u8>) -> InvokeRequest {
+        InvokeRequest {
+            function_name: self.function_name.clone(),
+            qualifier: self.qualifier.clone(),
+            invocation_type: self.invocation_type.to_wire(),
+            payload,
         }
     }
 
-    /// Builds the Lambda client from the ambient config, honoring an explicit
-    /// region override.
-    async fn build_client(&self) -> aws_sdk_lambda::Client {
+    /// The client `run` uses: the configured
+    /// [`lambda_client`](Self::lambda_client) unchanged, or else one built
+    /// from the ambient config with the [`region`](Self::region) override.
+    async fn resolve_client(&self) -> crate::LambdaClient {
+        if let Some(client) = &self.lambda_client {
+            return client.clone();
+        }
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(region) = &self.region {
             loader = loader.region(aws_sdk_lambda::config::Region::new(region.clone()));
         }
         let config = loader.load().await;
-        aws_sdk_lambda::Client::new(&config)
+        crate::LambdaClient::new(&config)
     }
+}
 
-    /// Best-effort history fetch used on the suspended (budget-exhausted) path.
-    async fn fetch_operations(
-        &self,
-        client: &aws_sdk_lambda::Client,
-        execution_arn: &str,
-    ) -> Vec<TestOperation> {
-        (self.fetch_history(client, execution_arn).await)
-            .map(|events| fold_history(&events))
-            .unwrap_or_default()
-    }
-
-    /// Retrieves the full paginated execution history.
-    async fn fetch_history(
-        &self,
-        client: &aws_sdk_lambda::Client,
-        execution_arn: &str,
-    ) -> Result<Vec<Event>, String> {
-        let mut events = Vec::new();
-        let mut marker: Option<String> = None;
-        loop {
-            let mut builder = client
-                .get_durable_execution_history()
-                .durable_execution_arn(execution_arn)
-                .include_execution_data(true);
-            if let Some(m) = &marker {
-                builder = builder.marker(m);
-            }
-            match builder.send().await {
-                Ok(out) => {
-                    events.extend(out.events().iter().cloned());
-                    match out.next_marker() {
-                        Some(m) if !m.is_empty() => marker = Some(m.to_owned()),
-                        _ => break,
-                    }
-                }
-                Err(e) => return Err(format!("get_durable_execution_history: {e}")),
-            }
+/// Retrieves the full paginated execution history.
+async fn fetch_history<A: CloudApi>(
+    api: &A,
+    execution_arn: &str,
+) -> Result<Vec<Event>, TestRunnerError> {
+    let mut events = Vec::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let out = api
+            .send_get_durable_execution_history(execution_arn, marker.as_deref())
+            .await
+            .map_err(aws_error)?;
+        events.extend(out.events().iter().cloned());
+        match out.next_marker() {
+            Some(m) if !m.is_empty() => marker = Some(m.to_owned()),
+            _ => break,
         }
-        Ok(events)
     }
+    Ok(events)
 }
 
-/// Builds a failed [`TestResult`] for a `CloudRunner` infrastructure error.
-fn cloud_failure<O>(message: String) -> TestResult<O> {
-    TestResult {
-        disposition: Disposition::Failed,
-        output: None,
-        error_type: Some(CLOUD_RUNNER_ERROR.to_owned()),
-        error_message: Some(message),
-        operations: Vec::new(),
-        invocations: 0,
-    }
+/// The last terminal execution event of the history: `ExecutionSucceeded`,
+/// `ExecutionFailed`, `ExecutionTimedOut` or `ExecutionStopped`.
+fn terminal_execution_event(events: &[Event]) -> Option<&Event> {
+    events.iter().rev().find(|e| {
+        matches!(
+            e.event_type(),
+            Some(
+                EventType::ExecutionSucceeded
+                    | EventType::ExecutionFailed
+                    | EventType::ExecutionTimedOut
+                    | EventType::ExecutionStopped
+            )
+        )
+    })
 }
 
-/// Deserializes the handler output from the `GetDurableExecution` result
+/// The error object a failed, timed-out or stopped terminal execution event
+/// carries.
+fn terminal_event_error(event: &Event) -> Option<&ErrorObject> {
+    let error = match event.event_type() {
+        Some(EventType::ExecutionFailed) => event
+            .execution_failed_details()
+            .and_then(aws_sdk_lambda::types::ExecutionFailedDetails::error),
+        Some(EventType::ExecutionTimedOut) => event
+            .execution_timed_out_details()
+            .and_then(aws_sdk_lambda::types::ExecutionTimedOutDetails::error),
+        Some(EventType::ExecutionStopped) => event
+            .execution_stopped_details()
+            .and_then(aws_sdk_lambda::types::ExecutionStoppedDetails::error),
+        _ => None,
+    };
+    error.and_then(aws_sdk_lambda::types::EventError::payload)
+}
+
+/// Deserializes the handler output from the terminal result
 /// string, tolerating a double-encoded (JSON-string-of-JSON) payload.
-fn deserialize_output<O: DeserializeOwned>(result: Option<&str>) -> Result<O, String> {
+fn deserialize_output<O: DeserializeOwned>(result: Option<&str>) -> Result<O, serde_json::Error> {
     let raw = result.unwrap_or("null");
     match serde_json::from_str::<O>(raw) {
         Ok(value) => Ok(value),
         Err(first) => match serde_json::from_str::<String>(raw) {
-            Ok(inner) => serde_json::from_str::<O>(&inner)
-                .map_err(|e| format!("deserialize handler output: {e}")),
-            Err(_) => Err(format!("deserialize handler output: {first}")),
+            Ok(inner) => serde_json::from_str::<O>(&inner),
+            Err(_) => Err(first),
         },
     }
 }
@@ -2073,7 +2622,7 @@ fn deserialize_output<O: DeserializeOwned>(result: Option<&str>) -> Result<O, St
 /// Only operation-scoped events (`Step*`, `Wait*`, `Context*`, `Callback*`,
 /// `ChainedInvoke*`) with an operation id are folded; execution-level and
 /// `InvocationCompleted` events are ignored here (the execution outcome comes
-/// from `GetDurableExecution`, the invocation count from
+/// from [`terminal_execution_event`], the invocation count from
 /// [`invocations_from_history`]). Later transitions overwrite earlier ones, so
 /// the recorded `status` is the operation's terminal-or-latest state.
 fn fold_history(events: &[Event]) -> Vec<TestOperation> {
@@ -2090,17 +2639,7 @@ fn fold_history(events: &[Event]) -> Vec<TestOperation> {
 
         let op = acc.entry(id.to_owned()).or_insert_with(|| {
             order.push(id.to_owned());
-            TestOperation {
-                id: id.to_owned(),
-                kind,
-                sub_type: None,
-                status: OperationStatus::Started,
-                result: None,
-                error_type: None,
-                error_message: None,
-                attempt: 0,
-                name: None,
-            }
+            TestOperation::started(id.to_owned(), kind)
         });
 
         if op.sub_type.is_none() {
@@ -2108,6 +2647,9 @@ fn fold_history(events: &[Event]) -> Vec<TestOperation> {
         }
         if op.name.is_none() {
             op.name = event.name().map(ToOwned::to_owned);
+        }
+        if op.parent_id.is_none() {
+            op.parent_id = event.parent_id().map(ToOwned::to_owned);
         }
         apply_event_transition(op, event);
     }
@@ -2119,12 +2661,21 @@ fn fold_history(events: &[Event]) -> Vec<TestOperation> {
 /// accumulating operation record.
 fn apply_event_transition(op: &mut TestOperation, event: &Event) {
     match event.event_type() {
+        Some(EventType::WaitStarted) => {
+            op.status = OperationStatus::Started;
+            op.wait.duration = event
+                .wait_started_details()
+                .and_then(|d| u64::try_from(d.duration()).ok())
+                .map(std::time::Duration::from_secs);
+        }
+        Some(EventType::CallbackStarted) => {
+            op.status = OperationStatus::Started;
+            op.callback.callback_id = event
+                .callback_started_details()
+                .map(|d| d.callback_id().to_owned());
+        }
         Some(
-            EventType::StepStarted
-            | EventType::WaitStarted
-            | EventType::ContextStarted
-            | EventType::CallbackStarted
-            | EventType::ChainedInvokeStarted,
+            EventType::StepStarted | EventType::ContextStarted | EventType::ChainedInvokeStarted,
         ) => op.status = OperationStatus::Started,
         Some(EventType::StepSucceeded) => {
             op.status = OperationStatus::Succeeded;
@@ -2136,7 +2687,6 @@ fn apply_event_transition(op: &mut TestOperation, event: &Event) {
         Some(EventType::StepFailed) => {
             op.status = OperationStatus::Failed;
             if let Some(details) = event.step_failed_details() {
-                set_error(op, details.error());
                 set_attempt(op, details.retry_details());
             }
         }
@@ -2148,29 +2698,11 @@ fn apply_event_transition(op: &mut TestOperation, event: &Event) {
                 .context_succeeded_details()
                 .and_then(|d| event_result_payload(d.result()));
         }
-        Some(EventType::ContextFailed) => {
-            op.status = OperationStatus::Failed;
-            if let Some(details) = event.context_failed_details() {
-                set_error(op, details.error());
-            }
-        }
         Some(EventType::CallbackSucceeded) => {
             op.status = OperationStatus::Succeeded;
             op.result = event
                 .callback_succeeded_details()
                 .and_then(|d| event_result_payload(d.result()));
-        }
-        Some(EventType::CallbackFailed) => {
-            op.status = OperationStatus::Failed;
-            if let Some(details) = event.callback_failed_details() {
-                set_error(op, details.error());
-            }
-        }
-        Some(EventType::CallbackTimedOut) => {
-            op.status = OperationStatus::TimedOut;
-            if let Some(details) = event.callback_timed_out_details() {
-                set_error(op, details.error());
-            }
         }
         Some(EventType::ChainedInvokeSucceeded) => {
             op.status = OperationStatus::Succeeded;
@@ -2178,15 +2710,36 @@ fn apply_event_transition(op: &mut TestOperation, event: &Event) {
                 .chained_invoke_succeeded_details()
                 .and_then(|d| event_result_payload(d.result()));
         }
-        Some(EventType::ChainedInvokeFailed) => {
-            op.status = OperationStatus::Failed;
-            if let Some(details) = event.chained_invoke_failed_details() {
-                set_error(op, details.error());
-            }
+        Some(
+            EventType::ContextFailed | EventType::CallbackFailed | EventType::ChainedInvokeFailed,
+        ) => op.status = OperationStatus::Failed,
+        Some(EventType::CallbackTimedOut | EventType::ChainedInvokeTimedOut) => {
+            op.status = OperationStatus::TimedOut;
         }
-        Some(EventType::ChainedInvokeTimedOut) => op.status = OperationStatus::TimedOut,
         Some(EventType::ChainedInvokeStopped) => op.status = OperationStatus::Stopped,
         _ => {}
+    }
+    set_error(op, operation_event_error(event));
+}
+
+/// The `EventError` an operation event carries.
+///
+/// Eight operation event types carry an error: `StepFailed`, `WaitCancelled`,
+/// `ContextFailed`, `CallbackFailed`, `CallbackTimedOut`,
+/// `ChainedInvokeFailed`, `ChainedInvokeTimedOut` and `ChainedInvokeStopped`.
+/// Every one of them is read here, in one place. So a transition arm cannot
+/// set the status of an error-bearing event and drop its error record.
+fn operation_event_error(event: &Event) -> Option<&aws_sdk_lambda::types::EventError> {
+    match event.event_type()? {
+        EventType::StepFailed => event.step_failed_details()?.error(),
+        EventType::WaitCancelled => event.wait_cancelled_details()?.error(),
+        EventType::ContextFailed => event.context_failed_details()?.error(),
+        EventType::CallbackFailed => event.callback_failed_details()?.error(),
+        EventType::CallbackTimedOut => event.callback_timed_out_details()?.error(),
+        EventType::ChainedInvokeFailed => event.chained_invoke_failed_details()?.error(),
+        EventType::ChainedInvokeTimedOut => event.chained_invoke_timed_out_details()?.error(),
+        EventType::ChainedInvokeStopped => event.chained_invoke_stopped_details()?.error(),
+        _ => None,
     }
 }
 
@@ -2197,26 +2750,39 @@ fn event_result_payload(result: Option<&aws_sdk_lambda::types::EventResult>) -> 
         .map(ToOwned::to_owned)
 }
 
-/// Records the error type/message from an optional `EventError` onto the op.
+/// Records the error of the current event onto the op: its type, message,
+/// error data and stack trace, or no error.
+///
+/// The op holds the error of its latest event. A retried step records
+/// `StepFailed` with an error and then `StepStarted` or `StepSucceeded`
+/// without one. Keeping the earlier error would report a succeeded step with
+/// the error of a failed attempt. So an event without an error clears it, as
+/// `LocalRunner` clears a stored error when a retry starts.
 fn set_error(op: &mut TestOperation, error: Option<&aws_sdk_lambda::types::EventError>) {
-    if let Some(obj) = error.and_then(aws_sdk_lambda::types::EventError::payload) {
-        op.error_type = obj.error_type().map(ToOwned::to_owned);
-        op.error_message = obj.error_message().map(ToOwned::to_owned);
-    }
+    op.error = error
+        .and_then(aws_sdk_lambda::types::EventError::payload)
+        .map(wire_error_from_object);
+}
+
+/// The wire error of a service `ErrorObject`, with every field.
+fn wire_error_from_object(obj: &ErrorObject) -> crate::WireError {
+    crate::WireError::new(obj.error_type(), obj.error_message())
+        .with_error_data(obj.error_data())
+        .with_stack_trace(obj.stack_trace().to_vec())
 }
 
 /// Records the number of completed retries from an optional `RetryDetails`
 /// onto the op.
 ///
 /// `RetryDetails.current_attempt` is 1-based (a first-try success reports `1`),
-/// while [`TestOperation::attempt`] reports completed retries (a first-try
+/// while [`StepDetails::attempt`] reports completed retries (a first-try
 /// success reports `0`). The two are reconciled here so both runners agree.
 /// `saturating_sub` guards the conversion: a non-positive `current_attempt`
 /// maps to `0` without underflow.
 fn set_attempt(op: &mut TestOperation, retry: Option<&aws_sdk_lambda::types::RetryDetails>) {
     if let Some(details) = retry {
         let one_based = u32::try_from(details.current_attempt().max(0)).unwrap_or(0);
-        op.attempt = one_based.saturating_sub(1);
+        op.step.attempt = one_based.saturating_sub(1);
     }
 }
 
@@ -2254,18 +2820,6 @@ fn invocations_from_history(events: &[Event]) -> usize {
         .iter()
         .filter(|e| matches!(e.event_type(), Some(EventType::InvocationCompleted)))
         .count()
-}
-
-/// Human-readable execution status for a failed/terminal disposition.
-fn execution_status_str(status: &ExecutionStatus) -> &'static str {
-    match *status {
-        ExecutionStatus::Succeeded => "Succeeded",
-        ExecutionStatus::Failed => "Failed",
-        ExecutionStatus::TimedOut => "TimedOut",
-        ExecutionStatus::Stopped => "Stopped",
-        ExecutionStatus::Running => "Running",
-        _ => "Unknown",
-    }
 }
 
 /// A stored operation record inside the in-memory backend.
@@ -2560,16 +3114,26 @@ impl Backend {
         state
             .ops
             .iter()
-            .map(|op| TestOperation {
-                id: op.id.clone(),
-                kind: op.kind,
-                sub_type: op.sub_type.clone(),
-                status: op.status,
-                result: op.result.clone(),
-                error_type: op.error_type.clone(),
-                error_message: op.error_message.clone(),
-                attempt: u32::try_from(op.attempt.max(0)).unwrap_or(0),
-                name: op.name.clone(),
+            .map(|op| {
+                let mut out = TestOperation::started(op.id.clone(), op.kind);
+                out.sub_type.clone_from(&op.sub_type);
+                out.status = op.status;
+                out.result.clone_from(&op.result);
+                out.error = has_error_fields(op).then(|| {
+                    crate::WireError::new(op.error_type.as_deref(), op.error_message.as_deref())
+                        .with_error_data(op.error_data.as_deref())
+                        .with_stack_trace(op.stack_trace.clone())
+                });
+                out.name.clone_from(&op.name);
+                out.parent_id.clone_from(&op.parent_id);
+                out.step.attempt = u32::try_from(op.attempt.max(0)).unwrap_or(0);
+                out.wait.duration = op
+                    .wait_seconds
+                    .and_then(|seconds| u64::try_from(seconds).ok())
+                    .map(std::time::Duration::from_secs);
+                out.callback.callback_id.clone_from(&op.callback_id);
+                out.context.replay_children = op.replay_children;
+                out
             })
             .collect()
     }
@@ -3222,7 +3786,7 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
 
     match stored.kind {
         OperationKind::Step => {
-            let mut sd = StepDetails::builder().attempt(stored.attempt);
+            let mut sd = WireStepDetails::builder().attempt(stored.attempt);
             if let Some(r) = &stored.result {
                 sd = sd.result(r);
             }
@@ -3232,7 +3796,7 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
             builder = builder.step_details(sd.build());
         }
         OperationKind::Context => {
-            let mut cd = ContextDetails::builder();
+            let mut cd = WireContextDetails::builder();
             if let Some(r) = &stored.result {
                 cd = cd.result(r);
             }
@@ -3245,7 +3809,7 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
             builder = builder.context_details(cd.build());
         }
         OperationKind::Callback => {
-            let mut cb = CallbackDetails::builder();
+            let mut cb = WireCallbackDetails::builder();
             if let Some(id) = &stored.callback_id {
                 cb = cb.callback_id(id);
             }
@@ -3592,6 +4156,15 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// The completed retries of a step operation, from its details, or
+    /// `None` for another kind.
+    fn step_attempt(op: &TestOperation) -> Option<u32> {
+        match op.details() {
+            TestOperationDetails::Step(step) => Some(step.attempt()),
+            _ => None,
+        }
+    }
+
     #[test]
     fn local_runner_failed_envelope_without_type_reads_error() {
         let response = serde_json::json!({
@@ -3603,10 +4176,24 @@ mod tests {
             operations: Vec::new(),
             invocations: 1,
         }
-        .into_test_result();
+        .into_test_result()
+        .expect("runner");
         assert!(result.is_failure());
         assert_eq!(result.error_type(), Some("Error"));
         assert_eq!(result.error_message(), Some("boom"));
+
+        // An `Error` object with neither type nor message reads type `Error`
+        // and an empty message.
+        let response = serde_json::json!({ "Status": "FAILED", "Error": {} });
+        let result: TestResult<()> = RawRun {
+            end: RawEnd::Failed(envelope_wire_error(&response)),
+            operations: Vec::new(),
+            invocations: 1,
+        }
+        .into_test_result()
+        .expect("runner");
+        assert_eq!(result.error_type(), Some("Error"));
+        assert_eq!(result.error_message(), Some(""));
     }
 
     // 1. step success
@@ -3624,7 +4211,8 @@ mod tests {
                 },
                 41_i32,
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&42));
@@ -3651,7 +4239,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_failure());
         // The execution record re-records the step failure's own recorded
@@ -3706,7 +4295,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&7));
@@ -3749,7 +4339,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_failure());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
@@ -3800,7 +4391,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&99));
@@ -3814,7 +4406,11 @@ mod tests {
             .find(|o| o.name() == Some("flaky"))
             .expect("flaky step recorded");
         assert!(step.succeeded());
-        assert_eq!(step.attempt(), 2, "backend recorded 2 completed retries");
+        assert_eq!(
+            step_attempt(step),
+            Some(2),
+            "backend recorded 2 completed retries"
+        );
     }
 
     // 2. wait then resume across invocations
@@ -3839,7 +4435,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output().map(String::as_str), Some("before-after"));
@@ -3894,7 +4491,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(
@@ -3934,7 +4532,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(
@@ -3975,7 +4574,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(
             !result.is_success(),
@@ -4051,7 +4651,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(
@@ -4085,7 +4686,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&30));
@@ -4126,7 +4728,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&3));
@@ -4151,7 +4754,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&60));
@@ -4214,7 +4818,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         // The predicate fired after two settles; item 2 never started.
@@ -4294,7 +4899,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         // All three items are in the result, the lone failure never
@@ -4392,7 +4998,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         // The predicate fired at item 0's committed failure; items 0 and 1
@@ -4482,7 +5089,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         // No trigger fired on either side of the suspension: all three
@@ -4528,7 +5136,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(
             !result.is_success(),
@@ -4574,7 +5183,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&true));
@@ -4593,7 +5203,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_failure());
         assert_eq!(result.error_type(), Some("CallbackError"));
@@ -4613,7 +5224,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output().map(String::as_str), Some("hi"));
@@ -4653,7 +5265,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(
@@ -4696,7 +5309,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(
@@ -4724,7 +5338,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output().map(String::as_str), Some("a=A b=B"));
@@ -4755,7 +5370,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&vec![1, 2]));
@@ -4776,7 +5392,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(
@@ -4802,7 +5419,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_suspended(), "{:?}", result.error_message());
     }
@@ -4818,7 +5436,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_suspended(), "{:?}", result.error_message());
         let message = result.error_message().unwrap_or_default();
@@ -4876,7 +5495,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(
@@ -4896,7 +5516,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_failure(), "{:?}", result.error_message());
         let cb_op = callback_record(&result);
@@ -4930,6 +5551,7 @@ mod tests {
                     (),
                 )
                 .await
+                .expect("runner")
         };
 
         let data_only = read(CallbackFailure::default().with_error_data("d")).await;
@@ -4964,7 +5586,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&true));
@@ -5015,7 +5638,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(
             result.is_success(),
@@ -5051,6 +5675,7 @@ mod tests {
                     (),
                 )
                 .await
+                .expect("runner")
         };
 
         let first = make_run().await;
@@ -5159,11 +5784,29 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].status(), OperationStatus::Succeeded);
         assert_eq!(
-            ops[0].attempt(),
-            1,
+            step_attempt(&ops[0]),
+            Some(1),
             "current_attempt 2 normalizes to 1 completed retry"
         );
         assert_eq!(ops[0].result(), Some("99"));
+        assert!(
+            ops[0].error().is_none(),
+            "the failed attempt's error is not kept: {:?}",
+            ops[0].error()
+        );
+
+        // A retry that has started but not finished is `Started`, with no
+        // error: the `StepStarted` arm sets the status, and its event
+        // carries no error.
+        let ops = fold_history(
+            &events[..2]
+                .iter()
+                .chain(&events[..1])
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(ops[0].status(), OperationStatus::Started);
+        assert!(ops[0].error().is_none(), "{:?}", ops[0].error());
     }
 
     #[test]
@@ -5189,8 +5832,8 @@ mod tests {
                 .build(),
         ];
         assert_eq!(
-            fold_history(&first_try)[0].attempt(),
-            0,
+            step_attempt(&fold_history(&first_try)[0]),
+            Some(0),
             "first-try success (current_attempt=1) is 0 completed retries"
         );
 
@@ -5214,8 +5857,8 @@ mod tests {
                 .build(),
         ];
         assert_eq!(
-            fold_history(&zero)[0].attempt(),
-            0,
+            step_attempt(&fold_history(&zero)[0]),
+            Some(0),
             "non-positive current_attempt saturates to 0"
         );
     }
@@ -5253,6 +5896,13 @@ mod tests {
         assert_eq!(ops[0].kind(), OperationKind::Callback);
         assert_eq!(ops[0].status(), OperationStatus::TimedOut);
         assert_eq!(ops[0].error_type(), Some("CallbackError"));
+        // The `CallbackStarted` event above has no `CallbackStartedDetails`,
+        // so the callback reports no ID.
+        assert!(
+            matches!(ops[0].details(), TestOperationDetails::Callback(c) if c.callback_id().is_none()),
+            "{:?}",
+            ops[0].details()
+        );
     }
 
     #[test]
@@ -5288,6 +5938,11 @@ mod tests {
         let ops = fold_history(&events);
         assert_eq!(ops.len(), 1, "only the operation-scoped event is folded");
         assert_eq!(ops[0].kind(), OperationKind::Step);
+        assert_eq!(
+            step_attempt(&ops[0]),
+            Some(0),
+            "a step event without RetryDetails reports attempt 0"
+        );
         assert_eq!(invocations_from_history(&events), 2);
     }
 
@@ -5321,6 +5976,70 @@ mod tests {
         assert_eq!(ids, vec!["first", "second"]);
         assert_eq!(ops[1].kind(), OperationKind::Wait);
         assert_eq!(ops[1].status(), OperationStatus::Succeeded);
+        // The `WaitStarted` event above has no `WaitStartedDetails`, so the
+        // wait reports no duration.
+        assert!(
+            matches!(ops[1].details(), TestOperationDetails::Wait(w) if w.duration().is_none()),
+            "{:?}",
+            ops[1].details()
+        );
+    }
+
+    /// An operation whose history holds no started event keeps the
+    /// defaults of [`TestOperation::started`]: attempt 0, no wait duration,
+    /// no callback ID, and `replay_children` false.
+    #[test]
+    fn fold_history_defaults_without_started_events() {
+        let events = vec![
+            Event::builder()
+                .event_type(EventType::StepSucceeded)
+                .id("s")
+                .event_id(1)
+                .build(),
+            Event::builder()
+                .event_type(EventType::WaitSucceeded)
+                .id("w")
+                .event_id(2)
+                .build(),
+            Event::builder()
+                .event_type(EventType::CallbackSucceeded)
+                .id("cb")
+                .event_id(3)
+                .build(),
+            Event::builder()
+                .event_type(EventType::ContextSucceeded)
+                .id("c")
+                .event_id(4)
+                .build(),
+        ];
+        let ops = fold_history(&events);
+        assert_eq!(ops.len(), 4);
+        assert!(
+            matches!(ops[0].details(), TestOperationDetails::Step(s) if s.attempt() == 0),
+            "{:?}",
+            ops[0].details()
+        );
+        assert!(
+            matches!(ops[1].details(), TestOperationDetails::Wait(w) if w.duration().is_none()),
+            "{:?}",
+            ops[1].details()
+        );
+        assert!(
+            matches!(ops[2].details(), TestOperationDetails::Callback(c) if c.callback_id().is_none()),
+            "{:?}",
+            ops[2].details()
+        );
+        assert!(
+            matches!(ops[3].details(), TestOperationDetails::Context(c) if !c.replay_children()),
+            "{:?}",
+            ops[3].details()
+        );
+        for op in &ops {
+            assert_eq!(op.status(), OperationStatus::Succeeded);
+            assert!(op.result().is_none(), "{:?}", op.result());
+            assert!(op.error().is_none(), "{:?}", op.error());
+            assert!(op.parent_id().is_none());
+        }
     }
 
     #[test]
@@ -5332,10 +6051,55 @@ mod tests {
         assert!(deserialize_output::<i32>(Some("not json")).is_err());
     }
 
+    /// A payload that is not a JSON string returns the error of decoding it
+    /// as `O`. A JSON string whose content does not decode returns the
+    /// error of decoding that content.
+    #[test]
+    fn deserialize_output_returns_the_error_of_the_decoded_value() {
+        let plain = deserialize_output::<u32>(Some("{\"a\":1}")).expect_err("not a u32");
+        let expected = serde_json::from_str::<u32>("{\"a\":1}").expect_err("not a u32");
+        assert_eq!(plain.to_string(), expected.to_string());
+
+        let inner = deserialize_output::<u32>(Some("\"x\"")).expect_err("not a u32");
+        let expected = serde_json::from_str::<u32>("x").expect_err("not a u32");
+        assert_eq!(inner.to_string(), expected.to_string());
+    }
+
     #[test]
     fn execution_status_and_family_maps() {
-        assert_eq!(execution_status_str(&ExecutionStatus::TimedOut), "TimedOut");
-        assert_eq!(execution_status_str(&ExecutionStatus::Stopped), "Stopped");
+        // Each row: the service status, the status it maps to, and the
+        // `Display` text of that status. Every variant appears once.
+        let rows = [
+            (
+                WireExecutionStatus::Running,
+                ExecutionStatus::Running,
+                "Running",
+            ),
+            (
+                WireExecutionStatus::Succeeded,
+                ExecutionStatus::Succeeded,
+                "Succeeded",
+            ),
+            (
+                WireExecutionStatus::Failed,
+                ExecutionStatus::Failed,
+                "Failed",
+            ),
+            (
+                WireExecutionStatus::TimedOut,
+                ExecutionStatus::TimedOut,
+                "TimedOut",
+            ),
+            (
+                WireExecutionStatus::Stopped,
+                ExecutionStatus::Stopped,
+                "Stopped",
+            ),
+        ];
+        for (wire, status, text) in rows {
+            assert_eq!(ExecutionStatus::from_wire(&wire), status, "{wire:?}");
+            assert_eq!(status.to_string(), text);
+        }
         assert_eq!(
             event_family_op_type(Some(&EventType::ChainedInvokeSucceeded)),
             Some(OperationKind::ChainedInvoke)
@@ -5378,7 +6142,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_success(), "{:?}", result.error_message());
         let ops = result.operations();
         assert_eq!(ops.len(), 1);
@@ -5405,14 +6170,6 @@ mod tests {
         assert!(!e.is_retryable());
         assert!(backend.snapshot_operations().is_empty());
         assert_eq!(backend.current_token(), token);
-    }
-
-    #[test]
-    fn cloud_failure_is_reported_as_failure() {
-        let result: TestResult<i32> = cloud_failure("boom".to_owned());
-        assert!(result.is_failure());
-        assert_eq!(result.error_type(), Some("CloudRunnerError"));
-        assert_eq!(result.output(), None);
     }
 
     // Pagination tests
@@ -5456,7 +6213,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(
             result.is_success(),
@@ -5515,7 +6273,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(
             result.is_success(),
@@ -5558,7 +6317,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(
             result.is_success(),
@@ -5593,7 +6353,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(
             result.is_success(),
@@ -5664,7 +6425,11 @@ mod tests {
                 .r#type(OperationType::Step)
                 .status(WireOperationStatus::Succeeded)
                 .start_timestamp(DateTime::from_secs(0))
-                .step_details(StepDetails::builder().result("\"page1-result\"").build())
+                .step_details(
+                    WireStepDetails::builder()
+                        .result("\"page1-result\"")
+                        .build(),
+                )
                 .build()
                 .unwrap(),
             Operation::builder()
@@ -5672,7 +6437,11 @@ mod tests {
                 .r#type(OperationType::Step)
                 .status(WireOperationStatus::Succeeded)
                 .start_timestamp(DateTime::from_secs(0))
-                .step_details(StepDetails::builder().result("\"page2-result\"").build())
+                .step_details(
+                    WireStepDetails::builder()
+                        .result("\"page2-result\"")
+                        .build(),
+                )
                 .build()
                 .unwrap(),
         ];
@@ -5767,7 +6536,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(
@@ -5800,7 +6570,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(
             result.is_failure(),
@@ -5846,7 +6617,8 @@ mod tests {
                 },
                 "null".to_owned(),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&2));
@@ -5889,7 +6661,8 @@ mod tests {
                 },
                 "null".to_owned(),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(
@@ -5988,7 +6761,8 @@ mod tests {
                 coalescing_probe_handler(Arc::clone(&baseline_execs)),
                 "null".to_owned(),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(baseline.is_success(), "{:?}", baseline.error_message());
         assert_eq!(baseline.output(), Some(&42));
 
@@ -6007,7 +6781,8 @@ mod tests {
                 coalescing_probe_handler(Arc::clone(&coalesced_execs)),
                 "null".to_owned(),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(coalesced.is_success(), "{:?}", coalesced.error_message());
         assert_eq!(
             coalesced.output(),
@@ -6064,7 +6839,8 @@ mod tests {
         ));
         let result = runner
             .run_on_backend(Arc::clone(&backend), handler, "null".to_owned())
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_success(), "{:?}", result.error_message());
         backend.checkpoint_call_count()
     }
@@ -6172,7 +6948,8 @@ mod tests {
         let result = LocalRunner::new()
             .options(lambda_options)
             .run(one_step_handler, ())
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&42));
 
@@ -6187,7 +6964,8 @@ mod tests {
         let result = LocalRunner::new()
             .options(client_options)
             .run(one_step_handler, ())
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&42));
         assert_eq!(
@@ -6221,7 +6999,8 @@ mod tests {
                 },
                 41_i32,
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&42));
@@ -6260,7 +7039,8 @@ mod tests {
                 coalescing_probe_handler(Arc::clone(&execs)),
                 "null".to_owned(),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(
@@ -6376,7 +7156,8 @@ mod tests {
                 },
                 "null".to_owned(),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert_eq!(
             body_runs.load(Ordering::SeqCst),
@@ -6439,7 +7220,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_failure());
         // The execution record re-records the child-context record's own
@@ -6485,7 +7267,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output().map(String::as_str), Some("fast"));
@@ -6537,7 +7320,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output().map(String::as_str), Some("waited"));
@@ -6570,7 +7354,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output().map(String::as_str), Some("b"));
@@ -6592,7 +7377,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output().map(String::as_str), Some("done"));
@@ -6621,7 +7407,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output().map(String::as_str), Some("cb"));
@@ -6846,8 +7633,9 @@ mod tests {
             runner.run_on_backend(Arc::clone(&backend), one_step_handler, "null".to_owned()),
             steps
         );
+        let delayed = delayed.expect("runner");
 
-        let baseline = unbatched().run(one_step_handler, ()).await;
+        let baseline = unbatched().run(one_step_handler, ()).await.expect("runner");
         assert!(delayed.is_success(), "{:?}", delayed.error_message());
         assert_eq!(delayed.output(), baseline.output());
         assert_eq!(
@@ -6868,7 +7656,9 @@ mod tests {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime builds");
-            let result = runtime.block_on(LocalRunner::new().run(one_step_handler, ()));
+            let result = runtime
+                .block_on(LocalRunner::new().run(one_step_handler, ()))
+                .expect("runner");
             // The receiver is gone only after the test already failed.
             let _ = sender.send((result.is_success(), result.output().copied()));
         });
@@ -6905,7 +7695,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&vec![153_600, 153_600]));
@@ -6941,7 +7732,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&307_200));
@@ -6960,7 +7752,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
 
         assert!(result.is_suspended(), "{:?}", result.error_message());
         let callback = result
@@ -7246,7 +8039,7 @@ mod tests {
         assert_eq!(
             context
                 .context_details()
-                .and_then(ContextDetails::replay_children),
+                .and_then(WireContextDetails::replay_children),
             Some(true)
         );
     }
@@ -7273,7 +8066,7 @@ mod tests {
         assert_eq!(
             context
                 .context_details()
-                .and_then(ContextDetails::replay_children),
+                .and_then(WireContextDetails::replay_children),
             Some(true)
         );
     }
@@ -7308,7 +8101,7 @@ mod tests {
         assert_eq!(
             get_state_ops(&backend).await[0]
                 .context_details()
-                .and_then(ContextDetails::replay_children),
+                .and_then(WireContextDetails::replay_children),
             None
         );
 
@@ -7327,7 +8120,7 @@ mod tests {
         assert_eq!(
             ops[0]
                 .context_details()
-                .and_then(ContextDetails::replay_children),
+                .and_then(WireContextDetails::replay_children),
             None
         );
     }
@@ -7648,7 +8441,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_failure(), "{:?}", result.error_message());
         let message = result.error_message().unwrap_or_default();
         assert!(
@@ -7669,7 +8463,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_success(), "{:?}", result.error_message());
     }
 
@@ -7880,7 +8675,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert_eq!(result.output(), Some(&42), "{:?}", result.error_message());
         let op = invoke_record(&result);
         assert_eq!(op.status(), OperationStatus::Succeeded);
@@ -7904,7 +8700,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert_eq!(
             result.output(),
             Some(&Some("PaymentError".to_owned())),
@@ -7933,7 +8730,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert_eq!(
             result.output(),
             Some(&(Some("Error".to_owned()), Some("boom".to_owned()))),
@@ -7953,7 +8751,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_success(), "{:?}", result.error_message());
         let op = invoke_record(&result);
         assert_eq!(op.status(), OperationStatus::Succeeded);
@@ -7970,7 +8769,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_failure(), "{:?}", result.error_message());
         let message = result.error_message().unwrap_or_default();
         assert!(
@@ -7995,7 +8795,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         let (error_type, message) = result.into_output().expect("the handler succeeds");
         assert_eq!(error_type.as_deref(), Some("Error"));
         let message = message.unwrap_or_default();
@@ -8019,7 +8820,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         let message = result
             .into_output()
             .expect("the handler succeeds")
@@ -8045,7 +8847,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -8072,7 +8875,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert_eq!(
             result.output().map(String::as_str),
             Some("invoked"),
@@ -8097,7 +8901,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert_eq!(result.output(), Some(&4), "{:?}", result.error_message());
         let op = invoke_record(&result);
         assert_eq!(op.status(), OperationStatus::Succeeded);
@@ -8131,7 +8936,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert_eq!(
             result.output(),
             Some(&(
@@ -8166,7 +8972,8 @@ mod tests {
         let result = LocalRunner::new()
             .register_durable_function("slow", slow_target)
             .run(invoke_slow, ())
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.invocation_count(), 2);
         assert_eq!(result.operations().len(), 1);
@@ -8189,7 +8996,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.invocation_count(), 3);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -8210,7 +9018,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_suspended(), "{:?}", result.error_message());
         assert_eq!(invoke_record(&result).status(), OperationStatus::Started);
         let message = result.error_message().unwrap_or_default();
@@ -8244,7 +9053,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_suspended(), "{:?}", result.error_message());
         assert_eq!(result.invocation_count(), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -8268,7 +9078,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         let message = result
             .into_output()
             .expect("the handler succeeds")
@@ -8285,7 +9096,8 @@ mod tests {
             .max_invocations(2)
             .register_durable_function("slow", slow_target)
             .run(invoke_slow, ())
-            .await;
+            .await
+            .expect("runner");
         assert!(result.is_suspended(), "{:?}", result.error_message());
         assert_eq!(invoke_record(&result).status(), OperationStatus::Started);
         let message = result.error_message().unwrap_or_default();
@@ -8317,7 +9129,7 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await?;
         assert_eq!(result.output(), Some(&200), "{:?}", result.error_message());
         Ok(())
     }
@@ -8336,7 +9148,8 @@ mod tests {
                 },
                 (),
             )
-            .await;
+            .await
+            .expect("runner");
         assert_eq!(result.output(), Some(&2), "{:?}", result.error_message());
     }
 
@@ -8389,7 +9202,8 @@ mod tests {
                 Err::<(), BoxError>(error_with_stack_trace())
             })
             .run(invoke_fail_wire, ())
-            .await;
+            .await
+            .expect("runner");
         assert_eq!(
             result.output(),
             Some(&expected_fail_wire()),
@@ -8405,7 +9219,8 @@ mod tests {
                 Err::<(), BoxError>(error_with_stack_trace())
             })
             .run(invoke_fail_wire, ())
-            .await;
+            .await
+            .expect("runner");
         assert_eq!(
             result.output(),
             Some(&expected_fail_wire()),
@@ -8472,5 +9287,1830 @@ mod tests {
         assert_eq!(envelope_updated_ids(&backend), serde_json::json!([]));
         assert!(backend.record_invoke_outcome("i", NestedOutcome::Succeeded(Some("2".to_owned()))));
         assert_eq!(envelope_updated_ids(&backend), serde_json::json!(["i"]));
+    }
+
+    // Operation detail, execution status and runner errors
+
+    /// The only operation with `kind` in `result`.
+    fn only_of_kind<O>(result: &TestResult<O>, kind: OperationKind) -> &TestOperation {
+        let mut ops = result.operations().iter().filter(|op| op.kind() == kind);
+        let op = ops.next().expect("an operation of the kind");
+        assert!(ops.next().is_none(), "one operation of kind {kind}");
+        op
+    }
+
+    #[tokio::test]
+    async fn wait_reports_duration() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    ctx.wait(std::time::Duration::from_secs(10)).await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let op = only_of_kind(&result, OperationKind::Wait);
+        assert!(matches!(
+            op.details(),
+            TestOperationDetails::Wait(w) if w.duration() == Some(std::time::Duration::from_secs(10))
+        ));
+    }
+
+    #[tokio::test]
+    async fn callback_reports_id_seen_by_handler() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let cb = ctx.create_callback::<u32>().await?;
+                    Ok::<_, BoxError>(cb.id().to_owned())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let output = result.output().expect("the handler returned the ID");
+        let op = only_of_kind(&result, OperationKind::Callback);
+        assert!(
+            matches!(
+                op.details(),
+                TestOperationDetails::Callback(c) if c.callback_id() == Some(output.as_str())
+            ),
+            "{:?}",
+            op.details()
+        );
+    }
+
+    #[tokio::test]
+    async fn map_children_are_its_items() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let out = ctx
+                        .map(vec![1_u32, 2, 3], |child, item, _idx| async move {
+                            Ok(child.step(move |_| async move { Ok(item) }).await?)
+                        })
+                        .name("items")
+                        .await?;
+                    Ok::<_, BoxError>(out)
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let map_op = result.operation("items").expect("the map operation");
+        let children: Vec<_> = result.children(map_op).collect();
+        assert_eq!(children.len(), 3);
+        for child in children {
+            assert_eq!(child.sub_type(), Some("MapIteration"));
+            assert_eq!(child.parent_id(), Some(map_op.id()));
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_children_is_reported() {
+        // The handler of `oversized_map_result_replays_with_replay_children`.
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let items = ctx
+                        .map(vec![0_u32, 1], |child, _item, _idx| async move {
+                            let big = child
+                                .step(|_| async { Ok("x".repeat(150 * 1024)) })
+                                .name("big")
+                                .await?;
+                            Ok(big)
+                        })
+                        .name("oversized")
+                        .await?;
+                    ctx.wait(std::time::Duration::from_secs(1))
+                        .name("pause")
+                        .await?;
+                    Ok::<_, BoxError>(items.iter().map(String::len).collect::<Vec<_>>())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let replay_children = |op: &TestOperation| match op.details() {
+            TestOperationDetails::Context(c) => Some(c.replay_children()),
+            _ => None,
+        };
+        let map_op = result.operation("oversized").expect("the map operation");
+        assert_eq!(replay_children(map_op), Some(true));
+        let items: Vec<_> = result.children(map_op).collect();
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert_eq!(replay_children(item), Some(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn details_match_kind() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_u32) }).name("s").await?;
+                    ctx.wait(std::time::Duration::from_secs(1)).await?;
+                    let _cb = ctx.create_callback::<u32>().await?;
+                    ctx.run_in_child_context(|_child| async { Ok(2_u32) })
+                        .await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let kinds: BTreeSet<String> = result
+            .operations()
+            .iter()
+            .map(|op| op.kind().to_string())
+            .collect();
+        assert_eq!(kinds.len(), 4, "{kinds:?}");
+        for op in result.operations() {
+            let matches = match op.details() {
+                TestOperationDetails::Execution => op.kind() == OperationKind::Execution,
+                TestOperationDetails::Context(_) => op.kind() == OperationKind::Context,
+                TestOperationDetails::Step(_) => op.kind() == OperationKind::Step,
+                TestOperationDetails::Wait(_) => op.kind() == OperationKind::Wait,
+                TestOperationDetails::Callback(_) => op.kind() == OperationKind::Callback,
+                TestOperationDetails::ChainedInvoke => op.kind() == OperationKind::ChainedInvoke,
+            };
+            assert!(matches, "{:?} has details {:?}", op.kind(), op.details());
+        }
+        let step = result.operation("s").expect("the step");
+        assert!(!matches!(step.details(), TestOperationDetails::Wait(_)));
+    }
+
+    #[test]
+    fn details_variant_for_every_kind() {
+        // The name of a `details()` variant, so each row below can state
+        // the one variant its kind must give.
+        fn variant(details: TestOperationDetails<'_>) -> &'static str {
+            match details {
+                TestOperationDetails::Execution => "Execution",
+                TestOperationDetails::Context(_) => "Context",
+                TestOperationDetails::Step(_) => "Step",
+                TestOperationDetails::Wait(_) => "Wait",
+                TestOperationDetails::Callback(_) => "Callback",
+                TestOperationDetails::ChainedInvoke => "ChainedInvoke",
+            }
+        }
+        let rows = [
+            (OperationKind::Execution, "Execution"),
+            (OperationKind::Context, "Context"),
+            (OperationKind::Step, "Step"),
+            (OperationKind::Wait, "Wait"),
+            (OperationKind::Callback, "Callback"),
+            (OperationKind::ChainedInvoke, "ChainedInvoke"),
+        ];
+        for (kind, expected) in rows {
+            let op = TestOperation::started("id".to_owned(), kind);
+            assert_eq!(variant(op.details()), expected, "{kind:?}");
+        }
+    }
+
+    /// The error a step body or a handler returns in the error data tests.
+    fn bad_error() -> BoxError {
+        Box::new(crate::TypedError::with_type("Bad", "no").with_error_data("{\"a\":1}"))
+    }
+
+    #[tokio::test]
+    async fn failed_step_error_keeps_data() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let _ = ctx
+                        .step(|_| async { Err::<u32, BoxError>(bad_error()) })
+                        .name("bad")
+                        .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                        .await;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let error = result
+            .operation("bad")
+            .and_then(TestOperation::error)
+            .expect("the step error");
+        assert_eq!(error.error_type(), Some("Bad"));
+        assert!(error.error_message().is_some_and(|m| m.contains("no")));
+        assert_eq!(error.error_data(), Some("{\"a\":1}"));
+    }
+
+    #[tokio::test]
+    async fn test_result_error_keeps_data() {
+        let result = LocalRunner::new()
+            .run(
+                |(), _ctx: DurableContext| async move { Err::<(), BoxError>(bad_error()) },
+                (),
+            )
+            .await
+            .expect("runner");
+        let error = result.error().expect("the execution error");
+        assert_eq!(error.error_type(), Some("Bad"));
+        assert_eq!(error.error_data(), Some("{\"a\":1}"));
+    }
+
+    #[tokio::test]
+    async fn operation_lookup_by_name() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_u32) }).name("process").await?;
+                    ctx.step(|_| async { Ok(2_u32) }).name("charge").await?;
+                    ctx.step(|_| async { Ok(3_u32) }).name("process").await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let ops = result.operations();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(
+            result.operation("charge").map(TestOperation::id),
+            Some(ops[1].id())
+        );
+        assert_eq!(result.operations_named("process").count(), 2);
+        assert_eq!(
+            result
+                .operations_named("process")
+                .nth(1)
+                .map(TestOperation::id),
+            Some(ops[2].id())
+        );
+        assert!(result.operation("absent").is_none());
+    }
+
+    #[test]
+    fn fold_history_fills_detail_fields() {
+        use aws_sdk_lambda::types::{CallbackStartedDetails, WaitStartedDetails};
+        let events = vec![
+            Event::builder()
+                .event_type(EventType::WaitStarted)
+                .id("w")
+                .parent_id("p")
+                .event_id(1)
+                .wait_started_details(
+                    WaitStartedDetails::builder()
+                        .duration(10)
+                        .scheduled_end_timestamp(DateTime::from_secs(10))
+                        .build()
+                        .expect("wait details"),
+                )
+                .build(),
+            Event::builder()
+                .event_type(EventType::CallbackStarted)
+                .id("c")
+                .event_id(2)
+                .callback_started_details(
+                    CallbackStartedDetails::builder()
+                        .callback_id("cb-1")
+                        .build()
+                        .expect("callback details"),
+                )
+                .build(),
+            Event::builder()
+                .event_type(EventType::StepStarted)
+                .id("s")
+                .event_id(3)
+                .build(),
+            Event::builder()
+                .event_type(EventType::StepFailed)
+                .id("s")
+                .event_id(4)
+                .step_failed_details(
+                    StepFailedDetails::builder()
+                        .error(
+                            EventError::builder()
+                                .payload(
+                                    ErrorObject::builder()
+                                        .error_type("Bad")
+                                        .error_message("no")
+                                        .error_data("{\"a\":1}")
+                                        .stack_trace("frame")
+                                        .build(),
+                                )
+                                .build(),
+                        )
+                        .retry_details(RetryDetails::builder().current_attempt(1).build())
+                        .build(),
+                )
+                .build(),
+            // A later event of the wait carries no parent. The parent of the
+            // first event stays.
+            Event::builder()
+                .event_type(EventType::WaitSucceeded)
+                .id("w")
+                .event_id(5)
+                .build(),
+            Event::builder()
+                .event_type(EventType::ContextStarted)
+                .id("x")
+                .event_id(6)
+                .build(),
+        ];
+        let ops = fold_history(&events);
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0].parent_id(), Some("p"));
+        // No history event carries `ReplayChildren`, so a folded context
+        // reports `false`.
+        assert!(
+            matches!(
+                ops[3].details(),
+                TestOperationDetails::Context(c) if !c.replay_children()
+            ),
+            "{:?}",
+            ops[3].details()
+        );
+        assert!(matches!(
+            ops[0].details(),
+            TestOperationDetails::Wait(w) if w.duration() == Some(std::time::Duration::from_secs(10))
+        ));
+        assert!(matches!(
+            ops[1].details(),
+            TestOperationDetails::Callback(c) if c.callback_id() == Some("cb-1")
+        ));
+        let error = ops[2].error().expect("the step error");
+        assert_eq!(error.error_type(), Some("Bad"));
+        assert_eq!(error.error_data(), Some("{\"a\":1}"));
+        assert_eq!(error.stack_trace(), ["frame".to_owned()]);
+    }
+
+    /// One event per operation event type that carries an `EventError`,
+    /// with its operation's kind and the status the event sets. Each error
+    /// has every field set.
+    fn error_event_rows() -> Vec<(Event, OperationKind, OperationStatus)> {
+        use aws_sdk_lambda::types::{
+            CallbackFailedDetails, ChainedInvokeFailedDetails, ChainedInvokeStoppedDetails,
+            ChainedInvokeTimedOutDetails, ContextFailedDetails, WaitCancelledDetails,
+        };
+        let error = || {
+            EventError::builder()
+                .payload(
+                    ErrorObject::builder()
+                        .error_type("Kind")
+                        .error_message("msg")
+                        .error_data("{\"d\":1}")
+                        .stack_trace("f1")
+                        .stack_trace("f2")
+                        .build(),
+                )
+                .build()
+        };
+        let base =
+            |event_type: EventType| Event::builder().event_type(event_type).id("op").event_id(1);
+        vec![
+            (
+                base(EventType::StepFailed)
+                    .step_failed_details(StepFailedDetails::builder().error(error()).build())
+                    .build(),
+                OperationKind::Step,
+                OperationStatus::Failed,
+            ),
+            (
+                base(EventType::WaitCancelled)
+                    .wait_cancelled_details(WaitCancelledDetails::builder().error(error()).build())
+                    .build(),
+                OperationKind::Wait,
+                OperationStatus::Cancelled,
+            ),
+            (
+                base(EventType::ContextFailed)
+                    .context_failed_details(ContextFailedDetails::builder().error(error()).build())
+                    .build(),
+                OperationKind::Context,
+                OperationStatus::Failed,
+            ),
+            (
+                base(EventType::CallbackFailed)
+                    .callback_failed_details(
+                        CallbackFailedDetails::builder().error(error()).build(),
+                    )
+                    .build(),
+                OperationKind::Callback,
+                OperationStatus::Failed,
+            ),
+            (
+                base(EventType::CallbackTimedOut)
+                    .callback_timed_out_details(
+                        CallbackTimedOutDetails::builder().error(error()).build(),
+                    )
+                    .build(),
+                OperationKind::Callback,
+                OperationStatus::TimedOut,
+            ),
+            (
+                base(EventType::ChainedInvokeFailed)
+                    .chained_invoke_failed_details(
+                        ChainedInvokeFailedDetails::builder().error(error()).build(),
+                    )
+                    .build(),
+                OperationKind::ChainedInvoke,
+                OperationStatus::Failed,
+            ),
+            (
+                base(EventType::ChainedInvokeTimedOut)
+                    .chained_invoke_timed_out_details(
+                        ChainedInvokeTimedOutDetails::builder()
+                            .error(error())
+                            .build(),
+                    )
+                    .build(),
+                OperationKind::ChainedInvoke,
+                OperationStatus::TimedOut,
+            ),
+            (
+                base(EventType::ChainedInvokeStopped)
+                    .chained_invoke_stopped_details(
+                        ChainedInvokeStoppedDetails::builder()
+                            .error(error())
+                            .build(),
+                    )
+                    .build(),
+                OperationKind::ChainedInvoke,
+                OperationStatus::Stopped,
+            ),
+        ]
+    }
+
+    /// Every operation event type that carries an `EventError` keeps the
+    /// whole record: type, message, data and stack trace. One row per type.
+    #[test]
+    fn fold_history_keeps_every_event_error_field() {
+        for (event, kind, status) in error_event_rows() {
+            let label = format!("{:?}", event.event_type());
+            let ops = fold_history(std::slice::from_ref(&event));
+            assert_eq!(ops.len(), 1, "{label}");
+            assert_eq!(ops[0].kind(), kind, "{label}");
+            assert_eq!(ops[0].status(), status, "{label}");
+            assert!(ops[0].error().is_some(), "{label}: no error");
+            let wire = ops[0].error().expect("the folded error");
+            assert_eq!(wire.error_type(), Some("Kind"), "{label}");
+            assert_eq!(wire.error_message(), Some("msg"), "{label}");
+            assert_eq!(wire.error_data(), Some("{\"d\":1}"), "{label}");
+            assert_eq!(
+                wire.stack_trace(),
+                ["f1".to_owned(), "f2".to_owned()],
+                "{label}"
+            );
+            assert_eq!(ops[0].error_type(), Some("Kind"), "{label}");
+            assert_eq!(ops[0].error_message(), Some("msg"), "{label}");
+        }
+    }
+
+    /// Asserts the predicates of `result` agree with its status.
+    fn assert_predicates_agree<O>(result: &TestResult<O>) {
+        let status = result.status();
+        assert_eq!(result.is_success(), status == ExecutionStatus::Succeeded);
+        assert_eq!(
+            result.is_failure(),
+            matches!(
+                status,
+                ExecutionStatus::Failed | ExecutionStatus::TimedOut | ExecutionStatus::Stopped
+            )
+        );
+        assert_eq!(result.is_suspended(), status == ExecutionStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn local_status_matches_predicates() {
+        let ok = LocalRunner::new()
+            .run(
+                |(), _ctx: DurableContext| async { Ok::<_, BoxError>(1_u32) },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert_eq!(ok.status(), ExecutionStatus::Succeeded);
+        assert_predicates_agree(&ok);
+
+        let failed = LocalRunner::new()
+            .run(
+                |(), _ctx: DurableContext| async { Err::<u32, BoxError>("boom".into()) },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert_eq!(failed.status(), ExecutionStatus::Failed);
+        assert_predicates_agree(&failed);
+
+        let running = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let cb = ctx.create_callback::<u32>().await?;
+                    cb.result().await.map_err(BoxError::from)
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert_eq!(running.status(), ExecutionStatus::Running);
+        assert_predicates_agree(&running);
+    }
+
+    /// An event whose `Serialize` always fails.
+    #[derive(Debug, Deserialize)]
+    struct Unserializable;
+
+    impl Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("refuse"))
+        }
+    }
+
+    /// Asserts that `source` is a `serde_json::Error` with the text of `e`.
+    fn assert_json_source(err: &TestRunnerError, e: &serde_json::Error) {
+        let source = std::error::Error::source(err).expect("a source");
+        let json = source
+            .downcast_ref::<serde_json::Error>()
+            .expect("the source is the serde_json error");
+        assert_eq!(json.to_string(), e.to_string());
+    }
+
+    #[tokio::test]
+    async fn event_serialization_is_a_runner_error() {
+        let err = LocalRunner::new()
+            .run(
+                |_e: Unserializable, _ctx: DurableContext| async { Ok::<_, BoxError>(()) },
+                Unserializable,
+            )
+            .await
+            .expect_err("a runner error");
+        let e = match &err {
+            TestRunnerError::EventSerialization(e) => Some(e),
+            _ => None,
+        }
+        .expect("an EventSerialization error");
+        assert_eq!(
+            err.to_string(),
+            format!("durable: test runner: event serialization failed: {e}")
+        );
+        assert!(e.to_string().contains("refuse"), "{e}");
+        assert_json_source(&err, e);
+    }
+
+    #[tokio::test]
+    async fn output_decode_is_a_runner_error() {
+        // `run` ties the handler output to `O`, so the test drives a handler
+        // that returns a string and decodes its output as `u32`.
+        let runner = LocalRunner::new();
+        let err = runner
+            .drive(
+                Arc::new(runner.new_backend()),
+                |(), _ctx: DurableContext| async { Ok::<_, BoxError>("text".to_owned()) },
+                "null".to_owned(),
+            )
+            .await
+            .expect("the run ends")
+            .into_test_result::<u32>()
+            .expect_err("a runner error");
+        let e = match &err {
+            TestRunnerError::OutputDeserialization(e) => Some(e),
+            _ => None,
+        }
+        .expect("an OutputDeserialization error");
+        assert_eq!(
+            err.to_string(),
+            format!("durable: test runner: output deserialization failed: {e}")
+        );
+        assert_json_source(&err, e);
+    }
+
+    #[tokio::test]
+    async fn unexpected_envelope_is_a_runner_error() {
+        let runner = LocalRunner::new();
+        let service = |_event: lambda_runtime::LambdaEvent<crate::InvocationPayload>| {
+            let response: crate::BoxedInvocationFuture = Box::pin(async {
+                Ok(crate::InvocationResponse(
+                    serde_json::json!({ "Status": "WEIRD" }),
+                ))
+            });
+            response
+        };
+        let err = runner
+            .drive_service(Arc::new(runner.new_backend()), service, "null".to_owned())
+            .await
+            .expect_err("a runner error");
+        assert!(
+            matches!(&err, TestRunnerError::UnexpectedEnvelope(Some(s)) if s == "WEIRD"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "durable: test runner: unexpected response envelope status: Some(\"WEIRD\")"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn invocation_type_default_is_request_response() {
+        let request = CloudRunner::new("f").build_invoke(Vec::new());
+        assert_eq!(request.invocation_type, WireInvocationType::RequestResponse);
+    }
+
+    #[test]
+    fn invoke_request_uses_configured_type() {
+        let request = CloudRunner::new("f")
+            .invocation_type(InvocationType::Event)
+            .build_invoke(Vec::new());
+        assert_eq!(request.invocation_type, WireInvocationType::Event);
+    }
+
+    #[tokio::test]
+    async fn configured_client_is_used() {
+        let config = aws_sdk_lambda::Config::builder()
+            .region(aws_sdk_lambda::config::Region::new("eu-west-3"))
+            .behavior_version(aws_sdk_lambda::config::BehaviorVersion::latest())
+            .build();
+        let client = crate::LambdaClient::from_conf(config);
+        let resolved = CloudRunner::new("f")
+            .lambda_client(client)
+            .region("us-east-1")
+            .resolve_client()
+            .await;
+        assert_eq!(
+            resolved.config().region().map(ToString::to_string),
+            Some("eu-west-3".to_owned())
+        );
+    }
+
+    /// A Lambda error with a fixed text.
+    #[derive(Debug)]
+    struct FakeError(&'static str);
+
+    impl std::fmt::Display for FakeError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for FakeError {}
+
+    type GetExecutionOutput =
+        aws_sdk_lambda::operation::get_durable_execution::GetDurableExecutionOutput;
+    type GetHistoryOutput =
+        aws_sdk_lambda::operation::get_durable_execution_history::GetDurableExecutionHistoryOutput;
+    type InvokeOutput = aws_sdk_lambda::operation::invoke::InvokeOutput;
+
+    /// The execution ARN every scripted invoke returns.
+    const ARN: &str = "fake-execution-arn";
+
+    /// One recorded `GetDurableExecution` request, with the tokio time it
+    /// was made.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ExecutionCall {
+        execution_arn: String,
+        at: tokio::time::Instant,
+    }
+
+    /// One recorded `GetDurableExecutionHistory` request.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HistoryCall {
+        execution_arn: String,
+        marker: Option<String>,
+    }
+
+    /// One scripted history page: its events and its next marker.
+    type HistoryPage = Result<(Vec<Event>, Option<String>), BoxError>;
+
+    /// A recording [`CloudApi`] that returns scripted outputs and errors,
+    /// and records the arguments of every request.
+    ///
+    /// `Invoke` returns `invoke` once. `GetDurableExecution` pops the front
+    /// of `executions`, and returns `RUNNING` once the queue is empty.
+    /// `GetDurableExecutionHistory` pops the front of `history`; a request
+    /// with no scripted page left panics, so a test notices an extra fetch.
+    struct FakeApi {
+        invoke: Mutex<Option<Result<InvokeOutput, BoxError>>>,
+        executions: Mutex<std::collections::VecDeque<Result<GetExecutionOutput, BoxError>>>,
+        history: Mutex<std::collections::VecDeque<HistoryPage>>,
+        invokes: Mutex<Vec<InvokeRequest>>,
+        execution_calls: Mutex<Vec<ExecutionCall>>,
+        history_calls: Mutex<Vec<HistoryCall>>,
+    }
+
+    impl FakeApi {
+        /// A fake whose invoke returns [`ARN`] and whose history is one
+        /// empty page.
+        fn new() -> Self {
+            Self {
+                invoke: Mutex::new(Some(Ok(invoke_output(Some(ARN))))),
+                executions: Mutex::new(std::collections::VecDeque::new()),
+                history: Mutex::new(std::collections::VecDeque::from([Ok((Vec::new(), None))])),
+                invokes: Mutex::new(Vec::new()),
+                execution_calls: Mutex::new(Vec::new()),
+                history_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_invoke(self, invoke: Result<InvokeOutput, BoxError>) -> Self {
+            *self.invoke.lock().expect("lock") = Some(invoke);
+            self
+        }
+
+        fn with_execution(self, execution: Result<GetExecutionOutput, BoxError>) -> Self {
+            self.executions.lock().expect("lock").push_back(execution);
+            self
+        }
+
+        /// Replaces the scripted history with one page that has no next
+        /// marker.
+        fn with_history(self, history: Result<Vec<Event>, BoxError>) -> Self {
+            self.with_history_pages(vec![history.map(|events| (events, None))])
+        }
+
+        /// Replaces the scripted history with `pages`, served in order.
+        fn with_history_pages(self, pages: Vec<HistoryPage>) -> Self {
+            *self.history.lock().expect("lock") = pages.into();
+            self
+        }
+
+        fn execution_call_count(&self) -> usize {
+            self.execution_calls.lock().expect("lock").len()
+        }
+
+        fn invokes(&self) -> Vec<InvokeRequest> {
+            self.invokes.lock().expect("lock").clone()
+        }
+
+        fn execution_arns(&self) -> Vec<String> {
+            self.execution_calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|call| call.execution_arn.clone())
+                .collect()
+        }
+
+        fn history_calls(&self) -> Vec<HistoryCall> {
+            self.history_calls.lock().expect("lock").clone()
+        }
+    }
+
+    impl CloudApi for FakeApi {
+        #[expect(clippy::unused_async_trait_impl)] // reason: the fake answers at once
+        async fn send_invoke(&self, request: InvokeRequest) -> Result<InvokeOutput, BoxError> {
+            self.invokes.lock().expect("lock").push(request);
+            self.invoke
+                .lock()
+                .expect("lock")
+                .take()
+                .expect("one invoke per run")
+        }
+
+        #[expect(clippy::unused_async_trait_impl)] // reason: the fake answers at once
+        async fn send_get_durable_execution(
+            &self,
+            execution_arn: &str,
+        ) -> Result<GetExecutionOutput, BoxError> {
+            self.execution_calls
+                .lock()
+                .expect("lock")
+                .push(ExecutionCall {
+                    execution_arn: execution_arn.to_owned(),
+                    at: tokio::time::Instant::now(),
+                });
+            self.executions
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(execution_output(WireExecutionStatus::Running, None)))
+        }
+
+        #[expect(clippy::unused_async_trait_impl)] // reason: the fake answers at once
+        async fn send_get_durable_execution_history(
+            &self,
+            execution_arn: &str,
+            marker: Option<&str>,
+        ) -> Result<GetHistoryOutput, BoxError> {
+            self.history_calls.lock().expect("lock").push(HistoryCall {
+                execution_arn: execution_arn.to_owned(),
+                marker: marker.map(ToOwned::to_owned),
+            });
+            let (events, next_marker) = self
+                .history
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .expect("a scripted history page")?;
+            Ok(GetHistoryOutput::builder()
+                .set_events(Some(events))
+                .set_next_marker(next_marker)
+                .build()
+                .expect("history output"))
+        }
+    }
+
+    /// The history requests of one fetch of a single page.
+    fn one_history_call() -> Vec<HistoryCall> {
+        vec![HistoryCall {
+            execution_arn: ARN.to_owned(),
+            marker: None,
+        }]
+    }
+
+    fn invoke_output(arn: Option<&str>) -> InvokeOutput {
+        InvokeOutput::builder()
+            .status_code(200)
+            .set_durable_execution_arn(arn.map(ToOwned::to_owned))
+            .build()
+    }
+
+    fn execution_output(status: WireExecutionStatus, result: Option<&str>) -> GetExecutionOutput {
+        GetExecutionOutput::builder()
+            .durable_execution_arn(ARN)
+            .durable_execution_name("name")
+            .function_arn("function")
+            .start_timestamp(DateTime::from_secs(0))
+            .status(status)
+            .set_result(result.map(ToOwned::to_owned))
+            .build()
+            .expect("execution output")
+    }
+
+    fn fake_error(text: &'static str) -> BoxError {
+        Box::new(FakeError(text))
+    }
+
+    /// Asserts `err` is an `Aws` error whose source is the fake error `text`.
+    fn assert_aws(err: &TestRunnerError, text: &str) {
+        assert!(matches!(err, TestRunnerError::Aws(_)), "{err:?}");
+        let display = err.to_string();
+        assert!(
+            display.starts_with("durable: test runner: AWS call failed: ")
+                && display.ends_with(text),
+            "{display}"
+        );
+        let source = std::error::Error::source(err).expect("a source");
+        assert_eq!(
+            source.downcast_ref::<FakeError>().map(|e| e.0),
+            Some(text),
+            "the source is the fake error"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fold_terminal_timed_out_status() {
+        let api = FakeApi::new()
+            .with_execution(Ok(execution_output(WireExecutionStatus::TimedOut, None)));
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(result.status(), ExecutionStatus::TimedOut);
+        assert!(result.is_failure());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_invoke_error_is_aws() {
+        let api = FakeApi::new().with_invoke(Err(fake_error("fake invoke")));
+        let err = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect_err("a runner error");
+        assert_aws(&err, "fake invoke");
+        assert_eq!(api.invokes().len(), 1);
+        assert_eq!(api.execution_call_count(), 0);
+        assert_eq!(api.history_calls(), Vec::<HistoryCall>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_get_execution_error_is_aws() {
+        let api = FakeApi::new().with_execution(Err(fake_error("fake get")));
+        let err = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect_err("a runner error");
+        assert_aws(&err, "fake get");
+        assert_eq!(api.execution_arns(), vec![ARN.to_owned()]);
+        assert_eq!(api.history_calls(), Vec::<HistoryCall>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_get_history_error_is_aws() {
+        let api = FakeApi::new()
+            .with_execution(Ok(execution_output(
+                WireExecutionStatus::Succeeded,
+                Some("5"),
+            )))
+            .with_history(Err(fake_error("fake history")));
+        let err = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect_err("a runner error");
+        assert_aws(&err, "fake history");
+        assert_eq!(api.execution_arns(), vec![ARN.to_owned()]);
+        assert_eq!(api.history_calls(), one_history_call());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_missing_execution_arn_is_runner_error() {
+        let api = FakeApi::new().with_invoke(Ok(invoke_output(None)));
+        let err = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect_err("a runner error");
+        assert!(matches!(err, TestRunnerError::NoExecutionArn), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "durable: test runner: the invoke response carried no DurableExecutionArn"
+        );
+        assert_eq!(api.execution_call_count(), 0);
+        assert_eq!(api.history_calls(), Vec::<HistoryCall>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_ignores_invoke_function_error_and_payload_for_both_invocation_types() {
+        use aws_sdk_lambda::types::{EventResult, ExecutionSucceededDetails};
+        for invocation_type in [InvocationType::RequestResponse, InvocationType::Event] {
+            let invoke = InvokeOutput::builder()
+                .status_code(200)
+                .durable_execution_arn(ARN)
+                .function_error("Unhandled")
+                .payload(Blob::new("{\"bogus\":true}"))
+                .build();
+            let history = vec![
+                Event::builder()
+                    .event_type(EventType::ExecutionSucceeded)
+                    .event_id(1)
+                    .execution_succeeded_details(
+                        ExecutionSucceededDetails::builder()
+                            .result(EventResult::builder().payload("5").build())
+                            .build(),
+                    )
+                    .build(),
+            ];
+            let api = FakeApi::new()
+                .with_invoke(Ok(invoke))
+                // The GetDurableExecution result differs from the history's,
+                // so the assertion below shows the history wins.
+                .with_execution(Ok(execution_output(
+                    WireExecutionStatus::Succeeded,
+                    Some("7"),
+                )))
+                .with_history(Ok(history));
+            let result = CloudRunner::new("f")
+                .invocation_type(invocation_type)
+                .run_with::<_, u32>(&api, Vec::new())
+                .await
+                .expect("runner");
+            assert_eq!(
+                result.status(),
+                ExecutionStatus::Succeeded,
+                "{invocation_type:?}"
+            );
+            assert_eq!(result.output(), Some(&5), "{invocation_type:?}");
+            assert_eq!(api.invokes().len(), 1);
+            assert_eq!(api.invokes()[0].invocation_type, invocation_type.to_wire());
+            assert_eq!(api.execution_arns(), vec![ARN.to_owned()]);
+            assert_eq!(api.history_calls(), one_history_call());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_reads_terminal_error_from_history_for_each_terminal_event() {
+        use aws_sdk_lambda::types::{
+            EventError, ExecutionFailedDetails, ExecutionStoppedDetails, ExecutionTimedOutDetails,
+        };
+        let history_error = || {
+            EventError::builder()
+                .payload(
+                    ErrorObject::builder()
+                        .error_type("HistoryError")
+                        .error_message("from history")
+                        .error_data("{\"code\":1}")
+                        .stack_trace("frame-1")
+                        .stack_trace("frame-2")
+                        .build(),
+                )
+                .build()
+        };
+        let failed = Event::builder()
+            .event_type(EventType::ExecutionFailed)
+            .execution_failed_details(
+                ExecutionFailedDetails::builder()
+                    .error(history_error())
+                    .build(),
+            );
+        let timed_out = Event::builder()
+            .event_type(EventType::ExecutionTimedOut)
+            .execution_timed_out_details(
+                ExecutionTimedOutDetails::builder()
+                    .error(history_error())
+                    .build(),
+            );
+        let stopped = Event::builder()
+            .event_type(EventType::ExecutionStopped)
+            .execution_stopped_details(
+                ExecutionStoppedDetails::builder()
+                    .error(history_error())
+                    .build(),
+            );
+        let rows = [
+            (WireExecutionStatus::Failed, ExecutionStatus::Failed, failed),
+            (
+                WireExecutionStatus::TimedOut,
+                ExecutionStatus::TimedOut,
+                timed_out,
+            ),
+            (
+                WireExecutionStatus::Stopped,
+                ExecutionStatus::Stopped,
+                stopped,
+            ),
+        ];
+        for (wire_status, status, event) in rows {
+            // GetDurableExecution reports a different error, so the
+            // assertions below show the history's terminal event wins.
+            let execution = GetExecutionOutput::builder()
+                .durable_execution_arn(ARN)
+                .durable_execution_name("name")
+                .function_arn("function")
+                .start_timestamp(DateTime::from_secs(0))
+                .status(wire_status)
+                .error(
+                    ErrorObject::builder()
+                        .error_type("ExecutionError")
+                        .error_message("from GetDurableExecution")
+                        .error_data("{\"code\":2}")
+                        .stack_trace("other-frame")
+                        .build(),
+                )
+                .build()
+                .expect("execution output");
+            let api = FakeApi::new()
+                .with_execution(Ok(execution))
+                .with_history(Ok(vec![event.event_id(1).build()]));
+            let result = CloudRunner::new("f")
+                .run_with::<_, u32>(&api, Vec::new())
+                .await
+                .expect("runner");
+            assert_eq!(result.status(), status);
+            assert!(result.is_failure(), "{status}");
+            let error = result.error().expect("an error");
+            assert_eq!(error.error_type(), Some("HistoryError"), "{status}");
+            assert_eq!(error.error_message(), Some("from history"), "{status}");
+            assert_eq!(error.error_data(), Some("{\"code\":1}"), "{status}");
+            assert_eq!(error.stack_trace(), ["frame-1", "frame-2"], "{status}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_poll_interval_defaults_to_one_second() {
+        let api = FakeApi::new()
+            .with_execution(Ok(execution_output(WireExecutionStatus::Running, None)))
+            .with_execution(Ok(execution_output(WireExecutionStatus::Running, None)))
+            .with_execution(Ok(execution_output(
+                WireExecutionStatus::Succeeded,
+                Some("1"),
+            )));
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect("runner");
+        assert!(result.is_success());
+        let calls = api.execution_calls.lock().expect("lock").clone();
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls.iter().all(|call| call.execution_arn == ARN),
+            "{calls:?}"
+        );
+        for pair in calls.windows(2) {
+            assert_eq!(pair[1].at - pair[0].at, std::time::Duration::from_secs(1));
+        }
+        assert_eq!(api.history_calls(), one_history_call());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_default_polling_continues_past_150_fetches() {
+        let mut api = FakeApi::new();
+        for _ in 0..200 {
+            api = api.with_execution(Ok(execution_output(WireExecutionStatus::Running, None)));
+        }
+        let api = api.with_execution(Ok(execution_output(
+            WireExecutionStatus::Succeeded,
+            Some("1"),
+        )));
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(result.status(), ExecutionStatus::Succeeded);
+        assert_eq!(api.execution_call_count(), 201);
+        assert_eq!(api.history_calls(), one_history_call());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_configured_poll_limit_ends_running() {
+        let api = FakeApi::new();
+        let result = CloudRunner::new("f")
+            .max_poll_attempts(3)
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(result.status(), ExecutionStatus::Running);
+        assert_eq!(api.execution_arns(), vec![ARN.to_owned(); 3]);
+        assert_eq!(api.history_calls(), one_history_call());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_records_request_arguments_and_follows_history_markers() {
+        use aws_sdk_lambda::types::{EventResult, ExecutionSucceededDetails, StepStartedDetails};
+        let step_started = |id: &str| {
+            Event::builder()
+                .event_type(EventType::StepStarted)
+                .event_id(1)
+                .id(id)
+                .name(id)
+                .step_started_details(StepStartedDetails::builder().build())
+                .build()
+        };
+        let succeeded = Event::builder()
+            .event_type(EventType::ExecutionSucceeded)
+            .event_id(3)
+            .execution_succeeded_details(
+                ExecutionSucceededDetails::builder()
+                    .result(EventResult::builder().payload("5").build())
+                    .build(),
+            )
+            .build();
+        let api = FakeApi::new()
+            .with_execution(Ok(execution_output(WireExecutionStatus::Running, None)))
+            .with_execution(Ok(execution_output(
+                WireExecutionStatus::Succeeded,
+                Some("5"),
+            )))
+            .with_history_pages(vec![
+                Ok((vec![step_started("first")], Some("page-2".to_owned()))),
+                Ok((vec![step_started("second")], Some("page-3".to_owned()))),
+                // An empty marker ends the history as an absent one does.
+                Ok((vec![succeeded], Some(String::new()))),
+            ]);
+        let result = CloudRunner::new("my-fn")
+            .qualifier("live")
+            .invocation_type(InvocationType::Event)
+            .run_with::<_, u32>(&api, b"{\"x\":1}".to_vec())
+            .await
+            .expect("runner");
+        assert_eq!(result.output(), Some(&5));
+        assert_eq!(
+            api.invokes(),
+            vec![InvokeRequest {
+                function_name: "my-fn".to_owned(),
+                qualifier: "live".to_owned(),
+                invocation_type: WireInvocationType::Event,
+                payload: b"{\"x\":1}".to_vec(),
+            }]
+        );
+        assert_eq!(api.execution_arns(), vec![ARN.to_owned(); 2]);
+        let marker = |m: Option<&str>| HistoryCall {
+            execution_arn: ARN.to_owned(),
+            marker: m.map(ToOwned::to_owned),
+        };
+        assert_eq!(
+            api.history_calls(),
+            vec![marker(None), marker(Some("page-2")), marker(Some("page-3"))]
+        );
+        let ids: Vec<&str> = result.operations().iter().map(TestOperation::id).collect();
+        assert_eq!(ids, ["first", "second"], "every page is folded");
+    }
+
+    // Rule 4 coverage of the runner error mappings and defaults
+
+    #[tokio::test]
+    async fn cloud_event_serialization_is_a_runner_error() {
+        // `run` serializes the event before it resolves a client, so this
+        // test makes no Lambda call.
+        let err = CloudRunner::new("f")
+            .run::<_, u32>(Unserializable)
+            .await
+            .expect_err("a runner error");
+        let e = match &err {
+            TestRunnerError::EventSerialization(e) => Some(e),
+            _ => None,
+        }
+        .expect("an EventSerialization error");
+        assert_eq!(
+            err.to_string(),
+            format!("durable: test runner: event serialization failed: {e}")
+        );
+        assert!(e.to_string().contains("refuse"), "{e}");
+        assert_json_source(&err, e);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_output_decode_is_a_runner_error() {
+        use aws_sdk_lambda::types::{EventResult, ExecutionSucceededDetails};
+        let succeeded = Event::builder()
+            .event_type(EventType::ExecutionSucceeded)
+            .event_id(1)
+            .execution_succeeded_details(
+                ExecutionSucceededDetails::builder()
+                    .result(EventResult::builder().payload("{\"a\":1}").build())
+                    .build(),
+            )
+            .build();
+        let api = FakeApi::new()
+            .with_execution(Ok(execution_output(
+                WireExecutionStatus::Succeeded,
+                Some("{\"a\":1}"),
+            )))
+            .with_history(Ok(vec![succeeded]));
+        let err = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect_err("a runner error");
+        let e = match &err {
+            TestRunnerError::OutputDeserialization(e) => Some(e),
+            _ => None,
+        }
+        .expect("an OutputDeserialization error");
+        assert_eq!(
+            err.to_string(),
+            format!("durable: test runner: output deserialization failed: {e}")
+        );
+        assert_json_source(&err, e);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_success_without_terminal_event_reads_execution_result() {
+        // The history holds no terminal execution event, so the output
+        // comes from the `GetDurableExecution` result.
+        let api = FakeApi::new().with_execution(Ok(execution_output(
+            WireExecutionStatus::Succeeded,
+            Some("9"),
+        )));
+        let result = CloudRunner::new("f")
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(result.output(), Some(&9));
+        assert!(result.error().is_none());
+    }
+
+    /// The history's `ExecutionSucceeded` event wins even when it carries no
+    /// result: the output decodes from `null`, not from the
+    /// `GetDurableExecution` result.
+    #[tokio::test(start_paused = true)]
+    async fn cloud_success_terminal_event_without_result_is_null() {
+        use aws_sdk_lambda::types::ExecutionSucceededDetails;
+        let api = FakeApi::new()
+            .with_execution(Ok(execution_output(
+                WireExecutionStatus::Succeeded,
+                Some("9"),
+            )))
+            .with_history(Ok(vec![
+                Event::builder()
+                    .event_type(EventType::ExecutionSucceeded)
+                    .event_id(1)
+                    .execution_succeeded_details(ExecutionSucceededDetails::builder().build())
+                    .build(),
+            ]));
+        let result = CloudRunner::new("f")
+            .run_with::<_, Option<u32>>(&api, Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(result.status(), ExecutionStatus::Succeeded);
+        assert_eq!(result.output(), Some(&None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_terminal_error_falls_back_to_execution_error_then_status_name() {
+        use aws_sdk_lambda::types::{ExecutionFailedDetails, ExecutionStoppedDetails};
+        let execution = |status: WireExecutionStatus, error: Option<ErrorObject>| {
+            GetExecutionOutput::builder()
+                .durable_execution_arn(ARN)
+                .durable_execution_name("name")
+                .function_arn("function")
+                .start_timestamp(DateTime::from_secs(0))
+                .status(status)
+                .set_error(error)
+                .build()
+                .expect("execution output")
+        };
+        let execution_error = || {
+            ErrorObject::builder()
+                .error_type("ExecutionError")
+                .error_message("from GetDurableExecution")
+                .error_data("{\"code\":2}")
+                .stack_trace("other-frame")
+                .build()
+        };
+        let from_execution =
+            crate::WireError::new(Some("ExecutionError"), Some("from GetDurableExecution"))
+                .with_error_data(Some("{\"code\":2}"))
+                .with_stack_trace(vec!["other-frame".to_owned()]);
+        let rows: Vec<(&str, GetExecutionOutput, Vec<Event>, crate::WireError)> = vec![
+            (
+                "no terminal event: the GetDurableExecution error",
+                execution(WireExecutionStatus::Failed, Some(execution_error())),
+                Vec::new(),
+                from_execution.clone(),
+            ),
+            (
+                "a terminal event without an error: the GetDurableExecution error",
+                execution(WireExecutionStatus::Failed, Some(execution_error())),
+                vec![
+                    Event::builder()
+                        .event_type(EventType::ExecutionFailed)
+                        .event_id(1)
+                        .execution_failed_details(ExecutionFailedDetails::builder().build())
+                        .build(),
+                ],
+                from_execution,
+            ),
+            (
+                "no error anywhere: the status name",
+                execution(WireExecutionStatus::Stopped, None),
+                Vec::new(),
+                crate::WireError::new(Some("Stopped"), Some("execution ended with status Stopped")),
+            ),
+            (
+                "an error without type or message: the status name and an empty message",
+                execution(WireExecutionStatus::Stopped, None),
+                vec![
+                    Event::builder()
+                        .event_type(EventType::ExecutionStopped)
+                        .event_id(1)
+                        .execution_stopped_details(
+                            ExecutionStoppedDetails::builder()
+                                .error(
+                                    EventError::builder()
+                                        .payload(ErrorObject::builder().error_data("d").build())
+                                        .build(),
+                                )
+                                .build(),
+                        )
+                        .build(),
+                ],
+                crate::WireError::new(Some("Stopped"), Some("")).with_error_data(Some("d")),
+            ),
+        ];
+        for (label, execution, history, expected) in rows {
+            let api = FakeApi::new()
+                .with_execution(Ok(execution))
+                .with_history(Ok(history));
+            let result = CloudRunner::new("f")
+                .run_with::<_, u32>(&api, Vec::new())
+                .await
+                .expect("runner");
+            assert_eq!(result.error(), Some(&expected), "{label}");
+        }
+    }
+
+    #[test]
+    fn terminal_execution_event_is_the_last_one() {
+        let event = |event_type: EventType, id: i32| {
+            Event::builder().event_type(event_type).event_id(id).build()
+        };
+        let events = [
+            event(EventType::ExecutionFailed, 1),
+            event(EventType::ExecutionSucceeded, 2),
+            event(EventType::InvocationCompleted, 3),
+        ];
+        assert_eq!(
+            terminal_execution_event(&events).map(Event::event_id),
+            Some(2)
+        );
+        assert!(terminal_execution_event(&events[2..]).is_none());
+    }
+
+    #[test]
+    fn terminal_event_error_of_a_succeeded_event_is_none() {
+        let event = Event::builder()
+            .event_type(EventType::ExecutionSucceeded)
+            .event_id(1)
+            .build();
+        assert!(terminal_event_error(&event).is_none());
+    }
+
+    #[test]
+    fn unknown_wire_execution_status_is_failed() {
+        assert_eq!(
+            ExecutionStatus::from_wire(&WireExecutionStatus::from("NotAStatus")),
+            ExecutionStatus::Failed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_poll_limit_result_reports_polls_and_history() {
+        use aws_sdk_lambda::types::StepStartedDetails;
+        let api = FakeApi::new().with_history(Ok(vec![
+            Event::builder()
+                .event_type(EventType::StepStarted)
+                .event_id(1)
+                .id("s")
+                .step_started_details(StepStartedDetails::builder().build())
+                .build(),
+        ]));
+        let result = CloudRunner::new("f")
+            .max_poll_attempts(2)
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(result.status(), ExecutionStatus::Running);
+        assert_eq!(result.invocation_count(), 2);
+        let error = result.error().expect("the reason the run ended");
+        assert_eq!(error.error_type(), None);
+        assert_eq!(
+            error.error_message(),
+            Some(format!("execution {ARN} still running after 2 polls").as_str())
+        );
+        let ids: Vec<&str> = result.operations().iter().map(TestOperation::id).collect();
+        assert_eq!(ids, ["s"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_poll_limit_history_error_is_aws() {
+        let api = FakeApi::new().with_history(Err(fake_error("fake history")));
+        let err = CloudRunner::new("f")
+            .max_poll_attempts(1)
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect_err("a runner error");
+        assert_aws(&err, "fake history");
+        assert_eq!(api.execution_call_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_poll_limit_of_zero_counts_as_one() {
+        let api = FakeApi::new();
+        let result = CloudRunner::new("f")
+            .max_poll_attempts(0)
+            .run_with::<_, u32>(&api, Vec::new())
+            .await
+            .expect("runner");
+        assert_eq!(result.status(), ExecutionStatus::Running);
+        assert_eq!(api.execution_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_client_without_a_client_uses_the_region() {
+        let resolved = CloudRunner::new("f")
+            .region("eu-west-3")
+            .resolve_client()
+            .await;
+        assert_eq!(
+            resolved.config().region().map(ToString::to_string),
+            Some("eu-west-3".to_owned())
+        );
+    }
+
+    /// `run` with a configured client sends each request through the
+    /// `LambdaClient` implementation of [`CloudApi`], with every argument
+    /// the runner sets. Each rule answers one request, so a request with
+    /// a wrong argument matches no rule and fails the run.
+    #[tokio::test]
+    async fn lambda_client_sends_each_request_with_its_arguments() {
+        use aws_sdk_lambda::types::{EventResult, ExecutionSucceededDetails};
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+        let invoke = mock!(aws_sdk_lambda::Client::invoke)
+            .match_requests(|req| {
+                req.function_name() == Some("my-fn")
+                    && req.qualifier() == Some("live")
+                    && req.invocation_type() == Some(&WireInvocationType::Event)
+                    && req.payload().map(Blob::as_ref) == Some(b"{\"x\":1}".as_slice())
+            })
+            .sequence()
+            .output(|| invoke_output(Some(ARN)))
+            .build();
+        let execution = mock!(aws_sdk_lambda::Client::get_durable_execution)
+            .match_requests(|req| {
+                req.durable_execution_arn() == Some(ARN)
+                    && req.include_execution_data() == Some(true)
+            })
+            .sequence()
+            .output(|| execution_output(WireExecutionStatus::Succeeded, Some("5")))
+            .build();
+        let first_page = mock!(aws_sdk_lambda::Client::get_durable_execution_history)
+            .match_requests(|req| {
+                req.durable_execution_arn() == Some(ARN)
+                    && req.include_execution_data() == Some(true)
+                    && req.marker().is_none()
+            })
+            .sequence()
+            .output(|| {
+                GetHistoryOutput::builder()
+                    .set_events(Some(Vec::new()))
+                    .next_marker("page-2")
+                    .build()
+                    .expect("history output")
+            })
+            .build();
+        let second_page = mock!(aws_sdk_lambda::Client::get_durable_execution_history)
+            .match_requests(|req| {
+                req.durable_execution_arn() == Some(ARN)
+                    && req.include_execution_data() == Some(true)
+                    && req.marker() == Some("page-2")
+            })
+            .sequence()
+            .output(|| {
+                GetHistoryOutput::builder()
+                    .set_events(Some(vec![
+                        Event::builder()
+                            .event_type(EventType::ExecutionSucceeded)
+                            .event_id(1)
+                            .execution_succeeded_details(
+                                ExecutionSucceededDetails::builder()
+                                    .result(EventResult::builder().payload("6").build())
+                                    .build(),
+                            )
+                            .build(),
+                    ]))
+                    .build()
+                    .expect("history output")
+            })
+            .build();
+        let client = mock_client!(
+            aws_sdk_lambda,
+            RuleMode::MatchAny,
+            [&invoke, &execution, &first_page, &second_page]
+        );
+        let result = CloudRunner::new("my-fn")
+            .qualifier("live")
+            .invocation_type(InvocationType::Event)
+            .poll_interval(std::time::Duration::ZERO)
+            .lambda_client(client)
+            .run::<_, u32>(serde_json::json!({ "x": 1 }))
+            .await
+            .expect("runner");
+        assert_eq!(result.output(), Some(&6));
+        assert_eq!(invoke.num_calls(), 1);
+        assert_eq!(execution.num_calls(), 1);
+        assert_eq!(first_page.num_calls(), 1);
+        assert_eq!(second_page.num_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn lambda_client_invoke_error_is_aws() {
+        use aws_sdk_lambda::operation::invoke::InvokeError;
+        use aws_smithy_mocks::{mock, mock_client};
+        let invoke = mock!(aws_sdk_lambda::Client::invoke).then_error(|| {
+            InvokeError::ResourceNotFoundException(
+                aws_sdk_lambda::types::error::ResourceNotFoundException::builder().build(),
+            )
+        });
+        let err = CloudRunner::new("f")
+            .lambda_client(mock_client!(aws_sdk_lambda, [&invoke]))
+            .run::<_, u32>(())
+            .await
+            .expect_err("a runner error");
+        assert!(matches!(err, TestRunnerError::Aws(_)), "{err:?}");
+        assert!(std::error::Error::source(&err).is_some());
+        assert_eq!(invoke.num_calls(), 1);
+    }
+
+    /// A `GetDurableExecution` failure of the `LambdaClient` implementation
+    /// of [`CloudApi`] is `TestRunnerError::Aws`, and its source is the SDK
+    /// error of that call.
+    #[tokio::test]
+    async fn lambda_client_get_execution_error_is_aws() {
+        use aws_sdk_lambda::operation::get_durable_execution::GetDurableExecutionError;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+        let invoke = mock!(aws_sdk_lambda::Client::invoke)
+            .sequence()
+            .output(|| invoke_output(Some(ARN)))
+            .build();
+        let execution = mock!(aws_sdk_lambda::Client::get_durable_execution)
+            .sequence()
+            .error(|| {
+                GetDurableExecutionError::ResourceNotFoundException(
+                    aws_sdk_lambda::types::error::ResourceNotFoundException::builder().build(),
+                )
+            })
+            .build();
+        let history = mock!(aws_sdk_lambda::Client::get_durable_execution_history)
+            .then_output(|| GetHistoryOutput::builder().build().expect("history output"));
+        let client = mock_client!(
+            aws_sdk_lambda,
+            RuleMode::MatchAny,
+            [&invoke, &execution, &history]
+        );
+        let err = CloudRunner::new("f")
+            .poll_interval(std::time::Duration::ZERO)
+            .lambda_client(client)
+            .run::<_, u32>(())
+            .await
+            .expect_err("a runner error");
+        assert!(matches!(err, TestRunnerError::Aws(_)), "{err:?}");
+        let source = std::error::Error::source(&err).expect("a source");
+        let sdk = source
+            .downcast_ref::<aws_sdk_lambda::error::SdkError<
+                GetDurableExecutionError,
+                aws_sdk_lambda::config::http::HttpResponse,
+            >>()
+            .expect("the GetDurableExecution SDK error");
+        assert!(
+            matches!(
+                sdk.as_service_error(),
+                Some(GetDurableExecutionError::ResourceNotFoundException(_))
+            ),
+            "{sdk:?}"
+        );
+        assert_eq!(invoke.num_calls(), 1);
+        assert_eq!(execution.num_calls(), 1);
+        assert_eq!(history.num_calls(), 0);
+    }
+
+    /// A `GetDurableExecutionHistory` failure of the `LambdaClient`
+    /// implementation of [`CloudApi`] is `TestRunnerError::Aws`, and its
+    /// source is the SDK error of that call.
+    #[tokio::test]
+    async fn lambda_client_get_history_error_is_aws() {
+        use aws_sdk_lambda::operation::get_durable_execution_history::GetDurableExecutionHistoryError;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+        let invoke = mock!(aws_sdk_lambda::Client::invoke)
+            .sequence()
+            .output(|| invoke_output(Some(ARN)))
+            .build();
+        let execution = mock!(aws_sdk_lambda::Client::get_durable_execution)
+            .sequence()
+            .output(|| execution_output(WireExecutionStatus::Succeeded, Some("5")))
+            .build();
+        let history = mock!(aws_sdk_lambda::Client::get_durable_execution_history)
+            .sequence()
+            .error(|| {
+                GetDurableExecutionHistoryError::ResourceNotFoundException(
+                    aws_sdk_lambda::types::error::ResourceNotFoundException::builder().build(),
+                )
+            })
+            .build();
+        let client = mock_client!(
+            aws_sdk_lambda,
+            RuleMode::MatchAny,
+            [&invoke, &execution, &history]
+        );
+        let err = CloudRunner::new("f")
+            .poll_interval(std::time::Duration::ZERO)
+            .lambda_client(client)
+            .run::<_, u32>(())
+            .await
+            .expect_err("a runner error");
+        assert!(matches!(err, TestRunnerError::Aws(_)), "{err:?}");
+        let source = std::error::Error::source(&err).expect("a source");
+        let sdk = source
+            .downcast_ref::<aws_sdk_lambda::error::SdkError<
+                GetDurableExecutionHistoryError,
+                aws_sdk_lambda::config::http::HttpResponse,
+            >>()
+            .expect("the GetDurableExecutionHistory SDK error");
+        assert!(
+            matches!(
+                sdk.as_service_error(),
+                Some(GetDurableExecutionHistoryError::ResourceNotFoundException(
+                    _
+                ))
+            ),
+            "{sdk:?}"
+        );
+        assert_eq!(invoke.num_calls(), 1);
+        assert_eq!(execution.num_calls(), 1);
+        assert_eq!(history.num_calls(), 1);
+    }
+
+    #[test]
+    fn no_execution_arn_has_no_source() {
+        assert!(std::error::Error::source(&TestRunnerError::NoExecutionArn).is_none());
+    }
+
+    #[tokio::test]
+    async fn unexpected_envelope_without_a_string_status() {
+        let runner = LocalRunner::new();
+        let service = |_event: lambda_runtime::LambdaEvent<crate::InvocationPayload>| {
+            let response: crate::BoxedInvocationFuture = Box::pin(async {
+                Ok(crate::InvocationResponse(
+                    serde_json::json!({ "Status": 3 }),
+                ))
+            });
+            response
+        };
+        let err = runner
+            .drive_service(Arc::new(runner.new_backend()), service, "null".to_owned())
+            .await
+            .expect_err("a runner error");
+        assert!(
+            matches!(&err, TestRunnerError::UnexpectedEnvelope(None)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "durable: test runner: unexpected response envelope status: None"
+        );
+    }
+
+    #[test]
+    fn local_failed_envelope_keeps_data_and_stack_trace() {
+        let response = serde_json::json!({
+            "Status": "FAILED",
+            "Error": {
+                "ErrorType": "T",
+                "ErrorMessage": "m",
+                "ErrorData": "d",
+                "StackTrace": ["a", "b"],
+            },
+        });
+        let result: TestResult<()> = RawRun {
+            end: RawEnd::Failed(envelope_wire_error(&response)),
+            operations: Vec::new(),
+            invocations: 1,
+        }
+        .into_test_result()
+        .expect("runner");
+        assert_eq!(result.status(), ExecutionStatus::Failed);
+        assert_eq!(
+            result.error(),
+            Some(
+                &crate::WireError::new(Some("T"), Some("m"))
+                    .with_error_data(Some("d"))
+                    .with_stack_trace(vec!["a".to_owned(), "b".to_owned()])
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn local_succeeded_operation_has_no_error() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_u32) }).name("ok").await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let step = result.operation("ok").expect("the step");
+        assert!(step.error().is_none(), "{:?}", step.error());
+        assert!(result.error().is_none());
+    }
+
+    #[test]
+    fn snapshot_reports_stack_trace_and_drops_a_negative_wait() {
+        let step = |action: OperationAction, error: Option<ErrorObject>| {
+            OperationUpdate::builder()
+                .id("s")
+                .r#type(OperationType::Step)
+                .action(action)
+                .set_error(error)
+                .build()
+                .expect("valid update")
+        };
+        let backend = seeded_backend(
+            Vec::new(),
+            0,
+            &[
+                step(OperationAction::Start, None),
+                step(
+                    OperationAction::Fail,
+                    Some(
+                        ErrorObject::builder()
+                            .error_type("T")
+                            .stack_trace("frame")
+                            .build(),
+                    ),
+                ),
+                wait_start("w", -5),
+            ],
+        );
+        let ops = backend.snapshot_operations();
+        let step_op = ops.iter().find(|op| op.id() == "s").expect("the step");
+        assert_eq!(
+            step_op.error().map(crate::WireError::stack_trace),
+            Some(["frame".to_owned()].as_slice())
+        );
+        let wait_op = ops.iter().find(|op| op.id() == "w").expect("the wait");
+        assert!(
+            matches!(wait_op.details(), TestOperationDetails::Wait(w) if w.duration().is_none()),
+            "{:?}",
+            wait_op.details()
+        );
+    }
+
+    #[test]
+    fn fold_history_drops_a_negative_wait_duration() {
+        use aws_sdk_lambda::types::WaitStartedDetails;
+        let event = Event::builder()
+            .event_type(EventType::WaitStarted)
+            .id("w")
+            .event_id(1)
+            .wait_started_details(
+                WaitStartedDetails::builder()
+                    .duration(-1)
+                    .scheduled_end_timestamp(DateTime::from_secs(0))
+                    .build()
+                    .expect("wait details"),
+            )
+            .build();
+        let ops = fold_history(std::slice::from_ref(&event));
+        assert!(
+            matches!(ops[0].details(), TestOperationDetails::Wait(w) if w.duration().is_none()),
+            "{:?}",
+            ops[0].details()
+        );
     }
 }

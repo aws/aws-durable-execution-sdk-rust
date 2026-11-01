@@ -70,7 +70,8 @@ async fn permanently_rejected_result_fails_execution_after_one_body_run() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(
         body_runs.load(Ordering::SeqCst),
@@ -147,7 +148,8 @@ async fn catch_cannot_observe_checkpoint_api_failure() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(
         caught.load(Ordering::SeqCst),
@@ -245,7 +247,8 @@ async fn serialization_failure_persists_fail_and_replays_without_rerun() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.invocation_count() >= 2,
@@ -324,7 +327,8 @@ async fn retryable_exhaustion_fails_invocation_and_reinvocation_converges() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -432,7 +436,8 @@ async fn step_serialization_failure_kind_is_replay_equivalent() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     let kinds = kinds.lock().expect("test mutex");
@@ -497,7 +502,8 @@ async fn step_execution_failed_kind_is_replay_equivalent() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     let kinds = kinds.lock().expect("test mutex");
@@ -554,7 +560,8 @@ async fn child_serialization_failure_persists_fail_and_replays_without_rerun() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     assert_eq!(
@@ -620,7 +627,8 @@ async fn map_item_serialization_failure_records_fail_and_replays_as_failed_item(
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     assert_eq!(
@@ -687,7 +695,8 @@ async fn flat_item_serialization_failure_is_recorded_in_batch_summary() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     assert_eq!(
@@ -756,7 +765,8 @@ async fn wfc_state_serialization_failure_persists_fail_and_replays_without_rerun
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     assert_eq!(
@@ -834,7 +844,8 @@ async fn nonretryable_flush_failure_terminalizes_dropped_contributor_and_fails_e
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(body_runs.load(Ordering::SeqCst), 1, "one body execution");
     assert_eq!(
@@ -910,7 +921,8 @@ async fn retryable_flush_failure_fails_invocation_and_reinvocation_converges() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),

@@ -69,6 +69,9 @@ allowed_external_types = [
     "aws_sdk_lambda::types::_wait_details::WaitDetails",
     "aws_sdk_lambda::types::_wait_options::WaitOptions",
     "aws_smithy_types::date_time::DateTime",
+    # `test_util::TestRunnerError` (feature `test-util`) carries the
+    # serde_json error of a failed event or output conversion.
+    "serde_json::error::Error",
     # The `replay-filter` feature exists to implement tracing-subscriber's
     # `Filter` trait, which necessarily names these types in the impl.
     "tracing_subscriber::layer::Filter",

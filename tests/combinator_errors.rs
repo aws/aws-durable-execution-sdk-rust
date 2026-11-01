@@ -78,7 +78,8 @@ async fn race_loser_error_identity_survives_replay() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -147,7 +148,8 @@ async fn race_and_select_ok_agree_on_empty_input() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -217,7 +219,8 @@ async fn try_join_all_failure_kind_and_index_survive_replay() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -288,7 +291,8 @@ async fn select_ok_all_failed_kind_and_loser_count_survive_replay() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -360,7 +364,8 @@ async fn join_all_rejected_wire_identity_survives_replay() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -463,7 +468,8 @@ async fn select_ok_all_failed_loser_identities_survive_replay() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),

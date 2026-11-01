@@ -214,6 +214,7 @@ async fn run_one_step(
             serde_json::Value::Null,
         )
         .await
+        .expect("runner")
 }
 
 #[tokio::test]
@@ -261,7 +262,8 @@ async fn step_marked_serialize_failure_at_most_once_takes_interrupted_path() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output().map(String::as_str), Some("Interrupted"));
     assert_eq!(counters.body(), 1);
@@ -316,7 +318,8 @@ async fn step_marked_replay_decode_failure_reinvokes() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     assert_eq!(result.invocation_count(), 3);
@@ -392,7 +395,8 @@ async fn step_unmarked_serialize_failure_records_fail_once() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(
         result.output().map(String::as_str),
@@ -457,6 +461,7 @@ async fn run_one_child(
             serde_json::Value::Null,
         )
         .await
+        .expect("runner")
 }
 
 #[tokio::test]
@@ -514,7 +519,8 @@ async fn create_callback_marked_decode_failure_reinvokes() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output().map(String::as_str), Some("ok"));
     assert_no_failed_operation(&result);
@@ -563,6 +569,7 @@ async fn run_count_to_two(serdes: InjectedFailures, counters: Counters) -> TestR
             serde_json::Value::Null,
         )
         .await
+        .expect("runner")
 }
 
 #[tokio::test]
@@ -638,6 +645,7 @@ async fn run_map(
             serde_json::Value::Null,
         )
         .await
+        .expect("runner")
 }
 
 #[tokio::test]
@@ -701,7 +709,8 @@ async fn map_result_serdes_marked_decode_failure_reinvokes() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.is_success(), "{:?}", result.error_message());
     assert_eq!(result.invocation_count(), 3);
@@ -751,7 +760,8 @@ async fn parallel_branch_marked_serialize_failure_reinvokes() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&vec![1, 2]));
     assert_eq!(
@@ -808,7 +818,8 @@ async fn filesystem_serdes_write_failure_ends_invocation() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
     let _ = std::fs::remove_file(&base);
 
     assert!(result.is_suspended(), "{:?}", result.error_message());

@@ -71,7 +71,8 @@ async fn step_round_trips_through_filesystem_across_replay() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -197,7 +198,8 @@ async fn serdes_call_does_not_block_the_executor() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -267,7 +269,8 @@ async fn mixed_serdes_futures_coexist_in_one_combinator() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -333,7 +336,8 @@ async fn send_not_sync_output_round_trips_through_operation() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -428,7 +432,8 @@ async fn with_retry_round_trips_non_serde_output_through_custom_serdes() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),

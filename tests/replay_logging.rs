@@ -7,6 +7,7 @@
 //! without re-emitting its log line.
 
 #![cfg(all(feature = "test-util", feature = "replay-filter"))]
+#![expect(clippy::expect_used)] // reason: test assertions
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -59,7 +60,8 @@ async fn handler_level_log_emitted_exactly_once_across_invocations() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&"done".to_owned()));
     assert!(
@@ -122,7 +124,8 @@ async fn child_context_pre_wait_logs_emitted_exactly_once() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&"child-done".to_owned()));
     assert!(
@@ -184,7 +187,8 @@ async fn map_branch_pre_wait_logs_emitted_exactly_once() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&vec![10_u32, 20]));
     assert!(
@@ -256,7 +260,8 @@ async fn post_flat_batch_marker_emitted_exactly_once_on_terminal_replay() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&vec![10_u32, 20]));
     assert!(

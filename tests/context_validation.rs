@@ -7,6 +7,7 @@
 //! working.
 
 #![cfg(feature = "test-util")]
+#![expect(clippy::expect_used)] // reason: test assertions
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -64,7 +65,8 @@ async fn parent_step_inside_child_body_fails() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     assert_context_usage_failure(&result, &message_a("step", "root", "1"));
 }
 
@@ -85,7 +87,8 @@ async fn context_used_inside_step_body_fails() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     assert_context_usage_failure(&result, &message_b("step", "1"));
 }
 
@@ -112,7 +115,8 @@ async fn context_used_inside_condition_check_fails() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     assert_context_usage_failure(&result, &message_b("step", "1"));
 }
 
@@ -135,7 +139,8 @@ async fn context_used_inside_submitter_fails() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     // wait_for_callback "1" runs its callback as "1-1" and the submitter
     // step as "1-2".
     assert_context_usage_failure(&result, &message_b("step", "1-2"));
@@ -164,7 +169,8 @@ async fn parent_step_inside_map_item_fails() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     // The map is "1". Its items nest flat in the parent's namespace, so the
     // first item's context has the prefix "2".
     assert_context_usage_failure(&result, &message_a("step", "root", "2"));
@@ -189,7 +195,8 @@ async fn parent_step_inside_parallel_branch_fails() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     // The parallel is "1"; its branch nests flat, like a map item.
     assert_context_usage_failure(&result, &message_a("step", "root", "2"));
 }
@@ -217,7 +224,8 @@ async fn parent_child_inside_grandchild_fails() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     assert_context_usage_failure(&result, &message_a("step", "1", "1-1"));
 }
 
@@ -239,7 +247,8 @@ async fn parent_step_in_child_closure_prelude_fails() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     assert_context_usage_failure(&result, &message_a("step", "root", "1"));
 }
 
@@ -268,7 +277,8 @@ async fn escaped_child_context_at_handler_level_fails() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     assert_context_usage_failure(&result, &message_a("step", "1", "root"));
 }
 
@@ -326,7 +336,8 @@ async fn correct_contexts_succeed() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     assert!(
         result.is_success(),
         "expected SUCCEEDED, got error {:?}",
@@ -368,7 +379,8 @@ async fn composites_inside_child_body_succeed() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
     assert!(
         result.is_success(),
         "expected SUCCEEDED, got error {:?}",

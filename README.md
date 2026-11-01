@@ -803,12 +803,13 @@ let result = LocalRunner::new()
         },
         41_u32,
     )
-    .await;
+    .await?;
 assert_eq!(result.output(), Some(&42));
 ```
 
 `TestResult` also reports the invocation count and every recorded operation,
 so a test can assert that a step ran once across replays.
+`result.operation("charge")` returns the first operation with that name, and `TestOperation::error()` returns its full error record, including error data.
 `TestOperation::kind()` and `TestOperation::status()` return `OperationKind`
 and `OperationStatus`, so a test checks
 `op.status() == OperationStatus::Succeeded`.

@@ -7,6 +7,7 @@
 //! started/resumed/suspended events.
 
 #![cfg(feature = "test-util")]
+#![expect(clippy::expect_used)] // reason: test assertions
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -109,7 +110,8 @@ async fn step_and_wait_lifecycle_events_follow_the_contract() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&"hello".to_owned()));
     assert!(
@@ -305,7 +307,8 @@ async fn retrying_step_emits_retry_scheduled_events() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&3));
 
@@ -382,7 +385,8 @@ async fn failing_step_emits_operation_failed() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(result.output().is_none(), "the handler must fail");
 
@@ -432,7 +436,8 @@ async fn execution_events_are_span_events_of_the_execution_span() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&7));
     let output = captured(&buffer);
@@ -513,7 +518,8 @@ async fn replayed_events_cover_child_condition_and_callback() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(result.output(), Some(&"42-1-yes".to_owned()));
     assert!(
@@ -590,7 +596,8 @@ async fn rejected_checkpoint_emits_no_record_transition_event() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.output().is_none(),
@@ -679,7 +686,8 @@ async fn failed_replay_decode_emits_no_operation_replayed() {
             },
             serde_json::Value::Null,
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.output().is_none(),

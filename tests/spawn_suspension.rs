@@ -49,7 +49,8 @@ async fn dropping_unpolled_spawn_does_not_deadlock_next_wait() {
         .expect(
             "execution deadlocked because the dropped spawn remained \
              registered as outstanding",
-        );
+        )
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -84,7 +85,8 @@ async fn race_does_not_propagate_loser_suspension_to_root() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -122,7 +124,8 @@ async fn select_ok_does_not_propagate_loser_suspension_to_root() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -160,7 +163,8 @@ async fn try_join_all_fail_fast_ignores_parked_sibling() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         !result.is_success(),
@@ -192,7 +196,8 @@ async fn race_with_all_inputs_parked_suspends_and_resumes() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert!(
         result.is_success(),
@@ -233,7 +238,8 @@ async fn join_all_suspends_until_parked_input_resolves() {
             },
             (),
         )
-        .await;
+        .await
+        .expect("runner");
 
     assert_eq!(
         result.output(),
