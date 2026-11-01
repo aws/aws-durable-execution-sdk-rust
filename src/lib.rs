@@ -97,6 +97,7 @@ mod future;
 pub(crate) mod invoke;
 pub(crate) mod map_parallel; // public types re-exported from crate::builders::map_parallel
 pub mod observability;
+mod operation;
 mod options;
 pub mod serdes;
 pub(crate) mod step;
@@ -131,6 +132,7 @@ pub use self::error::{
     WaitForConditionErrorKind, WireError,
 };
 pub use self::future::{Branch, DurableFuture, Settled};
+pub use self::operation::{OperationKind, OperationStatus};
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
 pub use self::serdes::{JsonSerdes, Serdes};
 pub use self::step::StepSemantics;

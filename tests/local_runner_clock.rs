@@ -60,11 +60,11 @@ async fn race_between_waits_returns_the_shorter_wait() {
             .operations()
             .iter()
             .find(|op| op.name() == Some(name))
-            .map(|op| op.status().to_owned())
+            .map(durable::test_util::TestOperation::status)
             .expect("the wait is recorded")
     };
-    assert_eq!(status("second"), "Succeeded");
-    assert_eq!(status("minute"), "Started");
+    assert_eq!(status("second"), durable::OperationStatus::Succeeded);
+    assert_eq!(status("minute"), durable::OperationStatus::Started);
 }
 
 /// A step retried after 300 seconds loses a race against a 1 second wait.
@@ -134,7 +134,7 @@ async fn queued_callback_reply_arrives_before_the_clock_moves() {
         .iter()
         .find(|op| op.name() == Some("hour"))
         .expect("the hour wait is recorded");
-    assert_eq!(hour.status(), "Started");
+    assert_eq!(hour.status(), durable::OperationStatus::Started);
 }
 
 /// A step that returns 42.

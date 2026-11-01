@@ -809,6 +809,9 @@ assert_eq!(result.output(), Some(&42));
 
 `TestResult` also reports the invocation count and every recorded operation,
 so a test can assert that a step ran once across replays.
+`TestOperation::kind()` and `TestOperation::status()` return `OperationKind`
+and `OperationStatus`, so a test checks
+`op.status() == OperationStatus::Succeeded`.
 
 `.register_function(name, f)` and `.register_durable_function(name, handler)`
 supply the target of `ctx.invoke`.

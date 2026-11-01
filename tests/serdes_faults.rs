@@ -352,7 +352,7 @@ async fn step_permanent_marked_failure_records_no_outcome() {
         .iter()
         .find(|op| op.name() == Some("encode-me"))
         .expect("the step START is recorded");
-    assert_eq!(step.status(), "Started");
+    assert_eq!(step.status(), durable::OperationStatus::Started);
     assert_no_failed_operation(&result);
     assert_eq!(
         counters.body(),

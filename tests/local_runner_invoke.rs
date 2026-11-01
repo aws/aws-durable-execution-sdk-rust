@@ -23,7 +23,7 @@ fn invoke_record<O>(result: &TestResult<O>) -> &TestOperation {
     let mut invokes = result
         .operations()
         .iter()
-        .filter(|op| op.op_type() == "ChainedInvoke");
+        .filter(|op| op.kind() == durable::OperationKind::ChainedInvoke);
     let invoke = invokes.next().expect("a chained invoke record");
     assert!(invokes.next().is_none(), "one chained invoke record");
     invoke
@@ -61,7 +61,7 @@ async fn plain_target_result_survives_replay() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(result.invocation_count(), 3);
     let invoke = invoke_record(&result);
-    assert_eq!(invoke.status(), "Succeeded");
+    assert_eq!(invoke.status(), durable::OperationStatus::Succeeded);
     assert_eq!(invoke.result(), Some("40"));
 }
 
@@ -103,7 +103,7 @@ async fn plain_target_typed_error_reaches_caller() {
         result.error_message()
     );
     let invoke = invoke_record(&result);
-    assert_eq!(invoke.status(), "Failed");
+    assert_eq!(invoke.status(), durable::OperationStatus::Failed);
     assert_eq!(invoke.error_type(), Some("PaymentError"));
 }
 
@@ -131,7 +131,7 @@ async fn durable_target_runs_as_its_own_execution() {
     assert_eq!(result.invocation_count(), 2);
     // The nested execution's operations stay separate.
     let invoke = invoke_record(&result);
-    assert_eq!(invoke.status(), "Succeeded");
+    assert_eq!(invoke.status(), durable::OperationStatus::Succeeded);
     assert_eq!(invoke.result(), Some("4"));
 }
 
@@ -155,7 +155,10 @@ async fn suspended_durable_target_names_the_pending_invoke() {
         .await;
 
     assert!(result.is_suspended(), "{:?}", result.error_message());
-    assert_eq!(invoke_record(&result).status(), "Started");
+    assert_eq!(
+        invoke_record(&result).status(),
+        durable::OperationStatus::Started
+    );
     let message = result.error_message().expect("a suspended message");
     assert!(
         message.ends_with("; chained invokes still pending for: \"approval\""),

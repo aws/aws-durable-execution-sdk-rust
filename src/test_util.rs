@@ -97,9 +97,9 @@
 //!   has no execution-level timed-out or stopped disposition (it reports
 //!   success, failure, or suspended).
 //! - **Transient operation statuses.** [`LocalRunner`] may surface the
-//!   intermediate `"Ready"` status it uses to model an elapsed retry delay;
-//!   [`CloudRunner`]'s status vocabulary comes from the event stream and does
-//!   not include `"Ready"`.
+//!   intermediate [`OperationStatus::Ready`] status it uses to model an
+//!   elapsed retry delay; [`CloudRunner`]'s status vocabulary comes from the
+//!   event stream and does not include [`OperationStatus::Ready`].
 //!
 //! # Examples
 //!
@@ -134,14 +134,13 @@ use serde::de::DeserializeOwned;
 use aws_sdk_lambda::primitives::{Blob, DateTime};
 use aws_sdk_lambda::types::{
     CallbackDetails, ChainedInvokeDetails, ContextDetails, ContextOptions, ErrorObject, Event,
-    EventType, ExecutionStatus, InvocationType, Operation, OperationAction, OperationStatus,
-    OperationType, OperationUpdate, StepDetails,
+    EventType, ExecutionStatus, InvocationType, Operation, OperationAction,
+    OperationStatus as WireOperationStatus, OperationType, OperationUpdate, StepDetails,
 };
 
-use crate::BoxError;
 use crate::client::{CheckpointOutput, ExecutionClient, ExecutionClientError, GetStateOutput};
 use crate::context::DurableContext;
-
+use crate::{BoxError, OperationKind, OperationStatus};
 /// Default cap on the number of invocations the runner will drive before
 /// declaring the execution stuck. Generous enough for deep timer/retry
 /// chains, low enough to fail a non-terminating handler (e.g. a
@@ -181,7 +180,7 @@ const DEFAULT_STATE_PAGE_SIZE: usize = 1;
 ///
 /// let ops = result.operations();
 /// assert_eq!(ops.len(), 1);
-/// assert_eq!(ops[0].op_type(), "Step");
+/// assert_eq!(ops[0].kind(), durable::OperationKind::Step);
 /// assert!(ops[0].succeeded());
 /// assert_eq!(ops[0].name(), Some("only"));
 /// # }
@@ -190,9 +189,9 @@ const DEFAULT_STATE_PAGE_SIZE: usize = 1;
 #[non_exhaustive]
 pub struct TestOperation {
     id: String,
-    op_type: String,
+    kind: OperationKind,
     sub_type: Option<String>,
-    status: String,
+    status: OperationStatus,
     result: Option<String>,
     error_type: Option<String>,
     error_message: Option<String>,
@@ -206,10 +205,10 @@ impl TestOperation {
         &self.id
     }
 
-    /// The operation type, e.g. `"Step"`, `"Wait"`, `"Context"`,
-    /// `"Callback"`.
-    pub fn op_type(&self) -> &str {
-        &self.op_type
+    /// The operation kind, such as [`OperationKind::Step`] or
+    /// [`OperationKind::Callback`].
+    pub fn kind(&self) -> OperationKind {
+        self.kind
     }
 
     /// The operation sub-type, e.g. `"Step"`, `"Wait"`, `"Map"`,
@@ -218,20 +217,20 @@ impl TestOperation {
         self.sub_type.as_deref()
     }
 
-    /// The terminal-or-current status, e.g. `"Succeeded"`, `"Failed"`,
-    /// `"Pending"`, `"TimedOut"`.
-    pub fn status(&self) -> &str {
-        &self.status
+    /// The terminal-or-current status, such as
+    /// [`OperationStatus::Succeeded`] or [`OperationStatus::TimedOut`].
+    pub fn status(&self) -> OperationStatus {
+        self.status
     }
 
     /// Returns `true` if the operation completed successfully.
     pub fn succeeded(&self) -> bool {
-        self.status == "Succeeded"
+        self.status == OperationStatus::Succeeded
     }
 
     /// Returns `true` if the operation ended in a failed status.
     pub fn failed(&self) -> bool {
-        self.status == "Failed"
+        self.status == OperationStatus::Failed
     }
 
     /// The serialized result payload, if the operation stored one.
@@ -1729,7 +1728,7 @@ const CLOUD_RUNNER_ERROR: &str = "CloudRunnerError";
 /// if result.is_success() {
 ///     assert_eq!(result.output(), Some(&42));
 ///     for op in result.operations() {
-///         println!("{} {} {}", op.id(), op.op_type(), op.status());
+///         println!("{} {} {}", op.id(), op.kind(), op.status());
 ///     }
 /// }
 /// # }
@@ -2084,7 +2083,7 @@ fn fold_history(events: &[Event]) -> Vec<TestOperation> {
     let mut acc: HashMap<String, TestOperation> = HashMap::new();
 
     for event in events {
-        let Some(op_type) = event_family_op_type(event.event_type()) else {
+        let Some(kind) = event_family_op_type(event.event_type()) else {
             continue;
         };
         let Some(id) = event.id() else { continue };
@@ -2093,9 +2092,9 @@ fn fold_history(events: &[Event]) -> Vec<TestOperation> {
             order.push(id.to_owned());
             TestOperation {
                 id: id.to_owned(),
-                op_type: op_type.to_owned(),
+                kind,
                 sub_type: None,
-                status: String::from("Started"),
+                status: OperationStatus::Started,
                 result: None,
                 error_type: None,
                 error_message: None,
@@ -2126,67 +2125,67 @@ fn apply_event_transition(op: &mut TestOperation, event: &Event) {
             | EventType::ContextStarted
             | EventType::CallbackStarted
             | EventType::ChainedInvokeStarted,
-        ) => op.status = String::from("Started"),
+        ) => op.status = OperationStatus::Started,
         Some(EventType::StepSucceeded) => {
-            op.status = String::from("Succeeded");
+            op.status = OperationStatus::Succeeded;
             if let Some(details) = event.step_succeeded_details() {
                 op.result = event_result_payload(details.result());
                 set_attempt(op, details.retry_details());
             }
         }
         Some(EventType::StepFailed) => {
-            op.status = String::from("Failed");
+            op.status = OperationStatus::Failed;
             if let Some(details) = event.step_failed_details() {
                 set_error(op, details.error());
                 set_attempt(op, details.retry_details());
             }
         }
-        Some(EventType::WaitSucceeded) => op.status = String::from("Succeeded"),
-        Some(EventType::WaitCancelled) => op.status = String::from("Cancelled"),
+        Some(EventType::WaitSucceeded) => op.status = OperationStatus::Succeeded,
+        Some(EventType::WaitCancelled) => op.status = OperationStatus::Cancelled,
         Some(EventType::ContextSucceeded) => {
-            op.status = String::from("Succeeded");
+            op.status = OperationStatus::Succeeded;
             op.result = event
                 .context_succeeded_details()
                 .and_then(|d| event_result_payload(d.result()));
         }
         Some(EventType::ContextFailed) => {
-            op.status = String::from("Failed");
+            op.status = OperationStatus::Failed;
             if let Some(details) = event.context_failed_details() {
                 set_error(op, details.error());
             }
         }
         Some(EventType::CallbackSucceeded) => {
-            op.status = String::from("Succeeded");
+            op.status = OperationStatus::Succeeded;
             op.result = event
                 .callback_succeeded_details()
                 .and_then(|d| event_result_payload(d.result()));
         }
         Some(EventType::CallbackFailed) => {
-            op.status = String::from("Failed");
+            op.status = OperationStatus::Failed;
             if let Some(details) = event.callback_failed_details() {
                 set_error(op, details.error());
             }
         }
         Some(EventType::CallbackTimedOut) => {
-            op.status = String::from("TimedOut");
+            op.status = OperationStatus::TimedOut;
             if let Some(details) = event.callback_timed_out_details() {
                 set_error(op, details.error());
             }
         }
         Some(EventType::ChainedInvokeSucceeded) => {
-            op.status = String::from("Succeeded");
+            op.status = OperationStatus::Succeeded;
             op.result = event
                 .chained_invoke_succeeded_details()
                 .and_then(|d| event_result_payload(d.result()));
         }
         Some(EventType::ChainedInvokeFailed) => {
-            op.status = String::from("Failed");
+            op.status = OperationStatus::Failed;
             if let Some(details) = event.chained_invoke_failed_details() {
                 set_error(op, details.error());
             }
         }
-        Some(EventType::ChainedInvokeTimedOut) => op.status = String::from("TimedOut"),
-        Some(EventType::ChainedInvokeStopped) => op.status = String::from("Stopped"),
+        Some(EventType::ChainedInvokeTimedOut) => op.status = OperationStatus::TimedOut,
+        Some(EventType::ChainedInvokeStopped) => op.status = OperationStatus::Stopped,
         _ => {}
     }
 }
@@ -2221,27 +2220,29 @@ fn set_attempt(op: &mut TestOperation, retry: Option<&aws_sdk_lambda::types::Ret
     }
 }
 
-/// Maps an event type to the operation-type string [`LocalRunner`] uses, or
+/// Maps an event type to the [`OperationKind`] of its operation, or
 /// `None` for execution-level / invocation-level events that are not folded
 /// into operations.
-fn event_family_op_type(event_type: Option<&EventType>) -> Option<&'static str> {
+fn event_family_op_type(event_type: Option<&EventType>) -> Option<OperationKind> {
     match event_type? {
-        EventType::StepStarted | EventType::StepSucceeded | EventType::StepFailed => Some("Step"),
+        EventType::StepStarted | EventType::StepSucceeded | EventType::StepFailed => {
+            Some(OperationKind::Step)
+        }
         EventType::WaitStarted | EventType::WaitSucceeded | EventType::WaitCancelled => {
-            Some("Wait")
+            Some(OperationKind::Wait)
         }
         EventType::ContextStarted | EventType::ContextSucceeded | EventType::ContextFailed => {
-            Some("Context")
+            Some(OperationKind::Context)
         }
         EventType::CallbackStarted
         | EventType::CallbackSucceeded
         | EventType::CallbackFailed
-        | EventType::CallbackTimedOut => Some("Callback"),
+        | EventType::CallbackTimedOut => Some(OperationKind::Callback),
         EventType::ChainedInvokeStarted
         | EventType::ChainedInvokeSucceeded
         | EventType::ChainedInvokeFailed
         | EventType::ChainedInvokeTimedOut
-        | EventType::ChainedInvokeStopped => Some("ChainedInvoke"),
+        | EventType::ChainedInvokeStopped => Some(OperationKind::ChainedInvoke),
         _ => None,
     }
 }
@@ -2271,7 +2272,7 @@ fn execution_status_str(status: &ExecutionStatus) -> &'static str {
 #[derive(Debug, Clone)]
 struct StoredOp {
     id: String,
-    op_type: OperationType,
+    kind: OperationKind,
     sub_type: Option<String>,
     status: OperationStatus,
     name: Option<String>,
@@ -2310,13 +2311,13 @@ struct StoredOp {
 /// caller merges name/sub-type metadata and the action's outcome fields.
 fn new_started_op(
     id: String,
-    op_type: OperationType,
+    kind: OperationKind,
     sub_type: Option<String>,
     parent_id: Option<String>,
 ) -> StoredOp {
     StoredOp {
         id,
-        op_type,
+        kind,
         sub_type,
         status: OperationStatus::Started,
         name: None,
@@ -2561,9 +2562,9 @@ impl Backend {
             .iter()
             .map(|op| TestOperation {
                 id: op.id.clone(),
-                op_type: operation_type_str(&op.op_type).to_owned(),
+                kind: op.kind,
                 sub_type: op.sub_type.clone(),
-                status: operation_status_str(&op.status).to_owned(),
+                status: op.status,
                 result: op.result.clone(),
                 error_type: op.error_type.clone(),
                 error_message: op.error_message.clone(),
@@ -2635,7 +2636,7 @@ impl Backend {
         *now = next;
         for op in ops.iter_mut() {
             if timed_due_at(op).is_some_and(|due| due <= next) {
-                op.status = if op.op_type == OperationType::Wait {
+                op.status = if op.kind == OperationKind::Wait {
                     OperationStatus::Succeeded
                 } else {
                     OperationStatus::Ready
@@ -2671,7 +2672,7 @@ impl Backend {
             .ops
             .iter_mut()
             .filter(|op| {
-                op.op_type == OperationType::ChainedInvoke
+                op.kind == OperationKind::ChainedInvoke
                     && op.status == OperationStatus::Started
                     && !op.invoke_dispatched
             })
@@ -2728,7 +2729,7 @@ impl Backend {
         let state = self.lock();
         let mut names: Vec<String> = Vec::new();
         for op in &state.ops {
-            if op.op_type == OperationType::ChainedInvoke
+            if op.kind == OperationKind::ChainedInvoke
                 && op.status == OperationStatus::Started
                 && let Some(name) = &op.invoke_function
                 && !names.contains(name)
@@ -2769,7 +2770,7 @@ fn suspended_message(unmatched_names: &[String], pending_invokes: &[String]) -> 
 /// Whether `op` is a pending callback: a callback record in `Pending` or
 /// `Started` that has not received a reply.
 fn is_pending_callback(op: &StoredOp) -> bool {
-    op.op_type == OperationType::Callback
+    op.kind == OperationKind::Callback
         && !op.callback_delivered
         && matches!(
             op.status,
@@ -2792,7 +2793,7 @@ fn reply_name_matches(ops: &[StoredOp], op: &StoredOp, name: &str) -> bool {
     };
     ops.iter().any(|parent| {
         parent.id == parent_id
-            && parent.op_type == OperationType::Context
+            && parent.kind == OperationKind::Context
             && parent.sub_type.as_deref() == Some(crate::callback::WFCB_SUB_TYPE)
             && parent.name.as_deref() == Some(name)
     })
@@ -2831,9 +2832,9 @@ fn take_callback_deliveries(
 /// Firing changes the status, which removes the operation from the timed
 /// set.
 fn timed_due_at(op: &StoredOp) -> Option<u64> {
-    match (&op.op_type, &op.status) {
-        (OperationType::Wait, OperationStatus::Started)
-        | (OperationType::Step, OperationStatus::Pending) => op.due_at,
+    match (op.kind, op.status) {
+        (OperationKind::Wait, OperationStatus::Started)
+        | (OperationKind::Step, OperationStatus::Pending) => op.due_at,
         _ => None,
     }
 }
@@ -2853,9 +2854,8 @@ impl BackendState {
     /// Applies a single `OperationUpdate` to the store, returning the
     /// resulting stored op (cloned) for the checkpoint response.
     #[expect(clippy::too_many_lines)] // reason: one match over the update actions reads better as one flow
-    fn apply_update(&mut self, update: &OperationUpdate) -> Option<StoredOp> {
+    fn apply_update(&mut self, kind: OperationKind, update: &OperationUpdate) -> Option<StoredOp> {
         let id = update.id().to_owned();
-        let op_type = update.r#type().clone();
         let sub_type = update.sub_type().map(ToOwned::to_owned);
         let action = update.action().clone();
         let name = update.name().map(ToOwned::to_owned);
@@ -2891,7 +2891,7 @@ impl BackendState {
         if self.find_mut(&id).is_none() {
             self.ops.push(new_started_op(
                 id.clone(),
-                op_type.clone(),
+                kind,
                 sub_type.clone(),
                 parent_id,
             ));
@@ -2900,7 +2900,7 @@ impl BackendState {
         // Decide callback-id assignment before taking the mutable op borrow
         // (assigning self.callback_counter later would conflict with it).
         let needs_callback_id = matches!(action, OperationAction::Start)
-            && op_type == OperationType::Callback
+            && kind == OperationKind::Callback
             && self
                 .ops
                 .iter()
@@ -2933,11 +2933,11 @@ impl BackendState {
                 op.error_message = None;
                 op.error_data = None;
                 op.stack_trace = Vec::new();
-                if op.op_type == OperationType::Wait {
+                if op.kind == OperationKind::Wait {
                     op.status = OperationStatus::Started;
                     op.wait_seconds = wait_seconds;
                     op.due_at = Some(now.saturating_add(whole_seconds(wait_seconds)));
-                } else if op.op_type == OperationType::Callback {
+                } else if op.kind == OperationKind::Callback {
                     // The service creates a callback in `Started` and keeps
                     // it there until an external outcome. The backend
                     // assigns the callback id here.
@@ -2947,7 +2947,7 @@ impl BackendState {
                     }
                 } else {
                     op.status = OperationStatus::Started;
-                    if op.op_type == OperationType::ChainedInvoke {
+                    if op.kind == OperationKind::ChainedInvoke {
                         op.invoke_function = invoke_function;
                         op.invoke_input = payload;
                     }
@@ -2956,13 +2956,13 @@ impl BackendState {
             OperationAction::Succeed => {
                 op.status = OperationStatus::Succeeded;
                 op.result = payload;
-                if op.op_type == OperationType::Context {
+                if op.kind == OperationKind::Context {
                     op.replay_children = replay_children;
                 }
             }
             OperationAction::Fail => {
                 op.status = OperationStatus::Failed;
-                if op.op_type == OperationType::Context {
+                if op.kind == OperationKind::Context {
                     op.replay_children = replay_children;
                 }
                 op.error_type = err_type;
@@ -3072,12 +3072,22 @@ impl Backend {
             );
             return Box::pin(async move { Err(ExecutionClientError::new_non_retryable(&message)) });
         }
+        // The service rejects an update of a type it does not know, before
+        // any state change. So every type converts before the state lock;
+        // an unknown type stores nothing and keeps the token.
+        let Some(kinds) = update_kinds(updates) else {
+            return Box::pin(async {
+                Err(ExecutionClientError::new_non_retryable(
+                    "Invalid operation type.",
+                ))
+            });
+        };
         let updated_ops: Vec<Operation> = {
             let mut state = self.lock();
             state.token_counter += 1;
             let mut out = Vec::with_capacity(updates.len());
-            for update in updates {
-                if let Some(stored) = state.apply_update(update)
+            for (update, kind) in updates.iter().zip(kinds) {
+                if let Some(stored) = state.apply_update(kind, update)
                     && let Some(op) = build_operation(&stored)
                 {
                     out.push(op);
@@ -3154,6 +3164,15 @@ impl ExecutionClient for Backend {
     }
 }
 
+/// The kind of each update, in order, or `None` when an update has a type
+/// that [`OperationKind`] does not list.
+fn update_kinds(updates: &[OperationUpdate]) -> Option<Vec<OperationKind>> {
+    updates
+        .iter()
+        .map(|update| OperationKind::from_wire(update.r#type()))
+        .collect()
+}
+
 /// Whether `stored` carries any error field. A callback failure may set
 /// only some of the four fields, so any one of them makes an error object.
 fn has_error_fields(stored: &StoredOp) -> bool {
@@ -3187,8 +3206,8 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
 
     let mut builder = Operation::builder()
         .id(&stored.id)
-        .r#type(stored.op_type.clone())
-        .status(stored.status.clone())
+        .r#type(OperationType::from(stored.kind.wire_str()))
+        .status(WireOperationStatus::from(stored.status.wire_str()))
         .start_timestamp(DateTime::from_secs(0));
 
     if let Some(ref st) = stored.sub_type {
@@ -3201,8 +3220,8 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
         builder = builder.parent_id(parent);
     }
 
-    match stored.op_type {
-        OperationType::Step => {
+    match stored.kind {
+        OperationKind::Step => {
             let mut sd = StepDetails::builder().attempt(stored.attempt);
             if let Some(r) = &stored.result {
                 sd = sd.result(r);
@@ -3212,7 +3231,7 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
             }
             builder = builder.step_details(sd.build());
         }
-        OperationType::Context => {
+        OperationKind::Context => {
             let mut cd = ContextDetails::builder();
             if let Some(r) = &stored.result {
                 cd = cd.result(r);
@@ -3225,7 +3244,7 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
             }
             builder = builder.context_details(cd.build());
         }
-        OperationType::Callback => {
+        OperationKind::Callback => {
             let mut cb = CallbackDetails::builder();
             if let Some(id) = &stored.callback_id {
                 cb = cb.callback_id(id);
@@ -3238,7 +3257,7 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
             }
             builder = builder.callback_details(cb.build());
         }
-        OperationType::ChainedInvoke => {
+        OperationKind::ChainedInvoke => {
             let mut ci = ChainedInvokeDetails::builder();
             if let Some(r) = &stored.result {
                 ci = ci.result(r);
@@ -3248,7 +3267,7 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
             }
             builder = builder.chained_invoke_details(ci.build());
         }
-        _ => {}
+        OperationKind::Wait | OperationKind::Execution => {}
     }
 
     builder.build().ok()
@@ -3262,13 +3281,10 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
 fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("Id".to_owned(), serde_json::json!(stored.id));
-    obj.insert(
-        "Type".to_owned(),
-        serde_json::json!(stored.op_type.as_str()),
-    );
+    obj.insert("Type".to_owned(), serde_json::json!(stored.kind.wire_str()));
     obj.insert(
         "Status".to_owned(),
-        serde_json::json!(operation_status_wire_str(&stored.status)),
+        serde_json::json!(stored.status.wire_str()),
     );
     if let Some(st) = &stored.sub_type {
         obj.insert("SubType".to_owned(), serde_json::json!(st));
@@ -3308,12 +3324,12 @@ fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
         details.insert("Error".to_owned(), e);
     }
 
-    match stored.op_type {
-        OperationType::Step => {
+    match stored.kind {
+        OperationKind::Step => {
             details.insert("Attempt".to_owned(), serde_json::json!(stored.attempt));
             obj.insert("StepDetails".to_owned(), serde_json::Value::Object(details));
         }
-        OperationType::Context => {
+        OperationKind::Context => {
             if stored.replay_children {
                 details.insert("ReplayChildren".to_owned(), serde_json::json!(true));
             }
@@ -3322,7 +3338,7 @@ fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
                 serde_json::Value::Object(details),
             );
         }
-        OperationType::Callback => {
+        OperationKind::Callback => {
             if let Some(id) = &stored.callback_id {
                 details.insert("CallbackId".to_owned(), serde_json::json!(id));
             }
@@ -3331,65 +3347,16 @@ fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
                 serde_json::Value::Object(details),
             );
         }
-        OperationType::ChainedInvoke => {
+        OperationKind::ChainedInvoke => {
             obj.insert(
                 "ChainedInvokeDetails".to_owned(),
                 serde_json::Value::Object(details),
             );
         }
-        _ => {}
+        OperationKind::Wait | OperationKind::Execution => {}
     }
 
     serde_json::Value::Object(obj)
-}
-
-/// Human-readable operation type for [`TestOperation::op_type`].
-fn operation_type_str(t: &OperationType) -> &'static str {
-    match *t {
-        OperationType::Step => "Step",
-        OperationType::Wait => "Wait",
-        OperationType::Context => "Context",
-        OperationType::Callback => "Callback",
-        OperationType::ChainedInvoke => "ChainedInvoke",
-        OperationType::Execution => "Execution",
-        _ => "Unknown",
-    }
-}
-
-/// Human-readable operation status for [`TestOperation::status`].
-fn operation_status_str(s: &OperationStatus) -> &'static str {
-    match *s {
-        OperationStatus::Started => "Started",
-        OperationStatus::Pending => "Pending",
-        OperationStatus::Ready => "Ready",
-        OperationStatus::Succeeded => "Succeeded",
-        OperationStatus::Failed => "Failed",
-        OperationStatus::Cancelled => "Cancelled",
-        OperationStatus::TimedOut => "TimedOut",
-        OperationStatus::Stopped => "Stopped",
-        _ => "Unknown",
-    }
-}
-
-/// Wire (`UPPER_CASE`) operation status for the envelope JSON that
-/// `parse_single_operation` reads.
-///
-/// The envelope must speak the service's wire dialect exactly: the real
-/// backend sends `TIMED_OUT` (never `TIMEDOUT`), and the production parser
-/// treats any other spelling as an unrecognized status (issue #45), so the
-/// local runner rendering `PascalCase` here would fail replay.
-fn operation_status_wire_str(s: &OperationStatus) -> &'static str {
-    match *s {
-        OperationStatus::Started => "STARTED",
-        OperationStatus::Pending => "PENDING",
-        OperationStatus::Ready => "READY",
-        OperationStatus::Succeeded => "SUCCEEDED",
-        OperationStatus::Failed => "FAILED",
-        OperationStatus::Cancelled => "CANCELLED",
-        OperationStatus::TimedOut => "TIMED_OUT",
-        OperationStatus::Stopped => "STOPPED",
-        _ => "UNKNOWN",
-    }
 }
 
 /// Returns the stored records the service sends in the invocation input and
@@ -3418,7 +3385,7 @@ fn prune_replay_children(ops: &[StoredOp]) -> Vec<&StoredOp> {
             let Some(parent) = parent_id.and_then(find) else {
                 return false;
             };
-            if parent.op_type == OperationType::Context
+            if parent.kind == OperationKind::Context
                 && matches!(
                     parent.status,
                     OperationStatus::Succeeded | OperationStatus::Failed
@@ -3881,7 +3848,7 @@ mod tests {
         let wait_op = result
             .operations()
             .iter()
-            .find(|o| o.op_type() == "Wait")
+            .find(|o| o.kind() == OperationKind::Wait)
             .expect("wait op recorded");
         assert!(wait_op.succeeded());
     }
@@ -4123,11 +4090,16 @@ mod tests {
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&30));
         // Parent context op + two child steps recorded.
-        assert!(result.operations().iter().any(|o| o.op_type() == "Context"));
+        assert!(
+            result
+                .operations()
+                .iter()
+                .any(|o| o.kind() == OperationKind::Context)
+        );
         let step_count = result
             .operations()
             .iter()
-            .filter(|o| o.op_type() == "Step")
+            .filter(|o| o.kind() == OperationKind::Step)
             .count();
         assert_eq!(step_count, 2);
     }
@@ -4586,7 +4558,7 @@ mod tests {
         result
             .operations()
             .iter()
-            .find(|o| o.op_type() == "Callback")
+            .find(|o| o.kind() == OperationKind::Callback)
             .expect("callback op recorded")
     }
 
@@ -4626,7 +4598,7 @@ mod tests {
         assert!(result.is_failure());
         assert_eq!(result.error_type(), Some("CallbackError"));
         let cb_op = callback_record(&result);
-        assert_eq!(cb_op.status(), "TimedOut");
+        assert_eq!(cb_op.status(), OperationStatus::TimedOut);
         assert_eq!(cb_op.error_message(), Some("Callback timed out"));
     }
 
@@ -4694,7 +4666,7 @@ mod tests {
             ))
         );
         let cb_op = callback_record(&result);
-        assert_eq!(cb_op.status(), "Failed");
+        assert_eq!(cb_op.status(), OperationStatus::Failed);
         assert_eq!(cb_op.error_type(), Some("Declined"));
         assert_eq!(cb_op.error_message(), Some("no"));
     }
@@ -4733,7 +4705,7 @@ mod tests {
             "kind is Callback(ExternalFailure)"
         );
         let cb_op = callback_record(&result);
-        assert_eq!(cb_op.status(), "Failed");
+        assert_eq!(cb_op.status(), OperationStatus::Failed);
         assert_eq!(cb_op.error_type(), Some("Declined"));
     }
 
@@ -4928,7 +4900,7 @@ mod tests {
 
         assert!(result.is_failure(), "{:?}", result.error_message());
         let cb_op = callback_record(&result);
-        assert_eq!(cb_op.status(), "Failed");
+        assert_eq!(cb_op.status(), OperationStatus::Failed);
         assert_eq!(cb_op.error_type(), None);
         assert_eq!(cb_op.error_message(), None);
     }
@@ -4997,7 +4969,7 @@ mod tests {
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output(), Some(&true));
         let cb_op = callback_record(&result);
-        assert_eq!(cb_op.status(), "TimedOut");
+        assert_eq!(cb_op.status(), OperationStatus::TimedOut);
         assert_eq!(cb_op.error_type(), Some("Callback.Heartbeat"));
         assert_eq!(
             cb_op.error_message(),
@@ -5135,8 +5107,8 @@ mod tests {
         ];
         let ops = fold_history(&events);
         assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].op_type(), "Step");
-        assert_eq!(ops[0].status(), "Succeeded");
+        assert_eq!(ops[0].kind(), OperationKind::Step);
+        assert_eq!(ops[0].status(), OperationStatus::Succeeded);
         assert_eq!(ops[0].result(), Some("\"ok\""));
         assert_eq!(ops[0].name(), Some("charge"));
         assert_eq!(ops[0].id(), "op-1");
@@ -5185,7 +5157,7 @@ mod tests {
         ];
         let ops = fold_history(&events);
         assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].status(), "Succeeded");
+        assert_eq!(ops[0].status(), OperationStatus::Succeeded);
         assert_eq!(
             ops[0].attempt(),
             1,
@@ -5278,8 +5250,8 @@ mod tests {
         ];
         let ops = fold_history(&events);
         assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].op_type(), "Callback");
-        assert_eq!(ops[0].status(), "TimedOut");
+        assert_eq!(ops[0].kind(), OperationKind::Callback);
+        assert_eq!(ops[0].status(), OperationStatus::TimedOut);
         assert_eq!(ops[0].error_type(), Some("CallbackError"));
     }
 
@@ -5315,7 +5287,7 @@ mod tests {
         ];
         let ops = fold_history(&events);
         assert_eq!(ops.len(), 1, "only the operation-scoped event is folded");
-        assert_eq!(ops[0].op_type(), "Step");
+        assert_eq!(ops[0].kind(), OperationKind::Step);
         assert_eq!(invocations_from_history(&events), 2);
     }
 
@@ -5347,8 +5319,8 @@ mod tests {
         let ops = fold_history(&events);
         let ids: Vec<&str> = ops.iter().map(TestOperation::id).collect();
         assert_eq!(ids, vec!["first", "second"]);
-        assert_eq!(ops[1].op_type(), "Wait");
-        assert_eq!(ops[1].status(), "Succeeded");
+        assert_eq!(ops[1].kind(), OperationKind::Wait);
+        assert_eq!(ops[1].status(), OperationStatus::Succeeded);
     }
 
     #[test]
@@ -5366,13 +5338,73 @@ mod tests {
         assert_eq!(execution_status_str(&ExecutionStatus::Stopped), "Stopped");
         assert_eq!(
             event_family_op_type(Some(&EventType::ChainedInvokeSucceeded)),
-            Some("ChainedInvoke")
+            Some(OperationKind::ChainedInvoke)
         );
         assert_eq!(
             event_family_op_type(Some(&EventType::ExecutionStarted)),
             None
         );
         assert_eq!(event_family_op_type(None), None);
+    }
+
+    #[test]
+    fn operation_kind_from_wire_round_trips() {
+        for kind in [
+            OperationKind::Step,
+            OperationKind::Wait,
+            OperationKind::Context,
+            OperationKind::Callback,
+            OperationKind::ChainedInvoke,
+            OperationKind::Execution,
+        ] {
+            assert_eq!(
+                OperationKind::from_wire(&OperationType::from(kind.wire_str())),
+                Some(kind)
+            );
+        }
+        assert_eq!(
+            OperationKind::from_wire(&OperationType::from("BOGUS")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn step_reports_kind_and_status() {
+        let result = LocalRunner::new()
+            .run(
+                |_e: (), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_i32) }).name("only").await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        let ops = result.operations();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].kind(), OperationKind::Step);
+        assert_eq!(ops[0].status(), OperationStatus::Succeeded);
+        assert!(ops[0].succeeded());
+    }
+
+    #[tokio::test]
+    async fn unknown_operation_type_is_rejected() {
+        let backend = Backend::new(QueuedReplies::default(), None);
+        let token = backend.current_token();
+        let update = OperationUpdate::builder()
+            .id("bogus")
+            .r#type(OperationType::from("BOGUS"))
+            .action(OperationAction::Start)
+            .build()
+            .expect("valid update");
+        let e = backend
+            .checkpoint("arn", &token, vec![update])
+            .await
+            .expect_err("an unknown operation type is rejected");
+        assert_eq!(e.to_string(), "durable: client: Invalid operation type.");
+        assert!(!e.is_retryable());
+        assert!(backend.snapshot_operations().is_empty());
+        assert_eq!(backend.current_token(), token);
     }
 
     #[test]
@@ -5630,7 +5662,7 @@ mod tests {
             Operation::builder()
                 .id("step-1")
                 .r#type(OperationType::Step)
-                .status(OperationStatus::Succeeded)
+                .status(WireOperationStatus::Succeeded)
                 .start_timestamp(DateTime::from_secs(0))
                 .step_details(StepDetails::builder().result("\"page1-result\"").build())
                 .build()
@@ -5638,7 +5670,7 @@ mod tests {
             Operation::builder()
                 .id("step-2")
                 .r#type(OperationType::Step)
-                .status(OperationStatus::Succeeded)
+                .status(WireOperationStatus::Succeeded)
                 .start_timestamp(DateTime::from_secs(0))
                 .step_details(StepDetails::builder().result("\"page2-result\"").build())
                 .build()
@@ -6198,7 +6230,8 @@ mod tests {
             result
                 .operations()
                 .iter()
-                .any(|op| op.status == "Succeeded" && op.name.as_deref() == Some("inc")),
+                .any(|op| op.status == OperationStatus::Succeeded
+                    && op.name.as_deref() == Some("inc")),
             "the step's coalesced checkpoints must be recorded: {:?}",
             result.operations()
         );
@@ -6377,7 +6410,8 @@ mod tests {
             .find(|op| op.name.as_deref() == Some("orphan"))
             .expect("the orphaned step's operation record exists");
         assert_eq!(
-            orphan_op.status, "Failed",
+            orphan_op.status,
+            OperationStatus::Failed,
             "a terminal FAIL must be recorded for the operation whose \
              retained outcome rejection was classified at the flush point"
         );
@@ -6597,7 +6631,7 @@ mod tests {
             .iter()
             .find(|op| op.name() == Some("hour"))
             .expect("the hour wait is recorded");
-        assert_eq!(hour.status(), "Started");
+        assert_eq!(hour.status(), OperationStatus::Started);
     }
 
     /// A WAIT `START` update with the given duration.
@@ -6659,7 +6693,8 @@ mod tests {
             let mut state = backend.lock();
             state.now = now;
             for update in updates {
-                state.apply_update(update).expect("update applies");
+                let kind = OperationKind::from_wire(update.r#type()).expect("a known type");
+                state.apply_update(kind, update).expect("update applies");
             }
         }
         backend
@@ -6673,7 +6708,7 @@ mod tests {
             .iter()
             .find(|op| op.id == id)
             .expect("op is stored");
-        (op.status.clone(), state.now)
+        (op.status, state.now)
     }
 
     /// A callback `START` stores `Started`, but `advance` still settles a
@@ -6773,12 +6808,12 @@ mod tests {
     }
 
     /// The statuses of the step records of `backend`.
-    fn step_statuses(backend: &Backend) -> Vec<String> {
+    fn step_statuses(backend: &Backend) -> Vec<OperationStatus> {
         backend
             .snapshot_operations()
             .iter()
-            .filter(|op| op.op_type() == "Step")
-            .map(|op| op.status().to_owned())
+            .filter(|op| op.kind() == OperationKind::Step)
+            .map(TestOperation::status)
             .collect()
     }
 
@@ -6801,11 +6836,11 @@ mod tests {
             tokio::time::advance(std::time::Duration::from_millis(49)).await;
             assert!(step_statuses(&backend).is_empty(), "START not applied yet");
             tokio::time::advance(std::time::Duration::from_millis(1)).await;
-            assert_eq!(step_statuses(&backend), ["Started"]);
+            assert_eq!(step_statuses(&backend), [OperationStatus::Started]);
             tokio::time::advance(std::time::Duration::from_millis(49)).await;
-            assert_eq!(step_statuses(&backend), ["Started"]);
+            assert_eq!(step_statuses(&backend), [OperationStatus::Started]);
             tokio::time::advance(std::time::Duration::from_millis(1)).await;
-            assert_eq!(step_statuses(&backend), ["Succeeded"]);
+            assert_eq!(step_statuses(&backend), [OperationStatus::Succeeded]);
         };
         let (delayed, ()) = tokio::join!(
             runner.run_on_backend(Arc::clone(&backend), one_step_handler, "null".to_owned()),
@@ -6913,7 +6948,7 @@ mod tests {
     }
 
     /// The service creates a callback in `Started`, so an open callback
-    /// reports `"Started"`, as under `CloudRunner`.
+    /// reports `OperationStatus::Started`, as under `CloudRunner`.
     #[tokio::test]
     async fn open_callback_reports_started() {
         let result = LocalRunner::new()
@@ -6931,9 +6966,9 @@ mod tests {
         let callback = result
             .operations()
             .iter()
-            .find(|op| op.op_type() == "Callback")
+            .find(|op| op.kind() == OperationKind::Callback)
             .expect("the callback is recorded");
-        assert_eq!(callback.status(), "Started");
+        assert_eq!(callback.status(), OperationStatus::Started);
     }
 
     /// One update for the pruning tests. `replay_children` sets the
@@ -6982,7 +7017,8 @@ mod tests {
         {
             let mut state = backend.lock();
             for update in updates {
-                state.apply_update(update).expect("update applies");
+                let kind = OperationKind::from_wire(update.r#type()).expect("a known type");
+                state.apply_update(kind, update).expect("update applies");
             }
         }
         backend
@@ -7206,7 +7242,7 @@ mod tests {
 
         let ops = get_state_ops(&backend).await;
         let context = ops.iter().find(|op| op.id() == "C").expect("C");
-        assert_eq!(context.status(), &OperationStatus::Failed);
+        assert_eq!(context.status(), &WireOperationStatus::Failed);
         assert_eq!(
             context
                 .context_details()
@@ -7279,7 +7315,10 @@ mod tests {
         // A close without the option records `false`, so the child goes.
         backend
             .lock()
-            .apply_update(&ctx_op("C", OperationAction::Succeed, None, None))
+            .apply_update(
+                OperationKind::Context,
+                &ctx_op("C", OperationAction::Succeed, None, None),
+            )
             .expect("update applies");
         assert!(!context_has_replay_children(&backend.envelope_history()));
         assert_eq!(envelope_ids(&backend), ["C"]);
@@ -7813,7 +7852,7 @@ mod tests {
         let invokes: Vec<&TestOperation> = result
             .operations()
             .iter()
-            .filter(|op| op.op_type() == "ChainedInvoke")
+            .filter(|op| op.kind() == OperationKind::ChainedInvoke)
             .collect();
         assert_eq!(invokes.len(), 1, "one chained invoke record");
         invokes[0]
@@ -7844,7 +7883,7 @@ mod tests {
             .await;
         assert_eq!(result.output(), Some(&42), "{:?}", result.error_message());
         let op = invoke_record(&result);
-        assert_eq!(op.status(), "Succeeded");
+        assert_eq!(op.status(), OperationStatus::Succeeded);
         assert_eq!(op.result(), Some("42"));
         assert_eq!(result.invocation_count(), 2);
     }
@@ -7873,7 +7912,7 @@ mod tests {
             result.error_message()
         );
         let op = invoke_record(&result);
-        assert_eq!(op.status(), "Failed");
+        assert_eq!(op.status(), OperationStatus::Failed);
         assert_eq!(op.error_type(), Some("PaymentError"));
     }
 
@@ -7917,7 +7956,7 @@ mod tests {
             .await;
         assert!(result.is_success(), "{:?}", result.error_message());
         let op = invoke_record(&result);
-        assert_eq!(op.status(), "Succeeded");
+        assert_eq!(op.status(), OperationStatus::Succeeded);
         assert_eq!(op.result(), Some("null"));
     }
 
@@ -8061,7 +8100,7 @@ mod tests {
             .await;
         assert_eq!(result.output(), Some(&4), "{:?}", result.error_message());
         let op = invoke_record(&result);
-        assert_eq!(op.status(), "Succeeded");
+        assert_eq!(op.status(), OperationStatus::Succeeded);
         assert_eq!(op.result(), Some("4"));
         assert_eq!(result.invocation_count(), 2);
     }
@@ -8103,7 +8142,7 @@ mod tests {
             result.error_message()
         );
         let op = invoke_record(&result);
-        assert_eq!(op.status(), "Failed");
+        assert_eq!(op.status(), OperationStatus::Failed);
         let message = op.error_message().unwrap_or_default();
         assert!(message.contains("declined"), "{message}");
     }
@@ -8173,7 +8212,7 @@ mod tests {
             )
             .await;
         assert!(result.is_suspended(), "{:?}", result.error_message());
-        assert_eq!(invoke_record(&result).status(), "Started");
+        assert_eq!(invoke_record(&result).status(), OperationStatus::Started);
         let message = result.error_message().unwrap_or_default();
         assert!(
             message.ends_with("; chained invokes still pending for: \"approval\""),
@@ -8248,7 +8287,7 @@ mod tests {
             .run(invoke_slow, ())
             .await;
         assert!(result.is_suspended(), "{:?}", result.error_message());
-        assert_eq!(invoke_record(&result).status(), "Started");
+        assert_eq!(invoke_record(&result).status(), OperationStatus::Started);
         let message = result.error_message().unwrap_or_default();
         assert!(
             message.ends_with("; chained invokes still pending for: \"slow\""),
