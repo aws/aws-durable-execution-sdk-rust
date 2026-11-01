@@ -810,6 +810,9 @@ assert_eq!(result.output(), Some(&42));
 `TestResult` also reports the invocation count and every recorded operation,
 so a test can assert that a step ran once across replays.
 
+`.register_function(name, f)` and `.register_durable_function(name, handler)`
+supply the target of `ctx.invoke`.
+
 A test queues a reply for a callback before the run.
 `.callback(CallbackReply::...)` queues one for the next pending callback, in
 order, and `.callback_for(name, CallbackReply::...)` queues one for the

@@ -53,6 +53,9 @@
 //!   by then. So waits and retries end in time order, as on the service.
 //! - Queued callback replies arrive before the clock moves. An advance that
 //!   delivers a callback reply fires no timer.
+//! - A chained invoke runs its registered target between invocations,
+//!   before the virtual clock moves (see [`LocalRunner::register_function`]
+//!   and [`LocalRunner::register_durable_function`]).
 //! - Callback replies are queued before the run. The runner runs no
 //!   callback timeout or heartbeat timer; [`CallbackReply::timeout`] and
 //!   [`CallbackReply::heartbeat_timeout`] deliver the records those timers
@@ -121,6 +124,8 @@
 //! # }
 //! ```
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -618,13 +623,71 @@ struct QueuedReplies {
     named: Vec<(String, CallbackReply)>,
 }
 
+/// A type-erased plain invoke target: it takes the invoke's input JSON and
+/// returns the output JSON.
+type PlainTarget = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, BoxError>> + Send>> + Send + Sync,
+>;
+
+/// A type-erased durable invoke target: it runs the handler as a nested
+/// execution with the given runner settings and the invoke's input JSON.
+type DurableTarget = Arc<
+    dyn Fn(LocalRunner, String) -> Pin<Box<dyn Future<Output = NestedOutcome> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A target registered for `ctx.invoke` with
+/// [`LocalRunner::register_function`] or
+/// [`LocalRunner::register_durable_function`].
+#[derive(Clone)]
+enum RegisteredFunction {
+    /// A plain function, run once inline.
+    Plain(PlainTarget),
+    /// A durable handler, run as a nested execution on a fresh backend.
+    Durable(DurableTarget),
+}
+
+impl std::fmt::Debug for RegisteredFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Plain(_) => f.write_str("RegisteredFunction::Plain"),
+            Self::Durable(_) => f.write_str("RegisteredFunction::Durable"),
+        }
+    }
+}
+
+/// The outcome of an invoke target, as the caller's invoke record stores
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NestedOutcome {
+    /// The target succeeded. The string is the raw result JSON; `None`
+    /// records `"null"`.
+    Succeeded(Option<String>),
+    /// The target failed with this wire error: its type, message, error
+    /// data and stack trace.
+    Failed(crate::WireError),
+    /// A nested durable execution suspended. The invoke stays `Started`.
+    Suspended,
+}
+
+impl NestedOutcome {
+    /// The outcome of a failed plain target, with the wire error of the
+    /// production handler mapping.
+    fn from_error(err: BoxError) -> Self {
+        Self::Failed(crate::wire_error_from_box_error(err))
+    }
+}
+
 /// Drives a durable handler to completion in memory, simulating the backend.
 ///
 /// Construct with [`LocalRunner::new`], optionally pass the handler's
-/// [`Options`](crate::Options) with [`options`](Self::options) and queue
+/// [`Options`](crate::Options) with [`options`](Self::options), queue
 /// callback replies with [`callback`](Self::callback) and
-/// [`callback_for`](Self::callback_for), then drive a handler with
-/// [`run`](Self::run).
+/// [`callback_for`](Self::callback_for), and register the targets of
+/// `ctx.invoke` with [`register_function`](Self::register_function) and
+/// [`register_durable_function`](Self::register_durable_function), then
+/// drive a handler with [`run`](Self::run).
 ///
 /// # Callback replies
 ///
@@ -686,11 +749,15 @@ struct QueuedReplies {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct LocalRunner {
     max_invocations: usize,
     callback_replies: QueuedReplies,
+    /// The targets of `ctx.invoke`, by exact function name (see
+    /// [`register_function`](Self::register_function) and
+    /// [`register_durable_function`](Self::register_durable_function)).
+    functions: BTreeMap<String, RegisteredFunction>,
     /// Initial-state page size. When set, the synthesized invocation
     /// envelope carries at most this many history operations inline plus a
     /// pagination marker, so the context fetches the remainder via
@@ -756,6 +823,7 @@ impl LocalRunner {
         Self {
             max_invocations: DEFAULT_MAX_INVOCATIONS,
             callback_replies: QueuedReplies::default(),
+            functions: BTreeMap::new(),
             initial_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
             checkpoint_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
             options: crate::Options::default(),
@@ -1021,6 +1089,185 @@ impl LocalRunner {
         self
     }
 
+    /// Registers `function` as the plain target of `ctx.invoke(name, ..)`.
+    ///
+    /// The name matches exactly: no qualifier, alias or ARN handling. A
+    /// later registration of either kind under the same name replaces this
+    /// one.
+    ///
+    /// When an invocation suspends, the runner runs every pending invoke
+    /// whose target is registered, once, in the order the invokes were
+    /// first checkpointed, before the virtual clock moves. A plain target
+    /// decodes its input from the invoke's payload, runs, and encodes its
+    /// output:
+    ///
+    /// - `Ok(value)` records the invoke `Succeeded` with the JSON of
+    ///   `value`. `Ok(())` records `null`.
+    /// - `Err(err)` records the invoke `Failed` with the error fields a
+    ///   failing handler records: a [`TypedError`](crate::TypedError) keeps
+    ///   its type and error data, and any other error records the type
+    ///   `Error`.
+    /// - An input that does not decode, or an output that does not encode,
+    ///   records the invoke `Failed` with the type `Error` and a message
+    ///   that starts `deserialize input:` or `serialize output:`.
+    ///
+    /// The target runs once per invoke, whatever its outcome. A replay of
+    /// the invoke reads the recorded outcome.
+    ///
+    /// An invoke of a name that no registration matches fails the run: the
+    /// backend rejects the invoke's checkpoint, and the result's
+    /// [`error_message`](TestResult::error_message) names the function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::test_util::LocalRunner;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let result = LocalRunner::new()
+    ///     .register_function("double", |x: i32| async move { Ok(x * 2) })
+    ///     .run(
+    ///         |n: i32, ctx: durable::DurableContext| async move {
+    ///             let doubled = ctx.invoke::<i32, _>("double", n).await?;
+    ///             Ok::<_, durable::BoxError>(doubled)
+    ///         },
+    ///         21_i32,
+    ///     )
+    ///     .await;
+    ///
+    /// assert_eq!(result.output(), Some(&42));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn register_function<I, O, F, Fut>(mut self, name: impl Into<String>, function: F) -> Self
+    where
+        I: DeserializeOwned + Send + 'static,
+        O: Serialize + Send + 'static,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    {
+        let function = Arc::new(function);
+        let target: PlainTarget = Arc::new(move |input: String| {
+            let function = Arc::clone(&function);
+            Box::pin(async move {
+                let input: I = serde_json::from_str(&input)
+                    .map_err(|e| -> BoxError { format!("deserialize input: {e}").into() })?;
+                let output = function(input).await?;
+                serde_json::to_string(&output)
+                    .map_err(|e| -> BoxError { format!("serialize output: {e}").into() })
+            })
+        });
+        self.functions
+            .insert(name.into(), RegisteredFunction::Plain(target));
+        self
+    }
+
+    /// Registers `handler` as the durable target of `ctx.invoke(name, ..)`.
+    ///
+    /// Name matching, replacement, and the time a target runs follow
+    /// [`register_function`](Self::register_function). The handler runs as
+    /// its own durable execution, driven to its end before the caller's
+    /// next invocation:
+    ///
+    /// - The target runs once per invoke, whatever its outcome. A replay of
+    ///   the invoke reads the recorded outcome.
+    /// - The nested execution has a fresh backend and its own virtual
+    ///   clock. It uses a copy of this runner's settings taken when the
+    ///   caller's run starts: the [`Options`](crate::Options), the page
+    ///   sizes, [`max_invocations`](Self::max_invocations) and
+    ///   [`checkpoint_latency`](Self::checkpoint_latency). It has no
+    ///   registered functions, no queued callback replies and no injected
+    ///   checkpoint failures.
+    /// - A nested execution that succeeds records the invoke `Succeeded`
+    ///   with the handler's result, or `null` when the envelope carries
+    ///   none. One that fails records the invoke `Failed` with the
+    ///   handler's wire error: its type, message, error data and stack
+    ///   trace. One that suspends, for example on a callback no reply
+    ///   answers, leaves the invoke `Started`.
+    /// - When the caller's run then ends suspended, because nothing can
+    ///   advance, and at least one chained invoke is still `Started`, the
+    ///   result's [`error_message`](TestResult::error_message) ends with
+    ///   `; chained invokes still pending for: ` and the function names.
+    ///   Each name is in double quotes, the names are separated by `, `,
+    ///   they appear in the order the invokes were stored, and each name
+    ///   appears once. This part comes after the part that names
+    ///   unmatched queued callback replies. For example:
+    ///   `; chained invokes still pending for: "approval", "audit"`.
+    /// - The nested execution's invocations do not count in the caller's
+    ///   [`invocation_count`](TestResult::invocation_count), and its
+    ///   operations do not appear in the caller's
+    ///   [`operations`](TestResult::operations).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::test_util::LocalRunner;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let result = LocalRunner::new()
+    ///     .register_durable_function("workflow", |n: u32, ctx: durable::DurableContext| async move {
+    ///         let next = ctx.step(move |_| async move { Ok(n + 1) }).await?;
+    ///         ctx.wait(Duration::from_secs(5)).await?;
+    ///         Ok::<_, durable::BoxError>(next * 2)
+    ///     })
+    ///     .run(
+    ///         |n: u32, ctx: durable::DurableContext| async move {
+    ///             let out = ctx.invoke::<u32, _>("workflow", n).await?;
+    ///             Ok::<_, durable::BoxError>(out)
+    ///         },
+    ///         1_u32,
+    ///     )
+    ///     .await;
+    ///
+    /// assert_eq!(result.output(), Some(&4));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn register_durable_function<E, O, F, Fut>(
+        mut self,
+        name: impl Into<String>,
+        handler: F,
+    ) -> Self
+    where
+        E: Serialize + DeserializeOwned + Send + 'static,
+        O: Serialize + DeserializeOwned + Send + 'static,
+        F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send,
+    {
+        let handler = Arc::new(handler);
+        let target: DurableTarget = Arc::new(move |runner: LocalRunner, input: String| {
+            let handler = Arc::clone(&handler);
+            Box::pin(async move {
+                let backend = Arc::new(runner.new_backend());
+                let nested = move |event: E, ctx: DurableContext| handler(event, ctx);
+                runner.drive(backend, nested, input).await.nested_outcome()
+            })
+        });
+        self.functions
+            .insert(name.into(), RegisteredFunction::Durable(target));
+        self
+    }
+
+    /// The settings of a nested durable run: a copy of this runner with no
+    /// registered functions, no queued callback replies and the fault
+    /// injection of [`LocalRunner::new`].
+    fn nested_settings(&self) -> Self {
+        let defaults = Self::new();
+        let mut nested = self.clone();
+        nested.functions = defaults.functions;
+        nested.callback_replies = defaults.callback_replies;
+        nested.checkpoint_failures = defaults.checkpoint_failures;
+        nested.checkpoint_failure_skip = defaults.checkpoint_failure_skip;
+        nested.checkpoint_failures_retryable = defaults.checkpoint_failures_retryable;
+        nested
+    }
+
     /// Drives `handler` to a terminal outcome, feeding it `event`.
     ///
     /// Each simulated invocation goes through the **production service
@@ -1062,15 +1309,31 @@ impl LocalRunner {
         F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send,
     {
-        self.run_on_backend(Arc::new(self.new_backend()), handler, event)
+        // Serialize the event once; the envelope re-delivers it per
+        // invocation.
+        let event_json = match serde_json::to_string(&event) {
+            Ok(json) => json,
+            Err(e) => {
+                return TestResult {
+                    disposition: Disposition::Failed,
+                    output: None,
+                    error_type: Some("SerializationFailed".to_owned()),
+                    error_message: Some(format!("serialize event: {e}")),
+                    operations: Vec::new(),
+                    invocations: 0,
+                };
+            }
+        };
+        self.run_on_backend(Arc::new(self.new_backend()), handler, event_json)
             .await
     }
 
     /// A fresh backend configured from this runner's settings: queued
-    /// callback replies, checkpoint page size, injected checkpoint
-    /// failures and checkpoint latency.
+    /// callback replies, checkpoint page size, registered function names,
+    /// injected checkpoint failures and checkpoint latency.
     fn new_backend(&self) -> Backend {
         let mut backend = Backend::new(self.callback_replies.clone(), self.checkpoint_page_size);
+        backend.registered_functions = self.functions.keys().cloned().collect();
         backend.checkpoint_failures_remaining.store(
             self.checkpoint_failures,
             std::sync::atomic::Ordering::SeqCst,
@@ -1088,16 +1351,36 @@ impl LocalRunner {
     }
 
     /// The invoke → parse → advance loop over an externally supplied
-    /// backend. Internal seam: unit tests inject a backend they retain a
-    /// handle to, so they can assert on transport-level facts (e.g. how
-    /// many `get_state` fetches pagination forced).
-    #[expect(clippy::too_many_lines)] // reason: the invoke → drive → advance loop reads better as one flow
+    /// backend, with the event as JSON. Internal seam: unit tests inject a
+    /// backend they retain a handle to, so they can assert on
+    /// transport-level facts (e.g. how many `get_state` fetches pagination
+    /// forced).
     async fn run_on_backend<E, O, F, Fut>(
         &self,
         backend: Arc<Backend>,
         handler: F,
-        event: E,
+        event_json: String,
     ) -> TestResult<O>
+    where
+        E: Serialize + DeserializeOwned + Send + 'static,
+        O: Serialize + DeserializeOwned + Send + 'static,
+        F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send,
+    {
+        self.drive(backend, handler, event_json)
+            .await
+            .into_test_result()
+    }
+
+    /// Drives one execution on `backend` and returns its end with the
+    /// handler output still raw JSON. [`run_on_backend`](Self::run_on_backend)
+    /// decodes the output; a nested durable run keeps it raw.
+    async fn drive<E, O, F, Fut>(
+        &self,
+        backend: Arc<Backend>,
+        handler: F,
+        event_json: String,
+    ) -> RawRun
     where
         E: Serialize + DeserializeOwned + Send + 'static,
         O: Serialize + DeserializeOwned + Send + 'static,
@@ -1117,21 +1400,8 @@ impl LocalRunner {
         options.execution_client = Some(client);
         let service = crate::wrap(handler, options);
 
-        // Serialize the event once; the envelope re-delivers it per
-        // invocation.
-        let event_json = match serde_json::to_string(&event) {
-            Ok(json) => json,
-            Err(e) => {
-                return TestResult {
-                    disposition: Disposition::Failed,
-                    output: None,
-                    error_type: Some("SerializationFailed".to_owned()),
-                    error_message: Some(format!("serialize event: {e}")),
-                    operations: Vec::new(),
-                    invocations: 0,
-                };
-            }
-        };
+        // A nested durable run uses the settings this run starts with.
+        let nested = self.nested_settings();
 
         let mut invocations = 0_usize;
         // The most recent invocation fault (Lambda runtime error), kept so
@@ -1142,27 +1412,27 @@ impl LocalRunner {
         loop {
             invocations += 1;
             if invocations > self.max_invocations {
-                return TestResult {
-                    disposition: Disposition::Suspended,
-                    output: None,
-                    error_type: last_invocation_fault
-                        .is_some()
-                        .then(|| "RuntimeError".to_owned()),
-                    error_message: Some(last_invocation_fault.map_or_else(
-                        || {
-                            format!(
-                                "execution did not terminate within {} invocations",
-                                self.max_invocations
-                            )
-                        },
-                        |fault| {
-                            format!(
-                                "execution did not terminate within {} invocations; \
-                                 last invocation fault: {fault}",
-                                self.max_invocations
-                            )
-                        },
-                    )),
+                return RawRun {
+                    end: RawEnd::Suspended {
+                        error_type: last_invocation_fault
+                            .is_some()
+                            .then(|| "RuntimeError".to_owned()),
+                        message: last_invocation_fault.map_or_else(
+                            || {
+                                format!(
+                                    "execution did not terminate within {} invocations",
+                                    self.max_invocations
+                                )
+                            },
+                            |fault| {
+                                format!(
+                                    "execution did not terminate within {} invocations; \
+                                     last invocation fault: {fault}",
+                                    self.max_invocations
+                                )
+                            },
+                        ),
+                    },
                     operations: backend.snapshot_operations(),
                     invocations: invocations - 1,
                 };
@@ -1193,70 +1463,159 @@ impl LocalRunner {
                 }
             };
 
-            match response.get("Status").and_then(serde_json::Value::as_str) {
-                Some("SUCCEEDED") => {
-                    let serialized = response
+            let end = match response.get("Status").and_then(serde_json::Value::as_str) {
+                Some("SUCCEEDED") => RawEnd::Succeeded(
+                    response
                         .get("Result")
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or("null");
-                    let output = serde_json::from_str::<O>(serialized).ok();
-                    let (error_type, error_message, disposition) = if output.is_some() {
-                        (None, None, Disposition::Succeeded)
-                    } else {
-                        (
-                            Some("SerializationFailed".to_owned()),
-                            Some("could not deserialize handler output".to_owned()),
-                            Disposition::Failed,
-                        )
-                    };
-                    return TestResult {
-                        disposition,
-                        output,
-                        error_type,
-                        error_message,
-                        operations: backend.snapshot_operations(),
-                        invocations,
-                    };
-                }
-                Some("FAILED") => {
-                    return failed_envelope_result(
-                        &response,
-                        backend.snapshot_operations(),
-                        invocations,
-                    );
-                }
+                        .map(ToOwned::to_owned),
+                ),
+                Some("FAILED") => RawEnd::Failed(envelope_wire_error(&response)),
                 Some("PENDING") => {
+                    // Pending invokes run before the clock moves. When one
+                    // of them changed its record, the next invocation
+                    // starts without an advance.
+                    if self.run_pending_invokes(&backend, &nested).await {
+                        continue;
+                    }
                     // Advance the simulated backend (timers, retries,
                     // callbacks). If nothing can advance, the execution is
                     // genuinely stuck.
-                    if !backend.advance() {
-                        return TestResult {
-                            disposition: Disposition::Suspended,
-                            output: None,
-                            error_type: None,
-                            error_message: Some(suspended_message(
-                                &backend.unmatched_reply_names(),
-                            )),
-                            operations: backend.snapshot_operations(),
-                            invocations,
-                        };
+                    if backend.advance() {
+                        continue;
+                    }
+                    RawEnd::Suspended {
+                        error_type: None,
+                        message: suspended_message(
+                            &backend.unmatched_reply_names(),
+                            &backend.pending_invoke_names(),
+                        ),
                     }
                 }
-                other => {
-                    return TestResult {
-                        disposition: Disposition::Failed,
-                        output: None,
-                        error_type: Some("RuntimeError".to_owned()),
-                        error_message: Some(format!(
-                            "unexpected response envelope status: {other:?}"
-                        )),
-                        operations: backend.snapshot_operations(),
-                        invocations,
-                    };
-                }
-            }
+                other => RawEnd::Failed(crate::WireError::new(
+                    Some("RuntimeError"),
+                    Some(format!("unexpected response envelope status: {other:?}")),
+                )),
+            };
+            return RawRun {
+                end,
+                operations: backend.snapshot_operations(),
+                invocations,
+            };
         }
     }
+
+    /// Runs each pending invoke with a registered target once, inline, in
+    /// stored order, and records its outcome. Returns whether at least one
+    /// record changed.
+    ///
+    /// The backend lock is not held while a target runs: the pending
+    /// invokes are collected first, then each target is awaited.
+    async fn run_pending_invokes(&self, backend: &Backend, nested: &Self) -> bool {
+        let mut changed = false;
+        for (id, target, input) in backend.take_pending_invokes(&self.functions) {
+            let outcome = match target {
+                RegisteredFunction::Plain(function) => match function(input).await {
+                    Ok(json) => NestedOutcome::Succeeded(Some(json)),
+                    Err(err) => NestedOutcome::from_error(err),
+                },
+                RegisteredFunction::Durable(handler) => handler(nested.clone(), input).await,
+            };
+            changed |= backend.record_invoke_outcome(&id, outcome);
+        }
+        changed
+    }
+}
+
+/// How one driven execution ended, with the handler output still raw JSON.
+#[derive(Debug)]
+struct RawRun {
+    end: RawEnd,
+    operations: Vec<TestOperation>,
+    invocations: usize,
+}
+
+/// The end of a driven execution (see [`RawRun`]).
+#[derive(Debug)]
+enum RawEnd {
+    /// A `SUCCEEDED` envelope, with its raw `Result` string.
+    Succeeded(Option<String>),
+    /// A `FAILED` envelope, with the wire error of its `Error` object. An
+    /// envelope with an unexpected status ends here too, with the type
+    /// `RuntimeError`.
+    Failed(crate::WireError),
+    /// The execution did not terminate.
+    Suspended {
+        error_type: Option<String>,
+        message: String,
+    },
+}
+
+impl RawRun {
+    /// The [`TestResult`] of a top-level run: the output decoded into `O`.
+    fn into_test_result<O: DeserializeOwned>(self) -> TestResult<O> {
+        let Self {
+            end,
+            operations,
+            invocations,
+        } = self;
+        let (disposition, output, error_type, error_message) = match end {
+            RawEnd::Succeeded(raw) => {
+                let output = serde_json::from_str::<O>(raw.as_deref().unwrap_or("null")).ok();
+                if output.is_some() {
+                    (Disposition::Succeeded, output, None, None)
+                } else {
+                    (
+                        Disposition::Failed,
+                        None,
+                        Some("SerializationFailed".to_owned()),
+                        Some("could not deserialize handler output".to_owned()),
+                    )
+                }
+            }
+            RawEnd::Failed(wire) => (
+                Disposition::Failed,
+                None,
+                Some(wire.error_type().unwrap_or("Error").to_owned()),
+                Some(wire.error_message().unwrap_or_default().to_owned()),
+            ),
+            RawEnd::Suspended {
+                error_type,
+                message,
+            } => (Disposition::Suspended, None, error_type, Some(message)),
+        };
+        TestResult {
+            disposition,
+            output,
+            error_type,
+            error_message,
+            operations,
+            invocations,
+        }
+    }
+
+    /// The outcome a nested durable run records on the caller's invoke.
+    fn nested_outcome(self) -> NestedOutcome {
+        match self.end {
+            RawEnd::Succeeded(raw) => NestedOutcome::Succeeded(raw),
+            RawEnd::Failed(wire) => NestedOutcome::Failed(wire),
+            RawEnd::Suspended { .. } => NestedOutcome::Suspended,
+        }
+    }
+}
+
+/// The wire error of a `FAILED` envelope's `Error` object: its
+/// `ErrorType`, `ErrorMessage`, `ErrorData` and `StackTrace`.
+fn envelope_wire_error(response: &serde_json::Value) -> crate::WireError {
+    let error = response.get("Error");
+    let field = |key: &str| {
+        error
+            .and_then(|e| e.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    crate::WireError::new(field("ErrorType"), field("ErrorMessage"))
+        .with_error_data(field("ErrorData"))
+        .with_stack_trace(error.and_then(crate::parse_stack_trace).unwrap_or_default())
 }
 
 /// The execution ARN the local runner stamps on every synthesized envelope.
@@ -1938,6 +2297,13 @@ struct StoredOp {
     /// The `ReplayChildren` option of the update that closed a context.
     /// A close without the option records `false`.
     replay_children: bool,
+    /// The function name of a chained invoke, from its `START`.
+    invoke_function: Option<String>,
+    /// The input payload of a chained invoke, from its `START`.
+    invoke_input: Option<String>,
+    /// Whether the runner already ran the invoke's target. A target runs
+    /// once per invoke, whatever its outcome.
+    invoke_dispatched: bool,
 }
 
 /// A fresh `Started` record for an operation seen for the first time; the
@@ -1966,6 +2332,9 @@ fn new_started_op(
         callback_delivered: false,
         parent_id,
         replay_children: false,
+        invoke_function: None,
+        invoke_input: None,
+        invoke_dispatched: false,
     }
 }
 
@@ -2044,6 +2413,9 @@ struct Backend {
     /// applies and answers the request (see
     /// [`LocalRunner::checkpoint_latency`]).
     checkpoint_latency: std::time::Duration,
+    /// The names registered on the runner as invoke targets. A chained
+    /// invoke `START` for any other name is rejected.
+    registered_functions: BTreeSet<String>,
     /// Per-call checkpoint plan (in-crate test seam): while non-empty,
     /// each `checkpoint` call pops and obeys the front entry instead of
     /// the counter-based injection (see
@@ -2087,6 +2459,7 @@ impl Backend {
             checkpoint_failures_skip: std::sync::atomic::AtomicUsize::new(0),
             checkpoint_failures_retryable: std::sync::atomic::AtomicBool::new(false),
             checkpoint_latency: std::time::Duration::ZERO,
+            registered_functions: BTreeSet::new(),
             #[cfg(test)]
             checkpoint_plan: Mutex::new(std::collections::VecDeque::new()),
         }
@@ -2285,25 +2658,112 @@ impl Backend {
         }
         names
     }
+
+    /// Marks every `Started` chained invoke whose target is registered and
+    /// has not run as run, and returns its ID, target and input (the empty
+    /// string when absent), in stored order.
+    fn take_pending_invokes(
+        &self,
+        functions: &BTreeMap<String, RegisteredFunction>,
+    ) -> Vec<(String, RegisteredFunction, String)> {
+        let mut state = self.lock();
+        state
+            .ops
+            .iter_mut()
+            .filter(|op| {
+                op.op_type == OperationType::ChainedInvoke
+                    && op.status == OperationStatus::Started
+                    && !op.invoke_dispatched
+            })
+            .filter_map(|op| {
+                let target = functions.get(op.invoke_function.as_deref()?)?.clone();
+                op.invoke_dispatched = true;
+                Some((
+                    op.id.clone(),
+                    target,
+                    op.invoke_input.clone().unwrap_or_default(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Records `outcome` on the chained invoke `id`, and adds `id` to the
+    /// updated IDs. Returns whether the record changed: a suspended nested
+    /// run leaves it `Started`.
+    fn record_invoke_outcome(&self, id: &str, outcome: NestedOutcome) -> bool {
+        let mut state = self.lock();
+        let BackendState {
+            ops, updated_ids, ..
+        } = &mut *state;
+        // The runner took `id` from the stored records, and the backend
+        // never removes a record. No checkpoint reaches this backend while
+        // a target runs, because the caller's handler is not running. So
+        // the record is still stored.
+        #[expect(clippy::expect_used)]
+        let op = ops
+            .iter_mut()
+            .find(|op| op.id == id)
+            .expect("a dispatched invoke record stays stored");
+        match outcome {
+            NestedOutcome::Succeeded(result) => {
+                op.status = OperationStatus::Succeeded;
+                op.result = Some(result.unwrap_or_else(|| "null".to_owned()));
+            }
+            NestedOutcome::Failed(wire) => {
+                op.status = OperationStatus::Failed;
+                op.error_type = wire.error_type().map(ToOwned::to_owned);
+                op.error_message = wire.error_message().map(ToOwned::to_owned);
+                op.error_data = wire.error_data().map(ToOwned::to_owned);
+                op.stack_trace = wire.stack_trace().to_vec();
+            }
+            NestedOutcome::Suspended => return false,
+        }
+        updated_ids.push(op.id.clone());
+        true
+    }
+
+    /// The function names of the `Started` chained invokes, in stored
+    /// order, each name once.
+    fn pending_invoke_names(&self) -> Vec<String> {
+        let state = self.lock();
+        let mut names: Vec<String> = Vec::new();
+        for op in &state.ops {
+            if op.op_type == OperationType::ChainedInvoke
+                && op.status == OperationStatus::Started
+                && let Some(name) = &op.invoke_function
+                && !names.contains(name)
+            {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
 }
 
 /// The message of a suspended result. It names every queued named reply
 /// that no pending callback matched, so a test sees a misspelled or wrong
-/// name.
-fn suspended_message(unmatched_names: &[String]) -> String {
-    let base = "execution suspended with no pending timer, retry, or callback \
-                to advance (missing callback outcome?)";
-    if unmatched_names.is_empty() {
-        return base.to_owned();
+/// name. Then it names the function of every chained invoke still
+/// pending.
+fn suspended_message(unmatched_names: &[String], pending_invokes: &[String]) -> String {
+    let quote = |names: &[String]| {
+        names
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut message = "execution suspended with no pending timer, retry, or callback \
+                       to advance (missing callback outcome?)"
+        .to_owned();
+    if !unmatched_names.is_empty() {
+        message.push_str("; no pending callback matched the queued replies for: ");
+        message.push_str(&quote(unmatched_names));
     }
-    let quoted: Vec<String> = unmatched_names
-        .iter()
-        .map(|name| format!("\"{name}\""))
-        .collect();
-    format!(
-        "{base}; no pending callback matched the queued replies for: {}",
-        quoted.join(", ")
-    )
+    if !pending_invokes.is_empty() {
+        message.push_str("; chained invokes still pending for: ");
+        message.push_str(&quote(pending_invokes));
+    }
+    message
 }
 
 /// Whether `op` is a pending callback: a callback record in `Pending` or
@@ -2416,6 +2876,9 @@ impl BackendState {
             .step_options()
             .and_then(aws_sdk_lambda::types::StepOptions::next_attempt_delay_seconds);
         let parent_id = update.parent_id().map(ToOwned::to_owned);
+        let invoke_function = update
+            .chained_invoke_options()
+            .map(|options| options.function_name().to_owned());
         let replay_children = update
             .context_options()
             .and_then(ContextOptions::replay_children)
@@ -2484,6 +2947,10 @@ impl BackendState {
                     }
                 } else {
                     op.status = OperationStatus::Started;
+                    if op.op_type == OperationType::ChainedInvoke {
+                        op.invoke_function = invoke_function;
+                        op.invoke_input = payload;
+                    }
                 }
             }
             OperationAction::Succeed => {
@@ -2528,9 +2995,8 @@ impl Backend {
     fn checkpoint_now<'a>(
         &'a self,
         updates: &[OperationUpdate],
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + 'a>,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + 'a>>
+    {
         self.checkpoint_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // In-crate test seam: a per-call plan (see
@@ -2588,6 +3054,24 @@ impl Backend {
         if let Err(message) = validate_service_limits(updates) {
             return Box::pin(async move { Err(ExecutionClientError::new_non_retryable(&message)) });
         }
+        // An invoke of a name the runner has no target for can never
+        // complete. So the backend rejects it before any state change, and
+        // the run fails with a message naming the function.
+        if let Some(name) = updates
+            .iter()
+            .filter(|update| {
+                update.r#type() == &OperationType::ChainedInvoke
+                    && update.action() == &OperationAction::Start
+            })
+            .filter_map(OperationUpdate::chained_invoke_options)
+            .map(aws_sdk_lambda::types::ChainedInvokeOptions::function_name)
+            .find(|name| !self.registered_functions.contains(*name))
+        {
+            let message = format!(
+                "No function found for function name \"{name}\". Register it on the LocalRunner."
+            );
+            return Box::pin(async move { Err(ExecutionClientError::new_non_retryable(&message)) });
+        }
         let updated_ops: Vec<Operation> = {
             let mut state = self.lock();
             state.token_counter += 1;
@@ -2641,9 +3125,8 @@ impl ExecutionClient for Backend {
         _execution_arn: &str,
         _checkpoint_token: &str,
         updates: Vec<OperationUpdate>,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+    {
         // `tokio::time::sleep` panics on a runtime built without the time
         // driver, and the SDK itself needs no timer. So the default zero
         // latency answers without creating a sleep.
@@ -2662,9 +3145,8 @@ impl ExecutionClient for Backend {
         _execution_arn: &str,
         _checkpoint_token: &str,
         _marker: Option<&str>,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+    {
         self.get_state_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let operations = self.build_pruned_operations();
@@ -2910,36 +3392,6 @@ fn operation_status_wire_str(s: &OperationStatus) -> &'static str {
     }
 }
 
-/// Builds the result of a `FAILED` envelope.
-///
-/// An envelope `Error` object without an `ErrorType` reads as the type
-/// `Error`, the type the SDK records for an untyped handler error.
-fn failed_envelope_result<O>(
-    response: &serde_json::Value,
-    operations: Vec<TestOperation>,
-    invocations: usize,
-) -> TestResult<O> {
-    let error = response.get("Error");
-    let error_type = error
-        .and_then(|e| e.get("ErrorType"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("Error")
-        .to_owned();
-    let error_message = error
-        .and_then(|e| e.get("ErrorMessage"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    TestResult {
-        disposition: Disposition::Failed,
-        output: None,
-        error_type: Some(error_type),
-        error_message: Some(error_message),
-        operations,
-        invocations,
-    }
-}
-
 /// Returns the stored records the service sends in the invocation input and
 /// in `GetDurableExecutionState`, in stored order.
 ///
@@ -3179,7 +3631,12 @@ mod tests {
             "Status": "FAILED",
             "Error": { "ErrorMessage": "boom" },
         });
-        let result: TestResult<()> = failed_envelope_result(&response, Vec::new(), 1);
+        let result: TestResult<()> = RawRun {
+            end: RawEnd::Failed(envelope_wire_error(&response)),
+            operations: Vec::new(),
+            invocations: 1,
+        }
+        .into_test_result();
         assert!(result.is_failure());
         assert_eq!(result.error_type(), Some("Error"));
         assert_eq!(result.error_message(), Some("boom"));
@@ -4415,13 +4872,13 @@ mod tests {
             None,
         );
         assert_eq!(
-            suspended_message(&backend.unmatched_reply_names()),
+            suspended_message(&backend.unmatched_reply_names(), &[]),
             "execution suspended with no pending timer, retry, or callback to advance \
              (missing callback outcome?); no pending callback matched the queued replies \
              for: \"missing\", \"other\""
         );
         assert_eq!(
-            suspended_message(&[]),
+            suspended_message(&[], &[]),
             "execution suspended with no pending timer, retry, or callback to advance \
              (missing callback outcome?)"
         );
@@ -5355,7 +5812,7 @@ mod tests {
                         .await?;
                     Ok::<_, BoxError>(b)
                 },
-                (),
+                "null".to_owned(),
             )
             .await;
 
@@ -5398,7 +5855,7 @@ mod tests {
                         .await?;
                     Ok::<_, BoxError>(b)
                 },
-                (),
+                "null".to_owned(),
             )
             .await;
 
@@ -5417,10 +5874,7 @@ mod tests {
     /// fidelity is observable from outside.
     fn coalescing_probe_handler(
         executions: Arc<std::sync::atomic::AtomicUsize>,
-    ) -> impl Fn(
-        (),
-        DurableContext,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
+    ) -> impl Fn((), DurableContext) -> Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>
     + Send
     + Sync
     + 'static {
@@ -5500,7 +5954,7 @@ mod tests {
             .run_on_backend(
                 Arc::clone(&baseline_backend),
                 coalescing_probe_handler(Arc::clone(&baseline_execs)),
-                (),
+                "null".to_owned(),
             )
             .await;
         assert!(baseline.is_success(), "{:?}", baseline.error_message());
@@ -5519,7 +5973,7 @@ mod tests {
             .run_on_backend(
                 Arc::clone(&coalesced_backend),
                 coalescing_probe_handler(Arc::clone(&coalesced_execs)),
-                (),
+                "null".to_owned(),
             )
             .await;
         assert!(coalesced.is_success(), "{:?}", coalesced.error_message());
@@ -5577,7 +6031,7 @@ mod tests {
             runner.checkpoint_page_size,
         ));
         let result = runner
-            .run_on_backend(Arc::clone(&backend), handler, ())
+            .run_on_backend(Arc::clone(&backend), handler, "null".to_owned())
             .await;
         assert!(result.is_success(), "{:?}", result.error_message());
         backend.checkpoint_call_count()
@@ -5636,9 +6090,8 @@ mod tests {
             _execution_arn: &str,
             _checkpoint_token: &str,
             _updates: Vec<OperationUpdate>,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
-        > {
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Err(ExecutionClientError::new(
@@ -5653,9 +6106,8 @@ mod tests {
             _execution_arn: &str,
             _checkpoint_token: &str,
             _marker: Option<&str>,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
-        > {
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Err(ExecutionClientError::new(
@@ -5773,7 +6225,7 @@ mod tests {
             .run_on_backend(
                 Arc::clone(&backend),
                 coalescing_probe_handler(Arc::clone(&execs)),
-                (),
+                "null".to_owned(),
             )
             .await;
 
@@ -5889,7 +6341,7 @@ mod tests {
                         Ok::<_, BoxError>(live)
                     }
                 },
-                (),
+                "null".to_owned(),
             )
             .await;
 
@@ -6356,7 +6808,7 @@ mod tests {
             assert_eq!(step_statuses(&backend), ["Succeeded"]);
         };
         let (delayed, ()) = tokio::join!(
-            runner.run_on_backend(Arc::clone(&backend), one_step_handler, ()),
+            runner.run_on_backend(Arc::clone(&backend), one_step_handler, "null".to_owned()),
             steps
         );
 
@@ -7352,5 +7804,634 @@ mod tests {
         )
         .await;
         assert_eq!(envelope_updated_ids(&backend), serde_json::json!([]));
+    }
+
+    // Chained invokes against registered targets.
+
+    /// The one chained invoke record of `result`.
+    fn invoke_record<O>(result: &TestResult<O>) -> &TestOperation {
+        let invokes: Vec<&TestOperation> = result
+            .operations()
+            .iter()
+            .filter(|op| op.op_type() == "ChainedInvoke")
+            .collect();
+        assert_eq!(invokes.len(), 1, "one chained invoke record");
+        invokes[0]
+    }
+
+    /// The wire type and message of an invoke error, as a handler sees it.
+    fn wire_type_and_message(err: &crate::OperationError) -> (Option<String>, Option<String>) {
+        let wire = err.wire();
+        (
+            wire.and_then(crate::WireError::error_type)
+                .map(ToOwned::to_owned),
+            wire.and_then(crate::WireError::error_message)
+                .map(ToOwned::to_owned),
+        )
+    }
+
+    #[tokio::test]
+    async fn invoke_registered_function_succeeds() {
+        let result = LocalRunner::new()
+            .register_function("double", |x: i32| async move { Ok(x * 2) })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let doubled = ctx.invoke::<i32, _>("double", 21).await?;
+                    Ok::<_, BoxError>(doubled)
+                },
+                (),
+            )
+            .await;
+        assert_eq!(result.output(), Some(&42), "{:?}", result.error_message());
+        let op = invoke_record(&result);
+        assert_eq!(op.status(), "Succeeded");
+        assert_eq!(op.result(), Some("42"));
+        assert_eq!(result.invocation_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn invoke_registered_function_failure_keeps_typed_error() {
+        let result = LocalRunner::new()
+            .register_function("pay", |(): ()| async move {
+                Err::<(), BoxError>(crate::TypedError::with_type("PaymentError", "declined").into())
+            })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let err = ctx
+                        .invoke::<(), _>("pay", ())
+                        .await
+                        .expect_err("the invoke fails");
+                    Ok::<_, BoxError>(wire_type_and_message(&err).0)
+                },
+                (),
+            )
+            .await;
+        assert_eq!(
+            result.output(),
+            Some(&Some("PaymentError".to_owned())),
+            "{:?}",
+            result.error_message()
+        );
+        let op = invoke_record(&result);
+        assert_eq!(op.status(), "Failed");
+        assert_eq!(op.error_type(), Some("PaymentError"));
+    }
+
+    #[tokio::test]
+    async fn invoke_plain_error_records_error_type() {
+        let result = LocalRunner::new()
+            .register_function(
+                "pay",
+                |(): ()| async move { Err::<(), BoxError>("boom".into()) },
+            )
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let err = ctx
+                        .invoke::<(), _>("pay", ())
+                        .await
+                        .expect_err("the invoke fails");
+                    Ok::<_, BoxError>(wire_type_and_message(&err))
+                },
+                (),
+            )
+            .await;
+        assert_eq!(
+            result.output(),
+            Some(&(Some("Error".to_owned()), Some("boom".to_owned()))),
+            "{:?}",
+            result.error_message()
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_unit_result_records_null() {
+        let result = LocalRunner::new()
+            .register_function("notify", |_: i32| async move { Ok(()) })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    ctx.invoke::<(), _>("notify", 1).await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        let op = invoke_record(&result);
+        assert_eq!(op.status(), "Succeeded");
+        assert_eq!(op.result(), Some("null"));
+    }
+
+    #[tokio::test]
+    async fn invoke_unregistered_function_fails_run() {
+        let result = LocalRunner::new()
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    ctx.invoke::<(), _>("child-fn", ()).await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await;
+        assert!(result.is_failure(), "{:?}", result.error_message());
+        let message = result.error_message().unwrap_or_default();
+        assert!(
+            message.contains(
+                "No function found for function name \"child-fn\". Register it on the LocalRunner."
+            ),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_input_decode_failure_fails_invoke() {
+        let result = LocalRunner::new()
+            .register_function("len", |s: String| async move { Ok(s.len()) })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let err = ctx
+                        .invoke::<usize, _>("len", 5_i32)
+                        .await
+                        .expect_err("the invoke fails");
+                    Ok::<_, BoxError>(wire_type_and_message(&err))
+                },
+                (),
+            )
+            .await;
+        let (error_type, message) = result.into_output().expect("the handler succeeds");
+        assert_eq!(error_type.as_deref(), Some("Error"));
+        let message = message.unwrap_or_default();
+        assert!(message.starts_with("deserialize input:"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn invoke_output_encode_failure_fails_invoke() {
+        let result = LocalRunner::new()
+            .register_function(
+                "map",
+                |(): ()| async move { Ok(BTreeMap::from([((1, 2), 3)])) },
+            )
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let err = ctx
+                        .invoke::<serde_json::Value, _>("map", ())
+                        .await
+                        .expect_err("the invoke fails");
+                    Ok::<_, BoxError>(wire_type_and_message(&err).1)
+                },
+                (),
+            )
+            .await;
+        let message = result
+            .into_output()
+            .expect("the handler succeeds")
+            .unwrap_or_default();
+        assert!(message.starts_with("serialize output:"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn invoke_target_runs_once() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let target_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .register_function("count", move |(): ()| {
+                let calls = Arc::clone(&target_calls);
+                async move { Ok(calls.fetch_add(1, Ordering::SeqCst) + 1) }
+            })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let count = ctx.invoke::<u32, _>("count", ()).await?;
+                    ctx.wait(std::time::Duration::from_secs(1)).await?;
+                    ctx.step(|_| async { Ok(()) }).await?;
+                    Ok::<_, BoxError>(count)
+                },
+                (),
+            )
+            .await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn invoke_completes_before_the_clock_moves() {
+        let result = LocalRunner::new()
+            .register_function("fast", |(): ()| async move { Ok("invoked") })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let waited = ctx
+                        .run_in_child_context(|child| async move {
+                            child.wait(std::time::Duration::from_secs(1)).await?;
+                            Ok("waited".to_owned())
+                        })
+                        .future();
+                    let invoked = ctx
+                        .run_in_child_context(|child| async move {
+                            Ok(child.invoke::<String, _>("fast", ()).await?)
+                        })
+                        .future();
+                    let winner = ctx.race([waited, invoked]).await?;
+                    Ok::<_, BoxError>(winner)
+                },
+                (),
+            )
+            .await;
+        assert_eq!(
+            result.output().map(String::as_str),
+            Some("invoked"),
+            "{:?}",
+            result.error_message()
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_durable_function_steps_and_waits() {
+        let result = LocalRunner::new()
+            .register_durable_function("workflow", |n: u32, ctx: DurableContext| async move {
+                let next = ctx.step(move |_| async move { Ok(n + 1) }).await?;
+                ctx.wait(std::time::Duration::from_secs(5)).await?;
+                let doubled = ctx.step(move |_| async move { Ok(next * 2) }).await?;
+                Ok::<_, BoxError>(doubled)
+            })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let out = ctx.invoke::<u32, _>("workflow", 1).await?;
+                    Ok::<_, BoxError>(out)
+                },
+                (),
+            )
+            .await;
+        assert_eq!(result.output(), Some(&4), "{:?}", result.error_message());
+        let op = invoke_record(&result);
+        assert_eq!(op.status(), "Succeeded");
+        assert_eq!(op.result(), Some("4"));
+        assert_eq!(result.invocation_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn invoke_durable_function_failure_keeps_type() {
+        let result = LocalRunner::new()
+            .register_durable_function("pay", |(): (), _ctx: DurableContext| async move {
+                Err::<(), BoxError>(
+                    crate::TypedError::with_type("PaymentError", "declined")
+                        .with_error_data("{\"code\":7}")
+                        .into(),
+                )
+            })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let err = ctx
+                        .invoke::<(), _>("pay", ())
+                        .await
+                        .expect_err("the invoke fails");
+                    let wire = err.wire();
+                    Ok::<_, BoxError>((
+                        wire.and_then(crate::WireError::error_type)
+                            .map(ToOwned::to_owned),
+                        wire.and_then(crate::WireError::error_data)
+                            .map(ToOwned::to_owned),
+                    ))
+                },
+                (),
+            )
+            .await;
+        assert_eq!(
+            result.output(),
+            Some(&(
+                Some("PaymentError".to_owned()),
+                Some("{\"code\":7}".to_owned())
+            )),
+            "{:?}",
+            result.error_message()
+        );
+        let op = invoke_record(&result);
+        assert_eq!(op.status(), "Failed");
+        let message = op.error_message().unwrap_or_default();
+        assert!(message.contains("declined"), "{message}");
+    }
+
+    /// A durable target that waits twice, so its run needs three
+    /// invocations.
+    async fn slow_target((): (), ctx: DurableContext) -> Result<(), BoxError> {
+        ctx.wait(std::time::Duration::from_secs(1)).await?;
+        ctx.wait(std::time::Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    /// A caller that invokes `"slow"`.
+    async fn invoke_slow((): (), ctx: DurableContext) -> Result<(), BoxError> {
+        ctx.invoke::<(), _>("slow", ()).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_invocations_do_not_count() {
+        let result = LocalRunner::new()
+            .register_durable_function("slow", slow_target)
+            .run(invoke_slow, ())
+            .await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(result.operations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_target_runs_once() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let target_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .register_durable_function("count", move |(): (), _ctx: DurableContext| {
+                target_calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok::<_, BoxError>(()) }
+            })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    ctx.invoke::<(), _>("count", ()).await?;
+                    ctx.wait(std::time::Duration::from_secs(1)).await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.invocation_count(), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn suspended_durable_target_leaves_invoke_started() {
+        let result = LocalRunner::new()
+            .register_durable_function("approval", |(): (), ctx: DurableContext| async move {
+                let cb = ctx.create_callback::<bool>().await?;
+                let approved = cb.result().await?;
+                Ok::<_, BoxError>(approved)
+            })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let approved = ctx.invoke::<bool, _>("approval", ()).await?;
+                    Ok::<_, BoxError>(approved)
+                },
+                (),
+            )
+            .await;
+        assert!(result.is_suspended(), "{:?}", result.error_message());
+        assert_eq!(invoke_record(&result).status(), "Started");
+        let message = result.error_message().unwrap_or_default();
+        assert!(
+            message.ends_with("; chained invokes still pending for: \"approval\""),
+            "{message}"
+        );
+    }
+
+    /// A suspended durable target stays `Started`, and the runner does not
+    /// run it again when a later invocation leaves it pending.
+    #[tokio::test]
+    async fn suspended_durable_target_runs_once() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let target_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .register_durable_function("approval", move |(): (), ctx: DurableContext| {
+                target_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let cb = ctx.create_callback::<bool>().await?;
+                    let approved = cb.result().await?;
+                    Ok::<_, BoxError>(approved)
+                }
+            })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let approval = ctx.invoke::<bool, _>("approval", ()).spawn();
+                    ctx.wait(std::time::Duration::from_secs(1)).await?;
+                    let approved = approval.await?;
+                    Ok::<_, BoxError>(approved)
+                },
+                (),
+            )
+            .await;
+        assert!(result.is_suspended(), "{:?}", result.error_message());
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_target_does_not_see_registered_functions() {
+        let result = LocalRunner::new()
+            .register_function("leaf", |(): ()| async move { Ok(1_u32) })
+            .register_durable_function("mid", |(): (), ctx: DurableContext| async move {
+                let leaf = ctx.invoke::<u32, _>("leaf", ()).await?;
+                Ok::<_, BoxError>(leaf)
+            })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let err = ctx
+                        .invoke::<u32, _>("mid", ())
+                        .await
+                        .expect_err("the invoke fails");
+                    Ok::<_, BoxError>(wire_type_and_message(&err).1)
+                },
+                (),
+            )
+            .await;
+        let message = result
+            .into_output()
+            .expect("the handler succeeds")
+            .unwrap_or_default();
+        assert!(
+            message.contains("No function found for function name \"leaf\""),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_target_uses_outer_settings() {
+        let result = LocalRunner::new()
+            .max_invocations(2)
+            .register_durable_function("slow", slow_target)
+            .run(invoke_slow, ())
+            .await;
+        assert!(result.is_suspended(), "{:?}", result.error_message());
+        assert_eq!(invoke_record(&result).status(), "Started");
+        let message = result.error_message().unwrap_or_default();
+        assert!(
+            message.ends_with("; chained invokes still pending for: \"slow\""),
+            "{message}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_target_uses_outer_checkpoint_latency() -> Result<(), BoxError> {
+        let result = LocalRunner::new()
+            .options(
+                crate::Options::builder()
+                    .checkpoint_batching(false)
+                    .build()?,
+            )
+            .checkpoint_latency(std::time::Duration::from_millis(100))
+            .register_durable_function("timed", |(): (), ctx: DurableContext| async move {
+                let before = tokio::time::Instant::now();
+                ctx.step(|_| async { Ok(()) }).name("s").await?;
+                let elapsed = tokio::time::Instant::now().duration_since(before);
+                Ok::<_, BoxError>(u64::try_from(elapsed.as_millis())?)
+            })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let millis = ctx.invoke::<u64, _>("timed", ()).await?;
+                    Ok::<_, BoxError>(millis)
+                },
+                (),
+            )
+            .await;
+        assert_eq!(result.output(), Some(&200), "{:?}", result.error_message());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn later_registration_replaces_earlier_kind() {
+        let result = LocalRunner::new()
+            .register_function("t", |(): ()| async move { Ok(1_u32) })
+            .register_durable_function("t", |(): (), _ctx: DurableContext| async move {
+                Ok::<_, BoxError>(2_u32)
+            })
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let out = ctx.invoke::<u32, _>("t", ()).await?;
+                    Ok::<_, BoxError>(out)
+                },
+                (),
+            )
+            .await;
+        assert_eq!(result.output(), Some(&2), "{:?}", result.error_message());
+    }
+
+    /// An error whose wire record carries a stack trace, as an external
+    /// callback failure read back from the wire does.
+    fn error_with_stack_trace() -> BoxError {
+        let wire = crate::WireError::new(Some("VendorError"), Some("denied"))
+            .with_error_data(Some("opaque"))
+            .with_stack_trace(vec!["frame-1".to_owned(), "frame-2".to_owned()]);
+        crate::OperationError::from_kind(crate::OperationErrorKind::Callback(
+            crate::error::CallbackError::new(
+                crate::CallbackErrorKind::ExternalFailure,
+                Some(crate::error::ReplayedFailure::source_from(wire.clone())),
+            ),
+        ))
+        .with_wire(wire)
+        .into()
+    }
+
+    /// A caller that invokes `"fail"` and returns the invoke error's wire
+    /// record.
+    async fn invoke_fail_wire(
+        (): (),
+        ctx: DurableContext,
+    ) -> Result<(Option<String>, Option<String>, Vec<String>), BoxError> {
+        let err = ctx
+            .invoke::<(), _>("fail", ())
+            .await
+            .expect_err("the invoke fails");
+        let wire = err.wire().cloned().unwrap_or_default();
+        Ok((
+            wire.error_type().map(ToOwned::to_owned),
+            wire.error_data().map(ToOwned::to_owned),
+            wire.stack_trace().to_vec(),
+        ))
+    }
+
+    fn expected_fail_wire() -> (Option<String>, Option<String>, Vec<String>) {
+        (
+            Some("VendorError".to_owned()),
+            Some("opaque".to_owned()),
+            vec!["frame-1".to_owned(), "frame-2".to_owned()],
+        )
+    }
+
+    #[tokio::test]
+    async fn invoke_plain_failure_keeps_stack_trace() {
+        let result = LocalRunner::new()
+            .register_function("fail", |(): ()| async move {
+                Err::<(), BoxError>(error_with_stack_trace())
+            })
+            .run(invoke_fail_wire, ())
+            .await;
+        assert_eq!(
+            result.output(),
+            Some(&expected_fail_wire()),
+            "{:?}",
+            result.error_message()
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_durable_failure_keeps_stack_trace() {
+        let result = LocalRunner::new()
+            .register_durable_function("fail", |(): (), _ctx: DurableContext| async move {
+                Err::<(), BoxError>(error_with_stack_trace())
+            })
+            .run(invoke_fail_wire, ())
+            .await;
+        assert_eq!(
+            result.output(),
+            Some(&expected_fail_wire()),
+            "{:?}",
+            result.error_message()
+        );
+    }
+
+    #[test]
+    fn envelope_wire_error_reads_every_field() {
+        let response = serde_json::json!({
+            "Status": "FAILED",
+            "Error": {
+                "ErrorType": "T",
+                "ErrorMessage": "m",
+                "ErrorData": "d",
+                "StackTrace": ["a", "b"],
+            },
+        });
+        assert_eq!(
+            envelope_wire_error(&response),
+            crate::WireError::new(Some("T"), Some("m"))
+                .with_error_data(Some("d"))
+                .with_stack_trace(vec!["a".to_owned(), "b".to_owned()])
+        );
+    }
+
+    /// A chained invoke `START` for `function`, with ID `id`.
+    fn invoke_start(id: &str, function: &str) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(id)
+            .r#type(OperationType::ChainedInvoke)
+            .action(OperationAction::Start)
+            .payload("1")
+            .chained_invoke_options(
+                aws_sdk_lambda::types::ChainedInvokeOptions::builder()
+                    .function_name(function)
+                    .build()
+                    .expect("valid options"),
+            )
+            .build()
+            .expect("valid update")
+    }
+
+    #[test]
+    fn pending_invoke_names_list_each_name_once_in_stored_order() {
+        let backend = seeded_backend(
+            Vec::new(),
+            0,
+            &[
+                invoke_start("i1", "b"),
+                invoke_start("i2", "a"),
+                invoke_start("i3", "b"),
+                invoke_start("i4", "c"),
+            ],
+        );
+        assert!(backend.record_invoke_outcome("i4", NestedOutcome::Succeeded(None)));
+        assert_eq!(backend.pending_invoke_names(), ["b", "a"]);
+    }
+
+    #[test]
+    fn invoke_completion_is_listed_in_updated_ids() {
+        let backend = seeded_backend(Vec::new(), 0, &[invoke_start("i", "double")]);
+        assert_eq!(envelope_updated_ids(&backend), serde_json::json!([]));
+        assert!(backend.record_invoke_outcome("i", NestedOutcome::Succeeded(Some("2".to_owned()))));
+        assert_eq!(envelope_updated_ids(&backend), serde_json::json!(["i"]));
     }
 }
