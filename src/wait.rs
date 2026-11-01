@@ -417,49 +417,66 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn wait_zero_duration_passes_zero_seconds() {
+    /// Drives `ctx.wait(duration)` on a fresh root context and returns the
+    /// `WaitSeconds` of the one START update it records. The wait must
+    /// suspend the invocation (`Pending`), because no timer fires.
+    async fn recorded_wait_seconds(duration: Duration) -> i32 {
         use crate::client::InMemoryExecutionClient;
 
-        // Zero duration → WaitSeconds=0.
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let log = Arc::new(CheckpointLog::empty());
         let ctx = DurableContext::new_root_with_client(
             "arn:test".to_owned(),
             lambda_runtime::Context::default(),
-            log,
-            client,
+            Arc::new(CheckpointLog::empty()),
+            client.clone(),
             "token0".to_owned(),
         );
 
-        let op_id = ctx.mint_id();
-        let exec = WaitExecution {
-            ctx: ctx.clone(),
-            op_id,
-            name: None,
-            duration_secs: 0, // direct: zero duration
-        };
-
         let signal = Arc::clone(ctx.suspension_signal());
-        // Should checkpoint and suspend (not panic or reject).
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
-        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
-    }
-
-    #[tokio::test]
-    async fn wait_sub_second_duration_rounds_up() {
-        // Sub-second durations round up: Duration(500ms) → 1 second.
-        let log = Arc::new(CheckpointLog::empty());
-        let ctx = DurableContext::new_root(
-            "arn:test".to_owned(),
-            lambda_runtime::Context::default(),
-            log,
+        let outcome = crate::driver::test_support::outcome_of(signal, ctx.wait(duration)).await;
+        assert_eq!(
+            outcome,
+            crate::driver::InvocationOutcome::Pending,
+            "{duration:?}"
         );
 
-        // Build a wait with 500ms: should round up to 1 second.
-        let builder = ctx.wait(Duration::from_millis(500));
-        // The builder stores duration_secs internally: verify via execution.
-        // We can't inspect private fields, but the execution should not panic.
-        let _debug = format!("{builder:?}");
+        let updates = client.recorded_updates();
+        let starts: Vec<_> = updates
+            .iter()
+            .filter(|u| {
+                matches!(u.action(), OperationAction::Start)
+                    && matches!(u.r#type(), OperationType::Wait)
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "{duration:?}: {updates:?}");
+        starts
+            .first()
+            .and_then(|u| u.wait_options())
+            .and_then(WaitOptions::wait_seconds)
+            .expect("the START update carries WaitSeconds")
+    }
+
+    /// The service rejects `WaitSeconds: 0`, so a zero wait records one
+    /// second.
+    #[tokio::test]
+    async fn wait_zero_duration_records_one_second() {
+        assert_eq!(recorded_wait_seconds(Duration::ZERO).await, 1);
+    }
+
+    /// A caller-given duration rounds up to whole seconds, so the wait
+    /// never ends early.
+    #[tokio::test]
+    async fn wait_sub_second_duration_rounds_up() {
+        for (duration, expected) in [
+            (Duration::from_millis(500), 1),
+            (Duration::from_millis(1500), 2),
+            (Duration::from_secs(2), 2),
+        ] {
+            assert_eq!(
+                recorded_wait_seconds(duration).await,
+                expected,
+                "{duration:?}"
+            );
+        }
     }
 }

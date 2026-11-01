@@ -36,10 +36,9 @@ impl RetryStrategyConfig {
     ///
     /// Exponential backoff: `initial_delay * backoff_rate^(attempt - 1)`,
     /// capped at `max_delay`, jittered per the configured
-    /// [`JitterStrategy`], and quantized to whole seconds with a
-    /// one-second minimum (see [`quantize_delay_secs`] for the
-    /// per-strategy rounding). Stops once `attempt` reaches
-    /// `max_attempts`.
+    /// [`JitterStrategy`], and rounded to the nearest whole second with a
+    /// one-second minimum for every jitter mode (see [`quantize_delay`]).
+    /// Stops once `attempt` reaches `max_attempts`.
     pub(crate) fn decide(&self, attempt: u32) -> RetryDecision {
         if attempt >= self.max_attempts() {
             return RetryDecision::Stop;
@@ -60,7 +59,7 @@ impl RetryStrategyConfig {
         };
 
         RetryDecision::Retry {
-            delay: Duration::from_secs(quantize_delay_secs(jittered, self.jitter())),
+            delay: quantize_delay(jittered),
         }
     }
 
@@ -69,32 +68,6 @@ impl RetryStrategyConfig {
     /// delay shaping depends only on the attempt number.
     pub(crate) fn into_retry_strategy(self) -> RetryStrategy {
         Box::new(move |_err: &StepError, attempt: u32| self.decide(attempt))
-    }
-}
-
-/// Quantizes a fractional delay in seconds to whole seconds, minimum 1.
-///
-/// The rounding rule depends on the jitter strategy:
-///
-/// - [`JitterStrategy::Full`] rounds to the **nearest** whole second. This
-///   is the SDK's legacy quantization, preserved so
-///   [`RetryStrategyConfig::default`] reproduces the historical
-///   full-jitter delay distribution exactly.
-/// - [`JitterStrategy::None`] rounds **up**: a deterministic configured
-///   delay must never fire earlier than requested, matching the wait and
-///   retry-checkpoint behavior.
-/// - [`JitterStrategy::Half`] rounds **up**: the documented
-///   `[base / 2, base]` lower bound survives quantization only under a
-///   ceiling (nearest-rounding could dip up to half a second below it).
-pub(crate) fn quantize_delay_secs(jittered: f64, jitter: JitterStrategy) -> u64 {
-    let quantized = match jitter {
-        JitterStrategy::Full => jittered.round(),
-        JitterStrategy::None | JitterStrategy::Half => jittered.ceil(),
-    };
-    #[expect(clippy::cast_possible_truncation)] // reason: delays are far below u64::MAX seconds
-    #[expect(clippy::cast_sign_loss)] // reason: quantized ≥ 0
-    {
-        quantized.max(1.0) as u64
     }
 }
 
@@ -121,6 +94,17 @@ pub(crate) fn rand_full_jitter(max_secs: f64) -> f64 {
     #[expect(clippy::cast_precision_loss)] // reason: approximation is fine for jitter
     let fraction = (bits as f64) / (u64::MAX as f64);
     fraction * max_secs
+}
+
+/// Rounds a delay in seconds to the nearest whole second, minimum 1.
+/// A non-finite input returns 1 second.
+///
+/// Both strategy paths ([`RetryStrategyConfig`] and the wait strategy of
+/// `wait_for_condition`) quantize a computed delay with this function, for
+/// every jitter mode. A delay a caller gives directly (a custom closure or
+/// `ctx.wait`) rounds up instead, so it never ends early.
+pub(crate) fn quantize_delay(secs: f64) -> Duration {
+    Duration::try_from_secs_f64(secs.round().max(1.0)).unwrap_or(Duration::from_secs(1))
 }
 
 /// Execution semantics for a step, controlling behavior on interrupted replay.
@@ -2190,7 +2174,7 @@ mod tests {
     /// one second, whatever the configuration.
     #[test]
     fn delays_are_capped_and_have_one_second_floor() {
-        // Sub-second initial delay rounds up to the 1s floor.
+        // A sub-second initial delay rises to the 1s floor.
         let tiny = RetryStrategyConfig::builder()
             .initial_delay(Duration::from_millis(1))
             .jitter(JitterStrategy::None)
@@ -2216,55 +2200,56 @@ mod tests {
         assert_eq!(config.decide(1), RetryDecision::Stop);
     }
 
-    /// Non-jittered fractional delays round UP, never down: a 1.1s
-    /// configured delay must schedule 2s, not 1s. Nearest-rounding would
-    /// truncate 1.1s to 1s and retry EARLIER than configured, conflicting
-    /// with the wait and retry-checkpoint behavior, which both ceil
-    /// fractional delays.
+    /// Every row of the `quantize_delay` case table: round to nearest,
+    /// one-second floor, and 1 second for a non-finite input. The rule is
+    /// the JS rule `Math.max(1, Math.round(x))`.
     #[test]
-    fn fractional_delays_round_up_not_to_nearest() {
+    fn quantize_delay_rounds_to_nearest_with_one_second_floor() {
+        let cases = [
+            (0.0, 1u64),
+            (0.4, 1),
+            (1.1, 1),
+            (2.25, 2),
+            (2.5, 3),
+            (4.4, 4),
+            (5.0, 5),
+            (f64::NAN, 1),
+            (f64::INFINITY, 1),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                quantize_delay(input),
+                Duration::from_secs(expected),
+                "input {input}"
+            );
+        }
+    }
+
+    /// Non-jittered fractional delays round to the nearest whole second,
+    /// as in JS and Go: 1.1 s schedules 1 s, 2.2 s schedules 2 s, 2.25 s
+    /// schedules 2 s, and 2.5 s schedules 3 s.
+    #[test]
+    fn fractional_delays_round_to_nearest() {
         let config = RetryStrategyConfig::builder()
             .initial_delay(Duration::from_millis(1100))
             .jitter(JitterStrategy::None)
             .build();
-        // 1.1s must become 2s (ceil), not 1s (round-to-nearest).
-        assert_eq!(retry_secs(&config.decide(1)), 2);
+        assert_eq!(retry_secs(&config.decide(1)), 1);
+        // 1.1 * 2 = 2.2 s.
+        assert_eq!(retry_secs(&config.decide(2)), 2);
 
-        // Backoff-computed fractions ceil too: 1.1 * 2 = 2.2s → 3s.
-        assert_eq!(retry_secs(&config.decide(2)), 3);
-
-        // Whole-second delays are unchanged by the ceiling: the default
-        // 5s/10s/... schedule is preserved.
-        let whole = RetryStrategyConfig::builder()
+        // 1 * 1.5^2 = 2.25 s.
+        let slow = RetryStrategyConfig::builder()
+            .initial_delay(Duration::from_secs(1))
+            .backoff_rate(1.5)
             .jitter(JitterStrategy::None)
             .build();
-        assert_eq!(retry_secs(&whole.decide(1)), 5);
-        assert_eq!(retry_secs(&whole.decide(2)), 10);
-    }
+        assert_eq!(retry_secs(&slow.decide(3)), 2);
 
-    /// Regression for the default full-jitter quantization: full jitter
-    /// keeps the SDK's legacy nearest-integer rounding
-    /// (`round().max(1.0)`), because issue #12 requires
-    /// `RetryStrategyConfig::default()` to reproduce the pre-config
-    /// behavior exactly, including how fractional jitter samples map to
-    /// whole seconds. A ceiling here would shift the delay distribution
-    /// for nearly every fractional sample.
-    #[test]
-    fn default_full_jitter_keeps_legacy_nearest_rounding() {
-        // Full jitter: nearest rounding, exactly as before issue #12.
-        assert_eq!(quantize_delay_secs(4.4, JitterStrategy::Full), 4);
-        assert_eq!(quantize_delay_secs(4.5, JitterStrategy::Full), 5);
-        assert_eq!(quantize_delay_secs(59.9, JitterStrategy::Full), 60);
-        // Samples near zero still respect the one-second floor.
-        assert_eq!(quantize_delay_secs(0.2, JitterStrategy::Full), 1);
-
-        // Non-jittered fractional delays ceil: a configured delay never
-        // fires earlier than requested.
-        assert_eq!(quantize_delay_secs(4.4, JitterStrategy::None), 5);
-        assert_eq!(quantize_delay_secs(4.0, JitterStrategy::None), 4);
-
-        // Half jitter ceils so the documented [base / 2, base] lower
-        // bound survives quantization.
-        assert_eq!(quantize_delay_secs(4.4, JitterStrategy::Half), 5);
+        let half = RetryStrategyConfig::builder()
+            .initial_delay(Duration::from_millis(2500))
+            .jitter(JitterStrategy::None)
+            .build();
+        assert_eq!(retry_secs(&half.decide(1)), 3);
     }
 }

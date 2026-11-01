@@ -183,12 +183,11 @@ pub enum JitterStrategy {
 /// `max_attempts`, so `max_attempts` is the total number of executions
 /// (initial attempt plus retries). Before that, the delay before attempt
 /// `n + 1` is `initial_delay * backoff_rate^(n - 1)` capped at `max_delay`,
-/// then jittered per [`JitterStrategy`] and quantized to whole seconds
-/// with a one-second minimum. Full jitter rounds to the nearest whole
-/// second (the SDK's legacy behavior, preserved so [`Default`] reproduces
-/// it exactly); no jitter and half jitter round up, so a deterministic
-/// configured delay never fires earlier than requested and half jitter's
-/// lower bound survives quantization.
+/// then jittered per [`JitterStrategy`] and rounded to the nearest whole
+/// second with a one-second minimum, for every jitter mode, as in the JS
+/// and Go SDKs. A delay that a custom retry closure returns is rounded up
+/// to whole seconds instead, with the same one-second minimum, so it never
+/// ends early.
 ///
 /// [`Default`] reproduces the SDK's built-in retry behavior exactly:
 /// 6 total attempts, 5 second initial delay, 60 second maximum delay,

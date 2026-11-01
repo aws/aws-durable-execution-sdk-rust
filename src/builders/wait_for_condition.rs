@@ -321,10 +321,12 @@ where
 ///
 /// The delay before check `n + 1` is `initial_delay * backoff_rate^(n - 1)`
 /// capped at `max_delay`, jittered per
-/// [`JitterStrategy`](crate::builders::JitterStrategy), and quantized
-/// to whole seconds with a one-second minimum, always rounding **up**
-/// (`max(1, ceil(delay))`): a sampled delay never fires earlier than
-/// sampled, for every jitter strategy.
+/// [`JitterStrategy`](crate::builders::JitterStrategy), and rounded to
+/// the nearest whole second with a one-second minimum, for every jitter
+/// mode, as in the JS and Go SDKs. A delay that a custom
+/// [`wait_strategy_fn`](WaitForConditionBuilder::wait_strategy_fn) closure
+/// returns is rounded up to whole seconds instead, with the same one-second
+/// minimum, so it never ends early.
 ///
 /// Read values back through the accessors.
 ///
@@ -478,8 +480,8 @@ impl<S> WaitStrategy<S> {
         }
 
         // Exponential backoff: initial * rate^(attempt-1), capped at max,
-        // jittered, then quantized with the round-up-min-1s policy
-        // (`max(1, ceil(delay))`): see [`quantize_wait_delay`].
+        // jittered, then rounded to the nearest whole second with a
+        // one-second minimum: see `crate::step::quantize_delay`.
         let exponent = i32::try_from(attempt).unwrap_or(1) - 1;
         let base = (self.initial_delay.as_secs_f64() * self.backoff_rate.powi(exponent))
             .min(self.max_delay.as_secs_f64());
@@ -493,28 +495,9 @@ impl<S> WaitStrategy<S> {
             crate::builders::JitterStrategy::Full => crate::step::rand_full_jitter(base),
         };
         WaitDecision::Continue {
-            delay: quantize_wait_delay(jittered),
+            delay: crate::step::quantize_delay(jittered),
         }
     }
-}
-
-/// Quantizes a fractional delay in seconds to a whole-second [`Duration`]
-/// with a one-second minimum, always rounding **up**: `max(1, ceil(delay))`,
-/// the policy issue #35 requires (Python does the same). A sampled delay is
-/// therefore never scheduled earlier than sampled: `4.4s` becomes `5s`.
-///
-/// This is deliberately independent of the retry path's
-/// `step::quantize_delay_secs`, whose `Full`-jitter arm rounds to the
-/// *nearest* second to preserve the legacy retry delay distribution. Wait
-/// strategies carry no such legacy and apply the round-up policy uniformly
-/// across every jitter strategy.
-///
-/// Conversion goes through [`Duration::try_from_secs_f64`] rather than a
-/// lossy `as` cast; a non-finite or out-of-range input falls back to the
-/// one-second minimum.
-fn quantize_wait_delay(jittered: f64) -> Duration {
-    let secs = jittered.ceil().max(1.0);
-    Duration::try_from_secs_f64(secs).unwrap_or(Duration::from_secs(1))
 }
 
 /// Builder for [`WaitStrategy`].
@@ -713,7 +696,7 @@ mod tests {
     /// With `JitterStrategy::None` the schedule is deterministic: the first
     /// delay is `initial_delay`, each subsequent delay grows by
     /// `backoff_rate`, the sequence caps at `max_delay`, and sub-second
-    /// results round up to the one-second minimum.
+    /// results rise to the one-second minimum.
     #[test]
     fn deterministic_schedule_respects_backoff_and_max_delay() {
         let strategy = WaitStrategy::builder(|state: &i32| *state >= 100)
@@ -736,7 +719,7 @@ mod tests {
         assert_eq!(delay_of(3), Duration::from_secs(10));
         assert_eq!(delay_of(9), Duration::from_secs(10));
 
-        // Sub-second base delays quantize up to the one-second minimum.
+        // Sub-second base delays rise to the one-second minimum.
         let tiny = WaitStrategy::builder(|state: &i32| *state >= 100)
             .initial_delay(Duration::from_millis(100))
             .jitter(JitterStrategy::None)
@@ -841,36 +824,51 @@ mod tests {
         assert!(matches!(strategy(0_i32, 4), WaitDecision::Exhausted { .. }));
     }
 
-    /// The wait-strategy quantizer implements the round-up-min-1s policy
-    /// issue #35 requires (`max(1, ceil(delay))`): a fractional sample is
-    /// never scheduled earlier than sampled: `4.4s` rounds **up** to `5s`,
-    /// unlike the retry path's legacy Full-jitter nearest-rounding, which
-    /// would schedule it at `4s`.
+    /// The wait strategy rounds a computed delay to the nearest whole
+    /// second, as the retry path does: 1.1 s schedules 1 s, 2.2 s
+    /// schedules 2 s, 2.25 s schedules 2 s, and 2.5 s schedules 3 s.
     #[test]
-    fn quantize_wait_delay_rounds_up_with_one_second_minimum() {
-        // Regression for the reviewer finding: 4.4 must become 5, not 4.
-        assert_eq!(quantize_wait_delay(4.4), Duration::from_secs(5));
-        // Nearest-rounding would also disagree here (4.5 → 5 either way,
-        // 4.1 → 4 under round()); ceil is unambiguous.
-        assert_eq!(quantize_wait_delay(4.1), Duration::from_secs(5));
-        // Whole seconds pass through unchanged.
-        assert_eq!(quantize_wait_delay(5.0), Duration::from_secs(5));
-        // Sub-second and zero samples clamp to the one-second minimum.
-        assert_eq!(quantize_wait_delay(0.4), Duration::from_secs(1));
-        assert_eq!(quantize_wait_delay(0.0), Duration::from_secs(1));
-        // Defensive fallback: a non-finite input degrades to the minimum
-        // rather than panicking.
-        assert_eq!(quantize_wait_delay(f64::NAN), Duration::from_secs(1));
+    fn wait_strategy_rounds_to_nearest() {
+        let delay_of =
+            |strategy: &WaitStrategy<i32>, attempt: u32| match strategy.decide(&0, attempt) {
+                WaitDecision::Continue { delay } => delay,
+                other => panic!("expected Continue, got {other:?}"),
+            };
+
+        // The retry config's default backoff rate is 2.0; the wait
+        // strategy's is 1.5. Set 2.0 so both tests run the same schedule.
+        let config = WaitStrategy::builder(|s: &i32| *s >= 100)
+            .initial_delay(Duration::from_millis(1100))
+            .backoff_rate(2.0)
+            .jitter(JitterStrategy::None)
+            .build();
+        assert_eq!(delay_of(&config, 1), Duration::from_secs(1));
+        // 1.1 * 2 = 2.2 s.
+        assert_eq!(delay_of(&config, 2), Duration::from_secs(2));
+
+        // 1 * 1.5^2 = 2.25 s.
+        let slow = WaitStrategy::builder(|s: &i32| *s >= 100)
+            .initial_delay(Duration::from_secs(1))
+            .backoff_rate(1.5)
+            .jitter(JitterStrategy::None)
+            .build();
+        assert_eq!(delay_of(&slow, 3), Duration::from_secs(2));
+
+        let half = WaitStrategy::builder(|s: &i32| *s >= 100)
+            .initial_delay(Duration::from_millis(2500))
+            .jitter(JitterStrategy::None)
+            .build();
+        assert_eq!(delay_of(&half, 1), Duration::from_secs(3));
     }
 
     /// End-to-end through `decide`: with `Full` jitter the sample lands in
-    /// `[0, base]`, so after round-up quantization every delay is a whole
-    /// second in `[1s, ceil(base)]`, never rounded below the sample.
+    /// `[0, base]`, so after quantization every delay is a whole second
+    /// in `[1s, round(base)]`, never below the one-second minimum.
     #[test]
     fn full_jitter_decide_never_rounds_below_one_second() {
         let strategy = WaitStrategy::builder(|state: &i32| *state >= 100)
             // base for attempt 1 is 1s, so full-jitter samples are all
-            // fractional in [0, 1]; round-up must yield exactly 1s.
+            // fractional in [0, 1]; the one-second minimum must yield 1s.
             .initial_delay(Duration::from_secs(1))
             .jitter(JitterStrategy::Full)
             .build();
@@ -881,7 +879,7 @@ mod tests {
                     assert_eq!(
                         delay,
                         Duration::from_secs(1),
-                        "sample in [0, 1] must quantize up to exactly 1s"
+                        "sample in [0, 1] must quantize to exactly 1s"
                     );
                 }
                 other => panic!("expected Continue, got {other:?}"),

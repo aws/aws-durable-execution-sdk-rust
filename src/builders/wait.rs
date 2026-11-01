@@ -16,6 +16,9 @@ use crate::future::DurableFuture;
 /// Created by [`DurableContext::wait`]. The wait duration is set at
 /// creation; chain `.name()` for identification.
 ///
+/// The duration is rounded up to whole seconds, and a duration under one
+/// second waits one second.
+///
 /// # Examples
 ///
 /// ```no_run

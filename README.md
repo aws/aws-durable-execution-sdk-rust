@@ -361,6 +361,9 @@ if let Err(err) = result {
 ctx.wait(Duration::from_secs(60)).name("cooldown").await?;
 ```
 
+The duration is rounded up to whole seconds, so a wait never ends early, and
+a wait shorter than one second waits one second.
+
 ### invoke
 
 `invoke` calls another durable function and resolves with its result. The

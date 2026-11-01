@@ -1867,6 +1867,10 @@ impl DurableContext {
     /// The execution pauses for the specified duration. The wait is
     /// checkpointed, so replay does not re-wait.
     ///
+    /// The duration is rounded up to whole seconds, so the wait never ends
+    /// early. A duration under one second, including [`Duration::ZERO`],
+    /// waits one second, because the service rejects a zero-second wait.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1884,10 +1888,11 @@ impl DurableContext {
     /// }
     /// ```
     pub fn wait(&self, duration: Duration) -> WaitBuilder {
-        // Round up to whole seconds. Zero duration passes 0 (no min guard).
+        // Round up to whole seconds. The service rejects `WaitSeconds: 0`,
+        // so the clamp raises a sub-second duration to one second.
         #[expect(clippy::cast_possible_truncation)]
-        // reason: duration ≤ i32::MAX for practical timers
-        let secs = (duration.as_secs_f64().ceil() as i64).min(i64::from(i32::MAX)) as i32;
+        // reason: the clamp bounds the value to `1..=i32::MAX` before the cast to i32
+        let secs = (duration.as_secs_f64().ceil() as i64).clamp(1, i64::from(i32::MAX)) as i32;
         let op_id = self.claim_operation_id("wait");
         WaitBuilder::new_internal(self.clone(), op_id, secs)
     }
