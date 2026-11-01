@@ -57,6 +57,11 @@
 //!   more invocations than the same execution uses on the service.
 //! - [`LocalRunner::checkpoint_latency`] delays each checkpoint response in
 //!   tokio time. It does not move the virtual clock.
+//! - The backend stores each operation's `ParentId` and the `ReplayChildren`
+//!   option of a completed context. It omits the children of a completed
+//!   context from the invocation input and from `GetDurableExecutionState`,
+//!   as the service does, unless the context recorded `ReplayChildren`.
+//!   Checkpoint responses and [`TestResult::operations`] keep every record.
 //!
 //! # Runner divergences
 //!
@@ -68,10 +73,6 @@
 //! the other observes the recorded execution history; assert around these
 //! when a test targets both runners:
 //!
-//! - **Open-callback status.** A created but not-yet-resolved callback reads
-//!   `"Pending"` under [`LocalRunner`] and `"Started"` under [`CloudRunner`]
-//!   (the recorded history has no distinct callback-pending status). Once the
-//!   callback resolves, both report `"Succeeded"` / `"Failed"` / `"TimedOut"`.
 //! - **Truncated results.** When a result exceeds the recorded-history inline
 //!   size limit, [`CloudRunner`] reports [`TestOperation::result`] as `None`
 //!   (the payload is withheld); [`LocalRunner`] always holds the full
@@ -116,9 +117,9 @@ use serde::de::DeserializeOwned;
 
 use aws_sdk_lambda::primitives::{Blob, DateTime};
 use aws_sdk_lambda::types::{
-    CallbackDetails, ChainedInvokeDetails, ContextDetails, ErrorObject, Event, EventType,
-    ExecutionStatus, InvocationType, Operation, OperationAction, OperationStatus, OperationType,
-    OperationUpdate, StepDetails,
+    CallbackDetails, ChainedInvokeDetails, ContextDetails, ContextOptions, ErrorObject, Event,
+    EventType, ExecutionStatus, InvocationType, Operation, OperationAction, OperationStatus,
+    OperationType, OperationUpdate, StepDetails,
 };
 
 use crate::BoxError;
@@ -986,8 +987,8 @@ fn build_envelope(
     let mut operations = Vec::with_capacity(page.len() + 1);
     operations.push(serde_json::json!({
         "Id": "execution",
-        "Type": "Execution",
-        "Status": "Started",
+        "Type": "EXECUTION",
+        "Status": "STARTED",
         "ExecutionDetails": { "InputPayload": event_json }
     }));
     operations.extend(page);
@@ -1624,11 +1625,22 @@ struct StoredOp {
     /// `RETRY`. Firing the operation keeps the value.
     due_at: Option<u64>,
     callback_delivered: bool,
+    /// The `ParentId` of the update that created the record. Later updates
+    /// do not change it.
+    parent_id: Option<String>,
+    /// The `ReplayChildren` option of the update that closed a context.
+    /// A close without the option records `false`.
+    replay_children: bool,
 }
 
 /// A fresh `Started` record for an operation seen for the first time; the
 /// caller merges name/sub-type metadata and the action's outcome fields.
-fn new_started_op(id: String, op_type: OperationType, sub_type: Option<String>) -> StoredOp {
+fn new_started_op(
+    id: String,
+    op_type: OperationType,
+    sub_type: Option<String>,
+    parent_id: Option<String>,
+) -> StoredOp {
     StoredOp {
         id,
         op_type,
@@ -1645,6 +1657,8 @@ fn new_started_op(id: String, op_type: OperationType, sub_type: Option<String>) 
         wait_seconds: None,
         due_at: None,
         callback_delivered: false,
+        parent_id,
+        replay_children: false,
     }
 }
 
@@ -1825,9 +1839,26 @@ impl Backend {
     /// Renders the recorded history as envelope-wire JSON operation
     /// objects: the exact shape `parse_inline_operations` reads from
     /// `InitialExecutionState.Operations`.
+    ///
+    /// The history omits the records the service omits from the invocation
+    /// input (see [`prune_replay_children`]).
     fn envelope_history(&self) -> Vec<serde_json::Value> {
         let state = self.lock();
-        state.ops.iter().map(stored_op_envelope_json).collect()
+        prune_replay_children(&state.ops)
+            .into_iter()
+            .map(stored_op_envelope_json)
+            .collect()
+    }
+
+    /// Builds the `Operation` records `GetDurableExecutionState` returns:
+    /// the current state without the records the service omits (see
+    /// [`prune_replay_children`]).
+    fn build_pruned_operations(&self) -> Vec<Operation> {
+        let state = self.lock();
+        prune_replay_children(&state.ops)
+            .into_iter()
+            .filter_map(build_operation)
+            .collect()
     }
 
     /// Snapshots the recorded operations as public [`TestOperation`]s.
@@ -1872,7 +1903,7 @@ impl Backend {
     /// - `step`/`wait_for_condition` retry: `src/step.rs` and
     ///   `src/wait_for_condition.rs` replay suspend for `Pending` and fall
     ///   through to live execution for `Ready`.
-    /// - callback: a `Pending` callback resolves to `Succeeded` (with a
+    /// - callback: a `Started` callback resolves to `Succeeded` (with a
     ///   payload) or `TimedOut` (`src/callback.rs` replay).
     fn advance(&self) -> bool {
         let mut state = self.lock();
@@ -1958,6 +1989,7 @@ impl BackendState {
 
     /// Applies a single `OperationUpdate` to the store, returning the
     /// resulting stored op (cloned) for the checkpoint response.
+    #[expect(clippy::too_many_lines)] // reason: one match over the update actions reads better as one flow
     fn apply_update(&mut self, update: &OperationUpdate) -> Option<StoredOp> {
         let id = update.id().to_owned();
         let op_type = update.r#type().clone();
@@ -1980,15 +2012,22 @@ impl BackendState {
         let retry_delay = update
             .step_options()
             .and_then(aws_sdk_lambda::types::StepOptions::next_attempt_delay_seconds);
+        let parent_id = update.parent_id().map(ToOwned::to_owned);
+        let replay_children = update
+            .context_options()
+            .and_then(ContextOptions::replay_children)
+            .unwrap_or(false);
         // Read the clock before the mutable op borrow below.
         let now = self.now;
 
-        // Ensure the op exists.
+        // Ensure the op exists. The parent comes from the creating update
+        // only, as on the service.
         if self.find_mut(&id).is_none() {
             self.ops.push(new_started_op(
                 id.clone(),
                 op_type.clone(),
                 sub_type.clone(),
+                parent_id,
             ));
         }
 
@@ -2033,9 +2072,10 @@ impl BackendState {
                     op.wait_seconds = wait_seconds;
                     op.due_at = Some(now.saturating_add(whole_seconds(wait_seconds)));
                 } else if op.op_type == OperationType::Callback {
-                    // Callbacks are pending until an external outcome; the
-                    // backend assigns the callback id here.
-                    op.status = OperationStatus::Pending;
+                    // The service creates a callback in `Started` and keeps
+                    // it there until an external outcome. The backend
+                    // assigns the callback id here.
+                    op.status = OperationStatus::Started;
                     if let Some(cb) = new_callback_id {
                         op.callback_id = Some(cb);
                     }
@@ -2046,9 +2086,15 @@ impl BackendState {
             OperationAction::Succeed => {
                 op.status = OperationStatus::Succeeded;
                 op.result = payload;
+                if op.op_type == OperationType::Context {
+                    op.replay_children = replay_children;
+                }
             }
             OperationAction::Fail => {
                 op.status = OperationStatus::Failed;
+                if op.op_type == OperationType::Context {
+                    op.replay_children = replay_children;
+                }
                 op.error_type = err_type;
                 op.error_message = err_msg;
                 op.error_data = err_data;
@@ -2211,7 +2257,7 @@ impl ExecutionClient for Backend {
     > {
         self.get_state_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let operations = self.build_operations();
+        let operations = self.build_pruned_operations();
         Box::pin(async move { Ok(GetStateOutput::new(operations, None)) })
     }
 }
@@ -2250,6 +2296,9 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
     if let Some(ref n) = stored.name {
         builder = builder.name(n);
     }
+    if let Some(ref parent) = stored.parent_id {
+        builder = builder.parent_id(parent);
+    }
 
     match stored.op_type {
         OperationType::Step => {
@@ -2269,6 +2318,9 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
             }
             if let Some(e) = error_obj.clone() {
                 cd = cd.error(e);
+            }
+            if stored.replay_children {
+                cd = cd.replay_children(true);
             }
             builder = builder.context_details(cd.build());
         }
@@ -2311,7 +2363,7 @@ fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
     obj.insert("Id".to_owned(), serde_json::json!(stored.id));
     obj.insert(
         "Type".to_owned(),
-        serde_json::json!(operation_type_str(&stored.op_type)),
+        serde_json::json!(stored.op_type.as_str()),
     );
     obj.insert(
         "Status".to_owned(),
@@ -2322,6 +2374,9 @@ fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
     }
     if let Some(n) = &stored.name {
         obj.insert("Name".to_owned(), serde_json::json!(n));
+    }
+    if let Some(parent) = &stored.parent_id {
+        obj.insert("ParentId".to_owned(), serde_json::json!(parent));
     }
 
     let error_obj = (stored.error_type.is_some() || stored.error_message.is_some()).then(|| {
@@ -2358,6 +2413,9 @@ fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
             obj.insert("StepDetails".to_owned(), serde_json::Value::Object(details));
         }
         OperationType::Context => {
+            if stored.replay_children {
+                details.insert("ReplayChildren".to_owned(), serde_json::json!(true));
+            }
             obj.insert(
                 "ContextDetails".to_owned(),
                 serde_json::Value::Object(details),
@@ -2461,6 +2519,48 @@ fn failed_envelope_result<O>(
         operations,
         invocations,
     }
+}
+
+/// Returns the stored records the service sends in the invocation input and
+/// in `GetDurableExecutionState`, in stored order.
+///
+/// The service omits every descendant of a completed context that did not
+/// record `ReplayChildren`, because the context's result replaces them on
+/// replay. The rules are:
+///
+/// 1. A record without a parent is kept.
+/// 2. Otherwise the walk goes up the parents. A parent that is not stored
+///    keeps the record. A parent that is a `Succeeded` or `Failed` context
+///    without `ReplayChildren` omits the record. Any other parent continues
+///    the walk. So a started context under a pruning ancestor is omitted
+///    with its children.
+/// 3. A crafted `ParentId` can form a cycle. So the walk takes at most
+///    `ops.len()` steps, and a record whose walk reaches the bound is kept.
+///
+/// Checkpoint responses are not pruned, because the service does not prune
+/// them.
+fn prune_replay_children(ops: &[StoredOp]) -> Vec<&StoredOp> {
+    let find = |id: &str| ops.iter().find(|op| op.id == id);
+    let omitted = |op: &StoredOp| {
+        let mut parent_id = op.parent_id.as_deref();
+        for _ in 0..ops.len() {
+            let Some(parent) = parent_id.and_then(find) else {
+                return false;
+            };
+            if parent.op_type == OperationType::Context
+                && matches!(
+                    parent.status,
+                    OperationStatus::Succeeded | OperationStatus::Failed
+                )
+                && !parent.replay_children
+            {
+                return true;
+            }
+            parent_id = parent.parent_id.as_deref();
+        }
+        false
+    };
+    ops.iter().filter(|op| !omitted(op)).collect()
 }
 
 #[cfg(test)]
@@ -5108,6 +5208,30 @@ mod tests {
         (op.status.clone(), state.now)
     }
 
+    /// A callback `START` stores `Started`, but `advance` still settles a
+    /// callback whose status is `Pending`. This test sets the status to
+    /// `Pending` directly, because no update produces it.
+    #[test]
+    fn advance_settles_pending_callback() {
+        let backend = seeded_backend(
+            vec![CallbackOutcome::Success("\"x\"".to_owned())],
+            0,
+            &[callback_start("c")],
+        );
+        backend
+            .lock()
+            .ops
+            .iter_mut()
+            .find(|op| op.id == "c")
+            .expect("op is stored")
+            .status = OperationStatus::Pending;
+        assert!(backend.advance());
+        assert_eq!(
+            status_and_now(&backend, "c"),
+            (OperationStatus::Succeeded, 0)
+        );
+    }
+
     /// `advance` follows the virtual clock: one assertion block per row of
     /// the case table in the issue.
     #[test]
@@ -5155,7 +5279,7 @@ mod tests {
         // Row 5: nothing to deliver and nothing timed.
         let backend = seeded_backend(Vec::new(), 0, &[callback_start("c")]);
         assert!(!backend.advance(), "row 5");
-        assert_eq!(status_and_now(&backend, "c"), (OperationStatus::Pending, 0));
+        assert_eq!(status_and_now(&backend, "c"), (OperationStatus::Started, 0));
 
         // Row 6: a zero-second wait is due at once.
         let backend = seeded_backend(Vec::new(), 7, &[wait_start("w", 0)]);
@@ -5253,5 +5377,504 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the run ends without a time driver");
         assert_eq!(outcome, (true, Some(42)));
+    }
+
+    // Issue #90: `ParentId` and `ReplayChildren` in the backend, and pruning.
+
+    /// A map whose results exceed the checkpoint size limit records the
+    /// batch with `ReplayChildren`. The wait forces a replay, which must
+    /// rebuild the result from the item children.
+    #[tokio::test]
+    async fn oversized_map_result_replays_with_replay_children() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let items = ctx
+                        .map(vec![0_u32, 1], |child, _item, _idx| async move {
+                            let big = child
+                                .step(|_| async { Ok("x".repeat(150 * 1024)) })
+                                .name("big")
+                                .await?;
+                            Ok(big)
+                        })
+                        .name("oversized")
+                        .await?;
+                    ctx.wait(std::time::Duration::from_secs(1))
+                        .name("pause")
+                        .await?;
+                    Ok::<_, BoxError>(items.iter().map(String::len).collect::<Vec<_>>())
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&vec![153_600, 153_600]));
+        assert_eq!(result.invocation_count(), 2);
+    }
+
+    /// A child context whose result exceeds the checkpoint size limit
+    /// records `ReplayChildren`. The wait forces a replay, which must rerun
+    /// the child from its recorded steps.
+    #[tokio::test]
+    async fn oversized_child_result_replays_with_replay_children() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let joined = ctx
+                        .run_in_child_context(|child| async move {
+                            let a = child
+                                .step(|_| async { Ok("x".repeat(150 * 1024)) })
+                                .name("a")
+                                .await?;
+                            let b = child
+                                .step(|_| async { Ok("x".repeat(150 * 1024)) })
+                                .name("b")
+                                .await?;
+                            Ok(format!("{a}{b}"))
+                        })
+                        .name("oversized")
+                        .await?;
+                    ctx.wait(std::time::Duration::from_secs(1))
+                        .name("pause")
+                        .await?;
+                    Ok::<_, BoxError>(joined.len())
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&307_200));
+    }
+
+    /// The service creates a callback in `Started`, so an open callback
+    /// reports `"Started"`, as under `CloudRunner`.
+    #[tokio::test]
+    async fn open_callback_reports_started() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let cb = ctx.create_callback::<String>().name("approval").await?;
+                    let value = cb.result().await?;
+                    Ok::<_, BoxError>(value)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_suspended(), "{:?}", result.error_message());
+        let callback = result
+            .operations()
+            .iter()
+            .find(|op| op.op_type() == "Callback")
+            .expect("the callback is recorded");
+        assert_eq!(callback.status(), "Started");
+    }
+
+    /// One update for the pruning tests. `replay_children` sets the
+    /// context option when given.
+    fn tree_update(
+        id: &str,
+        op_type: OperationType,
+        action: OperationAction,
+        parent: Option<&str>,
+        replay_children: Option<bool>,
+    ) -> OperationUpdate {
+        let is_fail = action == OperationAction::Fail;
+        let mut builder = OperationUpdate::builder()
+            .id(id)
+            .r#type(op_type)
+            .action(action);
+        if let Some(parent) = parent {
+            builder = builder.parent_id(parent);
+        }
+        if let Some(replay) = replay_children {
+            builder =
+                builder.context_options(ContextOptions::builder().replay_children(replay).build());
+        }
+        if is_fail {
+            builder = builder.error(ErrorObject::builder().error_message("boom").build());
+        }
+        builder.build().unwrap()
+    }
+
+    fn ctx_op(
+        id: &str,
+        action: OperationAction,
+        parent: Option<&str>,
+        replay_children: Option<bool>,
+    ) -> OperationUpdate {
+        tree_update(id, OperationType::Context, action, parent, replay_children)
+    }
+
+    fn step_op(id: &str, action: OperationAction, parent: Option<&str>) -> OperationUpdate {
+        tree_update(id, OperationType::Step, action, parent, None)
+    }
+
+    /// Applies `updates` to a fresh backend.
+    fn tree_backend(updates: &[OperationUpdate]) -> Backend {
+        let backend = Backend::new(Vec::new(), None);
+        {
+            let mut state = backend.lock();
+            for update in updates {
+                state.apply_update(update).expect("update applies");
+            }
+        }
+        backend
+    }
+
+    fn envelope_ids(backend: &Backend) -> Vec<String> {
+        backend
+            .envelope_history()
+            .iter()
+            .map(|op| op["Id"].as_str().expect("Id is a string").to_owned())
+            .collect()
+    }
+
+    async fn get_state_ops(backend: &Backend) -> Vec<Operation> {
+        backend
+            .get_state("arn:test", "token-0", None)
+            .await
+            .expect("get_state succeeds")
+            .operations
+    }
+
+    /// Asserts that the envelope history and `get_state` hold exactly
+    /// `kept`, and that `snapshot_operations` holds every stored record.
+    async fn assert_pruned(updates: &[OperationUpdate], kept: &[&str], all: &[&str]) {
+        let backend = tree_backend(updates);
+        assert_eq!(envelope_ids(&backend), kept, "envelope history");
+        let state_ids: Vec<String> = get_state_ops(&backend)
+            .await
+            .iter()
+            .map(|op| op.id().to_owned())
+            .collect();
+        assert_eq!(state_ids, kept, "get_state");
+        let snapshot_ids: Vec<String> = backend
+            .snapshot_operations()
+            .iter()
+            .map(|op| op.id().to_owned())
+            .collect();
+        assert_eq!(snapshot_ids, all, "snapshot_operations");
+    }
+
+    #[tokio::test]
+    async fn prune_replay_children_top_level_kept() {
+        assert_pruned(
+            &[step_op("S", OperationAction::Succeed, None)],
+            &["S"],
+            &["S"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prune_replay_children_completed_context_omits_child() {
+        assert_pruned(
+            &[
+                ctx_op("C", OperationAction::Succeed, None, Some(false)),
+                step_op("S", OperationAction::Succeed, Some("C")),
+            ],
+            &["C"],
+            &["C", "S"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prune_replay_children_failed_context_omits_child() {
+        assert_pruned(
+            &[
+                ctx_op("C", OperationAction::Fail, None, Some(false)),
+                step_op("S", OperationAction::Fail, Some("C")),
+            ],
+            &["C"],
+            &["C", "S"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prune_replay_children_started_context_keeps_child() {
+        assert_pruned(
+            &[
+                ctx_op("C", OperationAction::Start, None, None),
+                step_op("S", OperationAction::Succeed, Some("C")),
+            ],
+            &["C", "S"],
+            &["C", "S"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prune_replay_children_replay_children_keeps_child() {
+        assert_pruned(
+            &[
+                ctx_op("C", OperationAction::Succeed, None, Some(true)),
+                step_op("S", OperationAction::Succeed, Some("C")),
+            ],
+            &["C", "S"],
+            &["C", "S"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prune_replay_children_ancestor_omits_replay_children_context() {
+        assert_pruned(
+            &[
+                ctx_op("A", OperationAction::Succeed, None, Some(false)),
+                ctx_op("B", OperationAction::Succeed, Some("A"), Some(true)),
+                step_op("S", OperationAction::Succeed, Some("B")),
+            ],
+            &["A"],
+            &["A", "B", "S"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prune_replay_children_ancestor_omits_started_context() {
+        assert_pruned(
+            &[
+                ctx_op("A", OperationAction::Succeed, None, Some(false)),
+                ctx_op("B", OperationAction::Start, Some("A"), None),
+                step_op("S", OperationAction::Succeed, Some("B")),
+            ],
+            &["A"],
+            &["A", "B", "S"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prune_replay_children_missing_parent_kept() {
+        assert_pruned(
+            &[step_op("S", OperationAction::Succeed, Some("ghost"))],
+            &["S"],
+            &["S"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prune_replay_children_cyclic_parents_terminate() {
+        assert_pruned(
+            &[
+                ctx_op("X", OperationAction::Start, Some("Y"), None),
+                ctx_op("Y", OperationAction::Start, Some("X"), None),
+            ],
+            &["X", "Y"],
+            &["X", "Y"],
+        )
+        .await;
+    }
+
+    /// The service does not prune checkpoint responses, and the SDK merges
+    /// a response into its log. So the response keeps a child that the
+    /// same call's context close would omit from the invocation input.
+    #[tokio::test]
+    async fn checkpoint_response_is_not_pruned() {
+        let backend = Backend::new(Vec::new(), None);
+        let output = backend
+            .checkpoint(
+                "arn:test",
+                "token-0",
+                vec![
+                    step_op("S", OperationAction::Succeed, Some("C")),
+                    ctx_op("C", OperationAction::Succeed, None, None),
+                ],
+            )
+            .await
+            .expect("checkpoint succeeds");
+        let ids: Vec<&str> = output
+            .updated_operations
+            .iter()
+            .map(Operation::id)
+            .collect();
+        assert_eq!(ids, ["S", "C"]);
+    }
+
+    /// A paginated checkpoint response returns the first page of the full
+    /// state. That page is not pruned either. So with a page size of 1 the
+    /// page holds the child `S`, which was stored first, and not `C`.
+    #[tokio::test]
+    async fn paginated_checkpoint_response_is_not_pruned() {
+        let backend = Backend::new(Vec::new(), Some(1));
+        let output = backend
+            .checkpoint(
+                "arn:test",
+                "token-0",
+                vec![
+                    step_op("S", OperationAction::Succeed, Some("C")),
+                    ctx_op("C", OperationAction::Succeed, None, None),
+                ],
+            )
+            .await
+            .expect("checkpoint succeeds");
+        assert!(output.next_marker.is_some(), "the response is paginated");
+        let ids: Vec<&str> = output
+            .updated_operations
+            .iter()
+            .map(Operation::id)
+            .collect();
+        assert_eq!(ids, ["S"]);
+    }
+
+    /// A context closed with `FAIL` and `ReplayChildren: true` records the
+    /// option. So both renderers carry it, and both keep the child.
+    #[tokio::test]
+    async fn failed_context_with_replay_children_keeps_child() {
+        let updates = [
+            ctx_op("C", OperationAction::Start, None, None),
+            step_op("S", OperationAction::Fail, Some("C")),
+            ctx_op("C", OperationAction::Fail, None, Some(true)),
+        ];
+        assert_pruned(&updates, &["C", "S"], &["C", "S"]).await;
+
+        let backend = tree_backend(&updates);
+        let history = backend.envelope_history();
+        let context = history.iter().find(|op| op["Id"] == "C").expect("C");
+        assert_eq!(context["Status"], "FAILED");
+        assert_eq!(context["ContextDetails"]["ReplayChildren"], true);
+
+        let ops = get_state_ops(&backend).await;
+        let context = ops.iter().find(|op| op.id() == "C").expect("C");
+        assert_eq!(context.status(), &OperationStatus::Failed);
+        assert_eq!(
+            context
+                .context_details()
+                .and_then(ContextDetails::replay_children),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_id_and_replay_children_are_rendered() {
+        let backend = tree_backend(&[
+            ctx_op("C", OperationAction::Start, None, None),
+            step_op("S", OperationAction::Succeed, Some("C")),
+            ctx_op("C", OperationAction::Succeed, None, Some(true)),
+        ]);
+        let history = backend.envelope_history();
+        let context = history.iter().find(|op| op["Id"] == "C").expect("C");
+        let step = history.iter().find(|op| op["Id"] == "S").expect("S");
+        assert_eq!(step["ParentId"], "C");
+        assert!(context.get("ParentId").is_none());
+        assert_eq!(context["ContextDetails"]["ReplayChildren"], true);
+
+        let ops = get_state_ops(&backend).await;
+        let context = ops.iter().find(|op| op.id() == "C").expect("C");
+        let step = ops.iter().find(|op| op.id() == "S").expect("S");
+        assert_eq!(step.parent_id(), Some("C"));
+        assert_eq!(context.parent_id(), None);
+        assert_eq!(
+            context
+                .context_details()
+                .and_then(ContextDetails::replay_children),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_id_is_set_once() {
+        let backend = tree_backend(&[
+            step_op("S", OperationAction::Start, Some("P")),
+            step_op("S", OperationAction::Succeed, Some("Q")),
+        ]);
+        assert_eq!(backend.envelope_history()[0]["ParentId"], "P");
+        assert_eq!(get_state_ops(&backend).await[0].parent_id(), Some("P"));
+    }
+
+    #[tokio::test]
+    async fn replay_children_set_only_on_context_close() {
+        let backend = tree_backend(&[
+            ctx_op("C", OperationAction::Start, None, Some(true)),
+            step_op("S", OperationAction::Succeed, Some("C")),
+        ]);
+        let context_has_replay_children = |history: &[serde_json::Value]| {
+            history
+                .iter()
+                .find(|op| op["Id"] == "C")
+                .expect("C")
+                .get("ContextDetails")
+                .and_then(|details| details.get("ReplayChildren"))
+                .is_some()
+        };
+        // A START ignores the option.
+        assert!(!context_has_replay_children(&backend.envelope_history()));
+        assert_eq!(
+            get_state_ops(&backend).await[0]
+                .context_details()
+                .and_then(ContextDetails::replay_children),
+            None
+        );
+
+        // A close without the option records `false`, so the child goes.
+        backend
+            .lock()
+            .apply_update(&ctx_op("C", OperationAction::Succeed, None, None))
+            .expect("update applies");
+        assert!(!context_has_replay_children(&backend.envelope_history()));
+        assert_eq!(envelope_ids(&backend), ["C"]);
+        let ops = get_state_ops(&backend).await;
+        assert_eq!(ops.iter().map(Operation::id).collect::<Vec<_>>(), ["C"]);
+        assert_eq!(
+            ops[0]
+                .context_details()
+                .and_then(ContextDetails::replay_children),
+            None
+        );
+    }
+
+    #[test]
+    fn envelope_uses_service_type_spelling() {
+        let backend = tree_backend(&[
+            tree_update("s", OperationType::Step, OperationAction::Start, None, None),
+            tree_update("w", OperationType::Wait, OperationAction::Start, None, None),
+            tree_update(
+                "c",
+                OperationType::Context,
+                OperationAction::Start,
+                None,
+                None,
+            ),
+            tree_update(
+                "b",
+                OperationType::Callback,
+                OperationAction::Start,
+                None,
+                None,
+            ),
+            tree_update(
+                "i",
+                OperationType::ChainedInvoke,
+                OperationAction::Start,
+                None,
+                None,
+            ),
+        ]);
+        let envelope = build_envelope(&backend, "{}", None);
+        let ops = envelope["InitialExecutionState"]["Operations"]
+            .as_array()
+            .expect("Operations is an array");
+        let types: Vec<&str> = ops
+            .iter()
+            .map(|op| op["Type"].as_str().expect("Type is a string"))
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "EXECUTION",
+                "STEP",
+                "WAIT",
+                "CONTEXT",
+                "CALLBACK",
+                "CHAINED_INVOKE"
+            ]
+        );
+        assert_eq!(ops[0]["Status"], "STARTED");
     }
 }

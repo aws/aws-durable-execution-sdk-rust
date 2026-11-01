@@ -93,7 +93,7 @@ run() {
     resolve_role
 
     pids=""
-    # Absolute, because the runner starts from conformance/.
+    # Absolute, because each runner starts from its own directory.
     venv=$PWD/target/conformance-venv-$RUN_ID
     teardown_result=FAIL
     trap cleanup EXIT
@@ -112,19 +112,28 @@ run() {
     # its own process group, so cleanup's stop_group stops the runner and
     # the SAM CLI under it. Unbuffered, so a killed runner's log is whole.
     export PYTHONUNBUFFERED=1
+    # The runner builds a suite in <cwd>/build/<stack>, and SAM keeps its
+    # build graph in the parent of that directory, <cwd>/build/build.toml.
+    # SAM rewrites that file in place. So suites started from one directory
+    # write the same file at once and corrupt it. So each suite starts from
+    # its own directory, conformance/build/run-<suite>, and every path the
+    # runner takes is absolute. SAM resolves CodeUri relative to the
+    # template, so the cwd does not change it.
+    root=$PWD
+    rm -f conformance/build/build.toml
     for suite in $SUITES; do
         rm -rf "conformance/history-$suite" "conformance/report-$suite.xml"
-        mkdir -p "conformance/history-$suite"
-        (cd conformance && exec timeout 3600 "$venv/bin/python" -m aws_durable_execution_conformance_tests.app \
-            --template "template_$suite.yaml" \
+        mkdir -p "conformance/history-$suite" "conformance/build/run-$suite"
+        (cd "conformance/build/run-$suite" && exec timeout 3600 "$venv/bin/python" -m aws_durable_execution_conformance_tests.app \
+            --template "$root/conformance/template_$suite.yaml" \
             --language rust \
             --suite "$suite" \
             --name "conf-rust-$(slug "$suite")-$RUN_ID" \
             --region "$AWS_REGION" \
             --parameter-overrides ExecutionRoleArn="$EXECUTION_ROLE_ARN" \
-            --history-dir "history-$suite" \
+            --history-dir "$root/conformance/history-$suite" \
             --report junit \
-            --report-file "report-$suite") \
+            --report-file "$root/conformance/report-$suite") \
             > "conformance/history-$suite/runner.log" 2>&1 &
         pids="$pids $!"
         echo "started $suite, log conformance/history-$suite/runner.log"
