@@ -165,6 +165,11 @@ pub enum StepSemantics {
     /// consult the retry strategy to decide whether to schedule a new
     /// attempt or fail permanently.
     ///
+    /// The retry strategy sees [`StepErrorKind::Interrupted`], and the
+    /// RETRY or FAIL record carries the error type `StepInterruptedError`.
+    /// When the strategy stops, the step returns that kind, live and on
+    /// replay.
+    ///
     /// Use this for non-idempotent operations (e.g., charging a credit
     /// card) where re-execution could produce duplicate side effects.
     AtMostOncePerRetry,
@@ -363,15 +368,14 @@ where
                         // a step-interrupted failure and consult the retry
                         // strategy to decide FAIL or RETRY.
                         let attempt = self.ctx.get_attempt(&self.op_id).saturating_add(1);
-                        let interrupted_err: BoxError =
-                            "step interrupted (AtMostOncePerRetry)".into();
                         return Ok(StepPrelude::Done(
                             handle_failure::<O>(
                                 &self.ctx,
                                 &wire_id,
                                 self.name.as_deref(),
                                 self.retry_strategy.as_ref(),
-                                interrupted_err,
+                                StepErrorKind::Interrupted,
+                                STEP_INTERRUPTED_MESSAGE.into(),
                                 attempt,
                             )
                             .await,
@@ -477,6 +481,7 @@ where
                     &self.wire_id,
                     self.name.as_deref(),
                     self.retry_strategy.as_ref(),
+                    StepErrorKind::ExecutionFailed,
                     err,
                     attempt,
                 )
@@ -559,20 +564,32 @@ async fn handle_success<O, S: Serdes<O>>(
 }
 
 /// Handles a failed step: consult retry strategy, checkpoint accordingly.
+///
+/// `kind` is `StepErrorKind::ExecutionFailed` when the body returned
+/// `err`, and `StepErrorKind::Interrupted` when an `AtMostOncePerRetry`
+/// attempt started but recorded no outcome. The retry strategy sees
+/// `kind`, and the error returned when the strategy stops carries it.
 async fn handle_failure<O>(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
     retry_strategy: Option<&RetryStrategy>,
+    kind: StepErrorKind,
     err: BoxError,
     attempt: u32,
 ) -> Result<O, OperationError> {
     // Derive the wire failure record from the escaping error before it is
     // moved into the step error: message flattening, `error_type`
-    // pass-through, and the `error_data` and `stack_trace` chain walk all
-    // happen here, at the single wire-derivation site.
-    let wire = crate::error::wire_error_for(&*err, STEP_FALLBACK_ERROR_TYPE);
-    let step_err = StepError::new(StepErrorKind::ExecutionFailed, Some(err));
+    // pass-through, and the `error_data` chain walk all happen here, at
+    // the single wire-derivation site. An interrupted attempt has no
+    // typed error, so its fallback type is the one the JS SDK records.
+    let fallback = if matches!(kind, StepErrorKind::Interrupted) {
+        STEP_INTERRUPTED_ERROR_TYPE
+    } else {
+        STEP_FALLBACK_ERROR_TYPE
+    };
+    let wire = crate::error::wire_error_for(&*err, fallback);
+    let step_err = StepError::new(kind, Some(err));
 
     // Consult the retry strategy. The strategy sees the live escaping
     // error through the step error's `source()`.
@@ -624,9 +641,9 @@ async fn handle_failure<O>(
                     .await;
             }
 
-            // The step returns the body's error, as the JS SDK does: the
-            // kind stays `ExecutionFailed`, and the escaping error stays
-            // reachable through `source()`.
+            // The step returns the error the strategy saw, as the JS SDK
+            // does: the kind stays the one the strategy saw, and the
+            // escaping error stays reachable through `source()`.
             Err(
                 OperationError::from_kind(OperationErrorKind::Step(step_err))
                     .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
@@ -833,16 +850,20 @@ async fn replay_success<O, S: Serdes<O>>(
 /// A record whose `error_type` is the serialization discriminator
 /// ([`crate::error::SERIALIZATION_FAILED_ERROR_TYPE`]) reconstructs
 /// `StepErrorKind::SerializationFailed`, the kind the live path yielded
-/// after persisting that record (issue #43). Every other record is an
+/// after persisting that record (issue #43). A record whose `error_type`
+/// is [`STEP_INTERRUPTED_ERROR_TYPE`] reconstructs
+/// `StepErrorKind::Interrupted`, the kind the live path yielded after the
+/// retry strategy stopped an interrupted `AtMostOncePerRetry` attempt.
+/// Every other record is an
 /// ordinary terminal step failure, which the live path yields as
 /// `StepErrorKind::ExecutionFailed` after its retry strategy stopped, so
 /// replay reconstructs the SAME kind: a handler that branches on the
 /// kind takes the same path live and replayed.
 fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationError {
-    let kind = if wire.error_type() == Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) {
-        StepErrorKind::SerializationFailed
-    } else {
-        StepErrorKind::ExecutionFailed
+    let kind = match wire.error_type() {
+        Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) => StepErrorKind::SerializationFailed,
+        Some(STEP_INTERRUPTED_ERROR_TYPE) => StepErrorKind::Interrupted,
+        _ => StepErrorKind::ExecutionFailed,
     };
     OperationError::from_kind(OperationErrorKind::Step(StepError::new(
         kind,
@@ -864,6 +885,15 @@ fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationErro
 /// [`crate::error::ReplayedFailure`]: records its registry name or its
 /// original recorded type instead (see [`crate::error::wire_error_for`]).
 const STEP_FALLBACK_ERROR_TYPE: &str = "Error";
+
+/// The wire `ErrorType` recorded for an `AtMostOncePerRetry` attempt that
+/// started but recorded no outcome. It is the name the JS SDK records.
+const STEP_INTERRUPTED_ERROR_TYPE: &str = "StepInterruptedError";
+
+/// The wire `ErrorMessage` recorded for an interrupted `AtMostOncePerRetry`
+/// attempt. It is the message the JS SDK records.
+const STEP_INTERRUPTED_MESSAGE: &str =
+    "The step execution process was initiated but failed to reach completion due to an interruption.";
 
 #[cfg(test)]
 #[expect(clippy::panic)]
@@ -1786,78 +1816,93 @@ mod tests {
 
     // AtMostOncePerRetry tests
 
-    #[tokio::test]
-    async fn step_at_most_once_replay_started_no_retry_fails_permanently() {
-        use crate::engine::{CheckpointLog, CheckpointRecord};
-        use std::sync::atomic::{AtomicBool, Ordering};
+    /// A strategy that records the display of each kind it sees and
+    /// returns `decision`.
+    fn kind_recording_strategy(
+        decision: RetryDecision,
+    ) -> (RetryStrategy, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let strategy: RetryStrategy = Box::new(move |err: &StepError, _attempt: u32| {
+            seen_clone
+                .lock()
+                .expect("kind log lock")
+                .push(err.kind().to_string());
+            decision.clone()
+        });
+        (strategy, seen)
+    }
 
-        let executed = Arc::new(AtomicBool::new(false));
-        let executed_clone = Arc::clone(&executed);
+    /// The error object of the first update a test context recorded with
+    /// `action`, as a wire record.
+    fn recorded_error_for(
+        client: &crate::client::InMemoryExecutionClient,
+        action: &OperationAction,
+    ) -> crate::error::WireError {
+        let updates = client.recorded_updates();
+        let update = updates
+            .iter()
+            .find(|u| u.action() == action)
+            .unwrap_or_else(|| panic!("a {action:?} update must be recorded: {updates:?}"));
+        let error = update.error().expect("the update carries an error object");
+        crate::error::WireError::new(error.error_type(), error.error_message())
+    }
 
-        // Build a checkpoint log with a Started record (simulating an
-        // interrupted previous attempt).
-        let wire_key = crate::engine::compute_wire_id_public("1");
-        let record = CheckpointRecord {
-            id: wire_key.clone(),
-            status: CheckpointStatus::Started,
-            result: None,
-            error_type: None,
-            error_message: None,
-            error_data: None,
-            stack_trace: None,
-            attempt: 0,
-            invoke_result: None,
-            invoke_error_type: None,
-            invoke_error_message: None,
-            invoke_error_data: None,
-            invoke_stack_trace: None,
-            replay_children: false,
-            callback_id: None,
-            op_type: None,
-            sub_type: None,
-            op_name: None,
-        };
-        let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
-
-        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
-        let ctx = DurableContext::new_root_with_client(
-            "arn:test".to_owned(),
-            lambda_runtime::Context::default(),
-            log,
-            client,
-            "token0".to_owned(),
-        );
+    /// An `AtMostOncePerRetry` step over a STARTED record, whose body
+    /// sets `executed` if it runs.
+    fn at_most_once_over_started(
+        ctx: DurableContext,
+        retry_strategy: Option<RetryStrategy>,
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> StepExecution<
+        i32,
+        impl FnOnce(StepContext) -> std::future::Ready<Result<i32, BoxError>>,
+        crate::serdes::JsonSerdes,
+    > {
         let op_id = ctx.mint_id();
-
-        // Strategy that NEVER retries (stops immediately).
-        let no_retry: RetryStrategy =
-            Box::new(|_err: &StepError, _attempt: u32| RetryDecision::Stop);
-
-        let closure = move |_: StepContext| {
-            executed_clone.store(true, Ordering::SeqCst);
-            async { Ok::<i32, BoxError>(42) }
-        };
-
-        let exec = StepExecution {
+        StepExecution {
             ctx,
             op_id,
             name: Some("at-most-once-step".to_owned()),
-            retry_strategy: Some(no_retry),
+            retry_strategy,
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtMostOncePerRetry,
-            closure,
+            closure: move |_: StepContext| {
+                executed.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok::<i32, BoxError>(42))
+            },
             _marker: std::marker::PhantomData,
-        };
+        }
+    }
 
-        let result = exec.execute().await;
+    #[tokio::test]
+    async fn step_at_most_once_replay_started_no_retry_fails_permanently() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let (ctx, client) = context_over(vec![step_record(CheckpointStatus::Started, 0, None)]);
+        let (strategy, seen) = kind_recording_strategy(RetryDecision::Stop);
+        let exec = at_most_once_over_started(ctx, Some(strategy), Arc::clone(&executed));
+
+        let err = exec
+            .execute()
+            .await
+            .expect_err("expected failure for interrupted + no retry");
+
+        assert_eq!(*seen.lock().expect("kind log lock"), ["step interrupted"]);
+        let fail = recorded_error_for(&client, &OperationAction::Fail);
+        assert_eq!(fail.error_type(), Some(STEP_INTERRUPTED_ERROR_TYPE));
+        assert_eq!(fail.error_message(), Some(STEP_INTERRUPTED_MESSAGE));
+        let OperationErrorKind::Step(step_err) = err.kind() else {
+            panic!("expected a step error, got {err:?}");
+        };
         assert!(
-            result.is_err(),
-            "expected failure for interrupted + no retry"
+            matches!(step_err.kind(), StepErrorKind::Interrupted),
+            "got {step_err:?}"
         );
-        let err_msg = format!("{:#}", result.unwrap_err());
-        assert!(
-            err_msg.contains("retries exhausted") || err_msg.contains("interrupted"),
-            "got: {err_msg}"
+        assert_eq!(
+            err.wire().and_then(crate::error::WireError::error_type),
+            Some(STEP_INTERRUPTED_ERROR_TYPE)
         );
         assert!(
             !executed.load(Ordering::SeqCst),
@@ -1867,76 +1912,112 @@ mod tests {
 
     #[tokio::test]
     async fn step_at_most_once_replay_started_with_retry_suspends() {
-        use crate::engine::{CheckpointLog, CheckpointRecord};
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let executed = Arc::new(AtomicBool::new(false));
-        let executed_clone = Arc::clone(&executed);
-
-        let wire_key = crate::engine::compute_wire_id_public("1");
-        let record = CheckpointRecord {
-            id: wire_key.clone(),
-            status: CheckpointStatus::Started,
-            result: None,
-            error_type: None,
-            error_message: None,
-            error_data: None,
-            stack_trace: None,
-            attempt: 0,
-            invoke_result: None,
-            invoke_error_type: None,
-            invoke_error_message: None,
-            invoke_error_data: None,
-            invoke_stack_trace: None,
-            replay_children: false,
-            callback_id: None,
-            op_type: None,
-            sub_type: None,
-            op_name: None,
-        };
-        let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
-
-        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
-        let ctx = DurableContext::new_root_with_client(
-            "arn:test".to_owned(),
-            lambda_runtime::Context::default(),
-            log,
-            client,
-            "token0".to_owned(),
-        );
-        let op_id = ctx.mint_id();
-
-        // Strategy that always retries with 1s delay.
-        let always_retry: RetryStrategy =
-            Box::new(|_err: &StepError, _attempt: u32| RetryDecision::Retry {
-                delay: Duration::from_secs(1),
-            });
-
-        let closure = move |_: StepContext| {
-            executed_clone.store(true, Ordering::SeqCst);
-            async { Ok::<i32, BoxError>(42) }
-        };
-
-        let exec = StepExecution {
-            ctx: ctx.clone(),
-            op_id,
-            name: None,
-            retry_strategy: Some(always_retry),
-            serdes: crate::serdes::JsonSerdes,
-            semantics: StepSemantics::AtMostOncePerRetry,
-            closure,
-            _marker: std::marker::PhantomData,
-        };
-
+        let (ctx, client) = context_over(vec![step_record(CheckpointStatus::Started, 0, None)]);
+        let (strategy, seen) = kind_recording_strategy(RetryDecision::Retry {
+            delay: Duration::from_secs(5),
+        });
         let signal = Arc::clone(ctx.suspension_signal());
+        let exec = at_most_once_over_started(ctx, Some(strategy), Arc::clone(&executed));
+
         // Retry timer is backend-owned: the operation suspends (parks) rather
         // than surfacing a fabricated retry-schedule error to the caller.
         let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+        assert_eq!(*seen.lock().expect("kind log lock"), ["step interrupted"]);
+        let retry = recorded_error_for(&client, &OperationAction::Retry);
+        assert_eq!(retry.error_type(), Some(STEP_INTERRUPTED_ERROR_TYPE));
+        assert_eq!(retry.error_message(), Some(STEP_INTERRUPTED_MESSAGE));
         assert!(
             !executed.load(Ordering::SeqCst),
             "closure should NOT execute when AtMostOncePerRetry and replay=Started"
         );
+    }
+
+    #[tokio::test]
+    async fn step_at_most_once_interrupted_default_strategy_retries() {
+        use std::sync::atomic::AtomicBool;
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let (ctx, client) = context_over(vec![step_record(CheckpointStatus::Started, 0, None)]);
+        let signal = Arc::clone(ctx.suspension_signal());
+        let exec = at_most_once_over_started(ctx, None, executed);
+
+        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+        let retry = recorded_error_for(&client, &OperationAction::Retry);
+        assert_eq!(retry.error_type(), Some(STEP_INTERRUPTED_ERROR_TYPE));
+    }
+
+    #[tokio::test]
+    async fn step_body_error_strategy_sees_execution_failed() {
+        let (ctx, client) = context_over(Vec::new());
+        let op_id = ctx.mint_id();
+        let (strategy, seen) = kind_recording_strategy(RetryDecision::Stop);
+        let exec = StepExecution {
+            ctx,
+            op_id,
+            name: None,
+            retry_strategy: Some(strategy),
+            serdes: crate::serdes::JsonSerdes,
+            semantics: StepSemantics::AtMostOncePerRetry,
+            closure: |_: StepContext| async { Err::<i32, BoxError>("boom".into()) },
+            _marker: std::marker::PhantomData,
+        };
+
+        let err = exec.execute().await.expect_err("the step must fail");
+
+        assert_eq!(*seen.lock().expect("kind log lock"), ["execution failed"]);
+        let fail = recorded_error_for(&client, &OperationAction::Fail);
+        assert_eq!(fail.error_type(), Some(STEP_FALLBACK_ERROR_TYPE));
+        let OperationErrorKind::Step(step_err) = err.kind() else {
+            panic!("expected a step error, got {err:?}");
+        };
+        assert!(
+            matches!(step_err.kind(), StepErrorKind::ExecutionFailed),
+            "got {step_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_interrupted_fail_record_replays_as_interrupted() {
+        let wire = crate::error::WireError::new(
+            Some(STEP_INTERRUPTED_ERROR_TYPE),
+            Some(STEP_INTERRUPTED_MESSAGE),
+        );
+        let (ctx, _client) =
+            context_over(vec![step_record(CheckpointStatus::Failed, 1, Some(&wire))]);
+        let op_id = ctx.mint_id();
+        let exec = StepExecution {
+            ctx,
+            op_id,
+            name: None,
+            retry_strategy: None,
+            serdes: crate::serdes::JsonSerdes,
+            semantics: StepSemantics::AtMostOncePerRetry,
+            closure: |_: StepContext| async { Ok::<i32, BoxError>(1) },
+            _marker: std::marker::PhantomData,
+        };
+
+        let err = exec.execute().await.expect_err("the replayed step must fail");
+
+        let OperationErrorKind::Step(step_err) = err.kind() else {
+            panic!("expected a step error, got {err:?}");
+        };
+        assert!(
+            matches!(step_err.kind(), StepErrorKind::Interrupted),
+            "got {step_err:?}"
+        );
+        assert_eq!(
+            err.wire().and_then(crate::error::WireError::error_type),
+            Some(STEP_INTERRUPTED_ERROR_TYPE)
+        );
+        let replayed = std::error::Error::source(step_err)
+            .and_then(|s| s.downcast_ref::<crate::error::ReplayedFailure>())
+            .expect("replay source is a ReplayedFailure");
+        assert_eq!(replayed.error_type(), Some(STEP_INTERRUPTED_ERROR_TYPE));
     }
 
     #[tokio::test]

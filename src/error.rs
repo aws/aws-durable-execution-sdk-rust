@@ -914,6 +914,13 @@ pub enum StepErrorKind {
     /// A serialization or deserialization error occurred.
     #[non_exhaustive]
     SerializationFailed,
+    /// An `AtMostOncePerRetry` attempt started but recorded no outcome.
+    ///
+    /// The SDK did not run the body again. It recorded the attempt as a
+    /// failure with error type `StepInterruptedError` and asked the retry
+    /// strategy whether to schedule another attempt.
+    #[non_exhaustive]
+    Interrupted,
 }
 
 impl fmt::Display for StepErrorKind {
@@ -921,6 +928,7 @@ impl fmt::Display for StepErrorKind {
         match self {
             Self::ExecutionFailed => write!(f, "execution failed"),
             Self::SerializationFailed => write!(f, "serialization failed"),
+            Self::Interrupted => write!(f, "step interrupted"),
         }
     }
 }

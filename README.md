@@ -285,7 +285,8 @@ let result = ctx
 body on resume if the previous attempt started but recorded no outcome.
 `AtMostOncePerRetry` treats that interruption as a failure and consults the
 retry strategy, so a non-idempotent body never runs twice for the same
-attempt.
+attempt. The strategy sees `StepErrorKind::Interrupted`, and the recorded
+failure carries the error type `StepInterruptedError`.
 
 A step records the error its body returns. An unwrapped error records the
 type `Error`, because Rust erases the concrete type when the error is

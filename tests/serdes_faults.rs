@@ -263,7 +263,7 @@ async fn step_marked_serialize_failure_at_most_once_takes_interrupted_path() {
         )
         .await;
 
-    assert_eq!(result.output().map(String::as_str), Some("ExecutionFailed"));
+    assert_eq!(result.output().map(String::as_str), Some("Interrupted"));
     assert_eq!(counters.body(), 1);
     assert_eq!(counters.after(), 1);
     let step = result
