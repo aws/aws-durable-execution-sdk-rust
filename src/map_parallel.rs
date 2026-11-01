@@ -2928,7 +2928,7 @@ async fn checkpoint_batch_success_serialized(
     if let Some(n) = parent_name {
         builder = builder.name(n.to_owned());
     }
-    if let Some(parent_wire_id) = ctx.parent_wire_id_computed() {
+    if let Some(parent_wire_id) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire_id);
     }
 
@@ -2990,7 +2990,7 @@ fn build_parent_update(
     if let Some(n) = name {
         builder = builder.name(n.to_owned());
     }
-    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+    if let Some(parent_wire) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire);
     }
 
@@ -3072,7 +3072,7 @@ fn build_parent_fail_update(
     if let Some(n) = name {
         builder = builder.name(n.to_owned());
     }
-    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+    if let Some(parent_wire) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire);
     }
     #[expect(clippy::expect_used)] // reason: all required fields are set above

@@ -436,7 +436,7 @@ fn build_update(
     }
 
     // Set parent wire ID if this is a nested child (child-of-child).
-    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+    if let Some(parent_wire) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire);
     }
 
@@ -466,7 +466,7 @@ fn build_succeed_update(
     if let Some(n) = name {
         succeed_builder = succeed_builder.name(n);
     }
-    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+    if let Some(parent_wire) = ctx.parent_wire_id() {
         succeed_builder = succeed_builder.parent_id(parent_wire);
     }
     // Check payload size: if >256KB, use ReplayChildren mode.
@@ -540,7 +540,7 @@ fn build_child_fail_update(
     if let Some(n) = name {
         fail_builder = fail_builder.name(n);
     }
-    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+    if let Some(parent_wire) = ctx.parent_wire_id() {
         fail_builder = fail_builder.parent_id(parent_wire);
     }
     #[expect(clippy::expect_used)] // reason: all required fields are set above

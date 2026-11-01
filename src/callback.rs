@@ -173,7 +173,7 @@ where
         if let Some(n) = &self.name {
             builder = builder.name(n.clone());
         }
-        if let Some(parent_wire) = self.ctx.parent_wire_id_computed() {
+        if let Some(parent_wire) = self.ctx.parent_wire_id() {
             builder = builder.parent_id(parent_wire);
         }
 
@@ -445,7 +445,7 @@ where
                 if let Some(n) = &name {
                     builder = builder.name(n.clone());
                 }
-                if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+                if let Some(parent_wire) = ctx.parent_wire_id() {
                     builder = builder.parent_id(parent_wire);
                 }
                 #[expect(clippy::expect_used)] // reason: all required fields set above
@@ -482,7 +482,7 @@ where
                 if let Some(n) = &name {
                     builder = builder.name(n.clone());
                 }
-                if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+                if let Some(parent_wire) = ctx.parent_wire_id() {
                     builder = builder.parent_id(parent_wire);
                 }
                 builder = builder.error(wire.to_error_object());
@@ -621,7 +621,7 @@ fn build_wfcb_update(
     if let Some(n) = name {
         builder = builder.name(n.to_owned());
     }
-    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+    if let Some(parent_wire) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire);
     }
     #[expect(clippy::expect_used)] // reason: all required fields set above
@@ -647,7 +647,7 @@ fn build_wfcb_fail_update(
     if let Some(n) = name {
         builder = builder.name(n.to_owned());
     }
-    if let Some(parent_wire) = ctx.parent_wire_id_computed() {
+    if let Some(parent_wire) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire);
     }
     #[expect(clippy::expect_used)] // reason: all required fields set above

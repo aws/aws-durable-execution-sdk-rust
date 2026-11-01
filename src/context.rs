@@ -1733,16 +1733,6 @@ impl DurableContext {
         self.inner.parent_wire_id.as_deref()
     }
 
-    /// Returns the parent wire ID computed from the prefix, or None for root.
-    pub(crate) fn parent_wire_id_computed(&self) -> Option<String> {
-        let prefix = self.inner.engine.id_counter.prefix();
-        if prefix.is_empty() {
-            None
-        } else {
-            Some(crate::engine::compute_wire_id_public(prefix))
-        }
-    }
-
     /// Returns the attempt number for the given operation from the checkpoint
     /// log (0 if no prior attempt recorded).
     pub(crate) fn get_attempt(&self, op_id: &OperationId) -> u32 {

@@ -11113,4 +11113,127 @@ mod tests {
             ops[0].details()
         );
     }
+
+    /// Runs `item` as the only item of a Flat map named `m`, and asserts
+    /// that the record named `record` names the map as its parent.
+    ///
+    /// A Flat item writes no record of its own. So every operation inside it
+    /// must record the batch parent as `ParentId`, or its parent is missing
+    /// from the history.
+    async fn assert_flat_item_records_batch_parent<F, Fut, O>(
+        runner: LocalRunner,
+        record: &str,
+        item: F,
+    ) where
+        F: Fn(DurableContext) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+        O: Serialize + DeserializeOwned + Send + Sync + 'static,
+    {
+        use crate::builders::map_parallel::NestingMode;
+        let result = runner
+            .run(
+                move |(), ctx: DurableContext| {
+                    let item = item.clone();
+                    async move {
+                        let out = ctx
+                            .map(vec![1_u32], move |child, _item, _idx| item(child))
+                            .name("m")
+                            .nesting(NestingMode::Flat)
+                            .await?;
+                        Ok::<_, BoxError>(out)
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        let m = result.operation("m").expect("map record");
+        let op = result.operation(record).expect("record");
+        assert_eq!(op.parent_id(), Some(m.id()), "{record}");
+    }
+
+    #[tokio::test]
+    async fn flat_item_child_context_records_batch_parent() {
+        assert_flat_item_records_batch_parent(LocalRunner::new(), "nested", |child| async move {
+            child
+                .run_in_child_context(|nested| async move {
+                    Ok(nested
+                        .step(|_| async { Ok(1_u32) })
+                        .name("inner-step")
+                        .await?)
+                })
+                .name("nested")
+                .await
+                .map_err(BoxError::from)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn flat_item_combinator_records_batch_parent() {
+        assert_flat_item_records_batch_parent(LocalRunner::new(), "gather", |child| async move {
+            let a = child.step(|_| async { Ok(1_u32) }).name("a").future();
+            let b = child.step(|_| async { Ok(2_u32) }).name("b").future();
+            child
+                .try_join_all([a, b])
+                .name("gather")
+                .await
+                .map_err(BoxError::from)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn flat_item_nested_map_records_batch_parent() {
+        assert_flat_item_records_batch_parent(LocalRunner::new(), "inner", |child| async move {
+            child
+                .map(vec![1_u32], |grandchild, item, _idx| async move {
+                    Ok(grandchild
+                        .step(move |_| async move { Ok(item) })
+                        .name("inner-step")
+                        .await?)
+                })
+                .name("inner")
+                .await
+                .map_err(BoxError::from)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn flat_item_callback_records_batch_parent() {
+        assert_flat_item_records_batch_parent(LocalRunner::new(), "cb", |child| async move {
+            let cb = child.create_callback::<String>().name("cb").await?;
+            Ok(cb.id().to_owned())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn flat_item_wait_for_callback_records_batch_parent() {
+        let runner = LocalRunner::new()
+            .callback_for("approval", CallbackReply::success(&"ok").expect("encodes"));
+        assert_flat_item_records_batch_parent(runner, "approval", |child| async move {
+            child
+                .wait_for_callback::<String, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+                .name("approval")
+                .await
+                .map_err(BoxError::from)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn flat_item_step_records_batch_parent() {
+        assert_flat_item_records_batch_parent(LocalRunner::new(), "s", |child| async move {
+            child
+                .step(|_| async { Ok(1_u32) })
+                .name("s")
+                .await
+                .map_err(BoxError::from)
+        })
+        .await;
+    }
 }
