@@ -8,8 +8,9 @@
 //! ## Key invariants
 //!
 //! - The SDK surfaces a `WaitForConditionError::SerializationFailed` error
-//!   when checkpointed state fails to deserialize. It never silently resets
-//!   to `initial_state`.
+//!   when checkpointed state fails to deserialize with an unmarked serdes
+//!   error. A serdes error marked with `RetryableSerdesError` ends the
+//!   invocation instead. Neither falls back to `initial_state`.
 //! - [`WaitDecision`] is the type returned by the wait strategy.
 //! - Wait strategy exhaustion raises `WaitForConditionError::MaxChecksExceeded`,
 //!   live and on replay: the terminal record carries a dedicated wire
@@ -244,8 +245,14 @@ where
                     // payload or failing serdes surfaces as an error without
                     // claiming a recorded outcome was returned.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    let value =
-                        replay_terminal_success(&self.serdes, payload, serdes_ctx.clone()).await?;
+                    let value = replay_terminal_success(
+                        &self.ctx,
+                        self.name.as_deref(),
+                        &self.serdes,
+                        payload,
+                        serdes_ctx.clone(),
+                    )
+                    .await?;
                     self.ctx.emit_operation_replayed(
                         &wire_id,
                         self.name.as_deref(),
@@ -314,7 +321,14 @@ where
             if let Some(payload) = self.ctx.checkpoint_result_payload(&positional_id) {
                 // On deserialization failure, surface the error loudly and
                 // never silently fall back to initial_state.
-                deserialize_state_str(&self.serdes, payload, serdes_ctx.clone()).await?
+                deserialize_state_str(
+                    &self.ctx,
+                    self.name.as_deref(),
+                    &self.serdes,
+                    payload,
+                    serdes_ctx.clone(),
+                )
+                .await?
             } else {
                 self.initial_state.clone()
             };
@@ -388,11 +402,23 @@ where
                 // need a recorded outcome: with the FAIL recorded, replay
                 // yields it instead of re-running the check.
                 let round_trip = async {
-                    let serialized =
-                        serialize_state(&self.serdes, new_state, serdes_ctx.clone()).await?;
+                    let serialized = serialize_state(
+                        &self.ctx,
+                        self.name.as_deref(),
+                        &self.serdes,
+                        new_state,
+                        serdes_ctx.clone(),
+                    )
+                    .await?;
                     // Round-trip through serdes for consistency.
-                    let deserialized: S =
-                        deserialize_state_str(&self.serdes, serialized.clone(), serdes_ctx).await?;
+                    let deserialized: S = deserialize_state_str(
+                        &self.ctx,
+                        self.name.as_deref(),
+                        &self.serdes,
+                        serialized.clone(),
+                        serdes_ctx,
+                    )
+                    .await?;
                     Ok::<_, OperationError>((serialized, deserialized))
                 };
                 let (serialized, deserialized) = match round_trip.await {
@@ -561,12 +587,14 @@ where
 /// Replays a terminal success from the checkpoint log.
 /// CRITICAL: NEVER falls back to `initial_state` (Python #574 / JS #754 fix).
 async fn replay_terminal_success<S, SD: Serdes<S>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     serdes: &SD,
     result: Option<String>,
     serdes_ctx: SerdesContext,
 ) -> Result<S, OperationError> {
     let payload = result.unwrap_or_else(|| "null".to_owned());
-    deserialize_state_str(serdes, payload, serdes_ctx).await
+    deserialize_state_str(ctx, name, serdes, payload, serdes_ctx).await
 }
 
 /// Replays a terminal failure from the checkpoint log.
@@ -618,32 +646,61 @@ fn replay_terminal_failure(
 
 /// Serializes state through the configured serdes (ownership transfers;
 /// the serdes decides where its work runs).
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes
+/// `SerializationFailed`.
 async fn serialize_state<S, SD: Serdes<S>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     serdes: &SD,
     value: S,
     serdes_ctx: SerdesContext,
 ) -> Result<String, OperationError> {
-    serdes.serialize(value, serdes_ctx).await.map_err(|e| {
-        wfc_op_error_with_source(WaitForConditionErrorKind::SerializationFailed, Some(e))
-    })
+    let operation_id = serdes_ctx.operation_id().to_owned();
+    match serdes.serialize(value, serdes_ctx).await {
+        Ok(serialized) => Ok(serialized),
+        Err(err) => {
+            let e = ctx
+                .route_serdes_error("serialize", &operation_id, name, err)
+                .await;
+            Err(wfc_op_error_with_source(
+                WaitForConditionErrorKind::SerializationFailed,
+                Some(e),
+            ))
+        }
+    }
 }
 
 /// Deserializes state from a string payload.
 /// LOUD error on failure, never silently resets (Python #574 fix).
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes
+/// `SerializationFailed`.
 async fn deserialize_state_str<S, SD: Serdes<S>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     serdes: &SD,
     payload: String,
     serdes_ctx: SerdesContext,
 ) -> Result<S, OperationError> {
-    serdes.deserialize(payload, serdes_ctx).await.map_err(|e| {
-        wfc_op_error_with_source(
-            WaitForConditionErrorKind::SerializationFailed,
-            Some(crate::error::ContextualError::source_from(
-                "state deserialization failed",
-                e,
-            )),
-        )
-    })
+    let operation_id = serdes_ctx.operation_id().to_owned();
+    match serdes.deserialize(payload, serdes_ctx).await {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let e = ctx
+                .route_serdes_error("deserialize", &operation_id, name, err)
+                .await;
+            Err(wfc_op_error_with_source(
+                WaitForConditionErrorKind::SerializationFailed,
+                Some(crate::error::ContextualError::source_from(
+                    "state deserialization failed",
+                    e,
+                )),
+            ))
+        }
+    }
 }
 
 // OperationUpdate builders

@@ -1047,8 +1047,11 @@ where
                 // the parent checkpoints, and replay reconstructs the same
                 // failed item from it, so live and replayed batches agree.
                 let round_trip = async {
-                    let serialized = serialize_value(value, serdes, serdes_ctx.clone()).await?;
-                    let deserialized: O = deserialize_value(serialized, serdes, serdes_ctx).await?;
+                    let name = item_fault_name(&req.item_name);
+                    let serialized =
+                        serialize_value(&req.ctx, name, value, serdes, serdes_ctx.clone()).await?;
+                    let deserialized: O =
+                        deserialize_value(&req.ctx, name, serialized, serdes, serdes_ctx).await?;
                     Ok::<_, OperationError>(deserialized)
                 };
                 match round_trip.await {
@@ -1103,7 +1106,15 @@ where
             // replay of the FAIL record produces (see
             // [`replay_terminal_child`]), so live and replayed batches
             // agree, and the closure never re-runs for this failure.
-            let serialized = match serialize_value(value, serdes, serdes_ctx.clone()).await {
+            let serialized = match serialize_value(
+                &req.ctx,
+                item_fault_name(&req.item_name),
+                value,
+                serdes,
+                serdes_ctx.clone(),
+            )
+            .await
+            {
                 Ok(serialized) => serialized,
                 Err(op_err) => {
                     let wire = crate::error::serialization_failure_wire(&op_err);
@@ -1187,7 +1198,14 @@ where
             }
 
             // Round-trip deserialize for live == replay consistency.
-            let deserialized: O = deserialize_value(serialized, serdes, serdes_ctx).await?;
+            let deserialized: O = deserialize_value(
+                &req.ctx,
+                item_fault_name(&req.item_name),
+                serialized,
+                serdes,
+                serdes_ctx,
+            )
+            .await?;
 
             Ok(ItemOutcome::Terminal(BatchItem {
                 index: req.index,
@@ -1862,9 +1880,8 @@ where
             } else {
                 match replay_terminal_batch(
                     &ctx,
+                    parent_name.as_deref(),
                     &snapshot,
-                    &parent_positional,
-                    total_items,
                     &serdes,
                     &result_serdes,
                     &serdes_ctx,
@@ -1950,8 +1967,10 @@ where
             reason: CompletionReason::AllCompleted,
         };
         let (payload, result) =
-            from_batch_result(result, &serdes, &parent_wire, ctx.execution_arn()).await?;
+            from_batch_result(&ctx, result, &serdes, &parent_wire, ctx.execution_arn()).await?;
         let serialized_payload = serialize_value(
+            &ctx,
+            parent_name.as_deref(),
             payload,
             &result_serdes,
             SerdesContext::new(&parent_wire, ctx.execution_arn()),
@@ -2429,9 +2448,17 @@ where
     // as every other path, so `result_serdes` receives the typed
     // `BatchSummary` value directly, exactly as an item serdes receives the
     // typed item value.
-    let (payload, batch_result) =
-        from_batch_result(batch_result, &serdes, &parent_wire, ctx.execution_arn()).await?;
+    let (payload, batch_result) = from_batch_result(
+        &ctx,
+        batch_result,
+        &serdes,
+        &parent_wire,
+        ctx.execution_arn(),
+    )
+    .await?;
     let serialized_payload = serialize_value(
+        &ctx,
+        parent_name.as_deref(),
         payload,
         &result_serdes,
         SerdesContext::new(&parent_wire, ctx.execution_arn()),
@@ -2467,10 +2494,9 @@ where
 /// rather than the full checkpoint record: the status, `replay_children`,
 /// and payload/error strings are all this helper reads.
 async fn replay_terminal_batch<O, IS, RS>(
-    _ctx: &DurableContext,
+    ctx: &DurableContext,
+    name: Option<&str>,
     snapshot: &crate::engine::TerminalReplaySnapshot,
-    _parent_positional: &str,
-    _total_items: usize,
     serdes: &Arc<IS>,
     result_serdes: &RS,
     serdes_ctx: &SerdesContext,
@@ -2497,11 +2523,13 @@ where
             // Reverse the result serdes transform: through the same helper
             // every other path uses.
             let payload: BatchSummary =
-                deserialize_value(payload_str, result_serdes, serdes_ctx.clone()).await?;
+                deserialize_value(ctx, name, payload_str, result_serdes, serdes_ctx.clone())
+                    .await?;
             // The batch parent's serdes context carries the parent wire ID and
             // the execution ARN, which is exactly what the per-item contexts
             // are derived from.
             to_batch_result(
+                ctx,
                 payload,
                 serdes,
                 serdes_ctx.operation_id(),
@@ -2552,7 +2580,14 @@ where
                 .result
                 .clone()
                 .ok_or_else(|| batch_error("succeeded child has no result"))?;
-            let value: O = deserialize_value(payload, serdes, serdes_ctx.clone()).await?;
+            let value: O = deserialize_value(
+                ctx,
+                item_fault_name(item_name),
+                payload,
+                serdes,
+                serdes_ctx.clone(),
+            )
+            .await?;
             Ok(BatchItem {
                 index,
                 name: item_name.to_owned(),
@@ -3252,15 +3287,27 @@ fn should_stop_failure(
 /// child, batch result) uses, and, since the item paths call this helper
 /// too, the same one map/parallel ITEM results use. There is no separate
 /// item rule.
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes a
+/// batch error.
 async fn serialize_value<T, S: Serdes<T>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     value: T,
     serdes: &S,
     serdes_ctx: SerdesContext,
 ) -> Result<String, OperationError> {
-    serdes
-        .serialize(value, serdes_ctx)
-        .await
-        .map_err(|e| batch_error(&format!("serialize result: {e}")))
+    let operation_id = serdes_ctx.operation_id().to_owned();
+    match serdes.serialize(value, serdes_ctx).await {
+        Ok(serialized) => Ok(serialized),
+        Err(err) => {
+            let e = ctx
+                .route_serdes_error("serialize", &operation_id, name, err)
+                .await;
+            Err(batch_error(&format!("serialize result: {e}")))
+        }
+    }
 }
 
 /// Deserializes a value through the configured serdes.
@@ -3268,15 +3315,33 @@ async fn serialize_value<T, S: Serdes<T>>(
 /// Reverses [`serialize_value`]: the serdes turns the wire payload directly
 /// back into the typed value, no intermediate representation and no
 /// runtime downcast.
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes a
+/// batch error.
 async fn deserialize_value<T, S: Serdes<T>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     payload: String,
     serdes: &S,
     serdes_ctx: SerdesContext,
 ) -> Result<T, OperationError> {
-    serdes
-        .deserialize(payload, serdes_ctx)
-        .await
-        .map_err(|e| batch_error(&format!("deserialize result: {e}")))
+    let operation_id = serdes_ctx.operation_id().to_owned();
+    match serdes.deserialize(payload, serdes_ctx).await {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let e = ctx
+                .route_serdes_error("deserialize", &operation_id, name, err)
+                .await;
+            Err(batch_error(&format!("deserialize result: {e}")))
+        }
+    }
+}
+
+/// The name a serdes fault reports for a batch item: an empty item name
+/// (a map without an item namer) is `None`.
+fn item_fault_name(item_name: &str) -> Option<&str> {
+    (!item_name.is_empty()).then_some(item_name)
 }
 
 /// Builds the serdes context for an individual batch item result stored
@@ -3342,6 +3407,7 @@ struct BatchCheckpointItem {
 /// `BatchResult` carries the values reconstructed from their wire form,
 /// so live and replay observe identical values.
 async fn from_batch_result<O, IS>(
+    ctx: &DurableContext,
     result: BatchResult<O>,
     serdes: &Arc<IS>,
     parent_wire: &str,
@@ -3375,14 +3441,13 @@ where
         let (result_str, rebuilt_value) = match (status, result) {
             (BatchItemStatus::Succeeded, Some(value)) => {
                 let item_ctx = item_summary_serdes_ctx(parent_wire, execution_arn, index);
-                let wire = serdes
-                    .serialize(value, item_ctx.clone())
-                    .await
-                    .map_err(|e| batch_error(&format!("serialize result: {e}")))?;
-                let back: O = serdes
-                    .deserialize(wire.clone(), item_ctx)
-                    .await
-                    .map_err(|e| batch_error(&format!("deserialize result: {e}")))?;
+                let item_name = item_fault_name(&name);
+                let wire =
+                    serialize_value(ctx, item_name, value, serdes.as_ref(), item_ctx.clone())
+                        .await?;
+                let back: O =
+                    deserialize_value(ctx, item_name, wire.clone(), serdes.as_ref(), item_ctx)
+                        .await?;
                 (wire, Some(back))
             }
             _ => (String::new(), None),
@@ -3437,6 +3502,7 @@ where
 
 /// Converts a deserialized checkpoint payload back into a `BatchResult`.
 async fn to_batch_result<O, IS>(
+    ctx: &DurableContext,
     payload: BatchSummary,
     serdes: &Arc<IS>,
     parent_wire: &str,
@@ -3457,7 +3523,16 @@ where
         };
         let result = if status == BatchItemStatus::Succeeded && !cp.result.is_empty() {
             let item_ctx = item_summary_serdes_ctx(parent_wire, execution_arn, cp.index);
-            Some(deserialize_value::<O, _>(cp.result, serdes, item_ctx).await?)
+            Some(
+                deserialize_value::<O, _>(
+                    ctx,
+                    item_fault_name(&cp.name),
+                    cp.result,
+                    serdes.as_ref(),
+                    item_ctx,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -5055,12 +5130,24 @@ mod tests {
         );
 
         let json = Arc::new(crate::serdes::JsonSerdes);
-        let (payload, _rebuilt) = from_batch_result(original, &json, "parent-wire", "arn:test")
-            .await
-            .expect("serializing a batch result must succeed");
-        let replayed: BatchResult<i32> = to_batch_result(payload, &json, "parent-wire", "arn:test")
-            .await
-            .expect("deserializing the payload must succeed");
+        let (payload, _rebuilt) = from_batch_result(
+            &test_ctx(CheckpointLog::empty()),
+            original,
+            &json,
+            "parent-wire",
+            "arn:test",
+        )
+        .await
+        .expect("serializing a batch result must succeed");
+        let replayed: BatchResult<i32> = to_batch_result(
+            &test_ctx(CheckpointLog::empty()),
+            payload,
+            &json,
+            "parent-wire",
+            "arn:test",
+        )
+        .await
+        .expect("deserializing the payload must succeed");
 
         assert_eq!(replayed.reason, CompletionReason::FailureToleranceExceeded);
         assert_eq!(replayed.items.len(), 2);
@@ -5102,9 +5189,15 @@ mod tests {
             CompletionReason::AllCompleted,
         );
         let json = Arc::new(crate::serdes::JsonSerdes);
-        let (payload, _rebuilt) = from_batch_result(original, &json, "parent-wire", "arn:test")
-            .await
-            .expect("serializing a batch result must succeed");
+        let (payload, _rebuilt) = from_batch_result(
+            &test_ctx(CheckpointLog::empty()),
+            original,
+            &json,
+            "parent-wire",
+            "arn:test",
+        )
+        .await
+        .expect("serializing a batch result must succeed");
         assert_eq!(
             payload.results.first().map(|r| r.err_type.as_str()),
             Some(CHILD_FN_ERROR_TYPE)
@@ -5121,9 +5214,15 @@ mod tests {
         )
         .expect("payload literal must deserialize");
         let json = Arc::new(crate::serdes::JsonSerdes);
-        let replayed: BatchResult<i32> = to_batch_result(payload, &json, "parent-wire", "arn:test")
-            .await
-            .expect("deserializing the payload must succeed");
+        let replayed: BatchResult<i32> = to_batch_result(
+            &test_ctx(CheckpointLog::empty()),
+            payload,
+            &json,
+            "parent-wire",
+            "arn:test",
+        )
+        .await
+        .expect("deserializing the payload must succeed");
         let item = replayed.items.first().expect("one item");
         assert_eq!(item.error_message.as_deref(), Some("boom"));
         assert_eq!(item.error_type, None);
@@ -5994,6 +6093,8 @@ mod tests {
         let callback_rec = RecordingSerdes::new();
         let callback_ctx = SerdesContext::new("cb-1", "arn:test");
         let callback_out: String = crate::callback::deserialize_callback_result(
+            &step_ctx,
+            None,
             &callback_rec.clone(),
             wire.clone(),
             callback_ctx,

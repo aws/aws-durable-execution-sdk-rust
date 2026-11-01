@@ -320,7 +320,14 @@ where
                     // without the event.
                     let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    let value = replay_success(&self.serdes, payload, serdes_ctx).await?;
+                    let value = replay_success(
+                        &self.ctx,
+                        self.name.as_deref(),
+                        &self.serdes,
+                        payload,
+                        serdes_ctx,
+                    )
+                    .await?;
                     self.ctx.emit_operation_replayed(
                         &wire_id,
                         self.name.as_deref(),
@@ -503,7 +510,7 @@ async fn handle_success<O, S: Serdes<O>>(
     // recorded FAIL instead of re-running the body: the body executes
     // exactly once, and a handler that catches the error branches on a
     // decision replay reproduces.
-    let serialized = match serialize_value(serdes, value, serdes_ctx.clone()).await {
+    let serialized = match serialize_value(ctx, name, serdes, value, serdes_ctx.clone()).await {
         Ok(serialized) => serialized,
         Err(op_err) => {
             // The fixed serialization wire type is the replay
@@ -548,7 +555,7 @@ async fn handle_success<O, S: Serdes<O>>(
     }
 
     // Return deserialized from the serialized form (round-trip parity).
-    deserialize_result(serdes, serialized, serdes_ctx).await
+    deserialize_result(ctx, name, serdes, serialized, serdes_ctx).await
 }
 
 /// Handles a failed step: consult retry strategy, checkpoint accordingly.
@@ -752,27 +759,47 @@ fn build_fail_update(
 /// blocking task for `FileSystemSerdes`); the SDK awaits the returned
 /// future directly. Taking `value` by ownership keeps the future `Send`
 /// without requiring `O: Sync`.
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes
+/// `SerializationFailed`.
 async fn serialize_value<O, S: Serdes<O>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     serdes: &S,
     value: O,
     serdes_ctx: SerdesContext,
 ) -> Result<String, OperationError> {
-    serdes
-        .serialize(value, serdes_ctx)
-        .await
-        .map_err(step_serialization_error)
+    let operation_id = serdes_ctx.operation_id().to_owned();
+    match serdes.serialize(value, serdes_ctx).await {
+        Ok(serialized) => Ok(serialized),
+        Err(err) => Err(step_serialization_error(
+            ctx.route_serdes_error("serialize", &operation_id, name, err)
+                .await,
+        )),
+    }
 }
 
 /// Deserializes a step wire string through the configured serdes.
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes
+/// `SerializationFailed`.
 async fn deserialize_result<O, S: Serdes<O>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     serdes: &S,
     serialized: String,
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
-    serdes
-        .deserialize(serialized, serdes_ctx)
-        .await
-        .map_err(step_serialization_error)
+    let operation_id = serdes_ctx.operation_id().to_owned();
+    match serdes.deserialize(serialized, serdes_ctx).await {
+        Ok(value) => Ok(value),
+        Err(err) => Err(step_serialization_error(
+            ctx.route_serdes_error("deserialize", &operation_id, name, err)
+                .await,
+        )),
+    }
 }
 
 /// Wraps a serdes error as a step `SerializationFailed` operation error,
@@ -785,12 +812,14 @@ fn step_serialization_error(e: BoxError) -> OperationError {
 }
 
 async fn replay_success<O, S: Serdes<O>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     serdes: &S,
     result: Option<String>,
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
     let payload = result.unwrap_or_else(|| "null".to_owned());
-    deserialize_result(serdes, payload, serdes_ctx).await
+    deserialize_result(ctx, name, serdes, payload, serdes_ctx).await
 }
 
 /// Rebuilds a step error from the failure fields of a replayed record.
@@ -854,16 +883,18 @@ mod tests {
     async fn replay_success_deserializes_json() {
         let payload = "42".to_owned();
         let ctx = SerdesContext::new("op-1", "arn:test");
+        let (dctx, _client) = context_over(Vec::new());
         let result: Result<i32, OperationError> =
-            replay_success(&crate::serdes::JsonSerdes, Some(payload), ctx).await;
+            replay_success(&dctx, None, &crate::serdes::JsonSerdes, Some(payload), ctx).await;
         assert_eq!(result.unwrap(), 42);
     }
 
     #[tokio::test]
     async fn replay_success_null_returns_unit() {
         let ctx = SerdesContext::new("op-1", "arn:test");
+        let (dctx, _client) = context_over(Vec::new());
         let result: Result<(), OperationError> =
-            replay_success(&crate::serdes::JsonSerdes, None, ctx).await;
+            replay_success(&dctx, None, &crate::serdes::JsonSerdes, None, ctx).await;
         assert!(result.is_ok());
     }
 
@@ -934,13 +965,20 @@ mod tests {
     #[tokio::test]
     async fn serialize_deserialize_round_trip() {
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let serialized =
-            serialize_value(&crate::serdes::JsonSerdes, "hello".to_owned(), ctx.clone())
+        let (dctx, _client) = context_over(Vec::new());
+        let serialized = serialize_value(
+            &dctx,
+            None,
+            &crate::serdes::JsonSerdes,
+            "hello".to_owned(),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let deserialized: String =
+            deserialize_result(&dctx, None, &crate::serdes::JsonSerdes, serialized, ctx)
                 .await
                 .unwrap();
-        let deserialized: String = deserialize_result(&crate::serdes::JsonSerdes, serialized, ctx)
-            .await
-            .unwrap();
         assert_eq!(deserialized, "hello");
     }
 
@@ -968,7 +1006,8 @@ mod tests {
             }
         }
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let result = serialize_value(&Upper, "hello".to_owned(), ctx)
+        let (dctx, _client) = context_over(Vec::new());
+        let result = serialize_value(&dctx, None, &Upper, "hello".to_owned(), ctx)
             .await
             .unwrap();
         assert_eq!(result, "\"HELLO\"");

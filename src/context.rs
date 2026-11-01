@@ -982,6 +982,63 @@ impl DurableContext {
         std::future::pending::<T>().await
     }
 
+    /// Ends the invocation because a serdes call failed with a marked
+    /// error. Never resolves.
+    ///
+    /// A serdes marks a transient failure with
+    /// [`RetryableSerdesError`](crate::serdes::RetryableSerdesError). The
+    /// failure records nothing: the invocation fails with a Lambda runtime
+    /// error, and the service invokes the function again. The next
+    /// invocation then repeats the failed serdes call. Like
+    /// [`Self::checkpoint_failure_unrecoverable`], the fault goes into the
+    /// fatal slot that every scope shares, so user code can neither catch
+    /// nor ignore it.
+    pub(crate) async fn serdes_fault<T>(
+        &self,
+        call: &'static str,
+        operation_id: &str,
+        name: Option<&str>,
+        err: BoxError,
+    ) -> T {
+        let chain = crate::error::chain_string(&*err);
+        let message = match name {
+            Some(name) => {
+                format!("serdes {call} failed for operation \"{name}\" ({operation_id}): {chain}")
+            }
+            None => format!("serdes {call} failed for operation {operation_id}: {chain}"),
+        };
+        tracing::error!(
+            operation_id = %operation_id,
+            error = %chain,
+            "serdes {call} failed with a retryable error; failing the invocation so the \
+             service re-invokes"
+        );
+        self.inner
+            .suspension_signal
+            .record_invocation_fault(message);
+        std::future::pending::<T>().await
+    }
+
+    /// Ends the invocation when `err` is marked with
+    /// `RetryableSerdesError`. Returns `err` unchanged otherwise.
+    ///
+    /// Every call to a user [`Serdes`](crate::serdes::Serdes) passes its
+    /// error through this method before any other handling. So an
+    /// unmarked error takes the caller's permanent-failure path, and a
+    /// marked error never reaches it.
+    pub(crate) async fn route_serdes_error(
+        &self,
+        call: &'static str,
+        operation_id: &str,
+        name: Option<&str>,
+        err: BoxError,
+    ) -> BoxError {
+        if crate::serdes::is_retryable_serdes_error(&*err) {
+            return self.serdes_fault(call, operation_id, name, err).await;
+        }
+        err
+    }
+
     /// Checkpoints operation updates via the execution client.
     ///
     /// When [`Options`](crate::Options) configured a `checkpoint_delay`

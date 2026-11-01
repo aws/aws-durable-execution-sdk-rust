@@ -189,6 +189,11 @@ pub(crate) struct SuspensionSignal {
 ///   a retryable failure fails the invocation so the service re-invokes
 ///   ([`FatalSeverity::FailInvocation`]); a permanent rejection fails the
 ///   execution ([`FatalSeverity::FailExecution`]).
+/// - serdes faults ([`crate::context::DurableContext::serdes_fault`]): a
+///   serdes error marked with
+///   [`RetryableSerdesError`](crate::serdes::RetryableSerdesError) fails the
+///   invocation so the service re-invokes
+///   ([`FatalSeverity::FailInvocation`]).
 ///
 /// The invocation driver checks this slot with priority over both
 /// completion and suspension.
@@ -276,9 +281,11 @@ impl SuspensionSignal {
 
     /// Records an invocation-fatal error into the shared slot (first record
     /// wins): the invocation dies with a Lambda runtime error, the service
-    /// re-invokes, and the execution stays alive. Used by the retryable
-    /// checkpoint-failure path, where a follow-up write would fail the same
-    /// way and re-invocation is the recovery.
+    /// re-invokes, and the execution stays alive. Used by two producers:
+    /// the retryable checkpoint-failure path, where a follow-up write would
+    /// fail the same way and re-invocation is the recovery, and the serdes
+    /// fault path ([`crate::context::DurableContext::serdes_fault`]), where
+    /// a serdes marked its failure transient.
     pub(crate) fn record_invocation_fault(&self, error_message: String) {
         self.record(FatalError {
             error_type: crate::error::CHECKPOINT_FAILED_ERROR_TYPE.to_owned(),
@@ -801,6 +808,27 @@ pub(crate) mod test_support {
             Ok::<_, crate::error::WireError>("ok".to_owned())
         });
         drive_invocation(fut, signal).await
+    }
+
+    /// Drives `fut` to its invocation outcome and asserts that it ended the
+    /// invocation with a fault whose message contains `needle`.
+    #[expect(clippy::panic)] // reason: test assertion on an unexpected outcome
+    pub(crate) async fn expect_serdes_fault<F>(signal: Arc<SuspensionSignal>, fut: F, needle: &str)
+    where
+        F: IntoFuture + Send,
+        F::IntoFuture: Send,
+    {
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), outcome_of(signal, fut))
+                .await
+                .expect("the operation must reach an invocation outcome within 5 s");
+        let InvocationOutcome::Fault { message } = outcome else {
+            panic!("expected an invocation fault, got {outcome:?}");
+        };
+        assert!(
+            message.contains(needle),
+            "fault message {message:?} must contain {needle:?}"
+        );
     }
 }
 

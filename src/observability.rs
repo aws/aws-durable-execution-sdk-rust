@@ -65,7 +65,9 @@
 //! `race`). It is emitted only after the recorded outcome has actually been
 //! reconstructed: a corrupt payload or a failing custom serdes surfaces as
 //! an error **without** the event, because no recorded terminal outcome was
-//! returned. One exception is deliberate: a child context or batch recorded
+//! returned. A custom serdes error marked with
+//! [`RetryableSerdesError`](crate::serdes::RetryableSerdesError) instead
+//! ends the invocation, also without the event. One exception is deliberate: a child context or batch recorded
 //! in *replay-children* mode (its result was too large to checkpoint)
 //! re-executes its body rather than short-circuiting, so it emits no
 //! `operation_replayed` of its own: the operations inside it emit theirs.

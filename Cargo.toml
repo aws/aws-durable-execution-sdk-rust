@@ -157,6 +157,10 @@ name = "serdes_async"
 required-features = ["test-util"]
 
 [[test]]
+name = "serdes_faults"
+required-features = ["test-util"]
+
+[[test]]
 name = "replay_logging"
 required-features = ["test-util", "replay-filter"]
 

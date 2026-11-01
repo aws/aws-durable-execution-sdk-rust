@@ -104,8 +104,14 @@ where
                     let result_str = payload.unwrap_or_else(|| "null".to_owned());
                     let serdes_ctx =
                         SerdesContext::new(self.op_id.wire(), self.ctx.execution_arn());
-                    let value: O =
-                        deserialize_callback_result(&self.serdes, result_str, serdes_ctx).await?;
+                    let value: O = deserialize_callback_result(
+                        &self.ctx,
+                        self.name.as_deref(),
+                        &self.serdes,
+                        result_str,
+                        serdes_ctx,
+                    )
+                    .await?;
                     emit_replayed();
                     return Ok(Callback::new_settled(callback_id, Ok(value)));
                 }
@@ -753,15 +759,30 @@ fn callback_deser_error(boundary: &str, e: BoxError) -> OperationError {
 /// [`PayloadOrigin::External`] here, at the boundary, so a serdes with
 /// storage indirection (e.g. `FileSystemSerdes`) never honors a file
 /// reference an external caller delivered.
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes
+/// `DeserializationFailed`.
 pub(crate) async fn deserialize_callback_result<O, S: Serdes<O>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     serdes: &S,
     payload: String,
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
-    serdes
+    let operation_id = serdes_ctx.operation_id().to_owned();
+    match serdes
         .deserialize(payload, serdes_ctx.with_origin(PayloadOrigin::External))
         .await
-        .map_err(|e| callback_deser_error("callback serdes", e))
+    {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let e = ctx
+                .route_serdes_error("deserialize", &operation_id, name, err)
+                .await;
+            Err(callback_deser_error("callback serdes", e))
+        }
+    }
 }
 
 /// Creates a callback internal error; the message becomes the source

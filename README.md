@@ -682,6 +682,42 @@ and replay observe identical values. Ownership transfer is also what keeps
 operation outputs at `Send` (not `Sync`): the serdes can move the whole
 call into a `'static` blocking task without borrowing across an `.await`.
 
+A serdes error takes one of two paths. By default it is permanent: a
+serialize failure after the body ran records a terminal failure, so the
+body does not run again, and a deserialize failure of a recorded value
+returns an error to the handler. An error marked with
+`serdes::RetryableSerdesError` is transient: the SDK ends the Lambda
+invocation, records nothing, and the service invokes the function again.
+The SDK finds the marker anywhere in the error's `source()` chain, and
+`FileSystemSerdes` marks the failures of its filesystem calls.
+
+```rust ignore
+use durable::serdes::RetryableSerdesError;
+
+impl<T> Serdes<T> for BlobSerdes
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+{
+    async fn serialize(
+        &self,
+        value: T,
+        context: SerdesContext,
+    ) -> Result<String, durable::BoxError> {
+        // A value that cannot be encoded is a permanent failure.
+        let bytes = serde_json::to_vec(&value)?;
+        // A failed upload is transient: mark it, so the SDK ends the
+        // invocation and the service invokes the function again.
+        let key = self
+            .store
+            .put(context.operation_id(), bytes)
+            .await
+            .map_err(RetryableSerdesError::new)?;
+        Ok(key)
+    }
+    // deserialize: read the blob back, marking a failed read the same way.
+}
+```
+
 `FileSystemSerdes` stores payloads on a durable shared filesystem (Amazon EFS
 or S3 Files mounted to Lambda). Every write goes to a new, unique file
 (atomically renamed into place) under a directory resolved from the

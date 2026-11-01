@@ -35,6 +35,29 @@
 //! [`FileSystemSerdes`] stores values on a durable filesystem (EFS or S3
 //! Files mounted to Lambda), keeping checkpoint payloads small regardless
 //! of value size.
+//!
+//! # Failures
+//!
+//! A serdes error is permanent by default:
+//!
+//! - A permanent serialize failure after the body ran records a terminal
+//!   failure, and the body does not run again.
+//! - A permanent failure of the live round trip that runs before the
+//!   outcome is recorded (`wait_for_condition` state, a `Flat` batch item)
+//!   is treated the same way.
+//! - A permanent deserialize failure of a recorded value returns an error
+//!   to the handler and records nothing.
+//!
+//! An error marked with [`RetryableSerdesError`] ends the Lambda
+//! invocation and records nothing. The service then invokes the function
+//! again. After a marked serialize failure the body runs again, except
+//! that an [`AtMostOncePerRetry`](crate::StepSemantics::AtMostOncePerRetry)
+//! step takes its interrupted path. After a marked deserialize failure the
+//! next invocation decodes the recorded value again. The SDK finds the
+//! marker anywhere in the error's [`source()`](std::error::Error::source)
+//! chain.
+//!
+//! [`FileSystemSerdes`] marks the failures of its filesystem calls.
 
 use std::future::Future;
 
@@ -170,7 +193,8 @@ pub trait Serdes<T>: Send + Sync + 'static {
     /// The returned future resolves to an error if the transformation
     /// fails. The SDK awaits the future on the executor thread, so the
     /// implementation must not block it (see the trait-level scheduling
-    /// contract).
+    /// contract). An error is permanent unless it is marked with
+    /// [`RetryableSerdesError`]; see [Failures](self#failures).
     fn serialize(
         &self,
         value: T,
@@ -186,7 +210,8 @@ pub trait Serdes<T>: Send + Sync + 'static {
     /// The returned future resolves to an error if the transformation
     /// fails. The SDK awaits the future on the executor thread, so the
     /// implementation must not block it (see the trait-level scheduling
-    /// contract).
+    /// contract). An error is permanent unless it is marked with
+    /// [`RetryableSerdesError`]; see [Failures](self#failures).
     fn deserialize(
         &self,
         wire: String,
@@ -605,6 +630,25 @@ impl FileSystemSerdesConfigBuilder {
 /// callback completion) is deserialized directly as the value: it can
 /// never name a local file to read.
 ///
+/// # Failures
+///
+/// These failures are marked with [`RetryableSerdesError`], so they end
+/// the invocation and the service invokes the function again (see
+/// [Failures](self#failures)):
+///
+/// - every [`std::io::Error`] from creating the directory, canonicalizing
+///   a path, opening, writing, publishing (`hard_link`) or reading a
+///   payload file;
+/// - running out of unique payload file names, because a later invocation
+///   draws new names.
+///
+/// Every other failure is permanent: JSON rendering and parsing, an
+/// invalid envelope, an unsupported envelope version or kind, a missing
+/// envelope field, every `base_path` containment check, and a blocking
+/// task that did not complete. A containment check guards against path
+/// traversal, so a retry must never turn its rejection into a different
+/// outcome.
+///
 /// # Examples
 ///
 /// ```
@@ -889,20 +933,17 @@ impl FileSystemSerdes {
         path: &std::path::Path,
         display_path: &str,
     ) -> Result<T, BoxError> {
-        let canonical_base = std::fs::canonicalize(&self.base_path).map_err(|e| -> BoxError {
-            Box::new(FileSystemSerdesError::with_source(
+        let canonical_base = std::fs::canonicalize(&self.base_path).map_err(|e| {
+            filesystem_call_failure(
                 format!("failed to canonicalize base_path '{}'", self.base_path),
                 e,
-            ))
+            )
         })?;
         // Canonicalizing the full file path resolves every symlink,
         // including one at the final component, so the containment check
         // below judges the file's real location.
-        let canonical_file = std::fs::canonicalize(path).map_err(|e| -> BoxError {
-            Box::new(FileSystemSerdesError::with_source(
-                format!("failed to resolve file '{display_path}'"),
-                e,
-            ))
+        let canonical_file = std::fs::canonicalize(path).map_err(|e| {
+            filesystem_call_failure(format!("failed to resolve file '{display_path}'"), e)
         })?;
         if !canonical_file.starts_with(&canonical_base) {
             return Err(Box::new(FileSystemSerdesError::new(format!(
@@ -910,11 +951,8 @@ impl FileSystemSerdes {
                 self.base_path
             ))));
         }
-        let contents = std::fs::read_to_string(&canonical_file).map_err(|e| -> BoxError {
-            Box::new(FileSystemSerdesError::with_source(
-                format!("failed to read file '{display_path}'"),
-                e,
-            ))
+        let contents = std::fs::read_to_string(&canonical_file).map_err(|e| {
+            filesystem_call_failure(format!("failed to read file '{display_path}'"), e)
         })?;
         serde_json::from_str(&contents).map_err(|e| -> BoxError {
             Box::new(FileSystemSerdesError::with_source(
@@ -944,14 +982,9 @@ impl FileSystemSerdes {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let relative_dir = self.resolve_execution_dir(context)?;
         let dir_path = format!("{}/{relative_dir}", self.base_path);
-        std::fs::create_dir_all(&dir_path).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(FileSystemSerdesError::with_source(
-                    format!("failed to create directory '{dir_path}'"),
-                    e,
-                ))
-            },
-        )?;
+        std::fs::create_dir_all(&dir_path).map_err(|e| {
+            filesystem_call_failure(format!("failed to create directory '{dir_path}'"), e)
+        })?;
 
         // Defense-in-depth (physical): `resolve_execution_dir` checks only the
         // lexically-cleaned path, so a pre-existing symlink beneath `base_path`
@@ -1025,22 +1058,15 @@ impl FileSystemSerdes {
         &self,
         dir_path: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let canonical_dir = std::fs::canonicalize(dir_path).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(FileSystemSerdesError::with_source(
-                    format!("failed to canonicalize directory '{dir_path}'"),
-                    e,
-                ))
-            },
-        )?;
-        let canonical_base = std::fs::canonicalize(&self.base_path).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(FileSystemSerdesError::with_source(
-                    format!("failed to canonicalize base_path '{}'", self.base_path),
-                    e,
-                ))
-            },
-        )?;
+        let canonical_dir = std::fs::canonicalize(dir_path).map_err(|e| {
+            filesystem_call_failure(format!("failed to canonicalize directory '{dir_path}'"), e)
+        })?;
+        let canonical_base = std::fs::canonicalize(&self.base_path).map_err(|e| {
+            filesystem_call_failure(
+                format!("failed to canonicalize base_path '{}'", self.base_path),
+                e,
+            )
+        })?;
         if !canonical_dir.starts_with(&canonical_base) {
             return Err(Box::new(FileSystemSerdesError::new(format!(
                 "canonical path '{}' escapes base_path '{}' (symlink redirection)",
@@ -1168,6 +1194,89 @@ impl std::error::Error for FileSystemSerdesError {
     }
 }
 
+/// Marks a serdes failure as transient.
+///
+/// A serdes returns this error to mark a failure as transient. The SDK
+/// then ends the Lambda invocation, records nothing, and the service
+/// invokes the function again. Any other serdes error is permanent (see
+/// [Failures](self#failures)).
+///
+/// The SDK finds the marker anywhere in the returned error's
+/// [`source()`](std::error::Error::source) chain, so a serdes may wrap it
+/// in its own error type.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk::BoxError;
+/// use aws_durable_execution_sdk::serdes::RetryableSerdesError;
+///
+/// fn read_blob() -> Result<String, BoxError> {
+///     let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "mount timed out");
+///     Err(RetryableSerdesError::new(io).into())
+/// }
+///
+/// let err = read_blob().unwrap_err();
+/// assert_eq!(err.to_string(), "retryable serdes failure");
+/// assert_eq!(format!("{err:#}"), "retryable serdes failure: mount timed out");
+/// ```
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct RetryableSerdesError {
+    source: BoxError,
+}
+
+impl RetryableSerdesError {
+    /// Wraps `source` as a transient serdes failure.
+    #[must_use]
+    pub fn new(source: impl Into<BoxError>) -> Self {
+        Self {
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RetryableSerdesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const FRAME: &str = "retryable serdes failure";
+        if f.alternate() {
+            crate::error::write_chain(f, &FRAME, std::error::Error::source(self))
+        } else {
+            f.write_str(FRAME)
+        }
+    }
+}
+
+impl std::error::Error for RetryableSerdesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+/// Returns `true` when `err` or any error in its `source()` chain is a
+/// [`RetryableSerdesError`].
+pub(crate) fn is_retryable_serdes_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if e.downcast_ref::<RetryableSerdesError>().is_some() {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
+/// Builds the error for a failed filesystem call of [`FileSystemSerdes`].
+///
+/// A filesystem call can fail for a transient reason, such as a full or
+/// briefly unreachable mount, and a later invocation can succeed. So the
+/// [`FileSystemSerdesError`] is marked with [`RetryableSerdesError`].
+fn filesystem_call_failure(context: String, source: impl Into<crate::error::Source>) -> BoxError {
+    Box::new(RetryableSerdesError::new(
+        FileSystemSerdesError::with_source(context, source),
+    ))
+}
+
 /// The envelope version this SDK writes and reads.
 const ENVELOPE_VERSION: u64 = 1;
 
@@ -1241,19 +1350,19 @@ fn publish_unique_payload_file(
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                return Err(Box::new(FileSystemSerdesError::with_source(
+                return Err(filesystem_call_failure(
                     format!("failed to write file '{staging_path}'"),
                     e,
-                )));
+                ));
             }
         };
         if let Err(e) = staging.write_all(json_str.as_bytes()) {
             drop(staging);
             let _ = std::fs::remove_file(&staging_path);
-            return Err(Box::new(FileSystemSerdesError::with_source(
+            return Err(filesystem_call_failure(
                 format!("failed to write file '{staging_path}'"),
                 e,
-            )));
+            ));
         }
         drop(staging);
 
@@ -1266,17 +1375,20 @@ fn publish_unique_payload_file(
             Ok(()) => return Ok(file_name),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => {
-                return Err(Box::new(FileSystemSerdesError::with_source(
+                return Err(filesystem_call_failure(
                     format!("failed to move file into place at '{file_path}'"),
                     e,
-                )));
+                ));
             }
         }
     }
 
-    Err(Box::new(FileSystemSerdesError::new(format!(
-        "failed to publish a unique payload file under '{dir_path}' after {MAX_PUBLISH_ATTEMPTS} attempts"
-    ))))
+    // A later invocation draws new candidate names, so it can succeed.
+    Err(Box::new(RetryableSerdesError::new(
+        FileSystemSerdesError::new(format!(
+            "failed to publish a unique payload file under '{dir_path}' after {MAX_PUBLISH_ATTEMPTS} attempts"
+        )),
+    )))
 }
 
 fn unique_file_suffix() -> String {
@@ -1701,7 +1813,11 @@ mod tests {
         // clobbering, and leaves the published file untouched.
         let err = publish_unique_payload_file(&dir, "op", r#""writer-c""#, || "dup".to_owned())
             .expect_err("exhausted retries must fail");
-        assert!(err.to_string().contains("attempts"), "got: {err}");
+        // A later invocation draws new names, so the failure is marked
+        // transient; the message is in the chain below the marker.
+        assert!(is_retryable_serdes_error(&*err), "got: {err:#}");
+        let message = crate::error::chain_string(&*err);
+        assert!(message.contains("attempts"), "got: {message}");
         assert_eq!(
             std::fs::read_to_string(tmp.join("op-dup.json")).expect("read A again"),
             r#""writer-a""#
@@ -1838,7 +1954,7 @@ mod tests {
         let envelope = file_envelope("does-not-exist.json");
         let result = serdes.deserialize_sync::<serde_json::Value>(&envelope, &ctx);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = crate::error::chain_string(&*result.unwrap_err());
         assert!(err_msg.contains("failed to resolve file"), "err: {err_msg}");
 
         // Legacy envelope naming a missing file under base fails the same way.
@@ -1848,7 +1964,7 @@ mod tests {
         );
         let result = serdes.deserialize_sync::<serde_json::Value>(&legacy, &ctx);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = crate::error::chain_string(&*result.unwrap_err());
         assert!(err_msg.contains("failed to resolve file"), "err: {err_msg}");
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3038,5 +3154,107 @@ mod tests {
                 .contains("unsupported envelope kind 'chunked'"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn retryable_serdes_error_displays_one_frame() {
+        let err = RetryableSerdesError::new("boom");
+        assert_eq!(err.to_string(), "retryable serdes failure");
+        assert_eq!(format!("{err:#}"), "retryable serdes failure: boom");
+        let source = std::error::Error::source(&err).expect("the marker has a source");
+        assert_eq!(source.to_string(), "boom");
+    }
+
+    /// A user error whose `source()` is another error, for chain tests.
+    #[derive(Debug)]
+    struct Wrapping(BoxError);
+
+    impl std::fmt::Display for Wrapping {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("wrapping")
+        }
+    }
+
+    impl std::error::Error for Wrapping {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&*self.0)
+        }
+    }
+
+    #[test]
+    fn is_retryable_serdes_error_walks_the_chain() {
+        let bare: BoxError = Box::new(RetryableSerdesError::new("boom"));
+        assert!(is_retryable_serdes_error(&*bare));
+
+        let nested: BoxError = Box::new(Wrapping(Box::new(Wrapping(Box::new(
+            RetryableSerdesError::new("boom"),
+        )))));
+        assert!(is_retryable_serdes_error(&*nested));
+
+        let plain: BoxError = "plain".into();
+        assert!(!is_retryable_serdes_error(&*plain));
+    }
+
+    /// A unique scratch path under the temp dir.
+    fn scratch_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "fs_serdes_test_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn filesystem_io_failures_are_marked() {
+        // A base_path that is a regular file makes `create_dir_all` fail.
+        let file_base = scratch_path("io_file_base");
+        std::fs::write(&file_base, "not a directory").expect("create the file");
+        let serdes = FileSystemSerdes::with_config(
+            file_base.to_string_lossy().into_owned(),
+            FileSystemSerdesConfig::builder()
+                .storage_mode(FileSystemSerdesMode::Always)
+                .build(),
+        );
+        let ctx = SerdesContext::new("op", "arn:test");
+        let err = serdes
+            .serialize_sync(&"value", &ctx)
+            .expect_err("create_dir_all under a file fails");
+        assert!(is_retryable_serdes_error(&*err), "got: {err:#}");
+        let _ = std::fs::remove_file(&file_base);
+
+        // A file envelope naming a missing file under a real base_path.
+        let dir_base = scratch_path("io_dir_base");
+        std::fs::create_dir_all(&dir_base).expect("create the base dir");
+        let serdes = FileSystemSerdes::new(dir_base.to_string_lossy().into_owned());
+        let err = serdes
+            .deserialize_sync::<serde_json::Value>(&file_envelope("missing.json"), &ctx)
+            .expect_err("reading a missing file fails");
+        assert!(is_retryable_serdes_error(&*err), "got: {err:#}");
+        let _ = std::fs::remove_dir_all(&dir_base);
+    }
+
+    #[test]
+    fn filesystem_format_and_containment_failures_are_permanent() {
+        let dir_base = scratch_path("permanent_base");
+        std::fs::create_dir_all(&dir_base).expect("create the base dir");
+        let serdes = FileSystemSerdes::new(dir_base.to_string_lossy().into_owned());
+        let ctx = SerdesContext::new("op", "arn:test");
+
+        let unsupported_version =
+            r#"{"__aws_durable_serdes":{"version":2,"kind":"inline"},"value":1}"#;
+        let escaping = file_envelope("../escape.json");
+        for wire in ["{not json", unsupported_version, escaping.as_str()] {
+            let err = serdes
+                .deserialize_sync::<serde_json::Value>(wire, &ctx)
+                .expect_err("the record is rejected");
+            assert!(
+                !is_retryable_serdes_error(&*err),
+                "{wire} must fail permanently, got: {err:#}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir_base);
     }
 }

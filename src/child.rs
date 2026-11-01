@@ -263,7 +263,14 @@ where
         serdes_ctx: &SerdesContext,
     ) -> Result<O, OperationError> {
         let payload = self.ctx.checkpoint_result_payload(positional_id);
-        let value = replay_success(&self.serdes, payload, serdes_ctx.clone()).await?;
+        let value = replay_success(
+            &self.ctx,
+            self.name.as_deref(),
+            &self.serdes,
+            payload,
+            serdes_ctx.clone(),
+        )
+        .await?;
         self.ctx.emit_operation_replayed(
             wire_id,
             self.name.as_deref(),
@@ -327,8 +334,10 @@ where
         match (mode, result) {
             (ChildRunMode::Reconstruct, Ok(value)) => {
                 // Round-trip through serialization for consistency.
-                let serialized = serialize_value(value, &serdes, serdes_ctx.clone()).await?;
-                deserialize_value(serialized, &serdes, serdes_ctx).await
+                let serialized =
+                    serialize_value(&ctx, name.as_deref(), value, &serdes, serdes_ctx.clone())
+                        .await?;
+                deserialize_value(&ctx, name.as_deref(), serialized, &serdes, serdes_ctx).await
             }
             (ChildRunMode::Reconstruct, Err(child_err)) => Err(OperationError::from_kind(
                 OperationErrorKind::ChildContext(ChildContextError::new(
@@ -346,7 +355,15 @@ where
                 // with the FAIL recorded, replay yields it instead of
                 // re-running the closure, and a handler that catches the
                 // error branches on a decision replay reproduces.
-                let serialized = match serialize_value(value, &serdes, serdes_ctx.clone()).await {
+                let serialized = match serialize_value(
+                    &ctx,
+                    name.as_deref(),
+                    value,
+                    &serdes,
+                    serdes_ctx.clone(),
+                )
+                .await
+                {
                     Ok(serialized) => serialized,
                     Err(op_err) => {
                         let wire = crate::error::serialization_failure_wire(&op_err);
@@ -387,7 +404,7 @@ where
                 }
 
                 // Round-trip deserialize for consistency (first-run == replay).
-                deserialize_value(serialized, &serdes, serdes_ctx).await
+                deserialize_value(&ctx, name.as_deref(), serialized, &serdes, serdes_ctx).await
             }
             (ChildRunMode::Live, Err(child_err)) => {
                 // Failure: checkpoint FAIL with error details.
@@ -530,6 +547,8 @@ fn build_child_fail_update(
 
 /// Replays a successful child context result from the checkpoint log.
 async fn replay_success<O, S: Serdes<O>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     serdes: &S,
     result: Option<String>,
     serdes_ctx: SerdesContext,
@@ -537,7 +556,7 @@ async fn replay_success<O, S: Serdes<O>>(
     let payload = result.ok_or_else(|| {
         child_internal_error("checkpointed Succeeded operation has no result payload")
     })?;
-    deserialize_value(payload, serdes, serdes_ctx).await
+    deserialize_value(ctx, name, payload, serdes, serdes_ctx).await
 }
 
 /// Replays a failed child context result from the checkpoint log.
@@ -568,27 +587,51 @@ fn replay_failure(wire: crate::error::WireError, wire_id: &str) -> OperationErro
 
 /// Serializes a value through the configured serdes (ownership transfers;
 /// the serdes decides where its work runs).
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes
+/// `Internal`.
 async fn serialize_value<O, S: Serdes<O>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     value: O,
     serdes: &S,
     serdes_ctx: SerdesContext,
 ) -> Result<String, OperationError> {
-    serdes
-        .serialize(value, serdes_ctx)
-        .await
-        .map_err(|e| child_internal_error(&format!("serialize result: {e}")))
+    let operation_id = serdes_ctx.operation_id().to_owned();
+    match serdes.serialize(value, serdes_ctx).await {
+        Ok(serialized) => Ok(serialized),
+        Err(err) => {
+            let e = ctx
+                .route_serdes_error("serialize", &operation_id, name, err)
+                .await;
+            Err(child_internal_error(&format!("serialize result: {e}")))
+        }
+    }
 }
 
 /// Deserializes a wire payload through the configured serdes.
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes
+/// `Internal`.
 async fn deserialize_value<O, S: Serdes<O>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     payload: String,
     serdes: &S,
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
-    serdes
-        .deserialize(payload, serdes_ctx)
-        .await
-        .map_err(|e| child_internal_error(&format!("deserialize result: {e}")))
+    let operation_id = serdes_ctx.operation_id().to_owned();
+    match serdes.deserialize(payload, serdes_ctx).await {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let e = ctx
+                .route_serdes_error("deserialize", &operation_id, name, err)
+                .await;
+            Err(child_internal_error(&format!("deserialize result: {e}")))
+        }
+    }
 }
 
 /// Constructs a `ChildContextError::Internal` wrapped as an
@@ -761,6 +804,52 @@ mod tests {
 
         let value = result.unwrap();
         assert_eq!(value, "hello");
+    }
+
+    /// A serdes whose every call fails with a marked error.
+    struct MarkedFailure;
+
+    impl<T: Send + 'static> Serdes<T> for MarkedFailure {
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            _value: T,
+            _context: SerdesContext,
+        ) -> Result<String, crate::BoxError> {
+            Err(crate::serdes::RetryableSerdesError::new("injected failure").into())
+        }
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            _wire: String,
+            _context: SerdesContext,
+        ) -> Result<T, crate::BoxError> {
+            Err(crate::serdes::RetryableSerdesError::new("injected failure").into())
+        }
+    }
+
+    #[tokio::test]
+    async fn child_reconstruct_marked_failure_faults_invocation() {
+        // A ReplayChildren child: the recorded success carries no payload,
+        // so the body runs again and its result takes the round trip.
+        let (wire_id, mut record) = succeeded_record("1", "");
+        record.result = None;
+        record.replay_children = true;
+        let ctx = test_ctx(CheckpointLog::from_records(vec![(wire_id, record)]));
+        let signal = Arc::clone(ctx.suspension_signal());
+
+        let child = ctx
+            .run_in_child_context(|_child_ctx| async move { Ok(7_i32) })
+            .name("rebuild")
+            .serdes(MarkedFailure);
+        crate::driver::test_support::expect_serdes_fault(
+            signal,
+            child,
+            "serdes serialize failed for operation \"rebuild\"",
+        )
+        .await;
     }
 
     #[tokio::test]

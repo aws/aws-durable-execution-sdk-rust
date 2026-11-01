@@ -76,6 +76,8 @@ where
                         })
                         .flatten();
                     let value = deserialize_invoke_result(
+                        &self.ctx,
+                        self.name.as_deref(),
                         &self.result_serdes,
                         payload.unwrap_or_else(|| "null".to_owned()),
                         serdes_ctx.clone(),
@@ -156,8 +158,14 @@ where
         // serdes, then checkpoint. The input transfers by ownership: a
         // write-only payload has no round-trip to preserve, and owning it
         // lets the serdes move it into a blocking task when it needs one.
-        let wire_payload =
-            serialize_invoke_input(&self.payload_serdes, self.input, &serdes_ctx).await?;
+        let wire_payload = serialize_invoke_input(
+            &self.ctx,
+            self.name.as_deref(),
+            &self.payload_serdes,
+            self.input,
+            &serdes_ctx,
+        )
+        .await?;
 
         // Checkpoint ChainedInvokeStarted then suspend.
         let update = build_chained_invoke_start(
@@ -191,15 +199,26 @@ where
 /// Ownership of the input transfers to the serdes (write-only payloads
 /// have no round-trip to preserve); the serdes decides where its work
 /// runs.
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes
+/// `SerializationFailed`.
 async fn serialize_invoke_input<I, PS: Serdes<I>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     payload_serdes: &PS,
     input: I,
     serdes_ctx: &SerdesContext,
 ) -> Result<String, OperationError> {
-    payload_serdes
-        .serialize(input, serdes_ctx.clone())
-        .await
-        .map_err(|e| invoke_serialization_error("payload serdes", e))
+    match payload_serdes.serialize(input, serdes_ctx.clone()).await {
+        Ok(serialized) => Ok(serialized),
+        Err(err) => {
+            let e = ctx
+                .route_serdes_error("serialize", serdes_ctx.operation_id(), name, err)
+                .await;
+            Err(invoke_serialization_error("payload serdes", e))
+        }
+    }
 }
 
 /// Deserializes the invoke result payload through the configured serdes.
@@ -209,15 +228,30 @@ async fn serialize_invoke_input<I, PS: Serdes<I>>(
 /// [`PayloadOrigin::External`] here, at the boundary, so a serdes with
 /// storage indirection (e.g. `FileSystemSerdes`) never honors a file
 /// reference the target function's output happens to contain.
+///
+/// A marked error ends the invocation
+/// ([`DurableContext::route_serdes_error`]); any other error becomes
+/// `SerializationFailed`.
 async fn deserialize_invoke_result<O, RS: Serdes<O>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
     result_serdes: &RS,
     payload: String,
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
-    result_serdes
+    let operation_id = serdes_ctx.operation_id().to_owned();
+    match result_serdes
         .deserialize(payload, serdes_ctx.with_origin(PayloadOrigin::External))
         .await
-        .map_err(|e| invoke_serialization_error("result serdes", e))
+    {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let e = ctx
+                .route_serdes_error("deserialize", &operation_id, name, err)
+                .await;
+            Err(invoke_serialization_error("result serdes", e))
+        }
+    }
 }
 
 /// Wraps a serdes error as an invoke `SerializationFailed` operation
@@ -644,15 +678,21 @@ mod tests {
 
         // Test payload serialization: the serdes receives the typed input.
         let ctx = SerdesContext::new("op-1", "arn:test");
-        let serialized = serialize_invoke_input(&Upper, "hello".to_owned(), &ctx)
+        let dctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+        );
+        let serialized = serialize_invoke_input(&dctx, None, &Upper, "hello".to_owned(), &ctx)
             .await
             .unwrap();
         assert_eq!(serialized, "\"HELLO\"");
 
         // Test result deserialization: "\"WORLD\"" -> "\"world\"" -> "world".
-        let result: String = deserialize_invoke_result(&Upper, "\"WORLD\"".to_owned(), ctx)
-            .await
-            .unwrap();
+        let result: String =
+            deserialize_invoke_result(&dctx, None, &Upper, "\"WORLD\"".to_owned(), ctx)
+                .await
+                .unwrap();
         assert_eq!(result, "world");
     }
 
@@ -1011,5 +1051,118 @@ mod tests {
                 "null payload must never be substituted"
             );
         }
+    }
+
+    /// A serdes whose every call fails with a marked error.
+    struct MarkedFailure;
+
+    impl<T: Send + 'static> Serdes<T> for MarkedFailure {
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            _value: T,
+            _context: SerdesContext,
+        ) -> Result<String, crate::BoxError> {
+            Err(crate::serdes::RetryableSerdesError::new("injected failure").into())
+        }
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            _wire: String,
+            _context: SerdesContext,
+        ) -> Result<T, crate::BoxError> {
+            Err(crate::serdes::RetryableSerdesError::new("injected failure").into())
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_marked_input_serialize_failure_faults_invocation() {
+        use crate::client::InMemoryExecutionClient;
+
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client.clone(),
+            "token0".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+        let exec = InvokeExecution::<String, _, _, _> {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("charge".to_owned()),
+            function_id: "target-fn".to_owned(),
+            input: "hello".to_owned(),
+            payload_serdes: MarkedFailure,
+            result_serdes: crate::serdes::JsonSerdes,
+            tenant_id: None,
+            _marker: PhantomData,
+        };
+
+        let signal = Arc::clone(ctx.suspension_signal());
+        crate::driver::test_support::expect_serdes_fault(
+            signal,
+            exec.execute(),
+            "serdes serialize failed",
+        )
+        .await;
+        assert!(
+            client.recorded_updates().is_empty(),
+            "a marked failure records nothing: {:?}",
+            client.recorded_updates()
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_marked_replay_decode_failure_faults_invocation() {
+        let wire_key = crate::engine::compute_wire_id_public("1");
+        let record = CheckpointRecord {
+            id: wire_key.clone(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: Some("\"WORLD\"".to_owned()),
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        };
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(vec![(wire_key, record)])),
+        );
+        let op_id = ctx.mint_id();
+        let exec = InvokeExecution::<String, _, _, _> {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            function_id: "fn".to_owned(),
+            input: serde_json::Value::Null,
+            payload_serdes: crate::serdes::JsonSerdes,
+            result_serdes: MarkedFailure,
+            tenant_id: None,
+            _marker: PhantomData,
+        };
+
+        let signal = Arc::clone(ctx.suspension_signal());
+        crate::driver::test_support::expect_serdes_fault(
+            signal,
+            exec.execute(),
+            "serdes deserialize failed",
+        )
+        .await;
     }
 }
