@@ -806,8 +806,25 @@ assert_eq!(result.output(), Some(&42));
 
 `TestResult` also reports the invocation count and every recorded operation,
 so a test can assert that a step ran once across replays.
-`.callback_success(&value)` queues a payload for the next callback the handler
-awaits, and `.callback_timeout()` times one out.
+
+A test queues a reply for a callback before the run.
+`.callback(CallbackReply::...)` queues one for the next pending callback, in
+order, and `.callback_for(name, CallbackReply::...)` queues one for the
+callback with that name, or for the `wait_for_callback` with that name.
+`CallbackReply::success(&value)` delivers `value` encoded as JSON and returns
+the encoding error when `value` fails to serialize. `CallbackReply::raw`
+delivers a payload unchanged, `CallbackReply::failure` delivers an external
+failure built from a `CallbackFailure`, and `CallbackReply::timeout` and
+`CallbackReply::heartbeat_timeout` deliver the records a callback timeout and
+a missed heartbeat produce. The runner runs no callback timers itself.
+
+```rust ignore
+use durable::test_util::{CallbackFailure, CallbackReply, LocalRunner};
+
+let runner = LocalRunner::new()
+    .callback_for("approval", CallbackReply::success(&true)?)
+    .callback(CallbackReply::failure(CallbackFailure::new("Declined", "no")));
+```
 
 ## Examples
 

@@ -1883,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_inline_operations_handles_callback_success() {
+    fn parse_inline_operations_handles_callback_succeeded() {
         let payload = serde_json::json!({
             "InitialExecutionState": {
                 "Operations": [

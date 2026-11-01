@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
-use durable::test_util::LocalRunner;
+use durable::test_util::{CallbackReply, LocalRunner};
 use durable::{BoxError, DurableContext, Options, RetryDecision};
 
 /// A runner that sends each checkpoint in its own request.
@@ -111,7 +111,7 @@ async fn retry_delay_is_ordered_against_a_wait() {
 #[tokio::test]
 async fn queued_callback_reply_arrives_before_the_clock_moves() {
     let result = LocalRunner::new()
-        .callback_success(&"cb")
+        .callback(CallbackReply::success(&"cb").expect("encodes"))
         .run(
             |(), ctx: DurableContext| async move {
                 let cb = ctx.create_callback::<String>().await?;

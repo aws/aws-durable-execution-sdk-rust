@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
 use durable::observability::{TARGET, event_names, field_names, span_names};
-use durable::test_util::LocalRunner;
+use durable::test_util::{CallbackReply, LocalRunner};
 use tracing_subscriber::layer::SubscriberExt;
 
 /// A `MakeWriter` that captures subscriber output in a shared buffer.
@@ -466,11 +466,12 @@ async fn execution_events_are_span_events_of_the_execution_span() {
 /// it, with the documented identity fields, when a resumed invocation
 /// returns their recorded outcome without re-running them.
 #[tokio::test]
+#[expect(clippy::expect_used)] // reason: the queued reply encodes a string, which cannot fail
 async fn replayed_events_cover_child_condition_and_callback() {
     let (buffer, _guard) = capture_subscriber();
 
     let result = LocalRunner::new()
-        .callback_success(&"yes".to_owned())
+        .callback(CallbackReply::success(&"yes".to_owned()).expect("encodes"))
         .run(
             |_event: serde_json::Value, ctx: durable::DurableContext| async move {
                 let doubled = ctx

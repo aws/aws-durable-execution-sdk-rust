@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
-use durable::test_util::{LocalRunner, TestResult};
+use durable::test_util::{CallbackReply, LocalRunner, TestResult};
 use durable::{Branch, DurableContext};
 
 /// Message A: an operation called on a context whose body is not running.
@@ -117,9 +117,10 @@ async fn context_used_inside_condition_check_fails() {
 }
 
 #[tokio::test]
+#[expect(clippy::expect_used)] // reason: the queued reply encodes a string, which cannot fail
 async fn context_used_inside_submitter_fails() {
     let result = LocalRunner::new()
-        .callback_success(&"approved".to_owned())
+        .callback(CallbackReply::success(&"approved".to_owned()).expect("encodes"))
         .run(
             |_event: (), ctx: DurableContext| async move {
                 let cloned = ctx.clone();
@@ -335,9 +336,10 @@ async fn correct_contexts_succeed() {
 }
 
 #[tokio::test]
+#[expect(clippy::expect_used)] // reason: the queued reply encodes a string, which cannot fail
 async fn composites_inside_child_body_succeed() {
     let result = LocalRunner::new()
-        .callback_success(&"approved".to_owned())
+        .callback(CallbackReply::success(&"approved".to_owned()).expect("encodes"))
         .run(
             |_event: (), ctx: DurableContext| async move {
                 let value = ctx

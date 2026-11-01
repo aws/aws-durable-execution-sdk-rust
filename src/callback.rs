@@ -128,14 +128,21 @@ where
                 }
                 CheckpointStatus::TimedOut => {
                     // Callback timed out. The wire record, when the
-                    // backend attached one, still travels on the error.
+                    // backend attached one, still travels on the error. A
+                    // missed heartbeat also ends in `TimedOut`; its record
+                    // carries the `Callback.Heartbeat` type.
                     emit_replayed();
                     let wire = self
                         .ctx
                         .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
+                    let kind = if wire.error_type() == Some("Callback.Heartbeat") {
+                        CallbackErrorKind::HeartbeatTimedOut
+                    } else {
+                        CallbackErrorKind::TimedOut
+                    };
                     let err = OperationError::from_kind(OperationErrorKind::Callback(
-                        CallbackError::new(CallbackErrorKind::TimedOut, None),
+                        CallbackError::new(kind, None),
                     ))
                     .with_operation(self.op_id.wire(), view.status.wire_str())
                     .with_wire(wire);
@@ -1012,6 +1019,36 @@ mod tests {
             Some("Callback.Heartbeat"),
             Some("heartbeat timed out"),
             Some("cb-789"),
+        )]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: Some(Duration::from_secs(10)),
+            serdes: crate::serdes::JsonSerdes,
+            _marker: std::marker::PhantomData,
+        };
+        let cb = exec.execute().await.expect("should return callback");
+        let err = cb.result().await.unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::Callback(e)
+                if matches!(e.kind(), CallbackErrorKind::HeartbeatTimedOut)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_timed_out_on_heartbeat() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::TimedOut,
+            None,
+            Some("Callback.Heartbeat"),
+            Some("Callback timed out on heartbeat"),
+            Some("cb-790"),
         )]);
         let op_id = ctx.mint_id();
         let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {

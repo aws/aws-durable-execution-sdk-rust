@@ -20,7 +20,7 @@ use durable::serdes::{
     FileSystemSerdes, FileSystemSerdesConfig, FileSystemSerdesMode, RetryableSerdesError, Serdes,
     SerdesContext,
 };
-use durable::test_util::{LocalRunner, TestResult};
+use durable::test_util::{CallbackReply, LocalRunner, TestResult};
 use durable::{BoxError, DurableContext, RetryDecision, StepSemantics};
 
 /// How an injected failure is reported.
@@ -493,7 +493,7 @@ async fn create_callback_marked_decode_failure_reinvokes() {
     let serdes = InjectedFailures::new(Mark::Marked).deserialize_at(&[0]);
     let counters_h = counters.clone();
     let result = LocalRunner::new()
-        .callback_success(&"ok")
+        .callback(CallbackReply::success(&"ok").expect("encodes"))
         .run(
             move |_event: serde_json::Value, ctx: DurableContext| {
                 let serdes = serdes.clone();

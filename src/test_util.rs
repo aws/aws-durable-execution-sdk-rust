@@ -53,6 +53,10 @@
 //!   by then. So waits and retries end in time order, as on the service.
 //! - Queued callback replies arrive before the clock moves. An advance that
 //!   delivers a callback reply fires no timer.
+//! - Callback replies are queued before the run. The runner runs no
+//!   callback timeout or heartbeat timer; [`CallbackReply::timeout`] and
+//!   [`CallbackReply::heartbeat_timeout`] deliver the records those timers
+//!   produce.
 //! - Time never moves while an invocation runs. So a local run can use
 //!   more invocations than the same execution uses on the service.
 //! - [`LocalRunner::checkpoint_latency`] delays each checkpoint response in
@@ -344,31 +348,305 @@ impl<O> TestResult<O> {
     }
 }
 
-/// A queued external outcome for a pending callback.
+/// One reply that the simulated backend delivers to a pending callback.
+///
+/// Queue a reply with [`LocalRunner::callback`], for the next pending
+/// callback in order, or with [`LocalRunner::callback_for`], for the
+/// callback or `wait_for_callback` with a given name. The runner delivers
+/// queued replies between invocations, before it moves its virtual clock.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk as durable;
+/// use durable::test_util::{CallbackFailure, CallbackReply, LocalRunner};
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), durable::BoxError> {
+/// let runner = LocalRunner::new()
+///     .callback_for("approval", CallbackReply::success(&true)?)
+///     .callback(CallbackReply::failure(CallbackFailure::new(
+///         "Declined",
+///         "the reviewer said no",
+///     )));
+/// let result = runner
+///     .run(
+///         |_e: (), ctx: durable::DurableContext| async move {
+///             let audit = ctx.create_callback::<bool>().name("audit").await?;
+///             let approval = ctx.create_callback::<bool>().name("approval").await?;
+///             let approved = approval.result().await?;
+///             let audited = audit.result().await.is_ok();
+///             Ok::<_, durable::BoxError>((approved, audited))
+///         },
+///         (),
+///     )
+///     .await;
+///
+/// assert_eq!(result.output(), Some(&(true, false)));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
-enum CallbackOutcome {
+#[non_exhaustive]
+pub struct CallbackReply {
+    kind: CallbackReplyKind,
+}
+
+/// The record a [`CallbackReply`] gives a callback.
+#[derive(Debug, Clone)]
+enum CallbackReplyKind {
+    /// `Succeeded` with this payload.
     Success(String),
+    /// `Failed` with the reported error fields.
+    Failure(CallbackFailure),
+    /// `TimedOut`, as a callback timeout records it.
     Timeout,
+    /// `TimedOut`, as a missed heartbeat records it.
+    HeartbeatTimeout,
+}
+
+/// The message the JS local checkpoint server records for a callback
+/// timeout.
+const CALLBACK_TIMEOUT_MESSAGE: &str = "Callback timed out";
+/// The error type the SDK reads as a heartbeat timeout.
+const CALLBACK_HEARTBEAT_ERROR_TYPE: &str = "Callback.Heartbeat";
+/// The message the JS local checkpoint server records for a missed
+/// heartbeat.
+const CALLBACK_HEARTBEAT_MESSAGE: &str = "Callback timed out on heartbeat";
+
+impl CallbackReply {
+    /// A success whose payload is `value` encoded as JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoding error when `value` fails to serialize.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::{CallbackReply, LocalRunner};
+    ///
+    /// # fn main() -> Result<(), aws_durable_execution_sdk::BoxError> {
+    /// let runner = LocalRunner::new().callback(CallbackReply::success(&"approved")?);
+    /// # drop(runner);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn success<T: Serialize>(value: &T) -> Result<Self, BoxError> {
+        let payload = serde_json::to_string(value)?;
+        Ok(Self {
+            kind: CallbackReplyKind::Success(payload),
+        })
+    }
+
+    /// A success whose payload is `payload`, unchanged.
+    ///
+    /// The handler decodes the payload with the callback's serdes, so with
+    /// the default JSON serdes the payload must be JSON.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::{CallbackReply, LocalRunner};
+    ///
+    /// let runner = LocalRunner::new().callback(CallbackReply::raw(r#""approved""#));
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn raw(payload: impl Into<String>) -> Self {
+        Self {
+            kind: CallbackReplyKind::Success(payload.into()),
+        }
+    }
+
+    /// An external failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::{CallbackFailure, CallbackReply, LocalRunner};
+    ///
+    /// let failure = CallbackFailure::new("Declined", "no").with_error_data(r#"{"code":7}"#);
+    /// let runner = LocalRunner::new().callback(CallbackReply::failure(failure));
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn failure(failure: CallbackFailure) -> Self {
+        Self {
+            kind: CallbackReplyKind::Failure(failure),
+        }
+    }
+
+    /// A timeout, as the JS local checkpoint server records one.
+    ///
+    /// The callback becomes `TimedOut` with the message
+    /// `Callback timed out`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::{CallbackReply, LocalRunner};
+    ///
+    /// let runner = LocalRunner::new().callback(CallbackReply::timeout());
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn timeout() -> Self {
+        Self {
+            kind: CallbackReplyKind::Timeout,
+        }
+    }
+
+    /// A heartbeat timeout, as the service records one.
+    ///
+    /// The callback becomes `TimedOut` with the error type
+    /// `Callback.Heartbeat` and the message
+    /// `Callback timed out on heartbeat`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::{CallbackReply, LocalRunner};
+    ///
+    /// let runner = LocalRunner::new().callback(CallbackReply::heartbeat_timeout());
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn heartbeat_timeout() -> Self {
+        Self {
+            kind: CallbackReplyKind::HeartbeatTimeout,
+        }
+    }
+
+    /// Writes this reply into a pending callback record, as the table in
+    /// the `LocalRunner` callback docs states.
+    fn deliver_to(self, op: &mut StoredOp) {
+        op.result = None;
+        op.error_type = None;
+        op.error_message = None;
+        op.error_data = None;
+        op.stack_trace = Vec::new();
+        match self.kind {
+            CallbackReplyKind::Success(payload) => {
+                op.status = OperationStatus::Succeeded;
+                op.result = Some(payload);
+            }
+            CallbackReplyKind::Failure(failure) => {
+                op.status = OperationStatus::Failed;
+                op.error_type = failure.error_type;
+                op.error_message = failure.error_message;
+                op.error_data = failure.error_data;
+                op.stack_trace = failure.stack_trace;
+            }
+            CallbackReplyKind::Timeout => {
+                op.status = OperationStatus::TimedOut;
+                op.error_message = Some(CALLBACK_TIMEOUT_MESSAGE.to_owned());
+            }
+            CallbackReplyKind::HeartbeatTimeout => {
+                op.status = OperationStatus::TimedOut;
+                op.error_type = Some(CALLBACK_HEARTBEAT_ERROR_TYPE.to_owned());
+                op.error_message = Some(CALLBACK_HEARTBEAT_MESSAGE.to_owned());
+            }
+        }
+        op.callback_delivered = true;
+    }
+}
+
+/// The error an external system reports for a callback, as JS `ErrorObject`.
+///
+/// Each of the four fields is absent until it is set.
+/// [`CallbackFailure::default`] has every field absent.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk::test_util::CallbackFailure;
+///
+/// let failure = CallbackFailure::new("Declined", "no")
+///     .with_error_data(r#"{"code":7}"#)
+///     .with_stack_trace(vec!["at review".to_owned()]);
+/// # drop(failure);
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct CallbackFailure {
+    error_type: Option<String>,
+    error_message: Option<String>,
+    error_data: Option<String>,
+    stack_trace: Vec<String>,
+}
+
+impl CallbackFailure {
+    /// A failure with this error type and message.
+    #[must_use]
+    pub fn new(error_type: impl Into<String>, error_message: impl Into<String>) -> Self {
+        Self {
+            error_type: Some(error_type.into()),
+            error_message: Some(error_message.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Sets the opaque error data.
+    #[must_use]
+    pub fn with_error_data(mut self, error_data: impl Into<String>) -> Self {
+        self.error_data = Some(error_data.into());
+        self
+    }
+
+    /// Sets the stack trace frames.
+    #[must_use]
+    pub fn with_stack_trace(mut self, frames: Vec<String>) -> Self {
+        self.stack_trace = frames;
+        self
+    }
+}
+
+/// The callback replies a runner queues before a run.
+#[derive(Debug, Clone, Default)]
+struct QueuedReplies {
+    /// Replies for the next pending callback, in queue order.
+    fifo: std::collections::VecDeque<CallbackReply>,
+    /// Replies for a named callback or `wait_for_callback`, in queue order.
+    named: Vec<(String, CallbackReply)>,
 }
 
 /// Drives a durable handler to completion in memory, simulating the backend.
 ///
 /// Construct with [`LocalRunner::new`], optionally pass the handler's
 /// [`Options`](crate::Options) with [`options`](Self::options) and queue
-/// callback outcomes with [`callback_success`](Self::callback_success) /
-/// [`callback_timeout`](Self::callback_timeout), then drive a handler with
+/// callback replies with [`callback`](Self::callback) and
+/// [`callback_for`](Self::callback_for), then drive a handler with
 /// [`run`](Self::run).
+///
+/// # Callback replies
+///
+/// A pending callback is a callback record in `Pending` or `Started` that
+/// has not received a reply. Between invocations the runner visits the
+/// pending callbacks in first-checkpoint order. For each one it delivers
+/// the first queued [`callback_for`](Self::callback_for) reply that names
+/// it, else the front [`callback`](Self::callback) reply, else nothing. A
+/// named reply names a callback when the callback has that name, or when
+/// the callback's parent is a `wait_for_callback` with that name.
+///
+/// | Reply | Status | Stored fields |
+/// | --- | --- | --- |
+/// | [`CallbackReply::success`] | `Succeeded` | the result is the JSON of the value |
+/// | [`CallbackReply::raw`] | `Succeeded` | the result is the payload |
+/// | [`CallbackReply::failure`] | `Failed` | each field set in the [`CallbackFailure`] |
+/// | [`CallbackReply::timeout`] | `TimedOut` | the message `Callback timed out` |
+/// | [`CallbackReply::heartbeat_timeout`] | `TimedOut` | the type `Callback.Heartbeat` and the message `Callback timed out on heartbeat` |
 ///
 /// # Examples
 ///
 /// ```
 /// use aws_durable_execution_sdk as durable;
-/// use durable::test_util::LocalRunner;
+/// use durable::test_util::{CallbackReply, LocalRunner};
 ///
 /// # #[tokio::main]
-/// # async fn main() {
+/// # async fn main() -> Result<(), durable::BoxError> {
 /// // Deliver a value to the first callback the handler awaits.
-/// let runner = LocalRunner::new().callback_success(&true);
+/// let runner = LocalRunner::new().callback(CallbackReply::success(&true)?);
 /// let result = runner
 ///     .run(
 ///         |_e: (), ctx: durable::DurableContext| async move {
@@ -381,13 +659,31 @@ enum CallbackOutcome {
 ///     .await;
 ///
 /// assert_eq!(result.output(), Some(&true));
+///
+/// // Deliver a value to the `wait_for_callback` named "approve".
+/// let runner = LocalRunner::new().callback_for("approve", CallbackReply::success(&7_u32)?);
+/// let result = runner
+///     .run(
+///         |_e: (), ctx: durable::DurableContext| async move {
+///             let value = ctx
+///                 .wait_for_callback::<u32, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+///                 .name("approve")
+///                 .await?;
+///             Ok::<_, durable::BoxError>(value)
+///         },
+///         (),
+///     )
+///     .await;
+///
+/// assert_eq!(result.output(), Some(&7));
+/// # Ok(())
 /// # }
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LocalRunner {
     max_invocations: usize,
-    callback_outcomes: Vec<CallbackOutcome>,
+    callback_replies: QueuedReplies,
     /// Initial-state page size. When set, the synthesized invocation
     /// envelope carries at most this many history operations inline plus a
     /// pagination marker, so the context fetches the remainder via
@@ -432,7 +728,7 @@ impl Default for LocalRunner {
 
 impl LocalRunner {
     /// Creates a runner with default settings and no queued callback
-    /// outcomes.
+    /// replies.
     ///
     /// By default the simulated backend **paginates execution state**
     /// (both the initial invocation envelope and checkpoint responses
@@ -452,7 +748,7 @@ impl LocalRunner {
     pub fn new() -> Self {
         Self {
             max_invocations: DEFAULT_MAX_INVOCATIONS,
-            callback_outcomes: Vec::new(),
+            callback_replies: QueuedReplies::default(),
             initial_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
             checkpoint_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
             options: crate::Options::default(),
@@ -673,46 +969,48 @@ impl LocalRunner {
         self
     }
 
-    /// Queues a successful outcome for the next callback the handler awaits.
+    /// Queues `reply` for the next pending callback, in order.
     ///
-    /// The value is serialized as the callback payload and delivered when
-    /// the callback becomes pending, in the order queued.
-    ///
-    /// # Panics
-    ///
-    /// Never panics: a value that fails to serialize is queued as an empty
-    /// payload, which surfaces as a deserialization error to the handler
-    /// rather than aborting the test.
+    /// A pending callback that a [`callback_for`](Self::callback_for)
+    /// reply names takes that reply instead. See
+    /// [Callback replies](Self#callback-replies).
     ///
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::{CallbackReply, LocalRunner};
     ///
-    /// let runner = LocalRunner::new().callback_success(&"approved");
+    /// let runner = LocalRunner::new()
+    ///     .callback(CallbackReply::raw(r#""first""#))
+    ///     .callback(CallbackReply::timeout());
     /// # drop(runner);
     /// ```
     #[must_use]
-    pub fn callback_success<T: Serialize>(mut self, value: &T) -> Self {
-        let payload = serde_json::to_string(value).unwrap_or_default();
-        self.callback_outcomes
-            .push(CallbackOutcome::Success(payload));
+    pub fn callback(mut self, reply: CallbackReply) -> Self {
+        self.callback_replies.fifo.push_back(reply);
         self
     }
 
-    /// Queues a timeout outcome for the next callback the handler awaits.
+    /// Queues `reply` for the pending callback named `name`, or for the
+    /// callback of the `wait_for_callback` named `name`.
+    ///
+    /// When no pending callback matches by the end of the run, the
+    /// suspended result's message names `name`. See
+    /// [Callback replies](Self#callback-replies).
     ///
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk::test_util::LocalRunner;
+    /// use aws_durable_execution_sdk::test_util::{CallbackReply, LocalRunner};
     ///
-    /// let runner = LocalRunner::new().callback_timeout();
+    /// let runner = LocalRunner::new()
+    ///     .callback_for("cb-a", CallbackReply::raw(r#""A""#))
+    ///     .callback_for("cb-b", CallbackReply::raw(r#""B""#));
     /// # drop(runner);
     /// ```
     #[must_use]
-    pub fn callback_timeout(mut self) -> Self {
-        self.callback_outcomes.push(CallbackOutcome::Timeout);
+    pub fn callback_for(mut self, name: impl Into<String>, reply: CallbackReply) -> Self {
+        self.callback_replies.named.push((name.into(), reply));
         self
     }
 
@@ -762,10 +1060,10 @@ impl LocalRunner {
     }
 
     /// A fresh backend configured from this runner's settings: queued
-    /// callback outcomes, checkpoint page size, injected checkpoint
+    /// callback replies, checkpoint page size, injected checkpoint
     /// failures and checkpoint latency.
     fn new_backend(&self) -> Backend {
-        let mut backend = Backend::new(self.callback_outcomes.clone(), self.checkpoint_page_size);
+        let mut backend = Backend::new(self.callback_replies.clone(), self.checkpoint_page_size);
         backend.checkpoint_failures_remaining.store(
             self.checkpoint_failures,
             std::sync::atomic::Ordering::SeqCst,
@@ -929,11 +1227,9 @@ impl LocalRunner {
                             disposition: Disposition::Suspended,
                             output: None,
                             error_type: None,
-                            error_message: Some(
-                                "execution suspended with no pending timer, retry, or callback \
-                                 to advance (missing callback outcome?)"
-                                    .to_owned(),
-                            ),
+                            error_message: Some(suspended_message(
+                                &backend.unmatched_reply_names(),
+                            )),
                             operations: backend.snapshot_operations(),
                             invocations,
                         };
@@ -1692,8 +1988,8 @@ struct BackendState {
     ops: Vec<StoredOp>,
     token_counter: u64,
     callback_counter: u64,
-    /// Queued external callback outcomes, delivered FIFO.
-    callback_outcomes: Vec<CallbackOutcome>,
+    /// Queued external callback replies (see [`Backend::advance`]).
+    callback_replies: QueuedReplies,
     /// The virtual time in seconds. It starts at 0 and moves only in
     /// [`Backend::advance`], between invocations.
     now: u64,
@@ -1758,13 +2054,13 @@ enum PlannedCheckpoint {
 }
 
 impl Backend {
-    fn new(callback_outcomes: Vec<CallbackOutcome>, checkpoint_page_size: Option<usize>) -> Self {
+    fn new(callback_replies: QueuedReplies, checkpoint_page_size: Option<usize>) -> Self {
         Self {
             state: Mutex::new(BackendState {
                 ops: Vec::new(),
                 token_counter: 0,
                 callback_counter: 0,
-                callback_outcomes,
+                callback_replies,
                 now: 0,
             }),
             checkpoint_page_size,
@@ -1886,10 +2182,11 @@ impl Backend {
     ///
     /// The steps run in this order:
     ///
-    /// 1. Queued callback outcomes go to pending callbacks, FIFO. If at
-    ///    least one was delivered, the advance ends here: the clock does not
-    ///    move and no timer fires. A callback reply the service already
-    ///    holds arrives before any later timer.
+    /// 1. Queued callback replies go to pending callbacks (see
+    ///    [`take_callback_deliveries`]). If at least one was delivered, the
+    ///    advance ends here: the clock does not move and no timer fires. A
+    ///    callback reply the service already holds arrives before any later
+    ///    timer.
     /// 2. Otherwise the clock moves to the earliest end among timed
     ///    operations (see [`timed_due_at`]). With no timed operation, the
     ///    advance returns `false`.
@@ -1904,45 +2201,29 @@ impl Backend {
     ///   `src/wait_for_condition.rs` replay suspend for `Pending` and fall
     ///   through to live execution for `Ready`.
     /// - callback: a `Started` callback resolves to `Succeeded` (with a
-    ///   payload) or `TimedOut` (`src/callback.rs` replay).
+    ///   payload), `Failed` or `TimedOut` (`src/callback.rs` replay).
     fn advance(&self) -> bool {
         let mut state = self.lock();
-        // Split the borrow so we can pop the outcome queue while iterating.
+        // Split the borrow so the reply queues and the records can be
+        // changed in the same pass.
         let BackendState {
             ops,
-            callback_outcomes,
+            callback_replies,
             now,
             ..
         } = &mut *state;
 
-        let mut delivered = false;
-        for op in ops.iter_mut() {
-            let is_pending_callback = op.op_type == OperationType::Callback
-                && !op.callback_delivered
-                && matches!(
-                    op.status,
-                    OperationStatus::Pending | OperationStatus::Started
-                );
-            if !is_pending_callback {
-                continue;
-            }
-            if callback_outcomes.is_empty() {
-                continue;
-            }
-            let outcome = callback_outcomes.remove(0);
-            match outcome {
-                CallbackOutcome::Success(payload) => {
-                    op.status = OperationStatus::Succeeded;
-                    op.result = Some(payload);
-                }
-                CallbackOutcome::Timeout => {
-                    op.status = OperationStatus::TimedOut;
+        // A named reply can match through the parent record, so the
+        // matching pass reads `ops` while the delivery pass writes it.
+        let deliveries = take_callback_deliveries(ops, callback_replies);
+        if deliveries.iter().any(Option::is_some) {
+            // `deliveries` holds one entry per record, in record order, so
+            // zipping pairs each reply with the record it matched.
+            for (op, reply) in ops.iter_mut().zip(deliveries) {
+                if let Some(reply) = reply {
+                    reply.deliver_to(op);
                 }
             }
-            op.callback_delivered = true;
-            delivered = true;
-        }
-        if delivered {
             return true;
         }
 
@@ -1961,6 +2242,98 @@ impl Backend {
         }
         true
     }
+
+    /// The names of the queued named replies that no callback took, in
+    /// queue order, each name once.
+    fn unmatched_reply_names(&self) -> Vec<String> {
+        let state = self.lock();
+        let mut names: Vec<String> = Vec::new();
+        for (name, _) in &state.callback_replies.named {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+}
+
+/// The message of a suspended result. It names every queued named reply
+/// that no pending callback matched, so a test sees a misspelled or wrong
+/// name.
+fn suspended_message(unmatched_names: &[String]) -> String {
+    let base = "execution suspended with no pending timer, retry, or callback \
+                to advance (missing callback outcome?)";
+    if unmatched_names.is_empty() {
+        return base.to_owned();
+    }
+    let quoted: Vec<String> = unmatched_names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect();
+    format!(
+        "{base}; no pending callback matched the queued replies for: {}",
+        quoted.join(", ")
+    )
+}
+
+/// Whether `op` is a pending callback: a callback record in `Pending` or
+/// `Started` that has not received a reply.
+fn is_pending_callback(op: &StoredOp) -> bool {
+    op.op_type == OperationType::Callback
+        && !op.callback_delivered
+        && matches!(
+            op.status,
+            OperationStatus::Pending | OperationStatus::Started
+        )
+}
+
+/// Whether a named reply for `name` matches the callback `op`.
+///
+/// It matches when the callback has the name, or when the callback's parent
+/// is a stored `wait_for_callback` context with the name. A plain child
+/// context's name does not match: the JS test runner reads the callback of
+/// a context only for the `WAIT_FOR_CALLBACK` sub-type.
+fn reply_name_matches(ops: &[StoredOp], op: &StoredOp, name: &str) -> bool {
+    if op.name.as_deref() == Some(name) {
+        return true;
+    }
+    let Some(parent_id) = op.parent_id.as_deref() else {
+        return false;
+    };
+    ops.iter().any(|parent| {
+        parent.id == parent_id
+            && parent.op_type == OperationType::Context
+            && parent.sub_type.as_deref() == Some(crate::callback::WFCB_SUB_TYPE)
+            && parent.name.as_deref() == Some(name)
+    })
+}
+
+/// Removes from `replies` the reply each pending callback receives, and
+/// returns one entry per record of `ops`, in the same order: the reply the
+/// record receives, or `None`.
+///
+/// The pending callbacks are visited in stored order. Each one takes the
+/// first queued named reply that matches it (see [`reply_name_matches`]);
+/// else the front FIFO reply; else nothing.
+fn take_callback_deliveries(
+    ops: &[StoredOp],
+    replies: &mut QueuedReplies,
+) -> Vec<Option<CallbackReply>> {
+    ops.iter()
+        .map(|op| {
+            if !is_pending_callback(op) {
+                return None;
+            }
+            let named = replies
+                .named
+                .iter()
+                .position(|(name, _)| reply_name_matches(ops, op, name));
+            match named {
+                Some(position) => Some(replies.named.remove(position).1),
+                None => replies.fifo.pop_front(),
+            }
+        })
+        .collect()
 }
 
 /// The virtual time at which `op` ends, if it is timed: a wait in `Started`
@@ -2262,10 +2635,19 @@ impl ExecutionClient for Backend {
     }
 }
 
+/// Whether `stored` carries any error field. A callback failure may set
+/// only some of the four fields, so any one of them makes an error object.
+fn has_error_fields(stored: &StoredOp) -> bool {
+    stored.error_type.is_some()
+        || stored.error_message.is_some()
+        || stored.error_data.is_some()
+        || !stored.stack_trace.is_empty()
+}
+
 /// Builds an SDK `Operation` from a stored op, placing result/error in the
 /// details bucket the SDK reads for that operation type.
 fn build_operation(stored: &StoredOp) -> Option<Operation> {
-    let error_obj = if stored.error_type.is_some() || stored.error_message.is_some() {
+    let error_obj = if has_error_fields(stored) {
         let mut eb = ErrorObject::builder();
         if let Some(t) = &stored.error_type {
             eb = eb.error_type(t);
@@ -2379,7 +2761,7 @@ fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
         obj.insert("ParentId".to_owned(), serde_json::json!(parent));
     }
 
-    let error_obj = (stored.error_type.is_some() || stored.error_message.is_some()).then(|| {
+    let error_obj = has_error_fields(stored).then(|| {
         let mut err = serde_json::Map::new();
         if let Some(t) = &stored.error_type {
             err.insert("ErrorType".to_owned(), serde_json::json!(t));
@@ -3515,17 +3897,31 @@ mod tests {
         );
     }
 
-    // 6. callback success and callback timeout
+    // 6. callback replies
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Approval {
         approved: bool,
     }
 
+    /// `success(&v)` in the issue's test table.
+    fn success<T: Serialize>(value: &T) -> CallbackReply {
+        CallbackReply::success(value).expect("encodes")
+    }
+
+    /// The single callback record of `result`.
+    fn callback_record<O>(result: &TestResult<O>) -> &TestOperation {
+        result
+            .operations()
+            .iter()
+            .find(|o| o.op_type() == "Callback")
+            .expect("callback op recorded")
+    }
+
     #[tokio::test]
-    async fn callback_success_delivers_payload() {
+    async fn callback_reply_success_delivers_json() {
         let result = LocalRunner::new()
-            .callback_success(&Approval { approved: true })
+            .callback(success(&Approval { approved: true }))
             .run(
                 |(), ctx: DurableContext| async move {
                     let cb = ctx.create_callback::<Approval>().name("approval").await?;
@@ -3542,9 +3938,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_timeout_surfaces_error() {
+    async fn callback_reply_timeout_surfaces_error() {
         let result = LocalRunner::new()
-            .callback_timeout()
+            .callback(CallbackReply::timeout())
             .run(
                 |(), ctx: DurableContext| async move {
                     let cb = ctx.create_callback::<Approval>().name("approval").await?;
@@ -3557,12 +3953,399 @@ mod tests {
 
         assert!(result.is_failure());
         assert_eq!(result.error_type(), Some("CallbackError"));
-        let cb_op = result
-            .operations()
-            .iter()
-            .find(|o| o.op_type() == "Callback")
-            .expect("callback op recorded");
+        let cb_op = callback_record(&result);
         assert_eq!(cb_op.status(), "TimedOut");
+        assert_eq!(cb_op.error_message(), Some("Callback timed out"));
+    }
+
+    #[tokio::test]
+    async fn callback_reply_raw_is_not_encoded() {
+        let result = LocalRunner::new()
+            .callback(CallbackReply::raw("\"hi\""))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let cb = ctx.create_callback::<String>().await?;
+                    Ok::<_, BoxError>(cb.result().await?)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output().map(String::as_str), Some("hi"));
+    }
+
+    /// The fields a handler reads from a callback failure: whether the kind
+    /// is an external failure, then the wire type, message and data.
+    type FailureFields = (bool, Option<String>, Option<String>, Option<String>);
+
+    #[tokio::test]
+    async fn callback_reply_failure_reaches_create_callback() {
+        let result = LocalRunner::new()
+            .callback(CallbackReply::failure(
+                CallbackFailure::new("Declined", "no").with_error_data("{\"code\":7}"),
+            ))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let cb = ctx.create_callback::<String>().name("cb").await?;
+                    let Err(err) = cb.result().await else {
+                        return Err::<FailureFields, BoxError>("callback succeeded".into());
+                    };
+                    let external = matches!(
+                        err.kind(),
+                        crate::OperationErrorKind::Callback(e)
+                            if matches!(e.kind(), crate::CallbackErrorKind::ExternalFailure)
+                    );
+                    let wire = err.wire();
+                    let field = |read: fn(&crate::WireError) -> Option<&str>| {
+                        wire.and_then(read).map(ToOwned::to_owned)
+                    };
+                    Ok((
+                        external,
+                        field(crate::WireError::error_type),
+                        field(crate::WireError::error_message),
+                        field(crate::WireError::error_data),
+                    ))
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            result.output(),
+            Some(&(
+                true,
+                Some("Declined".to_owned()),
+                Some("no".to_owned()),
+                Some("{\"code\":7}".to_owned()),
+            ))
+        );
+        let cb_op = callback_record(&result);
+        assert_eq!(cb_op.status(), "Failed");
+        assert_eq!(cb_op.error_type(), Some("Declined"));
+        assert_eq!(cb_op.error_message(), Some("no"));
+    }
+
+    #[tokio::test]
+    async fn callback_reply_failure_reaches_wait_for_callback() {
+        let result = LocalRunner::new()
+            .callback(CallbackReply::failure(CallbackFailure::new(
+                "Declined", "no",
+            )))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let outcome = ctx
+                        .wait_for_callback::<String, _, _>(|_step_ctx, _callback_id| async {
+                            Ok(())
+                        })
+                        .name("approve")
+                        .await;
+                    let Err(err) = outcome else {
+                        return Err::<bool, BoxError>("wait_for_callback succeeded".into());
+                    };
+                    Ok(matches!(
+                        err.kind(),
+                        crate::OperationErrorKind::Callback(e)
+                            if matches!(e.kind(), crate::CallbackErrorKind::ExternalFailure)
+                    ))
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            result.output(),
+            Some(&true),
+            "kind is Callback(ExternalFailure)"
+        );
+        let cb_op = callback_record(&result);
+        assert_eq!(cb_op.status(), "Failed");
+        assert_eq!(cb_op.error_type(), Some("Declined"));
+    }
+
+    #[tokio::test]
+    async fn callback_for_targets_named_callbacks() {
+        let result = LocalRunner::new()
+            .callback_for("cb-a", CallbackReply::raw("\"A\""))
+            .callback_for("cb-b", CallbackReply::raw("\"B\""))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let b = ctx.create_callback::<String>().name("cb-b").await?;
+                    let a = ctx.create_callback::<String>().name("cb-a").await?;
+                    let a = a.result().await?;
+                    let b = b.result().await?;
+                    Ok::<_, BoxError>(format!("a={a} b={b}"))
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output().map(String::as_str), Some("a=A b=B"));
+    }
+
+    #[tokio::test]
+    async fn callback_for_targets_wait_for_callback_by_context_name() {
+        let result = LocalRunner::new()
+            .callback_for("second", success(&2_u32))
+            .callback_for("first", success(&1_u32))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let branches: Vec<crate::Branch<u32>> = ["first", "second"]
+                        .into_iter()
+                        .map(|name| {
+                            crate::Branch::new(name, move |child: DurableContext| async move {
+                                let value = child
+                                    .wait_for_callback::<u32, _, _>(
+                                        |_step_ctx, _callback_id| async { Ok(()) },
+                                    )
+                                    .name(name)
+                                    .await?;
+                                Ok(value)
+                            })
+                        })
+                        .collect();
+                    Ok::<_, BoxError>(ctx.parallel(branches).name("both").await?)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&vec![1, 2]));
+    }
+
+    #[tokio::test]
+    async fn callback_for_is_delivered_before_fifo() {
+        let result = LocalRunner::new()
+            .callback(success(&"fifo"))
+            .callback_for("named", success(&"named"))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let named = ctx.create_callback::<String>().name("named").await?;
+                    let other = ctx.create_callback::<String>().name("other").await?;
+                    let a = named.result().await?;
+                    let b = other.result().await?;
+                    Ok::<_, BoxError>(format!("named={a} other={b}"))
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            result.output().map(String::as_str),
+            Some("named=named other=fifo")
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_for_ignores_plain_child_context_name() {
+        let result = LocalRunner::new()
+            .callback_for("box", success(&1_u32))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let value = ctx
+                        .run_in_child_context(|child| async move {
+                            let cb = child.create_callback::<u32>().await?;
+                            Ok(cb.result().await?)
+                        })
+                        .name("box")
+                        .await?;
+                    Ok::<_, BoxError>(value)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_suspended(), "{:?}", result.error_message());
+    }
+
+    #[tokio::test]
+    async fn callback_for_unused_name_is_reported() {
+        let result = LocalRunner::new()
+            .callback_for("missing", success(&1_u32))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let cb = ctx.create_callback::<u32>().name("cb").await?;
+                    Ok::<_, BoxError>(cb.result().await?)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_suspended(), "{:?}", result.error_message());
+        let message = result.error_message().unwrap_or_default();
+        assert!(
+            message.ends_with("; no pending callback matched the queued replies for: \"missing\""),
+            "{message}"
+        );
+    }
+
+    /// Rule 8 of the issue: the unused names appear in queue order, each
+    /// once, and a run with no unused name keeps the old message.
+    #[test]
+    fn suspended_message_lists_unused_names_once_in_queue_order() {
+        let backend = Backend::new(
+            QueuedReplies {
+                fifo: std::collections::VecDeque::new(),
+                named: vec![
+                    ("missing".to_owned(), success(&1_u32)),
+                    ("other".to_owned(), success(&2_u32)),
+                    ("missing".to_owned(), success(&3_u32)),
+                ],
+            },
+            None,
+        );
+        assert_eq!(
+            suspended_message(&backend.unmatched_reply_names()),
+            "execution suspended with no pending timer, retry, or callback to advance \
+             (missing callback outcome?); no pending callback matched the queued replies \
+             for: \"missing\", \"other\""
+        );
+        assert_eq!(
+            suspended_message(&[]),
+            "execution suspended with no pending timer, retry, or callback to advance \
+             (missing callback outcome?)"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_reply_failure_carries_stack_trace() {
+        let result = LocalRunner::new()
+            .callback(CallbackReply::failure(
+                CallbackFailure::new("Declined", "no")
+                    .with_stack_trace(vec!["at a".into(), "at b".into()]),
+            ))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let cb = ctx.create_callback::<String>().name("cb").await?;
+                    let Err(err) = cb.result().await else {
+                        return Err::<Vec<String>, BoxError>("callback succeeded".into());
+                    };
+                    Ok(err
+                        .wire()
+                        .map(|wire| wire.stack_trace().to_vec())
+                        .unwrap_or_default())
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            result.output(),
+            Some(&vec!["at a".to_owned(), "at b".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_reply_default_failure_has_no_fields() {
+        let result = LocalRunner::new()
+            .callback(CallbackReply::failure(CallbackFailure::default()))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let cb = ctx.create_callback::<String>().name("cb").await?;
+                    Ok::<_, BoxError>(cb.result().await?)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_failure(), "{:?}", result.error_message());
+        let cb_op = callback_record(&result);
+        assert_eq!(cb_op.status(), "Failed");
+        assert_eq!(cb_op.error_type(), None);
+        assert_eq!(cb_op.error_message(), None);
+    }
+
+    /// A failure that sets only the error data or only the stack trace
+    /// still reaches the handler with that field (see `has_error_fields`).
+    #[tokio::test]
+    async fn callback_reply_failure_with_only_data_or_trace_keeps_it() {
+        let read = |failure: CallbackFailure| async move {
+            LocalRunner::new()
+                .callback(CallbackReply::failure(failure))
+                .run(
+                    |(), ctx: DurableContext| async move {
+                        let cb = ctx.create_callback::<String>().name("cb").await?;
+                        let Err(err) = cb.result().await else {
+                            return Err::<(Option<String>, Vec<String>), BoxError>(
+                                "callback succeeded".into(),
+                            );
+                        };
+                        let wire = err.wire();
+                        Ok((
+                            wire.and_then(crate::WireError::error_data)
+                                .map(ToOwned::to_owned),
+                            wire.map(|w| w.stack_trace().to_vec()).unwrap_or_default(),
+                        ))
+                    },
+                    (),
+                )
+                .await
+        };
+
+        let data_only = read(CallbackFailure::default().with_error_data("d")).await;
+        assert_eq!(
+            data_only.output(),
+            Some(&(Some("d".to_owned()), Vec::new()))
+        );
+        let trace_only =
+            read(CallbackFailure::default().with_stack_trace(vec!["at a".to_owned()])).await;
+        assert_eq!(trace_only.output(), Some(&(None, vec!["at a".to_owned()])));
+    }
+
+    #[tokio::test]
+    async fn callback_reply_heartbeat_timeout_reaches_handler() {
+        let result = LocalRunner::new()
+            .callback(CallbackReply::heartbeat_timeout())
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let cb = ctx
+                        .create_callback::<u32>()
+                        .name("cb")
+                        .heartbeat(std::time::Duration::from_secs(60))
+                        .await?;
+                    let Err(err) = cb.result().await else {
+                        return Err::<bool, BoxError>("callback succeeded".into());
+                    };
+                    Ok(matches!(
+                        err.kind(),
+                        crate::OperationErrorKind::Callback(e)
+                            if matches!(e.kind(), crate::CallbackErrorKind::HeartbeatTimedOut)
+                    ))
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&true));
+        let cb_op = callback_record(&result);
+        assert_eq!(cb_op.status(), "TimedOut");
+        assert_eq!(cb_op.error_type(), Some("Callback.Heartbeat"));
+        assert_eq!(
+            cb_op.error_message(),
+            Some("Callback timed out on heartbeat")
+        );
+    }
+
+    /// A value whose `Serialize` impl always fails.
+    struct Refuses;
+
+    impl Serialize for Refuses {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("refuse"))
+        }
+    }
+
+    #[test]
+    fn callback_reply_success_returns_the_encoding_error() {
+        let err = CallbackReply::success(&Refuses).expect_err("encoding fails");
+        assert!(err.to_string().contains("refuse"), "{err}");
     }
 
     /// A callback result created via the public `ctx.create_callback` API
@@ -3572,7 +4355,7 @@ mod tests {
     #[tokio::test]
     async fn callback_result_composes_with_step_in_combinator() {
         let result = LocalRunner::new()
-            .callback_success(&"from-callback".to_owned())
+            .callback(success(&"from-callback".to_owned()))
             .run(
                 |(), ctx: DurableContext| async move {
                     let cb = ctx.create_callback::<String>().name("approval").await?;
@@ -3794,7 +4577,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_history_maps_callback_timeout() {
+    fn fold_history_maps_callback_timed_out() {
         let events = vec![
             Event::builder()
                 .event_type(EventType::CallbackStarted)
@@ -4049,7 +4832,7 @@ mod tests {
     async fn truncated_checkpoint_page_requires_second_page() {
         let result = LocalRunner::new()
             .checkpoint_page_size(1)
-            .callback_success(&"approved".to_owned())
+            .callback(success(&"approved".to_owned()))
             .run(
                 |_event: (), ctx: DurableContext| async move {
                     // First stored operation: fills page 1.
@@ -4122,7 +4905,7 @@ mod tests {
     /// should then paginate via `get_state`.
     #[tokio::test]
     async fn backend_paginated_checkpoint_returns_marker() {
-        let backend = Arc::new(Backend::new(Vec::new(), Some(1)));
+        let backend = Arc::new(Backend::new(QueuedReplies::default(), Some(1)));
 
         // Checkpoint two operations so we exceed page_size=1.
         let updates = vec![
@@ -4336,7 +5119,10 @@ mod tests {
     #[tokio::test]
     async fn default_state_pagination_forces_get_state_fetches() {
         let runner = LocalRunner::new();
-        let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
+        let backend = Arc::new(Backend::new(
+            QueuedReplies::default(),
+            runner.checkpoint_page_size,
+        ));
 
         let result = runner
             .run_on_backend(
@@ -4378,7 +5164,10 @@ mod tests {
     #[tokio::test]
     async fn single_page_never_fetches_state() {
         let runner = LocalRunner::new().single_page();
-        let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
+        let backend = Arc::new(Backend::new(
+            QueuedReplies::default(),
+            runner.checkpoint_page_size,
+        ));
 
         let result = runner
             .run_on_backend(
@@ -4491,7 +5280,7 @@ mod tests {
                 .build()
                 .expect("valid options"),
         );
-        let baseline_backend = Arc::new(Backend::new(Vec::new(), None));
+        let baseline_backend = Arc::new(Backend::new(QueuedReplies::default(), None));
         let baseline = baseline_runner
             .run_on_backend(
                 Arc::clone(&baseline_backend),
@@ -4510,7 +5299,7 @@ mod tests {
                 .build()
                 .expect("valid options"),
         );
-        let coalesced_backend = Arc::new(Backend::new(Vec::new(), None));
+        let coalesced_backend = Arc::new(Backend::new(QueuedReplies::default(), None));
         let coalesced = coalesced_runner
             .run_on_backend(
                 Arc::clone(&coalesced_backend),
@@ -4568,7 +5357,10 @@ mod tests {
         F: Fn((), DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send,
     {
-        let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
+        let backend = Arc::new(Backend::new(
+            QueuedReplies::default(),
+            runner.checkpoint_page_size,
+        ));
         let result = runner
             .run_on_backend(Arc::clone(&backend), handler, ())
             .await;
@@ -4754,7 +5546,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn checkpoint_batching_preserves_handler_semantics() {
         let execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let backend = Arc::new(Backend::new(Vec::new(), None));
+        let backend = Arc::new(Backend::new(QueuedReplies::default(), None));
         let result = LocalRunner::new()
             .single_page()
             .options(
@@ -4810,7 +5602,10 @@ mod tests {
                 .build()
                 .expect("valid options"),
         );
-        let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
+        let backend = Arc::new(Backend::new(
+            QueuedReplies::default(),
+            runner.checkpoint_page_size,
+        ));
 
         // Call plan:
         //   1. orphan START: passes.
@@ -5108,7 +5903,7 @@ mod tests {
     #[tokio::test]
     async fn virtual_clock_delivers_callback_before_moving_clock() {
         let result = LocalRunner::new()
-            .callback_success(&"cb")
+            .callback(success(&"cb"))
             .run(
                 |(), ctx: DurableContext| async move {
                     let cb = ctx.create_callback::<String>().await?;
@@ -5182,11 +5977,17 @@ mod tests {
 
     /// A backend at virtual time `now`, seeded with `updates`.
     fn seeded_backend(
-        callback_outcomes: Vec<CallbackOutcome>,
+        callback_replies: Vec<CallbackReply>,
         now: u64,
         updates: &[OperationUpdate],
     ) -> Backend {
-        let backend = Backend::new(callback_outcomes, None);
+        let backend = Backend::new(
+            QueuedReplies {
+                fifo: callback_replies.into(),
+                named: Vec::new(),
+            },
+            None,
+        );
         {
             let mut state = backend.lock();
             state.now = now;
@@ -5213,11 +6014,7 @@ mod tests {
     /// `Pending` directly, because no update produces it.
     #[test]
     fn advance_settles_pending_callback() {
-        let backend = seeded_backend(
-            vec![CallbackOutcome::Success("\"x\"".to_owned())],
-            0,
-            &[callback_start("c")],
-        );
+        let backend = seeded_backend(vec![CallbackReply::raw("\"x\"")], 0, &[callback_start("c")]);
         backend
             .lock()
             .ops
@@ -5265,7 +6062,7 @@ mod tests {
 
         // Row 4: a queued callback reply arrives and the clock stays put.
         let backend = seeded_backend(
-            vec![CallbackOutcome::Success("\"x\"".to_owned())],
+            vec![CallbackReply::raw("\"x\"")],
             0,
             &[callback_start("c"), wait_start("w", 100)],
         );
@@ -5514,7 +6311,7 @@ mod tests {
 
     /// Applies `updates` to a fresh backend.
     fn tree_backend(updates: &[OperationUpdate]) -> Backend {
-        let backend = Backend::new(Vec::new(), None);
+        let backend = Backend::new(QueuedReplies::default(), None);
         {
             let mut state = backend.lock();
             for update in updates {
@@ -5677,7 +6474,7 @@ mod tests {
     /// same call's context close would omit from the invocation input.
     #[tokio::test]
     async fn checkpoint_response_is_not_pruned() {
-        let backend = Backend::new(Vec::new(), None);
+        let backend = Backend::new(QueuedReplies::default(), None);
         let output = backend
             .checkpoint(
                 "arn:test",
@@ -5702,7 +6499,7 @@ mod tests {
     /// page holds the child `S`, which was stored first, and not `C`.
     #[tokio::test]
     async fn paginated_checkpoint_response_is_not_pruned() {
-        let backend = Backend::new(Vec::new(), Some(1));
+        let backend = Backend::new(QueuedReplies::default(), Some(1));
         let output = backend
             .checkpoint(
                 "arn:test",
