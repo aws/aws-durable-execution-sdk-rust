@@ -104,6 +104,10 @@
 //! - **Replay children.** [`ContextDetails::replay_children`] is reported
 //!   only by [`LocalRunner`]. No history event carries it, so under
 //!   [`CloudRunner`] it is `false`.
+//! - **Times.** [`LocalRunner`] times come from the virtual clock, starting
+//!   at the time the run started: each reported time is the run's start time
+//!   plus virtual seconds. [`CloudRunner`] times are the timestamps of the
+//!   recorded history events.
 //!
 //! Runner failures (serialization, an unexpected envelope, an AWS error) are
 //! returned as [`TestRunnerError`]. A [`TestResult`] always describes the
@@ -207,6 +211,8 @@ pub struct TestOperation {
     error: Option<crate::WireError>,
     name: Option<String>,
     parent_id: Option<String>,
+    start_time: Option<std::time::SystemTime>,
+    end_time: Option<std::time::SystemTime>,
     // The detail of every kind is stored, and `details()` returns the one
     // of `kind`. So a runner fills a kind's field without matching on the
     // kind first.
@@ -229,8 +235,16 @@ impl TestOperation {
             error: None,
             name: None,
             parent_id: None,
-            step: StepDetails { attempt: 0 },
-            wait: WaitDetails { duration: None },
+            start_time: None,
+            end_time: None,
+            step: StepDetails {
+                attempt: 0,
+                next_attempt_time: None,
+            },
+            wait: WaitDetails {
+                duration: None,
+                scheduled_end_time: None,
+            },
             callback: CallbackDetails { callback_id: None },
             context: ContextDetails {
                 replay_children: false,
@@ -307,6 +321,26 @@ impl TestOperation {
         self.parent_id.as_deref()
     }
 
+    /// The time the operation started, or `None` when none was recorded.
+    ///
+    /// Under [`LocalRunner`] it is the virtual time the record was created,
+    /// reported as the run's start time plus virtual seconds. Under
+    /// [`CloudRunner`] it is the timestamp of the operation's first history
+    /// event.
+    pub fn start_time(&self) -> Option<std::time::SystemTime> {
+        self.start_time
+    }
+
+    /// The time the operation ended, or `None` while it has not ended.
+    ///
+    /// Under [`LocalRunner`] it is the virtual time the status first became
+    /// `Succeeded`, `Failed`, `TimedOut`, `Cancelled` or `Stopped`. Under
+    /// [`CloudRunner`] it is the timestamp of the operation's terminal
+    /// history event.
+    pub fn end_time(&self) -> Option<std::time::SystemTime> {
+        self.end_time
+    }
+
     /// The detail of this operation's kind. The variant matches
     /// [`kind`](Self::kind): [`OperationKind::Step`] gives
     /// [`TestOperationDetails::Step`], and so on.
@@ -375,6 +409,7 @@ pub enum TestOperationDetails<'a> {
 #[non_exhaustive]
 pub struct StepDetails {
     attempt: u32,
+    next_attempt_time: Option<std::time::SystemTime>,
 }
 
 impl StepDetails {
@@ -384,6 +419,16 @@ impl StepDetails {
     pub fn attempt(&self) -> u32 {
         self.attempt
     }
+
+    /// The time the step's next attempt was scheduled for, after a retry.
+    /// `None` for a step that was never retried.
+    ///
+    /// Under [`LocalRunner`] it is the virtual time the latest retry delay
+    /// ended. Under [`CloudRunner`] it is the timestamp of the latest
+    /// `StepFailed` event that carries a retry delay, plus that delay.
+    pub fn next_attempt_time(&self) -> Option<std::time::SystemTime> {
+        self.next_attempt_time
+    }
 }
 
 /// The detail of a wait [`TestOperation`].
@@ -391,6 +436,7 @@ impl StepDetails {
 #[non_exhaustive]
 pub struct WaitDetails {
     duration: Option<std::time::Duration>,
+    scheduled_end_time: Option<std::time::SystemTime>,
 }
 
 impl WaitDetails {
@@ -398,6 +444,16 @@ impl WaitDetails {
     /// duration was recorded.
     pub fn duration(&self) -> Option<std::time::Duration> {
         self.duration
+    }
+
+    /// The time the wait was scheduled to end, or `None` when none was
+    /// recorded.
+    ///
+    /// Under [`LocalRunner`] it is the virtual time the wait started plus
+    /// its duration. Under [`CloudRunner`] it is the scheduled end of the
+    /// `WaitStarted` event.
+    pub fn scheduled_end_time(&self) -> Option<std::time::SystemTime> {
+        self.scheduled_end_time
     }
 }
 
@@ -681,6 +737,231 @@ impl<O> TestResult<O> {
     pub fn invocation_count(&self) -> usize {
         self.invocations
     }
+
+    /// The operations as a table with the columns `columns` enables.
+    ///
+    /// [`Display`](std::fmt::Display) for `TestResult` prints this table
+    /// with every column. The output is:
+    ///
+    /// 1. `No operations found.` when [`operations`](Self::operations) is
+    ///    empty.
+    /// 2. Otherwise a header line with the enabled column names, in the
+    ///    order `parentId`, `name`, `type`, `subType`, `status`,
+    ///    `startTime`, `endTime`, `duration`, then one line per operation in
+    ///    [`operations`](Self::operations) order.
+    ///
+    /// Cells are joined by ` | `, and every line ends with a newline. A time
+    /// prints as ISO 8601 UTC with three fractional digits, as JS
+    /// `toISOString` prints it. The duration is the end time minus the
+    /// start time in whole milliseconds, such as `1000ms`. An absent value
+    /// prints `-`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::test_util::{LocalRunner, PrintColumns};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), durable::BoxError> {
+    /// let result = LocalRunner::new()
+    ///     .run(
+    ///         |_e: (), ctx: durable::DurableContext| async move {
+    ///             ctx.step(|_| async { Ok(1_i32) }).name("fetch").await?;
+    ///             Ok::<_, durable::BoxError>(())
+    ///         },
+    ///         (),
+    ///     )
+    ///     .await?;
+    ///
+    /// let mut columns = PrintColumns::default();
+    /// columns.parent_id = false;
+    /// columns.sub_type = false;
+    /// columns.start_time = false;
+    /// columns.end_time = false;
+    /// columns.duration = false;
+    /// assert_eq!(
+    ///     result.display_with(columns).to_string(),
+    ///     "name | type | status\nfetch | STEP | SUCCEEDED\n"
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn display_with(&self, columns: PrintColumns) -> impl std::fmt::Display + '_ {
+        OperationTable {
+            operations: &self.operations,
+            columns,
+        }
+    }
+}
+
+impl<O> std::fmt::Display for TestResult<O> {
+    /// Prints [`display_with`](Self::display_with) with every column.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.display_with(PrintColumns::default()).fmt(f)
+    }
+}
+
+/// The columns [`TestResult::display_with`] prints. Each field enables one
+/// column; [`PrintColumns::default`] enables every column, as JS
+/// `TestResult.print` does.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk::test_util::PrintColumns;
+///
+/// let mut columns = PrintColumns::default();
+/// columns.duration = false;
+/// assert!(columns.name);
+/// ```
+#[expect(clippy::struct_excessive_bools)] // reason: one flag per JS column, as JS's print config has
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PrintColumns {
+    /// The `parentId` column: [`TestOperation::parent_id`].
+    pub parent_id: bool,
+    /// The `name` column: [`TestOperation::name`].
+    pub name: bool,
+    /// The `type` column: the [`wire_str`](OperationKind::wire_str) of
+    /// [`TestOperation::kind`].
+    pub kind: bool,
+    /// The `subType` column: [`TestOperation::sub_type`].
+    pub sub_type: bool,
+    /// The `status` column: the [`wire_str`](OperationStatus::wire_str) of
+    /// [`TestOperation::status`].
+    pub status: bool,
+    /// The `startTime` column: [`TestOperation::start_time`].
+    pub start_time: bool,
+    /// The `endTime` column: [`TestOperation::end_time`].
+    pub end_time: bool,
+    /// The `duration` column: the end time minus the start time.
+    pub duration: bool,
+}
+
+impl Default for PrintColumns {
+    /// Every column enabled.
+    fn default() -> Self {
+        Self {
+            parent_id: true,
+            name: true,
+            kind: true,
+            sub_type: true,
+            status: true,
+            start_time: true,
+            end_time: true,
+            duration: true,
+        }
+    }
+}
+
+/// The table [`TestResult::display_with`] returns.
+struct OperationTable<'a> {
+    operations: &'a [TestOperation],
+    columns: PrintColumns,
+}
+
+impl std::fmt::Display for OperationTable<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.operations.is_empty() {
+            return f.write_str("No operations found.\n");
+        }
+        let c = self.columns;
+        let enabled = [
+            (c.parent_id, "parentId"),
+            (c.name, "name"),
+            (c.kind, "type"),
+            (c.sub_type, "subType"),
+            (c.status, "status"),
+            (c.start_time, "startTime"),
+            (c.end_time, "endTime"),
+            (c.duration, "duration"),
+        ];
+        let header: Vec<&str> = enabled
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, name)| *name)
+            .collect();
+        writeln!(f, "{}", header.join(" | "))?;
+        for op in self.operations {
+            let start = op.start_time.map(unix_millis);
+            let end = op.end_time.map(unix_millis);
+            let duration = duration_cell(start, end);
+            let cells = [
+                (c.parent_id, op.parent_id().unwrap_or("-").to_owned()),
+                (c.name, op.name().unwrap_or("-").to_owned()),
+                (c.kind, op.kind().wire_str().to_owned()),
+                (c.sub_type, op.sub_type().unwrap_or("-").to_owned()),
+                (c.status, op.status().wire_str().to_owned()),
+                (c.start_time, start.map_or_else(dash, iso_millis)),
+                (c.end_time, end.map_or_else(dash, iso_millis)),
+                (c.duration, duration),
+            ];
+            let row: Vec<String> = cells
+                .into_iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, cell)| cell)
+                .collect();
+            writeln!(f, "{}", row.join(" | "))?;
+        }
+        Ok(())
+    }
+}
+
+/// The duration cell: `end - start` in whole milliseconds, or `-` unless
+/// both times exist.
+///
+/// Each time is at most `u64::MAX` seconds from the epoch, about `2^74`
+/// milliseconds. So the difference fits an `i128` and cannot overflow.
+fn duration_cell(start: Option<i128>, end: Option<i128>) -> String {
+    match (start, end) {
+        (Some(start), Some(end)) => format!("{}ms", end - start),
+        _ => dash(),
+    }
+}
+
+/// The cell of an absent value.
+fn dash() -> String {
+    "-".to_owned()
+}
+
+/// The signed whole milliseconds of `time` from the Unix epoch, truncated
+/// toward zero.
+///
+/// A `Duration` holds at most `u64::MAX` seconds. So the milliseconds fit
+/// an `i128` for every `SystemTime`, and the result needs no `Option`. The
+/// time cells narrow the value only when they format it, so a time that
+/// cannot be printed still gives the duration cell its exact value.
+fn unix_millis(time: std::time::SystemTime) -> i128 {
+    let millis =
+        |d: std::time::Duration| i128::from(d.as_secs()) * 1000 + i128::from(d.subsec_millis());
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => millis(after),
+        Err(before) => -millis(before.duration()),
+    }
+}
+
+/// `millis` from the Unix epoch as JS `toISOString` prints it: ISO 8601 UTC
+/// with exactly three fractional digits. A value whose seconds do not fit
+/// an `i64`, or whose year the formatter does not support, prints `-`.
+fn iso_millis(millis: i128) -> String {
+    // Euclidean division keeps the remainder in 0..=999, so a time before
+    // the epoch borrows from the seconds, as an ISO timestamp does.
+    let remainder = millis.rem_euclid(1000);
+    i64::try_from(millis.div_euclid(1000))
+        .ok()
+        .and_then(|seconds| {
+            DateTime::from_secs(seconds)
+                .fmt(aws_sdk_lambda::primitives::DateTimeFormat::DateTime)
+                .ok()
+        })
+        .map_or_else(dash, |text| {
+            // `Format::DateTime` writes RFC 3339 in UTC, which always ends
+            // in `Z`. So a successful format always has the suffix.
+            #[expect(clippy::expect_used)] // reason: Format::DateTime always ends in Z
+            let whole = text.strip_suffix('Z').expect("Format::DateTime ends in Z");
+            format!("{whole}.{remainder:03}Z")
+        })
 }
 
 /// One reply that the simulated backend delivers to a pending callback.
@@ -855,7 +1136,7 @@ impl CallbackReply {
 
     /// Writes this reply into a pending callback record, as the table in
     /// the `LocalRunner` callback docs states.
-    fn deliver_to(self, op: &mut StoredOp) {
+    fn deliver_to(self, op: &mut StoredOp, now: u64) {
         op.result = None;
         op.error_type = None;
         op.error_message = None;
@@ -863,22 +1144,22 @@ impl CallbackReply {
         op.stack_trace = Vec::new();
         match self.kind {
             CallbackReplyKind::Success(payload) => {
-                op.status = OperationStatus::Succeeded;
+                op.set_status(OperationStatus::Succeeded, now);
                 op.result = Some(payload);
             }
             CallbackReplyKind::Failure(failure) => {
-                op.status = OperationStatus::Failed;
+                op.set_status(OperationStatus::Failed, now);
                 op.error_type = failure.error_type;
                 op.error_message = failure.error_message;
                 op.error_data = failure.error_data;
                 op.stack_trace = failure.stack_trace;
             }
             CallbackReplyKind::Timeout => {
-                op.status = OperationStatus::TimedOut;
+                op.set_status(OperationStatus::TimedOut, now);
                 op.error_message = Some(CALLBACK_TIMEOUT_MESSAGE.to_owned());
             }
             CallbackReplyKind::HeartbeatTimeout => {
-                op.status = OperationStatus::TimedOut;
+                op.set_status(OperationStatus::TimedOut, now);
                 op.error_type = Some(CALLBACK_HEARTBEAT_ERROR_TYPE.to_owned());
                 op.error_message = Some(CALLBACK_HEARTBEAT_MESSAGE.to_owned());
             }
@@ -2637,9 +2918,16 @@ fn fold_history(events: &[Event]) -> Vec<TestOperation> {
         };
         let Some(id) = event.id() else { continue };
 
+        // The start time is the timestamp of the operation's first event.
+        // It is set once, when that event creates the record. So a first
+        // event without a representable timestamp leaves it `None`, and a
+        // later event does not fill it.
         let op = acc.entry(id.to_owned()).or_insert_with(|| {
             order.push(id.to_owned());
-            TestOperation::started(id.to_owned(), kind)
+            TestOperation {
+                start_time: event_time(event),
+                ..TestOperation::started(id.to_owned(), kind)
+            }
         });
 
         if op.sub_type.is_none() {
@@ -2652,6 +2940,14 @@ fn fold_history(events: &[Event]) -> Vec<TestOperation> {
             op.parent_id = event.parent_id().map(ToOwned::to_owned);
         }
         apply_event_transition(op, event);
+        // The end time is the timestamp of the terminal event. A retried
+        // step records `StepFailed` and then `StepStarted`, so a later
+        // non-terminal event clears the end time of an earlier failure.
+        op.end_time = if is_terminal_status(op.status) {
+            event_time(event)
+        } else {
+            None
+        };
     }
 
     order.iter().filter_map(|id| acc.get(id).cloned()).collect()
@@ -2663,10 +2959,13 @@ fn apply_event_transition(op: &mut TestOperation, event: &Event) {
     match event.event_type() {
         Some(EventType::WaitStarted) => {
             op.status = OperationStatus::Started;
-            op.wait.duration = event
-                .wait_started_details()
+            let details = event.wait_started_details();
+            op.wait.duration = details
                 .and_then(|d| u64::try_from(d.duration()).ok())
                 .map(std::time::Duration::from_secs);
+            op.wait.scheduled_end_time = details
+                .map(aws_sdk_lambda::types::WaitStartedDetails::scheduled_end_timestamp)
+                .and_then(|t| std::time::SystemTime::try_from(*t).ok());
         }
         Some(EventType::CallbackStarted) => {
             op.status = OperationStatus::Started;
@@ -2688,6 +2987,16 @@ fn apply_event_transition(op: &mut TestOperation, event: &Event) {
             op.status = OperationStatus::Failed;
             if let Some(details) = event.step_failed_details() {
                 set_attempt(op, details.retry_details());
+                // The latest `StepFailed` that carries a retry delay sets
+                // the next attempt time; one without a delay keeps it. A
+                // carried delay whose time cannot be represented sets
+                // `None`, so the value never describes an older retry.
+                if let Some(delay) = details
+                    .retry_details()
+                    .and_then(aws_sdk_lambda::types::RetryDetails::next_attempt_delay_seconds)
+                {
+                    op.step.next_attempt_time = next_attempt_time(event, delay);
+                }
             }
         }
         Some(EventType::WaitSucceeded) => op.status = OperationStatus::Succeeded,
@@ -2720,6 +3029,23 @@ fn apply_event_transition(op: &mut TestOperation, event: &Event) {
         _ => {}
     }
     set_error(op, operation_event_error(event));
+}
+
+/// The event's timestamp, or `None` when it has none or it lies outside the
+/// range of `SystemTime`.
+fn event_time(event: &Event) -> Option<std::time::SystemTime> {
+    event
+        .event_timestamp()
+        .and_then(|t| std::time::SystemTime::try_from(*t).ok())
+}
+
+/// The next attempt time of a `StepFailed` event: its timestamp plus its
+/// retry delay `delay_seconds`, as the JS cloud runner derives it. `None`
+/// when the event has no timestamp, the delay is negative, or the sum
+/// overflows `SystemTime`.
+fn next_attempt_time(event: &Event, delay_seconds: i32) -> Option<std::time::SystemTime> {
+    let delay = std::time::Duration::from_secs(u64::try_from(delay_seconds).ok()?);
+    event_time(event)?.checked_add(delay)
 }
 
 /// The `EventError` an operation event carries.
@@ -2845,6 +3171,12 @@ struct StoredOp {
     /// pending retry may run again. Set by a WAIT `START` and a STEP
     /// `RETRY`. Firing the operation keeps the value.
     due_at: Option<u64>,
+    /// The virtual time, in seconds, at which the record was created.
+    start_at: u64,
+    /// The virtual time, in seconds, at which the status first became
+    /// terminal (see [`StoredOp::set_status`]), or `None` while it never
+    /// has.
+    end_at: Option<u64>,
     callback_delivered: bool,
     /// The `ParentId` of the update that created the record. Later updates
     /// do not change it.
@@ -2868,6 +3200,7 @@ fn new_started_op(
     kind: OperationKind,
     sub_type: Option<String>,
     parent_id: Option<String>,
+    now: u64,
 ) -> StoredOp {
     StoredOp {
         id,
@@ -2884,6 +3217,8 @@ fn new_started_op(
         callback_id: None,
         wait_seconds: None,
         due_at: None,
+        start_at: now,
+        end_at: None,
         callback_delivered: false,
         parent_id,
         replay_children: false,
@@ -2891,6 +3226,35 @@ fn new_started_op(
         invoke_input: None,
         invoke_dispatched: false,
     }
+}
+
+impl StoredOp {
+    /// Sets the status. Every status write of the backend goes through
+    /// this method.
+    ///
+    /// `end_at` is the time the operation ended. A terminal status ends
+    /// the operation, so the first terminal status records `now` as
+    /// `end_at`. A later write keeps that first value. Because every path
+    /// calls this method, a new status path cannot forget `end_at`.
+    fn set_status(&mut self, status: OperationStatus, now: u64) {
+        self.status = status;
+        if self.end_at.is_none() && is_terminal_status(status) {
+            self.end_at = Some(now);
+        }
+    }
+}
+
+/// Whether `status` ends an operation: `Succeeded`, `Failed`, `TimedOut`,
+/// `Cancelled` or `Stopped`.
+fn is_terminal_status(status: OperationStatus) -> bool {
+    matches!(
+        status,
+        OperationStatus::Succeeded
+            | OperationStatus::Failed
+            | OperationStatus::TimedOut
+            | OperationStatus::Cancelled
+            | OperationStatus::Stopped
+    )
 }
 
 /// Decrements `counter` by one if it is above zero, and returns whether it
@@ -2928,6 +3292,9 @@ struct BackendState {
     /// The virtual time in seconds. It starts at 0 and moves only in
     /// [`Backend::advance`], between invocations.
     now: u64,
+    /// The wall-clock time the run started. A reported time is `base`
+    /// plus a virtual time (see [`BackendState::local_time`]).
+    base: std::time::SystemTime,
     /// The IDs of the records [`Backend::advance`] changed since the last
     /// envelope, in change order. The next envelope sends them as
     /// `UpdatedOperationIds` and clears them (see
@@ -3005,6 +3372,7 @@ impl Backend {
                 callback_counter: 0,
                 callback_replies,
                 now: 0,
+                base: std::time::SystemTime::now(),
                 updated_ids: Vec::new(),
             }),
             checkpoint_page_size,
@@ -3126,7 +3494,14 @@ impl Backend {
                 });
                 out.name.clone_from(&op.name);
                 out.parent_id.clone_from(&op.parent_id);
+                out.start_time = state.local_time(op.start_at);
+                out.end_time = op.end_at.and_then(|t| state.local_time(t));
+                // `due_at` is the wait's scheduled end and the step's next
+                // attempt time. Only a step `RETRY` sets it on a step.
+                let due = op.due_at.and_then(|t| state.local_time(t));
                 out.step.attempt = u32::try_from(op.attempt.max(0)).unwrap_or(0);
+                out.step.next_attempt_time = due;
+                out.wait.scheduled_end_time = due;
                 out.wait.duration = op
                     .wait_seconds
                     .and_then(|seconds| u64::try_from(seconds).ok())
@@ -3187,7 +3562,7 @@ impl Backend {
             // zipping pairs each reply with the record it matched.
             for (op, reply) in ops.iter_mut().zip(deliveries) {
                 if let Some(reply) = reply {
-                    reply.deliver_to(op);
+                    reply.deliver_to(op, *now);
                     updated_ids.push(op.id.clone());
                 }
             }
@@ -3200,11 +3575,12 @@ impl Backend {
         *now = next;
         for op in ops.iter_mut() {
             if timed_due_at(op).is_some_and(|due| due <= next) {
-                op.status = if op.kind == OperationKind::Wait {
+                let fired = if op.kind == OperationKind::Wait {
                     OperationStatus::Succeeded
                 } else {
                     OperationStatus::Ready
                 };
+                op.set_status(fired, next);
                 updated_ids.push(op.id.clone());
             }
         }
@@ -3258,7 +3634,10 @@ impl Backend {
     fn record_invoke_outcome(&self, id: &str, outcome: NestedOutcome) -> bool {
         let mut state = self.lock();
         let BackendState {
-            ops, updated_ids, ..
+            ops,
+            updated_ids,
+            now,
+            ..
         } = &mut *state;
         // The runner took `id` from the stored records, and the backend
         // never removes a record. No checkpoint reaches this backend while
@@ -3271,11 +3650,11 @@ impl Backend {
             .expect("a dispatched invoke record stays stored");
         match outcome {
             NestedOutcome::Succeeded(result) => {
-                op.status = OperationStatus::Succeeded;
+                op.set_status(OperationStatus::Succeeded, *now);
                 op.result = Some(result.unwrap_or_else(|| "null".to_owned()));
             }
             NestedOutcome::Failed(wire) => {
-                op.status = OperationStatus::Failed;
+                op.set_status(OperationStatus::Failed, *now);
                 op.error_type = wire.error_type().map(ToOwned::to_owned);
                 op.error_message = wire.error_message().map(ToOwned::to_owned);
                 op.error_data = wire.error_data().map(ToOwned::to_owned);
@@ -3410,6 +3789,12 @@ fn whole_seconds(value: Option<i32>) -> u64 {
 }
 
 impl BackendState {
+    /// The reported time of the virtual time `t`: the run's start time plus
+    /// `t` seconds. A sum past the range of `SystemTime` reports `None`.
+    fn local_time(&self, t: u64) -> Option<std::time::SystemTime> {
+        self.base.checked_add(std::time::Duration::from_secs(t))
+    }
+
     /// Finds a stored op by wire ID.
     fn find_mut(&mut self, id: &str) -> Option<&mut StoredOp> {
         self.ops.iter_mut().find(|op| op.id == id)
@@ -3458,6 +3843,7 @@ impl BackendState {
                 kind,
                 sub_type.clone(),
                 parent_id,
+                now,
             ));
         }
 
@@ -3498,19 +3884,19 @@ impl BackendState {
                 op.error_data = None;
                 op.stack_trace = Vec::new();
                 if op.kind == OperationKind::Wait {
-                    op.status = OperationStatus::Started;
+                    op.set_status(OperationStatus::Started, now);
                     op.wait_seconds = wait_seconds;
                     op.due_at = Some(now.saturating_add(whole_seconds(wait_seconds)));
                 } else if op.kind == OperationKind::Callback {
                     // The service creates a callback in `Started` and keeps
                     // it there until an external outcome. The backend
                     // assigns the callback id here.
-                    op.status = OperationStatus::Started;
+                    op.set_status(OperationStatus::Started, now);
                     if let Some(cb) = new_callback_id {
                         op.callback_id = Some(cb);
                     }
                 } else {
-                    op.status = OperationStatus::Started;
+                    op.set_status(OperationStatus::Started, now);
                     if op.kind == OperationKind::ChainedInvoke {
                         op.invoke_function = invoke_function;
                         op.invoke_input = payload;
@@ -3518,14 +3904,14 @@ impl BackendState {
                 }
             }
             OperationAction::Succeed => {
-                op.status = OperationStatus::Succeeded;
+                op.set_status(OperationStatus::Succeeded, now);
                 op.result = payload;
                 if op.kind == OperationKind::Context {
                     op.replay_children = replay_children;
                 }
             }
             OperationAction::Fail => {
-                op.status = OperationStatus::Failed;
+                op.set_status(OperationStatus::Failed, now);
                 if op.kind == OperationKind::Context {
                     op.replay_children = replay_children;
                 }
@@ -3535,7 +3921,7 @@ impl BackendState {
                 op.stack_trace = err_trace;
             }
             OperationAction::Retry => {
-                op.status = OperationStatus::Pending;
+                op.set_status(OperationStatus::Pending, now);
                 op.attempt += 1;
                 op.due_at = Some(now.saturating_add(whole_seconds(retry_delay)));
                 op.error_type = err_type;
@@ -7638,10 +8024,28 @@ mod tests {
         let baseline = unbatched().run(one_step_handler, ()).await.expect("runner");
         assert!(delayed.is_success(), "{:?}", delayed.error_message());
         assert_eq!(delayed.output(), baseline.output());
+        // Each run reports times from its own start, so the comparison
+        // drops the times.
         assert_eq!(
-            format!("{:?}", delayed.operations()),
-            format!("{:?}", baseline.operations())
+            format!("{:?}", without_times(delayed.operations())),
+            format!("{:?}", without_times(baseline.operations()))
         );
+    }
+
+    /// `operations` with every reported time removed, so two runs that
+    /// started at different wall-clock times compare equal.
+    fn without_times(operations: &[TestOperation]) -> Vec<TestOperation> {
+        operations
+            .iter()
+            .cloned()
+            .map(|mut op| {
+                op.start_time = None;
+                op.end_time = None;
+                op.step.next_attempt_time = None;
+                op.wait.scheduled_end_time = None;
+                op
+            })
+            .collect()
     }
 
     /// With the default zero latency the backend creates no tokio timer, so
@@ -11235,5 +11639,657 @@ mod tests {
                 .map_err(BoxError::from)
         })
         .await;
+    }
+
+    /// The detail of a step operation, or `None` for another kind.
+    fn step_details(op: &TestOperation) -> Option<&StepDetails> {
+        match op.details() {
+            TestOperationDetails::Step(step) => Some(step),
+            _ => None,
+        }
+    }
+
+    /// The detail of a wait operation, or `None` for another kind.
+    fn wait_details(op: &TestOperation) -> Option<&WaitDetails> {
+        match op.details() {
+            TestOperationDetails::Wait(wait) => Some(wait),
+            _ => None,
+        }
+    }
+
+    /// A `TestResult` holding `operations`, built without a run (the
+    /// crate-private constructor of the table tests).
+    fn result_with(operations: Vec<TestOperation>) -> TestResult<()> {
+        TestResult {
+            status: ExecutionStatus::Succeeded,
+            output: Some(()),
+            error: None,
+            operations,
+            invocations: 0,
+        }
+    }
+
+    /// Every column except the ones `disabled` names.
+    fn columns_without(disabled: &[&str]) -> PrintColumns {
+        let on = |name: &str| !disabled.contains(&name);
+        PrintColumns {
+            parent_id: on("parent_id"),
+            name: on("name"),
+            kind: on("kind"),
+            sub_type: on("sub_type"),
+            status: on("status"),
+            start_time: on("start_time"),
+            end_time: on("end_time"),
+            duration: on("duration"),
+        }
+    }
+
+    /// Only the columns `enabled` names.
+    fn columns_only(enabled: &[&str]) -> PrintColumns {
+        let on = |name: &str| enabled.contains(&name);
+        PrintColumns {
+            parent_id: on("parent_id"),
+            name: on("name"),
+            kind: on("kind"),
+            sub_type: on("sub_type"),
+            status: on("status"),
+            start_time: on("start_time"),
+            end_time: on("end_time"),
+            duration: on("duration"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_times_follow_virtual_clock() {
+        let result = LocalRunner::new()
+            .run(
+                |_e: (), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_i32) }).name("a").await?;
+                    ctx.wait(std::time::Duration::from_secs(10))
+                        .name("pause")
+                        .await?;
+                    ctx.step(|_| async { Ok(2_i32) }).name("b").await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success());
+        let a = result.operation("a").expect("step a");
+        let wait = result.operation("pause").expect("the wait");
+        let b = result.operation("b").expect("step b");
+        let start = result.operations()[0].start_time().expect("a start time");
+        let at = |n: u64| Some(start + std::time::Duration::from_secs(n));
+        assert_eq!(wait.start_time(), at(0));
+        assert_eq!(wait.end_time(), at(10));
+        assert_eq!(
+            wait_details(wait)
+                .expect("wait details")
+                .scheduled_end_time(),
+            at(10)
+        );
+        assert_eq!(b.start_time(), at(10));
+        assert_eq!(a.end_time(), a.start_time());
+    }
+
+    #[tokio::test]
+    async fn retried_step_reports_next_attempt_time() {
+        let result = LocalRunner::new()
+            .run(
+                |_e: (), ctx: DurableContext| async move {
+                    ctx.step(|step| async move {
+                        if step.attempt() == 1 {
+                            return Err::<i32, BoxError>("first attempt fails".into());
+                        }
+                        Ok(7)
+                    })
+                    .name("flaky")
+                    .retry_strategy(|_err, _attempt| RetryDecision::Retry {
+                        delay: std::time::Duration::from_secs(30),
+                    })
+                    .await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{:?}", result.error());
+        let step = result.operation("flaky").expect("the step");
+        let start = result.operations()[0].start_time().expect("start time");
+        let at30 = Some(start + std::time::Duration::from_secs(30));
+        assert_eq!(
+            step_details(step)
+                .expect("step details")
+                .next_attempt_time(),
+            at30
+        );
+        assert_eq!(step.end_time(), at30);
+    }
+
+    #[tokio::test]
+    async fn step_without_retry_has_no_next_attempt_time() {
+        let result = LocalRunner::new()
+            .run(
+                |_e: (), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_i32) }).name("once").await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let step = result.operation("once").expect("the step");
+        assert_eq!(
+            step_details(step)
+                .expect("step details")
+                .next_attempt_time(),
+            None
+        );
+    }
+
+    #[test]
+    fn end_time_keeps_the_first_terminal_status() {
+        // A record that ends at virtual time 5 keeps that end time when a
+        // later write at time 9 sets another terminal status.
+        let mut op = new_started_op("x".to_owned(), OperationKind::Step, None, None, 1);
+        op.set_status(OperationStatus::Pending, 3);
+        assert_eq!(op.end_at, None);
+        op.set_status(OperationStatus::Succeeded, 5);
+        op.set_status(OperationStatus::Failed, 9);
+        assert_eq!((op.start_at, op.end_at), (1, Some(5)));
+    }
+
+    #[test]
+    fn every_terminal_status_sets_end_at() {
+        for (status, terminal) in [
+            (OperationStatus::Started, false),
+            (OperationStatus::Pending, false),
+            (OperationStatus::Ready, false),
+            (OperationStatus::Succeeded, true),
+            (OperationStatus::Failed, true),
+            (OperationStatus::TimedOut, true),
+            (OperationStatus::Cancelled, true),
+            (OperationStatus::Stopped, true),
+        ] {
+            let mut op = new_started_op("x".to_owned(), OperationKind::Step, None, None, 0);
+            op.set_status(status, 4);
+            assert_eq!(op.end_at, terminal.then_some(4), "{status:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_reply_and_invoke_outcome_set_end_time() {
+        // A delivered callback reply and a chained invoke outcome both end
+        // their records at the clock time of the advance.
+        let result = LocalRunner::new()
+            .callback(CallbackReply::success(&true).expect("reply"))
+            .register_function("target", |_input: serde_json::Value| async move {
+                Ok::<_, BoxError>(serde_json::json!(1))
+            })
+            .run(
+                |_e: (), ctx: DurableContext| async move {
+                    ctx.wait(std::time::Duration::from_secs(4))
+                        .name("w")
+                        .await?;
+                    let cb = ctx.create_callback::<bool>().name("cb").await?;
+                    cb.result().await?;
+                    ctx.invoke::<serde_json::Value, _>("target", serde_json::json!(0))
+                        .name("call")
+                        .await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{:?}", result.error());
+        let start = result.operations()[0].start_time().expect("start time");
+        let at4 = Some(start + std::time::Duration::from_secs(4));
+        assert_eq!(result.operation("cb").expect("callback").end_time(), at4);
+        assert_eq!(result.operation("call").expect("invoke").end_time(), at4);
+    }
+
+    #[test]
+    fn local_time_past_the_system_time_range_is_none() {
+        let backend = Backend::new(QueuedReplies::default(), None);
+        let state = backend.lock();
+        assert_eq!(state.local_time(0), Some(state.base));
+        assert_eq!(state.local_time(u64::MAX), None);
+    }
+
+    #[test]
+    fn fold_history_fills_times() {
+        use aws_sdk_lambda::types::WaitStartedDetails;
+        let events = vec![
+            Event::builder()
+                .event_type(EventType::WaitStarted)
+                .id("w")
+                .event_id(1)
+                .event_timestamp(DateTime::from_secs(100))
+                .wait_started_details(
+                    WaitStartedDetails::builder()
+                        .duration(10)
+                        .scheduled_end_timestamp(DateTime::from_secs(110))
+                        .build()
+                        .expect("wait details"),
+                )
+                .build(),
+            Event::builder()
+                .event_type(EventType::WaitSucceeded)
+                .id("w")
+                .event_id(2)
+                .event_timestamp(DateTime::from_secs(110))
+                .build(),
+        ];
+        let ops = fold_history(&events);
+        let at = |n: u64| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(n));
+        assert_eq!(ops[0].start_time(), at(100));
+        assert_eq!(ops[0].end_time(), at(110));
+        assert_eq!(
+            wait_details(&ops[0])
+                .expect("wait details")
+                .scheduled_end_time(),
+            at(110)
+        );
+    }
+
+    #[test]
+    fn fold_history_derives_next_attempt_time() {
+        use aws_sdk_lambda::types::{RetryDetails, StepFailedDetails};
+        let failed = |id: i32, at: i64, delay: Option<i32>| {
+            let mut retry = RetryDetails::builder().current_attempt(1);
+            if let Some(delay) = delay {
+                retry = retry.next_attempt_delay_seconds(delay);
+            }
+            Event::builder()
+                .event_type(EventType::StepFailed)
+                .id("s")
+                .event_id(id)
+                .event_timestamp(DateTime::from_secs(at))
+                .step_failed_details(
+                    StepFailedDetails::builder()
+                        .retry_details(retry.build())
+                        .build(),
+                )
+                .build()
+        };
+        let at = |n: u64| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(n));
+        let ops = fold_history(&[failed(1, 100, Some(30))]);
+        assert_eq!(
+            step_details(&ops[0]).expect("step").next_attempt_time(),
+            at(130)
+        );
+        // A later failure without a delay keeps the earlier time, and the
+        // latest failure with a delay replaces it.
+        let ops = fold_history(&[failed(1, 100, Some(30)), failed(2, 200, None)]);
+        assert_eq!(
+            step_details(&ops[0]).expect("step").next_attempt_time(),
+            at(130)
+        );
+        let ops = fold_history(&[failed(1, 100, Some(30)), failed(2, 200, Some(5))]);
+        assert_eq!(
+            step_details(&ops[0]).expect("step").next_attempt_time(),
+            at(205)
+        );
+        // No delay, a negative delay or no timestamp gives no time.
+        let ops = fold_history(&[failed(1, 100, None)]);
+        assert_eq!(
+            step_details(&ops[0]).expect("step").next_attempt_time(),
+            None
+        );
+        let ops = fold_history(&[failed(1, 100, Some(-1))]);
+        assert_eq!(
+            step_details(&ops[0]).expect("step").next_attempt_time(),
+            None
+        );
+        let untimed = Event::builder()
+            .event_type(EventType::StepFailed)
+            .id("s")
+            .event_id(1)
+            .step_failed_details(
+                StepFailedDetails::builder()
+                    .retry_details(
+                        RetryDetails::builder()
+                            .current_attempt(1)
+                            .next_attempt_delay_seconds(30)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build();
+        let ops = fold_history(&[untimed]);
+        assert_eq!(
+            step_details(&ops[0]).expect("step").next_attempt_time(),
+            None
+        );
+    }
+
+    #[test]
+    fn fold_history_keeps_start_time_of_an_untimed_first_event() {
+        // The first event carries no timestamp and a later one does. The
+        // start time is the first event's timestamp, so it stays `None`.
+        let untimed = Event::builder()
+            .event_type(EventType::StepStarted)
+            .id("s")
+            .event_id(1)
+            .build();
+        let timed = Event::builder()
+            .event_type(EventType::StepSucceeded)
+            .id("s")
+            .event_id(2)
+            .event_timestamp(DateTime::from_secs(200))
+            .build();
+        let ops = fold_history(&[untimed, timed]);
+        assert_eq!(ops[0].start_time(), None);
+        assert_eq!(
+            ops[0].end_time(),
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(200))
+        );
+    }
+
+    #[test]
+    fn fold_history_clears_next_attempt_time_when_the_latest_is_unrepresentable() {
+        use aws_sdk_lambda::types::{RetryDetails, StepFailedDetails};
+        let failed = |id: i32, at: Option<i64>, delay: i32| {
+            let mut event = Event::builder()
+                .event_type(EventType::StepFailed)
+                .id("s")
+                .event_id(id)
+                .step_failed_details(
+                    StepFailedDetails::builder()
+                        .retry_details(
+                            RetryDetails::builder()
+                                .current_attempt(1)
+                                .next_attempt_delay_seconds(delay)
+                                .build(),
+                        )
+                        .build(),
+                );
+            if let Some(at) = at {
+                event = event.event_timestamp(DateTime::from_secs(at));
+            }
+            event.build()
+        };
+        let next = |events: &[Event]| {
+            step_details(&fold_history(events)[0])
+                .expect("step")
+                .next_attempt_time()
+        };
+        let earlier = failed(1, Some(100), 30);
+        assert!(next(std::slice::from_ref(&earlier)).is_some());
+        // The latest failure carries a delay but no timestamp.
+        assert_eq!(next(&[earlier.clone(), failed(2, None, 5)]), None);
+        // The latest failure carries a negative delay.
+        assert_eq!(next(&[earlier.clone(), failed(2, Some(200), -1)]), None);
+        // The latest failure's timestamp plus its delay overflows.
+        let last = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(i64::MAX.unsigned_abs()))
+            .expect("in the SystemTime range on this platform");
+        assert!(
+            last.checked_add(std::time::Duration::from_secs(5))
+                .is_none()
+        );
+        assert_eq!(
+            std::time::SystemTime::try_from(DateTime::from_secs(i64::MAX)).ok(),
+            Some(last)
+        );
+        assert_eq!(next(&[earlier, failed(2, Some(i64::MAX), 5)]), None);
+    }
+
+    #[test]
+    fn fold_history_clears_end_time_when_a_retry_starts() {
+        let event = |id: i32, kind: EventType, at: i64| {
+            Event::builder()
+                .event_type(kind)
+                .id("s")
+                .event_id(id)
+                .event_timestamp(DateTime::from_secs(at))
+                .build()
+        };
+        let at = |n: u64| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(n));
+        let failed = [
+            event(1, EventType::StepStarted, 100),
+            event(2, EventType::StepFailed, 101),
+        ];
+        assert_eq!(fold_history(&failed)[0].end_time(), at(101));
+        let retried = [
+            event(1, EventType::StepStarted, 100),
+            event(2, EventType::StepFailed, 101),
+            event(3, EventType::StepStarted, 131),
+        ];
+        let ops = fold_history(&retried);
+        assert_eq!(ops[0].start_time(), at(100));
+        assert_eq!(ops[0].end_time(), None);
+    }
+
+    #[tokio::test]
+    async fn display_prints_js_table() {
+        use std::fmt::Write as _;
+        let result = LocalRunner::new()
+            .run(
+                |_e: (), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_i32) }).name("fetch").await?;
+                    ctx.run_in_child_context(|child| async move {
+                        child.step(|_| async { Ok(2_i32) }).name("inner").await?;
+                        Ok(())
+                    })
+                    .name("group")
+                    .await?;
+                    ctx.wait(std::time::Duration::from_secs(1))
+                        .name("cooldown")
+                        .await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let g = result.operation("group").expect("the context").id();
+        let expected = format!(
+            "parentId | name | type | subType | status | duration\n\
+             - | fetch | STEP | Step | SUCCEEDED | 0ms\n\
+             - | group | CONTEXT | RunInChildContext | SUCCEEDED | 0ms\n\
+             {g} | inner | STEP | Step | SUCCEEDED | 0ms\n\
+             - | cooldown | WAIT | Wait | SUCCEEDED | 1000ms\n"
+        );
+        assert_eq!(
+            result
+                .display_with(columns_without(&["start_time", "end_time"]))
+                .to_string(),
+            expected
+        );
+        let cell = |t: Option<std::time::SystemTime>| iso_millis(unix_millis(t.expect("a time")));
+        let mut full =
+            "parentId | name | type | subType | status | startTime | endTime | duration\n"
+                .to_owned();
+        for (op, duration) in result
+            .operations()
+            .iter()
+            .zip(["0ms", "0ms", "0ms", "1000ms"])
+        {
+            writeln!(
+                full,
+                "{} | {} | {} | {} | {} | {} | {} | {duration}",
+                op.parent_id().unwrap_or("-"),
+                op.name().unwrap_or("-"),
+                op.kind().wire_str(),
+                op.sub_type().unwrap_or("-"),
+                op.status().wire_str(),
+                cell(op.start_time()),
+                cell(op.end_time()),
+            )
+            .expect("write to a String");
+        }
+        assert_eq!(format!("{result}"), full);
+    }
+
+    #[tokio::test]
+    async fn display_with_selects_columns() {
+        let result = LocalRunner::new()
+            .run(
+                |_e: (), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_i32) }).name("fetch").await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert_eq!(
+            result
+                .display_with(columns_only(&["name", "status"]))
+                .to_string(),
+            "name | status\nfetch | SUCCEEDED\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_prints_dash_for_absent_values() {
+        let result = LocalRunner::new()
+            .run(
+                |_e: (), ctx: DurableContext| async move {
+                    ctx.step(|_| async { Ok(1_i32) }).await?;
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert_eq!(
+            result
+                .display_with(columns_only(&["parent_id", "name"]))
+                .to_string(),
+            "parentId | name\n- | -\n"
+        );
+    }
+
+    #[test]
+    fn display_prints_dash_for_absent_times_and_sub_type() {
+        // A record with no sub-type, no start and no end prints `-` in
+        // those cells and in the duration.
+        let op = TestOperation::started("x".to_owned(), OperationKind::Step);
+        let only_start = TestOperation {
+            start_time: Some(std::time::UNIX_EPOCH),
+            ..TestOperation::started("y".to_owned(), OperationKind::Step)
+        };
+        let result = result_with(vec![op, only_start]);
+        assert_eq!(
+            result
+                .display_with(columns_only(&[
+                    "sub_type",
+                    "start_time",
+                    "end_time",
+                    "duration"
+                ]))
+                .to_string(),
+            "subType | startTime | endTime | duration\n\
+             - | - | - | -\n\
+             - | 1970-01-01T00:00:00.000Z | - | -\n"
+        );
+    }
+
+    #[test]
+    fn display_preserves_millisecond_fraction() {
+        let op = TestOperation {
+            start_time: Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(100_123)),
+            ..TestOperation::started("x".to_owned(), OperationKind::Step)
+        };
+        let result = result_with(vec![op]);
+        let table = result
+            .display_with(columns_only(&["start_time"]))
+            .to_string();
+        assert_eq!(table, "startTime\n1970-01-01T00:01:40.123Z\n");
+        assert!(table.ends_with(".123Z\n"));
+    }
+
+    #[test]
+    fn display_truncates_times_before_the_epoch_toward_zero() {
+        // 1.5 ms before the epoch truncates to -1 ms, which prints as the
+        // last millisecond of 1969 with the Euclidean remainder 999.
+        let before = std::time::UNIX_EPOCH - std::time::Duration::from_micros(1_500);
+        assert_eq!(unix_millis(before), -1);
+        assert_eq!(iso_millis(-1), "1969-12-31T23:59:59.999Z");
+        // A year the formatter cannot print prints `-`.
+        assert_eq!(iso_millis(i128::from(i64::MAX)), "-");
+        // Seconds that do not fit an `i64` print `-`.
+        assert_eq!(iso_millis(i128::MAX), "-");
+        assert_eq!(iso_millis(i128::MIN), "-");
+    }
+
+    #[test]
+    fn unix_millis_keeps_the_i64_endpoints_and_beyond() {
+        // The `i64::MIN` endpoint is a valid millisecond value. Narrowing
+        // its magnitude to `i64` before negation would reject it.
+        let min_span = std::time::Duration::from_millis(i64::MIN.unsigned_abs());
+        let at_min = std::time::UNIX_EPOCH
+            .checked_sub(min_span)
+            .expect("in the SystemTime range on this platform");
+        assert_eq!(unix_millis(at_min), i128::from(i64::MIN));
+        let max_span = std::time::Duration::from_millis(i64::MAX.unsigned_abs());
+        let at_max = std::time::UNIX_EPOCH
+            .checked_add(max_span)
+            .expect("in the SystemTime range on this platform");
+        assert_eq!(unix_millis(at_max), i128::from(i64::MAX));
+        // One millisecond past each endpoint is still exact.
+        let one = std::time::Duration::from_millis(1);
+        assert_eq!(
+            unix_millis(at_min.checked_sub(one).expect("in range")),
+            i128::from(i64::MIN) - 1
+        );
+        assert_eq!(
+            unix_millis(at_max.checked_add(one).expect("in range")),
+            i128::from(i64::MAX) + 1
+        );
+    }
+
+    #[test]
+    fn display_prints_duration_for_times_beyond_the_i64_millisecond_range() {
+        // Both times exist, but neither fits `i64` milliseconds and neither
+        // time cell can be formatted. The duration still prints exactly.
+        let span = std::time::Duration::from_millis(i64::MAX.unsigned_abs())
+            + std::time::Duration::from_millis(1);
+        let op = TestOperation {
+            start_time: std::time::UNIX_EPOCH.checked_sub(span),
+            end_time: std::time::UNIX_EPOCH.checked_add(span),
+            ..TestOperation::started("x".to_owned(), OperationKind::Step)
+        };
+        assert!(op.start_time.is_some() && op.end_time.is_some());
+        let table = result_with(vec![op])
+            .display_with(columns_only(&["start_time", "end_time", "duration"]))
+            .to_string();
+        assert_eq!(
+            table,
+            "startTime | endTime | duration\n- | - | 18446744073709551616ms\n"
+        );
+    }
+
+    #[test]
+    fn display_prints_duration_across_the_whole_i64_range() {
+        // Both times fit `i64` milliseconds, but `end - start` is about
+        // 2^64 ms and does not fit an `i64`. The cell prints it exactly.
+        let span = std::time::Duration::from_millis(i64::MAX.unsigned_abs());
+        let op = TestOperation {
+            start_time: std::time::UNIX_EPOCH.checked_sub(span),
+            end_time: std::time::UNIX_EPOCH.checked_add(span),
+            ..TestOperation::started("x".to_owned(), OperationKind::Step)
+        };
+        assert!(op.start_time.is_some() && op.end_time.is_some());
+        let table = result_with(vec![op])
+            .display_with(columns_only(&["duration"]))
+            .to_string();
+        assert_eq!(table, "duration\n18446744073709551614ms\n");
+    }
+
+    #[test]
+    fn display_empty_result() {
+        let result = result_with(Vec::new());
+        assert_eq!(format!("{result}"), "No operations found.\n");
+    }
+
+    #[test]
+    fn print_columns_default_enables_every_column() {
+        assert_eq!(PrintColumns::default(), columns_without(&[]));
     }
 }

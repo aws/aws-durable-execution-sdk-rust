@@ -170,8 +170,29 @@ async fn checkpoint_latency_delays_responses_and_changes_nothing_else() {
     assert_eq!(delayed.output(), Some(&42));
     assert_eq!(delayed.output(), baseline.output());
     assert_eq!(delayed.invocation_count(), baseline.invocation_count());
-    assert_eq!(
-        format!("{:?}", delayed.operations()),
-        format!("{:?}", baseline.operations())
-    );
+    // Each run reports times from its own start, so the comparison covers
+    // every recorded field except the start and end times.
+    assert_eq!(without_times(&delayed), without_times(&baseline));
+}
+
+/// Every field of each operation except its start and end times, as text.
+fn without_times<O>(result: &durable::test_util::TestResult<O>) -> Vec<String> {
+    result
+        .operations()
+        .iter()
+        .map(|op| {
+            format!(
+                "{} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                op.id(),
+                op.kind(),
+                op.sub_type(),
+                op.status(),
+                op.result(),
+                op.error(),
+                op.name(),
+                op.parent_id(),
+                op.details(),
+            )
+        })
+        .collect()
 }
