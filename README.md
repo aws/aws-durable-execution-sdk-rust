@@ -159,6 +159,10 @@ per invocation. The event type needs `Deserialize` and the output type needs
 conversion. Use `durable::wrap` instead of `durable::run` when you want to
 supply `Options` or add your own middleware around the service function.
 
+Checkpoint writes from concurrent operations batch into fewer requests by
+default, and `Options::builder().checkpoint_batching(false)` sends each one
+in its own request.
+
 A handler failure does not fail the Lambda invocation. The SDK reports it
 inside a successful invocation response, as a `FAILED` envelope the durable
 execution service reads, which is what moves the execution to the `FAILED`

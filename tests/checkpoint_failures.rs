@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
+use durable::Options;
 use durable::test_util::LocalRunner;
 
 /// The wire error type a checkpoint-write failure records: internal to
@@ -791,7 +792,12 @@ async fn nonretryable_flush_failure_terminalizes_dropped_contributor_and_fails_e
     let body_runs_h = Arc::clone(&body_runs);
 
     let result = LocalRunner::new()
-        .checkpoint_batching()
+        .options(
+            Options::builder()
+                .checkpoint_batching(true)
+                .build()
+                .expect("valid options"),
+        )
         .fail_checkpoints_after(1, 1)
         .run(
             move |_event: serde_json::Value, ctx: durable::DurableContext| {
@@ -869,7 +875,12 @@ async fn retryable_flush_failure_fails_invocation_and_reinvocation_converges() {
     let body_runs_h = Arc::clone(&body_runs);
 
     let result = LocalRunner::new()
-        .checkpoint_batching()
+        .options(
+            Options::builder()
+                .checkpoint_batching(true)
+                .build()
+                .expect("valid options"),
+        )
         .fail_checkpoints_after_retryable(1, 1)
         .run(
             move |_event: serde_json::Value, ctx: durable::DurableContext| {

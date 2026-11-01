@@ -849,8 +849,8 @@ where
     } = options;
     // The checkpoint buffer window: a configured delay is the coalescing
     // window; batching without a delay buffers with a zero window (writes
-    // batch behind the single-writer lock but are never held back); neither
-    // knob means immediate writes, exactly the pre-knob behavior.
+    // batch behind the single-writer lock but are never held back); batching
+    // off without a delay means immediate writes.
     let checkpoint_buffer_window = match (checkpoint_delay, checkpoint_batching) {
         (Some(delay), _) => Some(delay),
         (None, true) => Some(std::time::Duration::ZERO),
@@ -869,41 +869,11 @@ where
     )
 }
 
-/// Creates a durable Lambda service function whose execution client is the
-/// supplied [`client::ExecutionClient`]: the injection point the `test-util`
-/// [`LocalRunner`](test_util::LocalRunner) uses to drive the handler through
-/// the exact production entry path (envelope parsing, bootstrap pagination,
-/// driver, wire-error mapping, response envelope) against a fake transport.
-///
-/// `checkpoint_buffer_window` mirrors the `checkpoint_delay` /
-/// `checkpoint_batching` options (`Some(window)` for a coalescing window,
-/// `Some(Duration::ZERO)` for pure batching, `None` for immediate writes),
-/// letting the [`LocalRunner`](test_util::LocalRunner) exercise checkpoint
-/// buffering against its fake transport.
-#[cfg(feature = "test-util")]
-pub(crate) fn wrap_with_execution_client<F, E, Fut, O>(
-    handler: F,
-    exec_client: std::sync::Arc<dyn ExecutionClient>,
-    checkpoint_buffer_window: Option<std::time::Duration>,
-) -> impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture + Send + Sync
-where
-    F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
-    E: for<'de> Deserialize<'de> + Send + 'static,
-    Fut: Future<Output = Result<O, BoxError>> + Send,
-    O: Serialize + Send + 'static,
-{
-    wrap_with_provider(
-        handler,
-        ClientProvider::new(Some(exec_client)),
-        checkpoint_buffer_window,
-    )
-}
-
-/// Shared body of [`wrap`] and [`wrap_with_execution_client`]: builds the
-/// per-invocation service function on top of an already-resolved
-/// [`ClientProvider`]. Keeping a single body guarantees the `test-util`
-/// runner and production execute the same envelope parsing, pagination,
-/// driver, and error-mapping code.
+/// Body of [`wrap`]: builds the per-invocation service function on top of
+/// an already-resolved [`ClientProvider`]. The `test-util` `LocalRunner`
+/// calls [`wrap`] with its
+/// in-memory backend as the execution client, so it runs the same envelope
+/// parsing, pagination, driver, and error-mapping code as production.
 fn wrap_with_provider<F, E, Fut, O>(
     handler: F,
     provider: ClientProvider,

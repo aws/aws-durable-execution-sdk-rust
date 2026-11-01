@@ -343,8 +343,9 @@ enum CallbackOutcome {
 
 /// Drives a durable handler to completion in memory, simulating the backend.
 ///
-/// Construct with [`LocalRunner::new`], optionally queue callback outcomes
-/// with [`callback_success`](Self::callback_success) /
+/// Construct with [`LocalRunner::new`], optionally pass the handler's
+/// [`Options`](crate::Options) with [`options`](Self::options) and queue
+/// callback outcomes with [`callback_success`](Self::callback_success) /
 /// [`callback_timeout`](Self::callback_timeout), then drive a handler with
 /// [`run`](Self::run).
 ///
@@ -390,13 +391,11 @@ pub struct LocalRunner {
     /// (the default; see [`DEFAULT_STATE_PAGE_SIZE`]). This exercises the
     /// checkpoint pagination path in `DurableContext::checkpoint_updates`.
     checkpoint_page_size: Option<usize>,
-    /// Checkpoint coalescing window, mirroring
-    /// [`Options`](crate::Options)'s `checkpoint_delay`. `None` (the
-    /// default) writes every checkpoint immediately.
-    checkpoint_delay: Option<std::time::Duration>,
-    /// Whether checkpoint batching is enabled, mirroring
-    /// [`Options`](crate::Options)'s `checkpoint_batching`.
-    checkpoint_batching: bool,
+    /// The [`Options`](crate::Options) each run passes to
+    /// [`wrap`](crate::wrap), with the transport replaced by the in-memory
+    /// backend. [`Options::default()`](crate::Options::default) unless set
+    /// with [`options`](Self::options).
+    options: crate::Options,
     /// Number of upcoming checkpoint calls the backend rejects with a
     /// non-retryable error (fault injection; see
     /// [`fail_next_checkpoints`](Self::fail_next_checkpoints)).
@@ -442,8 +441,7 @@ impl LocalRunner {
             callback_outcomes: Vec::new(),
             initial_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
             checkpoint_page_size: Some(DEFAULT_STATE_PAGE_SIZE),
-            checkpoint_delay: None,
-            checkpoint_batching: false,
+            options: crate::Options::default(),
             checkpoint_failures: 0,
             checkpoint_failure_skip: 0,
             checkpoint_failures_retryable: false,
@@ -531,25 +529,32 @@ impl LocalRunner {
         self
     }
 
-    /// Enables checkpoint coalescing with the given delay window, exactly
-    /// as [`Options`](crate::Options)'s
-    /// [`checkpoint_delay`](crate::OptionsBuilder::checkpoint_delay) does
-    /// in production: checkpoints from concurrently running operations
-    /// coalesce into fewer writes, and the buffer flushes unconditionally
-    /// at suspension, execution completion, and callback creation.
+    /// Sets the [`Options`](crate::Options) every run passes to
+    /// [`wrap`](crate::wrap).
+    ///
+    /// Every field applies as in production, except the transport.
+    /// `sdk_config`, `lambda_client` and `execution_client` are ignored: the
+    /// runner always uses its in-memory backend. So a test can pass the same
+    /// `Options` its production handler uses.
     ///
     /// # Examples
     ///
     /// ```
+    /// use aws_durable_execution_sdk::Options;
     /// use aws_durable_execution_sdk::test_util::LocalRunner;
-    /// use std::time::Duration;
     ///
-    /// let runner = LocalRunner::new().checkpoint_delay(Duration::from_millis(20));
+    /// // Send each checkpoint in its own request.
+    /// let runner = LocalRunner::new().options(
+    ///     Options::builder()
+    ///         .checkpoint_batching(false)
+    ///         .build()
+    ///         .expect("valid options"),
+    /// );
     /// # drop(runner);
     /// ```
     #[must_use]
-    pub fn checkpoint_delay(mut self, delay: std::time::Duration) -> Self {
-        self.checkpoint_delay = Some(delay);
+    pub fn options(mut self, options: crate::Options) -> Self {
+        self.options = options;
         self
     }
 
@@ -626,28 +631,6 @@ impl LocalRunner {
         self.checkpoint_failure_skip = skip;
         self.checkpoint_failures = count;
         self.checkpoint_failures_retryable = true;
-        self
-    }
-
-    /// Enables checkpoint batching, exactly as [`Options`](crate::Options)'s
-    /// [`checkpoint_batching`](crate::OptionsBuilder::checkpoint_batching)
-    /// does in production: checkpoint writes go through a single ordered
-    /// writer, checkpoints arriving while a write is in flight are sent
-    /// together in the next call (split to respect per-request size
-    /// limits), and the buffer flushes unconditionally at suspension,
-    /// execution completion, and callback creation.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use aws_durable_execution_sdk::test_util::LocalRunner;
-    ///
-    /// let runner = LocalRunner::new().checkpoint_batching();
-    /// # drop(runner);
-    /// ```
-    #[must_use]
-    pub fn checkpoint_batching(mut self) -> Self {
-        self.checkpoint_batching = true;
         self
     }
 
@@ -774,15 +757,15 @@ impl LocalRunner {
         let client: Arc<dyn ExecutionClient> = Arc::clone(&backend) as Arc<dyn ExecutionClient>;
 
         // The handler runs behind the SAME service function production
-        // registers with the Lambda runtime: only the transport (the
-        // execution client) is faked. The buffer window is derived from the
-        // two knobs exactly as `wrap` derives it from `Options`.
-        let checkpoint_buffer_window = match (self.checkpoint_delay, self.checkpoint_batching) {
-            (Some(delay), _) => Some(delay),
-            (None, true) => Some(std::time::Duration::ZERO),
-            (None, false) => None,
-        };
-        let service = crate::wrap_with_execution_client(handler, client, checkpoint_buffer_window);
+        // registers with the Lambda runtime, with the caller's `Options`:
+        // only the transport is faked. The three transport fields are set
+        // directly, so `build()`'s check that rejects `execution_client`
+        // together with `lambda_client` does not apply.
+        let mut options = self.options.clone();
+        options.sdk_config = None;
+        options.lambda_client = None;
+        options.execution_client = Some(client);
+        let service = crate::wrap(handler, options);
 
         // Serialize the event once; the envelope re-delivers it per
         // invocation.
@@ -4288,9 +4271,16 @@ mod tests {
     /// flushed before the invocation reported PENDING.
     #[tokio::test(start_paused = true)]
     async fn checkpoint_delay_coalesces_and_flushes_before_suspension() {
-        // Baseline: identical handler, no coalescing.
+        // Baseline: identical handler, no coalescing. Batching is on by
+        // default, so the baseline opts out to stay the immediate-write
+        // baseline.
         let baseline_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let baseline_runner = LocalRunner::new().single_page();
+        let baseline_runner = LocalRunner::new().single_page().options(
+            crate::Options::builder()
+                .checkpoint_batching(false)
+                .build()
+                .expect("valid options"),
+        );
         let baseline_backend = Arc::new(Backend::new(Vec::new(), None));
         let baseline = baseline_runner
             .run_on_backend(
@@ -4304,9 +4294,12 @@ mod tests {
 
         // Coalesced: same handler with a checkpoint delay window.
         let coalesced_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let coalesced_runner = LocalRunner::new()
-            .single_page()
-            .checkpoint_delay(std::time::Duration::from_millis(50));
+        let coalesced_runner = LocalRunner::new().single_page().options(
+            crate::Options::builder()
+                .checkpoint_delay(std::time::Duration::from_millis(50))
+                .build()
+                .expect("valid options"),
+        );
         let coalesced_backend = Arc::new(Backend::new(Vec::new(), None));
         let coalesced = coalesced_runner
             .run_on_backend(
@@ -4347,6 +4340,159 @@ mod tests {
         );
     }
 
+    /// A runner that sends each checkpoint in its own request.
+    fn unbatched_runner() -> LocalRunner {
+        LocalRunner::new().single_page().options(
+            crate::Options::builder()
+                .checkpoint_batching(false)
+                .build()
+                .expect("valid options"),
+        )
+    }
+
+    /// Runs `handler` on a retained backend and returns the number of
+    /// checkpoint calls the backend received.
+    async fn checkpoint_calls<O, F, Fut>(runner: &LocalRunner, handler: F) -> usize
+    where
+        O: Serialize + DeserializeOwned + Send + 'static,
+        F: Fn((), DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send,
+    {
+        let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
+        let result = runner
+            .run_on_backend(Arc::clone(&backend), handler, ())
+            .await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        backend.checkpoint_call_count()
+    }
+
+    /// A runner built with `new()` batches checkpoints: concurrent steps
+    /// send fewer checkpoint calls than with `checkpoint_batching(false)`.
+    #[tokio::test(start_paused = true)]
+    async fn new_runner_batches_by_default() {
+        let execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let default_calls = checkpoint_calls(
+            &LocalRunner::new().single_page(),
+            coalescing_probe_handler(Arc::clone(&execs)),
+        )
+        .await;
+        let unbatched_calls = checkpoint_calls(
+            &unbatched_runner(),
+            coalescing_probe_handler(Arc::clone(&execs)),
+        )
+        .await;
+        assert!(
+            default_calls < unbatched_calls,
+            "the default runner must batch: default={default_calls}, \
+             unbatched={unbatched_calls}"
+        );
+    }
+
+    /// A sequential handler has no concurrent writes to batch, so it sends
+    /// the same number of checkpoint calls with and without batching.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_handler_sends_one_request_per_checkpoint() {
+        let handler = |(), ctx: DurableContext| async move {
+            let a = ctx.step(|_| async { Ok(1_i32) }).name("a").await?;
+            let b = ctx.step(move |_| async move { Ok(a + 1) }).name("b").await?;
+            Ok::<_, BoxError>(b)
+        };
+        let default_calls = checkpoint_calls(&LocalRunner::new().single_page(), handler).await;
+        let unbatched_calls = checkpoint_calls(&unbatched_runner(), handler).await;
+        assert_eq!(
+            default_calls, unbatched_calls,
+            "a sequential handler must send one request per checkpoint"
+        );
+    }
+
+    /// A transport that fails every call and counts how often it was used.
+    struct CountingClient {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ExecutionClient for CountingClient {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(ExecutionClientError::new(
+                    crate::client::ExecutionClientErrorScope::Execution,
+                    "must not be called",
+                ))
+            })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(ExecutionClientError::new(
+                    crate::client::ExecutionClientErrorScope::Execution,
+                    "must not be called",
+                ))
+            })
+        }
+    }
+
+    /// A one-step handler that returns 42.
+    async fn one_step_handler((): (), ctx: DurableContext) -> Result<i32, BoxError> {
+        Ok(ctx.step(|_| async { Ok(42_i32) }).name("only").await?)
+    }
+
+    /// The runner replaces the transport in the supplied `Options` with its
+    /// in-memory backend, so a test can pass its production `Options`.
+    #[tokio::test]
+    async fn runner_ignores_the_transport_in_options() {
+        // Case 1: an offline Lambda client. It has no credentials, so a run
+        // that used it would fail.
+        let conf = aws_sdk_lambda::config::Config::builder()
+            .behavior_version(aws_sdk_lambda::config::BehaviorVersion::latest())
+            .region(aws_sdk_lambda::config::Region::new("us-east-1"))
+            .build();
+        let lambda_options = crate::Options::builder()
+            .lambda_client(aws_sdk_lambda::Client::from_conf(conf))
+            .build()
+            .expect("valid options");
+        let result = LocalRunner::new()
+            .options(lambda_options)
+            .run(one_step_handler, ())
+            .await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&42));
+
+        // Case 2: a caller-supplied execution client that fails every call.
+        let counting = Arc::new(CountingClient {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client_options = crate::Options::builder()
+            .execution_client(Arc::clone(&counting) as Arc<dyn ExecutionClient>)
+            .build()
+            .expect("valid options");
+        let result = LocalRunner::new()
+            .options(client_options)
+            .run(one_step_handler, ())
+            .await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&42));
+        assert_eq!(
+            counting.calls.load(Ordering::SeqCst),
+            0,
+            "the runner must never call the supplied execution client"
+        );
+    }
+
     /// `checkpoint_delay` with a whole-handler completion: the terminal
     /// SUCCEEDED envelope is only reported after the end-of-invocation
     /// flush drains the buffer, so a sequential handler under a large
@@ -4355,7 +4501,12 @@ mod tests {
     async fn checkpoint_delay_completes_sequential_handlers() {
         let result = LocalRunner::new()
             .single_page()
-            .checkpoint_delay(std::time::Duration::from_millis(20))
+            .options(
+                crate::Options::builder()
+                    .checkpoint_delay(std::time::Duration::from_millis(20))
+                    .build()
+                    .expect("valid options"),
+            )
             .run(
                 |n: i32, ctx: DurableContext| async move {
                     let v = ctx
@@ -4393,7 +4544,12 @@ mod tests {
         let backend = Arc::new(Backend::new(Vec::new(), None));
         let result = LocalRunner::new()
             .single_page()
-            .checkpoint_batching()
+            .options(
+                crate::Options::builder()
+                    .checkpoint_batching(true)
+                    .build()
+                    .expect("valid options"),
+            )
             .run_on_backend(
                 Arc::clone(&backend),
                 coalescing_probe_handler(Arc::clone(&execs)),
@@ -4435,7 +4591,12 @@ mod tests {
     /// subsequent contributor as here, before any retryable fault can.)
     #[tokio::test]
     async fn retained_nonretryable_failure_terminalizes_orphan_and_fails_execution() {
-        let runner = LocalRunner::new().checkpoint_batching();
+        let runner = LocalRunner::new().options(
+            crate::Options::builder()
+                .checkpoint_batching(true)
+                .build()
+                .expect("valid options"),
+        );
         let backend = Arc::new(Backend::new(Vec::new(), runner.checkpoint_page_size));
 
         // Call plan:

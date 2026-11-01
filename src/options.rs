@@ -68,6 +68,7 @@ impl std::error::Error for OptionsValidationError {}
 ///     .expect("valid default config");
 /// # drop(options);
 /// ```
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct Options {
     /// A user-built AWS SDK config used to construct the Lambda client.
@@ -78,12 +79,15 @@ pub struct Options {
     /// A caller-supplied transport. When set, it replaces the Lambda
     /// transport for both service calls.
     pub(crate) execution_client: Option<Arc<dyn ExecutionClient>>,
-    /// Coalescing window for checkpoint writes. `None` (the default) writes
-    /// every checkpoint immediately, exactly as before this knob existed.
+    /// Coalescing window for checkpoint writes. `None` (the default) adds
+    /// no window: with batching on (the default), writes batch with a zero
+    /// window. Immediate writes need `checkpoint_batching(false)` without a
+    /// delay.
     pub(crate) checkpoint_delay: Option<Duration>,
     /// Whether checkpoint writes batch behind the single-writer flush lock
-    /// even without a coalescing window. `false` (the default) keeps
-    /// immediate writes.
+    /// even without a coalescing window. `true` (the default) batches with
+    /// a zero window. `false` without a delay writes each checkpoint
+    /// immediately.
     pub(crate) checkpoint_batching: bool,
 }
 
@@ -104,7 +108,7 @@ impl Default for Options {
             lambda_client: None,
             execution_client: None,
             checkpoint_delay: None,
-            checkpoint_batching: false,
+            checkpoint_batching: true,
         }
     }
 }
@@ -333,7 +337,8 @@ impl OptionsBuilder {
     ///   because the service assigns the callback ID in the checkpoint
     ///   response and the handler needs that ID right away.
     ///
-    /// When unset (the default), every checkpoint is written immediately.
+    /// When unset (the default), no window is added. Batching, which is on
+    /// by default, still never holds a write back.
     ///
     /// # Examples
     ///
@@ -387,8 +392,8 @@ impl OptionsBuilder {
     ///   because the service assigns the callback ID in the checkpoint
     ///   response and the handler needs that ID right away.
     ///
-    /// When unset or `false` (the default), every checkpoint is written
-    /// immediately.
+    /// Batching is on by default. `false` sends each checkpoint in its own
+    /// request as soon as it is written.
     ///
     /// # Examples
     ///
@@ -396,7 +401,7 @@ impl OptionsBuilder {
     /// use aws_durable_execution_sdk::Options;
     ///
     /// let opts = Options::builder()
-    ///     .checkpoint_batching(true)
+    ///     .checkpoint_batching(false)
     ///     .build()
     ///     .expect("valid config");
     /// # drop(opts);
@@ -452,7 +457,7 @@ impl OptionsBuilder {
             lambda_client: self.lambda_client,
             execution_client: self.execution_client,
             checkpoint_delay: self.checkpoint_delay,
-            checkpoint_batching: self.checkpoint_batching.unwrap_or(false),
+            checkpoint_batching: self.checkpoint_batching.unwrap_or(true),
         })
     }
 }
@@ -571,11 +576,15 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_batching_defaults_off() {
+    fn checkpoint_batching_defaults_on() {
+        assert!(
+            Options::default().checkpoint_batching,
+            "Options::default() must batch checkpoints"
+        );
         let opts = Options::builder().build().expect("valid");
         assert!(
-            !opts.checkpoint_batching,
-            "unset batching must stay off so checkpoints write immediately"
+            opts.checkpoint_batching,
+            "unset batching must default to on in build()"
         );
     }
 

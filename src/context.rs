@@ -59,8 +59,10 @@ struct Inner {
     /// Checkpoint-write coalescer, present only when
     /// [`Options`](crate::Options) configured a `checkpoint_delay` and/or
     /// `checkpoint_batching`. Shared with every child context so updates
-    /// from all namespaces coalesce into the same batches. `None` means
-    /// every checkpoint writes immediately (the default).
+    /// from all namespaces coalesce into the same batches. A zero-window
+    /// batching coalescer is the default. `None` means every checkpoint
+    /// writes immediately, which needs `checkpoint_batching(false)` without
+    /// a `checkpoint_delay`.
     coalescer: Option<Arc<CheckpointCoalescer>>,
     /// Cached parent wire ID: the SHA-256 hash of this context's prefix
     /// (positional ID of the parent operation). `None` for root contexts.
@@ -279,10 +281,11 @@ impl DurableContext {
     /// Creates a root context with a client, token, and checkpoint
     /// buffering window threaded in from
     /// [`Options`](crate::Options) (internal). `checkpoint_buffer_window`
-    /// is `None` for immediate writes (the default), `Some(window)` for a
-    /// `checkpoint_delay` coalescing window, and `Some(Duration::ZERO)` for
-    /// pure `checkpoint_batching` (no added delay; writes batch behind the
-    /// single-writer lock).
+    /// is `Some(Duration::ZERO)` for pure `checkpoint_batching` (the
+    /// default: no added delay; writes batch behind the single-writer
+    /// lock), `Some(window)` for a `checkpoint_delay` coalescing window,
+    /// and `None` for immediate writes, which need
+    /// `checkpoint_batching(false)` without a delay.
     pub(crate) fn new_root_with_client_and_defaults(
         execution_arn: String,
         lambda_context: lambda_runtime::Context,
