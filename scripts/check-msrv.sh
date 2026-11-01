@@ -16,7 +16,7 @@
 #
 # Wired into `make check`. POSIX sh, no bashisms.
 
-set -e
+# Every failure exits non-zero explicitly, so no check relies on set -e.
 
 # Source of truth: the root manifest
 
@@ -50,5 +50,5 @@ if ! rustup toolchain list | grep -q "^$MSRV-"; then
 fi
 
 echo "msrv-check: RUSTFLAGS=\"-D warnings\" cargo +$MSRV check --all-targets --all-features"
-RUSTFLAGS="-D warnings" cargo "+$MSRV" check --all-targets --all-features
+RUSTFLAGS="-D warnings" cargo "+$MSRV" check --all-targets --all-features || exit 1
 echo "msrv-check OK: the SDK compiles warning-free on Rust $MSRV."

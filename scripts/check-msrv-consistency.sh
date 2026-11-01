@@ -19,7 +19,7 @@
 #
 # POSIX sh, no bashisms.
 
-set -e
+# Every failure exits non-zero explicitly, so no check relies on set -e.
 
 FAIL=0
 

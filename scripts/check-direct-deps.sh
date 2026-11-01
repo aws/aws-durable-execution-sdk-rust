@@ -21,13 +21,13 @@
 #
 # POSIX sh, no bashisms.
 
-set -e
+# Every failure exits non-zero explicitly, so no check relies on set -e.
 
 # Temporary files, created once and cleaned up on any exit path. Keeping
 # them at the top level (rather than per call) lets a single trap own them.
-TREE_FILE=$(mktemp /tmp/check-direct-deps-tree.XXXXXX)
-TREE_ERR_FILE=$(mktemp /tmp/check-direct-deps-tree-err.XXXXXX)
-VIOLATIONS_FILE=$(mktemp /tmp/check-direct-deps-violations.XXXXXX)
+TREE_FILE=$(mktemp /tmp/check-direct-deps-tree.XXXXXX) || exit 1
+TREE_ERR_FILE=$(mktemp /tmp/check-direct-deps-tree-err.XXXXXX) || exit 1
+VIOLATIONS_FILE=$(mktemp /tmp/check-direct-deps-violations.XXXXXX) || exit 1
 trap 'rm -f "$TREE_FILE" "$TREE_ERR_FILE" "$VIOLATIONS_FILE"' EXIT INT HUP TERM
 
 # The always-on production dependencies per the design spec. The allowlist
@@ -143,11 +143,11 @@ check_graph() {
 }
 
 # Pass 1: the default-feature graph must contain only the always-on crates.
-check_graph "$ALWAYS_ON" "default features"
+check_graph "$ALWAYS_ON" "default features" || exit 1
 
 # Pass 2: with every feature enabled, only always-on plus approved optional
 # crates may appear.
-check_graph "$ALWAYS_ON $OPTIONAL_ALLOWLIST" "--all-features" --all-features
+check_graph "$ALWAYS_ON $OPTIONAL_ALLOWLIST" "--all-features" --all-features || exit 1
 
 echo "direct-dep-allowlist OK: default-feature graph limited to the always-on allowlist;"
 echo "all-features graph adds only approved optional crates ($OPTIONAL_ALLOWLIST)."

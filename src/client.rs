@@ -1066,9 +1066,8 @@ pub(crate) fn merge_operations_into_log(log: &CheckpointLog, operations: &[Opera
 /// This is the single production decision point for bootstrap pagination.
 /// `first_page` is the log parsed from the inline
 /// `InitialExecutionState`, and `next_marker` is its `NextMarker`.
-/// `first_page_input` is `None` when the inline page holds no EXECUTION
-/// operation, and `Some(input)` when it holds one, with `input` that
-/// operation's `InputPayload`.
+/// `first_page_input` says whether the inline page holds the EXECUTION
+/// operation, and if so carries that operation's `InputPayload`.
 ///
 /// - Without a marker the inline page is the whole state. The function
 ///   returns `first_page` and the inline input unchanged, and calls nothing.
@@ -1087,7 +1086,7 @@ pub(crate) async fn resolve_bootstrap_log(
     execution_arn: &str,
     checkpoint_token: &str,
     first_page: CheckpointLog,
-    first_page_input: Option<Option<String>>,
+    first_page_input: PageInput,
     next_marker: Option<&str>,
 ) -> Result<(CheckpointLog, Option<String>), ExecutionClientError> {
     let mut input = first_page_input;
@@ -1099,16 +1098,17 @@ pub(crate) async fn resolve_bootstrap_log(
         marker = page.next_marker().map(str::to_owned);
         // The checkpoint log skips EXECUTION operations, so the input is
         // read from the raw page before the page is merged.
-        if input.is_none() {
-            input = page
+        if input == PageInput::NoExecutionOperation
+            && let Some(op) = page
                 .operations
                 .iter()
                 .find(|op| op.r#type == OperationType::Execution)
-                .map(|op| {
-                    op.execution_details
-                        .as_ref()
-                        .and_then(|d| d.input_payload.clone())
-                });
+        {
+            input = PageInput::Execution(
+                op.execution_details
+                    .as_ref()
+                    .and_then(|d| d.input_payload.clone()),
+            );
         }
         for op in page
             .operations
@@ -1119,7 +1119,33 @@ pub(crate) async fn resolve_bootstrap_log(
             first_page.insert(wire_id, record);
         }
     }
-    Ok((first_page, input.flatten()))
+    Ok((first_page, input.into_payload()))
+}
+
+/// What one page of the execution state holds of the execution input.
+///
+/// The input is the `InputPayload` of the EXECUTION operation. That
+/// operation may sit on a later page, so a page that lacks it differs from
+/// a page whose EXECUTION operation has no payload. Only the first case
+/// makes [`resolve_bootstrap_log`] keep searching the fetched pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PageInput {
+    /// The page holds no EXECUTION operation.
+    NoExecutionOperation,
+    /// The page holds the EXECUTION operation. The value is its
+    /// `InputPayload`, or `None` when the payload is absent or JSON `null`.
+    Execution(Option<String>),
+}
+
+impl PageInput {
+    /// Returns the `InputPayload`, or `None` when the page holds no
+    /// EXECUTION operation or the operation has no payload.
+    pub(crate) fn into_payload(self) -> Option<String> {
+        match self {
+            Self::NoExecutionOperation => None,
+            Self::Execution(payload) => payload,
+        }
+    }
 }
 
 /// Maps SDK `OperationStatus` to internal `CheckpointStatus`.
@@ -1320,6 +1346,12 @@ mod tests {
     /// Drives `wrap` over `sdk_client` with a one-step handler whose step
     /// the initial state already records as `STARTED`, so the step writes
     /// no START and its first request is its SUCCEED. Returns the response.
+    ///
+    /// Checkpoint batching is off, so each checkpoint is its own request
+    /// and a test can count the requests. With batching on, the end of
+    /// the invocation sends one more terminal `FAIL` for the step whose
+    /// batched `SUCCEED` got no token, because the step's own `FAIL` also
+    /// got no token and so the log does not show the step terminal.
     async fn invoke_started_step(sdk_client: aws_sdk_lambda::Client) -> serde_json::Value {
         let service = crate::wrap(
             |_event: serde_json::Value, ctx: crate::DurableContext| async move {
@@ -1328,6 +1360,7 @@ mod tests {
             },
             crate::Options::builder()
                 .execution_client(Arc::new(LambdaExecutionClient::new(sdk_client)))
+                .checkpoint_batching(false)
                 .build()
                 .expect("options build"),
         );
@@ -1715,7 +1748,7 @@ mod tests {
             "arn:test",
             "tok",
             first_page,
-            Some(Some("{}".to_owned())),
+            PageInput::Execution(Some("{}".to_owned())),
             Some("m-1"),
         )
         .await
@@ -1811,7 +1844,7 @@ mod tests {
             "arn:test",
             "tok",
             operations_to_checkpoint_log(&[]),
-            None,
+            PageInput::NoExecutionOperation,
             Some("m-1"),
         )
         .await

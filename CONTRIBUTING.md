@@ -78,10 +78,11 @@ dependency policy section below explains what adding to it involves.
 ## `make check`
 
 `make check` is the single entry point, and it must pass before you push. It
-runs nine commands in three groups, named after the `ci.yml` jobs that run them:
-`check-sdk`, `dependencies` and `msrv`. Inside a group, the first failing
-command ends the group. The next group still runs. A summary lists each group's
-result, and any failure fails the run:
+runs nine commands in three make targets, named after the `ci.yml` jobs that
+run them: `check-sdk`, `dependencies` and `msrv`. Each command is one recipe
+line of its target, and make stops at the first command that fails. So any
+failing command fails `make check`. `make -k check` also runs the remaining
+targets after a failure:
 
 | Command | Rejects |
 | --- | --- |
@@ -116,7 +117,7 @@ say why.
 your incremental build cache survives it. `make ci` runs everything `ci.yml`
 runs on a push to `main`, and it needs no AWS:
 
-- the three `make check` groups;
+- the three `make check` targets;
 - `external-types`, which rejects a foreign type in the public API that the
   allowlist under `[package.metadata.cargo_check_external_types]` in
   `Cargo.toml` does not name;
@@ -129,10 +130,12 @@ runs on a push to `main`, and it needs no AWS:
 
 `make ci` sets `RUSTFLAGS="-D warnings"` and `CARGO_PROFILE_DEV_DEBUG=0`, as
 `ci.yml` does, so a warning that `make check` lets through fails it. Run it
-before a push that CI must not fail. Each group is also a target of its own:
+before a push that CI must not fail. Each of these is a target of its own:
 `make check-sdk`, `make msrv`, `make dependencies`, `make external-types`,
 `make feature-powerset` and `make workspaces`. Each `ci.yml` job calls its
-target, so CI and a local run execute the same commands, from `scripts/ci.sh`.
+target, so CI and a local run execute the same commands, from the `Makefile`.
+`make ci` runs every target with `make -k`, so it reports every failing target
+and still fails when any one fails.
 
 Every target checks its tools before it runs anything. A missing tool, or a
 tool at another version than the one CI pins, fails the target with the

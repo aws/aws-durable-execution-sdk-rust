@@ -448,15 +448,17 @@ fn parse_envelope(
 /// `InitialExecutionState.Operations`. This function reads the first
 /// operation of that list whose `Type` is `EXECUTION`.
 ///
-/// - No such operation returns `Ok(None)`. The operation may be on a later
-///   page, which [`client::resolve_bootstrap_log`] fetches.
-/// - An absent or JSON `null` `InputPayload` returns `Ok(Some(None))`.
-/// - A string `InputPayload` returns `Ok(Some(Some(value)))`.
+/// - No such operation returns `PageInput::NoExecutionOperation`. The
+///   operation may be on a later page, which
+///   [`client::resolve_bootstrap_log`] fetches.
+/// - An absent or JSON `null` `InputPayload` returns
+///   `PageInput::Execution(None)`.
+/// - A string `InputPayload` returns `PageInput::Execution(Some(value))`.
 /// - Any other `InputPayload` fails the invocation. So a malformed
 ///   envelope fails before pagination or the handler runs.
 fn inline_input_payload(
     payload: &serde_json::Value,
-) -> Result<Option<Option<String>>, lambda_runtime::Error> {
+) -> Result<client::PageInput, lambda_runtime::Error> {
     let execution_op = payload
         .get("InitialExecutionState")
         .and_then(|s| s.get("Operations"))
@@ -469,14 +471,16 @@ fn inline_input_payload(
             })
         });
     let Some(op) = execution_op else {
-        return Ok(None);
+        return Ok(client::PageInput::NoExecutionOperation);
     };
     match op
         .get("ExecutionDetails")
         .and_then(|d| d.get("InputPayload"))
     {
-        None | Some(serde_json::Value::Null) => Ok(Some(None)),
-        Some(serde_json::Value::String(value)) => Ok(Some(Some(value.clone()))),
+        None | Some(serde_json::Value::Null) => Ok(client::PageInput::Execution(None)),
+        Some(serde_json::Value::String(value)) => {
+            Ok(client::PageInput::Execution(Some(value.clone())))
+        }
         Some(_) => Err(lambda_runtime::Error::from(
             "malformed invocation envelope: InputPayload is not a string".to_owned(),
         )),
@@ -2036,7 +2040,7 @@ mod tests {
             "arn:test",
             "token",
             inline_log,
-            None,
+            client::PageInput::NoExecutionOperation,
             Some("page-2-marker"),
         )
         .await;
@@ -2104,7 +2108,7 @@ mod tests {
             "arn:test",
             "token",
             inline_log,
-            Some(Some("\"inline-input\"".to_owned())),
+            client::PageInput::Execution(Some("\"inline-input\"".to_owned())),
             None,
         )
         .await;
@@ -2295,7 +2299,7 @@ mod tests {
                 }]
             }
         });
-        let input = inline_input_payload(&payload).unwrap().flatten();
+        let input = inline_input_payload(&payload).unwrap().into_payload();
         let result: Result<String, _> = extract_customer_input(input.as_deref());
         assert_eq!(result.unwrap(), "hello");
     }
@@ -2312,8 +2316,9 @@ mod tests {
             }
         });
         let input = inline_input_payload(&payload).unwrap();
-        assert_eq!(input, Some(None));
-        let result: serde_json::Value = extract_customer_input(input.flatten().as_deref()).unwrap();
+        assert_eq!(input, client::PageInput::Execution(None));
+        let result: serde_json::Value =
+            extract_customer_input(input.into_payload().as_deref()).unwrap();
         assert_eq!(result, serde_json::json!({}));
     }
 
@@ -2329,13 +2334,19 @@ mod tests {
             })
         };
         let step_only = envelope(serde_json::json!([{ "Id": "s1", "Type": "STEP" }]));
-        assert_eq!(inline_input_payload(&step_only).unwrap(), None);
+        assert_eq!(
+            inline_input_payload(&step_only).unwrap(),
+            client::PageInput::NoExecutionOperation
+        );
         let no_operations = serde_json::json!({
             "DurableExecutionArn": "arn:test",
             "CheckpointToken": "tok",
             "InitialExecutionState": { "NextMarker": "m-1" }
         });
-        assert_eq!(inline_input_payload(&no_operations).unwrap(), None);
+        assert_eq!(
+            inline_input_payload(&no_operations).unwrap(),
+            client::PageInput::NoExecutionOperation
+        );
         // The first EXECUTION operation is read, wherever it sits.
         let later = envelope(serde_json::json!([
             { "Id": "s1", "Type": "STEP", "ExecutionDetails": { "InputPayload": "\"wrong\"" } },
@@ -2343,12 +2354,15 @@ mod tests {
         ]));
         assert_eq!(
             inline_input_payload(&later).unwrap(),
-            Some(Some("\"right\"".to_owned()))
+            client::PageInput::Execution(Some("\"right\"".to_owned()))
         );
         let null = envelope(serde_json::json!([
             { "Id": "e", "Type": "EXECUTION", "ExecutionDetails": { "InputPayload": null } }
         ]));
-        assert_eq!(inline_input_payload(&null).unwrap(), Some(None));
+        assert_eq!(
+            inline_input_payload(&null).unwrap(),
+            client::PageInput::Execution(None)
+        );
         let number = envelope(serde_json::json!([
             { "Id": "e", "Type": "EXECUTION", "ExecutionDetails": { "InputPayload": 5 } }
         ]));
@@ -2425,12 +2439,10 @@ mod tests {
             Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
         > {
             self.markers.lock().unwrap().push(marker.map(str::to_owned));
-            let page = marker
-                .and_then(|m| self.pages.get(m))
-                .map(|p| {
-                    GetStateOutput::new(p.operations.clone(), p.next_marker().map(str::to_owned))
-                })
-                .unwrap_or_else(|| GetStateOutput::new(Vec::new(), None));
+            let page = marker.and_then(|m| self.pages.get(m)).map_or_else(
+                || GetStateOutput::new(Vec::new(), None),
+                |p| GetStateOutput::new(p.operations.clone(), p.next_marker().map(str::to_owned)),
+            );
             Box::pin(async move { Ok(page) })
         }
     }
@@ -2467,7 +2479,7 @@ mod tests {
         (service(event).await.map(|response| response.0), ran)
     }
 
-    fn bootstrap_envelope(state: serde_json::Value) -> serde_json::Value {
+    fn bootstrap_envelope(state: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "DurableExecutionArn": "arn:aws:lambda:us-east-1:1:function:test",
             "CheckpointToken": "token-abc",
@@ -2499,7 +2511,7 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({ "InputPayload": null }),
         ] {
-            let payload = bootstrap_envelope(serde_json::json!({
+            let payload = bootstrap_envelope(&serde_json::json!({
                 "Operations": [{
                     "Id": "execution",
                     "Type": "EXECUTION",
@@ -2518,7 +2530,7 @@ mod tests {
     /// Row 2: the input is read from a later page.
     #[tokio::test]
     async fn input_payload_found_after_pagination() {
-        let payload = bootstrap_envelope(serde_json::json!({ "NextMarker": "m-1" }));
+        let payload = bootstrap_envelope(&serde_json::json!({ "NextMarker": "m-1" }));
         let transport = std::sync::Arc::new(PagedTransport::new(vec![(
             "m-1",
             vec![make_test_execution_op("{\"count\":1}")],
@@ -2535,7 +2547,7 @@ mod tests {
     /// Row 3: an inline input is kept when later pages are fetched.
     #[tokio::test]
     async fn paginated_input_matches_first_page() {
-        let payload = bootstrap_envelope(serde_json::json!({
+        let payload = bootstrap_envelope(&serde_json::json!({
             "Operations": [{
                 "Id": "execution",
                 "Type": "EXECUTION",
@@ -2565,7 +2577,7 @@ mod tests {
             (serde_json::json!("not json"), "deserialize customer input"),
             (serde_json::json!(5), "InputPayload is not a string"),
         ] {
-            let payload = bootstrap_envelope(serde_json::json!({
+            let payload = bootstrap_envelope(&serde_json::json!({
                 "Operations": [{
                     "Id": "execution",
                     "Type": "EXECUTION",

@@ -4100,7 +4100,7 @@ mod tests {
             "arn:test",
             "token",
             operations_to_checkpoint_log(&first_page),
-            Some(Some("{}".to_owned())),
+            crate::client::PageInput::Execution(Some("{}".to_owned())),
             Some("marker-1"),
         )
         .await
@@ -4138,7 +4138,7 @@ mod tests {
             "arn:test",
             "token",
             operations_to_checkpoint_log(&first_page),
-            Some(Some("{}".to_owned())),
+            crate::client::PageInput::Execution(Some("{}".to_owned())),
             None,
         )
         .await

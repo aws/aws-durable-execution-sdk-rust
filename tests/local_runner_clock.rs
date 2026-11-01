@@ -138,7 +138,7 @@ async fn queued_callback_reply_arrives_before_the_clock_moves() {
 }
 
 /// A step that returns 42.
-async fn one_step(_: (), ctx: DurableContext) -> Result<u32, BoxError> {
+async fn one_step((): (), ctx: DurableContext) -> Result<u32, BoxError> {
     Ok(ctx.step(|_| async { Ok(42_u32) }).name("answer").await?)
 }
 

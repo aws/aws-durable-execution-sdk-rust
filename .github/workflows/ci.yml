@@ -17,7 +17,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  # Every command step calls a make target, and scripts/ci.sh holds the
+  # Every command step calls a make target, and the Makefile holds the
   # commands, so `make ci` runs locally what these jobs run. `make check` is
   # this job, the `dependencies` job and the `msrv` job.
   check:
@@ -116,7 +116,7 @@ jobs:
         if: steps.cache-cet.outputs.cache-hit != 'true'
         run: cargo install --locked cargo-check-external-types --version 0.5.0
 
-      # scripts/ci.sh clears the workflow-wide RUSTFLAGS for this command.
+      # The Makefile clears the workflow-wide RUSTFLAGS for this command.
       - name: Check external types in public API
         run: make external-types
 
