@@ -45,9 +45,18 @@
 //!   carries no payload, so the merged record clears any carried result:
 //!   the exact condition the `wait_for_condition` read-before-`Start` fix
 //!   guards against.
-//! - Timers (`wait`) and retry delays are modelled as state transitions
-//!   between invocations rather than wall-clock sleeps, so there is no
-//!   real time in the runner or its tests.
+//! - The backend keeps a virtual clock in whole seconds. It starts at 0
+//!   for each run. A wait is due at the clock time it started plus its
+//!   duration, and a retry is due at the clock time it was recorded plus
+//!   its delay. Between invocations, each advance moves the clock to the
+//!   earliest pending wait or retry end and fires every wait and retry due
+//!   by then. So waits and retries end in time order, as on the service.
+//! - Queued callback replies arrive before the clock moves. An advance that
+//!   delivers a callback reply fires no timer.
+//! - Time never moves while an invocation runs. So a local run can use
+//!   more invocations than the same execution uses on the service.
+//! - [`LocalRunner::checkpoint_latency`] delays each checkpoint response in
+//!   tokio time. It does not move the virtual clock.
 //!
 //! # Runner divergences
 //!
@@ -408,6 +417,10 @@ pub struct LocalRunner {
     /// fault; the runner re-invokes) rather than non-retryable (terminal
     /// `FAIL` then execution failure).
     checkpoint_failures_retryable: bool,
+    /// How long the backend waits before it applies and answers each
+    /// checkpoint request (see
+    /// [`checkpoint_latency`](Self::checkpoint_latency)). Zero by default.
+    checkpoint_latency: std::time::Duration,
 }
 
 impl Default for LocalRunner {
@@ -445,6 +458,7 @@ impl LocalRunner {
             checkpoint_failures: 0,
             checkpoint_failure_skip: 0,
             checkpoint_failures_retryable: false,
+            checkpoint_latency: std::time::Duration::ZERO,
         }
     }
 
@@ -634,6 +648,30 @@ impl LocalRunner {
         self
     }
 
+    /// Delays each checkpoint response, as JS `checkpointDelay`, to expose races.
+    /// Not the SDK's coalescing window.
+    ///
+    /// The backend waits `latency` in tokio time before it applies and
+    /// answers each checkpoint request. The default is zero, which answers
+    /// at once. The latency does not move the backend's virtual clock, so
+    /// waits and retry delays end at the same virtual times as without it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().checkpoint_latency(Duration::from_millis(50));
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn checkpoint_latency(mut self, latency: std::time::Duration) -> Self {
+        self.checkpoint_latency = latency;
+        self
+    }
+
     /// Queues a successful outcome for the next callback the handler awaits.
     ///
     /// The value is serialized as the callback payload and delivered when
@@ -718,10 +756,15 @@ impl LocalRunner {
         F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send,
     {
-        let backend = Arc::new(Backend::new(
-            self.callback_outcomes.clone(),
-            self.checkpoint_page_size,
-        ));
+        self.run_on_backend(Arc::new(self.new_backend()), handler, event)
+            .await
+    }
+
+    /// A fresh backend configured from this runner's settings: queued
+    /// callback outcomes, checkpoint page size, injected checkpoint
+    /// failures and checkpoint latency.
+    fn new_backend(&self) -> Backend {
+        let mut backend = Backend::new(self.callback_outcomes.clone(), self.checkpoint_page_size);
         backend.checkpoint_failures_remaining.store(
             self.checkpoint_failures,
             std::sync::atomic::Ordering::SeqCst,
@@ -734,7 +777,8 @@ impl LocalRunner {
             self.checkpoint_failures_retryable,
             std::sync::atomic::Ordering::SeqCst,
         );
-        self.run_on_backend(backend, handler, event).await
+        backend.checkpoint_latency = self.checkpoint_latency;
+        backend
     }
 
     /// The invoke → parse → advance loop over an externally supplied
@@ -1575,7 +1619,10 @@ struct StoredOp {
     attempt: i32,
     callback_id: Option<String>,
     wait_seconds: Option<i32>,
-    retry_delay: Option<i32>,
+    /// The virtual time, in seconds, at which a started wait ends or a
+    /// pending retry may run again. Set by a WAIT `START` and a STEP
+    /// `RETRY`. Firing the operation keeps the value.
+    due_at: Option<u64>,
     callback_delivered: bool,
 }
 
@@ -1596,7 +1643,7 @@ fn new_started_op(id: String, op_type: OperationType, sub_type: Option<String>) 
         attempt: 0,
         callback_id: None,
         wait_seconds: None,
-        retry_delay: None,
+        due_at: None,
         callback_delivered: false,
     }
 }
@@ -1633,6 +1680,9 @@ struct BackendState {
     callback_counter: u64,
     /// Queued external callback outcomes, delivered FIFO.
     callback_outcomes: Vec<CallbackOutcome>,
+    /// The virtual time in seconds. It starts at 0 and moves only in
+    /// [`Backend::advance`], between invocations.
+    now: u64,
 }
 
 /// The in-memory execution client. Shared (via `Arc`) between the runner and
@@ -1664,6 +1714,10 @@ struct Backend {
     /// Whether injected checkpoint failures are retryable (see
     /// [`LocalRunner::fail_checkpoints_after_retryable`]).
     checkpoint_failures_retryable: std::sync::atomic::AtomicBool,
+    /// How long each `checkpoint` call waits, in tokio time, before it
+    /// applies and answers the request (see
+    /// [`LocalRunner::checkpoint_latency`]).
+    checkpoint_latency: std::time::Duration,
     /// Per-call checkpoint plan (in-crate test seam): while non-empty,
     /// each `checkpoint` call pops and obeys the front entry instead of
     /// the counter-based injection (see
@@ -1697,6 +1751,7 @@ impl Backend {
                 token_counter: 0,
                 callback_counter: 0,
                 callback_outcomes,
+                now: 0,
             }),
             checkpoint_page_size,
             get_state_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -1704,6 +1759,7 @@ impl Backend {
             checkpoint_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
             checkpoint_failures_skip: std::sync::atomic::AtomicUsize::new(0),
             checkpoint_failures_retryable: std::sync::atomic::AtomicBool::new(false),
+            checkpoint_latency: std::time::Duration::ZERO,
             #[cfg(test)]
             checkpoint_plan: Mutex::new(std::collections::VecDeque::new()),
         }
@@ -1794,50 +1850,41 @@ impl Backend {
             .collect()
     }
 
-    /// Advances the simulated backend between invocations: fire elapsed
-    /// timers, elapse retry delays, and deliver or time out pending
-    /// callbacks. Returns `true` if any operation was advanced.
+    /// Advances the simulated backend between invocations. Returns `true`
+    /// if any operation was advanced.
+    ///
+    /// The steps run in this order:
+    ///
+    /// 1. Queued callback outcomes go to pending callbacks, FIFO. If at
+    ///    least one was delivered, the advance ends here: the clock does not
+    ///    move and no timer fires. A callback reply the service already
+    ///    holds arrives before any later timer.
+    /// 2. Otherwise the clock moves to the earliest end among timed
+    ///    operations (see [`timed_due_at`]). With no timed operation, the
+    ///    advance returns `false`.
+    /// 3. Every timed operation due by the new time fires: a wait becomes
+    ///    `Succeeded` and a pending retry becomes `Ready`, so the next
+    ///    invocation re-executes the body.
     ///
     /// Backend-behaviour anchors (this crate's own replay logic):
-    /// - `wait`: a `Started` wait becomes `Succeeded` once its timer
-    ///   elapses (`src/wait.rs` replay: `Succeeded` returns immediately,
-    ///   `Started` suspends).
-    /// - `step`/`wait_for_condition` retry: a `Pending` retry becomes
-    ///   `Ready` once its delay elapses, so the next invocation re-executes
-    ///   the body (`src/step.rs` and `src/wait_for_condition.rs` replay:
-    ///   `Pending` suspends, `Ready` falls through to live execution).
+    /// - `wait`: `src/wait.rs` replay returns at once for `Succeeded` and
+    ///   suspends for `Started`.
+    /// - `step`/`wait_for_condition` retry: `src/step.rs` and
+    ///   `src/wait_for_condition.rs` replay suspend for `Pending` and fall
+    ///   through to live execution for `Ready`.
     /// - callback: a `Pending` callback resolves to `Succeeded` (with a
     ///   payload) or `TimedOut` (`src/callback.rs` replay).
     fn advance(&self) -> bool {
         let mut state = self.lock();
-        let mut progressed = false;
-
-        // Timers and retry delays.
-        for op in &mut state.ops {
-            match op.op_type {
-                OperationType::Wait if op.status == OperationStatus::Started => {
-                    op.status = OperationStatus::Succeeded;
-                    progressed = true;
-                }
-                OperationType::Step
-                    if op.status == OperationStatus::Pending && op.retry_delay.is_some() =>
-                {
-                    // Retry timer elapsed: make the op re-executable.
-                    op.status = OperationStatus::Ready;
-                    op.retry_delay = None;
-                    progressed = true;
-                }
-                _ => {}
-            }
-        }
-
-        // Callback delivery (FIFO across queued outcomes).
         // Split the borrow so we can pop the outcome queue while iterating.
         let BackendState {
             ops,
             callback_outcomes,
+            now,
             ..
         } = &mut *state;
+
+        let mut delivered = false;
         for op in ops.iter_mut() {
             let is_pending_callback = op.op_type == OperationType::Callback
                 && !op.callback_delivered
@@ -1862,11 +1909,45 @@ impl Backend {
                 }
             }
             op.callback_delivered = true;
-            progressed = true;
+            delivered = true;
+        }
+        if delivered {
+            return true;
         }
 
-        progressed
+        let Some(next) = ops.iter().filter_map(timed_due_at).min() else {
+            return false;
+        };
+        *now = next;
+        for op in ops.iter_mut() {
+            if timed_due_at(op).is_some_and(|due| due <= next) {
+                op.status = if op.op_type == OperationType::Wait {
+                    OperationStatus::Succeeded
+                } else {
+                    OperationStatus::Ready
+                };
+            }
+        }
+        true
     }
+}
+
+/// The virtual time at which `op` ends, if it is timed: a wait in `Started`
+/// or a step (or `wait_for_condition` check) in `Pending` with a due time.
+/// Firing changes the status, which removes the operation from the timed
+/// set.
+fn timed_due_at(op: &StoredOp) -> Option<u64> {
+    match (&op.op_type, &op.status) {
+        (OperationType::Wait, OperationStatus::Started)
+        | (OperationType::Step, OperationStatus::Pending) => op.due_at,
+        _ => None,
+    }
+}
+
+/// Converts a wire duration in seconds to the clock's unit. A missing or
+/// negative value counts as 0, as in the JS and Python checkpoint servers.
+fn whole_seconds(value: Option<i32>) -> u64 {
+    u64::from(value.unwrap_or(0).max(0).unsigned_abs())
 }
 
 impl BackendState {
@@ -1899,6 +1980,8 @@ impl BackendState {
         let retry_delay = update
             .step_options()
             .and_then(aws_sdk_lambda::types::StepOptions::next_attempt_delay_seconds);
+        // Read the clock before the mutable op borrow below.
+        let now = self.now;
 
         // Ensure the op exists.
         if self.find_mut(&id).is_none() {
@@ -1948,6 +2031,7 @@ impl BackendState {
                 if op.op_type == OperationType::Wait {
                     op.status = OperationStatus::Started;
                     op.wait_seconds = wait_seconds;
+                    op.due_at = Some(now.saturating_add(whole_seconds(wait_seconds)));
                 } else if op.op_type == OperationType::Callback {
                     // Callbacks are pending until an external outcome; the
                     // backend assigns the callback id here.
@@ -1973,7 +2057,7 @@ impl BackendState {
             OperationAction::Retry => {
                 op.status = OperationStatus::Pending;
                 op.attempt += 1;
-                op.retry_delay = retry_delay.or(Some(1));
+                op.due_at = Some(now.saturating_add(whole_seconds(retry_delay)));
                 op.error_type = err_type;
                 op.error_message = err_msg;
                 op.error_data = err_data;
@@ -1990,14 +2074,13 @@ impl BackendState {
     }
 }
 
-impl ExecutionClient for Backend {
-    fn checkpoint(
-        &self,
-        _execution_arn: &str,
-        _checkpoint_token: &str,
-        updates: Vec<OperationUpdate>,
+impl Backend {
+    /// Applies and answers one checkpoint request with no latency.
+    fn checkpoint_now<'a>(
+        &'a self,
+        updates: &[OperationUpdate],
     ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
+        Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + 'a>,
     > {
         self.checkpoint_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2053,7 +2136,7 @@ impl ExecutionClient for Backend {
             let mut state = self.lock();
             state.token_counter += 1;
             let mut out = Vec::with_capacity(updates.len());
-            for update in &updates {
+            for update in updates {
                 if let Some(stored) = state.apply_update(update)
                     && let Some(op) = build_operation(&stored)
                 {
@@ -2092,6 +2175,29 @@ impl ExecutionClient for Backend {
                 updated_operations: response_ops,
                 next_marker,
             })
+        })
+    }
+}
+
+impl ExecutionClient for Backend {
+    fn checkpoint(
+        &self,
+        _execution_arn: &str,
+        _checkpoint_token: &str,
+        updates: Vec<OperationUpdate>,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
+    > {
+        // `tokio::time::sleep` panics on a runtime built without the time
+        // driver, and the SDK itself needs no timer. So the default zero
+        // latency answers without creating a sleep.
+        let latency = self.checkpoint_latency;
+        if latency.is_zero() {
+            return self.checkpoint_now(&updates);
+        }
+        Box::pin(async move {
+            tokio::time::sleep(latency).await;
+            self.checkpoint_now(&updates).await
         })
     }
 
@@ -4754,5 +4860,398 @@ mod tests {
             msg, "operation error: child_context: child failed: boom-child",
             "wire message is the flattened chain, one frame per layer"
         );
+    }
+
+    // ---- Virtual clock (waits and retry delays end in time order) ----
+
+    /// The shorter of two raced waits wins, because the clock moves to the
+    /// earliest end and fires only what is due then.
+    #[tokio::test]
+    async fn virtual_clock_race_returns_shorter_wait() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let slow = ctx
+                        .run_in_child_context(|child| async move {
+                            child.wait(std::time::Duration::from_secs(60)).await?;
+                            Ok("slow".to_owned())
+                        })
+                        .name("slow")
+                        .future();
+                    let fast = ctx
+                        .run_in_child_context(|child| async move {
+                            child.wait(std::time::Duration::from_secs(1)).await?;
+                            Ok("fast".to_owned())
+                        })
+                        .name("fast")
+                        .future();
+                    Ok::<_, BoxError>(ctx.race([slow, fast]).await?)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output().map(String::as_str), Some("fast"));
+        assert_eq!(result.invocation_count(), 2);
+    }
+
+    /// A retry delayed by 300 seconds loses a race against a 1 second wait.
+    ///
+    /// The runner sends each checkpoint in its own request, so the test
+    /// fails on a backend that fires every timer in one advance. Such a
+    /// backend fires the retry and the wait together. The next invocation
+    /// re-runs the step body while the wait child replays, and with
+    /// unbatched checkpoints the step's child settles first, so the race
+    /// returns `"retried"`.
+    #[tokio::test]
+    async fn virtual_clock_orders_retry_delay_against_wait() {
+        let result = LocalRunner::new()
+            .options(
+                crate::Options::builder()
+                    .checkpoint_batching(false)
+                    .build()
+                    .expect("valid options"),
+            )
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let retried = ctx
+                        .run_in_child_context(|child| async move {
+                            child
+                                .step(|step_ctx| async move {
+                                    if step_ctx.attempt() == 1 {
+                                        return Err::<String, BoxError>("first attempt".into());
+                                    }
+                                    Ok("retried".to_owned())
+                                })
+                                .retry_strategy(|_err, _attempt| RetryDecision::Retry {
+                                    delay: std::time::Duration::from_secs(300),
+                                })
+                                .await
+                                .map_err(BoxError::from)
+                        })
+                        .future();
+                    let waited = ctx
+                        .run_in_child_context(|child| async move {
+                            child.wait(std::time::Duration::from_secs(1)).await?;
+                            Ok("waited".to_owned())
+                        })
+                        .future();
+                    Ok::<_, BoxError>(ctx.race([retried, waited]).await?)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output().map(String::as_str), Some("waited"));
+        assert_eq!(result.invocation_count(), 2);
+    }
+
+    /// The clock orders timers by due time, not by duration: a 6 second
+    /// wait started at 10 ends at 16, after a 15 second wait started at 0.
+    #[tokio::test]
+    async fn virtual_clock_orders_by_due_time_not_duration() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let a = ctx
+                        .run_in_child_context(|child| async move {
+                            child.wait(std::time::Duration::from_secs(10)).await?;
+                            child.wait(std::time::Duration::from_secs(6)).await?;
+                            Ok("a".to_owned())
+                        })
+                        .name("a")
+                        .future();
+                    let b = ctx
+                        .run_in_child_context(|child| async move {
+                            child.wait(std::time::Duration::from_secs(15)).await?;
+                            Ok("b".to_owned())
+                        })
+                        .name("b")
+                        .future();
+                    Ok::<_, BoxError>(ctx.race([a, b]).await?)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output().map(String::as_str), Some("b"));
+        assert_eq!(result.invocation_count(), 3);
+    }
+
+    /// Waits due at the same time fire in the same advance.
+    #[tokio::test]
+    async fn virtual_clock_fires_equal_waits_together() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let first = ctx.wait(std::time::Duration::from_secs(10)).spawn();
+                    let second = ctx.wait(std::time::Duration::from_secs(10)).spawn();
+                    let (first, second) = tokio::join!(first, second);
+                    first?;
+                    second?;
+                    Ok("done".to_owned())
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output().map(String::as_str), Some("done"));
+        assert_eq!(result.invocation_count(), 2);
+    }
+
+    /// A queued callback reply arrives before the clock moves, so it wins
+    /// a race against an hour-long wait, and the wait never fires.
+    #[tokio::test]
+    async fn virtual_clock_delivers_callback_before_moving_clock() {
+        let result = LocalRunner::new()
+            .callback_success(&"cb")
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let cb = ctx.create_callback::<String>().await?;
+                    let timeout = ctx
+                        .run_in_child_context(|child| async move {
+                            child
+                                .wait(std::time::Duration::from_secs(3600))
+                                .name("hour")
+                                .await?;
+                            Ok("timeout".to_owned())
+                        })
+                        .future();
+                    Ok::<_, BoxError>(ctx.race([cb.result(), timeout]).await?)
+                },
+                (),
+            )
+            .await;
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output().map(String::as_str), Some("cb"));
+        assert_eq!(result.invocation_count(), 2);
+        let hour = result
+            .operations()
+            .iter()
+            .find(|op| op.name() == Some("hour"))
+            .expect("the hour wait is recorded");
+        assert_eq!(hour.status(), "Started");
+    }
+
+    /// A WAIT `START` update with the given duration.
+    fn wait_start(id: &str, wait_seconds: i32) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(id)
+            .r#type(OperationType::Wait)
+            .action(OperationAction::Start)
+            .wait_options(
+                aws_sdk_lambda::types::WaitOptions::builder()
+                    .wait_seconds(wait_seconds)
+                    .build(),
+            )
+            .build()
+            .expect("valid update")
+    }
+
+    /// A STEP `RETRY` update, with `NextAttemptDelaySeconds` when `delay`
+    /// is set.
+    fn step_retry(id: &str, delay: Option<i32>) -> OperationUpdate {
+        let mut builder = OperationUpdate::builder()
+            .id(id)
+            .r#type(OperationType::Step)
+            .action(OperationAction::Retry);
+        if let Some(delay) = delay {
+            builder = builder.step_options(
+                aws_sdk_lambda::types::StepOptions::builder()
+                    .next_attempt_delay_seconds(delay)
+                    .build(),
+            );
+        }
+        builder.build().expect("valid update")
+    }
+
+    /// A CALLBACK `START` update.
+    fn callback_start(id: &str) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(id)
+            .r#type(OperationType::Callback)
+            .action(OperationAction::Start)
+            .build()
+            .expect("valid update")
+    }
+
+    /// A backend at virtual time `now`, seeded with `updates`.
+    fn seeded_backend(
+        callback_outcomes: Vec<CallbackOutcome>,
+        now: u64,
+        updates: &[OperationUpdate],
+    ) -> Backend {
+        let backend = Backend::new(callback_outcomes, None);
+        {
+            let mut state = backend.lock();
+            state.now = now;
+            for update in updates {
+                state.apply_update(update).expect("update applies");
+            }
+        }
+        backend
+    }
+
+    /// The status of stored op `id`, and the backend's virtual time.
+    fn status_and_now(backend: &Backend, id: &str) -> (OperationStatus, u64) {
+        let state = backend.lock();
+        let op = state
+            .ops
+            .iter()
+            .find(|op| op.id == id)
+            .expect("op is stored");
+        (op.status.clone(), state.now)
+    }
+
+    /// `advance` follows the virtual clock: one assertion block per row of
+    /// the case table in the issue.
+    #[test]
+    fn advance_follows_virtual_clock() {
+        // Rows 1 and 2: the earlier wait fires first, then the later one.
+        let backend = seeded_backend(Vec::new(), 0, &[wait_start("a", 5), wait_start("b", 9)]);
+        assert!(backend.advance(), "row 1");
+        assert_eq!(
+            status_and_now(&backend, "a"),
+            (OperationStatus::Succeeded, 5)
+        );
+        assert_eq!(status_and_now(&backend, "b"), (OperationStatus::Started, 5));
+        assert!(backend.advance(), "row 2");
+        assert_eq!(
+            status_and_now(&backend, "b"),
+            (OperationStatus::Succeeded, 9)
+        );
+
+        // Row 3: a retry and a wait due at the same time fire together.
+        let backend = seeded_backend(
+            Vec::new(),
+            0,
+            &[step_retry("r", Some(3)), wait_start("w", 3)],
+        );
+        assert!(backend.advance(), "row 3");
+        assert_eq!(status_and_now(&backend, "r"), (OperationStatus::Ready, 3));
+        assert_eq!(
+            status_and_now(&backend, "w"),
+            (OperationStatus::Succeeded, 3)
+        );
+
+        // Row 4: a queued callback reply arrives and the clock stays put.
+        let backend = seeded_backend(
+            vec![CallbackOutcome::Success("\"x\"".to_owned())],
+            0,
+            &[callback_start("c"), wait_start("w", 100)],
+        );
+        assert!(backend.advance(), "row 4");
+        assert_eq!(
+            status_and_now(&backend, "c"),
+            (OperationStatus::Succeeded, 0)
+        );
+        assert_eq!(status_and_now(&backend, "w"), (OperationStatus::Started, 0));
+
+        // Row 5: nothing to deliver and nothing timed.
+        let backend = seeded_backend(Vec::new(), 0, &[callback_start("c")]);
+        assert!(!backend.advance(), "row 5");
+        assert_eq!(status_and_now(&backend, "c"), (OperationStatus::Pending, 0));
+
+        // Row 6: a zero-second wait is due at once.
+        let backend = seeded_backend(Vec::new(), 7, &[wait_start("w", 0)]);
+        assert!(backend.advance(), "row 6");
+        assert_eq!(
+            status_and_now(&backend, "w"),
+            (OperationStatus::Succeeded, 7)
+        );
+
+        // Row 7: negative durations count as 0.
+        let backend = seeded_backend(
+            Vec::new(),
+            7,
+            &[wait_start("w", -5), step_retry("r", Some(-5))],
+        );
+        assert!(backend.advance(), "row 7");
+        assert_eq!(
+            status_and_now(&backend, "w"),
+            (OperationStatus::Succeeded, 7)
+        );
+        assert_eq!(status_and_now(&backend, "r"), (OperationStatus::Ready, 7));
+
+        // Row 8: a retry without `StepOptions` is due at once.
+        let backend = seeded_backend(Vec::new(), 4, &[step_retry("r", None)]);
+        assert!(backend.advance(), "row 8");
+        assert_eq!(status_and_now(&backend, "r"), (OperationStatus::Ready, 4));
+    }
+
+    /// The statuses of the step records of `backend`.
+    fn step_statuses(backend: &Backend) -> Vec<String> {
+        backend
+            .snapshot_operations()
+            .iter()
+            .filter(|op| op.op_type() == "Step")
+            .map(|op| op.status().to_owned())
+            .collect()
+    }
+
+    /// `checkpoint_latency` holds each checkpoint request for the latency
+    /// before the backend applies it, and changes nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_latency_delays_each_checkpoint() {
+        let unbatched = || {
+            LocalRunner::new().options(
+                crate::Options::builder()
+                    .checkpoint_batching(false)
+                    .build()
+                    .expect("valid options"),
+            )
+        };
+        let runner = unbatched().checkpoint_latency(std::time::Duration::from_millis(50));
+        let backend = Arc::new(runner.new_backend());
+
+        let steps = async {
+            tokio::time::advance(std::time::Duration::from_millis(49)).await;
+            assert!(step_statuses(&backend).is_empty(), "START not applied yet");
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            assert_eq!(step_statuses(&backend), ["Started"]);
+            tokio::time::advance(std::time::Duration::from_millis(49)).await;
+            assert_eq!(step_statuses(&backend), ["Started"]);
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            assert_eq!(step_statuses(&backend), ["Succeeded"]);
+        };
+        let (delayed, ()) = tokio::join!(
+            runner.run_on_backend(Arc::clone(&backend), one_step_handler, ()),
+            steps
+        );
+
+        let baseline = unbatched().run(one_step_handler, ()).await;
+        assert!(delayed.is_success(), "{:?}", delayed.error_message());
+        assert_eq!(delayed.output(), baseline.output());
+        assert_eq!(
+            format!("{:?}", delayed.operations()),
+            format!("{:?}", baseline.operations())
+        );
+    }
+
+    /// With the default zero latency the backend creates no tokio timer, so
+    /// a runtime built without the time driver still runs the handler.
+    /// `tokio::time::sleep` cannot run on such a runtime, and the run then
+    /// never ends. So the run happens on its own thread, and the test fails
+    /// when no result arrives within 10 seconds.
+    #[test]
+    fn zero_checkpoint_latency_needs_no_timer() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime builds");
+            let result = runtime.block_on(LocalRunner::new().run(one_step_handler, ()));
+            // The receiver is gone only after the test already failed.
+            let _ = sender.send((result.is_success(), result.output().copied()));
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the run ends without a time driver");
+        assert_eq!(outcome, (true, Some(42)));
     }
 }

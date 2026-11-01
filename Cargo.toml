@@ -196,3 +196,7 @@ required-features = ["test-util"]
 [[test]]
 name = "context_validation"
 required-features = ["test-util"]
+
+[[test]]
+name = "local_runner_clock"
+required-features = ["test-util"]
