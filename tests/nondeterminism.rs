@@ -7,7 +7,7 @@
 #![expect(clippy::expect_used)] // reason: test assertions
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
@@ -915,9 +915,8 @@ async fn unpolled_dropped_future_mismatch_still_detected() {
 /// Test: a map whose `item_namer` returns empty strings suspends and
 /// resumes without a false non-determinism failure.
 ///
-/// The claim computes `Some("")` from the namer, but `build_child_update`
-/// omits `Name` for empty strings so the checkpoint stores `None`; the
-/// comparison must treat the two as the same identity.
+/// An empty name records the default name `map-item-{index}`. The replay
+/// claim carries the same default name, so the claim and the record agree.
 #[tokio::test]
 async fn empty_map_item_name_replays_successfully() {
     let result = LocalRunner::new()
@@ -933,7 +932,7 @@ async fn empty_map_item_name_replays_successfully() {
                         Ok(v)
                     })
                     .name("batch")
-                    .item_namer(|_i| String::new())
+                    .item_namer(|_item, _i| String::new())
                     .await?;
                 Ok::<_, durable::BoxError>(out.iter().sum::<u32>())
             },
@@ -956,8 +955,9 @@ async fn empty_map_item_name_replays_successfully() {
 }
 
 /// Test: a parallel branch named `""` suspends and resumes without a false
-/// non-determinism failure. Parallel always claims branch names through its
-/// namer, so an empty `Branch` name hits the same `Some("")`↔`None` path.
+/// non-determinism failure. An empty branch name records the default name
+/// `parallel-branch-{index}`, and the replay claim carries the same default
+/// name, so the claim and the record agree.
 #[tokio::test]
 async fn empty_parallel_branch_name_replays_successfully() {
     let result = LocalRunner::new()
@@ -993,5 +993,56 @@ async fn empty_parallel_branch_name_replays_successfully() {
         result.invocation_count() >= 2,
         "the waits must have suspended at least once, got {}",
         result.invocation_count()
+    );
+}
+
+/// Test: a map item namer whose result changes between invocations fails
+/// replay with a non-determinism error.
+///
+/// The namer names item `i` as `v{n}-{i}`, where `n` counts the handler
+/// invocations. Item 1 waits one second, so the batch is not terminal when
+/// invocation 1 ends. Invocation 2 claims the names `v1-0` and `v1-1`, but
+/// history recorded `v0-0` and `v0-1`.
+#[tokio::test]
+async fn changed_map_item_name_fails_replay() {
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&invocations);
+
+    let result = LocalRunner::new()
+        .run(
+            move |_event: (), ctx: durable::DurableContext| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let out = ctx
+                        .map(vec![0_u32, 1], |child, item, idx| async move {
+                            if idx == 1 {
+                                child.wait(Duration::from_secs(1)).name("hold").await?;
+                            }
+                            Ok(item)
+                        })
+                        .item_namer(move |_, i| format!("v{n}-{i}"))
+                        .await?;
+                    Ok::<_, durable::BoxError>(out.iter().sum::<u32>())
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+
+    assert!(
+        result.is_failure(),
+        "a changed item name must fail replay: output={:?}",
+        result.output()
+    );
+    assert_eq!(
+        result.error_type().unwrap_or(""),
+        "NonDeterministicExecutionError",
+        "error: {:?}",
+        result.error_message()
+    );
+    assert!(
+        invocations.load(Ordering::SeqCst) >= 2,
+        "the wait must end invocation 1 before the batch is terminal"
     );
 }

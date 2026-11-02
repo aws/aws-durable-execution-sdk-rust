@@ -3148,12 +3148,12 @@ fn replay_identity_mismatch(
     // replay identity and must be flagged, for the same reason as above.
     //
     // Empty names are normalized to `None` on BOTH sides before the
-    // comparison: the checkpoint builders deliberately omit the `Name`
-    // field when the string is empty (see `build_child_update` in
-    // `map_parallel`), so the record stores `None` where the claim
-    // computes `Some("")`, e.g. a map `item_namer` or a parallel
-    // `Branch` whose name is the empty string. Without normalization an
-    // UNCHANGED handler would be rejected on resume.
+    // comparison: an empty name and no name are the same identity, so an
+    // operation named `""` whose record holds no `Name` still matches.
+    // Without normalization an UNCHANGED handler would be rejected on
+    // resume. Map items and parallel branches never claim an empty name:
+    // they claim the recorded name, which defaults to `map-item-{index}`
+    // or `parallel-branch-{index}`.
     let claimed_name = claimed_name.filter(|n| !n.is_empty());
     let expected_name = record.op_name.as_deref().filter(|n| !n.is_empty());
     let name_matches = match (expected_name, claimed_name) {
@@ -4366,10 +4366,8 @@ mod tests {
 
     #[test]
     fn validate_replay_identity_empty_claimed_name_matches_stored_none() {
-        // The checkpoint builders omit `Name` when the string is empty, so
-        // the record stores `None` where the claim computes `Some("")`: a
-        // map `item_namer` or parallel `Branch` with an empty name. An
-        // unchanged handler must NOT be rejected on resume.
+        // An empty claimed name and a record with no `Name` are the same
+        // identity. An unchanged handler must NOT be rejected on resume.
         let ctx = test_ctx();
         let record = record_with_identity(Some("Context"), Some("MapIteration"), None);
 

@@ -593,6 +593,15 @@ let branches: Vec<Branch<u32>> = vec![
 let results = ctx.parallel(branches).name("fan-out").await?;
 ```
 
+History records a name for each item's child context. `.item_namer(...)`
+names a map item: the namer receives the item and its index, and runs once
+per item when the map starts, so it must be deterministic. A map item
+without a namer, or whose namer returns an empty string, records
+`map-item-{index}`. A branch built with `Branch::unnamed(...)`, or with an
+empty name, records `parallel-branch-{index}`. A completion predicate sees
+the name the caller gave instead: `None` for a map item without a namer and
+for an unnamed branch, and `Some("")` for an empty name.
+
 Both accept `.max_concurrency(...)` and `.completion(...)`. By default
 (with no `.completion(...)` call, or with an empty `CompletionConfig`) the
 first item failure fails the batch, matching the Python and JS SDKs.

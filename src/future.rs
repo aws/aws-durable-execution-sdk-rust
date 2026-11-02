@@ -180,10 +180,11 @@ pub enum Settled<O> {
     Rejected(OperationError),
 }
 
-/// A named branch for [`DurableContext::parallel`].
+/// A branch for [`DurableContext::parallel`].
 ///
-/// Each branch defines a name and an async closure that receives a child
-/// [`DurableContext`].
+/// Each branch defines an optional name and an async closure that receives
+/// a child [`DurableContext`]. History records the name, or
+/// `parallel-branch-{index}` when the branch has no name or an empty one.
 ///
 /// # Examples
 ///
@@ -198,7 +199,7 @@ pub enum Settled<O> {
 /// ```
 #[non_exhaustive]
 pub struct Branch<O> {
-    name: String,
+    name: Option<String>,
     body: BranchBody<O>,
 }
 
@@ -253,6 +254,10 @@ impl<O: Send + 'static> Branch<O> {
     /// a future producing the branch result. The factory is not invoked
     /// here: it runs when the parallel operation dispatches the branch.
     ///
+    /// History records `name`. An empty name records
+    /// `parallel-branch-{index}`, and a completion predicate sees
+    /// `Some("")`.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -268,9 +273,37 @@ impl<O: Send + 'static> Branch<O> {
         F: FnOnce(DurableContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     {
+        Self::with_name(Some(name.into()), factory)
+    }
+
+    /// A branch the caller does not name. A completion predicate sees
+    /// `None`; history records `parallel-branch-{index}`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk::{Branch, DurableContext};
+    ///
+    /// let branch: Branch<i32> = Branch::unnamed(|_ctx: DurableContext| async move { Ok(42) });
+    /// assert_eq!(branch.name(), None);
+    /// ```
+    pub fn unnamed<F, Fut>(factory: F) -> Self
+    where
+        F: FnOnce(DurableContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    {
+        Self::with_name(None, factory)
+    }
+
+    /// Builds a branch with the caller's name, if any (internal).
+    fn with_name<F, Fut>(name: Option<String>, factory: F) -> Self
+    where
+        F: FnOnce(DurableContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    {
         let (ctx_tx, ctx_rx) = tokio::sync::oneshot::channel::<DurableContext>();
         Self {
-            name: name.into(),
+            name,
             body: BranchBody {
                 ctx_tx,
                 // The SDK does the pinning and BoxError -> internal-carrier
@@ -289,13 +322,14 @@ impl<O: Send + 'static> Branch<O> {
         }
     }
 
-    /// Returns the branch name.
-    pub fn name(&self) -> &str {
-        &self.name
+    /// Returns the name the caller gave, or `None` for a branch built with
+    /// [`Branch::unnamed`].
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     /// Consumes the branch and returns its name and erased body (internal).
-    pub(crate) fn into_parts(self) -> (String, BranchBody<O>) {
+    pub(crate) fn into_parts(self) -> (Option<String>, BranchBody<O>) {
         (self.name, self.body)
     }
 }

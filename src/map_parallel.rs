@@ -108,7 +108,9 @@ pub enum BatchItemStatus {
 pub struct BatchItem<O> {
     /// Zero-based position in the original input.
     pub index: usize,
-    /// Display name (if any).
+    /// The name history records for the item: the map item namer's result
+    /// or the branch name, or `map-item-{index}` or
+    /// `parallel-branch-{index}` when that name is missing or empty.
     pub name: String,
     /// Status: `Succeeded` or `Failed` for a terminal item, or `Started`
     /// for an item that was not terminal when the batch completed.
@@ -291,8 +293,9 @@ impl std::fmt::Display for BatchStatus {
 pub struct BatchError<'a> {
     /// Zero-based position of the failed item in the original input.
     pub index: usize,
-    /// Display name of the failed item. Empty when the item has no name
-    /// (an unnamed map iteration).
+    /// The recorded name of the failed item: the map item namer's result or
+    /// the branch name, or `map-item-{index}` or `parallel-branch-{index}`
+    /// when that name is missing or empty.
     pub name: &'a str,
     /// The error message the item failed with.
     pub message: &'a str,
@@ -753,6 +756,10 @@ pub enum NestingMode {
     Flat,
 }
 
+/// A map item namer: receives the item and its index, and returns the name
+/// the caller gives the item.
+pub(crate) type ItemNamer<I> = Box<dyn Fn(&I, usize) -> String + Send + Sync>;
+
 /// Internal state for a map execution passed from the builder.
 ///
 /// Holds the user's map closure as `Arc<F>`: shared rather than boxed,
@@ -771,7 +778,7 @@ pub(crate) struct MapExecution<I, O, F, IS, RS> {
     pub(crate) serdes: IS,
     pub(crate) result_serdes: RS,
     pub(crate) nesting: NestingMode,
-    pub(crate) item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
+    pub(crate) item_namer: Option<ItemNamer<I>>,
     pub(crate) items: Vec<I>,
     pub(crate) closure: Arc<F>,
     pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
@@ -801,6 +808,18 @@ where
     /// [`collect_successful`].
     pub(crate) async fn execute_batch_result(self) -> Result<BatchResult<O>, OperationError> {
         let total_items = self.items.len();
+        // Every name is computed here, once per input item, while the items
+        // are still readable: after `into_item_slots` they sit behind
+        // take-once slots. So the namer runs exactly once per input item,
+        // including items that never start, and sees the item itself.
+        let user_names: Vec<Option<String>> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| self.item_namer.as_ref().map(|namer| namer(item, i)))
+            .collect();
+        drop(self.item_namer);
+        let record_names = record_names_of(&user_names, "map-item");
         let items = into_item_slots(self.items);
         let closure = self.closure;
         let items_ref = Arc::clone(&items);
@@ -825,7 +844,8 @@ where
             self.serdes,
             self.result_serdes,
             self.nesting,
-            self.item_namer,
+            user_names,
+            record_names,
             total_items,
             MAP_SUB_TYPE,
             MAP_ITERATION_SUB_TYPE,
@@ -845,7 +865,7 @@ pub(crate) struct ParallelExecution<O, IS, RS> {
     pub(crate) serdes: IS,
     pub(crate) result_serdes: RS,
     pub(crate) nesting: NestingMode,
-    pub(crate) branches: Vec<(String, crate::future::BranchBody<O>)>,
+    pub(crate) branches: Vec<(Option<String>, crate::future::BranchBody<O>)>,
 }
 
 impl<O, IS, RS> ParallelExecution<O, IS, RS>
@@ -872,19 +892,18 @@ where
     /// `Vec<O>` view is projected by [`collect_successful`].
     pub(crate) async fn execute_batch_result(self) -> Result<BatchResult<O>, OperationError> {
         let total = self.branches.len();
-        // Split each branch into its display name (threaded to the
-        // coordinator as the item namer so it reaches child checkpoint
-        // updates) and its erased body (kept in a take-once slot since it
-        // runs at most once).
-        let mut names: Vec<String> = Vec::with_capacity(total);
+        // Split each branch into the name the caller gave (`None` for
+        // `Branch::unnamed`) and its erased body (kept in a take-once slot
+        // since it runs at most once). The recorded names default a
+        // missing or empty name.
+        let mut user_names: Vec<Option<String>> = Vec::with_capacity(total);
         let mut slots: Vec<std::sync::Mutex<Option<crate::future::BranchBody<O>>>> =
             Vec::with_capacity(total);
         for (name, body) in self.branches {
-            names.push(name);
+            user_names.push(name);
             slots.push(std::sync::Mutex::new(Some(body)));
         }
-        let branch_namer: Arc<dyn Fn(usize) -> String + Send + Sync> =
-            Arc::new(move |index| names.get(index).cloned().unwrap_or_default());
+        let record_names = record_names_of(&user_names, "parallel-branch");
 
         let dispatch = BranchDispatch {
             slots: Arc::new(slots),
@@ -899,7 +918,8 @@ where
             self.serdes,
             self.result_serdes,
             self.nesting,
-            Some(branch_namer),
+            user_names,
+            record_names,
             total,
             PARALLEL_SUB_TYPE,
             PARALLEL_BRANCH_SUB_TYPE,
@@ -907,6 +927,20 @@ where
         )
         .await
     }
+}
+
+/// The name history records for each batch item: the caller's name when it
+/// is present and not empty, else `{prefix}-{index}`, as JS records
+/// `item.name || item.id`.
+fn record_names_of(user_names: &[Option<String>], prefix: &str) -> Vec<String> {
+    user_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| match name.as_deref() {
+            Some(name) if !name.is_empty() => name.to_owned(),
+            _ => format!("{prefix}-{i}"),
+        })
+        .collect()
 }
 
 /// Projects a full [`BatchResult`] onto the plain `Vec<O>` success view
@@ -1209,7 +1243,8 @@ where
                 .r#type(OperationType::Context)
                 .sub_type(req.child_sub_type.clone())
                 .action(OperationAction::Succeed)
-                .parent_id(req.parent_wire.clone());
+                .parent_id(req.parent_wire.clone())
+                .name(req.item_name.clone());
 
             if serialized.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
                 builder = builder.context_options(
@@ -1279,6 +1314,7 @@ where
                 .sub_type(req.child_sub_type.clone())
                 .action(OperationAction::Fail)
                 .parent_id(req.parent_wire.clone())
+                .name(req.item_name.clone())
                 .error(wire.to_error_object());
 
             #[expect(clippy::expect_used)] // reason: all required fields are set above
@@ -1664,7 +1700,8 @@ async fn execute_batch<O, IS, RS>(
     serdes: IS,
     result_serdes: RS,
     nesting: NestingMode,
-    item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
+    user_names: Vec<Option<String>>,
+    record_names: Vec<String>,
     total_items: usize,
     parent_sub_type: &str,
     child_sub_type: &str,
@@ -1691,19 +1728,23 @@ where
         ));
     }
 
-    // The caller name of each input item, computed once, before any replay
-    // or dispatch, and reused everywhere: the predicate view, replay
-    // identity validation, the child checkpoints and the result. So the
-    // namer runs exactly once per input item, and every consumer sees the
-    // same name. `parallel` passes its branch names as the namer, so every
-    // branch has `Some(name)`; a map item has `Some(..)` only when a namer
-    // is set.
-    let names: Vec<Option<String>> = (0..total_items)
-        .map(|i| item_namer.as_ref().map(|namer| namer(i)))
-        .collect();
-    drop(item_namer);
-    // The recorded item name: the caller name, or empty when none was given.
-    let item_name_of = |i: usize| -> String { names.get(i).cloned().flatten().unwrap_or_default() };
+    // The caller computed both name lists once per input item, before the
+    // items moved. `user_names` holds the name the caller gave, which only
+    // the completion predicate sees. `record_names` holds the name history
+    // records, which replay identity validation, the child checkpoints and
+    // the result use.
+    //
+    // `record_names` has one entry per input item, and every caller of
+    // this closure passes an index below `total_items`. So the lookup
+    // cannot miss.
+    #[expect(clippy::expect_used)]
+    // reason: `record_names` has one entry per input item and every index is below `total_items`
+    let item_name_of = |i: usize| -> String {
+        record_names
+            .get(i)
+            .expect("record_names has one entry per input item")
+            .clone()
+    };
 
     let parent_positional = parent_op_id.positional().to_owned();
     let parent_wire = parent_op_id.wire().to_owned();
@@ -1758,8 +1799,14 @@ where
                 // child records, so Flat always reconstructs through the
                 // plan-constrained re-execution below.
                 if nesting != NestingMode::Flat {
-                    match replay_batch_from_record(&ctx, &plan, &names, &serdes, child_sub_type)
-                        .await
+                    match replay_batch_from_record(
+                        &ctx,
+                        &plan,
+                        &record_names,
+                        &serdes,
+                        child_sub_type,
+                    )
+                    .await
                     {
                         Ok(result) => {
                             // Recorded terminal batch returned without
@@ -1952,7 +1999,6 @@ where
             let (has_record, is_terminal) = if consult_checkpoint {
                 let child_positional = child_op_id.positional().to_owned();
                 let child_wire = child_op_id.wire().to_owned();
-                let child_name = names.get(i).cloned().flatten();
                 // Non-determinism detection on child items happens inside
                 // the validated view fetch; only the status is consumed
                 // here.
@@ -1961,7 +2007,7 @@ where
                     &child_wire,
                     "Context",
                     Some(child_sub_type),
-                    child_name.as_deref(),
+                    Some(&item_name_of(i)),
                 )?;
                 (view.is_some(), view.is_some_and(|v| v.status.is_terminal()))
             } else {
@@ -2003,7 +2049,7 @@ where
 
     // The completion predicate sees each caller name as
     // `CompletionItem::name`.
-    let mut progress = BatchProgress::<O>::new(names.clone());
+    let mut progress = BatchProgress::<O>::new(user_names);
     // A batch rebuilt under its decision record already completed. The
     // record holds its reason, so the rebuild evaluates no completion rule.
     if replay_plan.is_some() {
@@ -2148,7 +2194,6 @@ where
                 }
             } else {
                 let child_op_id = ctx.peek_id_at(0);
-                let child_name = names.get(i).cloned().flatten();
                 // Non-determinism detection on child items happens inside
                 // the validated view fetch; only the status is consumed.
                 let view = ctx.checkpoint_view_validated(
@@ -2156,7 +2201,7 @@ where
                     child_op_id.wire(),
                     "Context",
                     Some(child_sub_type),
-                    child_name.as_deref(),
+                    Some(&item_name_of(i)),
                 )?;
                 let has_record = view.is_some();
                 let is_terminal = view.is_some_and(|v| v.status.is_terminal());
@@ -2764,7 +2809,7 @@ impl ReplayPlan {
 async fn replay_batch_from_record<O, IS>(
     ctx: &DurableContext,
     plan: &ReplayPlan,
-    names: &[Option<String>],
+    record_names: &[String],
     serdes: &Arc<IS>,
     child_sub_type: &str,
 ) -> Result<BatchResult<O>, OperationError>
@@ -2774,14 +2819,22 @@ where
 {
     let mut items = Vec::new();
     for i in 0..plan.total_count {
-        let child_name = names.get(i).cloned().flatten();
+        // `ReplayPlan::from_record` rejects a `totalCount` above the input
+        // length, and `record_names` has one entry per input item. So the
+        // lookup cannot miss.
+        #[expect(clippy::expect_used)]
+        // reason: `totalCount` is at most the input length, which is the length of `record_names`
+        let item_name = record_names
+            .get(i)
+            .expect("record_names has one entry per input item")
+            .clone();
         if !plan.completed.get(i).copied().unwrap_or(false) {
             // STARTED at batch completion: reported from the record with
             // no result and no error; its child checkpoints are never
             // read.
             items.push(BatchItem {
                 index: i,
-                name: child_name.unwrap_or_default(),
+                name: item_name,
                 status: BatchItemStatus::Started,
                 result: None,
                 error_message: None,
@@ -2799,9 +2852,8 @@ where
             op_id.wire(),
             "Context",
             Some(child_sub_type),
-            child_name.as_deref(),
+            Some(&item_name),
         )?;
-        let item_name = child_name.unwrap_or_default();
         let serdes_ctx = SerdesContext::new(op_id.wire().to_owned(), ctx.execution_arn());
         let item =
             replay_terminal_child(ctx, op_id.positional(), i, &item_name, serdes, &serdes_ctx)
@@ -2925,18 +2977,16 @@ fn build_child_update(
     parent_wire: &str,
     action: OperationAction,
 ) -> OperationUpdate {
-    let mut builder = OperationUpdate::builder()
+    // The recorded name of the map item or parallel branch, so it appears
+    // on the child's history records. It is never empty: a missing or empty
+    // caller name defaults to `map-item-{i}` or `parallel-branch-{i}`.
+    let builder = OperationUpdate::builder()
         .id(child_wire.to_owned())
         .r#type(OperationType::Context)
         .sub_type(child_sub_type.to_owned())
         .action(action)
-        .parent_id(parent_wire.to_owned());
-
-    // Propagate the map item / parallel branch display name so it appears
-    // on the child's history records.
-    if !child_name.is_empty() {
-        builder = builder.name(child_name.to_owned());
-    }
+        .parent_id(parent_wire.to_owned())
+        .name(child_name.to_owned());
 
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
@@ -2954,16 +3004,16 @@ fn build_child_fail_update(
     parent_wire: &str,
     wire: &crate::error::WireError,
 ) -> OperationUpdate {
-    let mut builder = OperationUpdate::builder()
+    // The recorded name is never empty: a missing or empty caller name
+    // defaults to `map-item-{i}` or `parallel-branch-{i}`.
+    let builder = OperationUpdate::builder()
         .id(child_wire.to_owned())
         .r#type(OperationType::Context)
         .sub_type(child_sub_type.to_owned())
         .action(OperationAction::Fail)
         .parent_id(parent_wire.to_owned())
-        .error(wire.to_error_object());
-    if !child_name.is_empty() {
-        builder = builder.name(child_name.to_owned());
-    }
+        .error(wire.to_error_object())
+        .name(child_name.to_owned());
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
@@ -3298,6 +3348,10 @@ pub struct BatchSummary {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct BatchCheckpointItem {
     index: usize,
+    /// The recorded item name: the caller's name, or `map-item-{index}` or
+    /// `parallel-branch-{index}` when it is missing or empty. A summary
+    /// that an earlier release wrote can hold no name, so reading defaults
+    /// it to the empty string.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     name: String,
     status: String,
@@ -3691,7 +3745,7 @@ mod tests {
                 vec![1_i32, 2],
                 |_child, item, _idx| async move { Ok(item * 10) },
             )
-            .item_namer(|i| format!("item-{i}"))
+            .item_namer(|_, i| format!("item-{i}"))
             .await
             .expect("map must succeed");
         assert_eq!(result, vec![10, 20]);
@@ -3728,6 +3782,71 @@ mod tests {
             names,
             vec![Some("alpha".to_owned()), Some("beta".to_owned())],
             "branch names must be checkpointed on child STARTs"
+        );
+    }
+
+    /// Collects `(action, name)` of every recorded child update, in write
+    /// order. A child update carries a `ParentId`; the batch parent's does
+    /// not.
+    fn child_update_names(
+        client: &crate::client::InMemoryExecutionClient,
+    ) -> Vec<(OperationAction, Option<String>)> {
+        client
+            .recorded_updates()
+            .iter()
+            .filter(|u| u.parent_id().is_some())
+            .map(|u| (u.action().clone(), u.name().map(str::to_owned)))
+            .collect()
+    }
+
+    /// A child's normal terminal `SUCCEED` and its body-error `FAIL` must
+    /// carry the recorded name, as its `START` does. Item 0 has no namer
+    /// result, so it records the default `map-item-0`.
+    #[tokio::test]
+    async fn child_terminal_updates_carry_the_recorded_name() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+
+        let batch = ctx
+            .map(vec![0_i32, 1], |_child, item, _idx| async move {
+                if item == 1 {
+                    Err::<i32, BoxError>("intentional".into())
+                } else {
+                    Ok(item)
+                }
+            })
+            .item_namer(|_, i| {
+                if i == 0 {
+                    String::new()
+                } else {
+                    "named".to_owned()
+                }
+            })
+            .max_concurrency(1)
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
+            .await_batch()
+            .await
+            .expect("a tolerated item failure must not become an operation error");
+        assert_eq!(batch.failure_count(), 1);
+
+        let updates = child_update_names(&client);
+        let name_of = |action: OperationAction| -> Vec<Option<String>> {
+            updates
+                .iter()
+                .filter(|(a, _)| *a == action)
+                .map(|(_, n)| n.clone())
+                .collect()
+        };
+        assert_eq!(
+            name_of(OperationAction::Succeed),
+            vec![Some("map-item-0".to_owned())],
+            "a child SUCCEED must carry the recorded name"
+        );
+        assert_eq!(
+            name_of(OperationAction::Fail),
+            vec![Some("named".to_owned())],
+            "a child body-error FAIL must carry the recorded name"
         );
     }
 
@@ -5614,7 +5733,7 @@ mod tests {
         let writer = Arc::clone(&log);
         let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
         ctx.map(vec![0_u32, 1], |_child, item, _idx| async move { Ok(item) })
-            .item_namer(|i| {
+            .item_namer(|_, i| {
                 if i == 0 {
                     String::new()
                 } else {
@@ -5665,7 +5784,7 @@ mod tests {
                     vec![0_u32, 1, 2],
                     |_child, item, _idx| async move { Ok(item) },
                 )
-                .item_namer(move |i| {
+                .item_namer(move |_, i| {
                     let call = counter.fetch_add(1, Ordering::SeqCst);
                     format!("n{i}-call{call}")
                 })
@@ -5698,6 +5817,199 @@ mod tests {
             assert_eq!(view_names, result_names, "concurrency {concurrency}");
             assert_eq!(start_names, result_names, "concurrency {concurrency}");
         }
+    }
+
+    /// The names one batch exposes: the child START names in record order,
+    /// the result's item names, and the caller names of the predicate's
+    /// first view, in index order.
+    struct BatchNames {
+        starts: Vec<Option<String>>,
+        results: Vec<String>,
+        predicate: Vec<Option<String>>,
+    }
+
+    impl BatchNames {
+        fn of<O>(
+            client: &crate::client::InMemoryExecutionClient,
+            batch: &BatchResult<O>,
+            log: &ViewLog,
+        ) -> Self {
+            Self {
+                starts: child_start_names(client),
+                results: batch.items.iter().map(|i| i.name.clone()).collect(),
+                predicate: log.lock().expect("no poisoned lock")[0]
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+            }
+        }
+    }
+
+    /// A completion predicate that records every view it sees and never
+    /// completes the batch.
+    fn logging_predicate(log: &ViewLog) -> Config {
+        let writer = Arc::clone(log);
+        Config::with_completion_predicate(move |s| {
+            writer.lock().expect("no poisoned lock").push(view_of(s));
+            CompletionDecision::Continue
+        })
+    }
+
+    fn some(names: &[&str]) -> Vec<Option<String>> {
+        names.iter().map(|n| Some((*n).to_owned())).collect()
+    }
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// The namer reads the item itself, so an item type that is not `Clone`
+    /// can be named after its content.
+    #[tokio::test]
+    async fn map_item_namer_reads_the_item() {
+        struct Order {
+            id: String,
+        }
+        let log: ViewLog = Arc::default();
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let orders = vec![
+            Order {
+                id: "o-1".to_owned(),
+            },
+            Order {
+                id: "o-2".to_owned(),
+            },
+        ];
+        let batch = ctx
+            .map(orders, |_child, order: Order, _idx| async move {
+                Ok(order.id.len())
+            })
+            .item_namer(|o, _| o.id.clone())
+            .max_concurrency(1)
+            .completion(logging_predicate(&log))
+            .await_batch()
+            .await
+            .expect("await_batch returns the batch");
+        let names = BatchNames::of(&client, &batch, &log);
+        assert_eq!(names.starts, some(&["o-1", "o-2"]));
+        assert_eq!(names.results, owned(&["o-1", "o-2"]));
+        assert_eq!(names.predicate, some(&["o-1", "o-2"]));
+    }
+
+    /// A map item without a namer records `map-item-{index}`, and the
+    /// predicate sees `None`.
+    #[tokio::test]
+    async fn unnamed_map_items_record_default_names() {
+        let log: ViewLog = Arc::default();
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = ctx
+            .map(vec![1_u32, 2], |_child, item, _idx| async move { Ok(item) })
+            .max_concurrency(1)
+            .completion(logging_predicate(&log))
+            .await_batch()
+            .await
+            .expect("await_batch returns the batch");
+        let names = BatchNames::of(&client, &batch, &log);
+        assert_eq!(names.starts, some(&["map-item-0", "map-item-1"]));
+        assert_eq!(names.results, owned(&["map-item-0", "map-item-1"]));
+        assert_eq!(names.predicate, [None, None]);
+    }
+
+    /// An empty namer result records `map-item-{index}`, and the predicate
+    /// sees `Some("")`.
+    #[tokio::test]
+    async fn empty_namer_result_records_default_name() {
+        let log: ViewLog = Arc::default();
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = ctx
+            .map(vec![1_u32, 2], |_child, item, _idx| async move { Ok(item) })
+            .item_namer(|_, i| {
+                if i == 0 {
+                    String::new()
+                } else {
+                    "named".into()
+                }
+            })
+            .max_concurrency(1)
+            .completion(logging_predicate(&log))
+            .await_batch()
+            .await
+            .expect("await_batch returns the batch");
+        let names = BatchNames::of(&client, &batch, &log);
+        assert_eq!(names.starts, some(&["map-item-0", "named"]));
+        assert_eq!(names.results, owned(&["map-item-0", "named"]));
+        assert_eq!(names.predicate, some(&["", "named"]));
+    }
+
+    /// An empty branch name records `parallel-branch-{index}`, and the
+    /// predicate sees `Some("")`.
+    #[tokio::test]
+    async fn empty_branch_name_records_default_name() {
+        use crate::future::Branch;
+        let log: ViewLog = Arc::default();
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = ctx
+            .parallel([
+                Branch::new("", |_c| async move { Ok(1_u32) }),
+                Branch::new("x", |_c| async move { Ok(2_u32) }),
+            ])
+            .max_concurrency(1)
+            .completion(logging_predicate(&log))
+            .await_batch()
+            .await
+            .expect("await_batch returns the batch");
+        let names = BatchNames::of(&client, &batch, &log);
+        assert_eq!(names.starts, some(&["parallel-branch-0", "x"]));
+        assert_eq!(names.results, owned(&["parallel-branch-0", "x"]));
+        assert_eq!(names.predicate, some(&["", "x"]));
+    }
+
+    /// A `Branch::unnamed` branch records `parallel-branch-{index}`, and the
+    /// predicate sees `None`.
+    #[tokio::test]
+    async fn unnamed_branch_records_default_name() {
+        use crate::future::Branch;
+        let log: ViewLog = Arc::default();
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = ctx
+            .parallel([
+                Branch::unnamed(|_c| async move { Ok(1_u32) }),
+                Branch::new("x", |_c| async move { Ok(2_u32) }),
+            ])
+            .max_concurrency(1)
+            .completion(logging_predicate(&log))
+            .await_batch()
+            .await
+            .expect("await_batch returns the batch");
+        let names = BatchNames::of(&client, &batch, &log);
+        assert_eq!(names.starts, some(&["parallel-branch-0", "x"]));
+        assert_eq!(names.results, owned(&["parallel-branch-0", "x"]));
+        assert_eq!(names.predicate, [None, Some("x".to_owned())]);
+    }
+
+    /// The namer runs once for every input item when the map starts,
+    /// including the two items that never start because the batch completes
+    /// after the first success.
+    #[tokio::test]
+    async fn namer_runs_once_per_item() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        ctx.map(
+            vec![1_u32, 2, 3],
+            |_child, item, _idx| async move { Ok(item) },
+        )
+        .item_namer(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            String::new()
+        })
+        .max_concurrency(1)
+        .completion(Config::with_min_successful(1))
+        .await_batch()
+        .await
+        .expect("await_batch returns the batch");
+        assert_eq!(child_start_names(&client), some(&["map-item-0"]));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     /// On the sequential path, a resumed batch replays its recorded-terminal
@@ -8452,7 +8764,7 @@ mod tests {
         );
         assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
         assert_eq!(batch.total_count(), 2);
-        assert_started_defaults(&batch.items[1], "");
+        assert_started_defaults(&batch.items[1], "map-item-1");
         assert_eq!(item_action_count(&client, 0, &OperationAction::Succeed), 1);
         assert_eq!(item_action_count(&client, 1, &OperationAction::Succeed), 0);
         // The batch abandoned only the item that was still running.
@@ -8952,7 +9264,7 @@ mod tests {
                 "late {late:?}"
             );
             assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
-            assert_started_defaults(&batch.items[1], "");
+            assert_started_defaults(&batch.items[1], "map-item-1");
         }
     }
 

@@ -5,10 +5,11 @@
 //! counterpart to [`parallel`]'s named branches: use `map` when the work is
 //! uniform across a collection.
 //!
-//! [`item_namer`] assigns a stable, human-readable name to each item's context
-//! from its index, which makes the operation history and any per-item logs easy
-//! to read. Names are derived from the index (not item content) so they stay
-//! deterministic across replay.
+//! [`item_namer`] assigns a stable, human-readable name to each item's context,
+//! which makes the operation history and any per-item logs easy to read. The
+//! namer receives the item and its index; this example names each context from
+//! its index. The namer runs again on every replay, so it must return the same
+//! name each time.
 //!
 //! This example maps a short list of strings, naming each item's context.
 //!
@@ -34,7 +35,7 @@ async fn handler(
                 .map_err(Into::into)
         })
         .name("process-all")
-        .item_namer(|idx| format!("item-{idx}"))
+        .item_namer(|_item, idx| format!("item-{idx}"))
         .await?;
     Ok(results)
 }

@@ -70,7 +70,7 @@ pub struct MapBuilder<I, O, F, Fut, IS = JsonSerdes, RS = JsonSerdes> {
     serdes: IS,
     result_serdes: RS,
     nesting: NestingMode,
-    item_namer: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
+    item_namer: Option<crate::map_parallel::ItemNamer<I>>,
     items: Vec<I>,
     closure: F,
     _marker: PhantomData<fn() -> (O, Fut)>,
@@ -218,10 +218,21 @@ where
 
     /// Sets a custom item namer for per-iteration display names.
     ///
-    /// The namer function receives the zero-based item index and returns
-    /// a display name for that iteration.
-    pub fn item_namer(mut self, namer: impl Fn(usize) -> String + Send + Sync + 'static) -> Self {
-        self.item_namer = Some(Arc::new(namer));
+    /// The namer receives a reference to the item and its zero-based index,
+    /// and returns the name history records for that item's child context.
+    /// It runs once per input item when the map starts, before any item
+    /// runs, including items that never start. It also runs on every
+    /// replay, so it must be deterministic: a name that changes between
+    /// invocations fails replay with a non-determinism error.
+    ///
+    /// A missing namer, or a namer that returns an empty string, records
+    /// `map-item-{index}`. A completion predicate sees the namer's result,
+    /// including `Some("")`, or `None` when no namer is set.
+    pub fn item_namer(
+        mut self,
+        namer: impl Fn(&I, usize) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.item_namer = Some(Box::new(namer));
         self
     }
 
@@ -437,7 +448,7 @@ pub struct ParallelBuilder<O, IS = JsonSerdes, RS = JsonSerdes> {
     serdes: IS,
     result_serdes: RS,
     nesting: NestingMode,
-    branches: Vec<(String, crate::future::BranchBody<O>)>,
+    branches: Vec<(Option<String>, crate::future::BranchBody<O>)>,
     _marker: PhantomData<O>,
 }
 
@@ -456,7 +467,7 @@ impl<O: Send + 'static> ParallelBuilder<O> {
     pub(crate) fn new_internal(
         ctx: DurableContext,
         op_id: OperationId,
-        branches: Vec<(String, crate::future::BranchBody<O>)>,
+        branches: Vec<(Option<String>, crate::future::BranchBody<O>)>,
     ) -> Self {
         Self {
             ctx,
