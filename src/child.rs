@@ -615,7 +615,7 @@ async fn serialize_value<O, S: Serdes<O>>(
     serdes_ctx: SerdesContext,
 ) -> Result<String, OperationError> {
     let operation_id = serdes_ctx.operation_id().to_owned();
-    match serdes.serialize(value, serdes_ctx).await {
+    match ctx.hold_activity(serdes.serialize(value, serdes_ctx)).await {
         Ok(serialized) => Ok(serialized),
         Err(err) => {
             let e = ctx
@@ -639,7 +639,10 @@ async fn deserialize_value<O, S: Serdes<O>>(
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
     let operation_id = serdes_ctx.operation_id().to_owned();
-    match serdes.deserialize(payload, serdes_ctx).await {
+    match ctx
+        .hold_activity(serdes.deserialize(payload, serdes_ctx))
+        .await
+    {
         Ok(value) => Ok(value),
         Err(err) => {
             let e = ctx
@@ -964,7 +967,7 @@ mod tests {
         record.result = None;
         record.replay_children = true;
         let ctx = test_ctx(CheckpointLog::from_records(vec![(wire_id, record)]));
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
 
         let child = ctx
             .run_in_child_context(|_child_ctx| async move { Ok(7_i32) })

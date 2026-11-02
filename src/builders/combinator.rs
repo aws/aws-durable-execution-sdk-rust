@@ -97,6 +97,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -112,12 +117,12 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::TryJoinAllExecution;
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = TryJoinAllExecution {
             ctx: self.ctx,
@@ -126,7 +131,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }
 
@@ -211,6 +216,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -226,12 +236,12 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     type Output = Result<Vec<Settled<O>>, OperationError>;
     type IntoFuture = DurableFuture<Vec<Settled<O>>>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::JoinAllExecution;
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = JoinAllExecution {
             ctx: self.ctx,
@@ -240,7 +250,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }
 
@@ -322,6 +332,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -337,12 +352,12 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::SelectOkExecution;
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = SelectOkExecution {
             ctx: self.ctx,
@@ -351,7 +366,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }
 
@@ -433,6 +448,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -448,12 +468,12 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::RaceExecution;
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = RaceExecution {
             ctx: self.ctx,
@@ -462,6 +482,6 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }

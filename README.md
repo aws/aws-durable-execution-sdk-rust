@@ -172,6 +172,9 @@ destinations do not trigger, and X-Ray does not mark the trace as an error.
 Monitor and alarm on the durable execution status instead, via
 `get-durable-execution` or `list-durable-executions-by-function`.
 
+Rust returns `PENDING` only when no SDK-owned local work can make progress
+and at least one attached service wait remains.
+
 An `Err` is a recoverable operation failure. A panic fails the Lambda
 invocation. A panic in a step body, a map item, a parallel branch or a
 combinator input propagates unchanged, the SDK records nothing for it, and
@@ -222,11 +225,15 @@ run time. A `DurableContext` clone that a step body, a `wait_for_condition`
 check, or a child body uses for an operation it does not own fails the
 execution on the first invocation with a context usage error.
 
-Two more constraints follow from how suspension works. Use `ctx.race` or
-`ctx.select_ok` rather than `tokio::select!` over durable futures, so the SDK
-records which branch won. And when an execution suspends, the SDK drops your
-handler future, so never make correctness between operations depend on `Drop`
-order.
+Use `ctx.race` or `ctx.select_ok` rather than `tokio::select!` over durable
+futures, so the SDK records which branch won. `tokio::join!` over SDK
+operations is allowed: the invocation suspends only when no SDK work can make
+progress. Work that is not an SDK operation belongs in a step; awaiting it
+between operations lets the invocation suspend. `tokio::task::yield_now()`
+outside a step body is such an await too: while an operation waits and no
+other SDK work runs, the invocation suspends at it. When an execution
+suspends, the SDK drops your handler future, so never make correctness
+between operations depend on `Drop` order.
 
 ### Replacing the transport
 
@@ -581,6 +588,10 @@ item's status and why the batch ended. `BatchResult::status()` returns a
 that tie each failure to the index and name of the item that produced it,
 along with the error's type identifier and message.
 
+An item that waits on a durable operation keeps its concurrency slot until it
+finishes. When its wait completes while other work runs, it continues in the
+same invocation.
+
 When the completion rule ends the batch early, items that are still running
 are cancelled at their next `.await` and reported as `Started`. A cancelled
 item writes no further checkpoint.
@@ -588,7 +599,9 @@ item writes no further checkpoint.
 ### combinators
 
 The four combinators take `DurableFuture` values, which `.future()` and
-`.spawn()` produce, and record the combined outcome as one operation.
+`.spawn()` produce, and record the combined outcome as one operation. An input
+that waits stays pending. When every remaining input waits and nothing else
+runs, the invocation suspends.
 
 `try_join_all` collects every result, propagating the first error:
 

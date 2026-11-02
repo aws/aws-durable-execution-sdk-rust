@@ -299,7 +299,8 @@ where
     {
         use crate::map_parallel::MapExecution;
 
-        // The admission check every lazy terminal runs in `lazy_scoped`.
+        // The admission check every lazy terminal runs in
+        // `DurableFuture::for_operation`.
         self.ctx.admit_operation().await;
         let execution = MapExecution {
             ctx: self.ctx,
@@ -341,6 +342,11 @@ where
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -366,12 +372,12 @@ where
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::map_parallel::MapExecution;
 
         preflight_identity!(self, "Context", crate::map_parallel::MAP_SUB_TYPE);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = MapExecution {
             ctx: self.ctx,
@@ -388,7 +394,7 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }
 
@@ -626,7 +632,8 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     {
         use crate::map_parallel::ParallelExecution;
 
-        // The admission check every lazy terminal runs in `lazy_scoped`.
+        // The admission check every lazy terminal runs in
+        // `DurableFuture::for_operation`.
         self.ctx.admit_operation().await;
         let execution = ParallelExecution {
             ctx: self.ctx,
@@ -665,6 +672,11 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -687,12 +699,12 @@ where
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::map_parallel::ParallelExecution;
 
         preflight_identity!(self, "Context", crate::map_parallel::PARALLEL_SUB_TYPE);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = ParallelExecution {
             ctx: self.ctx,
@@ -706,7 +718,7 @@ where
             branches: self.branches,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }
 

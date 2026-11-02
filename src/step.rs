@@ -227,8 +227,13 @@ where
                 // Execute the step body inside a tracing span carrying the
                 // structured-log field contract.
                 let step_ctx = StepContext::new(attempt);
-                let result = run_body(body, async move { (closure)(step_ctx).await })
-                    .instrument(span)
+                // The body holds an activity permit from its call until it
+                // returns, so the invocation does not suspend while it runs.
+                let activity = live.ctx.clone();
+                let result = activity
+                    .hold_activity(
+                        run_body(body, async move { (closure)(step_ctx).await }).instrument(span),
+                    )
                     .await;
                 live.settle(attempt, result).await
             }
@@ -346,8 +351,8 @@ where
                     return Ok(StepPrelude::Done(Err(replay_failure(wire, &wire_id))));
                 }
                 CheckpointStatus::Pending => {
-                    // Retry timer hasn't fired yet: suspend.
-                    return Ok(StepPrelude::Done(self.ctx.suspend_now().await));
+                    // Retry timer hasn't fired yet: wait for it.
+                    return Ok(StepPrelude::Done(wait_for_retry(&self.ctx, &wire_id).await));
                 }
                 CheckpointStatus::Started => {
                     // Already started: behavior depends on semantics.
@@ -552,6 +557,17 @@ async fn handle_success<O, S: Serdes<O>>(
     deserialize_result(ctx, name, serdes, serialized, serdes_ctx).await
 }
 
+/// Waits for a retry timer the backend owns.
+///
+/// The step body is `FnOnce`, so the step never resumes in this
+/// invocation: it registers a wait that is never ready. The invocation
+/// suspends once no other SDK work can make progress, and the backend
+/// invokes the function again when the timer fires.
+async fn wait_for_retry<T>(ctx: &DurableContext, wire_id: &str) -> T {
+    ctx.wait_for_record(wire_id, |_| false).await;
+    std::future::pending().await
+}
+
 /// Handles a failed step: consult retry strategy, checkpoint accordingly.
 ///
 /// `kind` is `StepErrorKind::ExecutionFailed` when the body returned
@@ -611,8 +627,8 @@ async fn handle_failure<O>(
                     .await;
             }
 
-            // Suspend: the backend owns the retry timer.
-            ctx.suspend_now().await
+            // The backend owns the retry timer: wait for it.
+            wait_for_retry(ctx, wire_id).await
         }
         RetryDecision::Stop => {
             // Checkpoint FAIL (permanent).
@@ -777,7 +793,7 @@ async fn serialize_value<O, S: Serdes<O>>(
     serdes_ctx: SerdesContext,
 ) -> Result<String, OperationError> {
     let operation_id = serdes_ctx.operation_id().to_owned();
-    match serdes.serialize(value, serdes_ctx).await {
+    match ctx.hold_activity(serdes.serialize(value, serdes_ctx)).await {
         Ok(serialized) => Ok(serialized),
         Err(err) => Err(step_serialization_error(
             ctx.route_serdes_error("serialize", &operation_id, name, err)
@@ -799,7 +815,10 @@ async fn deserialize_result<O, S: Serdes<O>>(
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
     let operation_id = serdes_ctx.operation_id().to_owned();
-    match serdes.deserialize(serialized, serdes_ctx).await {
+    match ctx
+        .hold_activity(serdes.deserialize(serialized, serdes_ctx))
+        .await
+    {
         Ok(value) => Ok(value),
         Err(err) => Err(step_serialization_error(
             ctx.route_serdes_error("deserialize", &operation_id, name, err)
@@ -1529,7 +1548,7 @@ mod tests {
 
         // Attempt 1: the strategy retries, so the step suspends.
         let (ctx, client) = context_over(Vec::new());
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -1678,7 +1697,7 @@ mod tests {
             _marker: std::marker::PhantomData,
         };
 
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         // Retry timer is backend-owned: the operation suspends (parks) rather
         // than surfacing a fabricated error to the caller.
         let outcome = crate::driver::test_support::outcome_of(
@@ -1726,7 +1745,7 @@ mod tests {
             _marker: std::marker::PhantomData,
         };
 
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -1922,7 +1941,7 @@ mod tests {
         let (strategy, seen) = kind_recording_strategy(RetryDecision::Retry {
             delay: Duration::from_secs(5),
         });
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let ownership = Arc::clone(ctx.task_ownership());
         let exec = at_most_once_over_started(ctx, Some(strategy), Arc::clone(&executed));
 
@@ -1947,7 +1966,7 @@ mod tests {
 
         let executed = Arc::new(AtomicBool::new(false));
         let (ctx, client) = context_over(vec![step_record(CheckpointStatus::Started, 0, None)]);
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let ownership = Arc::clone(ctx.task_ownership());
         let exec = at_most_once_over_started(ctx, None, executed);
 
@@ -2270,5 +2289,78 @@ mod tests {
             .jitter(JitterStrategy::None)
             .build();
         assert_eq!(retry_secs(&half.decide(1)), 3);
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{
+        ScriptedClient, drive_handler, named, operation_like, scripted_ctx, wire_err,
+    };
+    use aws_sdk_lambda::types::{OperationAction, OperationStatus};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn step_retry_stays_waiting_in_invocation() {
+        let client = Arc::new(ScriptedClient::new(|updates, history| {
+            if named(updates, "root", &OperationAction::Succeed).is_none() {
+                return Vec::new();
+            }
+            named(history, "flaky", &OperationAction::Start)
+                .map(|start| {
+                    operation_like(start, OperationStatus::Ready)
+                        .build()
+                        .expect("all required fields set")
+                })
+                .into_iter()
+                .collect()
+        }));
+        let ctx = scripted_ctx(&client);
+        let runs = Arc::new(AtomicU32::new(0));
+        let body_runs = Arc::clone(&runs);
+        let body_client = Arc::clone(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let flaky = ctx
+                .step(move |_| {
+                    let runs = Arc::clone(&body_runs);
+                    async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        Err::<u32, crate::BoxError>("transient".into())
+                    }
+                })
+                .name("flaky")
+                .retry_strategy(|_err, attempt| {
+                    if attempt < 2 {
+                        crate::RetryDecision::Retry {
+                            delay: Duration::from_secs(1),
+                        }
+                    } else {
+                        crate::RetryDecision::Stop
+                    }
+                })
+                .spawn();
+            ctx.step(move |_| async move {
+                // The READY arrives only after the retry was recorded.
+                for _ in 0..1000 {
+                    if body_client.received("flaky", &OperationAction::Retry) {
+                        return Ok(1_u32);
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err("the flaky step never retried".into())
+            })
+            .name("root")
+            .await
+            .map_err(wire_err)?;
+            flaky.await.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the retrying body ran once");
     }
 }

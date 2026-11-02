@@ -166,7 +166,7 @@ unsafe_code = "forbid"
 workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1.44", features = ["rt", "sync", "time", "macros"] }
 lambda_runtime = "1"
 # Both AWS crates disable default features so the legacy hyper-0.14 /
 # rustls-0.21 / ring chain never enters the graph. `default-https-client`

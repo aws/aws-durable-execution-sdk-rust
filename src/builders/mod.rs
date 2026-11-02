@@ -62,60 +62,22 @@ macro_rules! preflight_identity {
 
 /// The body shared by every builder's `.spawn()` terminal.
 ///
-/// Rebinds the builder's context onto a FRESH child suspension scope, then
-/// hands the operation future to
-/// [`DurableFuture::spawn_blessed`](crate::future::DurableFuture) together with
-/// the owner's scope (for quiescence accounting) and the new scope (which the
-/// spawned task drives).
-///
-/// The fresh scope is what keeps the accounting correct: an eagerly spawned
-/// operation that kept the owner's scope would park the owner (ending the
-/// invocation) the moment it hit a durable suspension point, aborting
-/// runnable siblings.
+/// Builds the operation future with the builder's lazy terminal
+/// (`into_future`, which runs the identity preflight and the admission
+/// check), then starts it on its own task through
+/// [`DurableFuture::spawn_blessed`](crate::future::DurableFuture), which
+/// blesses the task with the builder context's ownership handle.
 ///
 /// The builder must have a `ctx: DurableContext` field and implement
 /// [`IntoFuture`] with
 /// `IntoFuture = DurableFuture<_>`.
 macro_rules! spawn_terminal {
     ($builder:expr) => {{
-        let mut builder = $builder;
-        let owner_scope = ::std::sync::Arc::clone(builder.ctx.suspension_signal());
+        let builder = $builder;
         let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
-        let (spawn_ctx, spawn_scope) = builder.ctx.spawn_scope();
-        builder.ctx = spawn_ctx;
+        let coordinator = ::std::sync::Arc::clone(builder.ctx.coordinator());
         let future = ::std::future::IntoFuture::into_future(builder);
-        $crate::future::DurableFuture::spawn_blessed(
-            future,
-            &task_ownership,
-            owner_scope,
-            spawn_scope,
-        )
-    }};
-}
-
-/// The scope rebind shared by every builder's lazy terminal (`.await` /
-/// `.future()`), evaluated inside `into_future` after `preflight_identity!`.
-///
-/// Rebinds the builder's context onto a FRESH child suspension scope and
-/// returns `(owner_scope, op_scope)` for
-/// [`DurableFuture::lazy_scoped`](crate::future::DurableFuture): every park
-/// inside the operation lands on `op_scope` rather than on the scope the
-/// builder was created from, so whoever polls the future decides where the
-/// suspension goes. A direct `.await` forwards it to `owner_scope`
-/// (identical caller-visible behavior); a combinator redirects it onto a
-/// scope it controls, so a losing input's park never suspends the caller
-/// after a winner settled (issue #49).
-///
-/// The third value is a clone of the rebound context, which
-/// `lazy_scoped` uses for its admission check.
-///
-/// The builder must have a `ctx: DurableContext` field.
-macro_rules! rebind_lazy_scope {
-    ($builder:expr) => {{
-        let owner_scope = ::std::sync::Arc::clone($builder.ctx.suspension_signal());
-        let (scoped_ctx, op_scope) = $builder.ctx.spawn_scope();
-        $builder.ctx = scoped_ctx;
-        (owner_scope, op_scope, $builder.ctx.clone())
+        $crate::future::DurableFuture::spawn_blessed(future, &task_ownership, &coordinator)
     }};
 }
 

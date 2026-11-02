@@ -151,6 +151,11 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -176,14 +181,6 @@ where
 
         preflight_identity!(self, "Callback", crate::callback::CALLBACK_SUB_TYPE);
 
-        // Deliberately NOT rebound onto a fresh scope (no `rebind_lazy_scope!`
-        // here, unlike every other lazy terminal): registering a callback
-        // never parks, so there is nothing to isolate, and the returned
-        // [`Callback`](crate::builders::callback::Callback) stores this
-        // context for its `result()` future, which must park a scope that is
-        // still being driven when it is awaited. `Callback::result()` does
-        // its own rebind against this caller-scoped context.
-        // The admission check every other terminal runs in `lazy_scoped`.
         let gate = self.ctx.clone();
         let execution = CreateCallbackExecution {
             ctx: self.ctx,
@@ -195,11 +192,7 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::from_async(async move {
-            gate.admit_operation().await;
-            drop(gate);
-            execution.execute().await
-        })
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }
 
@@ -438,6 +431,11 @@ where
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -457,12 +455,12 @@ where
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::callback::WaitForCallbackExecution;
 
         preflight_identity!(self, "Context", crate::callback::WFCB_SUB_TYPE);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = WaitForCallbackExecution {
             ctx: self.ctx,
@@ -476,7 +474,7 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }
 

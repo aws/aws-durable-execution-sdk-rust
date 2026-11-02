@@ -24,6 +24,12 @@ use crate::error::{ChildFnError, OperationError};
 /// task. Dropping the `DurableFuture` before it resolves aborts that task,
 /// so spawned durable work never outlives its handle.
 ///
+/// An operation that waits on the service (a wait, a callback result, an
+/// invoke) stays pending while other SDK work runs, and continues in the
+/// same invocation when a checkpoint response completes it. The invocation
+/// suspends only when no SDK work can make progress and an operation
+/// waits.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -45,42 +51,6 @@ use crate::error::{ChildFnError, OperationError};
 #[non_exhaustive]
 pub struct DurableFuture<O> {
     inner: Pin<Box<dyn Future<Output = Result<O, OperationError>> + Send>>,
-    /// Optional shared cell that a spawned handle reads at park-time.
-    /// When set to `Some(scope)`, the handle parks that scope instead of the
-    /// one captured at `.spawn()` time. Enables spawned combinators to
-    /// redirect constituent parking onto the combinator's spawn scope,
-    /// preventing deadlock when a constituent parks and the combinator is
-    /// outstanding on the same owner scope.
-    park_redirect: Option<std::sync::Arc<ParkRedirect>>,
-}
-
-/// Shared mutable cell read by a spawned handle at park-time to determine
-/// which scope to park. Default is `None` (use the originally captured scope).
-#[derive(Debug)]
-pub(crate) struct ParkRedirect {
-    target: std::sync::Mutex<Option<std::sync::Arc<crate::driver::SuspensionSignal>>>,
-}
-
-impl ParkRedirect {
-    fn new() -> Self {
-        Self {
-            target: std::sync::Mutex::new(None),
-        }
-    }
-
-    fn set(&self, scope: std::sync::Arc<crate::driver::SuspensionSignal>) {
-        // A poisoned Mutex means a panic occurred while the lock was held.
-        // Since ParkRedirect access is trivial (clone-in / clone-out with no
-        // user code under the lock), poisoning is an irrecoverable internal
-        // state; silently falling back to the default park target is safe.
-        if let Ok(mut guard) = self.target.lock() {
-            *guard = Some(scope);
-        }
-    }
-
-    fn get(&self) -> Option<std::sync::Arc<crate::driver::SuspensionSignal>> {
-        self.target.lock().ok().and_then(|guard| guard.clone())
-    }
 }
 
 impl<O> std::fmt::Debug for DurableFuture<O> {
@@ -97,224 +67,54 @@ impl<O: Send + 'static> DurableFuture<O> {
     {
         Self {
             inner: Box::pin(fut),
-            park_redirect: None,
         }
     }
 
-    /// Redirects this future's park behaviour to `scope`.
+    /// Creates the future of one operation created on `ctx`.
     ///
-    /// When the underlying operation parks, the future parks `scope`
-    /// instead of the scope captured when the future was created. Both
-    /// terminals participate: a spawned future (produced by `.spawn()`)
-    /// reads the redirect when its task reports `Parked`, and a lazy
-    /// future (produced by [`Self::lazy_scoped`] via `.future()` or
-    /// `.await`) reads it when its own scope suspends. This is what lets
-    /// a combinator isolate a losing input's suspension onto a scope it
-    /// controls (issue #49). No-op on futures without a redirect cell
-    /// (immediate-error preflight futures, raw test futures).
-    pub(crate) fn set_park_scope(&self, scope: std::sync::Arc<crate::driver::SuspensionSignal>) {
-        if let Some(redirect) = &self.park_redirect {
-            redirect.set(scope);
-        }
-    }
-
-    /// Creates a lazy `DurableFuture` that runs `fut` inside its OWN
-    /// suspension scope, mirroring [`Self::spawn_blessed`] without the
-    /// eager tokio task.
-    ///
-    /// The builder's context was rebound onto `op_scope` (a fresh child
-    /// scope) before `fut` was constructed, so every park inside the
-    /// operation lands on `op_scope` rather than on the scope the builder
-    /// was created from. [`drive_scope`](crate::driver::drive_scope)
-    /// observes that park and this wrapper forwards it: to the redirect
-    /// target when [`Self::set_park_scope`] installed one (the future is a
-    /// combinator constituent), otherwise to `owner_scope` (the scope the
-    /// operation was created on: a direct `.await` must still suspend the
-    /// caller). After forwarding, the future pends forever: a parked
-    /// operation resumes only on a later invocation, exactly like the
-    /// spawned path.
-    ///
-    /// `gate` is the builder's context. When one of its owners is abandoned
-    /// before the first poll, `fut` is never polled and the future never
-    /// resolves (see [`crate::checkpoint_coalescer::Admission`]).
-    pub(crate) fn lazy_scoped<F>(
-        fut: F,
-        gate: DurableContext,
-        owner_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
-        op_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
-    ) -> Self
+    /// When one of the context's owners is abandoned before the first poll,
+    /// `fut` is never polled and the future never resolves (see
+    /// [`crate::checkpoint_coalescer::Admission`]). Every builder terminal,
+    /// awaited or spawned, passes here before its operation runs.
+    pub(crate) fn for_operation<F>(ctx: &DurableContext, fut: F) -> Self
     where
         F: Future<Output = Result<O, OperationError>> + Send + 'static,
     {
-        use crate::driver::{ScopeOutcome, drive_scope};
-
-        let redirect = std::sync::Arc::new(ParkRedirect::new());
-        let redirect_handle = std::sync::Arc::clone(&redirect);
-
-        Self {
-            inner: Box::pin(async move {
-                // An abandoned owner starts no operation: the operation is
-                // never polled, and this future never resolves (see
-                // `Admission`). Every builder future, awaited or spawned,
-                // passes here before its operation runs.
-                gate.admit_operation().await;
-                drop(gate);
-                match drive_scope(fut, op_scope).await {
-                    ScopeOutcome::Completed(result) => result,
-                    ScopeOutcome::Suspended => {
-                        let park_target = redirect_handle.get().unwrap_or(owner_scope);
-                        park_target.park_owner();
-                        std::future::pending().await
-                    }
-                }
-            }),
-            park_redirect: Some(redirect),
-        }
+        let gate = ctx.clone();
+        Self::from_async(async move {
+            gate.admit_operation().await;
+            drop(gate);
+            fut.await
+        })
     }
 
-    /// Spawns the future on a tokio task with its OWN suspension scope, and
-    /// registers it as blessed.
-    ///
-    /// `owner_scope` is the scope the `.spawn()` call was made from;
-    /// `spawn_scope` is the fresh child scope the operation runs in (the
-    /// builder's context was rebound onto it by
-    /// [`DurableContext::spawn_scope`](crate::context::DurableContext)).
-    ///
-    /// Scope isolation means a parking operation inside the spawned task
-    /// suspends only `spawn_scope`, which this task's
-    /// [`drive_scope`](crate::driver::drive_scope) observes: the owner's scope
-    /// is untouched, so runnable siblings keep running. The task then reports
-    /// how it settled to the owner's scope-quiescence accounting, which is what
-    /// lets the owner suspend exactly once everything runnable has finished or
-    /// parked.
-    ///
-    /// The accounting transitions happen ON THIS TASK, never in the returned
-    /// handle: the runtime always polls a live task, but nothing guarantees the
-    /// handle is ever polled. A task cancelled before it settles reports
-    /// `Aborted` from its RAII guard.
+    /// Spawns the operation future on its own task, blessed in
+    /// `task_ownership` before its first poll.
     ///
     /// The task starts through the task gateway
-    /// ([`crate::task::spawn_tracked`]). A panic in the operation resumes on
-    /// the task that awaits the handle, with its original payload. When no
-    /// Tokio runtime is running, the returned future resolves to an error
-    /// and the operation records nothing.
+    /// ([`crate::task::spawn_tracked`]) and holds a permit of `coordinator`
+    /// whenever it can make progress, so the invocation does not suspend
+    /// while it runs. A wait inside it registers like any other wait.
+    /// Dropping the returned future aborts the task. A panic in the
+    /// operation resumes on the task that awaits the handle, with its
+    /// original payload. When no Tokio runtime is running, the returned
+    /// future resolves to an error and the operation records nothing.
     pub(crate) fn spawn_blessed(
         future: Self,
         task_ownership: &std::sync::Arc<crate::driver::TaskOwnership>,
-        owner_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
-        spawn_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
-    ) -> Self
-    where
-        O: Send + 'static,
-    {
-        use crate::driver::{ScopeOutcome, SpawnSettlement, drive_scope};
-
-        /// Reports `Aborted` if the task is dropped before it settles, so a
-        /// cancelled spawn can never leave the owner's counter stuck above
-        /// zero (which would park the owner forever).
-        struct SpawnAccounting {
-            scope: std::sync::Arc<crate::driver::SuspensionSignal>,
-            settled: bool,
-        }
-
-        impl SpawnAccounting {
-            fn settle(&mut self, settlement: SpawnSettlement) {
-                if !self.settled {
-                    self.settled = true;
-                    self.scope.settle_spawn(settlement);
-                }
-            }
-        }
-
-        impl Drop for SpawnAccounting {
-            fn drop(&mut self) {
-                self.settle(SpawnSettlement::Aborted);
-            }
-        }
-
-        // Park-redirect cell: the handle reads this at park-time. A
-        // combinator's `.spawn()` may set it to the combinator's spawn scope
-        // before polling the handle, redirecting parking away from the
-        // captured `owner_scope`.
-        let redirect = std::sync::Arc::new(ParkRedirect::new());
-        let redirect_handle = std::sync::Arc::clone(&redirect);
-
-        // Register BEFORE spawning so the count is already correct even if the
-        // task settles before the owner is polled again.
-        owner_scope.register_spawn();
-        // Construct the settling guard BEFORE spawning and move it into the
-        // task. The guard must exist from the moment `register_spawn` takes
-        // effect: dropping the returned future aborts the task, and an abort
-        // that lands before the task's first poll drops the task body, and
-        // this guard with it, settling `Aborted`. Constructing the guard
-        // inside the task body instead would leave that window unguarded,
-        // permanently counting a phantom outstanding spawn that parks the
-        // owner forever (issue #48). When no runtime is running, the spawn
-        // below drops the body, and this guard settles `Aborted` at once.
-        let mut accounting = SpawnAccounting {
-            scope: std::sync::Arc::clone(&owner_scope),
-            settled: false,
-        };
-
-        let tasks = std::sync::Arc::clone(owner_scope.tasks());
-        // The gateway blesses the task before the body's first poll, catches
-        // a panic of the body, and hands it to the handle below.
-        let spawned = crate::task::spawn_tracked(&tasks, task_ownership, async move {
-            // Drive the operation in its OWN scope: a park inside it suspends
-            // that scope only, and surfaces here as `Suspended`.
-            match drive_scope(future, spawn_scope).await {
-                ScopeOutcome::Completed(result) => {
-                    accounting.settle(SpawnSettlement::Completed);
-                    SpawnMessage::Settled(result)
-                }
-                ScopeOutcome::Suspended => {
-                    accounting.settle(SpawnSettlement::Parked);
-                    SpawnMessage::Parked
-                }
-            }
-        });
-        let task = match spawned {
-            Ok(task) => task,
+        coordinator: &std::sync::Arc<crate::coordinator::InvocationCoordinator>,
+    ) -> Self {
+        match crate::task::spawn_tracked(coordinator, task_ownership, future) {
+            Ok(task) => Self::from_async(async move { task.await.into_value() }),
             // No Tokio runtime is running on this thread: the operation
             // records nothing and resolves to an error.
             Err(no_runtime) => {
-                return Self::from_async(async move {
-                    Err(crate::task::NoRuntime::operation_error(no_runtime))
-                });
+                Self::from_async(
+                    async move { Err(crate::task::NoRuntime::operation_error(no_runtime)) },
+                )
             }
-        };
-
-        Self {
-            inner: Box::pin(async move {
-                // Dropping `task` (this future) aborts the spawned task, so
-                // spawned durable work never outlives its handle.
-                match task.await.into_value() {
-                    SpawnMessage::Settled(result) => result,
-                    // The operation parked durably: it resumes on a later
-                    // invocation, so this handle can never resolve now. Park
-                    // the effective scope, either the redirect target (when
-                    // this future is a constituent of a spawned combinator) or
-                    // the original owner scope, then never return.
-                    SpawnMessage::Parked => {
-                        let park_target = redirect_handle
-                            .get()
-                            .unwrap_or_else(|| std::sync::Arc::clone(&owner_scope));
-                        park_target.park_owner();
-                        std::future::pending().await
-                    }
-                }
-            }),
-            park_redirect: Some(redirect),
         }
     }
-}
-
-/// What a spawned task reports to its handle.
-enum SpawnMessage<O> {
-    /// The operation resolved.
-    Settled(Result<O, OperationError>),
-    /// The operation suspended durably; it resumes on a later invocation.
-    Parked,
 }
 
 impl<O: Send + 'static> Future for DurableFuture<O> {
@@ -510,13 +310,37 @@ pub struct Callback<O> {
     state: CallbackState<O>,
 }
 
+/// Resolves a pending callback from its record once the record is
+/// terminal.
+pub(crate) type CallbackResolver<O> =
+    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<O, OperationError>> + Send>> + Send>;
+
 /// Internal state for a callback: either settled (replay) or pending (live).
-#[derive(Debug)]
 enum CallbackState<O> {
     /// The callback has a known outcome from the checkpoint log (replay).
     Settled(Option<Result<O, OperationError>>),
-    /// The callback is in flight: requesting the result triggers suspension.
-    Pending(DurableContext),
+    /// The callback is in flight: the result waits on its record.
+    Pending {
+        /// The context the callback was created on.
+        ctx: DurableContext,
+        /// The callback operation's wire ID.
+        wire_id: String,
+        /// Builds the outcome from the terminal record.
+        resolver: CallbackResolver<O>,
+    },
+}
+
+impl<O: std::fmt::Debug> std::fmt::Debug for CallbackState<O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Settled(outcome) => f.debug_tuple("Settled").field(outcome).finish(),
+            Self::Pending { ctx, wire_id, .. } => f
+                .debug_struct("Pending")
+                .field("ctx", ctx)
+                .field("wire_id", wire_id)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl<O: Send + 'static> Callback<O> {
@@ -529,10 +353,20 @@ impl<O: Send + 'static> Callback<O> {
     }
 
     /// Creates a pending callback (live: outcome not yet known).
-    pub(crate) fn new_pending(id: String, ctx: DurableContext) -> Self {
+    /// `resolver` builds the outcome from the record once it is terminal.
+    pub(crate) fn new_pending(
+        id: String,
+        ctx: DurableContext,
+        wire_id: String,
+        resolver: CallbackResolver<O>,
+    ) -> Self {
         Self {
             id,
-            state: CallbackState::Pending(ctx),
+            state: CallbackState::Pending {
+                ctx,
+                wire_id,
+                resolver,
+            },
         }
     }
 
@@ -568,9 +402,10 @@ impl<O: Send + 'static> Callback<O> {
     /// Returns the callback result as a [`DurableFuture`].
     ///
     /// For settled callbacks (replay), the future resolves with the stored
-    /// outcome immediately. For pending callbacks (live), polling the
-    /// future triggers suspension so the orchestrator can wait for the
-    /// external completion signal.
+    /// outcome immediately. For pending callbacks (live), the future waits
+    /// for the external completion. It resolves in the same invocation when
+    /// a checkpoint response carries the completed callback; otherwise the
+    /// invocation suspends once no other SDK work can make progress.
     ///
     /// Because the return type is a [`DurableFuture`], a callback result
     /// participates in the durable combinators
@@ -618,26 +453,25 @@ impl<O: Send + 'static> Callback<O> {
                     ))
                 })
             }),
-            CallbackState::Pending(ctx) => {
-                // Live path: request suspension and park. The stored context
-                // carries the CALLER's scope (create_callback deliberately
-                // does not rebind: see `CreateCallbackBuilder::into_future`),
-                // so rebind onto a fresh scope here: a direct `.await` still
-                // suspends the caller, while a combinator can redirect this
-                // future's park onto a scope it controls instead of parking
-                // the caller after a sibling already settled (issue #49).
-                // Either way control never returns here; the callback result
-                // surfaces only when a later invocation replays with a
-                // settled record.
-                let owner_scope = std::sync::Arc::clone(ctx.suspension_signal());
-                let (scoped_ctx, op_scope) = ctx.spawn_scope();
-                let gate = scoped_ctx.clone();
-                DurableFuture::lazy_scoped(
-                    async move { scoped_ctx.suspend_now().await },
-                    gate,
-                    owner_scope,
-                    op_scope,
-                )
+            CallbackState::Pending {
+                ctx,
+                wire_id,
+                resolver,
+            } => {
+                // Live path: wait until the record is terminal, then build
+                // the outcome from it, as the create-time replay does.
+                let gate = ctx.clone();
+                DurableFuture::for_operation(&gate, async move {
+                    ctx.wait_for_record(&wire_id, |status| {
+                        !matches!(
+                            status,
+                            crate::engine::CheckpointStatus::Started
+                                | crate::engine::CheckpointStatus::Pending
+                        )
+                    })
+                    .await;
+                    resolver().await
+                })
             }
         }
     }

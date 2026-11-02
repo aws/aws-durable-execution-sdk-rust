@@ -259,6 +259,11 @@ where
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -281,12 +286,12 @@ where
     type Output = Result<S, OperationError>;
     type IntoFuture = DurableFuture<S>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::wait_for_condition::WaitForConditionExecution;
 
         preflight_identity!(self, "Step", crate::wait_for_condition::WFC_SUB_TYPE);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = WaitForConditionExecution {
             ctx: self.ctx,
@@ -298,7 +303,7 @@ where
             check: self.check,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }
 

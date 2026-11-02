@@ -24,7 +24,8 @@ use crate::checkpoint_coalescer::{
 use crate::client::{
     CheckpointOutput, ExecutionClient, ExecutionClientError, ExecutionClientErrorScope,
 };
-use crate::driver::{SuspensionSignal, TaskOwnership};
+use crate::coordinator::{InvocationCoordinator, PermitKind};
+use crate::driver::TaskOwnership;
 use crate::engine::{
     CheckpointLog, CheckpointRecord, CheckpointStatus, CheckpointStatusView, EngineState,
     OperationId, TerminalReplaySnapshot,
@@ -68,9 +69,53 @@ pub(crate) fn run_body<F: Future>(body: ActiveBody, fut: F) -> impl Future<Outpu
     ACTIVE_BODY.scope(body, fut)
 }
 
+/// The time left from `now` until `deadline_ms` (milliseconds since the
+/// Unix epoch): `None` when the deadline is 0, `Duration::ZERO` once it
+/// passed.
+fn remaining_until(deadline_ms: u64, now: std::time::SystemTime) -> Option<Duration> {
+    if deadline_ms == 0 {
+        return None;
+    }
+    let deadline = std::time::UNIX_EPOCH + Duration::from_millis(deadline_ms);
+    Some(deadline.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
 /// Shows a context prefix in a context usage error: `root` for the root.
 fn display_prefix(prefix: &str) -> &str {
     if prefix.is_empty() { "root" } else { prefix }
+}
+
+/// Returns the wire ID and payload of every `wait_for_condition` `RETRY`
+/// among `updates`, in order.
+fn wfc_retries(updates: &[OperationUpdate]) -> Vec<(String, Option<String>)> {
+    updates
+        .iter()
+        .filter(|update| {
+            *update.action() == aws_sdk_lambda::types::OperationAction::Retry
+                && update.sub_type() == Some(crate::wait_for_condition::WFC_SUB_TYPE)
+        })
+        .map(|update| (update.id().to_owned(), update.payload().map(str::to_owned)))
+        .collect()
+}
+
+/// Marks the record of `wire_id` `PENDING` with `payload` as its result,
+/// after a `wait_for_condition` `RETRY` write whose response did not carry
+/// the operation.
+///
+/// The service moves a retried operation to `PENDING`. A response that
+/// does not carry the operation leaves the log at the status from before
+/// the write. A waiting operation that read that status would take it for
+/// the next status and run its next check at once. So the log takes the
+/// status the service recorded. A record already `PENDING` is kept, and a
+/// missing record stays missing. A response that carries the operation is
+/// merged instead, so its status is kept.
+fn mark_retry_pending(log: &CheckpointLog, wire_id: &str, payload: Option<&str>) {
+    log.update(wire_id, |record| {
+        if record.status != CheckpointStatus::Pending {
+            record.status = CheckpointStatus::Pending;
+            record.result = payload.map(str::to_owned);
+        }
+    });
 }
 
 /// Shared inner state for a durable execution context.
@@ -78,13 +123,14 @@ struct Inner {
     execution_arn: String,
     lambda_context: lambda_runtime::Context,
     /// Engine state (ID counter + checkpoint log) for this context's
-    /// namespace. Shared behind an `Arc` so a context can be rebound onto a
-    /// different suspension scope (see
-    /// [`DurableContext::spawn_scope`]) without duplicating the ID counter:
-    /// two contexts minting from separate counters would diverge on replay.
+    /// namespace. Shared behind an `Arc` because a clone of the context with
+    /// another owner set (see [`DurableContext::with_owner`]) must mint from
+    /// the same ID counter: two contexts minting from separate counters
+    /// would diverge on replay.
     engine: Arc<EngineState>,
-    /// Suspension signal shared with the driver.
-    suspension_signal: Arc<SuspensionSignal>,
+    /// The invocation coordinator, shared by every context of the
+    /// invocation and by the driver.
+    coordinator: Arc<InvocationCoordinator>,
     /// Task-ownership detector: catches user `tokio::spawn` misuse.
     task_ownership: Arc<TaskOwnership>,
     /// Execution client for checkpointing (None in test contexts without a client).
@@ -247,7 +293,7 @@ impl DurableContext {
                 execution_arn,
                 lambda_context,
                 engine,
-                suspension_signal: Arc::new(SuspensionSignal::new()),
+                coordinator: InvocationCoordinator::new(),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
@@ -281,7 +327,7 @@ impl DurableContext {
                 execution_arn,
                 lambda_context,
                 engine,
-                suspension_signal: Arc::new(SuspensionSignal::new()),
+                coordinator: InvocationCoordinator::new(),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: None,
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
@@ -315,7 +361,7 @@ impl DurableContext {
                 execution_arn,
                 lambda_context,
                 engine,
-                suspension_signal: Arc::new(SuspensionSignal::new()),
+                coordinator: InvocationCoordinator::new(),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
@@ -355,7 +401,7 @@ impl DurableContext {
                 execution_arn,
                 lambda_context,
                 engine,
-                suspension_signal: Arc::new(SuspensionSignal::new()),
+                coordinator: InvocationCoordinator::new(),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
@@ -391,7 +437,7 @@ impl DurableContext {
                 execution_arn,
                 lambda_context,
                 engine,
-                suspension_signal: Arc::new(SuspensionSignal::new()),
+                coordinator: InvocationCoordinator::new(),
                 task_ownership: Arc::new(TaskOwnership::new_current()),
                 execution_client: Some(client),
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
@@ -423,7 +469,7 @@ impl DurableContext {
                 execution_arn: self.inner.execution_arn.clone(),
                 lambda_context: self.inner.lambda_context.clone(),
                 engine,
-                suspension_signal: Arc::clone(&self.inner.suspension_signal),
+                coordinator: Arc::clone(&self.inner.coordinator),
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
@@ -505,8 +551,7 @@ impl DurableContext {
             .ok()
             .flatten();
         if let Some(message) = message {
-            self.suspension_signal()
-                .record_fatal("Error".to_owned(), message);
+            self.coordinator().record_fatal("Error".to_owned(), message);
         }
         self.mint_id()
     }
@@ -545,51 +590,10 @@ impl DurableContext {
         });
     }
 
-    /// Creates a child context with its OWN fresh suspension scope.
-    ///
-    /// Unlike [`Self::new_child`] (which shares the parent's scope so a
-    /// sequential child's suspension propagates directly upward), this gives
-    /// the child an independent scope. Used for each map/parallel BRANCH so
-    /// that a `wait` inside one branch suspends only that branch: sibling
-    /// branches keep running, and the coordinator's branch driver observes
-    /// the branch scope. Everything else (checkpoint log, token, ownership,
-    /// ARN) is shared with the parent, exactly like `new_child`.
-    pub(crate) fn new_scoped_child(&self, parent_positional_id: &str) -> Self {
-        let engine = Arc::new(EngineState::new_child(
-            parent_positional_id,
-            Arc::clone(&self.inner.engine.checkpoint_log),
-        ));
-        // A branch runs as its own task with its own namespace and its own
-        // replay high-water mark; give it its own detached span (initialized
-        // from the BRANCH engine's replay status) so its mints track branch
-        // replay state without clobbering the root handler span's flag.
-        let replay_span = crate::tracing_layer::scoped_execution_span(
-            &self.inner.execution_arn,
-            &self.inner.lambda_context.request_id,
-            engine.is_replaying(),
-        );
-        Self {
-            inner: Arc::new(Inner {
-                execution_arn: self.inner.execution_arn.clone(),
-                lambda_context: self.inner.lambda_context.clone(),
-                engine,
-                suspension_signal: Arc::new(self.inner.suspension_signal.new_child_scope()),
-                task_ownership: Arc::clone(&self.inner.task_ownership),
-                execution_client: self.inner.execution_client.clone(),
-                checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
-                coalescer: self.inner.coalescer.clone(),
-                parent_wire_id: Some(crate::engine::compute_wire_id_public(parent_positional_id)),
-                admission: Arc::clone(&self.inner.admission),
-                owners: self.owners_with(parent_positional_id),
-                replay_span,
-            }),
-        }
-    }
-
-    /// FLAT-nesting counterpart of [`Self::new_scoped_child`]: a fresh-scope
-    /// child that reports `parent_wire_id_override` as its operations' parent
-    /// (the batch parent, not the virtual child).
-    pub(crate) fn new_scoped_flat_child(
+    /// FLAT-nesting counterpart of [`Self::new_child`]: a child that
+    /// reports `parent_wire_id_override` as its operations' parent (the
+    /// batch parent, not the virtual child).
+    pub(crate) fn new_flat_child(
         &self,
         child_positional_id: &str,
         parent_wire_id_override: &str,
@@ -598,8 +602,8 @@ impl DurableContext {
             child_positional_id,
             Arc::clone(&self.inner.engine.checkpoint_log),
         ));
-        // Same reasoning as `new_scoped_child`: a flat branch has its own
-        // namespace and replay high-water mark, so it gets its own span.
+        // A flat branch has its own namespace and replay high-water mark,
+        // so it gets its own span, as a child from `new_child` does.
         let replay_span = crate::tracing_layer::scoped_execution_span(
             &self.inner.execution_arn,
             &self.inner.lambda_context.request_id,
@@ -610,7 +614,7 @@ impl DurableContext {
                 execution_arn: self.inner.execution_arn.clone(),
                 lambda_context: self.inner.lambda_context.clone(),
                 engine,
-                suspension_signal: Arc::new(self.inner.suspension_signal.new_child_scope()),
+                coordinator: Arc::clone(&self.inner.coordinator),
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
@@ -621,39 +625,6 @@ impl DurableContext {
                 replay_span,
             }),
         }
-    }
-
-    /// Creates a clone of this context bound to a FRESH child suspension
-    /// scope, for an eagerly spawned (`.spawn()`ed) operation.
-    ///
-    /// Returns the rebound context and the new scope. Everything else,
-    /// engine state (so the ID counter and checkpoint log stay shared, and
-    /// replay identity is unaffected), client, token, ownership, ARN, is the
-    /// same as this context: only the suspension scope differs. A parking
-    /// operation inside the spawned task therefore suspends ITS OWN scope
-    /// (observed by the spawned task's [`drive_scope`](crate::driver::drive_scope))
-    /// instead of the owner's, exactly like a map/parallel branch.
-    pub(crate) fn spawn_scope(&self) -> (Self, Arc<SuspensionSignal>) {
-        let scope = Arc::new(self.inner.suspension_signal.new_child_scope());
-        let rebound = Self {
-            inner: Arc::new(Inner {
-                execution_arn: self.inner.execution_arn.clone(),
-                lambda_context: self.inner.lambda_context.clone(),
-                engine: Arc::clone(&self.inner.engine),
-                suspension_signal: Arc::clone(&scope),
-                task_ownership: Arc::clone(&self.inner.task_ownership),
-                execution_client: self.inner.execution_client.clone(),
-                checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
-                coalescer: self.inner.coalescer.clone(),
-                parent_wire_id: self.inner.parent_wire_id.clone(),
-                admission: Arc::clone(&self.inner.admission),
-                owners: Arc::clone(&self.inner.owners),
-                // Same engine (same ID counter and namespace), so mints
-                // through the rebound context keep the shared flag current.
-                replay_span: self.inner.replay_span.clone(),
-            }),
-        };
-        (rebound, scope)
     }
 
     /// Creates a clone of this context whose owners also include the child
@@ -668,7 +639,7 @@ impl DurableContext {
                 execution_arn: self.inner.execution_arn.clone(),
                 lambda_context: self.inner.lambda_context.clone(),
                 engine: Arc::clone(&self.inner.engine),
-                suspension_signal: Arc::clone(&self.inner.suspension_signal),
+                coordinator: Arc::clone(&self.inner.coordinator),
                 task_ownership: Arc::clone(&self.inner.task_ownership),
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
@@ -746,11 +717,93 @@ impl DurableContext {
             .collect()
     }
 
-    /// Returns a reference to the suspension signal for this context.
+    /// Returns the invocation coordinator, shared by every context of the
+    /// invocation.
+    pub(crate) fn coordinator(&self) -> &Arc<InvocationCoordinator> {
+        &self.inner.coordinator
+    }
+
+    /// Awaits `fut` while holding an activity permit, so the invocation
+    /// does not suspend while `fut` runs. When the coordinator refuses the
+    /// permit (the phase left `Running`), never resolves.
     ///
-    /// Operations use this to request suspension when they cannot proceed.
-    pub(crate) fn suspension_signal(&self) -> &Arc<SuspensionSignal> {
-        &self.inner.suspension_signal
+    /// Wraps the step body, the `wait_for_condition` check and every serdes
+    /// call: work that can make progress without the SDK polling it.
+    pub(crate) async fn hold_activity<F: Future>(&self, fut: F) -> F::Output {
+        let Some(permit) = self.inner.coordinator.acquire(PermitKind::Activity) else {
+            return std::future::pending().await;
+        };
+        let output = fut.await;
+        drop(permit);
+        output
+    }
+
+    /// Resolves when the record of `wire_id` satisfies `ready`.
+    ///
+    /// Registers a wait on its first poll, then reads the record. A missing
+    /// record is not ready. When the record is ready, the registration is
+    /// dropped and the future resolves. Otherwise it returns `Pending`; a
+    /// merged checkpoint response that carries the operation wakes it, and
+    /// each later poll updates the waker and reads the record again.
+    ///
+    /// Registering before the read means a merge between the read and the
+    /// end of the poll still wakes the waiting task. When the coordinator
+    /// refuses the registration (the phase left `Running`), never resolves.
+    pub(crate) async fn wait_for_record(
+        &self,
+        wire_id: &str,
+        ready: fn(&CheckpointStatus) -> bool,
+    ) {
+        let mut registration: Option<crate::coordinator::WaitRegistration> = None;
+        std::future::poll_fn(|cx| {
+            match &registration {
+                Some(live) => live.update_waker(cx.waker()),
+                None => match self.inner.coordinator.register_wait(wire_id, cx.waker()) {
+                    Some(live) => registration = Some(live),
+                    None => return std::task::Poll::Pending,
+                },
+            }
+            let is_ready = self
+                .inner
+                .engine
+                .checkpoint_log
+                .status_view(wire_id)
+                .is_some_and(|view| ready(&view.status));
+            if is_ready {
+                registration = None;
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+
+    /// Waits until the record of the operation at `positional_id` satisfies
+    /// `ready` (see [`Self::wait_for_record`]), then returns its view.
+    pub(crate) async fn wait_for_record_view(
+        &self,
+        positional_id: &str,
+        ready: fn(&CheckpointStatus) -> bool,
+    ) -> CheckpointStatusView {
+        let wire_id = crate::engine::compute_wire_id_public(positional_id);
+        self.wait_for_record(&wire_id, ready).await;
+        #[expect(clippy::expect_used)]
+        // reason: `wait_for_record` resolves only once the record exists,
+        // and the checkpoint log never removes a record during an
+        // invocation.
+        self.checkpoint_status_view(positional_id)
+            .expect("a record that satisfied the wait is still in the log")
+    }
+
+    /// Returns the time left until the Lambda deadline: `None` when the
+    /// deadline is 0 (unknown), otherwise the deadline (milliseconds since
+    /// the Unix epoch) minus now, and `Duration::ZERO` once it passed.
+    pub(crate) fn remaining_time(&self) -> Option<Duration> {
+        remaining_until(
+            self.inner.lambda_context.deadline,
+            std::time::SystemTime::now(),
+        )
     }
 
     /// Returns a reference to the task-ownership tracker.
@@ -949,7 +1002,7 @@ impl DurableContext {
         // An abandoned owner replays no operation, so its claim is not
         // checked against history. A mismatch here would record a fatal
         // error and resolve the future. Skipping the check leaves the
-        // future to the admission check in `DurableFuture::lazy_scoped`,
+        // future to the admission check in `DurableFuture::for_operation`,
         // which never resolves it. An owner abandoned after this check is
         // stopped there too.
         if !self.admission().admits(self.owners()) {
@@ -1032,7 +1085,7 @@ impl DurableContext {
                 ),
             ),
         ));
-        self.inner.suspension_signal.record_fatal(
+        self.inner.coordinator.record_fatal(
             "NonDeterministicExecutionError".to_owned(),
             crate::error::chain_string(&err),
         );
@@ -1056,44 +1109,11 @@ impl DurableContext {
                 ),
             ),
         ));
-        self.inner.suspension_signal.record_fatal(
+        self.inner.coordinator.record_fatal(
             "NonDeterministicExecutionError".to_owned(),
             crate::error::chain_string(&err),
         );
         err
-    }
-
-    /// Requests suspension of THIS context's scope (used by operations that
-    /// cannot proceed, e.g. a pending retry timer).
-    ///
-    /// Routes through the scope's quiescence gate: if operations were
-    /// `.spawn()`ed into this scope and have not settled yet, the request is
-    /// deferred until the last of them settles, so a park never aborts a
-    /// runnable sibling. Every parking path in the SDK funnels through here
-    /// (directly or via [`Self::suspend_now`]), so none can bypass the
-    /// accounting.
-    pub(crate) fn request_suspend(&self) {
-        self.inner.suspension_signal.park_owner();
-    }
-
-    /// Suspends the invocation and never returns control to the caller.
-    ///
-    /// Requests suspension of this context's scope (through the scope's
-    /// quiescence gate: see [`Self::request_suspend`]), then awaits a future
-    /// that never resolves and never registers a waker. The driver observes
-    /// the signal on the next `Poll::Pending` from the handler and drops the
-    /// handler future at this await point, completing the invocation as
-    /// `PENDING`. Because the future is dropped rather than resumed, an
-    /// operation's suspension can never surface to user code and can never be
-    /// caught or ignored. The `-> T` return type is inhabited only vacuously:
-    /// the awaited future never completes, so no value is ever produced.
-    ///
-    /// When runnable `.spawn()`ed siblings are still outstanding in this
-    /// scope, the suspension request is deferred until they settle; this call
-    /// still never returns.
-    pub(crate) async fn suspend_now<T>(&self) -> T {
-        self.request_suspend();
-        std::future::pending::<T>().await
     }
 
     /// Routes a checkpoint write failure through the unrecoverable path
@@ -1123,11 +1143,10 @@ impl DurableContext {
     ///   [`checkpoint_execution_failure_wire`](crate::error::checkpoint_execution_failure_wire):
     ///   `CheckpointUnrecoverableExecutionError`, as in JS.
     ///
-    /// Like [`Self::suspend_now`], the returned future never resolves: the
-    /// fatal slot is recorded and the invocation driver, which checks it
-    /// with priority over completion and suspension, from any scope in the
-    /// tree, drops the handler at its current await point, so user code
-    /// can neither catch nor ignore the failure.
+    /// The returned future never resolves: the fatal slot is recorded and
+    /// the invocation driver, which checks it with priority over completion
+    /// and suspension, drops the handler at its current await point, so
+    /// user code can neither catch nor ignore the failure.
     ///
     /// One error is not a write failure: a direct write that found no Tokio
     /// runtime sent nothing (see [`Self::write_direct_detached`]). The
@@ -1152,9 +1171,7 @@ impl DurableContext {
                 "retryable checkpoint failure exhausted retries; failing the invocation \
                  so the service re-invokes"
             );
-            self.inner
-                .suspension_signal
-                .record_invocation_fault(message);
+            self.inner.coordinator.record_invocation_fault(message);
         } else {
             tracing::error!(
                 operation_id = %op_wire_id,
@@ -1176,7 +1193,7 @@ impl DurableContext {
                 }
             }
             let wire = crate::error::checkpoint_execution_failure_wire(&err);
-            self.inner.suspension_signal.record_fatal(
+            self.inner.coordinator.record_fatal(
                 wire.error_type().unwrap_or_default().to_owned(),
                 wire.error_message().unwrap_or_default().to_owned(),
             );
@@ -1215,9 +1232,7 @@ impl DurableContext {
             "serdes {call} failed with a retryable error; failing the invocation so the \
              service re-invokes"
         );
-        self.inner
-            .suspension_signal
-            .record_invocation_fault(message);
+        self.inner.coordinator.record_invocation_fault(message);
         std::future::pending::<T>().await
     }
 
@@ -1317,13 +1332,13 @@ impl DurableContext {
     }
 
     /// Dispatches a checkpoint write: joins the coalescing batch when one
-    /// is configured, otherwise writes directly. A non-urgent contributor
-    /// under a non-zero delay arms the delay timer and requests the flush
-    /// itself when the window elapses; an urgent contributor, or any
-    /// contributor under a zero-delay coalescer (pure `checkpoint_batching`
-    /// mode), requests the flush right away. Either way the flush task
-    /// claims and writes the batch under the coalescer's writer lock, so
-    /// batching still emerges while an earlier write is in flight.
+    /// is configured, otherwise writes directly. Under a non-zero delay, the
+    /// non-urgent join that opens a batch starts a detached flush that
+    /// waits out the window; an urgent contributor, or any contributor
+    /// under a zero-delay coalescer (pure `checkpoint_batching` mode),
+    /// requests the flush right away. Either way the flush task claims and
+    /// writes the batch under the coalescer's writer lock, so batching still
+    /// emerges while an earlier write is in flight.
     ///
     /// Joining the batch transfers ownership of each update's lifecycle
     /// event to the coalescer: the flush task that persists the update
@@ -1337,19 +1352,33 @@ impl DurableContext {
         let Some(coalescer) = self.inner.coalescer.clone() else {
             let (updates, events): (Vec<_>, Vec<_>) =
                 updates.into_iter().map(|t| (t.update, t.event)).unzip();
-            return self.write_direct_detached(updates, events).await;
+            let Some(permit) = self.inner.coordinator.acquire(PermitKind::Checkpoint) else {
+                // The phase left `Running`: the write is rejected, as a
+                // write from an abandoned owner is.
+                return std::future::pending().await;
+            };
+            return self
+                .write_direct_detached(updates, events, Some(permit))
+                .await;
         };
 
         // Admission (see `Admission`): an update from an abandoned owner is
         // rejected, and a rejected write never resolves. Its task is being
         // cancelled. Returning `Ok` instead would let an operation continue
-        // as if its update were recorded.
-        let Some(batch) = coalescer.join(self.admission(), self.owners(), updates) else {
+        // as if its update were recorded. The admitted join holds a
+        // checkpoint permit until the batch's response is merged.
+        let Some((batch, opened)) =
+            coalescer.join(self.admission(), self.coordinator(), self.owners(), updates)
+        else {
             return std::future::pending().await;
         };
-        let flush_now = urgent || coalescer.delay().is_zero();
-        if flush_now {
-            self.spawn_batch_flush(&coalescer, &batch);
+        if urgent || coalescer.delay().is_zero() {
+            self.spawn_batch_flush(&coalescer, &batch, Duration::ZERO);
+        } else if opened {
+            // The join that opened the batch arms its window on a detached
+            // task, so the batch is written even when every contributor is
+            // dropped before the window elapses.
+            self.spawn_batch_flush(&coalescer, &batch, coalescer.delay());
         }
 
         loop {
@@ -1360,16 +1389,7 @@ impl DurableContext {
             if let Some(result) = batch.result_clone() {
                 return result;
             }
-            if flush_now {
-                notified.await;
-            } else {
-                tokio::select! {
-                    () = notified => {}
-                    () = tokio::time::sleep(coalescer.delay()) => {
-                        self.spawn_batch_flush(&coalescer, &batch);
-                    }
-                }
-            }
+            notified.await;
         }
     }
 
@@ -1413,6 +1433,10 @@ impl DurableContext {
     /// Writes updates directly, on a detached task, after the admission
     /// check, and returns the result to the caller.
     ///
+    /// `permit` is the write's checkpoint permit, held until the response is
+    /// merged, the operations it readied are woken, and the result is
+    /// handed to the caller. `None` is passed only after the drive ended.
+    ///
     /// The write runs on its own task because a cancelled caller must not
     /// cancel an admitted request. A batch abandons its running items at
     /// early completion and aborts their tasks. If an aborted item
@@ -1435,10 +1459,11 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
         events: Vec<crate::tracing_layer::PendingTransitionEvent>,
+        permit: Option<crate::coordinator::Permit>,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let ctx = self.clone();
-        let spawned = crate::task::spawn_detached(self.suspension_signal().tasks(), async move {
+        let spawned = crate::task::spawn_detached(self.coordinator(), async move {
             let written = crate::task::catch_panic(ctx.checkpoint_direct_with_events(
                 updates,
                 &events,
@@ -1446,8 +1471,11 @@ impl DurableContext {
             ))
             .await;
             // A dropped receiver means the caller was cancelled: the write
-            // already happened, and its result has no reader.
+            // already happened, and its result has no reader. The caller's
+            // wake takes its own permit before the write's permit is
+            // released.
             drop(sender.send(written));
+            drop(permit);
         });
         if let Err(no_runtime) = spawned {
             // The source marks the error, so that
@@ -1490,6 +1518,7 @@ impl DurableContext {
         &self,
         coalescer: &Arc<CheckpointCoalescer>,
         batch: &Arc<CheckpointBatch>,
+        delay: Duration,
     ) {
         let ctx = self.clone();
         let coalescer = Arc::clone(coalescer);
@@ -1498,10 +1527,20 @@ impl DurableContext {
         // Detached mode of the task gateway (src/task.rs): this internal
         // task runs no user future and creates no durable operations, and it
         // must survive a cancelled contributor. It is still counted, so the
-        // invocation waits for an in-flight write before it returns.
-        let spawned = crate::task::spawn_detached(self.suspension_signal().tasks(), async move {
+        // invocation waits for an in-flight write before it returns. The
+        // batch's checkpoint permits keep the invocation from suspending
+        // until the response is merged and published.
+        let spawned = crate::task::spawn_detached(self.coordinator(), async move {
+            if !delay.is_zero() {
+                // The window ends early when the invocation would suspend
+                // but for buffered writes, or when the drive ended. A
+                // counted task that slept out the whole window would keep
+                // a resolved handler from returning for up to the full
+                // `checkpoint_delay`, which has no upper bound.
+                ctx.coordinator().coalescing_window(delay).await;
+            }
             let _writer = coalescer.writer_lock().lock().await;
-            if let Some(updates) = coalescer.take_batch(&batch) {
+            if let Some((updates, permits)) = coalescer.take_batch(&batch) {
                 // Failure latch (issue #43): once any buffered write has
                 // failed, the channel is down for the rest of the
                 // invocation: "no further writes". A flusher that queued
@@ -1520,6 +1559,7 @@ impl DurableContext {
                         updates.into_iter().map(|t| t.update).collect(),
                     );
                     batch.publish(Err(prior));
+                    drop(permits);
                     return;
                 }
                 let result = match ctx.write_batched_updates(updates, coalescer.limits()).await {
@@ -1537,7 +1577,11 @@ impl DurableContext {
                         Err(error)
                     }
                 };
+                // The merge already woke the operations the response
+                // readied. The contributors' wakes take their own permits
+                // before the batch's permits are released.
                 batch.publish(result);
+                drop(permits);
             }
         });
         // No Tokio runtime is running on this thread, so nothing can write
@@ -1651,7 +1695,7 @@ impl DurableContext {
         // the prior error and retained as unwritten instead of written.
         let mut prior: Option<ExecutionClientError> = coalescer.latched_failure();
         let mut failures: Vec<crate::checkpoint_coalescer::FailedFlush> = Vec::new();
-        while let Some((batch, updates)) = coalescer.take_any() {
+        while let Some((batch, updates, permits)) = coalescer.take_any() {
             if let Some(error) = prior.clone() {
                 // The channel already failed: do not attempt further
                 // outcome writes ("no further writes" for the retryable
@@ -1664,6 +1708,7 @@ impl DurableContext {
                     error,
                     unwritten: updates.into_iter().map(|t| t.update).collect(),
                 });
+                drop(permits);
                 continue;
             }
             match self
@@ -1677,6 +1722,7 @@ impl DurableContext {
                     failures.push(crate::checkpoint_coalescer::FailedFlush { error, unwritten });
                 }
             }
+            drop(permits);
         }
         // Failures a spawned flush retained because its contributors were
         // all dropped happened BEFORE this drain: report them first.
@@ -1814,7 +1860,7 @@ impl DurableContext {
             match builder.build() {
                 Ok(fail_update) => {
                     updates.push(fail_update);
-                    if let Err(err) = self.checkpoint_updates_direct(updates).await {
+                    if let Err(err) = self.checkpoint_updates_after_drive(updates).await {
                         tracing::error!(
                             operation_id = %wire_id,
                             error = %err,
@@ -1851,7 +1897,22 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
-        self.write_direct_detached(updates, Vec::new()).await
+        let Some(permit) = self.inner.coordinator.acquire(PermitKind::Checkpoint) else {
+            // The phase left `Running`: the write is rejected, as a write
+            // from an abandoned owner is.
+            return std::future::pending().await;
+        };
+        self.write_direct_detached(updates, Vec::new(), Some(permit))
+            .await
+    }
+
+    /// A direct write after the drive ended, when no permit can be taken:
+    /// the terminal `FAIL` records of the end-of-invocation flush point.
+    async fn checkpoint_updates_after_drive(
+        &self,
+        updates: Vec<OperationUpdate>,
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
+        self.write_direct_detached(updates, Vec::new(), None).await
     }
 
     /// Body of [`Self::checkpoint_updates_direct`] that additionally owns
@@ -1903,6 +1964,7 @@ impl DurableContext {
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
     ) -> Result<CheckpointOutput, ExecutionClientError> {
+        let retried = wfc_retries(&updates);
         let output = client
             .checkpoint(&self.inner.execution_arn, &token_guard, updates)
             .await?;
@@ -1930,10 +1992,17 @@ impl DurableContext {
         // Merge updated operations into the checkpoint log so that
         // subsequent reads (e.g. reading callback_id after START) see
         // backend-assigned fields.
+        let mut merged: Vec<String> = Vec::new();
         if !output.updated_operations.is_empty() {
             crate::client::merge_operations_into_log(
                 &self.inner.engine.checkpoint_log,
                 &output.updated_operations,
+            );
+            merged.extend(
+                output
+                    .updated_operations
+                    .iter()
+                    .map(|op| op.id().to_owned()),
             );
         }
 
@@ -1954,10 +2023,30 @@ impl DurableContext {
                     &self.inner.engine.checkpoint_log,
                     &full_state,
                 );
+                merged.extend(full_state.iter().map(|op| op.id().to_owned()));
             }
         }
 
+        // A `wait_for_condition` RETRY the response did not carry: the log
+        // takes the status the service recorded. This runs under the token
+        // lock, so a later response, which carries a newer status, merges
+        // after it.
+        for (wire_id, payload) in &retried {
+            if !merged.iter().any(|id| id == wire_id) {
+                mark_retry_pending(
+                    &self.inner.engine.checkpoint_log,
+                    wire_id,
+                    payload.as_deref(),
+                );
+            }
+        }
+
+        // The token is rotated and the response merged: release the lock,
+        // then wake every operation the response carries. The write's
+        // checkpoint permit is still held, so each woken operation holds
+        // its own permit before this write's permit is released.
         drop(token_guard);
+        self.inner.coordinator.wake_operations(&merged);
 
         Ok(output)
     }
@@ -2864,7 +2953,7 @@ mod tests {
         let ctx = DurableContext::test_context();
         let id = ctx.claim_operation_id("step");
         assert_eq!(id.positional(), "1");
-        assert!(ctx.suspension_signal().fatal_error().is_none());
+        assert!(ctx.coordinator().fatal_error().is_none());
     }
 
     /// A claim on the context whose body is active passes.
@@ -2876,7 +2965,7 @@ mod tests {
         })
         .await;
         assert_eq!(id.positional(), "1");
-        assert!(ctx.suspension_signal().fatal_error().is_none());
+        assert!(ctx.coordinator().fatal_error().is_none());
     }
 
     /// A claim on another context than the active body records message A
@@ -2889,10 +2978,7 @@ mod tests {
         })
         .await;
         assert_eq!(id.positional(), "1");
-        let fatal = ctx
-            .suspension_signal()
-            .fatal_error()
-            .expect("fatal recorded");
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
         assert_eq!(fatal.error_type, "Error");
         assert_eq!(
             fatal.error_message,
@@ -2910,10 +2996,7 @@ mod tests {
             ctx.claim_operation_id("map")
         })
         .await;
-        let fatal = ctx
-            .suspension_signal()
-            .fatal_error()
-            .expect("fatal recorded");
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
         assert_eq!(fatal.error_type, "Error");
         assert_eq!(
             fatal.error_message,
@@ -3356,7 +3439,7 @@ mod tests {
         });
 
         assert!(
-            ctx.suspension_signal().fatal_error().is_none(),
+            ctx.coordinator().fatal_error().is_none(),
             "no fatal recorded before the replay check"
         );
 
@@ -3381,7 +3464,7 @@ mod tests {
         // The fatal slot is written so the invocation driver fails the
         // execution even if the returned `Err` is swallowed downstream.
         let fatal = ctx
-            .suspension_signal()
+            .coordinator()
             .fatal_error()
             .expect("unrecognized status must record a fatal error");
         assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
@@ -3419,7 +3502,7 @@ mod tests {
 
         let result = ctx.checkpoint_view_validated("1", "wire-1", "Step", Some("Step"), None);
         assert!(matches!(result, Ok(Some(_))));
-        assert!(ctx.suspension_signal().fatal_error().is_none());
+        assert!(ctx.coordinator().fatal_error().is_none());
     }
 
     #[test]
@@ -4011,7 +4094,7 @@ mod tests {
         let record = record_with_identity(Some("Step"), Some("Step"), Some("alpha"));
 
         assert!(
-            ctx.suspension_signal().fatal_error().is_none(),
+            ctx.coordinator().fatal_error().is_none(),
             "no fatal recorded before validation"
         );
         let result =
@@ -4019,7 +4102,7 @@ mod tests {
         assert!(result.is_err());
 
         let fatal = ctx
-            .suspension_signal()
+            .coordinator()
             .fatal_error()
             .expect("mismatch must record a fatal error");
         assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
@@ -4039,7 +4122,7 @@ mod tests {
             ctx.validate_replay_identity(&record, "wire-1", "Step", Some("Step"), Some("same"));
         assert!(result.is_ok());
         assert!(
-            ctx.suspension_signal().fatal_error().is_none(),
+            ctx.coordinator().fatal_error().is_none(),
             "a passing validation must not record a fatal error"
         );
     }
@@ -5070,7 +5153,7 @@ mod tests {
     async fn assert_abandoned_write_not_sent(window: Option<Duration>) {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, window);
-        let item = root.new_scoped_child("1");
+        let item = root.new_child("1");
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
         let written = tokio::time::timeout(
@@ -5098,7 +5181,7 @@ mod tests {
         // So this rejection comes from the check under the token lock.
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, Some(Duration::ZERO));
-        let item = root.new_scoped_child("1");
+        let item = root.new_child("1");
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
         let written = tokio::time::timeout(
@@ -5114,8 +5197,8 @@ mod tests {
     async fn nested_owner_follows_its_outer_item() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, Some(Duration::ZERO));
-        let item = root.new_scoped_child("1");
-        let inner = item.new_scoped_child("1-1");
+        let item = root.new_child("1");
+        let inner = item.new_child("1-1");
         assert_eq!(
             inner.owners(),
             [
@@ -5139,7 +5222,7 @@ mod tests {
     async fn admitted_update_precedes_parent_final_update() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, Some(Duration::from_millis(50)));
-        let item = root.new_scoped_child("1");
+        let item = root.new_child("1");
         let writer = tokio::spawn({
             let item = item.clone();
             async move { item.checkpoint_updates(vec![make_update("a")]).await }
@@ -5249,7 +5332,7 @@ mod tests {
             "token-0".to_owned(),
             None,
         );
-        let item = root.new_scoped_child("1");
+        let item = root.new_child("1");
         let entered = client.entered.notified();
         let writer = tokio::spawn({
             let item = item.clone();
@@ -5288,7 +5371,7 @@ mod tests {
     async fn abandoned_owner_starts_no_operation() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, Some(Duration::ZERO));
-        let item = root.new_scoped_child("1");
+        let item = root.new_child("1");
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5348,7 +5431,7 @@ mod tests {
             "token-0".to_owned(),
             Some(Duration::ZERO),
         );
-        let item = root.new_scoped_child("1");
+        let item = root.new_child("1");
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
         let stepped = tokio::time::timeout(
@@ -5410,7 +5493,7 @@ mod tests {
 
         // Control: an owner that is not abandoned records the mismatch.
         let (_, control_root) = build_root();
-        let control_item = control_root.new_scoped_child("1");
+        let control_item = control_root.new_child("1");
         let control = tokio::time::timeout(
             ADMISSION_BOUND,
             control_item.step(|_| async { Ok(0_u32) }).into_future(),
@@ -5419,13 +5502,13 @@ mod tests {
         .expect("the mismatch resolves at once");
         assert!(control.is_err(), "the mismatch is an error: {control:?}");
         assert!(
-            control_item.suspension_signal().fatal_error().is_some(),
+            control_item.coordinator().fatal_error().is_some(),
             "the mismatch records a fatal error"
         );
 
         // The builder exists before the abandonment and is finalized after it.
         let (client, root) = build_root();
-        let item = root.new_scoped_child("1");
+        let item = root.new_child("1");
         let builder = item.step(|_| async { Ok(0_u32) });
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
@@ -5435,11 +5518,11 @@ mod tests {
             "the abandoned owner's future never resolves: {stepped:?}"
         );
         assert!(
-            item.suspension_signal().fatal_error().is_none(),
+            item.coordinator().fatal_error().is_none(),
             "no fatal error is recorded for the abandoned owner"
         );
         assert!(
-            root.suspension_signal().fatal_error().is_none(),
+            root.coordinator().fatal_error().is_none(),
             "no fatal error reaches the root"
         );
         assert!(client.recorded_updates().is_empty(), "nothing is written");
@@ -5482,7 +5565,7 @@ mod tests {
             Some(Duration::ZERO),
         );
         // The control: an owner that is not abandoned replays the callback.
-        let control = root.new_scoped_child("1");
+        let control = root.new_child("1");
         let replayed = tokio::time::timeout(
             ADMISSION_BOUND,
             control.create_callback::<String>().into_future(),
@@ -5492,7 +5575,7 @@ mod tests {
         .expect("the replay succeeds");
         assert_eq!(replayed.id(), "cb-1");
 
-        let item = root.new_scoped_child("1");
+        let item = root.new_child("1");
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
         let created = tokio::time::timeout(
@@ -5512,7 +5595,7 @@ mod tests {
         for window in [Some(Duration::ZERO), None] {
             let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
             let root = admission_root(&client, window);
-            let item = root.new_scoped_child("1");
+            let item = root.new_child("1");
             tokio::time::timeout(
                 ADMISSION_BOUND,
                 item.checkpoint_updates(vec![make_update("u")]),
@@ -5556,7 +5639,7 @@ mod tests {
     fn operation_without_runtime_returns_spawn_error() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let ctx = admission_root(&client, None);
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
             ctx.step(|_| async { Ok(1_u32) }).into_future().await
         });
@@ -5606,7 +5689,7 @@ mod tests {
             "token-0".to_owned(),
             None,
         );
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
             ctx.run_in_child_context(|_child| async { Err::<u32, BoxError>("boom".into()) })
                 .into_future()
@@ -5857,6 +5940,373 @@ mod tests {
         assert!(
             !has(&step_wire, OperationAction::Succeed),
             "s SUCCEED is never sent after the child returned"
+        );
+    }
+}
+
+#[cfg(test)]
+// Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
+// behavior; production spawning is confined to the src/task.rs gateway.
+#[expect(clippy::disallowed_methods)]
+mod coordinator_tests {
+    use super::{DurableContext, remaining_until};
+    use crate::client::ExecutionClient;
+    use crate::coordinator::{InvocationCoordinator, PermitKind, Phase};
+    use crate::driver::test_support::{ScriptedClient, operation_like};
+    use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
+    use crate::task::test_support::{Schedule, ScheduleState};
+    use aws_sdk_lambda::types::{OperationAction, OperationStatus, OperationType, OperationUpdate};
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, SystemTime};
+
+    fn ctx_with(log: Arc<CheckpointLog>, client: &Arc<ScriptedClient>) -> DurableContext {
+        DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+            Arc::clone(client) as Arc<dyn ExecutionClient>,
+            "t0".to_owned(),
+        )
+    }
+
+    #[test]
+    fn remaining_time_cases() {
+        let now = SystemTime::now();
+        let now_ms = |offset: i64| {
+            let base = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_millis();
+            u64::try_from(i128::try_from(base).expect("fits") + i128::from(offset))
+                .expect("non-negative")
+        };
+        assert_eq!(remaining_until(0, now), None);
+        let ahead = remaining_until(now_ms(5_000), now).expect("a deadline");
+        assert!(ahead > Duration::from_secs(4) && ahead <= Duration::from_secs(5));
+        assert_eq!(remaining_until(now_ms(-1_000), now), Some(Duration::ZERO));
+
+        // The context reads its own Lambda deadline.
+        let ctx = DurableContext::test_context();
+        assert_eq!(ctx.remaining_time(), None, "the default deadline is 0");
+    }
+
+    #[test]
+    fn wait_for_record_ready_before_registration() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let log = Arc::new(CheckpointLog::from_records(vec![(
+            wire.clone(),
+            CheckpointRecord::with_status(&wire, CheckpointStatus::Succeeded),
+        )]));
+        let client = Arc::new(ScriptedClient::empty());
+        let ctx = ctx_with(log, &client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        let schedule = Schedule::idle(&coordinator);
+        let mut wait = Box::pin(ctx.wait_for_record(&wire, |s| *s != CheckpointStatus::Started));
+        assert!(schedule.poll(wait.as_mut()).is_ready());
+        assert_eq!(coordinator.live_waits(), 0);
+        assert_eq!(client.call_count(), 0);
+    }
+
+    /// What the readiness hook of the next test changes on its first call:
+    /// the log, the coordinator, and the wire ID.
+    type Hook = Option<(Arc<CheckpointLog>, Arc<InvocationCoordinator>, String)>;
+
+    thread_local! {
+        static HOOK: RefCell<Hook> = const { RefCell::new(None) };
+    }
+
+    /// On its first call: marks the record `SUCCEEDED`, wakes its
+    /// registration, as a merge between the read and the end of the poll
+    /// does, and returns `false`. Later calls: ready once the record left
+    /// `STARTED`.
+    fn merge_during_first_read(status: &CheckpointStatus) -> bool {
+        if let Some((log, coordinator, wire)) = HOOK.with(|hook| hook.borrow_mut().take()) {
+            log.insert(
+                wire.clone(),
+                CheckpointRecord::with_status(&wire, CheckpointStatus::Succeeded),
+            );
+            coordinator.wake_operations(&[wire]);
+            return false;
+        }
+        *status != CheckpointStatus::Started
+    }
+
+    #[test]
+    fn wait_for_record_merge_after_read_is_not_lost() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let log = Arc::new(CheckpointLog::from_records(vec![(
+            wire.clone(),
+            CheckpointRecord::with_status(&wire, CheckpointStatus::Started),
+        )]));
+        let client = Arc::new(ScriptedClient::empty());
+        let ctx = ctx_with(Arc::clone(&log), &client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        HOOK.with(|hook| {
+            *hook.borrow_mut() = Some((Arc::clone(&log), Arc::clone(&coordinator), wire.clone()));
+        });
+        let schedule = Schedule::idle(&coordinator);
+        let mut wait = Box::pin(ctx.wait_for_record(&wire, merge_during_first_read));
+        assert!(schedule.poll(wait.as_mut()).is_pending());
+        assert_eq!(
+            schedule.state(),
+            ScheduleState::Queued,
+            "the wake during the poll keeps the task queued"
+        );
+        assert_eq!(coordinator.permits(PermitKind::Activity), 1);
+        assert_eq!(coordinator.phase(), Phase::Running);
+        assert!(schedule.poll(wait.as_mut()).is_ready());
+        assert_eq!(
+            client.call_count(),
+            0,
+            "no checkpoint call between the polls"
+        );
+        assert_eq!(coordinator.live_waits(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_write_holds_token_lock_through_response_merge() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let ctx_slot: Arc<std::sync::OnceLock<DurableContext>> =
+            Arc::new(std::sync::OnceLock::new());
+        let a_merged_at_b = Arc::new(AtomicBool::new(false));
+        let responder_ctx = Arc::clone(&ctx_slot);
+        let responder_flag = Arc::clone(&a_merged_at_b);
+        let client = Arc::new(
+            ScriptedClient::new(move |updates, history| {
+                if history.len() == updates.len() {
+                    // A's call: the response carries operation `a`.
+                    return updates
+                        .iter()
+                        .map(|u| {
+                            operation_like(u, OperationStatus::Succeeded)
+                                .build()
+                                .expect("all required fields set")
+                        })
+                        .collect();
+                }
+                let merged = responder_ctx
+                    .get()
+                    .is_some_and(|ctx| ctx.has_checkpoint_record("1"));
+                responder_flag.store(merged, Ordering::SeqCst);
+                Vec::new()
+            })
+            .with_first_call_gate(Arc::clone(&gate)),
+        );
+        let ctx = ctx_with(Arc::new(CheckpointLog::empty()), &client);
+        ctx_slot.set(ctx.clone()).expect("set once");
+        let update = |positional: &str| {
+            OperationUpdate::builder()
+                .id(crate::engine::compute_wire_id_public(positional))
+                .r#type(OperationType::Step)
+                .sub_type("Step")
+                .action(OperationAction::Start)
+                .build()
+                .expect("all required fields set")
+        };
+        let a_ctx = ctx.clone();
+        let a_update = update("1");
+        let a = tokio::spawn(async move { a_ctx.checkpoint_updates_direct(vec![a_update]).await });
+        for _ in 0..1000 {
+            if client.call_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(client.call_count(), 1, "A's call was received");
+        let b_ctx = ctx.clone();
+        let b_update = update("2");
+        let b = tokio::spawn(async move { b_ctx.checkpoint_updates_direct(vec![b_update]).await });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(client.call_count(), 1, "B waits for A's merge");
+        gate.notify_one();
+        a.await.expect("A does not panic").expect("A succeeds");
+        b.await.expect("B does not panic").expect("B succeeds");
+        let calls = client.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls.get(1).map(|(token, _)| token.as_str()),
+            Some("t1"),
+            "B's call carries the token A's response rotated in"
+        );
+        assert!(
+            a_merged_at_b.load(Ordering::SeqCst),
+            "operation a was merged before B's call was sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_activity_after_suspension_never_resolves() {
+        let ctx = DurableContext::test_context();
+        ctx.coordinator().finish();
+        let ran = Arc::new(AtomicBool::new(false));
+        let held = Arc::clone(&ran);
+        let waited = tokio::time::timeout(
+            Duration::from_millis(100),
+            ctx.hold_activity(async move { held.store(true, Ordering::SeqCst) }),
+        )
+        .await;
+        assert!(waited.is_err(), "the held future never resolves");
+        assert!(!ran.load(Ordering::SeqCst), "the work never ran");
+    }
+
+    #[tokio::test]
+    async fn direct_write_after_suspension_is_rejected() {
+        let client = Arc::new(ScriptedClient::empty());
+        let ctx = ctx_with(Arc::new(CheckpointLog::empty()), &client);
+        ctx.coordinator().finish();
+        let update = OperationUpdate::builder()
+            .id("u")
+            .r#type(OperationType::Step)
+            .action(OperationAction::Start)
+            .build()
+            .expect("all required fields set");
+        let written = tokio::time::timeout(
+            Duration::from_millis(100),
+            ctx.checkpoint_updates_direct(vec![update]),
+        )
+        .await;
+        assert!(written.is_err(), "the rejected write never resolves");
+        assert_eq!(client.call_count(), 0, "nothing was sent");
+    }
+
+    #[tokio::test]
+    async fn wait_for_record_after_suspension_never_resolves() {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let log = Arc::new(CheckpointLog::from_records(vec![(
+            wire.clone(),
+            CheckpointRecord::with_status(&wire, CheckpointStatus::Succeeded),
+        )]));
+        let ctx = ctx_with(log, &Arc::new(ScriptedClient::empty()));
+        ctx.coordinator().finish();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(100),
+            ctx.wait_for_record(&wire, |s| *s != CheckpointStatus::Started),
+        )
+        .await;
+        assert!(waited.is_err(), "a refused registration never resolves");
+    }
+
+    /// A `RETRY` update of `positional` with sub-type `sub_type`.
+    fn retry_update(positional: &str, sub_type: &str, payload: &str) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(crate::engine::compute_wire_id_public(positional))
+            .r#type(OperationType::Step)
+            .sub_type(sub_type)
+            .action(OperationAction::Retry)
+            .payload(payload)
+            .build()
+            .expect("all required fields set")
+    }
+
+    #[tokio::test]
+    async fn wfc_retry_keeps_status_the_response_carries() {
+        let wfc = crate::wait_for_condition::WFC_SUB_TYPE;
+        for (carried, expected) in [
+            (OperationStatus::Ready, CheckpointStatus::Ready),
+            (OperationStatus::Succeeded, CheckpointStatus::Succeeded),
+            (OperationStatus::Failed, CheckpointStatus::Failed),
+        ] {
+            let wire = crate::engine::compute_wire_id_public("1");
+            let log = Arc::new(CheckpointLog::from_records(vec![(
+                wire.clone(),
+                CheckpointRecord::with_status(&wire, CheckpointStatus::Started),
+            )]));
+            let status = carried.clone();
+            let client = Arc::new(ScriptedClient::new(move |updates, _| {
+                updates
+                    .iter()
+                    .map(|u| {
+                        operation_like(u, status.clone())
+                            .build()
+                            .expect("all required fields set")
+                    })
+                    .collect()
+            }));
+            let ctx = ctx_with(Arc::clone(&log), &client);
+            ctx.checkpoint_updates_direct(vec![retry_update("1", wfc, "1")])
+                .await
+                .expect("the write succeeds");
+            assert_eq!(
+                log.get(&wire).expect("present").status,
+                expected,
+                "a RETRY response that carries {carried:?} keeps it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wfc_retry_omitted_from_response_is_pending() {
+        let wfc = crate::wait_for_condition::WFC_SUB_TYPE;
+        let ready = crate::engine::compute_wire_id_public("1");
+        let pending = crate::engine::compute_wire_id_public("2");
+        let step = crate::engine::compute_wire_id_public("3");
+        let succeeded = crate::engine::compute_wire_id_public("5");
+        let mut pending_record = CheckpointRecord::with_status(&pending, CheckpointStatus::Pending);
+        pending_record.result = Some("old".to_owned());
+        let log = Arc::new(CheckpointLog::from_records(vec![
+            (
+                ready.clone(),
+                CheckpointRecord::with_status(&ready, CheckpointStatus::Ready),
+            ),
+            (pending.clone(), pending_record),
+            (
+                step.clone(),
+                CheckpointRecord::with_status(&step, CheckpointStatus::Started),
+            ),
+            (
+                succeeded.clone(),
+                CheckpointRecord::with_status(&succeeded, CheckpointStatus::Started),
+            ),
+        ]));
+        let client = Arc::new(ScriptedClient::empty());
+        let ctx = ctx_with(Arc::clone(&log), &client);
+        ctx.checkpoint_updates_direct(vec![
+            retry_update("1", wfc, "next"),
+            retry_update("2", wfc, "new"),
+            retry_update("3", "Step", "x"),
+            retry_update("4", wfc, "x"),
+            OperationUpdate::builder()
+                .id(crate::engine::compute_wire_id_public("5"))
+                .r#type(OperationType::Step)
+                .sub_type(wfc)
+                .action(OperationAction::Succeed)
+                .payload("y")
+                .build()
+                .expect("all required fields set"),
+        ])
+        .await
+        .expect("the write succeeds");
+
+        let record = log.get(&ready).expect("present");
+        assert_eq!(
+            record.status,
+            CheckpointStatus::Pending,
+            "a READY record from the previous cycle takes the PENDING the service recorded"
+        );
+        assert_eq!(record.result.as_deref(), Some("next"));
+        assert_eq!(
+            log.get(&pending).expect("present").result.as_deref(),
+            Some("old"),
+            "a record the service already marked PENDING is kept"
+        );
+        assert_eq!(
+            log.get(&step).expect("present").status,
+            CheckpointStatus::Started,
+            "a step RETRY is not a wait_for_condition RETRY"
+        );
+        assert_eq!(
+            log.get(&succeeded).expect("present").status,
+            CheckpointStatus::Started,
+            "a wait_for_condition SUCCEED is not a RETRY"
+        );
+        let missing = crate::engine::compute_wire_id_public("4");
+        assert!(
+            log.get(&missing).is_none(),
+            "a missing record stays missing"
         );
     }
 }

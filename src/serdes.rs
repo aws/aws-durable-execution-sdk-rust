@@ -1775,14 +1775,15 @@ mod tests {
             let occupier = tokio::task::spawn_blocking(move || {
                 let _ = wait_for_release.recv();
             });
-            let tasks = std::sync::Arc::new(crate::task::TaskTracker::new());
+            let coordinator = crate::coordinator::InvocationCoordinator::new();
+            let tasks = std::sync::Arc::clone(coordinator.tasks());
             let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
             let mut write = Box::pin(Serdes::<serde_json::Value>::serialize(
                 &serdes,
                 serde_json::json!({"value": 1}),
                 fs_context(),
             ));
-            let polled = crate::task::test_support::with_current_tasks(&tasks, || {
+            let polled = crate::task::test_support::with_current_coordinator(&coordinator, || {
                 write
                     .as_mut()
                     .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))

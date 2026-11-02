@@ -12,8 +12,10 @@
 //! - `ParentId` on children points to the parent's wire ID
 //!
 //! Invariants:
-//! - Suspended branches RETAIN concurrency slots (only terminal events
-//!   decrement in-flight)
+//! - A branch that waits on a durable operation stays pending in the
+//!   coordinator's join set and RETAINS its concurrency slot (only terminal
+//!   events decrement in-flight). It continues in the same invocation when
+//!   its wait completes
 //! - Never-started branches are OMITTED from results
 //! - Completion decision uses the STARTED set
 //! - Results collected positionally per branch index
@@ -30,7 +32,6 @@ use tracing::Instrument as _;
 use crate::BoxError;
 use crate::Serdes;
 use crate::context::{ActiveBody, DurableContext, run_body};
-use crate::driver::{ScopeOutcome, drive_scope};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     ChildContextError, ChildContextErrorKind, ChildFnError, OperationError, OperationErrorKind,
@@ -898,22 +899,11 @@ struct PreClaimed {
     has_record: bool,
 }
 
-/// How one branch resolved within a single invocation.
-///
-/// A `Terminal` branch (succeeded or failed) frees its concurrency slot; a
-/// `Suspended` branch parked on a durable operation and KEEPS its slot until
-/// it terminally completes on a later invocation (the slot-holding
-/// invariant). Never-started branches are simply never dispatched.
-enum ItemOutcome<O> {
-    /// The branch reached a terminal state this invocation.
-    Terminal(BatchItem<O>),
-    /// The branch suspended (parked): its slot stays held.
-    Suspended,
-}
-
 /// The payload a branch task delivers through the coordinator's join set:
-/// the item index plus how the item resolved.
-type ItemJoin<O> = (usize, Result<ItemOutcome<O>, OperationError>);
+/// the item index plus the item's terminal outcome. A branch that waits on
+/// a durable operation stays pending in the join set and keeps its
+/// concurrency slot until it finishes.
+type ItemJoin<O> = (usize, Result<BatchItem<O>, OperationError>);
 
 /// Everything one item body needs, owned and free of generic parameters.
 ///
@@ -941,8 +931,7 @@ struct ItemRequest<IS> {
 enum ItemPrelude<O> {
     /// Recorded terminal outcome decoded from the checkpoint log.
     Done(BatchItem<O>),
-    /// The body must run; the child context (with its own suspension
-    /// scope) is ready.
+    /// The body must run; the child context is ready.
     Run {
         /// The child context the item body receives.
         child_ctx: DurableContext,
@@ -992,19 +981,16 @@ where
     // parent. Operations inside the flat branch checkpoint with ParentId
     // pointing to the batch parent (not the virtual child).
     if req.nesting == NestingMode::Flat {
-        let child_ctx = req
-            .ctx
-            .new_scoped_flat_child(&child_positional, &req.parent_wire);
+        let child_ctx = req.ctx.new_flat_child(&child_positional, &req.parent_wire);
         return Ok(ItemPrelude::Run { child_ctx });
     }
 
-    // Create child context with its OWN suspension scope so a park inside
-    // the body is caught locally as Suspended instead of tearing down the
-    // whole invocation. The child's `Start` was already checkpointed by the
-    // coordinator at dispatch (the coordinator is the sole writer of child
-    // starts; see `execute_batch`), or exists from a prior invocation.
+    // Create the child context. The child's `Start` was already
+    // checkpointed by the coordinator at dispatch (the coordinator is the
+    // sole writer of child starts; see `execute_batch`), or exists from a
+    // prior invocation.
     Ok(ItemPrelude::Run {
-        child_ctx: req.ctx.new_scoped_child(&child_positional),
+        child_ctx: req.ctx.new_child(&child_positional),
     })
 }
 
@@ -1014,9 +1000,8 @@ where
 #[expect(clippy::too_many_lines)] // reason: FLAT/NORMAL outcome checkpointing reads better in one flow
 async fn item_after<O, IS>(
     req: &ItemRequest<IS>,
-    scope: &Arc<crate::driver::SuspensionSignal>,
-    outcome: ScopeOutcome<Result<O, ChildFnError>>,
-) -> Result<ItemOutcome<O>, OperationError>
+    outcome: Result<O, ChildFnError>,
+) -> Result<BatchItem<O>, OperationError>
 where
     O: Send + 'static,
     IS: Serdes<O>,
@@ -1033,8 +1018,7 @@ where
     // (round-trip for live == replay consistency) happens here.
     if req.nesting == NestingMode::Flat {
         return match outcome {
-            ScopeOutcome::Suspended => Ok(ItemOutcome::Suspended),
-            ScopeOutcome::Completed(Ok(value)) => {
+            Ok(value) => {
                 // A result serialization failure is LOCAL and
                 // deterministic: the item closure already ran, so the item
                 // settles as a failed `BatchItem` instead of yielding a
@@ -1052,7 +1036,7 @@ where
                     Ok::<_, OperationError>(deserialized)
                 };
                 match round_trip.await {
-                    Ok(deserialized) => Ok(ItemOutcome::Terminal(BatchItem {
+                    Ok(deserialized) => Ok(BatchItem {
                         index: req.index,
                         name: req.item_name.clone(),
                         status: BatchItemStatus::Succeeded,
@@ -1061,40 +1045,33 @@ where
                         error_type: None,
                         error_data: None,
                         stack_trace: Vec::new(),
-                    })),
+                    }),
                     Err(op_err) => {
                         let wire = crate::error::serialization_failure_wire(&op_err);
-                        Ok(ItemOutcome::Terminal(BatchItem::failed_from_wire(
+                        Ok(BatchItem::failed_from_wire(
                             req.index,
                             req.item_name.clone(),
                             &wire,
-                        )))
+                        ))
                     }
                 }
             }
-            ScopeOutcome::Completed(Err(child_err)) => {
+            Err(child_err) => {
                 // The wire record is derived from the error the body
                 // returned: its recorded type, and its flattened chain as
                 // the message.
                 let wire = child_err.failure_wire();
-                Ok(ItemOutcome::Terminal(BatchItem::failed_from_wire(
+                Ok(BatchItem::failed_from_wire(
                     req.index,
                     req.item_name.clone(),
                     &wire,
-                )))
+                ))
             }
         };
     }
 
     match outcome {
-        ScopeOutcome::Suspended => {
-            // Branch parked: do NOT checkpoint a terminal state. The child
-            // context stays Started-not-terminal in the log; on resume it is
-            // re-entered and its now-completed durable op replays. The branch
-            // keeps its concurrency slot until it terminally completes.
-            Ok(ItemOutcome::Suspended)
-        }
-        ScopeOutcome::Completed(Ok(value)) => {
+        Ok(value) => {
             // Serialize and checkpoint success.
             //
             // A result serialization failure is LOCAL and deterministic:
@@ -1144,11 +1121,11 @@ where
                             )
                             .await;
                     }
-                    return Ok(ItemOutcome::Terminal(BatchItem::failed_from_wire(
+                    return Ok(BatchItem::failed_from_wire(
                         req.index,
                         req.item_name.clone(),
                         &wire,
-                    )));
+                    ));
                 }
             };
             let mut builder = OperationUpdate::builder()
@@ -1203,7 +1180,7 @@ where
             )
             .await?;
 
-            Ok(ItemOutcome::Terminal(BatchItem {
+            Ok(BatchItem {
                 index: req.index,
                 name: req.item_name.clone(),
                 status: BatchItemStatus::Succeeded,
@@ -1212,16 +1189,9 @@ where
                 error_type: None,
                 error_data: None,
                 stack_trace: Vec::new(),
-            }))
+            })
         }
-        ScopeOutcome::Completed(Err(child_err)) => {
-            // Defensive: a durable op that set its suspend flag and then
-            // returned Err (rather than parking) is a suspension, not a
-            // failure: mirror the invocation driver's precedence rule.
-            if scope.is_suspend_requested() {
-                return Ok(ItemOutcome::Suspended);
-            }
-
+        Err(child_err) => {
             // Checkpoint failure. The wire record is derived from the
             // error the body returned, so the type is the body error's
             // recorded type, the message is its flattened chain, and
@@ -1260,11 +1230,11 @@ where
                     .await;
             }
 
-            Ok(ItemOutcome::Terminal(BatchItem::failed_from_wire(
+            Ok(BatchItem::failed_from_wire(
                 req.index,
                 req.item_name.clone(),
                 &wire,
-            )))
+            ))
         }
     }
 }
@@ -1276,7 +1246,7 @@ where
 async fn run_single_item<O, F, Fut, IS>(
     req: ItemRequest<IS>,
     run_item: Arc<F>,
-) -> Result<ItemOutcome<O>, OperationError>
+) -> Result<BatchItem<O>, OperationError>
 where
     O: Send + 'static,
     F: Fn(DurableContext, usize) -> Fut + Send + Sync + 'static,
@@ -1284,24 +1254,22 @@ where
     IS: Serdes<O>,
 {
     match item_before(&req).await? {
-        ItemPrelude::Done(item) => Ok(ItemOutcome::Terminal(item)),
+        ItemPrelude::Done(item) => Ok(item),
         ItemPrelude::Run { child_ctx } => {
             // Instrument the branch body with the branch namespace's
             // replay-aware span: a resumed branch's pre-wait log lines are
             // suppressed while its own operations replay, independently of
             // the root handler span and of sibling branches.
-            let scope = Arc::clone(child_ctx.suspension_signal());
             let span = child_ctx.replay_span();
             let index = req.index;
-            // The scope encloses the closure call, so code the closure runs
-            // before it returns its future is checked too.
+            // The active-body scope encloses the closure call, so code the
+            // closure runs before it returns its future is checked too. A
+            // wait inside the body keeps this task pending in the join set.
             let body = ActiveBody::Context(child_ctx.prefix().to_owned());
-            let outcome = drive_scope(
-                run_body(body, async move { run_item(child_ctx, index).await }).instrument(span),
-                Arc::clone(&scope),
-            )
-            .await;
-            item_after(&req, &scope, outcome).await
+            let outcome = run_body(body, async move { run_item(child_ctx, index).await })
+                .instrument(span)
+                .await;
+            item_after(&req, outcome).await
         }
     }
 }
@@ -1312,33 +1280,30 @@ where
 async fn run_branch_item<O, IS>(
     req: ItemRequest<IS>,
     slots: Arc<Vec<std::sync::Mutex<Option<crate::future::BranchBody<O>>>>>,
-) -> Result<ItemOutcome<O>, OperationError>
+) -> Result<BatchItem<O>, OperationError>
 where
     O: Send + 'static,
     IS: Serdes<O>,
 {
     match item_before(&req).await? {
-        ItemPrelude::Done(item) => Ok(ItemOutcome::Terminal(item)),
+        ItemPrelude::Done(item) => Ok(item),
         ItemPrelude::Run { child_ctx } => {
-            let scope = Arc::clone(child_ctx.suspension_signal());
             let span = child_ctx.replay_span();
             let outcome = match take_branch_body(&slots, req.index) {
                 Ok(body) => {
                     // `start` injects the child context and returns the
-                    // branch's single erased future, polled here under the
-                    // branch driver exactly like a map item's body.
-                    // The factory closure runs inside the erased future, so
-                    // wrapping the future encloses the closure call.
+                    // branch's single erased future, awaited here exactly
+                    // like a map item's body. The factory closure runs
+                    // inside the erased future, so wrapping the future
+                    // encloses the closure call.
                     let active = ActiveBody::Context(child_ctx.prefix().to_owned());
-                    drive_scope(
-                        run_body(active, body.start(child_ctx)).instrument(span),
-                        Arc::clone(&scope),
-                    )
-                    .await
+                    run_body(active, body.start(child_ctx))
+                        .instrument(span)
+                        .await
                 }
-                Err(err) => ScopeOutcome::Completed(Err(err)),
+                Err(err) => Err(err),
             };
-            item_after(&req, &scope, outcome).await
+            item_after(&req, outcome).await
         }
     }
 }
@@ -1366,13 +1331,14 @@ fn take_branch_body<O>(
 /// and the thin wrapper it spawns ([`run_single_item`]) monomorphize per
 /// call site, while the futures inside the join set stay unboxed.
 trait ItemDispatch<O, IS>: Send + Sync {
-    /// Spawns the item body for `req` and returns the task's ID. The join
-    /// set blesses the task before the body's first poll.
+    /// Spawns the item body for `req` and returns the task's ID, or `None`
+    /// when the coordinator refused the spawn. The join set blesses the
+    /// task before the body's first poll.
     fn spawn_item(
         &self,
         set: &mut TrackedJoinSet<ItemJoin<O>>,
         req: ItemRequest<IS>,
-    ) -> Result<tokio::task::Id, NoRuntime>;
+    ) -> Result<Option<tokio::task::Id>, NoRuntime>;
 }
 
 /// Map dispatcher: shares the user closure as `Arc<F>` and produces one
@@ -1392,7 +1358,7 @@ where
         &self,
         set: &mut TrackedJoinSet<ItemJoin<O>>,
         req: ItemRequest<IS>,
-    ) -> Result<tokio::task::Id, NoRuntime> {
+    ) -> Result<Option<tokio::task::Id>, NoRuntime> {
         let run_item = Arc::clone(&self.run_item);
         let ownership = Arc::clone(req.ctx.task_ownership());
         set.spawn(&ownership, async move {
@@ -1418,7 +1384,7 @@ where
         &self,
         set: &mut TrackedJoinSet<ItemJoin<O>>,
         req: ItemRequest<IS>,
-    ) -> Result<tokio::task::Id, NoRuntime> {
+    ) -> Result<Option<tokio::task::Id>, NoRuntime> {
         let slots = Arc::clone(&self.slots);
         let ownership = Arc::clone(req.ctx.task_ownership());
         set.spawn(&ownership, async move {
@@ -1434,10 +1400,6 @@ struct BatchProgress<O> {
     tracker: CompletionTracker,
     /// Terminal outcomes, positional by item index.
     results: Vec<Option<BatchItem<O>>>,
-    /// Parked branches: they RETAIN their concurrency slots.
-    suspended_count: usize,
-    /// Whether ANY branch parked this invocation.
-    any_suspended: bool,
     /// Which items were EVER admitted: dispatched live this invocation, or
     /// holding a checkpoint record from a prior one. Ordered admission makes
     /// this a contiguous prefix of the input, and its length is the
@@ -1451,8 +1413,6 @@ impl<O> BatchProgress<O> {
         Self {
             tracker: CompletionTracker::new(total_items),
             results: (0..total_items).map(|_| None).collect(),
-            suspended_count: 0,
-            any_suspended: false,
             started: vec![false; total_items],
         }
     }
@@ -1464,30 +1424,19 @@ impl<O> BatchProgress<O> {
         }
     }
 
-    /// Records one item outcome: a terminal item feeds the completion
-    /// statistics and its result slot; a suspended item keeps its slot.
-    /// Returns whether the outcome was terminal.
+    /// Records one terminal item outcome: it feeds the completion
+    /// statistics and its result slot.
     fn settle_outcome(
         &mut self,
         completion_cfg: &crate::builders::map_parallel::CompletionConfig,
         total_items: usize,
         index: usize,
-        outcome: ItemOutcome<O>,
-    ) -> bool {
-        match outcome {
-            ItemOutcome::Terminal(item) => {
-                self.tracker
-                    .settle(completion_cfg, total_items, index, item.status);
-                if let Some(slot) = self.results.get_mut(index) {
-                    *slot = Some(item);
-                }
-                true
-            }
-            ItemOutcome::Suspended => {
-                self.suspended_count += 1;
-                self.any_suspended = true;
-                false
-            }
+        item: BatchItem<O>,
+    ) {
+        self.tracker
+            .settle(completion_cfg, total_items, index, item.status);
+        if let Some(slot) = self.results.get_mut(index) {
+            *slot = Some(item);
         }
     }
 }
@@ -1516,21 +1465,18 @@ where
     /// its original payload, and nothing is recorded for it: a panic fails
     /// the invocation, not the item.
     ///
-    /// Returns the index of the item when its outcome was terminal, and
-    /// `None` when the item parked. A parked item is not terminal, so the
-    /// caller keeps it among the owners an early completion abandons.
+    /// Returns the index of the item.
     fn settle_joined(
         &self,
         joined: TaskOutcome<ItemJoin<O>>,
         progress: &mut BatchProgress<O>,
-    ) -> Result<Option<usize>, OperationError> {
+    ) -> Result<usize, OperationError> {
         let (index, outcome) = joined.into_value();
         // A coordinator-level failure surfaces; the caller's join set drop
         // aborts the remaining branches.
-        let outcome = outcome?;
-        let terminal =
-            progress.settle_outcome(self.completion_cfg, self.total_items, index, outcome);
-        Ok(terminal.then_some(index))
+        let item = outcome?;
+        progress.settle_outcome(self.completion_cfg, self.total_items, index, item);
+        Ok(index)
     }
 
     /// Resolves a recorded-terminal child inline on the coordinator, in
@@ -1565,12 +1511,7 @@ where
         .await
         {
             Ok(item) => {
-                progress.settle_outcome(
-                    self.completion_cfg,
-                    self.total_items,
-                    index,
-                    ItemOutcome::Terminal(item),
-                );
+                progress.settle_outcome(self.completion_cfg, self.total_items, index, item);
                 Ok(())
             }
             Err(e) => {
@@ -1607,7 +1548,7 @@ where
                 // Verify (rather than assume) the quiescence invariant: the
                 // join event must belong to the reconstruction task spawned
                 // above.
-                if joined_id != reconstruction_id {
+                if Some(joined_id) != reconstruction_id {
                     return Err(batch_error(
                         "re-executed replay child joined an unexpected task",
                     ));
@@ -1946,14 +1887,12 @@ where
     // failure part-way leaves no starts recorded for children that never
     // ran.
 
-    // Coordinator loop. In-flight = running + suspended, bounded by
-    // `concurrency`: a SUSPENDED branch KEEPS its slot (only terminal
-    // completion frees one: the slot-holding invariant), so
-    // `suspended_count` counts against the cap and new branches only start
-    // when capacity remains after terminal completions. Each branch runs
-    // through the dispatcher's thin wrapper, which drives the branch body
-    // under its own scope so a park resolves to `ItemOutcome::Suspended`
-    // locally rather than tearing down the whole invocation.
+    // Coordinator loop. In-flight items are bounded by `concurrency`. An
+    // item that waits on a durable operation stays pending in the join set
+    // and counts in `running` until its task ends, so it KEEPS its slot
+    // (only terminal completion frees one: the slot-holding invariant). It
+    // continues when its wait completes; when nothing else can make
+    // progress, the invocation coordinator suspends the invocation.
     let child_sub_type_owned = child_sub_type.to_owned();
     // Coordinator-owned task set. Dropping it (on error return OR when the
     // driver drops this coordinator on invocation teardown) aborts every
@@ -1962,7 +1901,7 @@ where
     // Every task delivers its outcome through the set, including a panic,
     // which `settle_joined` resumes.
     let mut join_set: TrackedJoinSet<ItemJoin<O>> =
-        TrackedJoinSet::new(Arc::clone(ctx.suspension_signal().tasks()));
+        TrackedJoinSet::new(Arc::clone(ctx.coordinator()));
 
     let mut progress = BatchProgress::<O>::new(total_items);
     let mut running: usize = 0;
@@ -2045,7 +1984,7 @@ where
         // taken verbatim below.
         while (replay_plan.is_some() || progress.tracker.stop_reason.is_none())
             && next_index < total_items
-            && running + progress.suspended_count < concurrency
+            && running < concurrency
         {
             let i = next_index;
             next_index += 1;
@@ -2209,9 +2148,8 @@ where
         }
 
         if running == 0 {
-            // Quiescent: nothing in flight. Either all dispatched work is
-            // terminal, a threshold stopped dispatch, or every remaining slot
-            // is held by a parked branch.
+            // Nothing in flight: either all dispatched work is terminal, or
+            // a threshold stopped dispatch.
             break;
         }
 
@@ -2221,12 +2159,8 @@ where
             break; // set is empty: unreachable while running > 0
         };
         running -= 1;
-        // A parked item stays among the owners: it is not terminal, and an
-        // operation it created but did not await must not start after an
-        // early completion.
-        if let Some(settled) = env.settle_joined(joined, &mut progress)? {
-            running_owners.remove(&settled);
-        }
+        let settled = env.settle_joined(joined, &mut progress)?;
+        running_owners.remove(&settled);
 
         // Early completion: the completion rule is met, so the batch ends
         // now, without waiting for its running items (as in JS). Their
@@ -2246,26 +2180,8 @@ where
     let BatchProgress {
         tracker,
         mut results,
-        any_suspended,
         started,
-        ..
     } = progress;
-
-    // Quiescent. If a branch is parked and no completion trigger fired, the
-    // batch cannot finish this invocation: suspend the coordinator's OWN
-    // scope so whoever drives it (the invocation driver at the root, or an
-    // outer coordinator's branch driver when nested) observes the suspension
-    // and reports PENDING for its subtree. `suspend_now` never returns; the
-    // coordinator future is dropped at teardown, aborting the guards.
-    // Started-not-terminal children replay on the next invocation. When a
-    // trigger DID fire, the batch completes normally, and parked branches
-    // are reported as STARTED below. Under a replay plan the
-    // trigger state is not consulted (thresholds re-fire spuriously on
-    // recorded outcomes): a parked reconstruction always suspends, so an
-    // admitted item is never silently dropped from a recorded result.
-    if any_suspended && (replay_plan.is_some() || tracker.stop_reason.is_none()) {
-        return Ok(ctx.suspend_now::<BatchResult<O>>().await);
-    }
 
     // 9. Assemble results in input order. On the live path, every
     // dispatched item that is not terminal (running when the trigger fired,
@@ -3208,7 +3124,7 @@ async fn serialize_value<T, S: Serdes<T>>(
     serdes_ctx: SerdesContext,
 ) -> Result<String, OperationError> {
     let operation_id = serdes_ctx.operation_id().to_owned();
-    match serdes.serialize(value, serdes_ctx).await {
+    match ctx.hold_activity(serdes.serialize(value, serdes_ctx)).await {
         Ok(serialized) => Ok(serialized),
         Err(err) => {
             let e = ctx
@@ -3236,7 +3152,10 @@ async fn deserialize_value<T, S: Serdes<T>>(
     serdes_ctx: SerdesContext,
 ) -> Result<T, OperationError> {
     let operation_id = serdes_ctx.operation_id().to_owned();
-    match serdes.deserialize(payload, serdes_ctx).await {
+    match ctx
+        .hold_activity(serdes.deserialize(payload, serdes_ctx))
+        .await
+    {
         Ok(value) => Ok(value),
         Err(err) => {
             let e = ctx
@@ -5377,36 +5296,13 @@ mod tests {
         let child_op = ctx.mint_id();
         let child_positional = child_op.positional().to_owned();
         // Create a flat child context with the batch parent's wire ID.
-        let flat_child = ctx.new_scoped_flat_child(&child_positional, &batch_wire);
+        let flat_child = ctx.new_flat_child(&child_positional, &batch_wire);
         // Operations inside the flat child should report the batch parent
         // as their parent wire ID.
         assert_eq!(
             flat_child.parent_wire_id(),
             Some(batch_wire.as_str()),
             "flat child must report the batch parent's wire ID"
-        );
-    }
-
-    // Bug 4: Suspension propagation (no ContextFailed checkpoint)
-
-    #[test]
-    fn suspension_signal_detected_prevents_false_failure() {
-        // The suspension signal is shared across parent and child contexts.
-        let ctx = test_ctx(CheckpointLog::empty());
-        assert!(
-            !ctx.suspension_signal().is_suspend_requested(),
-            "initially no suspension"
-        );
-        ctx.request_suspend();
-        assert!(
-            ctx.suspension_signal().is_suspend_requested(),
-            "suspension signal propagates"
-        );
-        // A child context shares the same signal.
-        let child = ctx.new_child("1");
-        assert!(
-            child.suspension_signal().is_suspend_requested(),
-            "child inherits suspension signal from parent"
         );
     }
 
@@ -5702,7 +5598,7 @@ mod tests {
     {
         let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
         let ownership = Arc::clone(ctx.task_ownership());
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let handler = run(ctx);
         let outcome = crate::driver::drive_invocation(
             async move {
@@ -5711,6 +5607,7 @@ mod tests {
             },
             ownership,
             signal,
+            None,
         )
         .await;
         let Err(payload) = outcome else {
@@ -6182,7 +6079,7 @@ mod tests {
         // invoke payload
         let invoke_rec = RecordingSerdes::new();
         let (invoke_ctx, _invoke_client) = test_ctx_with_client(CheckpointLog::empty());
-        let signal = Arc::clone(invoke_ctx.suspension_signal());
+        let signal = Arc::clone(invoke_ctx.coordinator());
         let invoke_fut = invoke_ctx
             .invoke::<String, String>("target-fn", value.clone())
             .payload_serdes(invoke_rec.clone());
@@ -7748,7 +7645,7 @@ mod tests {
     async fn abandoned_item_leaves_no_task_after_invocation() {
         let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
         let ownership = Arc::clone(ctx.task_ownership());
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let guard = no_guard();
         let handler = {
             let ctx = ctx.clone();
@@ -7766,7 +7663,7 @@ mod tests {
         };
         let outcome = tokio::time::timeout(
             EARLY_BOUND,
-            crate::driver::drive_invocation(handler, ownership, signal),
+            crate::driver::drive_invocation(handler, ownership, signal, None),
         )
         .await
         .expect("the invocation does not wait for the abandoned item");
@@ -7778,7 +7675,7 @@ mod tests {
             guard.load(Ordering::SeqCst),
             "the abandoned item's task unwound before the invocation returned"
         );
-        assert_eq!(ctx.suspension_signal().tasks().live(), 0);
+        assert_eq!(ctx.coordinator().tasks().live(), 0);
     }
 
     /// Plain `.await` of an early-completing map or parallel returns only
@@ -7832,7 +7729,7 @@ mod tests {
     #[expect(clippy::panic)] // reason: the late item's panic is a case under test
     async fn queued_outcome_batch(late: Late) -> BatchResult<i32> {
         let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
-        let tasks = Arc::clone(ctx.suspension_signal().tasks());
+        let tasks = Arc::clone(ctx.coordinator().tasks());
         let entered = Arc::new(AtomicUsize::new(0));
         let ready = Arc::new([tokio::sync::Notify::new(), tokio::sync::Notify::new()]);
         let body = {
@@ -7969,7 +7866,7 @@ mod tests {
                 }
             };
             // The control: an owner that is not abandoned replays the batch.
-            let control = root.new_scoped_child("1");
+            let control = root.new_child("1");
             let replayed = tokio::time::timeout(bound, replay(control))
                 .await
                 .expect("the recorded batch replays")
@@ -7979,7 +7876,7 @@ mod tests {
                 [&"hello".to_owned(), &"world".to_owned()]
             );
 
-            let item = root.new_scoped_child("1");
+            let item = root.new_child("1");
             root.admission()
                 .abandon(item.owners().iter().map(String::as_str));
             let replayed = tokio::time::timeout(bound, replay(item)).await;
@@ -7999,7 +7896,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandoned_item_terminal_write_is_rejected() {
         let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
-        let tasks = Arc::clone(ctx.suspension_signal().tasks());
+        let tasks = Arc::clone(ctx.coordinator().tasks());
         let entered = Arc::new(tokio::sync::Notify::new());
         let (release, released) = std::sync::mpsc::channel::<()>();
         let released = Arc::new(std::sync::Mutex::new(Some(released)));
@@ -8063,12 +7960,11 @@ mod tests {
         );
     }
 
-    /// A parked item is not terminal, so an early completion abandons it
+    /// A waiting item is not terminal, so an early completion abandons it
     /// too. An operation it created but did not await then never starts.
-    /// Item 1 creates a step future, parks on a wait, and its parked
-    /// outcome is joined. Only then does item 0 succeed and fire the
-    /// trigger: paused time advances item 0's timer only once every other
-    /// task is idle.
+    /// Item 1 creates a step future and waits. Only then does item 0
+    /// succeed and fire the trigger: paused time advances item 0's timer
+    /// only once every other task is idle.
     #[tokio::test(start_paused = true)]
     async fn early_completion_abandons_parked_item() {
         let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
@@ -8102,11 +7998,18 @@ mod tests {
                 }
             }
         };
+        // The test awaits the batch on its own root future, which the SDK
+        // does not poll through a permit-aware task. The held activity
+        // stands in for the handler task's permit.
         let batch = tokio::time::timeout(
             EARLY_BOUND,
-            ctx.map(vec![0_i32, 1], body)
-                .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
-                .await_batch(),
+            ctx.hold_activity(
+                ctx.map(vec![0_i32, 1], body)
+                    .completion(
+                        crate::builders::map_parallel::CompletionConfig::with_min_successful(1),
+                    )
+                    .await_batch(),
+            ),
         )
         .await
         .expect("the batch completes")
@@ -8137,5 +8040,226 @@ mod tests {
             !has_start(&client, "escaped"),
             "the escaped step wrote nothing"
         );
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::panic)] // reason: an item panics on purpose, and test assertions
+mod coordinator_tests {
+    use crate::DurableContext;
+    use crate::builders::map_parallel::CompletionConfig;
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{
+        ScriptedClient, drive_handler, named, operation_like, scripted_ctx, wire_err,
+    };
+    use aws_sdk_lambda::types::{OperationAction, OperationStatus};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Counts the items whose body is running and keeps the peak.
+    #[derive(Default)]
+    struct InFlight {
+        now: AtomicUsize,
+        peak: AtomicUsize,
+        events: Mutex<Vec<String>>,
+    }
+
+    impl InFlight {
+        fn enter(&self, idx: usize) {
+            let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            self.events
+                .lock()
+                .expect("lock")
+                .push(format!("start{idx}"));
+        }
+
+        fn leave(&self, idx: usize) {
+            self.events.lock().expect("lock").push(format!("end{idx}"));
+            self.now.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        fn position(&self, event: &str) -> usize {
+            self.events
+                .lock()
+                .expect("lock")
+                .iter()
+                .position(|e| e == event)
+                .unwrap_or_else(|| panic!("no event {event}"))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_item_keeps_slot_and_continues() {
+        let client = Arc::new(ScriptedClient::new(|updates, history| {
+            if named(updates, "s1", &OperationAction::Succeed).is_none() {
+                return Vec::new();
+            }
+            named(history, "w0", &OperationAction::Start)
+                .map(|start| {
+                    operation_like(start, OperationStatus::Succeeded)
+                        .build()
+                        .expect("all required fields set")
+                })
+                .into_iter()
+                .collect()
+        }));
+        let ctx = scripted_ctx(&client);
+        let flight = Arc::new(InFlight::default());
+        let body_flight = Arc::clone(&flight);
+        let body_client = Arc::clone(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let batch = ctx
+                .map(
+                    vec![0_u32, 1, 2],
+                    move |child: DurableContext, _item, idx| {
+                        let flight = Arc::clone(&body_flight);
+                        let client = Arc::clone(&body_client);
+                        async move {
+                            flight.enter(idx);
+                            match idx {
+                                0 => {
+                                    child.wait(Duration::from_secs(1)).name("w0").await?;
+                                    child.step(|_| async { Ok(0_u32) }).name("after0").await?;
+                                }
+                                1 => {
+                                    child
+                                        .step(move |_| async move {
+                                            // The response that completes w0
+                                            // comes after w0 registered.
+                                            for _ in 0..1000 {
+                                                if client.received("w0", &OperationAction::Start) {
+                                                    return Ok(1_u32);
+                                                }
+                                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                            }
+                                            Err("w0 never started".into())
+                                        })
+                                        .name("s1")
+                                        .await?;
+                                }
+                                _ => {
+                                    child.step(|_| async { Ok(2_u32) }).name("s2").await?;
+                                }
+                            }
+                            flight.leave(idx);
+                            Ok(idx)
+                        }
+                    },
+                )
+                .max_concurrency(2)
+                .await_batch()
+                .await
+                .map_err(wire_err)?;
+            let statuses: Vec<String> = batch
+                .items
+                .iter()
+                .map(|item| format!("{:?}", item.status))
+                .collect();
+            Ok(statuses.join(","))
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(
+            outcome,
+            InvocationOutcome::Complete("Succeeded,Succeeded,Succeeded".to_owned()),
+            "the batch completes in one invocation"
+        );
+        assert_eq!(flight.peak.load(Ordering::SeqCst), 2);
+        assert!(
+            flight.position("end1") < flight.position("start2"),
+            "item 2 starts after item 1 finished"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn item_panic_while_others_wait_propagates() {
+        let ctx = scripted_ctx(&Arc::new(ScriptedClient::empty()));
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let _ = ctx
+                .map(
+                    vec![0_u32, 1, 2],
+                    |child: DurableContext, _item, idx| async move {
+                        if idx == 0 {
+                            child
+                                .step(|_| async {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                    Ok(0_u32)
+                                })
+                                .await?;
+                            panic!("boom while others wait");
+                        }
+                        child.wait(Duration::from_secs(3600)).await?;
+                        Ok(idx)
+                    },
+                )
+                .max_concurrency(3)
+                .await;
+            Ok("done".to_owned())
+        })
+        .await;
+        let Err(payload) = outcome else {
+            panic!("expected the item panic, got {outcome:?}");
+        };
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"boom while others wait")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn early_completion_cancels_running_item_while_others_wait() {
+        let client = Arc::new(ScriptedClient::empty());
+        let ctx = scripted_ctx(&client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let batch = ctx
+                .map(
+                    vec![0_u32, 1, 2, 3],
+                    |child: DurableContext, _item, idx| async move {
+                        match idx {
+                            0 => {}
+                            1 | 2 => child.wait(Duration::from_secs(3600)).await?,
+                            _ => {
+                                child
+                                    .step(|_| async {
+                                        tokio::time::sleep(Duration::from_millis(800)).await;
+                                        Ok(())
+                                    })
+                                    .name("a")
+                                    .await?;
+                                child.step(|_| async { Ok(()) }).name("late").await?;
+                            }
+                        }
+                        Ok(idx)
+                    },
+                )
+                .max_concurrency(4)
+                .completion(CompletionConfig::with_min_successful(1))
+                .await_batch()
+                .await
+                .map_err(wire_err)?;
+            ctx.hold_activity(ctx.coordinator().tasks().wait_idle())
+                .await;
+            let waits = ctx.coordinator().live_waits();
+            let statuses: Vec<String> = batch
+                .items
+                .iter()
+                .map(|item| format!("{:?}", item.status))
+                .collect();
+            Ok(format!("{}:{waits}", statuses.join(",")))
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(
+            outcome,
+            InvocationOutcome::Complete("Succeeded,Started,Started,Started:0".to_owned())
+        );
+        assert!(
+            client.updates().iter().all(|u| u.name() != Some("late")),
+            "the cancelled item wrote no later update"
+        );
+        assert_eq!(coordinator.tasks().live(), 0);
     }
 }

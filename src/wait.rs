@@ -1,9 +1,12 @@
 //! Wait operation execution engine.
 //!
 //! Implements the durable timer: checkpoint `WaitStarted` with
-//! `WaitOptions.WaitSeconds`, then request suspension. The backend owns
-//! the timer and re-invokes when the duration elapses. On replay a
-//! completed wait returns immediately.
+//! `WaitOptions.WaitSeconds`, then wait for the record to change. The
+//! backend owns the timer. When a checkpoint response completes the wait
+//! during the invocation, the wait continues at once; otherwise the
+//! invocation suspends once no other SDK work can make progress, and the
+//! backend invokes the function again when the duration elapses. On replay
+//! a completed wait returns immediately.
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate, WaitOptions};
 
@@ -53,35 +56,11 @@ impl WaitExecution {
                     return Ok(());
                 }
                 CheckpointStatus::Started => {
-                    // Timer started but not yet completed: suspend by
-                    // parking the future; the driver drops it and reports
-                    // PENDING.
-                    return self.ctx.suspend_now().await;
+                    // Timer started but not yet completed: wait for the
+                    // record to change.
+                    return self.resume(&positional_id, &wire_id).await;
                 }
-                CheckpointStatus::Pending
-                | CheckpointStatus::Ready
-                | CheckpointStatus::Failed
-                | CheckpointStatus::Cancelled
-                | CheckpointStatus::TimedOut
-                | CheckpointStatus::Stopped => {
-                    // Unexpected status for wait: treat as error.
-                    return Err(OperationError::from_kind(OperationErrorKind::Wait(
-                        WaitError::new(
-                            WaitErrorKind::UnexpectedStatus(crate::error::UnexpectedStatus::new(
-                                view.status.wire_str(),
-                            )),
-                            None,
-                        ),
-                    ))
-                    .with_operation(&wire_id, view.status.wire_str()));
-                }
-                CheckpointStatus::Unknown(ref raw) => {
-                    // Unreachable in production: `checkpoint_view_validated`
-                    // already failed the execution (issue #45). Kept as a
-                    // typed arm so a future bypass fails loudly instead of
-                    // being demoted to a catchable unexpected-status error.
-                    return Err(self.ctx.unrecognized_status_error(&wire_id, raw));
-                }
+                status => return recorded_outcome(&self.ctx, &wire_id, &status),
             }
         }
 
@@ -104,8 +83,56 @@ impl WaitExecution {
                 .await;
         }
 
-        // Request suspension: the backend owns the timer.
-        self.ctx.suspend_now().await
+        // The backend owns the timer: wait for the record to change.
+        self.resume(&positional_id, &wire_id).await
+    }
+
+    /// Waits until the wait's record is no longer `STARTED`, then returns
+    /// the outcome the record holds. A wait that a checkpoint response
+    /// completes continues in the same invocation; one that nothing
+    /// completes keeps a wait registration, so the invocation suspends once
+    /// no other SDK work can make progress. A resumed wait emits no
+    /// `operation_replayed` event.
+    async fn resume(&self, positional_id: &str, wire_id: &str) -> Result<(), OperationError> {
+        let view = self
+            .ctx
+            .wait_for_record_view(positional_id, |status| *status != CheckpointStatus::Started)
+            .await;
+        recorded_outcome(&self.ctx, wire_id, &view.status)
+    }
+}
+
+/// The outcome of a wait whose record is not `STARTED`: `Ok` for
+/// `SUCCEEDED`, and an unexpected-status error for every other status.
+fn recorded_outcome(
+    ctx: &DurableContext,
+    wire_id: &str,
+    status: &CheckpointStatus,
+) -> Result<(), OperationError> {
+    match status {
+        CheckpointStatus::Succeeded => Ok(()),
+        CheckpointStatus::Unknown(raw) => {
+            // Unreachable in production: `checkpoint_view_validated`
+            // already failed the execution (issue #45). Kept as a typed arm
+            // so a future bypass fails loudly instead of being demoted to a
+            // catchable unexpected-status error.
+            Err(ctx.unrecognized_status_error(wire_id, raw))
+        }
+        CheckpointStatus::Started
+        | CheckpointStatus::Pending
+        | CheckpointStatus::Ready
+        | CheckpointStatus::Failed
+        | CheckpointStatus::Cancelled
+        | CheckpointStatus::TimedOut
+        | CheckpointStatus::Stopped => Err(OperationError::from_kind(OperationErrorKind::Wait(
+            WaitError::new(
+                WaitErrorKind::UnexpectedStatus(crate::error::UnexpectedStatus::new(
+                    status.wire_str(),
+                )),
+                None,
+            ),
+        ))
+        .with_operation(wire_id, status.wire_str())),
     }
 }
 
@@ -228,7 +255,7 @@ mod tests {
             duration_secs: 5,
         };
 
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -326,7 +353,7 @@ mod tests {
             duration_secs: 10,
         };
 
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -355,7 +382,7 @@ mod tests {
         // Verify the builder is Debug (API Guidelines C-COMMON-TRAITS)
         let _debug = format!("{builder:?}");
         // Execute via IntoFuture
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         // Should suspend (not panic): name was propagated successfully.
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
@@ -381,7 +408,7 @@ mod tests {
         );
 
         // spawn() should succeed (blessed task, not foreign).
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let handle = ctx.wait(Duration::from_secs(2)).name("spawned").spawn();
         // Blessed spawn: the op suspends (no ownership error), so the driver
         // reports Pending rather than Failed.
@@ -452,7 +479,7 @@ mod tests {
             "token0".to_owned(),
         );
 
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,

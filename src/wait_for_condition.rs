@@ -131,9 +131,9 @@ where
     ///
     /// Thin generic wrapper: the ONLY code monomorphized per call site.
     /// The checkpoint-state-strategy machine lives in the non-generic
-    /// [`WfcCore`] / [`WfcAfter`] halves (generic over the state type `S`
-    /// only); this wrapper just polls the user's concrete check future
-    /// between them.
+    /// [`WfcCore`] (generic over the state type `S` only); this wrapper
+    /// just polls the user's concrete check future between its halves, one
+    /// cycle per check, and waits for the retry timer between cycles.
     pub(crate) async fn execute(self) -> Result<S, OperationError> {
         let Self {
             ctx,
@@ -144,9 +144,6 @@ where
             serdes,
             check,
         } = self;
-        // The check runs as a `Step` body: an operation claimed inside it
-        // fails the execution with a context usage error.
-        let body = ActiveBody::Step(op_id.positional().to_owned());
         let core = WfcCore {
             ctx,
             op_id,
@@ -155,19 +152,38 @@ where
             wait_strategy,
             serdes,
         };
-        match core.before().await? {
-            WfcPrelude::Done(result) => result,
-            WfcPrelude::Run {
-                attempt,
-                state,
-                after,
-            } => {
-                // Execute the check function.
-                let step_ctx = StepContext::new(attempt);
-                let check_result =
-                    run_body(body, async move { (check)(step_ctx, state).await }).await;
-                after.settle(attempt, check_result).await
+        let mut resumed = false;
+        loop {
+            match core.before(resumed).await? {
+                WfcPrelude::Done(result) => return result,
+                WfcPrelude::Wait => {}
+                WfcPrelude::Run { attempt, state } => {
+                    // Execute the check function. The check runs as a
+                    // `Step` body: an operation claimed inside it fails the
+                    // execution with a context usage error. It holds an
+                    // activity permit while it runs.
+                    let body = ActiveBody::Step(core.op_id.positional().to_owned());
+                    let step_ctx = StepContext::new(attempt);
+                    let check_result = core
+                        .ctx
+                        .hold_activity(run_body(body, async { (check)(step_ctx, state).await }))
+                        .await;
+                    match core.settle(attempt, check_result).await? {
+                        WfcSettled::Done(value) => return Ok(value),
+                        WfcSettled::Retry => {}
+                    }
+                }
             }
+            // The record is PENDING until its retry timer fires. Wait until
+            // a checkpoint response carries the next status, then handle
+            // the record as a new invocation would: READY runs the next
+            // check cycle, a terminal status returns its outcome.
+            core.ctx
+                .wait_for_record(core.op_id.wire(), |status| {
+                    *status != CheckpointStatus::Pending
+                })
+                .await;
+            resumed = true;
         }
     }
 }
@@ -187,31 +203,28 @@ struct WfcCore<S, SD> {
 }
 
 /// What [`WfcCore::before`] decided: the operation is already resolved from
-/// the checkpoint log (or suspended), or one check-attempt cycle must run.
-enum WfcPrelude<S, SD> {
-    /// Resolved without running the check (replay or suspension).
+/// the checkpoint log, its retry timer has not fired, or one check-attempt
+/// cycle must run.
+enum WfcPrelude<S> {
+    /// Resolved without running the check (replay).
     Done(Result<S, OperationError>),
-    /// The check must run at `attempt` against the carried `state`; `after`
-    /// settles the decision cycle.
+    /// The record is `PENDING`: the retry timer has not fired yet.
+    Wait,
+    /// The check must run at `attempt` against the carried `state`.
     Run {
         /// 1-based attempt number for this check cycle.
         attempt: u32,
         /// The carried state the check receives.
         state: S,
-        /// The post-check half that runs the strategy/decision protocol.
-        after: WfcAfter<S, SD>,
     },
 }
 
-/// The post-check half of `wait_for_condition`: state serialization, wait
-/// strategy consultation, and the Succeed/Retry/Fail checkpoint protocol.
-/// Generic only over the state type.
-struct WfcAfter<S, SD> {
-    ctx: DurableContext,
-    wire_id: String,
-    name: Option<String>,
-    wait_strategy: Option<WaitStrategyFn<S>>,
-    serdes: SD,
+/// How [`WfcCore::settle`] ended one check cycle.
+enum WfcSettled<S> {
+    /// The operation completed with this state.
+    Done(S),
+    /// A `RETRY` was checkpointed: the next cycle waits for its timer.
+    Retry,
 }
 
 impl<S, SD> WfcCore<S, SD>
@@ -222,7 +235,11 @@ where
     /// Runs everything that precedes the check closure: replay path, or
     /// the live-path preamble (carried-state derivation + START checkpoint).
     #[expect(clippy::too_many_lines)] // reason: replay-status protocol is a single logical unit; splitting would obscure it
-    async fn before(self) -> Result<WfcPrelude<S, SD>, OperationError> {
+    ///
+    /// `resumed` is true when the record changed during this invocation: a
+    /// terminal record then returns its outcome without an
+    /// `operation_replayed` event.
+    async fn before(&self, resumed: bool) -> Result<WfcPrelude<S>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
 
@@ -257,24 +274,28 @@ where
                         serdes_ctx.clone(),
                     )
                     .await?;
-                    self.ctx.emit_operation_replayed(
-                        &wire_id,
-                        self.name.as_deref(),
-                        "Step",
-                        Some(WFC_SUB_TYPE),
-                        view.attempt,
-                    );
+                    if !resumed {
+                        self.ctx.emit_operation_replayed(
+                            &wire_id,
+                            self.name.as_deref(),
+                            "Step",
+                            Some(WFC_SUB_TYPE),
+                            view.attempt,
+                        );
+                    }
                     return Ok(WfcPrelude::Done(Ok(value)));
                 }
                 CheckpointStatus::Failed => {
                     // Terminal failure: reconstruct error from checkpoint.
-                    self.ctx.emit_operation_replayed(
-                        &wire_id,
-                        self.name.as_deref(),
-                        "Step",
-                        Some(WFC_SUB_TYPE),
-                        view.attempt,
-                    );
+                    if !resumed {
+                        self.ctx.emit_operation_replayed(
+                            &wire_id,
+                            self.name.as_deref(),
+                            "Step",
+                            Some(WFC_SUB_TYPE),
+                            view.attempt,
+                        );
+                    }
                     let wire = self
                         .ctx
                         .checkpoint_wire_error(&positional_id)
@@ -286,8 +307,8 @@ where
                     ))));
                 }
                 CheckpointStatus::Pending => {
-                    // Retry timer hasn't fired yet: suspend.
-                    return Ok(WfcPrelude::Done(self.ctx.suspend_now().await));
+                    // Retry timer hasn't fired yet: wait for it.
+                    return Ok(WfcPrelude::Wait);
                 }
                 CheckpointStatus::Started => {
                     // This invocation already checkpointed START: skip it.
@@ -358,42 +379,22 @@ where
             }
         }
 
-        let Self {
-            ctx,
-            name,
-            wait_strategy,
-            serdes,
-            ..
-        } = self;
-
         Ok(WfcPrelude::Run {
             attempt,
             state: current_state,
-            after: WfcAfter {
-                ctx,
-                wire_id,
-                name,
-                wait_strategy,
-                serdes,
-            },
         })
     }
-}
 
-impl<S, SD> WfcAfter<S, SD>
-where
-    S: Clone + Send + Sync + 'static,
-    SD: Serdes<S>,
-{
     /// Settles one check cycle: serializes the new state, consults the wait
     /// strategy, and runs the Succeed/Retry/Fail checkpoint protocol.
     #[expect(clippy::too_many_lines)] // reason: the settle protocol (serialize, strategy, checkpoint) is a single logical unit; splitting would obscure it
     async fn settle(
-        self,
+        &self,
         attempt: u32,
         check_result: Result<S, BoxError>,
-    ) -> Result<S, OperationError> {
-        let serdes_ctx = SerdesContext::new(&self.wire_id, self.ctx.execution_arn());
+    ) -> Result<WfcSettled<S>, OperationError> {
+        let wire_id = self.op_id.wire();
+        let serdes_ctx = SerdesContext::new(wire_id, self.ctx.execution_arn());
         match check_result {
             Ok(new_state) => {
                 // Serialize the new state (ownership transfers to the
@@ -430,7 +431,7 @@ where
                     Err(op_err) => {
                         let wire = crate::error::serialization_failure_wire(&op_err);
                         let update = build_wfc_fail_update(
-                            &self.wire_id,
+                            wire_id,
                             self.name.as_deref(),
                             self.ctx.parent_wire_id(),
                             &wire,
@@ -443,7 +444,7 @@ where
                             return self.checkpoint_unrecoverable(client_err).await;
                         }
                         return Err(op_err
-                            .with_operation(&self.wire_id, CheckpointStatus::Failed.wire_str())
+                            .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
                             .with_wire(wire));
                     }
                 };
@@ -462,7 +463,7 @@ where
                     WaitDecision::Complete => {
                         // Condition met: checkpoint terminal SUCCEED.
                         let update = build_wfc_update(
-                            &self.wire_id,
+                            wire_id,
                             self.name.as_deref(),
                             self.ctx.parent_wire_id(),
                             OperationAction::Succeed,
@@ -477,7 +478,7 @@ where
                             return self.checkpoint_unrecoverable(err).await;
                         }
 
-                        Ok(deserialized)
+                        Ok(WfcSettled::Done(deserialized))
                     }
                     WaitDecision::Continue { delay } => {
                         // Not met: checkpoint RETRY with state + delay, then suspend.
@@ -486,7 +487,7 @@ where
                             .clamp(1, i64::from(i32::MAX))
                             as i32;
                         let update = build_wfc_update(
-                            &self.wire_id,
+                            wire_id,
                             self.name.as_deref(),
                             self.ctx.parent_wire_id(),
                             OperationAction::Retry,
@@ -502,7 +503,7 @@ where
                             return self.checkpoint_unrecoverable(err).await;
                         }
 
-                        self.ctx.suspend_now().await
+                        Ok(WfcSettled::Retry)
                     }
                     WaitDecision::Exhausted { reason } => {
                         // Strategy exhaustion: checkpoint FAIL, raise
@@ -516,7 +517,7 @@ where
                             Some(reason.as_str()),
                         );
                         let update = build_wfc_fail_update(
-                            &self.wire_id,
+                            wire_id,
                             self.name.as_deref(),
                             self.ctx.parent_wire_id(),
                             &wire,
@@ -532,7 +533,7 @@ where
                         Err(wfc_op_error(WaitForConditionErrorKind::MaxChecksExceeded(
                             crate::error::MaxChecksExceeded::new(attempt),
                         ))
-                        .with_operation(&self.wire_id, CheckpointStatus::Failed.wire_str())
+                        .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
                         .with_wire(wire))
                     }
                 }
@@ -544,7 +545,7 @@ where
                 // flattened message, `error_data`/`stack_trace` pass-through.
                 let wire = crate::error::wire_error_with_type(&*check_err, "WaitForConditionError");
                 let update = build_wfc_fail_update(
-                    &self.wire_id,
+                    wire_id,
                     self.name.as_deref(),
                     self.ctx.parent_wire_id(),
                     &wire,
@@ -561,7 +562,7 @@ where
                     WaitForConditionErrorKind::CheckFailed,
                     Some(check_err),
                 )
-                .with_operation(&self.wire_id, CheckpointStatus::Failed.wire_str())
+                .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
                 .with_wire(wire))
             }
         }
@@ -578,13 +579,13 @@ where
     ) -> T {
         let cwire = crate::error::checkpoint_failure_wire(&err);
         let terminal = build_wfc_fail_update(
-            &self.wire_id,
+            self.op_id.wire(),
             self.name.as_deref(),
             self.ctx.parent_wire_id(),
             &cwire,
         );
         self.ctx
-            .checkpoint_failure_unrecoverable(&self.wire_id, err, Some(terminal))
+            .checkpoint_failure_unrecoverable(self.op_id.wire(), err, Some(terminal))
             .await
     }
 }
@@ -665,7 +666,7 @@ async fn serialize_state<S, SD: Serdes<S>>(
     serdes_ctx: SerdesContext,
 ) -> Result<String, OperationError> {
     let operation_id = serdes_ctx.operation_id().to_owned();
-    match serdes.serialize(value, serdes_ctx).await {
+    match ctx.hold_activity(serdes.serialize(value, serdes_ctx)).await {
         Ok(serialized) => Ok(serialized),
         Err(err) => {
             let e = ctx
@@ -693,7 +694,10 @@ async fn deserialize_state_str<S, SD: Serdes<S>>(
     serdes_ctx: SerdesContext,
 ) -> Result<S, OperationError> {
     let operation_id = serdes_ctx.operation_id().to_owned();
-    match serdes.deserialize(payload, serdes_ctx).await {
+    match ctx
+        .hold_activity(serdes.deserialize(payload, serdes_ctx))
+        .await
+    {
         Ok(value) => Ok(value),
         Err(err) => {
             let e = ctx
@@ -895,7 +899,7 @@ mod tests {
         let seen = Arc::new(StdMutex::new(None::<i32>));
         let seen_check = Arc::clone(&seen);
 
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let ownership = Arc::clone(ctx.task_ownership());
         let exec = WaitForConditionExecution {
             ctx,
@@ -1024,7 +1028,7 @@ mod tests {
         // unrecoverable path (issue #43): the operation future parks for
         // the invocation driver instead of yielding a catchable error, and
         // the fatal slot records the checkpoint failure.
-        let signal = Arc::clone(exec.ctx.suspension_signal());
+        let signal = Arc::clone(exec.ctx.coordinator());
         let parked = tokio::time::timeout(Duration::from_millis(200), exec.execute()).await;
         assert!(
             parked.is_err(),
@@ -1108,7 +1112,7 @@ mod tests {
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id(); // mints "1"
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let ownership = Arc::clone(ctx.task_ownership());
 
         let exec = WaitForConditionExecution {
@@ -1462,5 +1466,155 @@ mod tests {
 
         let result = handle.await;
         assert_eq!(result.unwrap(), 5);
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use crate::BoxError;
+    use crate::builders::wait_for_condition::WaitDecision;
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{
+        ScriptedClient, drive_handler, named, operation_like, scripted_ctx, wire_err,
+    };
+    use aws_sdk_lambda::types::{OperationAction, OperationStatus, StepDetails};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn condition_check_resumes_on_sibling_response() {
+        let (events, _guard) = crate::driver::test_support::EventMessages::install();
+        let client = Arc::new(ScriptedClient::new(|updates, history| {
+            if named(updates, "s", &OperationAction::Succeed).is_none() {
+                return Vec::new();
+            }
+            named(history, "cond", &OperationAction::Start)
+                .map(|start| {
+                    operation_like(start, OperationStatus::Ready)
+                        .step_details(StepDetails::builder().attempt(1).result("1").build())
+                        .build()
+                        .expect("all required fields set")
+                })
+                .into_iter()
+                .collect()
+        }));
+        let ctx = scripted_ctx(&client);
+        let checks = Arc::new(AtomicU32::new(0));
+        let check_count = Arc::clone(&checks);
+        let body_client = Arc::clone(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let cond = ctx
+                .wait_for_condition(
+                    move |_ctx, state: i32| {
+                        let checks = Arc::clone(&check_count);
+                        async move {
+                            checks.fetch_add(1, Ordering::SeqCst);
+                            Ok::<i32, BoxError>(state + 1)
+                        }
+                    },
+                    0,
+                )
+                .wait_strategy_fn(|state: i32, _attempt| {
+                    if state >= 2 {
+                        WaitDecision::complete()
+                    } else {
+                        WaitDecision::continue_with(Duration::from_secs(1))
+                    }
+                })
+                .name("cond")
+                .spawn();
+            ctx.step(move |_| async move {
+                // The READY arrives only after the retry was recorded.
+                for _ in 0..1000 {
+                    if body_client.received("cond", &OperationAction::Retry) {
+                        return Ok(1_u32);
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err("the condition never retried".into())
+            })
+            .name("s")
+            .await
+            .map_err(wire_err)?;
+            let state = cond.await.map_err(wire_err)?;
+            Ok(state.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("2".to_owned()));
+        assert_eq!(checks.load(Ordering::SeqCst), 2, "the check ran twice");
+        assert_eq!(
+            events.replayed(),
+            0,
+            "a resumed operation emits no replay event"
+        );
+    }
+
+    /// A record that a sibling's response completes while the condition
+    /// waits returns its recorded outcome, without an `operation_replayed`
+    /// event and without another check.
+    #[tokio::test(start_paused = true)]
+    async fn resumed_terminal_record_returns_without_replay_event() {
+        let (events, _guard) = crate::driver::test_support::EventMessages::install();
+        let client = Arc::new(ScriptedClient::new(|updates, history| {
+            if named(updates, "s", &OperationAction::Succeed).is_none() {
+                return Vec::new();
+            }
+            named(history, "cond", &OperationAction::Start)
+                .map(|start| {
+                    operation_like(start, OperationStatus::Succeeded)
+                        .step_details(StepDetails::builder().attempt(1).result("5").build())
+                        .build()
+                        .expect("all required fields set")
+                })
+                .into_iter()
+                .collect()
+        }));
+        let ctx = scripted_ctx(&client);
+        let checks = Arc::new(AtomicU32::new(0));
+        let check_count = Arc::clone(&checks);
+        let body_client = Arc::clone(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let cond = ctx
+                .wait_for_condition(
+                    move |_ctx, state: i32| {
+                        let checks = Arc::clone(&check_count);
+                        async move {
+                            checks.fetch_add(1, Ordering::SeqCst);
+                            Ok::<i32, BoxError>(state + 1)
+                        }
+                    },
+                    0,
+                )
+                .wait_strategy_fn(|_state: i32, _attempt| {
+                    WaitDecision::continue_with(Duration::from_secs(1))
+                })
+                .name("cond")
+                .spawn();
+            ctx.step(move |_| async move {
+                for _ in 0..1000 {
+                    if body_client.received("cond", &OperationAction::Retry) {
+                        return Ok(1_u32);
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err("the condition never retried".into())
+            })
+            .name("s")
+            .await
+            .map_err(wire_err)?;
+            let state = cond.await.map_err(wire_err)?;
+            Ok(state.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("5".to_owned()));
+        assert_eq!(checks.load(Ordering::SeqCst), 1, "the check ran once");
+        assert_eq!(
+            events.replayed(),
+            0,
+            "a resumed record emits no replay event"
+        );
     }
 }

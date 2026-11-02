@@ -8,8 +8,12 @@
 //!
 //! Issue #49: inputs of a directly awaited combinator used to park the
 //! root suspension scope, so a losing input's wait suspended the
-//! invocation even after another input settled. Each input now runs in
-//! its own suspension scope, so a losing park stays isolated.
+//! invocation even after another input settled. The invocation now
+//! suspends only when no SDK work can make progress, so a losing wait
+//! never suspends it once another input settled.
+//!
+//! `tokio::join!` over a lazy operation that waits and a running step lets
+//! the step finish before the invocation suspends.
 
 #![cfg(feature = "test-util")]
 #![expect(clippy::expect_used)] // reason: test assertions
@@ -251,5 +255,160 @@ async fn join_all_suspends_until_parked_input_resolves() {
         result.invocation_count() >= 2,
         "join_all must suspend while an input is parked and complete on a \
          later invocation",
+    );
+}
+
+/// Counts the starts and ends of a step body.
+#[derive(Default)]
+struct BodyRuns {
+    started: std::sync::atomic::AtomicUsize,
+    finished: std::sync::atomic::AtomicUsize,
+}
+
+impl BodyRuns {
+    fn started(&self) -> usize {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn finished(&self) -> usize {
+        self.finished.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A step body that sleeps 100 ms and counts its starts and ends.
+async fn slow_submit(runs: std::sync::Arc<BodyRuns>) -> Result<u32, durable::BoxError> {
+    runs.started
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    runs.finished
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(1)
+}
+
+/// A lazy callback result joined with a running step: the step finishes
+/// before the invocation suspends on the callback.
+#[tokio::test(flavor = "current_thread")]
+async fn join_lazy_callback_result_with_running_step() {
+    let runs = std::sync::Arc::new(BodyRuns::default());
+    let handler_runs = std::sync::Arc::clone(&runs);
+    let result = LocalRunner::new()
+        .run(
+            move |(), ctx: durable::DurableContext| {
+                let runs = std::sync::Arc::clone(&handler_runs);
+                async move {
+                    let cb = ctx.create_callback::<String>().name("approval").await?;
+                    let (approval, submitted) = tokio::join!(
+                        cb.result(),
+                        ctx.step(move |_| slow_submit(runs)).name("submit").future()
+                    );
+                    submitted?;
+                    Ok::<_, durable::BoxError>(approval?)
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+
+    assert!(result.is_suspended(), "no reply was queued");
+    assert_eq!(result.invocation_count(), 1);
+    assert_eq!(
+        result
+            .operation("submit")
+            .map(durable::test_util::TestOperation::status),
+        Some(durable::OperationStatus::Succeeded)
+    );
+    assert_eq!(runs.started(), 1, "the body started once");
+    assert_eq!(runs.finished(), 1, "the body finished once");
+}
+
+/// A lazy wait joined with a running step: the step finishes before the
+/// invocation suspends on the wait, so it runs only once.
+#[tokio::test(flavor = "current_thread")]
+async fn join_lazy_wait_with_running_step() {
+    let runs = std::sync::Arc::new(BodyRuns::default());
+    let handler_runs = std::sync::Arc::clone(&runs);
+    let result = LocalRunner::new()
+        .run(
+            move |(), ctx: durable::DurableContext| {
+                let runs = std::sync::Arc::clone(&handler_runs);
+                async move {
+                    let (timer, submitted) = tokio::join!(
+                        ctx.wait(Duration::from_secs(1)).name("timer").future(),
+                        ctx.step(move |_| slow_submit(runs)).name("submit").future()
+                    );
+                    timer?;
+                    submitted?;
+                    Ok::<_, durable::BoxError>(())
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.invocation_count(), 2);
+    assert_eq!(runs.started(), 1, "the body started once");
+}
+
+/// The winner of the issue #49 race is checkpointed, and a replay returns
+/// the same winner without running the winning body again.
+#[tokio::test(flavor = "current_thread")]
+async fn race_winner_is_recorded_and_replayed() {
+    let winners = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let fast_runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler_winners = std::sync::Arc::clone(&winners);
+    let handler_runs = std::sync::Arc::clone(&fast_runs);
+    let result = LocalRunner::new()
+        .run(
+            move |(), ctx: durable::DurableContext| {
+                let winners = std::sync::Arc::clone(&handler_winners);
+                let runs = std::sync::Arc::clone(&handler_runs);
+                async move {
+                    // The race needs one output type: the losing wait runs
+                    // in a child context that returns a string.
+                    let waiting = ctx
+                        .run_in_child_context(|child| async move {
+                            child.wait(Duration::from_mins(1)).await?;
+                            Ok("slow".to_owned())
+                        })
+                        .future();
+                    let fast = ctx
+                        .step(move |_| async move {
+                            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tokio::task::yield_now().await;
+                            Ok("fast".to_owned())
+                        })
+                        .name("fast")
+                        .future();
+                    let winner = ctx.race([waiting, fast]).name("race").await?;
+                    winners.lock().expect("lock").push(winner);
+                    ctx.wait(Duration::from_secs(1)).name("after").await?;
+                    Ok::<_, durable::BoxError>(())
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.invocation_count(), 2);
+    assert_eq!(
+        *winners.lock().expect("lock"),
+        vec!["fast".to_owned(), "fast".to_owned()],
+        "the replay returned the same winner"
+    );
+    assert_eq!(
+        fast_runs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the winning body ran once"
+    );
+    assert_eq!(
+        result
+            .operation("race")
+            .map(durable::test_util::TestOperation::status),
+        Some(durable::OperationStatus::Succeeded)
     );
 }

@@ -264,6 +264,11 @@ where
 
     /// Eagerly spawns the step on a tokio task.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -299,12 +304,12 @@ where
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::step::StepExecution;
 
         preflight_identity!(self, "Step", crate::step::STEP_SUB_TYPE);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = StepExecution {
             ctx: self.ctx,
@@ -317,7 +322,7 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }
 

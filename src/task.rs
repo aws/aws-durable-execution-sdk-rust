@@ -2,8 +2,9 @@
 //!
 //! The SDK starts tasks for `.spawn()`, for each map item and parallel
 //! branch, for each combinator input, for the checkpoint batch flusher, for
-//! blocking serdes work, and for the handler itself. Each of these tasks
-//! goes through one of the functions below:
+//! detached checkpoint writes, for blocking serdes work, and for the
+//! handler itself. Each of these tasks goes through one of the functions
+//! below:
 //!
 //! - [`spawn_root`] starts the handler of one invocation;
 //! - [`spawn_tracked`] and [`TrackedJoinSet::spawn`] start operation tasks;
@@ -26,6 +27,27 @@
 //! it before the task exits. So every task that can run a durable
 //! operation passes the check, and tokio can reuse a task ID only for a
 //! task that is not in the set.
+//!
+//! # Permits
+//!
+//! The wrapper of the root task and of every operation task holds an
+//! activity permit of the invocation's
+//! [`InvocationCoordinator`](crate::coordinator::InvocationCoordinator)
+//! while its task can make progress (see [`Schedule`]):
+//!
+//! 1. A spawn takes the permit on the spawning task, so the new task counts
+//!    before tokio polls it. A spawn after the phase left `Running` starts
+//!    nothing and returns a handle that never resolves.
+//! 2. The wrapper polls its future with a waker of its own. A wake while the
+//!    task is idle takes a permit; a wake during a poll keeps the poll's
+//!    permit. A poll that returns `Pending` without a wake releases it.
+//! 3. A task that finishes hands its outcome over, which wakes the consumer
+//!    and so gives the consumer its permit, and only then releases its own.
+//! 4. Once the phase is not `Running`, the wrapper no longer polls its
+//!    future.
+//!
+//! Detached tasks run no user code, take no activity permit and ignore the
+//! phase.
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
@@ -33,10 +55,11 @@ use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 
 use tokio::task::{AbortHandle, Id, JoinSet};
 
+use crate::coordinator::{InvocationCoordinator, Permit, PermitKind, Phase};
 use crate::driver::TaskOwnership;
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
 
@@ -49,10 +72,11 @@ pub(crate) const NO_RUNTIME_MESSAGE: &str = "durable operation started with `.sp
      Tokio runtime is running; call it from the handler or from an SDK operation";
 
 tokio::task_local! {
-    /// The tracker of the invocation whose task is being polled. The
+    /// The coordinator of the invocation whose task is being polled. The
     /// gateway wrapper sets it for each poll of its future, so blocking
-    /// work started from any SDK task is counted on that invocation.
-    static CURRENT_TASKS: Arc<TaskTracker>;
+    /// work started from any SDK task holds a permit of that invocation
+    /// and is counted on its tracker.
+    static CURRENT_COORDINATOR: Arc<InvocationCoordinator>;
 }
 
 /// How a tracked task ended.
@@ -291,6 +315,181 @@ fn discard_panic(f: impl FnOnce()) {
     drop(catch_unwind(AssertUnwindSafe(f)));
 }
 
+/// The scheduling state of one permit-aware task.
+#[derive(Debug)]
+enum ScheduleState {
+    /// Not runnable: no permit is held.
+    Idle,
+    /// Woken (or just spawned) and waiting for its next poll: holds the
+    /// permit that poll uses.
+    Queued(Permit),
+    /// Being polled. `woken` records a wake during the poll.
+    Polling { permit: Permit, woken: bool },
+    /// The task finished or was dropped. Wakes take nothing.
+    Done,
+}
+
+/// The permit state of one permit-aware task, and the waker the wrapper
+/// polls its future with.
+///
+/// A registration or a resource the future waits on holds this waker. So
+/// a wake that makes the task runnable takes the task's activity permit
+/// before the waker of the task itself runs.
+pub(crate) struct Schedule {
+    state: Mutex<ScheduleState>,
+    coordinator: Arc<InvocationCoordinator>,
+    /// The waker tokio polled the task with last. Every wake also wakes it.
+    outer: Mutex<Option<Waker>>,
+}
+
+impl std::fmt::Debug for Schedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Schedule").finish_non_exhaustive()
+    }
+}
+
+impl Schedule {
+    fn with_state(coordinator: &Arc<InvocationCoordinator>, state: ScheduleState) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(state),
+            coordinator: Arc::clone(coordinator),
+            outer: Mutex::new(None),
+        })
+    }
+
+    /// A schedule that starts `Queued` with an activity permit taken now.
+    /// Returns `None` when the phase is not `Running`.
+    fn queued(coordinator: &Arc<InvocationCoordinator>) -> Option<Arc<Self>> {
+        let permit = coordinator.acquire(PermitKind::Activity)?;
+        Some(Self::with_state(coordinator, ScheduleState::Queued(permit)))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ScheduleState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stores the waker tokio polled the task with.
+    fn set_outer(&self, waker: &Waker) {
+        let mut outer = self.outer.lock().unwrap_or_else(PoisonError::into_inner);
+        match &*outer {
+            Some(existing) if existing.will_wake(waker) => {}
+            _ => *outer = Some(waker.clone()),
+        }
+    }
+
+    /// Starts a poll: `Queued` becomes `Polling` with the same permit, and
+    /// `Idle` takes a fresh permit. Returns `false` when no permit can be
+    /// taken (the phase left `Running`) or the task is done.
+    fn begin_poll(&self) -> bool {
+        let mut state = self.lock();
+        match std::mem::replace(&mut *state, ScheduleState::Done) {
+            ScheduleState::Queued(permit) => {
+                *state = ScheduleState::Polling {
+                    permit,
+                    woken: false,
+                };
+                true
+            }
+            ScheduleState::Idle => {
+                if let Some(permit) = self.coordinator.acquire(PermitKind::Activity) {
+                    *state = ScheduleState::Polling {
+                        permit,
+                        woken: false,
+                    };
+                    true
+                } else {
+                    *state = ScheduleState::Idle;
+                    false
+                }
+            }
+            polling @ ScheduleState::Polling { .. } => {
+                *state = polling;
+                true
+            }
+            ScheduleState::Done => false,
+        }
+    }
+
+    /// Ends a poll that returned `Pending`. With a wake during the poll, or
+    /// with `requeue`, the task stays `Queued` with the poll's permit.
+    /// Otherwise it becomes `Idle`, and the permit is released after the
+    /// lock is.
+    fn end_pending(&self, requeue: bool) {
+        let released = {
+            let mut state = self.lock();
+            match std::mem::replace(&mut *state, ScheduleState::Done) {
+                ScheduleState::Polling { permit, woken } if woken || requeue => {
+                    *state = ScheduleState::Queued(permit);
+                    None
+                }
+                ScheduleState::Polling { permit, .. } => {
+                    *state = ScheduleState::Idle;
+                    Some(permit)
+                }
+                other => {
+                    *state = other;
+                    None
+                }
+            }
+        };
+        drop(released);
+    }
+
+    /// Ends the task's last poll: the task is done, and the poll's permit is
+    /// returned so the caller releases it after it handed the outcome over.
+    fn end_ready(&self) -> Option<Permit> {
+        let mut state = self.lock();
+        match std::mem::replace(&mut *state, ScheduleState::Done) {
+            ScheduleState::Polling { permit, .. } | ScheduleState::Queued(permit) => Some(permit),
+            ScheduleState::Idle | ScheduleState::Done => None,
+        }
+    }
+
+    /// Marks the task done and releases any permit it holds.
+    fn close(&self) {
+        let released = std::mem::replace(&mut *self.lock(), ScheduleState::Done);
+        drop(released);
+    }
+
+    /// The waker the wrapper polls its future with.
+    fn waker(self: &Arc<Self>) -> Waker {
+        Waker::from(Arc::clone(self))
+    }
+
+    fn on_wake(&self) {
+        {
+            let mut state = self.lock();
+            match &mut *state {
+                ScheduleState::Idle => {
+                    if let Some(permit) = self.coordinator.acquire(PermitKind::Activity) {
+                        *state = ScheduleState::Queued(permit);
+                    }
+                }
+                ScheduleState::Polling { woken, .. } => *woken = true,
+                ScheduleState::Queued(_) | ScheduleState::Done => {}
+            }
+        }
+        let outer = self
+            .outer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(outer) = outer {
+            outer.wake();
+        }
+    }
+}
+
+impl Wake for Schedule {
+    fn wake(self: Arc<Self>) {
+        self.on_wake();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.on_wake();
+    }
+}
+
 /// The state an outcome slot shares between a task and its handle.
 struct SlotState<T> {
     outcome: Option<TaskOutcome<T>>,
@@ -394,12 +593,28 @@ impl Drop for BlessGuard {
     }
 }
 
+/// How a wrapper takes part in the suspension decision.
+enum Gate {
+    /// An operation task or the root: polled under its [`Schedule`] while
+    /// the phase is `Running`, and not polled afterwards.
+    Scheduled {
+        schedule: Arc<Schedule>,
+        waker: Waker,
+        /// The root sets the phase to `Finished` before it releases its
+        /// permit, when the handler resolves or panics.
+        root: bool,
+    },
+    /// A detached task: no permit, polled whatever the phase.
+    Detached,
+}
+
 /// The future of every gateway task: polls the inner future under
 /// `catch_unwind`, blesses the task before the first poll, and hands the
-/// outcome to the consumer before it releases its permit.
+/// outcome to the consumer before it releases its permits.
 ///
 /// The fields drop in declaration order, so after `Drop::drop` has dropped
-/// the inner future, the bless guard drops before the permit.
+/// the inner future and closed the schedule, the bless guard drops before
+/// the task count.
 struct Wrapped<F: Future> {
     /// The inner future. `None` once it finished or was dropped.
     inner: Option<Pin<Box<F>>>,
@@ -407,8 +622,9 @@ struct Wrapped<F: Future> {
     bless: Option<BlessGuard>,
     /// The ownership handle to bless the task in, taken at the first poll.
     ownership: Option<Arc<TaskOwnership>>,
-    /// The tracker set as `CURRENT_TASKS` during each poll.
-    scope: Arc<TaskTracker>,
+    /// The coordinator set as `CURRENT_COORDINATOR` during each poll.
+    coordinator: Arc<InvocationCoordinator>,
+    gate: Gate,
     /// Where the outcome goes.
     sink: Sink<F::Output>,
     /// The task's count, dropped after the outcome is stored.
@@ -419,7 +635,8 @@ impl<F: Future> Wrapped<F> {
     fn new(
         future: F,
         ownership: Option<Arc<TaskOwnership>>,
-        scope: Arc<TaskTracker>,
+        coordinator: Arc<InvocationCoordinator>,
+        gate: Gate,
         sink: Sink<F::Output>,
         permit: Option<TaskPermit>,
     ) -> Self {
@@ -427,10 +644,21 @@ impl<F: Future> Wrapped<F> {
             inner: Some(Box::pin(future)),
             bless: None,
             ownership,
-            scope,
+            coordinator,
+            gate,
             sink,
             permit,
         }
+    }
+}
+
+/// A [`Gate::Scheduled`] for `schedule`.
+fn scheduled(schedule: Arc<Schedule>, root: bool) -> Gate {
+    let waker = schedule.waker();
+    Gate::Scheduled {
+        schedule,
+        waker,
+        root,
     }
 }
 
@@ -439,6 +667,12 @@ impl<F: Future> Future for Wrapped<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
+        if let Gate::Scheduled { schedule, .. } = &this.gate {
+            schedule.set_outer(cx.waker());
+            if this.coordinator.phase() != Phase::Running || !schedule.begin_poll() {
+                return Poll::Pending;
+            }
+        }
         // Bless before the inner future can run any code, so a durable
         // operation it calls on its first poll passes the ownership check.
         if let Some(ownership) = this.ownership.take() {
@@ -453,11 +687,32 @@ impl<F: Future> Future for Wrapped<F> {
             .inner
             .as_mut()
             .expect("tokio does not poll a finished task");
-        let polled = CURRENT_TASKS.sync_scope(Arc::clone(&this.scope), || {
-            catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx)))
-        });
+        let polled = match &this.gate {
+            Gate::Scheduled { waker, .. } => {
+                let mut inner_cx = Context::from_waker(waker);
+                CURRENT_COORDINATOR.sync_scope(Arc::clone(&this.coordinator), || {
+                    catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(&mut inner_cx)))
+                })
+            }
+            Gate::Detached => CURRENT_COORDINATOR.sync_scope(Arc::clone(&this.coordinator), || {
+                catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx)))
+            }),
+        };
         let outcome = match polled {
-            Ok(Poll::Pending) => return Poll::Pending,
+            Ok(Poll::Pending) => {
+                if let Gate::Scheduled { schedule, .. } = &this.gate {
+                    // After the cooperative budget is spent, a tokio
+                    // resource returns `Pending` and wakes the task only
+                    // after this poll returned. Without the requeue the
+                    // task would look idle while it is runnable.
+                    let exhausted = !tokio::task::coop::has_budget_remaining();
+                    schedule.end_pending(exhausted);
+                    if exhausted {
+                        cx.waker().wake_by_ref();
+                    }
+                }
+                return Poll::Pending;
+            }
             Ok(Poll::Ready(value)) => {
                 let inner = this.inner.take();
                 match catch_unwind(AssertUnwindSafe(move || drop(inner))) {
@@ -479,7 +734,17 @@ impl<F: Future> Future for Wrapped<F> {
             }
         };
         drop(this.bless.take());
+        // The poll's permit is held while the outcome is handed over, so
+        // the consumer's wake takes its own permit first.
+        let permit = match &this.gate {
+            Gate::Scheduled { schedule, .. } => schedule.end_ready(),
+            Gate::Detached => None,
+        };
         this.sink.deliver(outcome);
+        if let Gate::Scheduled { root: true, .. } = &this.gate {
+            this.coordinator.finish();
+        }
+        drop(permit);
         drop(this.permit.take());
         Poll::Ready(())
     }
@@ -492,6 +757,10 @@ impl<F: Future> Drop for Wrapped<F> {
         // panic of an aborted task whose handle is gone.
         if let Some(inner) = self.inner.take() {
             discard_panic(move || drop(inner));
+        }
+        // A waker that outlives the task takes no permit from now on.
+        if let Gate::Scheduled { schedule, .. } = &self.gate {
+            schedule.close();
         }
     }
 }
@@ -529,36 +798,36 @@ mod raw {
 }
 
 /// Aborts its task on drop. Holds the outcome slot it shares with its
-/// task, and the task's `AbortHandle`.
+/// task, and the task's `AbortHandle`. A handle without an abort handle
+/// belongs to a spawn the coordinator refused: it never resolves.
 pub(crate) struct TrackedTask<T> {
     slot: Arc<Slot<T>>,
-    abort: AbortHandle,
+    abort: Option<AbortHandle>,
 }
 
 impl<T> std::fmt::Debug for TrackedTask<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TrackedTask")
-            .field("id", &self.abort.id())
+            .field("id", &self.abort.as_ref().map(AbortHandle::id))
             .finish_non_exhaustive()
     }
 }
 
 impl<T> TrackedTask<T> {
+    /// A handle of a spawn that started nothing: it never resolves.
+    fn refused() -> Self {
+        Self {
+            slot: Arc::new(Slot::new()),
+            abort: None,
+        }
+    }
+
     /// Aborts the task. Aborting a finished task does nothing, so an outcome
     /// the task already stored stays in the slot.
     pub(crate) fn abort(&self) {
-        self.abort.abort();
-    }
-
-    /// Takes the outcome the task stored, if it has stored one and no poll
-    /// has taken it yet.
-    pub(crate) fn take_finished(&self) -> Option<TaskOutcome<T>> {
-        self.slot
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .outcome
-            .take()
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
     }
 }
 
@@ -572,16 +841,18 @@ impl<T> Future for TrackedTask<T> {
 
 impl<T> Drop for TrackedTask<T> {
     fn drop(&mut self) {
-        self.abort.abort();
+        self.abort();
     }
 }
 
-/// Starts an operation task, counted on `tasks` and aborted by
-/// [`TaskTracker::abort_all`].
+/// Starts an operation task, counted on the coordinator's tracker and
+/// aborted by [`TaskTracker::abort_all`].
 ///
-/// Blesses the task in `ownership` before the first poll of `future`.
+/// Blesses the task in `ownership` before the first poll of `future`. Takes
+/// an activity permit for the task on the calling task. When the phase is
+/// not `Running`, starts nothing and returns a handle that never resolves.
 pub(crate) fn spawn_tracked<F>(
-    tasks: &Arc<TaskTracker>,
+    coordinator: &Arc<InvocationCoordinator>,
     ownership: &Arc<TaskOwnership>,
     future: F,
 ) -> Result<TrackedTask<F::Output>, NoRuntime>
@@ -590,30 +861,37 @@ where
     F::Output: Send + 'static,
 {
     ensure_runtime()?;
+    let Some(schedule) = Schedule::queued(coordinator) else {
+        return Ok(TrackedTask::refused());
+    };
+    let tasks = coordinator.tasks();
     let permit = tasks.acquire();
     let slot = Arc::new(Slot::new());
     let handle = raw::spawn(Wrapped::new(
         future,
         Some(Arc::clone(ownership)),
-        Arc::clone(tasks),
+        Arc::clone(coordinator),
+        scheduled(schedule, false),
         Sink::Slot(Arc::clone(&slot)),
         Some(permit),
     ));
     tasks.register_abort(handle.abort_handle());
     Ok(TrackedTask {
         slot,
-        abort: handle.abort_handle(),
+        abort: Some(handle.abort_handle()),
     })
 }
 
 /// Starts the handler of one invocation as an operation task. Blessed in
 /// `ownership` before its first poll and polled by the same wrapper as
-/// `spawn_tracked`, with `tasks` as the current tracker. Not counted in
-/// `tasks` and not reached by `abort_all`: `drive_invocation` aborts it and
-/// awaits the returned `JoinHandle` before it aborts the other tasks.
+/// `spawn_tracked`, with `coordinator` as the current coordinator. Not
+/// counted in the tracker and not reached by `abort_all`:
+/// `drive_invocation` aborts it and awaits the returned `JoinHandle` before
+/// it aborts the other tasks. When the handler resolves or panics, its
+/// wrapper sets the phase to `Finished` before it releases its permit.
 pub(crate) fn spawn_root<F>(
     ownership: &Arc<TaskOwnership>,
-    tasks: &Arc<TaskTracker>,
+    coordinator: &Arc<InvocationCoordinator>,
     future: F,
 ) -> Result<(TrackedTask<F::Output>, tokio::task::JoinHandle<()>), NoRuntime>
 where
@@ -621,17 +899,22 @@ where
     F::Output: Send + 'static,
 {
     ensure_runtime()?;
+    // A coordinator that is no longer `Running` refuses the permit; the
+    // root then starts idle and is never polled.
+    let schedule = Schedule::queued(coordinator)
+        .unwrap_or_else(|| Schedule::with_state(coordinator, ScheduleState::Idle));
     let slot = Arc::new(Slot::new());
     let handle = raw::spawn(Wrapped::new(
         future,
         Some(Arc::clone(ownership)),
-        Arc::clone(tasks),
+        Arc::clone(coordinator),
+        scheduled(schedule, true),
         Sink::Slot(Arc::clone(&slot)),
         None,
     ));
     let task = TrackedTask {
         slot,
-        abort: handle.abort_handle(),
+        abort: Some(handle.abort_handle()),
     };
     Ok((task, handle))
 }
@@ -639,17 +922,22 @@ where
 /// Not aborted on drop or by `abort_all`, still counted. For the batch
 /// flusher and for detached checkpoint writes. Takes no ownership handle
 /// and never blesses its task, because this work never creates a durable
-/// operation.
-pub(crate) fn spawn_detached<F>(tasks: &Arc<TaskTracker>, future: F) -> Result<(), NoRuntime>
+/// operation. Takes no activity permit and is polled whatever the phase:
+/// the checkpoint permit of the write it carries keeps the invocation open.
+pub(crate) fn spawn_detached<F>(
+    coordinator: &Arc<InvocationCoordinator>,
+    future: F,
+) -> Result<(), NoRuntime>
 where
     F: Future<Output = ()> + Send + 'static,
 {
     ensure_runtime()?;
-    let permit = tasks.acquire();
+    let permit = coordinator.tasks().acquire();
     drop(raw::spawn(Wrapped::new(
         future,
         None,
-        Arc::clone(tasks),
+        Arc::clone(coordinator),
+        Gate::Detached,
         Sink::Discard,
         Some(permit),
     )));
@@ -709,7 +997,7 @@ pub(crate) async fn catch_panic<F: Future>(future: F) -> TaskOutcome<F::Output> 
 pub(crate) struct TrackedJoinSet<T> {
     outcomes: Arc<Mutex<JoinState<T>>>,
     tasks: JoinSet<()>,
-    tracker: Arc<TaskTracker>,
+    coordinator: Arc<InvocationCoordinator>,
     /// Tasks whose outcome has not been joined yet.
     pending: usize,
 }
@@ -723,46 +1011,57 @@ impl<T> std::fmt::Debug for TrackedJoinSet<T> {
 }
 
 impl<T: Send + 'static> TrackedJoinSet<T> {
-    /// Creates an empty set whose tasks are counted on `tasks`.
-    pub(crate) fn new(tasks: Arc<TaskTracker>) -> Self {
+    /// Creates an empty set whose tasks are counted on the coordinator's
+    /// tracker.
+    pub(crate) fn new(coordinator: Arc<InvocationCoordinator>) -> Self {
         Self {
             outcomes: Arc::new(Mutex::new(JoinState {
                 outcomes: VecDeque::new(),
                 waker: None,
             })),
             tasks: JoinSet::new(),
-            tracker: tasks,
+            coordinator,
             pending: 0,
         }
     }
 
-    /// Starts an operation task in the set.
+    /// Starts an operation task in the set, and returns its ID.
     ///
-    /// Blesses the task in `ownership` before the first poll of `future`.
+    /// Blesses the task in `ownership` before the first poll of `future`,
+    /// and takes an activity permit for it on the calling task. When the
+    /// phase is not `Running`, starts nothing, returns `None`, and the set
+    /// never yields another outcome.
     pub(crate) fn spawn<F>(
         &mut self,
         ownership: &Arc<TaskOwnership>,
         future: F,
-    ) -> Result<Id, NoRuntime>
+    ) -> Result<Option<Id>, NoRuntime>
     where
         F: Future<Output = T> + Send + 'static,
     {
         ensure_runtime()?;
-        let permit = self.tracker.acquire();
+        // A refused task still counts as pending, so the set never reports
+        // that every task was joined.
+        self.pending += 1;
+        let Some(schedule) = Schedule::queued(&self.coordinator) else {
+            return Ok(None);
+        };
+        let tracker = self.coordinator.tasks();
+        let permit = tracker.acquire();
         let abort = raw::join_set_spawn(
             &mut self.tasks,
             Wrapped::new(
                 future,
                 Some(Arc::clone(ownership)),
-                Arc::clone(&self.tracker),
+                Arc::clone(&self.coordinator),
+                scheduled(schedule, false),
                 Sink::Queue(Arc::clone(&self.outcomes)),
                 Some(permit),
             ),
         );
         let id = abort.id();
-        self.tracker.register_abort(abort);
-        self.pending += 1;
-        Ok(id)
+        tracker.register_abort(abort);
+        Ok(Some(id))
     }
 
     /// Returns the outcome of the next task to finish, or `None` when every
@@ -789,19 +1088,33 @@ impl<T: Send + 'static> TrackedJoinSet<T> {
     }
 }
 
-/// Runs `f` on the blocking pool, counted on the tracker of the current
-/// invocation (the `CURRENT_TASKS` task-local). Without one, the work is not
-/// counted. Takes no ownership handle and never blesses, because blocking
-/// serdes work never creates a durable operation.
+/// Runs `f` on the blocking pool.
+///
+/// With a current coordinator (the `CURRENT_COORDINATOR` task-local), the
+/// work holds an activity permit and a count on the coordinator's tracker
+/// from before the spawn until after it handed its outcome over. So the
+/// invocation does not suspend while the work runs, and the consumer's
+/// wake takes the consumer's permit before the work's permit is released.
+/// When the coordinator refuses the permit, nothing runs and the future
+/// never resolves. Without a current coordinator the work is not counted.
+///
+/// Takes no ownership handle and never blesses, because blocking serdes
+/// work never creates a durable operation.
 pub(crate) async fn run_blocking<F, R>(f: F) -> Result<TaskOutcome<R>, NoRuntime>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
     ensure_runtime()?;
-    let permit = CURRENT_TASKS
-        .try_with(TaskTracker::acquire)
-        .unwrap_or(TaskPermit { tasks: None });
+    let permits = match CURRENT_COORDINATOR.try_with(Arc::clone) {
+        Ok(coordinator) => {
+            let Some(activity) = coordinator.acquire(PermitKind::Activity) else {
+                return std::future::pending().await;
+            };
+            Some((activity, coordinator.tasks().acquire()))
+        }
+        Err(_) => None,
+    };
     let slot = Arc::new(Slot::new());
     let task_slot = Arc::clone(&slot);
     raw::spawn_blocking(move || {
@@ -812,7 +1125,7 @@ where
             Err(payload) => TaskOutcome::Panicked(payload),
         };
         task_slot.deliver(outcome);
-        drop(permit);
+        drop(permits);
     });
     Ok(SlotWait(slot).await)
 }
@@ -822,14 +1135,111 @@ pub(crate) mod test_support {
     //! Helpers for tests in other modules.
 
     use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll, Waker};
 
-    use super::{CURRENT_TASKS, TaskTracker};
+    use super::{CURRENT_COORDINATOR, ScheduleState as Inner, Slot, TaskOutcome};
+    use crate::coordinator::{InvocationCoordinator, Permit};
 
-    /// Calls `f` with `tasks` as the current tracker.
-    pub(crate) fn with_current_tasks<R>(tasks: &Arc<TaskTracker>, f: impl FnOnce() -> R) -> R {
-        CURRENT_TASKS.sync_scope(Arc::clone(tasks), f)
+    /// Calls `f` with `coordinator` as the current coordinator.
+    pub(crate) fn with_current_coordinator<R>(
+        coordinator: &Arc<InvocationCoordinator>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        CURRENT_COORDINATOR.sync_scope(Arc::clone(coordinator), f)
+    }
+
+    /// The observable state of a [`Schedule`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ScheduleState {
+        Idle,
+        Queued,
+        Polling,
+        Done,
+    }
+
+    /// A permit-aware schedule driven by hand, as the gateway wrapper
+    /// drives it. Dropping it closes the schedule.
+    pub(crate) struct Schedule(Arc<super::Schedule>);
+
+    impl Schedule {
+        /// A schedule in `Idle`.
+        pub(crate) fn idle(coordinator: &Arc<InvocationCoordinator>) -> Self {
+            Self(super::Schedule::with_state(coordinator, Inner::Idle))
+        }
+
+        pub(crate) fn waker(&self) -> Waker {
+            self.0.waker()
+        }
+
+        pub(crate) fn state(&self) -> ScheduleState {
+            match &*self.0.lock() {
+                Inner::Idle => ScheduleState::Idle,
+                Inner::Queued(_) => ScheduleState::Queued,
+                Inner::Polling { .. } => ScheduleState::Polling,
+                Inner::Done => ScheduleState::Done,
+            }
+        }
+
+        pub(crate) fn begin_poll(&self) -> bool {
+            self.0.begin_poll()
+        }
+
+        pub(crate) fn end_pending(&self, requeue: bool) {
+            self.0.end_pending(requeue);
+        }
+
+        pub(crate) fn end_ready(&self) -> Option<Permit> {
+            self.0.end_ready()
+        }
+
+        /// Polls `future` once as the gateway wrapper does: under the
+        /// schedule's permit and waker, with the schedule's coordinator as
+        /// the current coordinator. A `Ready` poll releases the permit.
+        pub(crate) fn poll<F: Future>(&self, future: Pin<&mut F>) -> Poll<F::Output> {
+            if !self.0.begin_poll() {
+                return Poll::Pending;
+            }
+            let waker = self.0.waker();
+            let mut cx = Context::from_waker(&waker);
+            let coordinator = Arc::clone(&self.0.coordinator);
+            let polled = CURRENT_COORDINATOR.sync_scope(coordinator, || future.poll(&mut cx));
+            match polled {
+                Poll::Pending => {
+                    self.0.end_pending(false);
+                    Poll::Pending
+                }
+                Poll::Ready(value) => {
+                    drop(self.0.end_ready());
+                    Poll::Ready(value)
+                }
+            }
+        }
+    }
+
+    impl Drop for Schedule {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+
+    /// An outcome slot whose consumer registered `waker`.
+    pub(crate) struct TestSlot<T>(Arc<Slot<T>>);
+
+    impl<T> TestSlot<T> {
+        /// Stores `value` as the outcome and wakes the consumer.
+        pub(crate) fn deliver_value(&self, value: T) {
+            self.0.deliver(TaskOutcome::Value(value));
+        }
+    }
+
+    /// A slot whose consumer is `waker`.
+    pub(crate) fn slot_with_waker<T>(waker: &Waker) -> TestSlot<T> {
+        let slot = Arc::new(Slot::new());
+        let cx = Context::from_waker(waker);
+        assert!(slot.poll_take(&cx).is_pending());
+        TestSlot(slot)
     }
 
     /// Builds a future with `make` on a new thread with no Tokio runtime,
@@ -870,15 +1280,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
 
-    use super::test_support::{poll_once_without_runtime, str_payload, with_current_tasks};
+    use super::test_support::{poll_once_without_runtime, str_payload, with_current_coordinator};
     use super::{
-        NoRuntime, TaskOutcome, TaskTracker, TrackedJoinSet, catch_panic, run_blocking,
-        spawn_detached, spawn_tracked,
+        NoRuntime, TaskOutcome, TrackedJoinSet, catch_panic, run_blocking, spawn_detached,
+        spawn_root, spawn_tracked,
     };
+    use crate::coordinator::{InvocationCoordinator, PermitKind, Phase};
     use crate::driver::TaskOwnership;
 
-    fn tracker() -> Arc<TaskTracker> {
-        Arc::new(TaskTracker::new())
+    fn coordinator() -> Arc<InvocationCoordinator> {
+        InvocationCoordinator::new()
     }
 
     /// Ownership tracking anchored to the test's root future, which has no
@@ -969,8 +1380,9 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_task_returns_value_with_permit() {
-        let tasks = tracker();
-        let task = spawn_tracked(&tasks, &ownership(), async { 7 }).expect("runtime");
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
+        let task = spawn_tracked(&coord, &ownership(), async { 7 }).expect("runtime");
         let outcome = task.await;
         assert_eq!(tasks.live(), 0, "the task released its permit on exit");
         assert!(matches!(outcome, TaskOutcome::Value(7)));
@@ -978,8 +1390,8 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_task_catches_panic() {
-        let tasks = tracker();
-        let task = spawn_tracked(&tasks, &ownership(), async {
+        let coord = coordinator();
+        let task = spawn_tracked(&coord, &ownership(), async {
             panic!("boom");
         })
         .expect("runtime");
@@ -989,10 +1401,11 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_tracked_task_counts_until_unwound() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         let dropped = Arc::new(AtomicBool::new(false));
         let guard = DropFlag(Arc::clone(&dropped));
-        let task = spawn_tracked(&tasks, &ownership(), async move {
+        let task = spawn_tracked(&coord, &ownership(), async move {
             let _guard = guard;
             std::future::pending::<()>().await;
         })
@@ -1011,13 +1424,14 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_work_counts_until_closure_returns() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let work_barrier = Arc::clone(&barrier);
         let mut work = Box::pin(run_blocking(move || {
             work_barrier.wait();
         }));
-        let polled = with_current_tasks(&tasks, || {
+        let polled = with_current_coordinator(&coord, || {
             work.as_mut().poll(&mut Context::from_waker(Waker::noop()))
         });
         assert!(polled.is_pending());
@@ -1036,9 +1450,10 @@ mod tests {
 
     #[tokio::test]
     async fn detached_task_counts_until_done() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        spawn_detached(&tasks, async move {
+        spawn_detached(&coord, async move {
             let _ = rx.await;
         })
         .expect("runtime");
@@ -1050,19 +1465,20 @@ mod tests {
 
     #[tokio::test]
     async fn abort_all_aborts_tracked_tasks_only() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         let own = ownership();
         let tracked_dropped = Arc::new(AtomicBool::new(false));
         let joined_dropped = Arc::new(AtomicBool::new(false));
         let detached_done = Arc::new(AtomicBool::new(false));
 
         let guard = DropFlag(Arc::clone(&tracked_dropped));
-        let _task = spawn_tracked(&tasks, &own, async move {
+        let _task = spawn_tracked(&coord, &own, async move {
             let _guard = guard;
             std::future::pending::<()>().await;
         })
         .expect("runtime");
-        let mut set = TrackedJoinSet::new(Arc::clone(&tasks));
+        let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         let guard = DropFlag(Arc::clone(&joined_dropped));
         set.spawn(&own, async move {
             let _guard = guard;
@@ -1071,7 +1487,7 @@ mod tests {
         .expect("runtime");
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let done = Arc::clone(&detached_done);
-        spawn_detached(&tasks, async move {
+        spawn_detached(&coord, async move {
             let _ = rx.await;
             done.store(true, Ordering::SeqCst);
         })
@@ -1095,22 +1511,23 @@ mod tests {
     /// tracker accepts tasks again.
     #[tokio::test]
     async fn abort_all_aborts_late_registrations() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         let own = ownership();
         // A live task, as during teardown: the parent of the late tasks.
-        let parent = spawn_tracked(&tasks, &own, std::future::pending::<()>()).expect("runtime");
+        let parent = spawn_tracked(&coord, &own, std::future::pending::<()>()).expect("runtime");
         tokio::task::yield_now().await;
         tasks.abort_all();
 
         let tracked_dropped = Arc::new(AtomicBool::new(false));
         let guard = DropFlag(Arc::clone(&tracked_dropped));
-        let late_task = spawn_tracked(&tasks, &own, async move {
+        let late_task = spawn_tracked(&coord, &own, async move {
             let _guard = guard;
             std::future::pending::<()>().await;
         })
         .expect("runtime");
         let joined_dropped = Arc::new(AtomicBool::new(false));
-        let mut set = TrackedJoinSet::new(Arc::clone(&tasks));
+        let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         let guard = DropFlag(Arc::clone(&joined_dropped));
         set.spawn(&own, async move {
             let _guard = guard;
@@ -1128,7 +1545,7 @@ mod tests {
         // The handles are still held, so only `abort_all` aborted the tasks.
         drop((parent, late_task, set));
 
-        let task = spawn_tracked(&tasks, &own, async { 7 }).expect("runtime");
+        let task = spawn_tracked(&coord, &own, async { 7 }).expect("runtime");
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .expect("an idle tracker no longer aborts new tasks");
@@ -1139,9 +1556,10 @@ mod tests {
     /// of a teardown can register afterwards, so new tasks are not aborted.
     #[tokio::test]
     async fn abort_all_on_idle_tracker_keeps_it_usable() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         tasks.abort_all();
-        let task = spawn_tracked(&tasks, &ownership(), async { 7 }).expect("runtime");
+        let task = spawn_tracked(&coord, &ownership(), async { 7 }).expect("runtime");
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .expect("the task was not aborted");
@@ -1156,18 +1574,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn abort_all_races_nested_spawns() {
         for _ in 0..50 {
-            let tasks = tracker();
+            let coord = coordinator();
+            let tasks = Arc::clone(coord.tasks());
             let own = ownership();
             let escaped = Arc::new(Mutex::new(Vec::new()));
             let started = Arc::new(tokio::sync::Notify::new());
             let spawner = {
-                let tasks = Arc::clone(&tasks);
+                let coord = Arc::clone(&coord);
                 let own = Arc::clone(&own);
                 let escaped = Arc::clone(&escaped);
                 let started = Arc::clone(&started);
-                spawn_tracked(&tasks.clone(), &own.clone(), async move {
+                spawn_tracked(&coord.clone(), &own.clone(), async move {
                     loop {
-                        let nested = spawn_tracked(&tasks, &own, std::future::pending::<()>())
+                        let nested = spawn_tracked(&coord, &own, std::future::pending::<()>())
                             .expect("runtime");
                         escaped.lock().expect("lock").push(nested);
                         started.notify_one();
@@ -1189,15 +1608,16 @@ mod tests {
 
     #[test]
     fn spawn_without_runtime_returns_no_runtime() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         let ran = Arc::new(AtomicBool::new(false));
-        let thread_tasks = Arc::clone(&tasks);
+        let thread_coord = Arc::clone(&coord);
         let thread_ran = Arc::clone(&ran);
         let polled = poll_once_without_runtime(move || {
             let own = ownership();
-            let tracked = spawn_tracked(&thread_tasks, &own, async {}).map(drop);
-            let detached = spawn_detached(&thread_tasks, async {});
-            let mut set = TrackedJoinSet::<()>::new(Arc::clone(&thread_tasks));
+            let tracked = spawn_tracked(&thread_coord, &own, async {}).map(drop);
+            let detached = spawn_detached(&thread_coord, async {});
+            let mut set = TrackedJoinSet::<()>::new(Arc::clone(&thread_coord));
             let joined = set.spawn(&own, async {}).map(drop);
             let blocking = run_blocking(move || thread_ran.store(true, Ordering::SeqCst));
             async move {
@@ -1223,12 +1643,12 @@ mod tests {
 
     #[tokio::test]
     async fn operation_tasks_are_blessed_before_first_poll() {
-        let tasks = tracker();
+        let coord = coordinator();
         let own = ownership();
         let task_own = Arc::clone(&own);
-        let tracked = spawn_tracked(&tasks, &own, async move { task_own.check_current_task() })
+        let tracked = spawn_tracked(&coord, &own, async move { task_own.check_current_task() })
             .expect("runtime");
-        let mut set = TrackedJoinSet::new(Arc::clone(&tasks));
+        let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         let set_own = Arc::clone(&own);
         set.spawn(&own, async move { set_own.check_current_task() })
             .expect("runtime");
@@ -1240,11 +1660,11 @@ mod tests {
 
     #[tokio::test]
     async fn detached_task_is_not_blessed() {
-        let tasks = tracker();
+        let coord = coordinator();
         let own = ownership();
         let task_own = Arc::clone(&own);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        spawn_detached(&tasks, async move {
+        spawn_detached(&coord, async move {
             let _ = tx.send(task_own.check_current_task());
         })
         .expect("runtime");
@@ -1255,9 +1675,9 @@ mod tests {
 
     #[tokio::test]
     async fn finished_operation_task_is_unblessed_before_it_exits() {
-        let tasks = tracker();
+        let coord = coordinator();
         let own = ownership();
-        let mut set = TrackedJoinSet::new(Arc::clone(&tasks));
+        let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         for _ in 0..100 {
             let task_own = Arc::clone(&own);
             set.spawn(&own, async move { task_own.check_current_task() })
@@ -1274,10 +1694,11 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_operation_task_is_unblessed() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         let own = ownership();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let task = spawn_tracked(&tasks, &own, async move {
+        let task = spawn_tracked(&coord, &own, async move {
             let _ = tx.send(());
             std::future::pending::<()>().await;
         })
@@ -1291,8 +1712,9 @@ mod tests {
 
     #[tokio::test]
     async fn finished_task_with_escaped_handle_does_not_block_idle() {
-        let tasks = tracker();
-        let task = spawn_tracked(&tasks, &ownership(), async { 1 }).expect("runtime");
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
+        let task = spawn_tracked(&coord, &ownership(), async { 1 }).expect("runtime");
         let held = Arc::new(Mutex::new(Some(task)));
         for _ in 0..100 {
             if tasks.live() == 0 {
@@ -1309,11 +1731,12 @@ mod tests {
 
     #[tokio::test]
     async fn ready_then_drop_panic_is_the_outcome() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         let own = ownership();
-        let task = spawn_tracked(&tasks, &own, ReadyThenDropPanics).expect("runtime");
+        let task = spawn_tracked(&coord, &own, ReadyThenDropPanics).expect("runtime");
         assert_eq!(panicked_with(task.await), Some("drop boom"));
-        let mut set = TrackedJoinSet::new(Arc::clone(&tasks));
+        let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         set.spawn(&own, ReadyThenDropPanics).expect("runtime");
         let (_, joined) = set.join_next_with_id().await.expect("one task");
         assert_eq!(panicked_with(joined), Some("drop boom"));
@@ -1352,8 +1775,9 @@ mod tests {
     /// dropped, and a panic while dropping it is discarded.
     #[tokio::test]
     async fn value_drop_panic_after_drop_panic_is_discarded() {
-        let tasks = tracker();
-        let task = spawn_tracked(&tasks, &ownership(), ReadyValueThenDropPanics).expect("runtime");
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
+        let task = spawn_tracked(&coord, &ownership(), ReadyValueThenDropPanics).expect("runtime");
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .expect("the outcome is delivered");
@@ -1365,10 +1789,11 @@ mod tests {
     /// The tracker clears its abort handles once no task is live.
     #[tokio::test]
     async fn idle_tracker_clears_abort_handles() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         let own = ownership();
-        let task = spawn_tracked(&tasks, &own, async {}).expect("runtime");
-        let mut set = TrackedJoinSet::new(Arc::clone(&tasks));
+        let task = spawn_tracked(&coord, &own, async {}).expect("runtime");
+        let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         set.spawn(&own, async {}).expect("runtime");
         assert_eq!(tasks.abortable_count(), 2);
         let _ = task.await;
@@ -1379,11 +1804,11 @@ mod tests {
 
     #[tokio::test]
     async fn poll_panic_wins_over_drop_panic() {
-        let tasks = tracker();
+        let coord = coordinator();
         let own = ownership();
-        let task = spawn_tracked(&tasks, &own, PollPanicsThenDropPanics).expect("runtime");
+        let task = spawn_tracked(&coord, &own, PollPanicsThenDropPanics).expect("runtime");
         assert_eq!(panicked_with(task.await), Some("poll boom"));
-        let mut set = TrackedJoinSet::new(Arc::clone(&tasks));
+        let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         set.spawn(&own, PollPanicsThenDropPanics).expect("runtime");
         let (_, joined) = set.join_next_with_id().await.expect("one task");
         assert_eq!(panicked_with(joined), Some("poll boom"));
@@ -1403,11 +1828,12 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_task_drop_panic_releases_permit() {
-        let tasks = tracker();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
         let own = ownership();
         let waker_slot = Arc::new(Mutex::new(None));
         let task = spawn_tracked(
-            &tasks,
+            &coord,
             &own,
             StoresWakerThenDropPanics(Arc::clone(&waker_slot)),
         )
@@ -1428,6 +1854,17 @@ mod tests {
         tasks.wait_idle().await;
         assert_eq!(tasks.live(), 0);
         assert_eq!(own.blessed_count(), 0);
+        assert_eq!(
+            coord.permits(PermitKind::Activity),
+            0,
+            "the aborted task released its activity permit while its waker is held"
+        );
+        waker.wake_by_ref();
+        assert_eq!(
+            coord.permits(PermitKind::Activity),
+            0,
+            "a wake after the task ended takes no permit"
+        );
         drop(waker);
     }
 
@@ -1507,5 +1944,199 @@ mod tests {
             panic!("expected the value");
         };
         assert_eq!(value, 7);
+    }
+
+    /// Waits, polling the condition, until it holds or 5 s passed.
+    fn spin_until(what: &str, condition: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !condition() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_work_wakes_consumer_before_release() {
+        use crate::task::test_support::{Schedule, ScheduleState};
+
+        let coord = coordinator();
+        let _wait = coord.register_wait("op", Waker::noop()).expect("running");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let consumer = Schedule::idle(&coord);
+        let mut work = Box::pin(run_blocking(move || {
+            release_rx.recv().expect("the test releases the closure");
+        }));
+        assert!(consumer.poll(work.as_mut()).is_pending());
+        assert_eq!(consumer.state(), ScheduleState::Idle);
+        assert_eq!(
+            coord.permits(PermitKind::Activity),
+            1,
+            "the blocking work holds a permit while it waits"
+        );
+        assert_eq!(coord.phase(), Phase::Running);
+
+        release_tx.send(()).expect("the closure waits");
+        let tasks = Arc::clone(coord.tasks());
+        spin_until("the blocking work to exit", || tasks.live() == 0);
+        assert_eq!(consumer.state(), ScheduleState::Queued);
+        assert_eq!(
+            coord.permits(PermitKind::Activity),
+            1,
+            "the consumer holds its own permit before the work released its own"
+        );
+        assert_eq!(coord.phase(), Phase::Running);
+
+        let polled = consumer.poll(work.as_mut());
+        assert!(matches!(polled, Poll::Ready(Ok(TaskOutcome::Value(())))));
+        assert_eq!(coord.phase(), Phase::Suspending);
+    }
+
+    #[tokio::test]
+    async fn spawn_after_suspension_spawns_nothing() {
+        let coord = coordinator();
+        let _wait = coord.register_wait("op", Waker::noop()).expect("running");
+        drop(coord.acquire(PermitKind::Activity));
+        assert_eq!(coord.phase(), Phase::Suspending);
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let task_ran = Arc::clone(&ran);
+        let mut task = spawn_tracked(&coord, &ownership(), async move {
+            task_ran.store(true, Ordering::SeqCst);
+        })
+        .expect("runtime");
+        let polled = Pin::new(&mut task).poll(&mut Context::from_waker(Waker::noop()));
+        assert!(polled.is_pending());
+        tokio::task::yield_now().await;
+        assert!(!ran.load(Ordering::SeqCst), "nothing was started");
+        assert_eq!(coord.tasks().live(), 0);
+
+        let mut set = TrackedJoinSet::<()>::new(Arc::clone(&coord));
+        let id = set.spawn(&ownership(), async {}).expect("runtime");
+        assert!(id.is_none(), "the join set started nothing");
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            set.join_next_with_id(),
+        )
+        .await;
+        assert!(joined.is_err(), "a refused join set never yields");
+        assert_eq!(coord.tasks().live(), 0);
+    }
+
+    #[tokio::test]
+    async fn blocking_work_after_suspension_never_runs() {
+        let coord = coordinator();
+        let _wait = coord.register_wait("op", Waker::noop()).expect("running");
+        drop(coord.acquire(PermitKind::Activity));
+        let ran = Arc::new(AtomicBool::new(false));
+        let work_ran = Arc::clone(&ran);
+        let mut work = Box::pin(run_blocking(move || work_ran.store(true, Ordering::SeqCst)));
+        let polled = with_current_coordinator(&coord, || {
+            work.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        });
+        assert!(polled.is_pending());
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(coord.tasks().live(), 0);
+    }
+
+    /// A task that is woken while it is not polled holds a permit until
+    /// its next poll ends.
+    #[tokio::test]
+    async fn woken_task_counts_until_polled() {
+        let coord = coordinator();
+        let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+        let task = spawn_tracked(&coord, &ownership(), async move { rx.await.unwrap_or(0) })
+            .expect("runtime");
+        assert_eq!(
+            coord.permits(PermitKind::Activity),
+            1,
+            "a spawned task counts before its first poll"
+        );
+        let tasks = Arc::clone(coord.tasks());
+        for _ in 0..100 {
+            if coord.permits(PermitKind::Activity) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            coord.permits(PermitKind::Activity),
+            0,
+            "an idle task holds nothing"
+        );
+        tx.send(5).expect("the task waits");
+        assert_eq!(
+            coord.permits(PermitKind::Activity),
+            1,
+            "the wake took a permit for the next poll"
+        );
+        assert!(matches!(task.await, TaskOutcome::Value(5)));
+        tasks.wait_idle().await;
+        assert_eq!(coord.permits(PermitKind::Activity), 0);
+    }
+
+    /// The root wrapper sets `Finished` before it releases its permit, so
+    /// an unwinding registration cannot turn the release into a
+    /// suspension.
+    #[tokio::test]
+    async fn root_sets_finished_before_release() {
+        let coord = coordinator();
+        let _wait = coord.register_wait("op", Waker::noop()).expect("running");
+        let (root, join) = spawn_root(&ownership(), &coord, async { 3 }).expect("runtime");
+        assert!(matches!(root.await, TaskOutcome::Value(3)));
+        drop(join.await);
+        assert_eq!(coord.phase(), Phase::Finished);
+    }
+
+    /// A detached task is polled after the phase left `Running`.
+    #[tokio::test]
+    async fn detached_task_ignores_the_phase() {
+        let coord = coordinator();
+        coord.finish();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        spawn_detached(&coord, async move {
+            let _ = tx.send(());
+        })
+        .expect("runtime");
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the detached task ran")
+            .expect("the detached task sent");
+    }
+
+    /// After the phase left `Running`, an idle schedule cannot start a poll
+    /// and a wake takes no permit.
+    #[test]
+    fn idle_schedule_takes_nothing_after_suspension() {
+        use crate::task::test_support::{Schedule, ScheduleState};
+
+        let coord = coordinator();
+        let schedule = Schedule::idle(&coord);
+        coord.finish();
+        assert!(!schedule.begin_poll(), "no permit after the phase ended");
+        assert_eq!(schedule.state(), ScheduleState::Idle);
+        schedule.waker().wake_by_ref();
+        assert_eq!(schedule.state(), ScheduleState::Idle);
+        assert_eq!(coord.permits(PermitKind::Activity), 0);
+    }
+
+    /// A root spawned after the phase ended is never polled.
+    #[tokio::test]
+    async fn root_after_finish_is_never_polled() {
+        let coord = coordinator();
+        coord.finish();
+        let ran = Arc::new(AtomicBool::new(false));
+        let root_ran = Arc::clone(&ran);
+        let (root, join) = spawn_root(&ownership(), &coord, async move {
+            root_ran.store(true, Ordering::SeqCst);
+        })
+        .expect("runtime");
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(100), root).await;
+        assert!(waited.is_err(), "the root never resolves");
+        assert!(!ran.load(Ordering::SeqCst));
+        join.abort();
+        let _ = join.await;
     }
 }

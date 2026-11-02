@@ -52,7 +52,6 @@ where
     S: Serdes<O>,
 {
     /// Executes the create-callback operation: replay or live path.
-    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<Callback<O>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -82,85 +81,24 @@ where
                 .ok_or_else(|| missing_callback_id_error(&wire_id, view.status.wire_str()))?;
             // Terminal statuses replay the recorded outcome without waiting
             // on the external system again (see `crate::observability`).
-            let emit_replayed = || {
-                self.ctx.emit_operation_replayed(
-                    &wire_id,
-                    self.name.as_deref(),
-                    "Callback",
-                    Some(CALLBACK_SUB_TYPE),
-                    view.attempt,
-                );
-            };
-            match view.status {
-                CheckpointStatus::Succeeded => {
-                    // Callback completed successfully during a previous
-                    // invocation: return settled Callback with the result.
-                    // The payload was written by an external caller, so only
-                    // the deserialize side of the serdes acts on it. Decode
-                    // FIRST, then emit `operation_replayed`: a corrupt
-                    // payload or failing serdes surfaces as an error without
-                    // claiming a recorded outcome was returned.
-                    let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    let result_str = payload.unwrap_or_else(|| "null".to_owned());
-                    let serdes_ctx =
-                        SerdesContext::new(self.op_id.wire(), self.ctx.execution_arn());
-                    let value: O = deserialize_callback_result(
-                        &self.ctx,
-                        self.name.as_deref(),
-                        &self.serdes,
-                        result_str,
-                        serdes_ctx,
-                    )
-                    .await?;
-                    emit_replayed();
-                    return Ok(Callback::new_settled(callback_id, Ok(value)));
-                }
-                CheckpointStatus::Failed => {
-                    // Callback failed externally.
-                    emit_replayed();
-                    let wire = self
-                        .ctx
-                        .checkpoint_wire_error(&positional_id)
-                        .unwrap_or_default();
-                    let err =
-                        replayed_callback_error(wire, self.op_id.wire(), view.status.wire_str());
-                    return Ok(Callback::new_settled(callback_id, Err(err)));
-                }
-                CheckpointStatus::TimedOut => {
-                    // Callback timed out. The wire record, when the
-                    // backend attached one, still travels on the error. A
-                    // missed heartbeat also ends in `TimedOut`; its record
-                    // carries the `Callback.Heartbeat` type.
-                    emit_replayed();
-                    let wire = self
-                        .ctx
-                        .checkpoint_wire_error(&positional_id)
-                        .unwrap_or_default();
-                    let kind = if wire.error_type() == Some("Callback.Heartbeat") {
-                        CallbackErrorKind::HeartbeatTimedOut
-                    } else {
-                        CallbackErrorKind::TimedOut
-                    };
-                    let err = OperationError::from_kind(OperationErrorKind::Callback(
-                        CallbackError::new(kind, None),
-                    ))
-                    .with_operation(self.op_id.wire(), view.status.wire_str())
-                    .with_wire(wire);
-                    return Ok(Callback::new_settled(callback_id, Err(err)));
-                }
-                CheckpointStatus::Started | CheckpointStatus::Pending => {
-                    // Callback is in flight: return pending (will suspend on
-                    // .result()).
-                    return Ok(Callback::new_pending(callback_id, self.ctx.clone()));
-                }
-                _ => {
-                    // Unexpected status: treat as internal error.
-                    return Err(callback_internal_error(&format!(
-                        "unexpected checkpointed status: {:?}",
-                        view.status
-                    )));
-                }
+            if matches!(
+                view.status,
+                CheckpointStatus::Started | CheckpointStatus::Pending
+            ) {
+                // Callback is in flight: return pending (`result()` waits
+                // for the record).
+                return Ok(self.into_pending(callback_id));
             }
+            let outcome = callback_outcome(
+                &self.ctx,
+                &positional_id,
+                self.name.as_deref(),
+                &self.serdes,
+                &view,
+                true,
+            )
+            .await?;
+            return Ok(Callback::new_settled(callback_id, outcome));
         }
 
         // 3. First invocation: checkpoint START with callback options.
@@ -213,8 +151,128 @@ where
                 missing_callback_id_error(&wire_id, CheckpointStatus::Started.wire_str())
             })?;
 
-        // Return pending: Result() will fire suspend.
-        Ok(Callback::new_pending(callback_id, self.ctx.clone()))
+        // Return pending: `result()` waits for the record.
+        Ok(self.into_pending(callback_id))
+    }
+
+    /// A pending callback whose `result()` waits for the record to settle,
+    /// then builds the outcome from it as the create-time replay does.
+    fn into_pending(self, callback_id: String) -> Callback<O> {
+        let Self {
+            ctx,
+            op_id,
+            name,
+            serdes,
+            ..
+        } = self;
+        let wire_id = op_id.wire().to_owned();
+        let positional_id = op_id.positional().to_owned();
+        let resolver_ctx = ctx.clone();
+        let resolver: crate::future::CallbackResolver<O> = Box::new(move || {
+            Box::pin(async move {
+                #[expect(clippy::expect_used)]
+                // reason: `result()` calls the resolver only after the record
+                // left STARTED and PENDING, and the checkpoint log never
+                // removes a record during an invocation.
+                let view = resolver_ctx
+                    .checkpoint_status_view(&positional_id)
+                    .expect("a settled callback record is still in the log");
+                callback_outcome(
+                    &resolver_ctx,
+                    &positional_id,
+                    name.as_deref(),
+                    &serdes,
+                    &view,
+                    false,
+                )
+                .await
+                .and_then(|outcome| outcome)
+            })
+        });
+        Callback::new_pending(callback_id, ctx, wire_id, resolver)
+    }
+}
+
+/// The outcome a settled callback record holds: the create-time replay
+/// (`emit_replayed` true) and the result of a pending callback whose record
+/// settled during the invocation (`emit_replayed` false).
+///
+/// The outer error fails the operation that reads the record (a payload
+/// the serdes cannot decode, an unexpected status); the inner result is the
+/// callback's own outcome.
+async fn callback_outcome<O, S: Serdes<O>>(
+    ctx: &DurableContext,
+    positional_id: &str,
+    name: Option<&str>,
+    serdes: &S,
+    view: &crate::engine::CheckpointStatusView,
+    emit_replayed: bool,
+) -> Result<Result<O, OperationError>, OperationError>
+where
+    O: Send + 'static,
+{
+    let wire_id = crate::engine::compute_wire_id_public(positional_id);
+    let emit = || {
+        if emit_replayed {
+            ctx.emit_operation_replayed(
+                &wire_id,
+                name,
+                "Callback",
+                Some(CALLBACK_SUB_TYPE),
+                view.attempt,
+            );
+        }
+    };
+    match view.status {
+        CheckpointStatus::Succeeded => {
+            // Callback completed successfully. The payload was written by an
+            // external caller, so only the deserialize side of the serdes
+            // acts on it. Decode FIRST, then emit `operation_replayed`: a
+            // corrupt payload or failing serdes surfaces as an error without
+            // claiming a recorded outcome was returned.
+            let payload = ctx.checkpoint_result_payload(positional_id);
+            let result_str = payload.unwrap_or_else(|| "null".to_owned());
+            let serdes_ctx = SerdesContext::new(&wire_id, ctx.execution_arn());
+            let value: O =
+                deserialize_callback_result(ctx, name, serdes, result_str, serdes_ctx).await?;
+            emit();
+            Ok(Ok(value))
+        }
+        CheckpointStatus::Failed => {
+            // Callback failed externally.
+            emit();
+            let wire = ctx.checkpoint_wire_error(positional_id).unwrap_or_default();
+            Ok(Err(replayed_callback_error(
+                wire,
+                &wire_id,
+                view.status.wire_str(),
+            )))
+        }
+        CheckpointStatus::TimedOut => {
+            // Callback timed out. The wire record, when the backend attached
+            // one, still travels on the error. A missed heartbeat also ends
+            // in `TimedOut`; its record carries the `Callback.Heartbeat`
+            // type.
+            emit();
+            let wire = ctx.checkpoint_wire_error(positional_id).unwrap_or_default();
+            let kind = if wire.error_type() == Some("Callback.Heartbeat") {
+                CallbackErrorKind::HeartbeatTimedOut
+            } else {
+                CallbackErrorKind::TimedOut
+            };
+            Ok(Err(OperationError::from_kind(
+                OperationErrorKind::Callback(CallbackError::new(kind, None)),
+            )
+            .with_operation(&wire_id, view.status.wire_str())
+            .with_wire(wire)))
+        }
+        _ => {
+            // Unexpected status: treat as internal error.
+            Err(callback_internal_error(&format!(
+                "unexpected checkpointed status: {:?}",
+                view.status
+            )))
+        }
     }
 }
 
@@ -783,8 +841,8 @@ pub(crate) async fn deserialize_callback_result<O, S: Serdes<O>>(
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
     let operation_id = serdes_ctx.operation_id().to_owned();
-    match serdes
-        .deserialize(payload, serdes_ctx.with_origin(PayloadOrigin::External))
+    match ctx
+        .hold_activity(serdes.deserialize(payload, serdes_ctx.with_origin(PayloadOrigin::External)))
         .await
     {
         Ok(value) => Ok(value),
@@ -1392,7 +1450,7 @@ mod tests {
         // The submitter step fails; the default retry strategy schedules a
         // retry (backend-owned timer), which suspends the invocation instead
         // of surfacing a fabricated error to the caller.
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -1511,7 +1569,7 @@ mod tests {
         // submitter ran and checkpoints were produced.
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
-            Arc::clone(ctx.suspension_signal()),
+            Arc::clone(ctx.coordinator()),
             exec.execute(),
         )
         .await;
@@ -1652,7 +1710,7 @@ mod tests {
         // is pending. But the submitter must NOT have been re-invoked.
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
-            Arc::clone(ctx.suspension_signal()),
+            Arc::clone(ctx.coordinator()),
             exec.execute(),
         )
         .await;
@@ -1696,7 +1754,7 @@ mod tests {
         // The submitter step fails; the default retry strategy schedules a
         // retry (backend-owned timer), which suspends the invocation instead
         // of surfacing a fabricated error to the caller.
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -1810,7 +1868,7 @@ mod tests {
         // Execute: will suspend at callback result, but submitter runs.
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
-            Arc::clone(ctx.suspension_signal()),
+            Arc::clone(ctx.coordinator()),
             exec.execute(),
         )
         .await;
@@ -2086,5 +2144,161 @@ mod tests {
             .await
             .expect("wfcb should decode via threaded serdes");
         assert_eq!(result, "wfcb");
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{
+        ScriptedClient, drive_handler, named, operation_like, scripted_ctx, wire_err,
+    };
+    use aws_sdk_lambda::types::{
+        CallbackDetails, ErrorObject, Operation, OperationAction, OperationStatus, OperationType,
+        OperationUpdate,
+    };
+    use std::sync::Arc;
+
+    /// The record a callback START gets: `STARTED` with its callback ID.
+    fn started(start: &OperationUpdate) -> Operation {
+        operation_like(start, OperationStatus::Started)
+            .callback_details(CallbackDetails::builder().callback_id("cb-1").build())
+            .build()
+            .expect("all required fields set")
+    }
+
+    /// A client that answers the callback START with its ID, and carries
+    /// `completed` for the callback on the call that carries step `s`'s
+    /// SUCCEED.
+    fn client_completing(
+        completed: impl Fn(&OperationUpdate) -> Operation + Send + Sync + 'static,
+    ) -> ScriptedClient {
+        ScriptedClient::new(move |updates, history| {
+            let mut ops = Vec::new();
+            for update in updates {
+                if update.r#type() == &OperationType::Callback
+                    && update.action() == &OperationAction::Start
+                {
+                    ops.push(started(update));
+                }
+            }
+            if named(updates, "s", &OperationAction::Succeed).is_some()
+                && let Some(start) = named(history, "cb", &OperationAction::Start)
+            {
+                ops.push(completed(start));
+            }
+            ops
+        })
+    }
+
+    fn succeeded(start: &OperationUpdate) -> Operation {
+        operation_like(start, OperationStatus::Succeeded)
+            .callback_details(
+                CallbackDetails::builder()
+                    .callback_id("cb-1")
+                    .result("\"ok\"")
+                    .build(),
+            )
+            .build()
+            .expect("all required fields set")
+    }
+
+    fn declined(start: &OperationUpdate) -> Operation {
+        operation_like(start, OperationStatus::Failed)
+            .callback_details(
+                CallbackDetails::builder()
+                    .callback_id("cb-1")
+                    .error(
+                        ErrorObject::builder()
+                            .error_type("Declined")
+                            .error_message("no")
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+            .expect("all required fields set")
+    }
+
+    /// Runs the callback scenario against `client` and returns the
+    /// callback's outcome.
+    async fn join_callback_with_step(
+        client: &Arc<ScriptedClient>,
+    ) -> (
+        InvocationOutcome,
+        Option<Result<String, crate::OperationError>>,
+    ) {
+        let ctx = scripted_ctx(client);
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let handler_seen = Arc::clone(&seen);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let (result, step) = tokio::join!(
+                cb.result(),
+                ctx.step(|_| async { Ok(2_u32) }).name("s").future()
+            );
+            step.map_err(wire_err)?;
+            *handler_seen.lock().expect("lock") = Some(result);
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        let result = seen.lock().expect("lock").take();
+        (outcome, result)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_resumes_on_sibling_response() {
+        let (events, _guard) = crate::driver::test_support::EventMessages::install();
+        let client = Arc::new(client_completing(succeeded));
+        let (outcome, result) = join_callback_with_step(&client).await;
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let value = result
+            .expect("the handler finished")
+            .expect("the callback succeeded");
+        assert_eq!(value, "ok");
+        assert_eq!(
+            events.replayed(),
+            0,
+            "a resumed operation emits no replay event"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumed_callback_failure_matches_replay() {
+        let client = Arc::new(client_completing(declined));
+        let (outcome, result) = join_callback_with_step(&client).await;
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let live = result
+            .expect("the handler finished")
+            .expect_err("the callback was declined");
+
+        // The create-time replay of the same record.
+        let start = named(&client.updates(), "cb", &OperationAction::Start)
+            .cloned()
+            .expect("the callback started");
+        let log = crate::client::operations_to_checkpoint_log(&[declined(&start)]);
+        let replay_ctx = crate::DurableContext::new_root(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+        );
+        let replayed = replay_ctx
+            .create_callback::<String>()
+            .name("cb")
+            .await
+            .expect("the record replays")
+            .result()
+            .await
+            .expect_err("the replayed callback was declined");
+        assert_eq!(
+            format!("{:?}", live.kind()),
+            format!("{:?}", replayed.kind())
+        );
+        assert_eq!(live.wire(), replayed.wire());
     }
 }

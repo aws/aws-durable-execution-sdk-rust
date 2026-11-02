@@ -289,6 +289,33 @@ pub(crate) struct CheckpointRecord {
     pub(crate) op_name: Option<String>,
 }
 
+#[cfg(test)]
+impl CheckpointRecord {
+    /// A record of `id` with `status` and every other field empty.
+    pub(crate) fn with_status(id: &str, status: CheckpointStatus) -> Self {
+        Self {
+            id: id.to_owned(),
+            status,
+            result: None,
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        }
+    }
+}
+
 /// A compact, copyable view of a checkpoint record.
 ///
 /// Carries the fields that nearly every operation reads at the start of its
@@ -427,6 +454,18 @@ impl CheckpointLog {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.contains_key(wire_id)
+    }
+
+    /// Applies `f` to the stored record of `wire_id` under the write guard.
+    /// Does nothing when no record exists. `f` must not touch the log.
+    pub(crate) fn update(&self, wire_id: &str, f: impl FnOnce(&mut CheckpointRecord)) {
+        let mut guard = self
+            .records
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = guard.get_mut(wire_id) {
+            f(record);
+        }
     }
 
     /// Inserts or replaces a record in the log.

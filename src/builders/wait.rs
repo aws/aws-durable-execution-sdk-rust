@@ -91,6 +91,11 @@ impl WaitBuilder {
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -121,12 +126,12 @@ impl IntoFuture for WaitBuilder {
     type Output = Result<(), OperationError>;
     type IntoFuture = DurableFuture<()>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::wait::WaitExecution;
 
         preflight_identity!(self, "Wait", crate::wait::WAIT_SUB_TYPE);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = WaitExecution {
             ctx: self.ctx,
@@ -135,6 +140,6 @@ impl IntoFuture for WaitBuilder {
             duration_secs: self.duration_secs,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }

@@ -44,7 +44,6 @@ where
     RS: Serdes<O>,
 {
     /// Executes the invoke operation: replay path or live path.
-    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -63,95 +62,17 @@ where
             Some(CHAINED_INVOKE_SUB_TYPE),
             self.name.as_deref(),
         )? {
-            match view.status {
-                CheckpointStatus::Succeeded => {
-                    // Invoke succeeded: deserialize the result from invoke
-                    // details FIRST, then emit `operation_replayed`: a corrupt
-                    // payload or failing serdes surfaces as an error without
-                    // claiming a recorded outcome was returned.
-                    let payload = self
-                        .ctx
-                        .with_checkpoint_record(&positional_id, |record| {
-                            record.invoke_result.clone()
-                        })
-                        .flatten();
-                    let value = deserialize_invoke_result(
-                        &self.ctx,
-                        self.name.as_deref(),
-                        &self.result_serdes,
-                        payload.unwrap_or_else(|| "null".to_owned()),
-                        serdes_ctx.clone(),
-                    )
-                    .await?;
-                    self.ctx.emit_operation_replayed(
-                        &wire_id,
-                        self.name.as_deref(),
-                        "ChainedInvoke",
-                        Some(CHAINED_INVOKE_SUB_TYPE),
-                        view.attempt,
-                    );
-                    return Ok(value);
-                }
-                CheckpointStatus::Failed
-                | CheckpointStatus::TimedOut
-                | CheckpointStatus::Stopped => {
-                    // Invoke failed: reconstruct InvokeError from details.
-                    self.ctx.emit_operation_replayed(
-                        &wire_id,
-                        self.name.as_deref(),
-                        "ChainedInvoke",
-                        Some(CHAINED_INVOKE_SUB_TYPE),
-                        view.attempt,
-                    );
-                    let (error_type, error_message, error_data, stack_trace) = self
-                        .ctx
-                        .with_checkpoint_record(&positional_id, |record| {
-                            (
-                                record.invoke_error_type.clone(),
-                                record.invoke_error_message.clone(),
-                                record.invoke_error_data.clone(),
-                                record.invoke_stack_trace.clone(),
-                            )
-                        })
-                        .unwrap_or_default();
-                    return Err(invoke_error_from_record(
-                        &self.function_id,
-                        error_type,
-                        error_message,
-                        error_data,
-                        stack_trace,
-                        &wire_id,
-                        view.status.wire_str(),
-                    ));
-                }
-                CheckpointStatus::Started | CheckpointStatus::Pending | CheckpointStatus::Ready => {
-                    // Invoke has not settled yet: suspend.
-                    return self.ctx.suspend_now().await;
-                }
-                CheckpointStatus::Cancelled => {
-                    self.ctx.emit_operation_replayed(
-                        &wire_id,
-                        self.name.as_deref(),
-                        "ChainedInvoke",
-                        Some(CHAINED_INVOKE_SUB_TYPE),
-                        view.attempt,
-                    );
-                    return Err(OperationError::from_kind(OperationErrorKind::Invoke(
-                        InvokeError::new(
-                            InvokeErrorKind::FunctionFailed,
-                            Some("invoke cancelled".into()),
-                        ),
-                    ))
-                    .with_operation(&wire_id, view.status.wire_str()));
-                }
-                CheckpointStatus::Unknown(ref raw) => {
-                    // Unreachable in production: `checkpoint_view_validated`
-                    // already failed the execution (issue #45). Kept as a
-                    // typed arm so a future bypass cannot suspend forever on
-                    // a status that may be terminal.
-                    return Err(self.ctx.unrecognized_status_error(&wire_id, raw));
-                }
-            }
+            return recorded_outcome(
+                &self.ctx,
+                self.name.as_deref(),
+                &self.function_id,
+                &self.result_serdes,
+                &view,
+                &positional_id,
+                serdes_ctx,
+                true,
+            )
+            .await;
         }
 
         // 3. Live path: serialize the typed input through the payload
@@ -187,8 +108,152 @@ where
                 .await;
         }
 
-        // Suspend: the backend owns the child invocation.
-        self.ctx.suspend_now().await
+        // The backend owns the child invocation: wait for its record.
+        resume(
+            &self.ctx,
+            self.name.as_deref(),
+            &self.function_id,
+            &self.result_serdes,
+            &positional_id,
+            serdes_ctx,
+        )
+        .await
+    }
+}
+
+/// Waits until the invoke's record is no longer `STARTED`, `PENDING` or
+/// `READY`, then returns the outcome it holds. An invoke that a checkpoint
+/// response completes continues in the same invocation and emits no
+/// `operation_replayed` event.
+async fn resume<O, RS: Serdes<O>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
+    function_id: &str,
+    result_serdes: &RS,
+    positional_id: &str,
+    serdes_ctx: SerdesContext,
+) -> Result<O, OperationError> {
+    let view = ctx
+        .wait_for_record_view(positional_id, |status| {
+            !matches!(
+                status,
+                CheckpointStatus::Started | CheckpointStatus::Pending | CheckpointStatus::Ready
+            )
+        })
+        .await;
+    recorded_outcome(
+        ctx,
+        name,
+        function_id,
+        result_serdes,
+        &view,
+        positional_id,
+        serdes_ctx,
+        false,
+    )
+    .await
+}
+
+/// The outcome of an invoke's record: the replay path of a new invocation
+/// (`emit_replayed` true), and the continuation of a waiting invoke
+/// (`emit_replayed` false). A record that has not settled waits first.
+/// Emits the `operation_replayed` event for a terminal record when
+/// `emit_replayed`.
+#[expect(clippy::too_many_arguments)] // reason: the replay and resume paths share every input
+async fn recorded_outcome<O, RS: Serdes<O>>(
+    ctx: &DurableContext,
+    name: Option<&str>,
+    function_id: &str,
+    result_serdes: &RS,
+    view: &crate::engine::CheckpointStatusView,
+    positional_id: &str,
+    serdes_ctx: SerdesContext,
+    emit_replayed: bool,
+) -> Result<O, OperationError> {
+    let wire_id = crate::engine::compute_wire_id_public(positional_id);
+    let emit = || {
+        if emit_replayed {
+            ctx.emit_operation_replayed(
+                &wire_id,
+                name,
+                "ChainedInvoke",
+                Some(CHAINED_INVOKE_SUB_TYPE),
+                view.attempt,
+            );
+        }
+    };
+    match &view.status {
+        CheckpointStatus::Succeeded => {
+            // Invoke succeeded: deserialize the result from invoke details
+            // FIRST, then emit `operation_replayed`: a corrupt payload or
+            // failing serdes surfaces as an error without claiming a
+            // recorded outcome was returned.
+            let payload = ctx
+                .with_checkpoint_record(positional_id, |record| record.invoke_result.clone())
+                .flatten();
+            let value = deserialize_invoke_result(
+                ctx,
+                name,
+                result_serdes,
+                payload.unwrap_or_else(|| "null".to_owned()),
+                serdes_ctx,
+            )
+            .await?;
+            emit();
+            Ok(value)
+        }
+        CheckpointStatus::Failed | CheckpointStatus::TimedOut | CheckpointStatus::Stopped => {
+            // Invoke failed: reconstruct InvokeError from details.
+            emit();
+            let (error_type, error_message, error_data, stack_trace) = ctx
+                .with_checkpoint_record(positional_id, |record| {
+                    (
+                        record.invoke_error_type.clone(),
+                        record.invoke_error_message.clone(),
+                        record.invoke_error_data.clone(),
+                        record.invoke_stack_trace.clone(),
+                    )
+                })
+                .unwrap_or_default();
+            Err(invoke_error_from_record(
+                function_id,
+                error_type,
+                error_message,
+                error_data,
+                stack_trace,
+                &wire_id,
+                view.status.wire_str(),
+            ))
+        }
+        CheckpointStatus::Started | CheckpointStatus::Pending | CheckpointStatus::Ready => {
+            // Invoke has not settled yet: wait for its record.
+            Box::pin(resume(
+                ctx,
+                name,
+                function_id,
+                result_serdes,
+                positional_id,
+                serdes_ctx,
+            ))
+            .await
+        }
+        CheckpointStatus::Cancelled => {
+            emit();
+            Err(
+                OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::new(
+                    InvokeErrorKind::FunctionFailed,
+                    Some("invoke cancelled".into()),
+                )))
+                .with_operation(&wire_id, view.status.wire_str()),
+            )
+        }
+        CheckpointStatus::Unknown(raw) => {
+            // Unreachable in production: `checkpoint_view_validated` already
+            // failed the execution (issue #45). Kept as a typed arm so a
+            // future bypass cannot wait forever on a status that may be
+            // terminal.
+            Err(ctx.unrecognized_status_error(&wire_id, raw))
+        }
     }
 }
 
@@ -210,7 +275,10 @@ async fn serialize_invoke_input<I, PS: Serdes<I>>(
     input: I,
     serdes_ctx: &SerdesContext,
 ) -> Result<String, OperationError> {
-    match payload_serdes.serialize(input, serdes_ctx.clone()).await {
+    match ctx
+        .hold_activity(payload_serdes.serialize(input, serdes_ctx.clone()))
+        .await
+    {
         Ok(serialized) => Ok(serialized),
         Err(err) => {
             let e = ctx
@@ -240,8 +308,10 @@ async fn deserialize_invoke_result<O, RS: Serdes<O>>(
     serdes_ctx: SerdesContext,
 ) -> Result<O, OperationError> {
     let operation_id = serdes_ctx.operation_id().to_owned();
-    match result_serdes
-        .deserialize(payload, serdes_ctx.with_origin(PayloadOrigin::External))
+    match ctx
+        .hold_activity(
+            result_serdes.deserialize(payload, serdes_ctx.with_origin(PayloadOrigin::External)),
+        )
         .await
     {
         Ok(value) => Ok(value),
@@ -613,7 +683,7 @@ mod tests {
             _marker: PhantomData,
         };
 
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -650,7 +720,7 @@ mod tests {
             _marker: PhantomData,
         };
 
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -734,7 +804,7 @@ mod tests {
         };
 
         // Should not panic, should suspend.
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -759,7 +829,7 @@ mod tests {
         );
 
         // Use the public API: ctx.invoke().spawn() should succeed on a blessed task.
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let handle = ctx
             .invoke::<serde_json::Value, _>("fn-arn", "input".to_owned())
             .name("spawned-invoke")
@@ -921,7 +991,7 @@ mod tests {
 
         // Execute: checkpoints then suspends (parks); drive through the
         // driver so it terminates as Pending instead of parking forever.
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -1127,7 +1197,7 @@ mod tests {
             _marker: PhantomData,
         };
 
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         crate::driver::test_support::expect_serdes_fault(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -1183,7 +1253,7 @@ mod tests {
             _marker: PhantomData,
         };
 
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         crate::driver::test_support::expect_serdes_fault(
             Arc::clone(ctx.task_ownership()),
             signal,
@@ -1191,5 +1261,62 @@ mod tests {
             "serdes deserialize failed",
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{
+        ScriptedClient, drive_handler, named, operation_like, scripted_ctx, wire_err,
+    };
+    use aws_sdk_lambda::types::{ChainedInvokeDetails, OperationAction, OperationStatus};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn invoke_resumes_on_sibling_response() {
+        let (events, _guard) = crate::driver::test_support::EventMessages::install();
+        let client = Arc::new(ScriptedClient::new(|updates, history| {
+            if named(updates, "s", &OperationAction::Succeed).is_none() {
+                return Vec::new();
+            }
+            named(history, "inv", &OperationAction::Start)
+                .map(|start| {
+                    operation_like(start, OperationStatus::Succeeded)
+                        .chained_invoke_details(ChainedInvokeDetails::builder().result("7").build())
+                        .build()
+                        .expect("all required fields set")
+                })
+                .into_iter()
+                .collect()
+        }));
+        let ctx = scripted_ctx(&client);
+        let body_client = Arc::clone(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let inv = ctx.invoke::<u32, _>("target", 1_u32).name("inv").spawn();
+            ctx.step(move |_| async move {
+                for _ in 0..1000 {
+                    if body_client.received("inv", &OperationAction::Start) {
+                        return Ok(1_u32);
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err("the invoke never started".into())
+            })
+            .name("s")
+            .await
+            .map_err(wire_err)?;
+            let value = inv.await.map_err(wire_err)?;
+            Ok(value.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("7".to_owned()));
+        assert_eq!(
+            events.replayed(),
+            0,
+            "a resumed operation emits no replay event"
+        );
     }
 }

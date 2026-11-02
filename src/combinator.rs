@@ -21,14 +21,15 @@
 //! combinator runs inside a child context so the combined result is
 //! checkpointed atomically.
 //!
-//! Suspension is isolated per input: each constituent runs in its own
-//! suspension scope ([`spawn_constituent`]), so a parked input, a pending
-//! wait, an unresolved callback, never suspends the caller's scope. The
-//! combined outcome is recorded the moment the completion condition is met
-//! (a winner for `race`/`select_ok`, a first error for `try_join_all`),
-//! whatever the losing inputs are doing. The combinator itself suspends
-//! only when no input can make progress: everything still pending has
-//! durably parked and the completion condition is unmet (issue #49).
+//! Each input runs on its own task in the combinator's join set
+//! ([`spawn_constituent`]). An input that waits (a pending wait, an
+//! unresolved callback) stays pending there, and continues in the same
+//! invocation when a checkpoint response completes it. The combined outcome
+//! is recorded the moment the completion condition is met (a winner for
+//! `race`/`select_ok`, a first error for `try_join_all`), whatever the
+//! losing inputs are doing; the losers are then aborted. When every
+//! remaining input waits and nothing else runs, the invocation coordinator
+//! suspends the invocation (issue #49).
 
 use std::sync::Arc;
 
@@ -156,7 +157,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
     /// Live path: awaits all futures concurrently, fails fast on first error,
     /// checkpoints the combined `Vec<O>` result.
     /// Replay path: returns the frozen result from the checkpoint log.
-    #[expect(clippy::too_many_lines)] // reason: validation adds lines but the flow reads better flat
     pub(crate) async fn execute(self) -> Result<Vec<O>, OperationError> {
         // Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -214,9 +214,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         }
 
         // Live path: run all futures concurrently, fail-fast on first error.
-        // Each constituent runs under its own suspension scope (see
-        // `drive_constituent`), so a parked input surfaces as `Suspended`
-        // here instead of parking the caller's scope.
         let count = self.futures.len();
         let mut results: Vec<Option<O>> = (0..count).map(|_| None).collect();
         let mut join_set = constituent_set(&self.ctx);
@@ -226,27 +223,19 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         }
 
         let mut first_error: Option<(usize, OperationError)> = None;
-        let mut parked = 0_usize;
         while let Some((_, joined)) = join_set.join_next_with_id().await {
             // A panicked input resumes its panic here.
             match joined.into_value() {
-                (idx, ConstituentOutcome::Settled(Ok(value))) => {
+                (idx, Ok(value)) => {
                     if let Some(slot) = results.get_mut(idx) {
                         *slot = Some(value);
                     }
                 }
-                (idx, ConstituentOutcome::Settled(Err(op_err))) => {
+                (idx, Err(op_err)) => {
                     first_error = Some((idx, op_err));
                     // Abort remaining tasks (fail-fast + loser-drop).
                     join_set.abort_all();
                     break;
-                }
-                (_idx, ConstituentOutcome::Parked) => {
-                    // The input parked its own scope; the join cannot
-                    // complete this invocation, but runnable siblings keep
-                    // going (they checkpoint their own results) and a
-                    // settling error can still fail fast.
-                    parked += 1;
                 }
             }
         }
@@ -272,16 +261,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
             ))
             .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
             .with_wire(wire));
-        }
-
-        // No error, but at least one input is durably parked: nothing left
-        // here can make progress, so the combinator itself suspends. The
-        // settled inputs recorded their own checkpoints, so a later
-        // invocation replays them instantly and resumes only the parked
-        // ones. No combined outcome is recorded: the completion condition
-        // was not met.
-        if parked > 0 {
-            return Ok(self.ctx.suspend_now().await);
         }
 
         // All succeeded: collect results in order.
@@ -404,10 +383,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
         }
 
-        // Live path: run all futures, never short-circuit. Each constituent
-        // runs under its own suspension scope (see `drive_constituent`), so
-        // a parked input surfaces as `Parked` here instead of parking the
-        // caller's scope.
+        // Live path: run all futures, never short-circuit.
         let count = self.futures.len();
         let mut settled: Vec<Option<Settled<O>>> = (0..count).map(|_| None).collect();
         let mut join_set = constituent_set(&self.ctx);
@@ -416,36 +392,20 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             spawn_constituent(&self.ctx, &mut join_set, idx, future)?;
         }
 
-        let mut parked = 0_usize;
         while let Some((_, joined)) = join_set.join_next_with_id().await {
             // A panicked input resumes its panic here.
             match joined.into_value() {
-                (idx, ConstituentOutcome::Settled(Ok(value))) => {
+                (idx, Ok(value)) => {
                     if let Some(slot) = settled.get_mut(idx) {
                         *slot = Some(Settled::Fulfilled(value));
                     }
                 }
-                (idx, ConstituentOutcome::Settled(Err(op_err))) => {
+                (idx, Err(op_err)) => {
                     if let Some(slot) = settled.get_mut(idx) {
                         *slot = Some(Settled::Rejected(op_err));
                     }
                 }
-                (_idx, ConstituentOutcome::Parked) => {
-                    // The input parked its own scope; its slot stays empty.
-                    // Siblings keep running, a parked input never blocks
-                    // them, and the decision is made after the drain.
-                    parked += 1;
-                }
             }
-        }
-
-        // At least one input is durably parked: the collection cannot
-        // complete this invocation. Everything runnable already settled
-        // (and checkpointed its own outcome), so suspend and let a later
-        // invocation resume only the parked inputs. No combined outcome is
-        // recorded: `join_all` completes only when every input settles.
-        if parked > 0 {
-            return Ok(self.ctx.suspend_now().await);
         }
 
         // Collect in order.
@@ -584,9 +544,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         }
 
         // Live path: race all futures, keep going until one succeeds or all
-        // fail. Each constituent runs under its own suspension scope (see
-        // `drive_constituent`), so a parked input surfaces as `Parked` here
-        // instead of parking the caller's scope after a sibling succeeded.
+        // fail.
         let mut join_set = constituent_set(&self.ctx);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
@@ -594,15 +552,13 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         }
 
         let mut errors: Vec<(usize, crate::error::Source)> = Vec::new();
-        let mut parked = 0_usize;
 
         while let Some((_, joined)) = join_set.join_next_with_id().await {
             // A panicked input resumes its panic here.
             match joined.into_value() {
-                (_idx, ConstituentOutcome::Settled(Ok(value))) => {
-                    // First success: cancel losers (drop via abort_all).
-                    // Parked losers only ever parked their own constituent
-                    // scopes, so recording the winner is not blocked by them.
+                (_idx, Ok(value)) => {
+                    // First success: cancel losers (drop via abort_all). A
+                    // waiting loser does not block recording the winner.
                     join_set.abort_all();
 
                     // Checkpoint SUCCESS with the winner.
@@ -613,24 +569,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                         .await?;
                     return Ok(value);
                 }
-                (idx, ConstituentOutcome::Settled(Err(op_err))) => {
+                (idx, Err(op_err)) => {
                     errors.push((idx, Box::new(op_err)));
                 }
-                (_idx, ConstituentOutcome::Parked) => {
-                    // The input parked its own scope; it may still succeed on
-                    // a later invocation, so it neither wins nor counts as a
-                    // failure now.
-                    parked += 1;
-                }
             }
-        }
-
-        // No success yet, and at least one input is durably parked: it may
-        // still deliver the success, so recording `AllFailed` now would be
-        // premature. Suspend; the settled failures replay instantly from
-        // their own checkpoints and only the parked inputs resume.
-        if parked > 0 {
-            return Ok(self.ctx.suspend_now().await);
         }
 
         // All failed: build the aggregate error keeping every loser (in
@@ -772,115 +714,79 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                 .with_wire(wire));
         }
 
-        // Live path: race all futures, first settled wins. Each constituent
-        // runs under its own suspension scope (see `drive_constituent`), so
-        // a losing input's park surfaces as `Parked` here instead of
-        // suspending the caller after the winner already settled: the
-        // defect that let replay pick a different winner (issue #49).
+        // Live path: race all futures, first settled wins. A losing input
+        // that waits stays pending and never suspends the invocation once
+        // the winner settled (issue #49): the winner is recorded, and the
+        // losers are aborted.
         let mut join_set = constituent_set(&self.ctx);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
             spawn_constituent(&self.ctx, &mut join_set, idx, future)?;
         }
 
-        // Wait for the first SETTLED task; parked inputs do not settle and
-        // do not block a later sibling from winning.
-        while let Some((_, joined)) = join_set.join_next_with_id().await {
-            // A panicked input resumes its panic here.
-            let settled_result = match joined.into_value() {
-                (_idx, ConstituentOutcome::Parked) => {
-                    // The input parked its own scope; keep waiting for a
-                    // sibling to settle.
-                    continue;
-                }
-                (_idx, ConstituentOutcome::Settled(result)) => result,
-            };
+        // Wait for the first SETTLED task. When every input waits, the race
+        // stays pending here.
+        #[expect(clippy::expect_used)]
+        // reason: the input list is not empty here, and the set yields one
+        // outcome per input it started (a refused start never yields), so
+        // the join never reports an empty set.
+        let (_, joined) = join_set
+            .join_next_with_id()
+            .await
+            .expect("a non-empty race joins an input");
+        // A panicked input resumes its panic here.
+        let (_idx, settled_result) = joined.into_value();
 
-            // Cancel all remaining losers.
-            join_set.abort_all();
+        // Cancel all remaining losers.
+        join_set.abort_all();
 
-            match settled_result {
-                Ok(value) => {
-                    // Winner is a success.
-                    let serialized = serde_json::to_string(&value).map_err(|e| {
-                        combinator_internal_error(&format!("serialization failed: {e}"))
-                    })?;
-                    checkpoint_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized)
-                        .await?;
-                    return Ok(value);
-                }
-                Err(op_err) => {
-                    // Winner is a failure: race propagates it. The losing
-                    // error is preserved as the combinator error's source;
-                    // the wire `error_type` carries the discriminator so
-                    // replay reproduces the same variant, while the message,
-                    // `error_data`, and `stack_trace` derive from the loser
-                    // itself (pass-through; a chain that recorded no frames
-                    // records none).
-                    let wire = crate::error::wire_error_with_type(
-                        &op_err,
-                        FIRST_SETTLED_FAILED_ERROR_TYPE,
-                    );
-                    checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
-                    return Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                        CombinatorError::new(
-                            CombinatorErrorKind::FirstSettledFailed,
-                            vec![Box::new(op_err)],
-                        ),
-                    ))
-                    .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
-                    .with_wire(wire));
-                }
+        match settled_result {
+            Ok(value) => {
+                // Winner is a success.
+                let serialized = serde_json::to_string(&value).map_err(|e| {
+                    combinator_internal_error(&format!("serialization failed: {e}"))
+                })?;
+                checkpoint_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized).await?;
+                Ok(value)
+            }
+            Err(op_err) => {
+                // Winner is a failure: race propagates it. The losing
+                // error is preserved as the combinator error's source;
+                // the wire `error_type` carries the discriminator so
+                // replay reproduces the same variant, while the message,
+                // `error_data`, and `stack_trace` derive from the loser
+                // itself (pass-through; a chain that recorded no frames
+                // records none).
+                let wire =
+                    crate::error::wire_error_with_type(&op_err, FIRST_SETTLED_FAILED_ERROR_TYPE);
+                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+                Err(OperationError::from_kind(OperationErrorKind::Combinator(
+                    CombinatorError::new(
+                        CombinatorErrorKind::FirstSettledFailed,
+                        vec![Box::new(op_err)],
+                    ),
+                ))
+                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+                .with_wire(wire))
             }
         }
-
-        // Every input parked without settling: no winner can be decided
-        // this invocation, so the race itself suspends. Nothing is
-        // recorded: the winner is frozen only once an input settles.
-        Ok(self.ctx.suspend_now().await)
     }
 }
 
-/// How one combinator input ended within this invocation.
-enum ConstituentOutcome<O> {
-    /// The input resolved with a success or a failure.
-    Settled(Result<O, OperationError>),
-    /// The input durably parked; only a later invocation can resume it.
-    Parked,
-}
-
-/// Spawns one combinator input onto `join_set`, isolated in its own
-/// suspension scope.
+/// Spawns one combinator input onto `join_set`.
 ///
-/// The input's park is redirected onto a fresh child scope (via
-/// [`DurableFuture::set_park_scope`]) which
-/// [`drive_scope`](crate::driver::drive_scope) observes on the spawned
-/// task, so a parking input completes its task with
-/// [`ConstituentOutcome::Parked`] instead of parking the caller's scope.
-/// This is what keeps a losing input's suspension from ending the
-/// invocation after a winner already settled (issue #49), and what lets
-/// the combinator decide for itself when no input can make progress.
-///
-/// The join set blesses the task before its first poll. When no Tokio
-/// runtime is running, the input is dropped and the combinator returns the
-/// error.
+/// The input future runs on its own task; an input that waits stays pending
+/// in the set until a checkpoint response completes it. The join set
+/// blesses the task before its first poll. When no Tokio runtime is
+/// running, the input is dropped and the combinator returns the error.
 fn spawn_constituent<O: Send + 'static>(
     ctx: &DurableContext,
-    join_set: &mut TrackedJoinSet<(usize, ConstituentOutcome<O>)>,
+    join_set: &mut TrackedJoinSet<(usize, Result<O, OperationError>)>,
     idx: usize,
     future: DurableFuture<O>,
 ) -> Result<(), OperationError> {
-    use crate::driver::{ScopeOutcome, drive_scope};
-
-    let scope = Arc::new(ctx.suspension_signal().new_child_scope());
-    future.set_park_scope(Arc::clone(&scope));
     join_set
-        .spawn(ctx.task_ownership(), async move {
-            match drive_scope(future, scope).await {
-                ScopeOutcome::Completed(result) => (idx, ConstituentOutcome::Settled(result)),
-                ScopeOutcome::Suspended => (idx, ConstituentOutcome::Parked),
-            }
-        })
+        .spawn(ctx.task_ownership(), async move { (idx, future.await) })
         .map(drop)
         .map_err(NoRuntime::operation_error)
 }
@@ -889,8 +795,8 @@ fn spawn_constituent<O: Send + 'static>(
 /// invocation's task tracker.
 fn constituent_set<O: Send + 'static>(
     ctx: &DurableContext,
-) -> TrackedJoinSet<(usize, ConstituentOutcome<O>)> {
-    TrackedJoinSet::new(Arc::clone(ctx.suspension_signal().tasks()))
+) -> TrackedJoinSet<(usize, Result<O, OperationError>)> {
+    TrackedJoinSet::new(Arc::clone(ctx.coordinator()))
 }
 
 /// Refuses a combinator's terminal checkpoint once an execution-fatal error
@@ -908,7 +814,7 @@ fn constituent_set<O: Send + 'static>(
 /// the fatal as its own error and the invocation driver fails the execution
 /// with the dedicated `NonDeterministicExecutionError`.
 fn fatal_gate(ctx: &DurableContext) -> Result<(), OperationError> {
-    if let Some(fatal) = ctx.suspension_signal().fatal_error() {
+    if let Some(fatal) = ctx.coordinator().fatal_error() {
         return Err(combinator_internal_error(&fatal.error_message));
     }
     Ok(())
@@ -1494,7 +1400,7 @@ mod tests {
     {
         let (ctx, client) = recording_ctx(CheckpointLog::empty());
         let ownership = Arc::clone(ctx.task_ownership());
-        let signal = Arc::clone(ctx.suspension_signal());
+        let signal = Arc::clone(ctx.coordinator());
         let handler = run(ctx);
         let outcome = crate::driver::drive_invocation(
             async move {
@@ -1503,6 +1409,7 @@ mod tests {
             },
             ownership,
             signal,
+            None,
         )
         .await;
         let Err(payload) = outcome else {
@@ -2607,5 +2514,118 @@ mod tests {
         // Must succeed, no ownership errors.
         let value = result.unwrap();
         assert_eq!(value, "fast");
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{
+        ScriptedClient, drive_handler, named, operation_like, scripted_ctx, wire_err,
+    };
+    use aws_sdk_lambda::types::{OperationAction, OperationStatus, OperationType};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_race_loser_retires_its_registration() {
+        let ctx = scripted_ctx(&Arc::new(ScriptedClient::empty()));
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let fast = ctx
+                .step(|_| async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(1_u32)
+                })
+                .name("fast")
+                .future();
+            let slow = ctx.wait(Duration::from_secs(3600)).name("slow").future();
+            let slow = crate::DurableFuture::from_async(async move {
+                slow.await?;
+                Ok(0_u32)
+            });
+            ctx.race([fast, slow]).await.map_err(wire_err)?;
+            ctx.hold_activity(ctx.coordinator().tasks().wait_idle())
+                .await;
+            let waits = ctx.coordinator().live_waits();
+            ctx.step(|_| async { Ok(2_u32) })
+                .name("more")
+                .await
+                .map_err(wire_err)?;
+            Ok(waits.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("0".to_owned()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn race_with_every_input_waiting_suspends() {
+        let client = Arc::new(ScriptedClient::empty());
+        let ctx = scripted_ctx(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let one = ctx.wait(Duration::from_secs(1)).future();
+            let two = ctx.wait(Duration::from_secs(2)).future();
+            ctx.race([one, two]).await.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        let calls = client.calls();
+        assert_eq!(calls.len(), 3, "the race START and the two wait STARTs");
+        for (_, updates) in calls.iter().skip(1) {
+            assert!(
+                updates
+                    .iter()
+                    .all(|u| u.r#type() == &OperationType::Wait
+                        && u.action() == &OperationAction::Start),
+                "no checkpoint call after the two wait STARTs"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_input_continues_on_sibling_response() {
+        let client = Arc::new(ScriptedClient::new(|updates, history| {
+            if named(updates, "s", &OperationAction::Succeed).is_none() {
+                return Vec::new();
+            }
+            named(history, "w", &OperationAction::Start)
+                .map(|start| {
+                    operation_like(start, OperationStatus::Succeeded)
+                        .build()
+                        .expect("all required fields set")
+                })
+                .into_iter()
+                .collect()
+        }));
+        let ctx = scripted_ctx(&client);
+        let body_client = Arc::clone(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let child = ctx
+                .run_in_child_context(|child| async move {
+                    child.wait(Duration::from_secs(1)).name("w").await?;
+                    Ok(1_u32)
+                })
+                .name("child")
+                .future();
+            let step = ctx
+                .step(move |_| async move {
+                    for _ in 0..1000 {
+                        if body_client.received("w", &OperationAction::Start) {
+                            return Ok(2_u32);
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err("w never started".into())
+                })
+                .name("s")
+                .future();
+            let values = ctx.try_join_all([child, step]).await.map_err(wire_err)?;
+            Ok(format!("{values:?}"))
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("[1, 2]".to_owned()));
     }
 }

@@ -62,6 +62,7 @@ use tokio::sync::Notify;
 use tokio::sync::futures::Notified;
 
 use crate::client::{CheckpointOutput, ExecutionClientError};
+use crate::coordinator::{InvocationCoordinator, Permit, PermitKind};
 use crate::tracing_layer::PendingTransitionEvent;
 
 /// An operation update paired with the lifecycle event describing the
@@ -271,6 +272,10 @@ struct CoalescerState {
     /// Updates (each paired with its lifecycle event) awaiting the next
     /// flush, in join order.
     pending: Vec<TrackedUpdate>,
+    /// One checkpoint permit per admitted join of the pending updates. The
+    /// permits travel with the updates to the flusher, which releases them
+    /// after the response is merged and published.
+    permits: Vec<Permit>,
     /// The batch the pending updates belong to, if one is open.
     batch: Option<Arc<CheckpointBatch>>,
     /// Write failures observed by flushers, retained for the
@@ -303,6 +308,25 @@ struct CoalescerState {
     /// failures but never clears the latch: the coalescer lives for one
     /// invocation, and its write channel does not come back within it.
     latched: Option<ExecutionClientError>,
+}
+
+/// The checkpoint permits of one claimed batch. Dropping them releases the
+/// batch's hold on the invocation.
+#[derive(Debug)]
+pub(crate) struct BatchPermits {
+    /// Held until the batch is released, then dropped. Read only by
+    /// tests; the field exists for its drop.
+    #[cfg_attr(not(test), expect(dead_code))]
+    // reason: the permits are held for their drop, which releases them.
+    held: Vec<Permit>,
+}
+
+impl BatchPermits {
+    /// The number of permits.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.held.len()
+    }
 }
 
 /// One checkpoint write failure retained by the coalescer: the error plus
@@ -387,38 +411,61 @@ impl CheckpointCoalescer {
     }
 
     /// Adds `updates` to the buffer and returns the batch they joined,
-    /// opening a new batch if none is pending. The buffer takes ownership
-    /// of each update's lifecycle event along with it: from this point the
-    /// flusher that persists the update, not the (cancellable)
-    /// contributor, is responsible for emitting it.
+    /// opening a new batch if none is pending, and whether this join opened
+    /// it. The buffer takes ownership of each update's lifecycle event along
+    /// with it: from this point the flusher that persists the update, not
+    /// the (cancellable) contributor, is responsible for emitting it.
+    ///
+    /// An admitted join takes a checkpoint permit of `coordinator`, under
+    /// the buffer lock, and buffers it with the updates. So the invocation
+    /// does not suspend while an admitted update waits in the buffer.
     ///
     /// Returns `None` and buffers nothing when `admission` rejects one of
-    /// `owners` (see [`Admission`]). The check runs under the buffer lock.
-    /// So an update is either buffered before its owner is abandoned, and
-    /// written before any update buffered later, or it is rejected.
+    /// `owners` (see [`Admission`]), or when the coordinator refuses the
+    /// permit. The checks run under the buffer lock. So an update is either
+    /// buffered before its owner is abandoned, and written before any update
+    /// buffered later, or it is rejected.
     pub(crate) fn join(
         &self,
         admission: &Admission,
+        coordinator: &Arc<InvocationCoordinator>,
         owners: &[String],
         updates: Vec<TrackedUpdate>,
-    ) -> Option<Arc<CheckpointBatch>> {
+    ) -> Option<(Arc<CheckpointBatch>, bool)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if !admission.admits(owners) {
             return None;
         }
+        let permit = coordinator.acquire(PermitKind::Checkpoint)?;
         state.pending.extend(updates);
-        Some(Arc::clone(state.batch.get_or_insert_with(Arc::default)))
+        state.permits.push(permit);
+        let opened = state.batch.is_none();
+        Some((
+            Arc::clone(state.batch.get_or_insert_with(Arc::default)),
+            opened,
+        ))
     }
 
     /// Claims `target`'s buffered updates for flushing, if `target` is still
     /// the open batch. Returns `None` when another flusher already claimed
     /// it (its result will be published by that flusher).
-    pub(crate) fn take_batch(&self, target: &Arc<CheckpointBatch>) -> Option<Vec<TrackedUpdate>> {
+    ///
+    /// The returned permits are the batch's checkpoint permits: the flusher
+    /// drops them after the response is merged and published.
+    pub(crate) fn take_batch(
+        &self,
+        target: &Arc<CheckpointBatch>,
+    ) -> Option<(Vec<TrackedUpdate>, BatchPermits)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match &state.batch {
             Some(open) if Arc::ptr_eq(open, target) => {
                 state.batch = None;
-                Some(std::mem::take(&mut state.pending))
+                Some((
+                    std::mem::take(&mut state.pending),
+                    BatchPermits {
+                        held: std::mem::take(&mut state.permits),
+                    },
+                ))
             }
             _ => None,
         }
@@ -428,10 +475,18 @@ impl CheckpointCoalescer {
     /// points (suspension, end of invocation) that must drain the buffer
     /// regardless of which batch is pending. Returns `None` when the buffer
     /// is idle.
-    pub(crate) fn take_any(&self) -> Option<(Arc<CheckpointBatch>, Vec<TrackedUpdate>)> {
+    pub(crate) fn take_any(
+        &self,
+    ) -> Option<(Arc<CheckpointBatch>, Vec<TrackedUpdate>, BatchPermits)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let batch = state.batch.take()?;
-        Some((batch, std::mem::take(&mut state.pending)))
+        Some((
+            batch,
+            std::mem::take(&mut state.pending),
+            BatchPermits {
+                held: std::mem::take(&mut state.permits),
+            },
+        ))
     }
 
     /// Retains a checkpoint write failure for the end-of-invocation flush
@@ -507,8 +562,14 @@ mod tests {
     /// Joins one update from the root, which no abandonment can reject.
     fn join(coalescer: &CheckpointCoalescer, id: &str) -> Arc<CheckpointBatch> {
         coalescer
-            .join(&Admission::new(), &[], vec![track(dummy_update(id))])
+            .join(
+                &Admission::new(),
+                &InvocationCoordinator::new(),
+                &[],
+                vec![track(dummy_update(id))],
+            )
             .expect("the root is always admitted")
+            .0
     }
 
     #[test]
@@ -535,6 +596,7 @@ mod tests {
         admission.abandon(["item"]);
         let rejected = coalescer.join(
             &admission,
+            &InvocationCoordinator::new(),
             &["item".to_owned()],
             vec![track(dummy_update("a"))],
         );
@@ -563,8 +625,9 @@ mod tests {
             "concurrent joins share one batch"
         );
 
-        let updates = coalescer.take_batch(&first).expect("batch is open");
+        let (updates, permits) = coalescer.take_batch(&first).expect("batch is open");
         assert_eq!(updates.len(), 2, "both joins' updates drain together");
+        assert_eq!(permits.len(), 2, "each join's permit drains with them");
     }
 
     #[test]
@@ -581,7 +644,7 @@ mod tests {
             "stale flusher must not steal the newer batch"
         );
         assert_eq!(
-            coalescer.take_any().map(|(_, u)| u.len()),
+            coalescer.take_any().map(|(_, u, _)| u.len()),
             Some(1),
             "the newer batch still holds its update"
         );
@@ -850,5 +913,49 @@ mod tests {
             coalescer.latched_failure().is_some(),
             "the latch survives the drain — the channel stays poisoned"
         );
+    }
+
+    #[test]
+    fn admitted_join_holds_a_checkpoint_permit_until_the_batch_is_released() {
+        let coordinator = InvocationCoordinator::new();
+        let coalescer = CheckpointCoalescer::new(Duration::ZERO);
+        let (batch, opened) = coalescer
+            .join(
+                &Admission::new(),
+                &coordinator,
+                &[],
+                vec![track(dummy_update("a"))],
+            )
+            .expect("admitted");
+        assert!(opened, "the first join opens the batch");
+        let (_, second_opened) = coalescer
+            .join(
+                &Admission::new(),
+                &coordinator,
+                &[],
+                vec![track(dummy_update("b"))],
+            )
+            .expect("admitted");
+        assert!(!second_opened, "a later join joins the open batch");
+        assert_eq!(coordinator.permits(PermitKind::Checkpoint), 2);
+        let (_, permits) = coalescer.take_batch(&batch).expect("open");
+        assert_eq!(coordinator.permits(PermitKind::Checkpoint), 2);
+        drop(permits);
+        assert_eq!(coordinator.permits(PermitKind::Checkpoint), 0);
+    }
+
+    #[test]
+    fn join_after_suspension_buffers_nothing() {
+        let coordinator = InvocationCoordinator::new();
+        coordinator.finish();
+        let coalescer = CheckpointCoalescer::new(Duration::ZERO);
+        let refused = coalescer.join(
+            &Admission::new(),
+            &coordinator,
+            &[],
+            vec![track(dummy_update("a"))],
+        );
+        assert!(refused.is_none());
+        assert!(coalescer.take_any().is_none(), "nothing was buffered");
     }
 }

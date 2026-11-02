@@ -90,6 +90,7 @@ pub(crate) mod child;
 pub(crate) mod client;
 pub(crate) mod combinator;
 mod context;
+pub(crate) mod coordinator;
 pub(crate) mod driver;
 mod engine;
 mod error;
@@ -1014,7 +1015,8 @@ where
             // Retained past the handler move so the post-outcome flush can
             // drain the checkpoint coalescing buffer (a cheap Arc clone).
             let flush_ctx = ctx.clone();
-            let suspension_signal = ctx.suspension_signal().clone();
+            let coordinator = StdArc::clone(ctx.coordinator());
+            let remaining = ctx.remaining_time();
             let replay_span = ctx.replay_span();
 
             // Lifecycle event: exactly one of `execution_started` /
@@ -1056,11 +1058,17 @@ where
             // A handler panic returns here only after the driver cleaned up
             // every task, and leaves the SDK with its original payload.
             // Nothing runs between the cleanup and the resume.
-            let outcome =
-                match driver::drive_invocation(root, task_ownership, suspension_signal).await {
-                    Ok(outcome) => outcome,
-                    Err(payload) => std::panic::resume_unwind(payload),
-                };
+            let outcome = match driver::drive_invocation(
+                root,
+                task_ownership,
+                coordinator,
+                remaining,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
 
             // Unconditional flush point of the checkpoint buffering
             // contract (`checkpoint_delay` / `checkpoint_batching`):

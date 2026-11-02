@@ -5900,10 +5900,19 @@ mod tests {
                                             // Settle strictly after item 1:
                                             // wait for its signal, then let
                                             // its join drain first.
-                                            gate.notified().await;
-                                            for _ in 0..16 {
-                                                tokio::task::yield_now().await;
-                                            }
+                                            // The gate and the yields are
+                                            // not SDK operations: they run
+                                            // under a held activity permit,
+                                            // so a waiting sibling cannot
+                                            // suspend the invocation here.
+                                            child
+                                                .hold_activity(async {
+                                                    gate.notified().await;
+                                                    for _ in 0..16 {
+                                                        tokio::task::yield_now().await;
+                                                    }
+                                                })
+                                                .await;
                                             Err("item 0 fails last".into())
                                         }
                                         1 => {
@@ -5990,10 +5999,19 @@ mod tests {
                                 async move {
                                     match idx {
                                         0 => {
-                                            gate.notified().await;
-                                            for _ in 0..16 {
-                                                tokio::task::yield_now().await;
-                                            }
+                                            // The gate and the yields are
+                                            // not SDK operations: they run
+                                            // under a held activity permit,
+                                            // so a waiting sibling cannot
+                                            // suspend the invocation here.
+                                            child
+                                                .hold_activity(async {
+                                                    gate.notified().await;
+                                                    for _ in 0..16 {
+                                                        tokio::task::yield_now().await;
+                                                    }
+                                                })
+                                                .await;
                                             Err("item 0 fails last".into())
                                         }
                                         1 => {

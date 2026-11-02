@@ -250,6 +250,11 @@ where
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -290,7 +295,7 @@ where
     type Output = Result<O, OperationError>;
     type IntoFuture = DurableFuture<O>;
 
-    fn into_future(mut self) -> Self::IntoFuture {
+    fn into_future(self) -> Self::IntoFuture {
         use crate::child::ChildExecution;
 
         // The block is a child context on the wire; validate against the
@@ -308,7 +313,7 @@ where
         let serdes = Arc::new(self.serdes);
         let loop_serdes = Arc::clone(&serdes);
 
-        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
+        let gate = self.ctx.clone();
 
         let execution = ChildExecution {
             ctx: self.ctx,
@@ -323,6 +328,6 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
+        DurableFuture::for_operation(&gate, execution.execute())
     }
 }
