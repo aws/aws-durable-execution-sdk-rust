@@ -105,6 +105,12 @@ where
                     .instrument(child_span)
                     .await
                     .map_err(Into::into);
+                // The body returned, so the child is finished. An operation
+                // it started and did not await writes no further checkpoint
+                // (see `Admission`). The child's own terminal update below
+                // is written through the parent context, whose owners do not
+                // include this child, so it is admitted.
+                after.abandon_child();
                 after.settle(mode, result).await
             }
         }
@@ -313,6 +319,12 @@ where
     O: Send + 'static,
     S: Serdes<O>,
 {
+    /// Abandons the child context: every later checkpoint update from a
+    /// context inside it is rejected.
+    fn abandon_child(&self) {
+        self.ctx.admission().abandon([self.wire_id.as_str()]);
+    }
+
     /// Settles the child body's outcome.
     ///
     /// Live mode checkpoints it: success through [`build_succeed_update`]

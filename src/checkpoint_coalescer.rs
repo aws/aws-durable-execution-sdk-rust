@@ -53,6 +53,7 @@
 //!   contributor, and a chunk persisted before a later chunk fails still
 //!   emits its events even though the batch as a whole publishes the error.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -92,6 +93,53 @@ impl TrackedUpdate {
     pub(crate) fn capture(update: OperationUpdate, attempt: u32) -> Self {
         let event = PendingTransitionEvent::capture(&update, attempt);
         Self { update, event }
+    }
+}
+
+/// Abandoned owners of one invocation: non-virtual child contexts, batch
+/// items included.
+///
+/// An owner is named by the wire ID of its child context. Every context
+/// carries the owners it runs in, outermost first (see
+/// `DurableContext::owners`). A checkpoint update is admitted only when no
+/// owner of the context that writes it is abandoned. So once an owner is
+/// abandoned, no later update from it or from any context nested in it is
+/// sent.
+///
+/// The admission check runs where an update enters the ordered write path:
+/// inside [`CheckpointCoalescer::join`] under the buffer lock, and after a
+/// direct write takes the checkpoint-token lock. An update admitted before
+/// an owner is abandoned is already in the buffer or already holds the
+/// token lock. The parent's final update is issued after the abandonment,
+/// so it is written after that update. [`Self::abandon`] takes only the
+/// admission lock, and the buffer lock is never taken inside it.
+#[derive(Debug, Default)]
+pub(crate) struct Admission {
+    abandoned: Mutex<BTreeSet<String>>,
+}
+
+impl Admission {
+    /// Creates an admission with no abandoned owner.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks these owners abandoned. Later updates from them are rejected.
+    pub(crate) fn abandon<'a>(&self, owners: impl IntoIterator<Item = &'a str>) {
+        let mut abandoned = self
+            .abandoned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        abandoned.extend(owners.into_iter().map(str::to_owned));
+    }
+
+    /// True when no owner in `owners` is abandoned.
+    pub(crate) fn admits(&self, owners: &[String]) -> bool {
+        let abandoned = self
+            .abandoned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        !owners.iter().any(|owner| abandoned.contains(owner))
     }
 }
 
@@ -343,10 +391,23 @@ impl CheckpointCoalescer {
     /// of each update's lifecycle event along with it: from this point the
     /// flusher that persists the update, not the (cancellable)
     /// contributor, is responsible for emitting it.
-    pub(crate) fn join(&self, updates: Vec<TrackedUpdate>) -> Arc<CheckpointBatch> {
+    ///
+    /// Returns `None` and buffers nothing when `admission` rejects one of
+    /// `owners` (see [`Admission`]). The check runs under the buffer lock.
+    /// So an update is either buffered before its owner is abandoned, and
+    /// written before any update buffered later, or it is rejected.
+    pub(crate) fn join(
+        &self,
+        admission: &Admission,
+        owners: &[String],
+        updates: Vec<TrackedUpdate>,
+    ) -> Option<Arc<CheckpointBatch>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if !admission.admits(owners) {
+            return None;
+        }
         state.pending.extend(updates);
-        Arc::clone(state.batch.get_or_insert_with(Arc::default))
+        Some(Arc::clone(state.batch.get_or_insert_with(Arc::default)))
     }
 
     /// Claims `target`'s buffered updates for flushing, if `target` is still
@@ -400,6 +461,17 @@ impl CheckpointCoalescer {
         state.latched.clone()
     }
 
+    /// The number of buffered updates. Tests use it to wait until an
+    /// update is buffered.
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .len()
+    }
+
     /// Drains the retained write failures, in occurrence order. The
     /// failure latch is deliberately NOT cleared (see
     /// [`CoalescerState::latched`]): the write channel stays poisoned for
@@ -432,6 +504,47 @@ mod tests {
         TrackedUpdate::capture(update, 1)
     }
 
+    /// Joins one update from the root, which no abandonment can reject.
+    fn join(coalescer: &CheckpointCoalescer, id: &str) -> Arc<CheckpointBatch> {
+        coalescer
+            .join(&Admission::new(), &[], vec![track(dummy_update(id))])
+            .expect("the root is always admitted")
+    }
+
+    #[test]
+    fn admission_rejects_an_abandoned_owner_and_its_descendants() {
+        let admission = Admission::new();
+        let outer = vec!["item".to_owned()];
+        let nested = vec!["item".to_owned(), "inner".to_owned()];
+        let sibling = vec!["other".to_owned()];
+        assert!(admission.admits(&outer), "nothing is abandoned yet");
+        admission.abandon(["item"]);
+        assert!(!admission.admits(&outer), "the abandoned owner is rejected");
+        assert!(
+            !admission.admits(&nested),
+            "a context nested in the abandoned owner is rejected"
+        );
+        assert!(admission.admits(&sibling), "a sibling owner is admitted");
+        assert!(admission.admits(&[]), "the root is admitted");
+    }
+
+    #[test]
+    fn join_buffers_nothing_for_an_abandoned_owner() {
+        let coalescer = CheckpointCoalescer::new(Duration::ZERO);
+        let admission = Admission::new();
+        admission.abandon(["item"]);
+        let rejected = coalescer.join(
+            &admission,
+            &["item".to_owned()],
+            vec![track(dummy_update("a"))],
+        );
+        assert!(rejected.is_none(), "the rejected join returns no batch");
+        assert!(
+            coalescer.take_any().is_none(),
+            "the rejected join opened no batch and buffered nothing"
+        );
+    }
+
     fn dummy_output() -> CheckpointOutput {
         CheckpointOutput {
             checkpoint_token: Some("token-1".to_owned()),
@@ -443,8 +556,8 @@ mod tests {
     #[test]
     fn joins_accumulate_into_one_batch() {
         let coalescer = CheckpointCoalescer::new(Duration::from_millis(10));
-        let first = coalescer.join(vec![track(dummy_update("a"))]);
-        let second = coalescer.join(vec![track(dummy_update("b"))]);
+        let first = join(&coalescer, "a");
+        let second = join(&coalescer, "b");
         assert!(
             Arc::ptr_eq(&first, &second),
             "concurrent joins share one batch"
@@ -457,11 +570,11 @@ mod tests {
     #[test]
     fn take_batch_is_a_no_op_for_a_stale_batch() {
         let coalescer = CheckpointCoalescer::new(Duration::from_millis(10));
-        let old = coalescer.join(vec![track(dummy_update("a"))]);
+        let old = join(&coalescer, "a");
         assert!(coalescer.take_batch(&old).is_some());
 
         // A new batch opens after the take; the stale handle cannot claim it.
-        let new = coalescer.join(vec![track(dummy_update("b"))]);
+        let new = join(&coalescer, "b");
         assert!(!Arc::ptr_eq(&old, &new), "a fresh batch opened");
         assert!(
             coalescer.take_batch(&old).is_none(),

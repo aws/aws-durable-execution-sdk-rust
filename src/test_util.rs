@@ -5911,8 +5911,8 @@ mod tests {
                                             Ok(item)
                                         }
                                         _ => {
-                                            // Parks; excluded once the
-                                            // trigger fires.
+                                            // Parks; reported as STARTED
+                                            // once the trigger fires.
                                             child
                                                 .wait(std::time::Duration::from_secs(1))
                                                 .name("stall")
@@ -5953,8 +5953,9 @@ mod tests {
 
         assert!(result.is_success(), "{:?}", result.error_message());
         // The predicate fired at item 0's committed failure; items 0 and 1
-        // both settled and are in the result, parked item 2 is excluded.
-        assert_eq!(result.output(), Some(&"PREDICATE_MATCHED:2:1:1".to_owned()));
+        // both settled and are in the result, and parked item 2 is reported
+        // as STARTED, so the batch counts three items.
+        assert_eq!(result.output(), Some(&"PREDICATE_MATCHED:3:1:1".to_owned()));
         // The trigger fired on the first invocation: the batch never
         // suspended, so the fresh run and any replay cannot disagree.
         assert_eq!(

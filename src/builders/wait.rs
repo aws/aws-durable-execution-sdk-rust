@@ -126,7 +126,7 @@ impl IntoFuture for WaitBuilder {
 
         preflight_identity!(self, "Wait", crate::wait::WAIT_SUB_TYPE);
 
-        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
+        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
 
         let execution = WaitExecution {
             ctx: self.ctx,
@@ -135,6 +135,6 @@ impl IntoFuture for WaitBuilder {
             duration_secs: self.duration_secs,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
+        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
     }
 }

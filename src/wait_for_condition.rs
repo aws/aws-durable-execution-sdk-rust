@@ -572,7 +572,10 @@ where
     /// so each supplies a small checkpoint-failure-derived terminal `FAIL`:
     /// the record persisted before the execution dies when the
     /// rejection is permanent.
-    async fn checkpoint_unrecoverable<T>(&self, err: crate::client::ExecutionClientError) -> T {
+    async fn checkpoint_unrecoverable<T: crate::context::NoRuntimeOutcome>(
+        &self,
+        err: crate::client::ExecutionClientError,
+    ) -> T {
         let cwire = crate::error::checkpoint_failure_wire(&err);
         let terminal = build_wfc_fail_update(
             &self.wire_id,

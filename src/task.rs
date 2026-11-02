@@ -656,6 +656,51 @@ where
     Ok(())
 }
 
+/// Polls `future` to completion and returns its value, or the payload of a
+/// panic from one of its polls or from its destructor.
+///
+/// A detached task delivers its outcome nowhere. A detached task whose
+/// consumer awaits a result therefore runs its work through this function
+/// and sends the outcome itself. So a panic in that work resumes on the
+/// consumer with its original payload, as for every other SDK task.
+///
+/// The precedence is the task gateway's (see `Wrapped`). A poll that
+/// returns `Ready` drops the future at once; when that destructor panics,
+/// its panic is the outcome and the value is dropped. A poll that panics is
+/// the outcome, and a destructor panic after it is discarded.
+pub(crate) async fn catch_panic<F: Future>(future: F) -> TaskOutcome<F::Output> {
+    let mut inner = Some(Box::pin(future));
+    std::future::poll_fn(move |cx| {
+        #[expect(clippy::expect_used)]
+        // reason: the future is taken only when this poll returns `Ready`,
+        // and the `.await` below never polls a finished `poll_fn` again.
+        let future = inner
+            .as_mut()
+            .expect("a finished catch_panic is never polled");
+        let polled = catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)));
+        let outcome = match polled {
+            Ok(Poll::Pending) => return Poll::Pending,
+            Ok(Poll::Ready(value)) => {
+                let finished = inner.take();
+                match catch_unwind(AssertUnwindSafe(move || drop(finished))) {
+                    Ok(()) => TaskOutcome::Value(value),
+                    Err(payload) => {
+                        discard_panic(move || drop(value));
+                        TaskOutcome::Panicked(payload)
+                    }
+                }
+            }
+            Err(payload) => {
+                let finished = inner.take();
+                discard_panic(move || drop(finished));
+                TaskOutcome::Panicked(payload)
+            }
+        };
+        Poll::Ready(outcome)
+    })
+    .await
+}
+
 /// A set of operation tasks whose outcomes are joined in completion order.
 ///
 /// The outcomes of finished tasks wait in a queue it shares with its tasks;
@@ -827,8 +872,8 @@ mod tests {
 
     use super::test_support::{poll_once_without_runtime, str_payload, with_current_tasks};
     use super::{
-        NoRuntime, TaskOutcome, TaskTracker, TrackedJoinSet, run_blocking, spawn_detached,
-        spawn_tracked,
+        NoRuntime, TaskOutcome, TaskTracker, TrackedJoinSet, catch_panic, run_blocking,
+        spawn_detached, spawn_tracked,
     };
     use crate::driver::TaskOwnership;
 
@@ -1384,5 +1429,83 @@ mod tests {
         assert_eq!(tasks.live(), 0);
         assert_eq!(own.blessed_count(), 0);
         drop(waker);
+    }
+
+    /// A value whose destructor panics with `payload`.
+    struct PanicOnDrop(&'static str);
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("{}", self.0);
+        }
+    }
+
+    /// A future that returns `Ready` with a value whose destructor panics,
+    /// and whose own destructor panics with `"future drop"`.
+    struct ReadyThenDropPanic;
+
+    impl Future for ReadyThenDropPanic {
+        type Output = PanicOnDrop;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<PanicOnDrop> {
+            Poll::Ready(PanicOnDrop("value drop"))
+        }
+    }
+
+    impl Drop for ReadyThenDropPanic {
+        fn drop(&mut self) {
+            panic!("future drop");
+        }
+    }
+
+    /// A future whose poll panics with `"poll"` and whose destructor
+    /// panics with `"future drop"`.
+    struct PollPanicThenDropPanic;
+
+    impl Future for PollPanicThenDropPanic {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            panic!("poll");
+        }
+    }
+
+    impl Drop for PollPanicThenDropPanic {
+        fn drop(&mut self) {
+            panic!("future drop");
+        }
+    }
+
+    /// A future that returns `Ready` and then panics in its destructor:
+    /// that panic is the outcome, as in the task gateway, and the value's
+    /// own destructor panic is discarded.
+    #[tokio::test]
+    async fn catch_panic_returns_a_destructor_panic_after_ready() {
+        let TaskOutcome::Panicked(payload) = catch_panic(ReadyThenDropPanic).await else {
+            panic!("expected the destructor's panic");
+        };
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| str_payload(payload.as_ref()));
+        assert_eq!(message, Some("future drop"));
+    }
+
+    /// A poll's panic wins over a destructor panic after it.
+    #[tokio::test]
+    async fn catch_panic_prefers_the_poll_panic() {
+        let TaskOutcome::Panicked(payload) = catch_panic(PollPanicThenDropPanic).await else {
+            panic!("expected the poll's panic");
+        };
+        assert_eq!(str_payload(payload.as_ref()), Some("poll"));
+    }
+
+    /// A future that finishes normally gives its value.
+    #[tokio::test]
+    async fn catch_panic_returns_the_value() {
+        let TaskOutcome::Value(value) = catch_panic(async { 7_u32 }).await else {
+            panic!("expected the value");
+        };
+        assert_eq!(value, 7);
     }
 }

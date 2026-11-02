@@ -183,6 +183,8 @@ where
         // context for its `result()` future, which must park a scope that is
         // still being driven when it is awaited. `Callback::result()` does
         // its own rebind against this caller-scoped context.
+        // The admission check every other terminal runs in `lazy_scoped`.
+        let gate = self.ctx.clone();
         let execution = CreateCallbackExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -193,7 +195,11 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::from_async(execution.execute())
+        DurableFuture::from_async(async move {
+            gate.admit_operation().await;
+            drop(gate);
+            execution.execute().await
+        })
     }
 }
 
@@ -456,7 +462,7 @@ where
 
         preflight_identity!(self, "Context", crate::callback::WFCB_SUB_TYPE);
 
-        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
+        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
 
         let execution = WaitForCallbackExecution {
             ctx: self.ctx,
@@ -470,7 +476,7 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
+        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
     }
 }
 

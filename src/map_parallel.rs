@@ -20,6 +20,7 @@
 //! - Each branch runs in its own child context
 //! - Fail-fast when `min_successful` can no longer be met
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -66,20 +67,25 @@ pub enum BatchItemStatus {
     Succeeded,
     /// The item failed.
     Failed,
-    /// The item had started but was not terminal when the batch completed.
+    /// The item was dispatched and was not terminal when the batch
+    /// completed.
     ///
-    /// Reported on replay from the batch decision record's started set:
-    /// the item began under the live run but a completion trigger settled
-    /// the batch before it finished. It carries no result and no error,
-    /// and its child checkpoints are never consulted.
+    /// It appears live and on replay. A completion rule that ends the batch
+    /// early leaves running and parked items in this status. The SDK
+    /// cancels a running item at its next `.await`, and none of its later
+    /// checkpoints is written. Its child context can still show
+    /// `Succeeded` or `Failed` in history when its outcome was recorded
+    /// before the batch completed. The item carries no result and no
+    /// error.
     Started,
 }
 
 /// The outcome of one item or branch in a batch operation.
 ///
-/// Contains the index, optional display name, terminal status, and either
-/// the result value or the item's complete recorded failure record (type
-/// identifier, message, opaque `error_data` payload, and stack trace).
+/// Contains the index, optional display name, status, and either the
+/// result value or the item's complete recorded failure record (type
+/// identifier, message, opaque `error_data` payload, and stack trace). A
+/// [`BatchItemStatus::Started`] item carries neither.
 ///
 /// # Examples
 ///
@@ -103,7 +109,8 @@ pub struct BatchItem<O> {
     pub index: usize,
     /// Display name (if any).
     pub name: String,
-    /// Terminal status.
+    /// Status: `Succeeded` or `Failed` for a terminal item, or `Started`
+    /// for an item that was not terminal when the batch completed.
     pub status: BatchItemStatus,
     /// Result value (only meaningful when status is Succeeded).
     pub result: Option<O>,
@@ -527,7 +534,9 @@ impl<'a> BatchStats<'a> {
 /// accessor methods for building conformance projections.
 ///
 /// Only items that were actually started are included: items that never
-/// started due to early completion are omitted.
+/// started due to early completion are omitted. An item that was still
+/// running or parked when the completion rule ended the batch appears as
+/// [`BatchItemStatus::Started`], live and on replay.
 ///
 /// # Examples
 ///
@@ -560,7 +569,8 @@ impl<'a> BatchStats<'a> {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct BatchResult<O> {
-    /// Per-item outcomes in input order (only started items).
+    /// Per-item outcomes in input order (only started items, including
+    /// [`BatchItemStatus::Started`] ones).
     pub items: Vec<BatchItem<O>>,
     /// Why the batch completed.
     pub reason: CompletionReason,
@@ -575,7 +585,8 @@ impl<O> BatchResult<O> {
 
     /// Returns successful results in input order.
     ///
-    /// Failed or not-started items are omitted.
+    /// Failed items, `Started` items, and items that never started are
+    /// omitted.
     pub fn results(&self) -> Vec<&O> {
         self.items
             .iter()
@@ -623,6 +634,9 @@ impl<O> BatchResult<O> {
     }
 
     /// Returns the total number of items that were started.
+    ///
+    /// The count includes [`BatchItemStatus::Started`] items, which can
+    /// appear live when the completion rule ends the batch early.
     pub fn total_count(&self) -> usize {
         self.items.len()
     }
@@ -857,9 +871,10 @@ fn collect_successful<O>(batch_result: BatchResult<O>) -> Result<Vec<O>, Operati
                 }
                 // Within tolerance: skip this item in the Vec<O> output.
             }
-            // Started-but-not-terminal at batch completion (replayed from
-            // the decision record): carries no value, so it is skipped in
-            // the Vec<O> success view exactly like a tolerated failure.
+            // Started-but-not-terminal at batch completion (live, or
+            // replayed from the decision record): carries no value, so it is
+            // skipped in the Vec<O> success view exactly like a tolerated
+            // failure.
             BatchItemStatus::Started => {}
         }
     }
@@ -1009,6 +1024,10 @@ where
     let child_wire = req.child_op_id.wire().to_owned();
     let serdes_ctx = SerdesContext::new(child_wire.clone(), req.ctx.execution_arn());
     let serdes = &req.serdes;
+    // The item's own terminal update is written on the item's behalf: once
+    // the batch abandoned the item at early completion, the write is
+    // rejected, as every write of the item's body is.
+    let writer = req.ctx.with_owner(req.child_op_id.positional());
 
     // FLAT nesting emits no child-context events: only the value transform
     // (round-trip for live == replay consistency) happens here.
@@ -1104,7 +1123,7 @@ where
                         &req.parent_wire,
                         &wire,
                     );
-                    if let Err(client_err) = req.ctx.checkpoint_updates(vec![update]).await {
+                    if let Err(client_err) = writer.checkpoint_updates(vec![update]).await {
                         // Audit (#43): batch child FAIL (serialization):
                         // the item closure ran; the failed FAIL write
                         // routes unrecoverable with a minimal terminal
@@ -1117,8 +1136,7 @@ where
                             &req.parent_wire,
                             &cwire,
                         );
-                        return req
-                            .ctx
+                        return writer
                             .checkpoint_failure_unrecoverable(
                                 &child_wire,
                                 client_err,
@@ -1155,7 +1173,7 @@ where
                 .build()
                 .expect("all required OperationUpdate fields set");
 
-            if let Err(err) = req.ctx.checkpoint_updates(vec![update]).await {
+            if let Err(err) = writer.checkpoint_updates(vec![update]).await {
                 // Audit (#43): batch child SUCCEED: the item closure
                 // ran, so its side effects need a recorded outcome. A
                 // permanent rejection persists a small terminal FAIL
@@ -1170,8 +1188,7 @@ where
                     &req.parent_wire,
                     &cwire,
                 );
-                return req
-                    .ctx
+                return writer
                     .checkpoint_failure_unrecoverable(&child_wire, err, Some(terminal))
                     .await;
             }
@@ -1223,7 +1240,7 @@ where
                 .build()
                 .expect("all required OperationUpdate fields set");
 
-            if let Err(client_err) = req.ctx.checkpoint_updates(vec![update]).await {
+            if let Err(client_err) = writer.checkpoint_updates(vec![update]).await {
                 // Audit (#43): batch child FAIL: the item closure ran
                 // and failed; the failed FAIL write routes unrecoverable
                 // with a minimal terminal FAIL retry (the original
@@ -1238,8 +1255,7 @@ where
                     &req.parent_wire,
                     &cwire,
                 );
-                return req
-                    .ctx
+                return writer
                     .checkpoint_failure_unrecoverable(&child_wire, client_err, Some(terminal))
                     .await;
             }
@@ -1450,13 +1466,14 @@ impl<O> BatchProgress<O> {
 
     /// Records one item outcome: a terminal item feeds the completion
     /// statistics and its result slot; a suspended item keeps its slot.
+    /// Returns whether the outcome was terminal.
     fn settle_outcome(
         &mut self,
         completion_cfg: &crate::builders::map_parallel::CompletionConfig,
         total_items: usize,
         index: usize,
         outcome: ItemOutcome<O>,
-    ) {
+    ) -> bool {
         match outcome {
             ItemOutcome::Terminal(item) => {
                 self.tracker
@@ -1464,10 +1481,12 @@ impl<O> BatchProgress<O> {
                 if let Some(slot) = self.results.get_mut(index) {
                     *slot = Some(item);
                 }
+                true
             }
             ItemOutcome::Suspended => {
                 self.suspended_count += 1;
                 self.any_suspended = true;
+                false
             }
         }
     }
@@ -1496,17 +1515,22 @@ where
     /// call) is returned. A panic of the task resumes unwinding here, with
     /// its original payload, and nothing is recorded for it: a panic fails
     /// the invocation, not the item.
+    ///
+    /// Returns the index of the item when its outcome was terminal, and
+    /// `None` when the item parked. A parked item is not terminal, so the
+    /// caller keeps it among the owners an early completion abandons.
     fn settle_joined(
         &self,
         joined: TaskOutcome<ItemJoin<O>>,
         progress: &mut BatchProgress<O>,
-    ) -> Result<(), OperationError> {
+    ) -> Result<Option<usize>, OperationError> {
         let (index, outcome) = joined.into_value();
         // A coordinator-level failure surfaces; the caller's join set drop
         // aborts the remaining branches.
         let outcome = outcome?;
-        progress.settle_outcome(self.completion_cfg, self.total_items, index, outcome);
-        Ok(())
+        let terminal =
+            progress.settle_outcome(self.completion_cfg, self.total_items, index, outcome);
+        Ok(terminal.then_some(index))
     }
 
     /// Resolves a recorded-terminal child inline on the coordinator, in
@@ -1588,7 +1612,7 @@ where
                         "re-executed replay child joined an unexpected task",
                     ));
                 }
-                self.settle_joined(joined, progress)
+                self.settle_joined(joined, progress).map(drop)
             }
         }
     }
@@ -1942,6 +1966,10 @@ where
 
     let mut progress = BatchProgress::<O>::new(total_items);
     let mut running: usize = 0;
+    // The owner of each dispatched item that is not terminal, running or
+    // parked: its index and its child wire ID. At early completion these
+    // owners are abandoned (see `Admission`).
+    let mut running_owners: BTreeMap<usize, String> = BTreeMap::new();
     let mut next_index: usize = 0;
 
     // A child holding ANY checkpoint record was admitted by a prior
@@ -2008,9 +2036,9 @@ where
 
     loop {
         // Dispatch while capacity remains and not-started eligible work exists.
-        // A completion trigger (`tracker.stop_reason`) halts new dispatch;
-        // already-running branches are still drained below (in-flight
-        // branches always complete). Under a replay plan the trigger check
+        // A completion trigger (`tracker.stop_reason`) halts new dispatch,
+        // and the join below abandons the running items. Under a replay
+        // plan the trigger check
         // is bypassed: the recorded admission set IS the outcome being
         // reproduced, so every admitted item is dispatched regardless of
         // what the thresholds would re-derive, and the recorded reason is
@@ -2177,6 +2205,7 @@ where
                 .spawn_item(&mut join_set, req)
                 .map_err(NoRuntime::operation_error)?;
             running += 1;
+            running_owners.insert(branch_index, branch_wire);
         }
 
         if running == 0 {
@@ -2192,12 +2221,31 @@ where
             break; // set is empty: unreachable while running > 0
         };
         running -= 1;
-        env.settle_joined(joined, &mut progress)?;
+        // A parked item stays among the owners: it is not terminal, and an
+        // operation it created but did not await must not start after an
+        // early completion.
+        if let Some(settled) = env.settle_joined(joined, &mut progress)? {
+            running_owners.remove(&settled);
+        }
+
+        // Early completion: the completion rule is met, so the batch ends
+        // now, without waiting for its running items (as in JS). Their
+        // owners are abandoned first, so a write they issue from now on is
+        // rejected. Then their tasks are aborted and never joined: an
+        // outcome of an abandoned item is never observed. Each aborted task
+        // stays counted until it unwinds. Under a replay plan the recorded
+        // outcome is reproduced instead, so nothing is abandoned.
+        if replay_plan.is_none() && progress.tracker.stop_reason.is_some() {
+            ctx.admission()
+                .abandon(running_owners.values().map(String::as_str));
+            join_set.abort_all();
+            break;
+        }
     }
 
     let BatchProgress {
         tracker,
-        results,
+        mut results,
         any_suspended,
         started,
         ..
@@ -2210,8 +2258,8 @@ where
     // and reports PENDING for its subtree. `suspend_now` never returns; the
     // coordinator future is dropped at teardown, aborting the guards.
     // Started-not-terminal children replay on the next invocation. When a
-    // trigger DID fire, parked branches are excluded (like never-started
-    // work) and the batch completes normally. Under a replay plan the
+    // trigger DID fire, the batch completes normally, and parked branches
+    // are reported as STARTED below. Under a replay plan the
     // trigger state is not consulted (thresholds re-fire spuriously on
     // recorded outcomes): a parked reconstruction always suspends, so an
     // admitted item is never silently dropped from a recorded result.
@@ -2219,9 +2267,30 @@ where
         return Ok(ctx.suspend_now::<BatchResult<O>>().await);
     }
 
-    // 9. Assemble results in input order (terminal items; suspended and
-    // never-started branches are omitted: except under a replay plan,
-    // where the record's started set appears as STARTED items).
+    // 9. Assemble results in input order. On the live path, every
+    // dispatched item that is not terminal (running when the trigger fired,
+    // parked, or finished but not joined) is reported as STARTED, as in JS.
+    // Never-started items are omitted. Under a replay plan the record's
+    // started set already appears as STARTED items.
+    if replay_plan.is_none() {
+        // `results` and `started` both have one entry per input item.
+        for (i, (slot, started)) in results.iter_mut().zip(&started).enumerate() {
+            if slot.is_none() && *started {
+                *slot = Some(BatchItem {
+                    index: i,
+                    name: item_namer
+                        .as_ref()
+                        .map_or_else(String::new, |namer| namer(i)),
+                    status: BatchItemStatus::Started,
+                    result: None,
+                    error_message: None,
+                    error_type: None,
+                    error_data: None,
+                    stack_trace: Vec::new(),
+                });
+            }
+        }
+    }
     let final_items: Vec<BatchItem<O>> = results.into_iter().flatten().collect();
 
     // 8b. Under a replay plan, the batch outcome is already durably
@@ -2501,8 +2570,9 @@ struct BatchDecisionRecord {
 }
 
 /// Builds the decision record for a completed batch: `ever_started` is the
-/// admitted prefix length, `items` are the terminal outcomes, and the
-/// shorter of the two index sets is the one written.
+/// admitted prefix length, `items` are the reported items, and the shorter
+/// of the two index sets is the one written. Only a `Succeeded` or `Failed`
+/// item counts as completed.
 fn build_decision_record<O>(
     items: &[BatchItem<O>],
     ever_started: usize,
@@ -2510,6 +2580,11 @@ fn build_decision_record<O>(
 ) -> BatchDecisionRecord {
     let mut completed_flags = vec![false; ever_started];
     for item in items {
+        // A STARTED item was not terminal when the batch completed, so it
+        // stays in the started set.
+        if item.status == BatchItemStatus::Started {
+            continue;
+        }
         if let Some(slot) = completed_flags.get_mut(item.index) {
             *slot = true;
         }
@@ -6924,6 +6999,65 @@ mod tests {
         );
     }
 
+    /// Under a replay plan, a completion rule that fires again on the
+    /// reconstructed outcomes abandons and aborts nothing. The record says
+    /// items 0 and 1 both completed, and the current configuration needs
+    /// only one success. Item 0 settles first and meets that rule while
+    /// item 1 is still running. The batch still waits for item 1 and
+    /// reports both recorded completions, because the record, not the
+    /// re-derived trigger, decides the outcome.
+    #[tokio::test]
+    async fn replay_plan_trigger_keeps_recorded_completed_items() {
+        let decision =
+            r#"{"totalCount":2,"completionReason":"MIN_SUCCESSFUL_REACHED","startedIndexes":[]}"#;
+        let log = CheckpointLog::from_records(vec![decision_record_parent("1", decision)]);
+        let ctx = test_ctx(log);
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_probe = Arc::clone(&finished);
+
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.map(vec![0_usize, 1], move |_child, _item, idx| {
+                let finished = Arc::clone(&finished_probe);
+                async move {
+                    if idx == 1 {
+                        // Item 0 settles while item 1 is still running.
+                        for _ in 0..20 {
+                            tokio::task::yield_now().await;
+                        }
+                        finished.store(true, Ordering::SeqCst);
+                    }
+                    Ok(format!("flat-{idx}"))
+                }
+            })
+            .nesting(NestingMode::Flat)
+            .max_concurrency(2)
+            .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+            .await_batch(),
+        )
+        .await
+        .expect("the replay resolves")
+        .expect("the replay succeeds");
+
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        let items: Vec<(usize, BatchItemStatus, Option<String>)> = batch
+            .items
+            .iter()
+            .map(|i| (i.index, i.status, i.result.clone()))
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                (0, BatchItemStatus::Succeeded, Some("flat-0".to_owned())),
+                (1, BatchItemStatus::Succeeded, Some("flat-1".to_owned())),
+            ],
+            "both recorded completions are reconstructed"
+        );
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "item 1 ran to its end and was not aborted"
+        );
+    }
     #[test]
     fn decision_record_writes_the_shorter_index_set() {
         let items = vec![
@@ -7183,6 +7317,825 @@ mod tests {
         assert!(
             matches!(err.kind(), OperationErrorKind::NonDeterministicExecution(_)),
             "expected NonDeterministicExecution, got: {err:#}"
+        );
+    }
+
+    // Early completion: running items are abandoned, not drained.
+
+    /// The bound on every batch await in the early-completion tests.
+    const EARLY_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The wire IDs of the two items of a root map at position 1: the
+    /// batch claims its items' IDs next, in the root namespace.
+    fn item_wires() -> [String; 2] {
+        [
+            crate::engine::compute_wire_id_public("2"),
+            crate::engine::compute_wire_id_public("3"),
+        ]
+    }
+
+    /// The number of recorded updates with `action` for item `index`'s
+    /// child context.
+    fn item_action_count(
+        client: &crate::client::InMemoryExecutionClient,
+        index: usize,
+        action: &OperationAction,
+    ) -> usize {
+        let wire = item_wires()[index].clone();
+        client
+            .recorded_updates()
+            .iter()
+            .filter(|u| u.id == wire && u.action() == action)
+            .count()
+    }
+
+    /// The statuses of a batch's items, in input order.
+    fn statuses<O>(batch: &BatchResult<O>) -> Vec<(usize, BatchItemStatus)> {
+        batch.items.iter().map(|i| (i.index, i.status)).collect()
+    }
+
+    /// A boxed item body future.
+    type ItemFut = Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>;
+
+    /// The body of the early-completion maps over `[0, 1]`. Item 0 waits
+    /// until item 1 runs, then runs a step that returns at once, or returns
+    /// `Err("boom")` from its body when `fail` is set. Item 1 holds `guard`
+    /// until its task is dropped, and runs a step whose body never returns.
+    /// So item 1 is running when item 0 settles.
+    fn early_body(
+        fail: bool,
+        guard: Arc<AtomicBool>,
+    ) -> impl Fn(DurableContext, i32, usize) -> ItemFut + Send + Sync + 'static {
+        let running = Arc::new(tokio::sync::Notify::new());
+        move |child, item, _idx| {
+            let guard = Arc::clone(&guard);
+            let running = Arc::clone(&running);
+            Box::pin(async move {
+                if item == 0 {
+                    running.notified().await;
+                    if fail {
+                        return Err("boom".into());
+                    }
+                    return Ok(child.step(|_| async { Ok(0_i32) }).name("fast").await?);
+                }
+                let _guard = SetOnDrop(guard);
+                running.notify_one();
+                Ok(child
+                    .step(|_| std::future::pending::<Result<i32, BoxError>>())
+                    .name("forever")
+                    .await?)
+            })
+        }
+    }
+
+    /// Sets its flag when dropped.
+    struct SetOnDrop(Arc<AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn no_guard() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    #[tokio::test]
+    async fn early_completion_does_not_wait_for_running_item() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.map(vec![0_i32, 1], early_body(false, no_guard()))
+                .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+                .await_batch(),
+        )
+        .await
+        .expect("the batch does not wait for its running item")
+        .expect("the batch succeeds");
+        assert_eq!(
+            statuses(&batch),
+            [
+                (0, BatchItemStatus::Succeeded),
+                (1, BatchItemStatus::Started)
+            ]
+        );
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        assert_eq!(batch.total_count(), 2);
+        assert_started_defaults(&batch.items[1], "");
+        assert_eq!(item_action_count(&client, 0, &OperationAction::Succeed), 1);
+        assert_eq!(item_action_count(&client, 1, &OperationAction::Succeed), 0);
+        // The batch abandoned only the item that was still running.
+        let [settled, running] = item_wires();
+        assert!(
+            ctx.admission().admits(&[settled]),
+            "item 0 is not abandoned"
+        );
+        assert!(!ctx.admission().admits(&[running]), "item 1 is abandoned");
+    }
+
+    /// A client that, at the batch parent's `SUCCEED`, yields until
+    /// `guard` is set (at most 1,000 times) and records whether it was.
+    #[derive(Debug)]
+    struct GuardAtParentWrite {
+        guard: Arc<AtomicBool>,
+        seen: Arc<AtomicBool>,
+    }
+
+    impl crate::client::ExecutionClient for GuardAtParentWrite {
+        fn checkpoint(
+            &self,
+            _arn: &str,
+            _token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::client::CheckpointOutput,
+                            crate::client::ExecutionClientError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            let parent = crate::engine::compute_wire_id_public("1");
+            let at_parent = updates
+                .iter()
+                .any(|u| u.id == parent && u.action() == &OperationAction::Succeed);
+            Box::pin(async move {
+                if at_parent {
+                    for _ in 0..1_000 {
+                        if self.guard.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    self.seen
+                        .store(self.guard.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                Ok(crate::client::CheckpointOutput {
+                    checkpoint_token: Some("token".to_owned()),
+                    updated_operations: Vec::new(),
+                    next_marker: None,
+                })
+            })
+        }
+
+        fn get_state(
+            &self,
+            _arn: &str,
+            _token: &str,
+            _marker: Option<&str>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::client::GetStateOutput,
+                            crate::client::ExecutionClientError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::client::GetStateOutput {
+                    operations: Vec::new(),
+                    next_marker: None,
+                })
+            })
+        }
+    }
+
+    /// The batch aborts its running items at the trigger, before it writes
+    /// its own `SUCCEED`. So item 1's task unwinds while that write is in
+    /// flight. Without the abort, the task would be dropped only with the
+    /// join set, after the write.
+    #[tokio::test]
+    async fn early_completion_aborts_running_item_before_parent_write() {
+        let guard = no_guard();
+        let seen = no_guard();
+        let client = Arc::new(GuardAtParentWrite {
+            guard: Arc::clone(&guard),
+            seen: Arc::clone(&seen),
+        });
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+        );
+        tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.map(vec![0_i32, 1], early_body(false, Arc::clone(&guard)))
+                .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+                .await_batch(),
+        )
+        .await
+        .expect("the batch does not wait for its running item")
+        .expect("the batch succeeds");
+        assert!(
+            seen.load(Ordering::SeqCst),
+            "item 1's task unwound before the batch parent's SUCCEED was written"
+        );
+    }
+
+    /// A `Started` item of a `parallel` carries its branch name.
+    #[tokio::test]
+    async fn started_branch_keeps_its_name() {
+        use crate::future::Branch;
+
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.parallel(vec![
+                Branch::new("fast", |_child| async { Ok(0_i32) }),
+                Branch::new("slow", |_child| std::future::pending()),
+            ])
+            .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+            .await_batch(),
+        )
+        .await
+        .expect("the batch does not wait for its running branch")
+        .expect("the batch succeeds");
+        let started = batch
+            .items
+            .iter()
+            .find(|item| item.status == BatchItemStatus::Started)
+            .expect("the running branch is reported as Started");
+        assert_started_defaults(started, "slow");
+        assert_eq!(started.index, 1);
+    }
+
+    /// A live `Started` item carries `name`, no result, no error fields and
+    /// an empty stack trace.
+    fn assert_started_defaults<O: std::fmt::Debug>(item: &BatchItem<O>, name: &str) {
+        assert_eq!(item.status, BatchItemStatus::Started);
+        assert_eq!(item.name, name);
+        assert!(item.result.is_none(), "no result: {item:?}");
+        assert_eq!(item.error_message, None);
+        assert_eq!(item.error_type, None);
+        assert_eq!(item.error_data, None);
+        assert!(item.stack_trace.is_empty(), "no stack trace: {item:?}");
+    }
+
+    /// Yields until `client` recorded the `START` of the operation named
+    /// `name`, at most 1,000 times. Panics at the bound.
+    async fn wait_for_start(client: &crate::client::InMemoryExecutionClient, name: &str) {
+        for _ in 0..1_000 {
+            if has_start(client, name) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            has_start(client, name),
+            "the START of {name} was never recorded"
+        );
+    }
+
+    /// Whether `client` recorded the `START` of the operation named `name`.
+    fn has_start(client: &crate::client::InMemoryExecutionClient, name: &str) -> bool {
+        client
+            .recorded_updates()
+            .iter()
+            .any(|u| u.name() == Some(name) && u.action() == &OperationAction::Start)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn early_completion_abandons_running_item() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let observer = Arc::clone(&client);
+        let start = tokio::time::Instant::now();
+        let batch = tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.map(
+                vec![0_i32, 1],
+                move |child: DurableContext, item: i32, _idx| {
+                    let observer = Arc::clone(&observer);
+                    async move {
+                        if item == 0 {
+                            // Item 0 settles only once item 1 runs step `a`:
+                            // its START is recorded.
+                            wait_for_start(&observer, "a").await;
+                            return Ok(child.step(|_| async { Ok(0_i32) }).name("fast").await?);
+                        }
+                        child
+                            .step(|_| async {
+                                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                                Ok(1_i32)
+                            })
+                            .name("a")
+                            .await?;
+                        Ok(child.step(|_| async { Ok(2_i32) }).name("b").await?)
+                    }
+                },
+            )
+            .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+            .await_batch(),
+        )
+        .await
+        .expect("the batch returns")
+        .expect("the batch succeeds");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(800),
+            "the batch returned after {:?}, so it waited for item 1",
+            start.elapsed()
+        );
+        assert_eq!(
+            statuses(&batch),
+            [
+                (0, BatchItemStatus::Succeeded),
+                (1, BatchItemStatus::Started)
+            ]
+        );
+        assert!(has_start(&client, "a"), "item 1 entered step a");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(
+            !client
+                .recorded_updates()
+                .iter()
+                .any(|u| u.name() == Some("b")),
+            "the abandoned item started no later operation"
+        );
+        assert_eq!(item_action_count(&client, 1, &OperationAction::Succeed), 0);
+    }
+
+    #[tokio::test]
+    async fn fail_fast_does_not_wait_for_running_sibling() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.map(vec![0_i32, 1], early_body(true, no_guard()))
+                .await_batch(),
+        )
+        .await
+        .expect("the batch does not wait for its running item")
+        .expect("await_batch reports item failures as items");
+        assert_eq!(
+            statuses(&batch),
+            [(0, BatchItemStatus::Failed), (1, BatchItemStatus::Started)]
+        );
+        assert_eq!(batch.reason, CompletionReason::FailureToleranceExceeded);
+        assert_eq!(item_action_count(&client, 0, &OperationAction::Fail), 1);
+        assert_eq!(item_action_count(&client, 1, &OperationAction::Fail), 0);
+
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let err = tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.map(vec![0_i32, 1], early_body(true, no_guard()))
+                .into_future(),
+        )
+        .await
+        .expect("the batch does not wait for its running item")
+        .expect_err("fail-fast ends the batch with an error");
+        assert!(
+            matches!(
+                err.kind(),
+                OperationErrorKind::ChildContext(e) if matches!(e.kind(), ChildContextErrorKind::ChildFailed)
+            ),
+            "unexpected error kind: {:?}",
+            err.kind()
+        );
+        assert_eq!(item_action_count(&client, 0, &OperationAction::Fail), 1);
+        assert_eq!(item_action_count(&client, 1, &OperationAction::Fail), 0);
+    }
+
+    #[tokio::test]
+    async fn predicate_completion_does_not_wait_for_running_item() {
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let batch = tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.map(vec![0_i32, 1], early_body(false, no_guard()))
+                .completion(
+                    crate::builders::map_parallel::CompletionConfig::with_completion_predicate(
+                        |s| s.succeeded() >= 1,
+                    ),
+                )
+                .await_batch(),
+        )
+        .await
+        .expect("the batch does not wait for its running item")
+        .expect("the batch succeeds");
+        assert_eq!(
+            statuses(&batch),
+            [
+                (0, BatchItemStatus::Succeeded),
+                (1, BatchItemStatus::Started)
+            ]
+        );
+    }
+
+    #[test]
+    fn decision_record_keeps_started_items_out_of_completed() {
+        let item =
+            |index, status| BatchItem::<i32>::new(index, String::new(), status, None, None, None);
+        let record = build_decision_record(
+            &[
+                item(0, BatchItemStatus::Succeeded),
+                item(1, BatchItemStatus::Succeeded),
+                item(2, BatchItemStatus::Started),
+            ],
+            3,
+            CompletionReason::MinSuccessfulReached,
+        );
+        assert_eq!(record.started_indexes, Some(vec![2]));
+        assert_eq!(record.completed_indexes, None);
+    }
+
+    #[tokio::test]
+    async fn abandoned_item_leaves_no_task_after_invocation() {
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let guard = no_guard();
+        let handler = {
+            let ctx = ctx.clone();
+            let guard = Arc::clone(&guard);
+            async move {
+                ctx.map(vec![0_i32, 1], early_body(false, guard))
+                    .completion(
+                        crate::builders::map_parallel::CompletionConfig::with_min_successful(1),
+                    )
+                    .await_batch()
+                    .await
+                    .expect("the batch succeeds");
+                Ok::<_, crate::error::WireError>("done".to_owned())
+            }
+        };
+        let outcome = tokio::time::timeout(
+            EARLY_BOUND,
+            crate::driver::drive_invocation(handler, ownership, signal),
+        )
+        .await
+        .expect("the invocation does not wait for the abandoned item");
+        assert!(
+            matches!(outcome, Ok(crate::driver::InvocationOutcome::Complete(_))),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert!(
+            guard.load(Ordering::SeqCst),
+            "the abandoned item's task unwound before the invocation returned"
+        );
+        assert_eq!(ctx.suspension_signal().tasks().live(), 0);
+    }
+
+    /// Plain `.await` of an early-completing map or parallel returns only
+    /// the succeeded values: the running item, reported `Started`, adds
+    /// none.
+    #[tokio::test]
+    async fn early_completion_await_returns_only_succeeded_values() {
+        use crate::future::Branch;
+
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let values = tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.map(vec![0_i32, 1], early_body(false, no_guard()))
+                .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+                .into_future(),
+        )
+        .await
+        .expect("the map does not wait for its running item")
+        .expect("the map succeeds");
+        assert_eq!(values, [0]);
+
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let values = tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.parallel(vec![
+                Branch::new("fast", |_child| async { Ok(0_i32) }),
+                Branch::new("slow", |_child| std::future::pending()),
+            ])
+            .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+            .into_future(),
+        )
+        .await
+        .expect("the parallel does not wait for its running branch")
+        .expect("the parallel succeeds");
+        assert_eq!(values, [0]);
+    }
+
+    /// How the late item of `queued_outcome_batch` finishes.
+    #[derive(Debug, Clone, Copy)]
+    enum Late {
+        Value,
+        Error,
+        Panic,
+    }
+
+    /// Runs a FLAT map over `[0, 1]` with `min_successful(1)`, so that
+    /// both items have finished, item 0 first, before the coordinator joins
+    /// either outcome. Item 1 finishes as `late` says. The coordinator then
+    /// joins item 0, the trigger fires, and item 1's queued outcome is
+    /// never joined.
+    #[expect(clippy::panic)] // reason: the late item's panic is a case under test
+    async fn queued_outcome_batch(late: Late) -> BatchResult<i32> {
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let tasks = Arc::clone(ctx.suspension_signal().tasks());
+        let entered = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new([tokio::sync::Notify::new(), tokio::sync::Notify::new()]);
+        let body = {
+            let entered = Arc::clone(&entered);
+            let ready = Arc::clone(&ready);
+            move |_child: DurableContext, item: i32, idx: usize| {
+                let entered = Arc::clone(&entered);
+                let ready = Arc::clone(&ready);
+                async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    ready[idx].notified().await;
+                    if item == 0 {
+                        return Ok(0_i32);
+                    }
+                    match late {
+                        Late::Value => Ok(1_i32),
+                        Late::Error => Err("late failure".into()),
+                        Late::Panic => panic!("late panic"),
+                    }
+                }
+            }
+        };
+        let mut batch = std::pin::pin!(
+            ctx.map(vec![0_i32, 1], body)
+                .nesting(NestingMode::Flat)
+                .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+                .await_batch()
+        );
+
+        // 1. Drive the batch until both items wait.
+        let early = std::future::poll_fn(|cx| {
+            if entered.load(Ordering::SeqCst) == 2 {
+                return std::task::Poll::Ready(None);
+            }
+            if let std::task::Poll::Ready(done) = batch.as_mut().poll(cx) {
+                return std::task::Poll::Ready(Some(done));
+            }
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        });
+        let early = tokio::time::timeout(EARLY_BOUND, early)
+            .await
+            .expect("both items start");
+        assert!(early.is_none(), "the batch completed before its items ran");
+
+        // 2. Without polling the batch, let item 0 finish, then item 1.
+        //    Each finished task releases its count once its outcome is
+        //    queued.
+        let wait_live = |n: usize| {
+            let tasks = Arc::clone(&tasks);
+            async move {
+                for _ in 0..10_000 {
+                    if tasks.live() == n {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(tasks.live(), n, "the live task count never reached {n}");
+            }
+        };
+        ready[0].notify_one();
+        wait_live(1).await;
+        ready[1].notify_one();
+        wait_live(0).await;
+
+        // 3. The coordinator joins item 0 first, and the trigger fires.
+        tokio::time::timeout(EARLY_BOUND, batch)
+            .await
+            .expect("the batch completes")
+            .expect("the late outcome is not observed")
+    }
+
+    /// An item that finished but whose outcome the coordinator had not
+    /// joined when the trigger fired is reported `Started`: its value, its
+    /// error and its panic are never observed.
+    #[tokio::test]
+    async fn finished_unjoined_item_is_started() {
+        for late in [Late::Value, Late::Error, Late::Panic] {
+            let batch = queued_outcome_batch(late).await;
+            assert_eq!(
+                statuses(&batch),
+                [
+                    (0, BatchItemStatus::Succeeded),
+                    (1, BatchItemStatus::Started)
+                ],
+                "late {late:?}"
+            );
+            assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+            assert_started_defaults(&batch.items[1], "");
+        }
+    }
+
+    /// The payload of a terminal map or parallel parent with two
+    /// succeeded items.
+    fn terminal_batch_payload() -> String {
+        serde_json::json!({
+            "results": [
+                {"index": 0, "status": "SUCCEEDED", "result": "\"hello\""},
+                {"index": 1, "status": "SUCCEEDED", "result": "\"world\""}
+            ],
+            "reason": "ALL_COMPLETED"
+        })
+        .to_string()
+    }
+
+    /// An abandoned owner does not replay a recorded map or parallel from
+    /// `await_batch`. The terminal parent replays without a write, so only
+    /// the admission check at the terminal can hold it back.
+    #[tokio::test]
+    async fn abandoned_owner_replays_no_batch() {
+        use crate::future::Branch;
+
+        let bound = std::time::Duration::from_secs(1);
+        for parallel in [false, true] {
+            let log = CheckpointLog::from_records(vec![succeeded_record(
+                "1-1",
+                &terminal_batch_payload(),
+            )]);
+            let (root, client) = test_ctx_with_client(log);
+            let replay = |ctx: DurableContext| async move {
+                if parallel {
+                    ctx.parallel(vec![
+                        Branch::new("a", |_c| async { Ok(String::new()) }),
+                        Branch::new("b", |_c| async { Ok(String::new()) }),
+                    ])
+                    .await_batch()
+                    .await
+                } else {
+                    ctx.map(vec![0_i32, 1], |_c, _item, _idx| async {
+                        Ok(String::new())
+                    })
+                    .await_batch()
+                    .await
+                }
+            };
+            // The control: an owner that is not abandoned replays the batch.
+            let control = root.new_scoped_child("1");
+            let replayed = tokio::time::timeout(bound, replay(control))
+                .await
+                .expect("the recorded batch replays")
+                .expect("the replay succeeds");
+            assert_eq!(
+                replayed.results(),
+                [&"hello".to_owned(), &"world".to_owned()]
+            );
+
+            let item = root.new_scoped_child("1");
+            root.admission()
+                .abandon(item.owners().iter().map(String::as_str));
+            let replayed = tokio::time::timeout(bound, replay(item)).await;
+            assert!(
+                replayed.is_err(),
+                "parallel {parallel}: the recorded batch is not replayed for an abandoned owner"
+            );
+            assert!(client.recorded_updates().is_empty(), "nothing is sent");
+        }
+    }
+
+    /// An item that is abandoned while its body runs on another worker
+    /// thread does not write its terminal update afterwards. Item 1 blocks
+    /// its worker thread inside its body, so the abort cannot land, until
+    /// the batch has completed. Then item 1 returns, and its `SUCCEED` is
+    /// rejected because the item is abandoned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_item_terminal_write_is_rejected() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let tasks = Arc::clone(ctx.suspension_signal().tasks());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(std::sync::Mutex::new(Some(released)));
+        let body = {
+            let entered = Arc::clone(&entered);
+            move |_child: DurableContext, item: i32, _idx: usize| {
+                let entered = Arc::clone(&entered);
+                let released = Arc::clone(&released);
+                async move {
+                    if item == 0 {
+                        entered.notified().await;
+                        return Ok(0_i32);
+                    }
+                    let released = released.lock().unwrap().take().expect("item 1 runs once");
+                    entered.notify_one();
+                    // Blocks inside the poll, so the abort of this task
+                    // cannot take effect. `block_in_place` hands this
+                    // worker's queued tasks to another thread, so item 0
+                    // still runs.
+                    tokio::task::block_in_place(|| {
+                        released.recv().expect("the test releases item 1");
+                    });
+                    Ok(1_i32)
+                }
+            }
+        };
+        let batch = tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.map(vec![0_i32, 1], body)
+                .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+                .await_batch(),
+        )
+        .await
+        .expect("the batch does not wait for its running item")
+        .expect("the batch succeeds");
+        assert_eq!(
+            statuses(&batch),
+            [
+                (0, BatchItemStatus::Succeeded),
+                (1, BatchItemStatus::Started)
+            ]
+        );
+        assert_eq!(item_action_count(&client, 0, &OperationAction::Succeed), 1);
+
+        // Release item 1, and wait until its task and any write it started
+        // have ended.
+        release.send(()).expect("item 1 waits");
+        let mut ended = false;
+        for _ in 0..500 {
+            if tasks.live() == 0 {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ended, "item 1's task ended");
+        assert_eq!(
+            item_action_count(&client, 1, &OperationAction::Succeed),
+            0,
+            "the abandoned item wrote no terminal update"
+        );
+    }
+
+    /// A parked item is not terminal, so an early completion abandons it
+    /// too. An operation it created but did not await then never starts.
+    /// Item 1 creates a step future, parks on a wait, and its parked
+    /// outcome is joined. Only then does item 0 succeed and fire the
+    /// trigger: paused time advances item 0's timer only once every other
+    /// task is idle.
+    #[tokio::test(start_paused = true)]
+    async fn early_completion_abandons_parked_item() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let slot: Arc<std::sync::Mutex<Option<crate::DurableFuture<i32>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let ran = no_guard();
+        let body = {
+            let slot = Arc::clone(&slot);
+            let ran = Arc::clone(&ran);
+            move |child: DurableContext, item: i32, _idx: usize| {
+                let slot = Arc::clone(&slot);
+                let ran = Arc::clone(&ran);
+                async move {
+                    if item == 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        return Ok(0_i32);
+                    }
+                    let escaped = child
+                        .step(move |_| async move {
+                            ran.store(true, Ordering::SeqCst);
+                            Ok(5_i32)
+                        })
+                        .name("escaped")
+                        .future();
+                    *slot.lock().unwrap() = Some(escaped);
+                    child
+                        .wait(std::time::Duration::from_secs(5))
+                        .name("park")
+                        .await?;
+                    Ok(1_i32)
+                }
+            }
+        };
+        let batch = tokio::time::timeout(
+            EARLY_BOUND,
+            ctx.map(vec![0_i32, 1], body)
+                .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+                .await_batch(),
+        )
+        .await
+        .expect("the batch completes")
+        .expect("the batch succeeds");
+        assert_eq!(
+            statuses(&batch),
+            [
+                (0, BatchItemStatus::Succeeded),
+                (1, BatchItemStatus::Started)
+            ]
+        );
+        assert!(has_start(&client, "park"), "item 1 parked on its wait");
+        let [_, parked] = item_wires();
+        assert!(
+            !ctx.admission().admits(&[parked]),
+            "the parked item is abandoned"
+        );
+
+        let escaped = slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("item 1 stored its step future");
+        let awaited = tokio::time::timeout(std::time::Duration::from_secs(1), escaped).await;
+        assert!(awaited.is_err(), "the escaped step never resolves");
+        assert!(!ran.load(Ordering::SeqCst), "the escaped step never ran");
+        assert!(
+            !has_start(&client, "escaped"),
+            "the escaped step wrote nothing"
         );
     }
 }

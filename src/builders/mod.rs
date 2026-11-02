@@ -106,13 +106,16 @@ macro_rules! spawn_terminal {
 /// scope it controls, so a losing input's park never suspends the caller
 /// after a winner settled (issue #49).
 ///
+/// The third value is a clone of the rebound context, which
+/// `lazy_scoped` uses for its admission check.
+///
 /// The builder must have a `ctx: DurableContext` field.
 macro_rules! rebind_lazy_scope {
     ($builder:expr) => {{
         let owner_scope = ::std::sync::Arc::clone($builder.ctx.suspension_signal());
         let (scoped_ctx, op_scope) = $builder.ctx.spawn_scope();
         $builder.ctx = scoped_ctx;
-        (owner_scope, op_scope)
+        (owner_scope, op_scope, $builder.ctx.clone())
     }};
 }
 

@@ -133,8 +133,13 @@ impl<O: Send + 'static> DurableFuture<O> {
     /// caller). After forwarding, the future pends forever: a parked
     /// operation resumes only on a later invocation, exactly like the
     /// spawned path.
+    ///
+    /// `gate` is the builder's context. When one of its owners is abandoned
+    /// before the first poll, `fut` is never polled and the future never
+    /// resolves (see [`crate::checkpoint_coalescer::Admission`]).
     pub(crate) fn lazy_scoped<F>(
         fut: F,
+        gate: DurableContext,
         owner_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
         op_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
     ) -> Self
@@ -148,6 +153,12 @@ impl<O: Send + 'static> DurableFuture<O> {
 
         Self {
             inner: Box::pin(async move {
+                // An abandoned owner starts no operation: the operation is
+                // never polled, and this future never resolves (see
+                // `Admission`). Every builder future, awaited or spawned,
+                // passes here before its operation runs.
+                gate.admit_operation().await;
+                drop(gate);
                 match drive_scope(fut, op_scope).await {
                     ScopeOutcome::Completed(result) => result,
                     ScopeOutcome::Suspended => {
@@ -620,8 +631,10 @@ impl<O: Send + 'static> Callback<O> {
                 // settled record.
                 let owner_scope = std::sync::Arc::clone(ctx.suspension_signal());
                 let (scoped_ctx, op_scope) = ctx.spawn_scope();
+                let gate = scoped_ctx.clone();
                 DurableFuture::lazy_scoped(
                     async move { scoped_ctx.suspend_now().await },
+                    gate,
                     owner_scope,
                     op_scope,
                 )

@@ -117,7 +117,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
 
-        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
+        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
 
         let execution = TryJoinAllExecution {
             ctx: self.ctx,
@@ -126,7 +126,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
+        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
     }
 }
 
@@ -231,7 +231,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
 
-        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
+        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
 
         let execution = JoinAllExecution {
             ctx: self.ctx,
@@ -240,7 +240,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
+        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
     }
 }
 
@@ -342,7 +342,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
 
-        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
+        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
 
         let execution = SelectOkExecution {
             ctx: self.ctx,
@@ -351,7 +351,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
+        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
     }
 }
 
@@ -453,7 +453,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
         preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
 
-        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
+        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
 
         let execution = RaceExecution {
             ctx: self.ctx,
@@ -462,6 +462,6 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
             futures: self.futures,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
+        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
     }
 }

@@ -18,7 +18,8 @@ use crate::builders::{
     WaitForCallbackBuilder, WaitForConditionBuilder, WithRetryBuilder,
 };
 use crate::checkpoint_coalescer::{
-    BatchLimits, CheckpointBatch, CheckpointCoalescer, TrackedUpdate, split_into_requests,
+    Admission, BatchLimits, CheckpointBatch, CheckpointCoalescer, TrackedUpdate,
+    split_into_requests,
 };
 use crate::client::{
     CheckpointOutput, ExecutionClient, ExecutionClientError, ExecutionClientErrorScope,
@@ -104,6 +105,14 @@ struct Inner {
     /// Cached parent wire ID: the SHA-256 hash of this context's prefix
     /// (positional ID of the parent operation). `None` for root contexts.
     parent_wire_id: Option<String>,
+    /// Abandoned owners of this invocation, shared by the root and every
+    /// context derived from it (see [`Admission`]).
+    admission: Arc<Admission>,
+    /// The owners this context runs in, outermost first: the wire IDs of
+    /// the non-virtual child contexts (batch items included) that enclose
+    /// it. Empty at the root. A checkpoint update from this context is
+    /// admitted only while none of them is abandoned.
+    owners: Arc<[String]>,
     /// This namespace's `durable_execution` span. For a root context it is
     /// the handler-level span wrapping the invocation; for a child context
     /// (sequential child, map/parallel branch, callback body) it is a
@@ -244,6 +253,8 @@ impl DurableContext {
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
                 coalescer: None,
                 parent_wire_id: None,
+                admission: Arc::new(Admission::new()),
+                owners: Arc::from(Vec::new()),
                 replay_span,
             }),
         }
@@ -276,6 +287,8 @@ impl DurableContext {
                 checkpoint_token: Arc::new(Mutex::new(String::new())),
                 coalescer: None,
                 parent_wire_id: None,
+                admission: Arc::new(Admission::new()),
+                owners: Arc::from(Vec::new()),
                 replay_span,
             }),
         }
@@ -308,6 +321,8 @@ impl DurableContext {
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
                 coalescer: None,
                 parent_wire_id: None,
+                admission: Arc::new(Admission::new()),
+                owners: Arc::from(Vec::new()),
                 replay_span,
             }),
         }
@@ -346,6 +361,8 @@ impl DurableContext {
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
                 coalescer: checkpoint_buffer_window.map(|d| Arc::new(CheckpointCoalescer::new(d))),
                 parent_wire_id: None,
+                admission: Arc::new(Admission::new()),
+                owners: Arc::from(Vec::new()),
                 replay_span,
             }),
         }
@@ -380,6 +397,8 @@ impl DurableContext {
                 checkpoint_token: Arc::new(Mutex::new(checkpoint_token)),
                 coalescer: Some(Arc::new(coalescer)),
                 parent_wire_id: None,
+                admission: Arc::new(Admission::new()),
+                owners: Arc::from(Vec::new()),
                 replay_span,
             }),
         }
@@ -410,6 +429,8 @@ impl DurableContext {
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: Some(crate::engine::compute_wire_id_public(parent_positional_id)),
+                admission: Arc::clone(&self.inner.admission),
+                owners: self.owners_with(parent_positional_id),
                 replay_span,
             }),
         }
@@ -558,6 +579,8 @@ impl DurableContext {
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: Some(crate::engine::compute_wire_id_public(parent_positional_id)),
+                admission: Arc::clone(&self.inner.admission),
+                owners: self.owners_with(parent_positional_id),
                 replay_span,
             }),
         }
@@ -593,6 +616,8 @@ impl DurableContext {
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: Some(parent_wire_id_override.to_owned()),
+                admission: Arc::clone(&self.inner.admission),
+                owners: self.owners_with(child_positional_id),
                 replay_span,
             }),
         }
@@ -621,12 +646,39 @@ impl DurableContext {
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 coalescer: self.inner.coalescer.clone(),
                 parent_wire_id: self.inner.parent_wire_id.clone(),
+                admission: Arc::clone(&self.inner.admission),
+                owners: Arc::clone(&self.inner.owners),
                 // Same engine (same ID counter and namespace), so mints
                 // through the rebound context keep the shared flag current.
                 replay_span: self.inner.replay_span.clone(),
             }),
         };
         (rebound, scope)
+    }
+
+    /// Creates a clone of this context whose owners also include the child
+    /// context at `positional_id`. Everything else is this context's.
+    ///
+    /// A batch item writes its own terminal update through it. So the
+    /// write is rejected once the batch abandoned the item, as every write
+    /// of the item's body is (see [`Admission`]).
+    pub(crate) fn with_owner(&self, positional_id: &str) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                execution_arn: self.inner.execution_arn.clone(),
+                lambda_context: self.inner.lambda_context.clone(),
+                engine: Arc::clone(&self.inner.engine),
+                suspension_signal: Arc::clone(&self.inner.suspension_signal),
+                task_ownership: Arc::clone(&self.inner.task_ownership),
+                execution_client: self.inner.execution_client.clone(),
+                checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
+                coalescer: self.inner.coalescer.clone(),
+                parent_wire_id: self.inner.parent_wire_id.clone(),
+                admission: Arc::clone(&self.inner.admission),
+                owners: self.owners_with(positional_id),
+                replay_span: self.inner.replay_span.clone(),
+            }),
+        }
     }
 
     /// Advances the ID counter by `n` positions without minting.
@@ -659,6 +711,39 @@ impl DurableContext {
     /// attempt fall back to re-execution with the counter untouched.
     pub(crate) fn peek_id_at(&self, offset: usize) -> OperationId {
         self.inner.engine.id_counter.peek_at(offset as u64)
+    }
+
+    /// The abandoned owners of this invocation (see [`Admission`]).
+    pub(crate) fn admission(&self) -> &Arc<Admission> {
+        &self.inner.admission
+    }
+
+    /// The owners this context runs in, outermost first. Empty at the root.
+    pub(crate) fn owners(&self) -> &[String] {
+        &self.inner.owners
+    }
+
+    /// Returns at once when no owner of this context is abandoned, and
+    /// never returns otherwise (see [`Admission`]). Every operation
+    /// terminal awaits it before it runs the operation, so an abandoned
+    /// owner starts no operation and replays no recorded one.
+    pub(crate) async fn admit_operation(&self) {
+        if !self.admission().admits(self.owners()) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// This context's owners followed by the wire ID of `positional_id`:
+    /// the owners of a child context created for that operation.
+    fn owners_with(&self, positional_id: &str) -> Arc<[String]> {
+        self.inner
+            .owners
+            .iter()
+            .cloned()
+            .chain(std::iter::once(crate::engine::compute_wire_id_public(
+                positional_id,
+            )))
+            .collect()
     }
 
     /// Returns a reference to the suspension signal for this context.
@@ -861,6 +946,15 @@ impl DurableContext {
         claimed_sub_type: Option<&str>,
         claimed_name: Option<&str>,
     ) -> Result<(), OperationError> {
+        // An abandoned owner replays no operation, so its claim is not
+        // checked against history. A mismatch here would record a fatal
+        // error and resolve the future. Skipping the check leaves the
+        // future to the admission check in `DurableFuture::lazy_scoped`,
+        // which never resolves it. An owner abandoned after this check is
+        // stopped there too.
+        if !self.admission().admits(self.owners()) {
+            return Ok(());
+        }
         self.checkpoint_view_validated(
             op_id.positional(),
             op_id.wire(),
@@ -1034,12 +1128,22 @@ impl DurableContext {
     /// with priority over completion and suspension, from any scope in the
     /// tree, drops the handler at its current await point, so user code
     /// can neither catch nor ignore the failure.
-    pub(crate) async fn checkpoint_failure_unrecoverable<T>(
+    ///
+    /// One error is not a write failure: a direct write that found no Tokio
+    /// runtime sent nothing (see [`Self::write_direct_detached`]). The
+    /// operation then returns the error `.spawn()` returns without a
+    /// runtime, at once, and nothing is recorded.
+    pub(crate) async fn checkpoint_failure_unrecoverable<T: NoRuntimeOutcome>(
         &self,
         op_wire_id: &str,
         err: ExecutionClientError,
         terminal_fail: Option<OperationUpdate>,
     ) -> T {
+        if let Some(no_runtime) = std::error::Error::source(&err)
+            .and_then(|source| source.downcast_ref::<crate::task::NoRuntime>())
+        {
+            return T::no_runtime(*no_runtime);
+        }
         let message = format!("checkpoint write failed for operation {op_wire_id}: {err}");
         if err.is_retryable() {
             tracing::error!(
@@ -1231,10 +1335,18 @@ impl DurableContext {
         urgent: bool,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
         let Some(coalescer) = self.inner.coalescer.clone() else {
-            return self.write_tracked_direct(updates).await;
+            let (updates, events): (Vec<_>, Vec<_>) =
+                updates.into_iter().map(|t| (t.update, t.event)).unzip();
+            return self.write_direct_detached(updates, events).await;
         };
 
-        let batch = coalescer.join(updates);
+        // Admission (see `Admission`): an update from an abandoned owner is
+        // rejected, and a rejected write never resolves. Its task is being
+        // cancelled. Returning `Ok` instead would let an operation continue
+        // as if its update were recorded.
+        let Some(batch) = coalescer.join(self.admission(), self.owners(), updates) else {
+            return std::future::pending().await;
+        };
         let flush_now = urgent || coalescer.delay().is_zero();
         if flush_now {
             self.spawn_batch_flush(&coalescer, &batch);
@@ -1272,13 +1384,92 @@ impl DurableContext {
     /// hydration that follows it, so a transition the service recorded
     /// always emits its event even when hydrating the paginated state
     /// fails afterwards.
+    ///
+    /// Only the batch flusher calls this. Its updates were admitted when
+    /// they joined the buffer, so it skips the admission check.
     async fn write_tracked_direct(
         &self,
         tracked: Vec<TrackedUpdate>,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
         let (updates, events): (Vec<_>, Vec<_>) =
             tracked.into_iter().map(|t| (t.update, t.event)).unzip();
-        self.checkpoint_direct_with_events(updates, &events).await
+        self.write_unchecked(updates, &events).await
+    }
+
+    /// Writes updates that skip the admission check: the batch flusher's.
+    async fn write_unchecked(
+        &self,
+        updates: Vec<OperationUpdate>,
+        events: &[crate::tracing_layer::PendingTransitionEvent],
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
+        #[expect(clippy::expect_used)]
+        // reason: with no owners to check, `checkpoint_direct_with_events`
+        // never rejects the write, so it always returns a result.
+        self.checkpoint_direct_with_events(updates, events, None)
+            .await
+            .expect("a write without an admission check is never rejected")
+    }
+
+    /// Writes updates directly, on a detached task, after the admission
+    /// check, and returns the result to the caller.
+    ///
+    /// The write runs on its own task because a cancelled caller must not
+    /// cancel an admitted request. A batch abandons its running items at
+    /// early completion and aborts their tasks. If an aborted item
+    /// cancelled a request the service had accepted, the checkpoint token
+    /// would not rotate, and the parent's next write would use a stale
+    /// token. The task is counted, so the invocation waits for it.
+    ///
+    /// The outcomes are:
+    ///
+    /// - No Tokio runtime is running: nothing is sent, and the caller gets
+    ///   an invocation-scope error whose source is
+    ///   [`NoRuntime`](crate::task::NoRuntime). An operation that receives
+    ///   it returns the error `.spawn()` returns without a runtime (see
+    ///   [`Self::checkpoint_failure_unrecoverable`]).
+    /// - The admission check rejects the write: nothing is sent, and the
+    ///   returned future never resolves (see [`Admission`]).
+    /// - The write panics: the panic resumes on the caller.
+    /// - Otherwise: the caller gets the write's result.
+    async fn write_direct_detached(
+        &self,
+        updates: Vec<OperationUpdate>,
+        events: Vec<crate::tracing_layer::PendingTransitionEvent>,
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let ctx = self.clone();
+        let spawned = crate::task::spawn_detached(self.suspension_signal().tasks(), async move {
+            let written = crate::task::catch_panic(ctx.checkpoint_direct_with_events(
+                updates,
+                &events,
+                Some(ctx.owners()),
+            ))
+            .await;
+            // A dropped receiver means the caller was cancelled: the write
+            // already happened, and its result has no reader.
+            drop(sender.send(written));
+        });
+        if let Err(no_runtime) = spawned {
+            // The source marks the error, so that
+            // `checkpoint_failure_unrecoverable` returns the operation error
+            // `.spawn()` returns instead of failing the invocation.
+            return Err(ExecutionClientError::with_source(
+                ExecutionClientErrorScope::Invocation,
+                no_runtime.to_string(),
+                no_runtime,
+            ));
+        }
+        #[expect(clippy::expect_used)]
+        // reason: the task always sends before it exits, a panic included,
+        // and a detached task is never aborted. So the sender is never
+        // dropped unsent while this future is polled.
+        let written = receiver
+            .await
+            .expect("a detached write task always sends its outcome");
+        match written.into_value() {
+            Some(result) => result,
+            None => std::future::pending().await,
+        }
     }
 
     /// Spawns a task that claims `batch` (if it is still the open batch)
@@ -1390,7 +1581,7 @@ impl DurableContext {
             // An empty seal (possible only defensively) still performs one
             // call so a waiting contributor receives a published result.
             return self
-                .checkpoint_updates_direct(Vec::new())
+                .write_unchecked(Vec::new(), &[])
                 .await
                 .map_err(|e| (e, Vec::new()));
         }
@@ -1653,11 +1844,14 @@ impl DurableContext {
     /// marker, through the follow-up `get_state` fetch as well, so no
     /// concurrent branch can rotate the token out from under the paginated
     /// state read.
+    ///
+    /// The write is admitted (see [`Admission`]) and runs on a detached
+    /// task (see [`Self::write_direct_detached`]).
     pub(crate) async fn checkpoint_updates_direct(
         &self,
         updates: Vec<OperationUpdate>,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
-        self.checkpoint_direct_with_events(updates, &[]).await
+        self.write_direct_detached(updates, Vec::new()).await
     }
 
     /// Body of [`Self::checkpoint_updates_direct`] that additionally owns
@@ -1668,21 +1862,47 @@ impl DurableContext {
     /// already persisted. Emitting first keeps telemetry faithful to what
     /// was recorded: a rejected write emits nothing, and a persisted write
     /// emits everything even when the follow-up `get_state` fetch fails.
+    ///
+    /// With `Some(owners)`, the write is admitted while this call holds the
+    /// checkpoint-token lock. A rejected write sends nothing, emits no
+    /// event, does not rotate the token, and returns `None`. `None` skips
+    /// the check: the batch flusher passes it, because its updates were
+    /// admitted when they joined the buffer.
     async fn checkpoint_direct_with_events(
         &self,
         updates: Vec<OperationUpdate>,
         events: &[crate::tracing_layer::PendingTransitionEvent],
-    ) -> Result<CheckpointOutput, ExecutionClientError> {
-        let client = self.inner.execution_client.as_ref().ok_or_else(|| {
-            ExecutionClientError::new_non_retryable("no execution client configured")
-        })?;
+        owners: Option<&[String]>,
+    ) -> Option<Result<CheckpointOutput, ExecutionClientError>> {
+        let Some(client) = self.inner.execution_client.as_ref() else {
+            return Some(Err(ExecutionClientError::new_non_retryable(
+                "no execution client configured",
+            )));
+        };
 
         // Hold the async mutex across the entire checkpoint call to
         // serialize concurrent branch checkpoints. This is the Rust
         // equivalent of Go's sync.Mutex held across the blocking API call
         // in checkpointer.checkpoint().
-        let mut token_guard = self.inner.checkpoint_token.lock().await;
+        let token_guard = self.inner.checkpoint_token.lock().await;
+        if owners.is_some_and(|owners| !self.admission().admits(owners)) {
+            return None;
+        }
+        Some(
+            self.write_locked(client, token_guard, updates, events)
+                .await,
+        )
+    }
 
+    /// The write of [`Self::checkpoint_direct_with_events`], with the
+    /// checkpoint-token lock held.
+    async fn write_locked(
+        &self,
+        client: &Arc<dyn ExecutionClient>,
+        mut token_guard: tokio::sync::MutexGuard<'_, String>,
+        updates: Vec<OperationUpdate>,
+        events: &[crate::tracing_layer::PendingTransitionEvent],
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
         let output = client
             .checkpoint(&self.inner.execution_arn, &token_guard, updates)
             .await?;
@@ -2603,6 +2823,26 @@ fn format_op_identity(op_type: &str, sub_type: Option<&str>, name: Option<&str>)
         s.push('"');
     }
     s
+}
+
+/// The value an operation returns when its direct checkpoint write found
+/// no Tokio runtime (see `DurableContext::checkpoint_failure_unrecoverable`).
+pub(crate) trait NoRuntimeOutcome {
+    /// The outcome for `no_runtime`.
+    fn no_runtime(no_runtime: crate::task::NoRuntime) -> Self;
+}
+
+impl<T> NoRuntimeOutcome for Result<T, OperationError> {
+    fn no_runtime(no_runtime: crate::task::NoRuntime) -> Self {
+        Err(crate::task::NoRuntime::operation_error(no_runtime))
+    }
+}
+
+/// For a call site whose function returns the operation error itself.
+impl NoRuntimeOutcome for OperationError {
+    fn no_runtime(no_runtime: crate::task::NoRuntime) -> Self {
+        crate::task::NoRuntime::operation_error(no_runtime)
+    }
 }
 
 #[cfg(test)]
@@ -4791,6 +5031,832 @@ mod tests {
             emitted,
             "no attempt emitted operation_started for the persisted transition — \
              telemetry was suppressed by a failed pagination fetch"
+        );
+    }
+
+    // Checkpoint admission tests (abandoned owners).
+
+    /// The bound on every await in the admission tests. A rejected write
+    /// never resolves, so these awaits time out.
+    const ADMISSION_BOUND: Duration = Duration::from_secs(1);
+
+    /// A root context with batching on (`Some(Duration::ZERO)`), a
+    /// coalescing delay, or no buffering (`None`).
+    fn admission_root(
+        client: &Arc<InMemoryExecutionClient>,
+        window: Option<Duration>,
+    ) -> DurableContext {
+        DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(client) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+            window,
+        )
+    }
+
+    /// The wire IDs the client recorded, in order.
+    fn recorded_ids(client: &InMemoryExecutionClient) -> Vec<String> {
+        client
+            .recorded_updates()
+            .iter()
+            .map(|u| u.id.clone())
+            .collect()
+    }
+
+    /// Writes `id` from `item` after abandoning it, and asserts that the
+    /// write never resolves and that nothing is recorded.
+    async fn assert_abandoned_write_not_sent(window: Option<Duration>) {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let root = admission_root(&client, window);
+        let item = root.new_scoped_child("1");
+        root.admission()
+            .abandon(item.owners().iter().map(String::as_str));
+        let written = tokio::time::timeout(
+            ADMISSION_BOUND,
+            item.checkpoint_updates(vec![make_update("u")]),
+        )
+        .await;
+        assert!(written.is_err(), "a rejected write never resolves");
+        assert!(client.recorded_updates().is_empty(), "nothing is sent");
+    }
+
+    #[tokio::test]
+    async fn abandoned_owner_update_is_not_sent_buffered() {
+        assert_abandoned_write_not_sent(Some(Duration::ZERO)).await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_owner_update_is_not_sent_direct() {
+        assert_abandoned_write_not_sent(None).await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_owner_direct_write_is_rejected() {
+        // Batching is on, but `checkpoint_updates_direct` skips the buffer.
+        // So this rejection comes from the check under the token lock.
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let root = admission_root(&client, Some(Duration::ZERO));
+        let item = root.new_scoped_child("1");
+        root.admission()
+            .abandon(item.owners().iter().map(String::as_str));
+        let written = tokio::time::timeout(
+            ADMISSION_BOUND,
+            item.checkpoint_updates_direct(vec![make_update("u")]),
+        )
+        .await;
+        assert!(written.is_err(), "a rejected direct write never resolves");
+        assert!(client.recorded_updates().is_empty(), "nothing is sent");
+    }
+
+    #[tokio::test]
+    async fn nested_owner_follows_its_outer_item() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let root = admission_root(&client, Some(Duration::ZERO));
+        let item = root.new_scoped_child("1");
+        let inner = item.new_scoped_child("1-1");
+        assert_eq!(
+            inner.owners(),
+            [
+                crate::engine::compute_wire_id_public("1"),
+                crate::engine::compute_wire_id_public("1-1"),
+            ],
+            "a nested context runs in its outer item, outermost first"
+        );
+        root.admission()
+            .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
+        let written = tokio::time::timeout(
+            ADMISSION_BOUND,
+            inner.checkpoint_updates(vec![make_update("u")]),
+        )
+        .await;
+        assert!(written.is_err(), "the nested write never resolves");
+        assert!(client.recorded_updates().is_empty(), "nothing is sent");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admitted_update_precedes_parent_final_update() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let root = admission_root(&client, Some(Duration::from_millis(50)));
+        let item = root.new_scoped_child("1");
+        let writer = tokio::spawn({
+            let item = item.clone();
+            async move { item.checkpoint_updates(vec![make_update("a")]).await }
+        });
+        // Yield until `a` is buffered. The delay window holds it there, so
+        // it is admitted but not yet sent when the item is abandoned.
+        let coalescer = Arc::clone(root.inner.coalescer.as_ref().expect("buffering is on"));
+        let mut yields = 0;
+        while coalescer.pending_len() == 0 {
+            assert!(yields < 1_000, "the item update was never buffered");
+            yields += 1;
+            tokio::task::yield_now().await;
+        }
+        root.admission()
+            .abandon(item.owners().iter().map(String::as_str));
+        let parent = tokio::spawn({
+            let root = root.clone();
+            async move { root.checkpoint_updates(vec![make_update("p")]).await }
+        });
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::time::timeout(ADMISSION_BOUND, writer)
+            .await
+            .expect("the admitted write resolves")
+            .expect("the writer task completes")
+            .expect("the admitted write succeeds");
+        tokio::time::timeout(ADMISSION_BOUND, parent)
+            .await
+            .expect("the parent write resolves")
+            .expect("the parent task completes")
+            .expect("the parent write succeeds");
+        assert_eq!(
+            recorded_ids(&client),
+            ["a", "p"],
+            "the admitted item update reaches the service before the parent's"
+        );
+    }
+
+    /// A client that holds its first checkpoint call until the test opens a
+    /// gate, and records the token and the update IDs of every call. Call
+    /// `n` returns the token `token-n`.
+    #[derive(Debug, Default)]
+    struct TokenGateClient {
+        entered: tokio::sync::Notify,
+        gate: tokio::sync::Notify,
+        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl TokenGateClient {
+        fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ExecutionClient for TokenGateClient {
+        fn checkpoint(
+            &self,
+            _arn: &str,
+            token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            let token = token.to_owned();
+            Box::pin(async move {
+                let n = {
+                    let mut calls = self.calls.lock().unwrap();
+                    calls.push((token, updates.iter().map(|u| u.id.clone()).collect()));
+                    calls.len()
+                };
+                if n == 1 {
+                    self.entered.notify_one();
+                    self.gate.notified().await;
+                }
+                Ok(CheckpointOutput {
+                    checkpoint_token: Some(format!("token-{n}")),
+                    updated_operations: Vec::new(),
+                    next_marker: None,
+                })
+            })
+        }
+
+        fn get_state(
+            &self,
+            _arn: &str,
+            _token: &str,
+            _marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Ok(GetStateOutput {
+                    operations: Vec::new(),
+                    next_marker: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_direct_write_survives_cancelled_caller() {
+        let client = Arc::new(TokenGateClient::default());
+        let root = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+            None,
+        );
+        let item = root.new_scoped_child("1");
+        let entered = client.entered.notified();
+        let writer = tokio::spawn({
+            let item = item.clone();
+            async move { item.checkpoint_updates(vec![make_update("a")]).await }
+        });
+        tokio::time::timeout(ADMISSION_BOUND, entered)
+            .await
+            .expect("the client holds the item's write");
+        writer.abort();
+        assert!(
+            writer
+                .await
+                .expect_err("the caller was aborted")
+                .is_cancelled(),
+            "the caller is cancelled while its write is in flight"
+        );
+        client.gate.notify_one();
+        tokio::time::timeout(
+            ADMISSION_BOUND,
+            root.checkpoint_updates(vec![make_update("p")]),
+        )
+        .await
+        .expect("the parent write resolves")
+        .expect("the parent write succeeds");
+        assert_eq!(
+            client.calls(),
+            [
+                ("token-0".to_owned(), vec!["a".to_owned()]),
+                ("token-1".to_owned(), vec!["p".to_owned()]),
+            ],
+            "the cancelled caller's write completed and rotated the token"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_owner_starts_no_operation() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let root = admission_root(&client, Some(Duration::ZERO));
+        let item = root.new_scoped_child("1");
+        root.admission()
+            .abandon(item.owners().iter().map(String::as_str));
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let stepped = tokio::time::timeout(
+            ADMISSION_BOUND,
+            item.step(move |_| async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(1_u32)
+            })
+            .into_future(),
+        )
+        .await;
+        assert!(stepped.is_err(), "the operation never resolves");
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the step body never ran"
+        );
+        assert!(
+            client.recorded_updates().is_empty(),
+            "no update is recorded"
+        );
+    }
+
+    /// An abandoned owner does not even replay a recorded operation, which
+    /// writes nothing: the builder future is never polled past the check.
+    #[tokio::test]
+    async fn abandoned_owner_replays_no_operation() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let wire = crate::engine::compute_wire_id_public("1-1");
+        let record = CheckpointRecord {
+            id: wire.clone(),
+            status: CheckpointStatus::Succeeded,
+            result: Some("7".to_owned()),
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        };
+        let log = CheckpointLog::from_records(vec![(wire, record)]);
+        let root = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+            Some(Duration::ZERO),
+        );
+        let item = root.new_scoped_child("1");
+        root.admission()
+            .abandon(item.owners().iter().map(String::as_str));
+        let stepped = tokio::time::timeout(
+            ADMISSION_BOUND,
+            item.step(|_| async { Ok(0_u32) }).into_future(),
+        )
+        .await;
+        assert!(
+            stepped.is_err(),
+            "the recorded step is not replayed for an abandoned owner: {stepped:?}"
+        );
+    }
+
+    /// A builder created before its owner is abandoned, and finalized after,
+    /// is not checked against a contradicting record. The record says the
+    /// operation was a wait, and the builder claims a step. For an owner that
+    /// is not abandoned, the same claim records a fatal error and resolves.
+    /// For the abandoned owner, nothing is recorded, nothing is written, and
+    /// the future never resolves.
+    #[tokio::test]
+    async fn abandoned_owner_skips_replay_preflight() {
+        let wait_record = |positional: &str| {
+            let wire = crate::engine::compute_wire_id_public(positional);
+            let record = CheckpointRecord {
+                id: wire.clone(),
+                status: CheckpointStatus::Succeeded,
+                result: None,
+                error_type: None,
+                error_message: None,
+                error_data: None,
+                stack_trace: None,
+                attempt: 0,
+                invoke_result: None,
+                invoke_error_type: None,
+                invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
+                replay_children: false,
+                callback_id: None,
+                op_type: Some("Wait".to_owned()),
+                sub_type: Some("Wait".to_owned()),
+                op_name: None,
+            };
+            (wire, record)
+        };
+        let build_root = || {
+            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+            let log = CheckpointLog::from_records(vec![wait_record("1-1")]);
+            let root = DurableContext::new_root_with_client_and_defaults(
+                "arn:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(log),
+                Arc::clone(&client) as Arc<dyn ExecutionClient>,
+                "token-0".to_owned(),
+                Some(Duration::ZERO),
+            );
+            (client, root)
+        };
+
+        // Control: an owner that is not abandoned records the mismatch.
+        let (_, control_root) = build_root();
+        let control_item = control_root.new_scoped_child("1");
+        let control = tokio::time::timeout(
+            ADMISSION_BOUND,
+            control_item.step(|_| async { Ok(0_u32) }).into_future(),
+        )
+        .await
+        .expect("the mismatch resolves at once");
+        assert!(control.is_err(), "the mismatch is an error: {control:?}");
+        assert!(
+            control_item.suspension_signal().fatal_error().is_some(),
+            "the mismatch records a fatal error"
+        );
+
+        // The builder exists before the abandonment and is finalized after it.
+        let (client, root) = build_root();
+        let item = root.new_scoped_child("1");
+        let builder = item.step(|_| async { Ok(0_u32) });
+        root.admission()
+            .abandon(item.owners().iter().map(String::as_str));
+        let stepped = tokio::time::timeout(ADMISSION_BOUND, builder.into_future()).await;
+        assert!(
+            stepped.is_err(),
+            "the abandoned owner's future never resolves: {stepped:?}"
+        );
+        assert!(
+            item.suspension_signal().fatal_error().is_none(),
+            "no fatal error is recorded for the abandoned owner"
+        );
+        assert!(
+            root.suspension_signal().fatal_error().is_none(),
+            "no fatal error reaches the root"
+        );
+        assert!(client.recorded_updates().is_empty(), "nothing is written");
+    }
+
+    /// An abandoned owner does not replay a recorded callback either. The
+    /// recorded `Started` callback resolves without a write, so only the
+    /// admission check at the terminal can hold it back.
+    #[tokio::test]
+    async fn abandoned_owner_replays_no_callback() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let wire = crate::engine::compute_wire_id_public("1-1");
+        let record = CheckpointRecord {
+            id: wire.clone(),
+            status: CheckpointStatus::Started,
+            result: None,
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: Some("cb-1".to_owned()),
+            op_type: None,
+            sub_type: None,
+            op_name: None,
+        };
+        let log = Arc::new(CheckpointLog::from_records(vec![(wire, record)]));
+        let root = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::clone(&log),
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+            Some(Duration::ZERO),
+        );
+        // The control: an owner that is not abandoned replays the callback.
+        let control = root.new_scoped_child("1");
+        let replayed = tokio::time::timeout(
+            ADMISSION_BOUND,
+            control.create_callback::<String>().into_future(),
+        )
+        .await
+        .expect("the recorded callback replays")
+        .expect("the replay succeeds");
+        assert_eq!(replayed.id(), "cb-1");
+
+        let item = root.new_scoped_child("1");
+        root.admission()
+            .abandon(item.owners().iter().map(String::as_str));
+        let created = tokio::time::timeout(
+            ADMISSION_BOUND,
+            item.create_callback::<String>().into_future(),
+        )
+        .await;
+        assert!(
+            created.is_err(),
+            "the recorded callback is not replayed for an abandoned owner"
+        );
+        assert!(client.recorded_updates().is_empty(), "nothing is sent");
+    }
+
+    #[tokio::test]
+    async fn admitted_owner_writes_as_before() {
+        for window in [Some(Duration::ZERO), None] {
+            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+            let root = admission_root(&client, window);
+            let item = root.new_scoped_child("1");
+            tokio::time::timeout(
+                ADMISSION_BOUND,
+                item.checkpoint_updates(vec![make_update("u")]),
+            )
+            .await
+            .expect("the write resolves")
+            .expect("the write succeeds");
+            assert_eq!(recorded_ids(&client), ["u"], "window {window:?}");
+        }
+    }
+
+    /// Without a Tokio runtime a direct write cannot start its task. The
+    /// caller gets the no-runtime error at once, and nothing is sent.
+    #[test]
+    fn direct_write_without_runtime_returns_invocation_error() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = admission_root(&client, None);
+        let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
+            ctx.checkpoint_updates(vec![make_update("u")]).await
+        });
+        let std::task::Poll::Ready(Err(err)) = polled else {
+            unreachable!("expected an immediate error, got {polled:?}");
+        };
+        assert_eq!(err.scope(), ExecutionClientErrorScope::Invocation);
+        assert!(
+            err.to_string().contains(crate::task::NO_RUNTIME_MESSAGE),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::error::Error::source(&err)
+                .is_some_and(<dyn std::error::Error>::is::<crate::task::NoRuntime>),
+            "the error carries the no-runtime marker"
+        );
+        assert!(client.recorded_updates().is_empty(), "nothing is sent");
+    }
+
+    /// An operation whose direct write finds no Tokio runtime returns the
+    /// error `.spawn()` returns without a runtime, at once. Nothing is
+    /// sent, and no invocation fault is recorded.
+    #[test]
+    fn operation_without_runtime_returns_spawn_error() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = admission_root(&client, None);
+        let signal = Arc::clone(ctx.suspension_signal());
+        let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
+            ctx.step(|_| async { Ok(1_u32) }).into_future().await
+        });
+        let std::task::Poll::Ready(Err(err)) = polled else {
+            unreachable!("expected an immediate error, got {polled:?}");
+        };
+        let spawn_error = crate::task::NoRuntime::operation_error(crate::task::NoRuntime);
+        assert_eq!(format!("{err:#}"), format!("{spawn_error:#}"));
+        assert!(client.recorded_updates().is_empty(), "nothing is sent");
+        assert!(signal.fatal_error().is_none(), "no fault is recorded");
+    }
+
+    /// A replayed `Started` child skips its START write, so its body runs
+    /// and its first write is the terminal `FAIL`. When that direct write
+    /// finds no Tokio runtime, the child returns the error `.spawn()`
+    /// returns without a runtime. Nothing is sent, and no invocation fault
+    /// is recorded.
+    #[test]
+    fn replayed_child_failure_without_runtime_returns_spawn_error() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let wire = crate::engine::compute_wire_id_public("1");
+        let record = CheckpointRecord {
+            id: wire.clone(),
+            status: CheckpointStatus::Started,
+            result: None,
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Context".to_owned()),
+            sub_type: Some(crate::child::CHILD_SUB_TYPE.to_owned()),
+            op_name: None,
+        };
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(vec![(wire, record)])),
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+            None,
+        );
+        let signal = Arc::clone(ctx.suspension_signal());
+        let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
+            ctx.run_in_child_context(|_child| async { Err::<u32, BoxError>("boom".into()) })
+                .into_future()
+                .await
+        });
+        let std::task::Poll::Ready(Err(err)) = polled else {
+            unreachable!("expected an immediate error, got {polled:?}");
+        };
+        let spawn_error = crate::task::NoRuntime::operation_error(crate::task::NoRuntime);
+        assert_eq!(format!("{err:#}"), format!("{spawn_error:#}"));
+        assert!(client.recorded_updates().is_empty(), "nothing is sent");
+        assert!(signal.fatal_error().is_none(), "no fault is recorded");
+    }
+
+    /// A client whose checkpoint call panics.
+    #[derive(Debug)]
+    struct PanickingClient;
+
+    impl ExecutionClient for PanickingClient {
+        fn checkpoint(
+            &self,
+            _arn: &str,
+            _token: &str,
+            _updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            #[expect(clippy::panic)] // reason: the panic is the behavior under test
+            Box::pin(async { panic!("boom in checkpoint") })
+        }
+
+        fn get_state(
+            &self,
+            _arn: &str,
+            _token: &str,
+            _marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Ok(GetStateOutput {
+                    operations: Vec::new(),
+                    next_marker: None,
+                })
+            })
+        }
+    }
+
+    /// A panic in a direct write's task resumes on the caller with its
+    /// original payload.
+    #[tokio::test]
+    async fn direct_write_panic_resumes_on_caller() {
+        let root = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::new(PanickingClient) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+            None,
+        );
+        let caller =
+            tokio::spawn(async move { root.checkpoint_updates(vec![make_update("u")]).await });
+        let joined = tokio::time::timeout(ADMISSION_BOUND, caller)
+            .await
+            .expect("the caller resolves");
+        let payload = joined.expect_err("the caller panicked").into_panic();
+        assert_eq!(
+            crate::task::test_support::str_payload(payload.as_ref()),
+            Some("boom in checkpoint")
+        );
+    }
+
+    /// A checkpoint future that returns `Ready` and then panics in its
+    /// destructor.
+    struct ReadyThenDropPanic;
+
+    impl Future for ReadyThenDropPanic {
+        type Output = Result<CheckpointOutput, ExecutionClientError>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Ready(Ok(CheckpointOutput {
+                checkpoint_token: Some("token-1".to_owned()),
+                updated_operations: Vec::new(),
+                next_marker: None,
+            }))
+        }
+    }
+
+    impl Drop for ReadyThenDropPanic {
+        #[expect(clippy::panic)] // reason: the panic is the behavior under test
+        fn drop(&mut self) {
+            panic!("boom in checkpoint drop");
+        }
+    }
+
+    /// A client whose checkpoint future panics in its destructor.
+    #[derive(Debug)]
+    struct DropPanickingClient;
+
+    impl ExecutionClient for DropPanickingClient {
+        fn checkpoint(
+            &self,
+            _arn: &str,
+            _token: &str,
+            _updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            Box::pin(ReadyThenDropPanic)
+        }
+
+        fn get_state(
+            &self,
+            _arn: &str,
+            _token: &str,
+            _marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Ok(GetStateOutput {
+                    operations: Vec::new(),
+                    next_marker: None,
+                })
+            })
+        }
+    }
+
+    /// A panic from the destructor of a checkpoint future that returned
+    /// `Ready` resumes on the caller of the direct write with its original
+    /// payload.
+    #[tokio::test]
+    async fn direct_write_drop_panic_resumes_on_caller() {
+        let root = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::new(DropPanickingClient) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+            None,
+        );
+        let caller =
+            tokio::spawn(async move { root.checkpoint_updates(vec![make_update("u")]).await });
+        let joined = tokio::time::timeout(ADMISSION_BOUND, caller)
+            .await
+            .expect("the caller resolves");
+        let payload = joined.expect_err("the caller panicked").into_panic();
+        assert_eq!(
+            crate::task::test_support::str_payload(payload.as_ref()),
+            Some("boom in checkpoint drop")
+        );
+    }
+
+    #[tokio::test]
+    async fn child_context_owner_covers_its_descendants() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let root = admission_root(&client, Some(Duration::ZERO));
+        let child = root.new_child("1");
+        root.admission()
+            .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
+        let written = tokio::time::timeout(
+            ADMISSION_BOUND,
+            child.checkpoint_updates(vec![make_update("u")]),
+        )
+        .await;
+        assert!(written.is_err(), "the child's write never resolves");
+        tokio::time::timeout(
+            ADMISSION_BOUND,
+            root.checkpoint_updates(vec![make_update("p")]),
+        )
+        .await
+        .expect("the root write resolves")
+        .expect("the root write succeeds");
+        assert_eq!(recorded_ids(&client), ["p"], "only the root update is sent");
+    }
+
+    #[tokio::test]
+    async fn finished_child_rejects_escaped_descendant_write() {
+        use aws_sdk_lambda::types::OperationAction;
+
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let root = admission_root(&client, Some(Duration::ZERO));
+        let slot: Arc<std::sync::Mutex<Option<DurableFuture<u32>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let step_wire = crate::engine::compute_wire_id_public("1-1");
+        let child_wire = crate::engine::compute_wire_id_public("1");
+
+        let returned = tokio::time::timeout(ADMISSION_BOUND, {
+            let slot = Arc::clone(&slot);
+            let release = Arc::clone(&release);
+            let client = Arc::clone(&client);
+            let step_wire = step_wire.clone();
+            root.run_in_child_context(move |child| async move {
+                let handle = child
+                    .step(move |_| async move {
+                        release.notified().await;
+                        Ok(7_u32)
+                    })
+                    .name("s")
+                    .spawn();
+                *slot.lock().unwrap() = Some(handle);
+                let mut yields = 0;
+                while !client
+                    .recorded_updates()
+                    .iter()
+                    .any(|u| u.id == step_wire && u.action == OperationAction::Start)
+                {
+                    if yields == 1_000 {
+                        return Err("the step START was never recorded".into());
+                    }
+                    yields += 1;
+                    tokio::task::yield_now().await;
+                }
+                Ok(1_u32)
+            })
+            .into_future()
+        })
+        .await
+        .expect("the child returns")
+        .expect("the child succeeds");
+        assert_eq!(returned, 1);
+
+        release.notify_one();
+        let handle = slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the body stored the handle");
+        let awaited = tokio::time::timeout(ADMISSION_BOUND, handle).await;
+        assert!(awaited.is_err(), "the escaped operation never resolves");
+
+        let updates = client.recorded_updates();
+        let has = |id: &str, action: OperationAction| {
+            updates.iter().any(|u| u.id == id && u.action == action)
+        };
+        assert!(
+            has(&step_wire, OperationAction::Start),
+            "s START is recorded"
+        );
+        assert!(
+            has(&child_wire, OperationAction::Succeed),
+            "the child's SUCCEED is recorded"
+        );
+        assert!(
+            !has(&step_wire, OperationAction::Succeed),
+            "s SUCCEED is never sent after the child returned"
         );
     }
 }

@@ -471,6 +471,9 @@ let greeting = ctx
     .await?;
 ```
 
+When a child context's body returns, an operation it started and did not
+await writes no further checkpoint, and awaiting it never resolves.
+
 ### with_retry
 
 `with_retry` runs a closure against a child context and applies a retry
@@ -577,6 +580,10 @@ item's status and why the batch ended. `BatchResult::status()` returns a
 `BatchStatus` enum, and `BatchResult::errors()` returns `BatchError` entries
 that tie each failure to the index and name of the item that produced it,
 along with the error's type identifier and message.
+
+When the completion rule ends the batch early, items that are still running
+are cancelled at their next `.await` and reported as `Started`. A cancelled
+item writes no further checkpoint.
 
 ### combinators
 

@@ -286,7 +286,7 @@ where
 
         preflight_identity!(self, "Step", crate::wait_for_condition::WFC_SUB_TYPE);
 
-        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
+        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
 
         let execution = WaitForConditionExecution {
             ctx: self.ctx,
@@ -298,7 +298,7 @@ where
             check: self.check,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
+        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
     }
 }
 

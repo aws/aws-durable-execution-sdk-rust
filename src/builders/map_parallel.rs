@@ -237,7 +237,10 @@ where
     /// Always returns the full `BatchResult<O>` including per-item outcomes.
     /// [`BatchResult::status`] reports the overall outcome as a
     /// [`BatchStatus`], and [`BatchResult::errors`] associates each failure
-    /// with the index and name of the item that produced it.
+    /// with the index and name of the item that produced it. When the
+    /// completion rule ends the batch early, an item that is still running
+    /// or parked is cancelled at its next `.await` and appears live as
+    /// [`BatchItemStatus::Started`].
     ///
     /// # Errors
     ///
@@ -296,6 +299,8 @@ where
     {
         use crate::map_parallel::MapExecution;
 
+        // The admission check every lazy terminal runs in `lazy_scoped`.
+        self.ctx.admit_operation().await;
         let execution = MapExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -366,7 +371,7 @@ where
 
         preflight_identity!(self, "Context", crate::map_parallel::MAP_SUB_TYPE);
 
-        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
+        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
 
         let execution = MapExecution {
             ctx: self.ctx,
@@ -383,7 +388,7 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
+        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
     }
 }
 
@@ -562,7 +567,10 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// Always returns the full `BatchResult<O>` including per-branch
     /// outcomes. [`BatchResult::status`] reports the overall outcome as a
     /// [`BatchStatus`], and [`BatchResult::errors`] associates each failure
-    /// with the index and name of the branch that produced it.
+    /// with the index and name of the branch that produced it. When the
+    /// completion rule ends the batch early, a branch that is still running
+    /// or parked is cancelled at its next `.await` and appears live as
+    /// [`BatchItemStatus::Started`].
     ///
     /// # Errors
     ///
@@ -618,6 +626,8 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     {
         use crate::map_parallel::ParallelExecution;
 
+        // The admission check every lazy terminal runs in `lazy_scoped`.
+        self.ctx.admit_operation().await;
         let execution = ParallelExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -682,7 +692,7 @@ where
 
         preflight_identity!(self, "Context", crate::map_parallel::PARALLEL_SUB_TYPE);
 
-        let (owner_scope, op_scope) = rebind_lazy_scope!(self);
+        let (owner_scope, op_scope, gate) = rebind_lazy_scope!(self);
 
         let execution = ParallelExecution {
             ctx: self.ctx,
@@ -696,7 +706,7 @@ where
             branches: self.branches,
         };
 
-        DurableFuture::lazy_scoped(execution.execute(), owner_scope, op_scope)
+        DurableFuture::lazy_scoped(execution.execute(), gate, owner_scope, op_scope)
     }
 }
 

@@ -288,6 +288,11 @@ where
                 )
                 .instrument(child_span)
                 .await;
+                // The body returned, so the child is finished: abandon it,
+                // as a `run_in_child_context` child is (see `Admission`).
+                // The terminal update below goes through the parent
+                // context, so it is admitted.
+                after.ctx.admission().abandon([after.wire_id.as_str()]);
                 after.settle(body_result).await
             }
         }
@@ -1752,6 +1757,13 @@ mod tests {
         };
 
         let err = exec.execute().await.unwrap_err();
+        // The body returned, so the finished child is abandoned: a later
+        // write from inside it would be rejected.
+        assert!(
+            !ctx.admission()
+                .admits(std::slice::from_ref(&expected_wire_id)),
+            "a finished wait_for_callback child is abandoned"
+        );
         // Live/replay parity: the checkpointed context is attached.
         assert_eq!(err.operation_id(), Some(expected_wire_id.as_str()));
         assert_eq!(err.status(), Some("FAILED"));
