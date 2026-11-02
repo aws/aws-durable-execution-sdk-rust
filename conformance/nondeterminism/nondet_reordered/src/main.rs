@@ -1,4 +1,4 @@
-//! Conformance requirement 12-1: reordered operations on replay (issue #6).
+//! Conformance requirement nondeterminism-1: reordered operations on replay (issue #6).
 //!
 //! Deliberately violates the determinism contract: the replay path creates
 //! the two steps in the opposite order from the first execution. The SDK

@@ -1374,6 +1374,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "general_replay_operation_identity"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

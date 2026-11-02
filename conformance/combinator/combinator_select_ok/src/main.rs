@@ -1,4 +1,4 @@
-//! Conformance requirement 13-3: `select_ok` task ownership (issue #7).
+//! Conformance requirement combinator-3: `select_ok` task ownership (issue #7).
 //!
 //! Without task-ownership blessing, every branch is rejected as a foreign
 //! task, so no branch can win. With the blessing in place, the failing

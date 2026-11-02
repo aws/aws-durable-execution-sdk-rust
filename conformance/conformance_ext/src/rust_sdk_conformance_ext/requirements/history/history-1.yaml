@@ -1,5 +1,5 @@
 ---
-# 11-1: Multi-page history replay (issue #5)
+# history-1: Multi-page history replay (issue #5)
 description: Multi-page history replay (bootstrap paginates execution state)
 handler: |
   Creates 150 sequential steps, each returning an index-tagged ~1KB payload

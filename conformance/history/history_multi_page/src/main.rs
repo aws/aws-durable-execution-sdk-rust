@@ -1,4 +1,4 @@
-//! Conformance requirement 11-1: multi-page history replay (issue #5).
+//! Conformance requirement history-1: multi-page history replay (issue #5).
 //!
 //! Creates enough operations, each with a ~1KB payload, that the recorded
 //! history spans more than one `GetDurableExecutionState` page. A wait in

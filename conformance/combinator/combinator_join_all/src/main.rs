@@ -1,4 +1,4 @@
-//! Conformance requirement 13-2: `join_all` task ownership (issue #7).
+//! Conformance requirement combinator-2: `join_all` task ownership (issue #7).
 //!
 //! The silent-corruption case: without task-ownership blessing, every
 //! branch settles as `Err` with the ownership error while `join_all`

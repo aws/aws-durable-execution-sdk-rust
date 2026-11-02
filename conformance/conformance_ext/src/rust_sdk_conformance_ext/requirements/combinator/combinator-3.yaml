@@ -1,5 +1,5 @@
 ---
-# 13-3: select_ok task ownership (issue #7)
+# combinator-3: select_ok task ownership (issue #7)
 description: select_ok returns the first successful branch from blessed tasks
 handler: |
   Spawns two steps as durable futures (one fails permanently, one

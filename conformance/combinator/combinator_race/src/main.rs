@@ -1,4 +1,4 @@
-//! Conformance requirement 13-4: `race` task ownership (issue #7).
+//! Conformance requirement combinator-4: `race` task ownership (issue #7).
 //!
 //! Without task-ownership blessing, `race` branches fail with the
 //! ownership error instead of settling normally. Both branches return the

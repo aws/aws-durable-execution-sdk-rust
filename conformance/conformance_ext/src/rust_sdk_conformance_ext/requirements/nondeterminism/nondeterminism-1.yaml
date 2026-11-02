@@ -1,5 +1,5 @@
 ---
-# 12-1: Non-determinism detection: reordered operations (issue #6)
+# nondeterminism-1: Non-determinism detection: reordered operations (issue #6)
 description: Reordered operations on replay fail with a non-determinism error
 handler: |
   On the first execution, runs step "alpha" then step "beta", then a

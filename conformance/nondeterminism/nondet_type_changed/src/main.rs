@@ -1,4 +1,4 @@
-//! Conformance requirement 12-2: operation changes type on replay (issue #6).
+//! Conformance requirement nondeterminism-2: operation changes type on replay (issue #6).
 //!
 //! Deliberately violates the determinism contract: the first execution
 //! records a step, the replay claims a wait at the same position. The SDK

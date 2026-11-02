@@ -34,7 +34,7 @@
 # Operations (default: all found in this directory):
 #   smoke, step, wait, callback, child, invoke, parallel,
 #   wait_for_callback, wait_for_condition, map, history,
-#   nondeterminism, combinator
+#   nondeterminism, combinator, general
 #
 # Examples:
 #   ./build_examples.sh smoke          # build only the smoke suite

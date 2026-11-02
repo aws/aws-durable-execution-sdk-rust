@@ -7,6 +7,7 @@
 # dependency cache per handler and multiplying full-suite rebuild time.
 members = [
     "smoke/*",
+    "general/*",
     "step/*",
     "wait/*",
     "callback/*",

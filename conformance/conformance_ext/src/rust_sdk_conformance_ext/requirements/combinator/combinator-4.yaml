@@ -1,5 +1,5 @@
 ---
-# 13-4: race task ownership (issue #7)
+# combinator-4: race task ownership (issue #7)
 description: race returns the first settled branch from blessed tasks
 handler: |
   Spawns two steps as durable futures, both returning the same value, and

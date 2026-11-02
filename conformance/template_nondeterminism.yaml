@@ -15,13 +15,13 @@ Resources:
   NondetReordered:
     Type: AWS::Serverless::Function
     TestingMetadata:
-      TestDescription: ["12-1"]
+      TestDescription: ["nondeterminism-1"]
     Metadata:
       BuildMethod: makefile
     Properties:
       CodeUri: publish/nondet_reordered/
       Handler: bootstrap
-      Description: 'Conformance 12-1: reordered operations fail replay'
+      Description: 'Conformance nondeterminism-1: reordered operations fail replay'
       Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
@@ -30,13 +30,13 @@ Resources:
   NondetTypeChanged:
     Type: AWS::Serverless::Function
     TestingMetadata:
-      TestDescription: ["12-2"]
+      TestDescription: ["nondeterminism-2"]
     Metadata:
       BuildMethod: makefile
     Properties:
       CodeUri: publish/nondet_type_changed/
       Handler: bootstrap
-      Description: 'Conformance 12-2: type-changed operation fails replay'
+      Description: 'Conformance nondeterminism-2: type-changed operation fails replay'
       Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
@@ -45,13 +45,13 @@ Resources:
   NondetRemoved:
     Type: AWS::Serverless::Function
     TestingMetadata:
-      TestDescription: ["12-3"]
+      TestDescription: ["nondeterminism-3"]
     Metadata:
       BuildMethod: makefile
     Properties:
       CodeUri: publish/nondet_removed/
       Handler: bootstrap
-      Description: 'Conformance 12-3: removed operation fails replay'
+      Description: 'Conformance nondeterminism-3: removed operation fails replay'
       Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7

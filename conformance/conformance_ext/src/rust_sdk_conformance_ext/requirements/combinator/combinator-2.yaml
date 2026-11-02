@@ -1,5 +1,5 @@
 ---
-# 13-2: join_all task ownership: settled outcomes are genuine (issue #7)
+# combinator-2: join_all task ownership: settled outcomes are genuine (issue #7)
 description: join_all reports real per-branch outcomes, not ownership rejections
 handler: |
   Spawns two steps as durable futures (one succeeds, one fails

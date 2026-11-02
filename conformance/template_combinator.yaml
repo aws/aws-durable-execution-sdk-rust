@@ -15,13 +15,13 @@ Resources:
   CombinatorTryJoinAll:
     Type: AWS::Serverless::Function
     TestingMetadata:
-      TestDescription: ["13-1"]
+      TestDescription: ["combinator-1"]
     Metadata:
       BuildMethod: makefile
     Properties:
       CodeUri: publish/combinator_try_join_all/
       Handler: bootstrap
-      Description: 'Conformance 13-1: try_join_all task ownership'
+      Description: 'Conformance combinator-1: try_join_all task ownership'
       Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
@@ -30,13 +30,13 @@ Resources:
   CombinatorJoinAll:
     Type: AWS::Serverless::Function
     TestingMetadata:
-      TestDescription: ["13-2"]
+      TestDescription: ["combinator-2"]
     Metadata:
       BuildMethod: makefile
     Properties:
       CodeUri: publish/combinator_join_all/
       Handler: bootstrap
-      Description: 'Conformance 13-2: join_all settled outcomes are genuine'
+      Description: 'Conformance combinator-2: join_all settled outcomes are genuine'
       Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
@@ -45,13 +45,13 @@ Resources:
   CombinatorSelectOk:
     Type: AWS::Serverless::Function
     TestingMetadata:
-      TestDescription: ["13-3"]
+      TestDescription: ["combinator-3"]
     Metadata:
       BuildMethod: makefile
     Properties:
       CodeUri: publish/combinator_select_ok/
       Handler: bootstrap
-      Description: 'Conformance 13-3: select_ok task ownership'
+      Description: 'Conformance combinator-3: select_ok task ownership'
       Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7
@@ -60,13 +60,13 @@ Resources:
   CombinatorRace:
     Type: AWS::Serverless::Function
     TestingMetadata:
-      TestDescription: ["13-4"]
+      TestDescription: ["combinator-4"]
     Metadata:
       BuildMethod: makefile
     Properties:
       CodeUri: publish/combinator_race/
       Handler: bootstrap
-      Description: 'Conformance 13-4: race task ownership'
+      Description: 'Conformance combinator-4: race task ownership'
       Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7

@@ -15,13 +15,13 @@ Resources:
   HistoryMultiPage:
     Type: AWS::Serverless::Function
     TestingMetadata:
-      TestDescription: ["11-1"]
+      TestDescription: ["history-1"]
     Metadata:
       BuildMethod: makefile
     Properties:
       CodeUri: publish/history_multi_page/
       Handler: bootstrap
-      Description: 'Conformance 11-1: multi-page history replay'
+      Description: 'Conformance history-1: multi-page history replay'
       Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7

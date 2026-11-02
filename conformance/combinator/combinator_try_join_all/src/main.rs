@@ -1,4 +1,4 @@
-//! Conformance requirement 13-1: `try_join_all` task ownership (issue #7).
+//! Conformance requirement combinator-1: `try_join_all` task ownership (issue #7).
 //!
 //! The combinator drives its branch futures on internal `JoinSet` tasks,
 //! which must be blessed with the task-ownership guard: an unblessed

@@ -1,4 +1,4 @@
-//! Conformance requirement 12-3: removed operation on replay (issue #6).
+//! Conformance requirement nondeterminism-3: removed operation on replay (issue #6).
 //!
 //! Deliberately violates the determinism contract: the replay path skips
 //! the first recorded step, so its first claim ("process-data") lands on
