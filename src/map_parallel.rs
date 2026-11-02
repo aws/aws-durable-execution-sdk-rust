@@ -121,11 +121,12 @@ pub struct BatchItem<O> {
     pub error_message: Option<String>,
     /// Error type identifier (only meaningful when status is Failed).
     ///
-    /// Carries the `errType` recorded in the batch checkpoint payload: the
-    /// recorded type of the error the item body returned (`"Error"` for an
-    /// untyped error), so error identity
-    /// survives checkpoint replay alongside the message. `None` when the
-    /// payload recorded no type (a payload written before error typing).
+    /// Carries the type recorded in the batch checkpoint payload (the
+    /// item error's `Cause.ErrorType`): the recorded type of the error the
+    /// item body returned (`"Error"` for an untyped error), so error
+    /// identity survives checkpoint replay alongside the message. `None`
+    /// when the payload recorded no type (a payload written before error
+    /// typing).
     pub error_type: Option<String>,
     /// Opaque wire `ErrorData` payload recorded with the failure (only
     /// meaningful when status is Failed).
@@ -776,6 +777,7 @@ pub(crate) struct MapExecution<I, O, F, IS, RS> {
     pub(crate) max_concurrency: Option<usize>,
     pub(crate) completion: Option<crate::builders::map_parallel::CompletionConfig>,
     pub(crate) serdes: IS,
+    pub(crate) encoding: ItemEncoding,
     pub(crate) result_serdes: RS,
     pub(crate) nesting: NestingMode,
     pub(crate) item_namer: Option<ItemNamer<I>>,
@@ -842,6 +844,7 @@ where
             self.max_concurrency,
             self.completion,
             self.serdes,
+            self.encoding,
             self.result_serdes,
             self.nesting,
             user_names,
@@ -863,6 +866,7 @@ pub(crate) struct ParallelExecution<O, IS, RS> {
     pub(crate) max_concurrency: Option<usize>,
     pub(crate) completion: Option<crate::builders::map_parallel::CompletionConfig>,
     pub(crate) serdes: IS,
+    pub(crate) encoding: ItemEncoding,
     pub(crate) result_serdes: RS,
     pub(crate) nesting: NestingMode,
     pub(crate) branches: Vec<(Option<String>, crate::future::BranchBody<O>)>,
@@ -916,6 +920,7 @@ where
             self.max_concurrency,
             self.completion,
             self.serdes,
+            self.encoding,
             self.result_serdes,
             self.nesting,
             user_names,
@@ -1013,7 +1018,13 @@ struct PreClaimed {
 /// the item index plus the item's terminal outcome. A branch that waits on
 /// a durable operation stays pending in the join set and keeps its
 /// concurrency slot until it finishes.
-type ItemJoin<O> = (usize, Result<BatchItem<O>, OperationError>);
+type ItemJoin<O> = (usize, Result<ItemOutcome<O>, OperationError>);
+
+/// One item's terminal outcome, plus the wire string its child produced
+/// when it succeeded: the string the child serialized for its record or its
+/// size check, or the string replay read from its record. The batch record
+/// takes the item value from it, so it needs no second serdes call.
+type ItemOutcome<O> = (BatchItem<O>, Option<String>);
 
 /// Everything one item body needs, owned and free of generic parameters.
 ///
@@ -1040,7 +1051,7 @@ struct ItemRequest<IS> {
 /// checkpoint log, or the body must run in the prepared child context.
 enum ItemPrelude<O> {
     /// Recorded terminal outcome decoded from the checkpoint log.
-    Done(BatchItem<O>),
+    Done(ItemOutcome<O>),
     /// The body must run; the child context is ready.
     Run {
         /// The child context the item body receives.
@@ -1111,7 +1122,7 @@ where
 async fn item_after<O, IS>(
     req: &ItemRequest<IS>,
     outcome: Result<O, ChildFnError>,
-) -> Result<BatchItem<O>, OperationError>
+) -> Result<ItemOutcome<O>, OperationError>
 where
     O: Send + 'static,
     IS: Serdes<O>,
@@ -1142,26 +1153,29 @@ where
                     let serialized =
                         serialize_value(&req.ctx, name, value, serdes, serdes_ctx.clone()).await?;
                     let deserialized: O =
-                        deserialize_value(&req.ctx, name, serialized, serdes, serdes_ctx).await?;
-                    Ok::<_, OperationError>(deserialized)
+                        deserialize_value(&req.ctx, name, serialized.clone(), serdes, serdes_ctx)
+                            .await?;
+                    Ok::<_, OperationError>((deserialized, serialized))
                 };
                 match round_trip.await {
-                    Ok(deserialized) => Ok(BatchItem {
-                        index: req.index,
-                        name: req.item_name.clone(),
-                        status: BatchItemStatus::Succeeded,
-                        result: Some(deserialized),
-                        error_message: None,
-                        error_type: None,
-                        error_data: None,
-                        stack_trace: Vec::new(),
-                    }),
+                    Ok((deserialized, serialized)) => Ok((
+                        BatchItem {
+                            index: req.index,
+                            name: req.item_name.clone(),
+                            status: BatchItemStatus::Succeeded,
+                            result: Some(deserialized),
+                            error_message: None,
+                            error_type: None,
+                            error_data: None,
+                            stack_trace: Vec::new(),
+                        },
+                        Some(serialized),
+                    )),
                     Err(op_err) => {
                         let wire = crate::error::serialization_failure_wire(&op_err);
-                        Ok(BatchItem::failed_from_wire(
-                            req.index,
-                            req.item_name.clone(),
-                            &wire,
+                        Ok((
+                            BatchItem::failed_from_wire(req.index, req.item_name.clone(), &wire),
+                            None,
                         ))
                     }
                 }
@@ -1171,10 +1185,9 @@ where
                 // returned: its recorded type, and its flattened chain as
                 // the message.
                 let wire = child_err.failure_wire();
-                Ok(BatchItem::failed_from_wire(
-                    req.index,
-                    req.item_name.clone(),
-                    &wire,
+                Ok((
+                    BatchItem::failed_from_wire(req.index, req.item_name.clone(), &wire),
+                    None,
                 ))
             }
         };
@@ -1231,10 +1244,9 @@ where
                             )
                             .await;
                     }
-                    return Ok(BatchItem::failed_from_wire(
-                        req.index,
-                        req.item_name.clone(),
-                        &wire,
+                    return Ok((
+                        BatchItem::failed_from_wire(req.index, req.item_name.clone(), &wire),
+                        None,
                     ));
                 }
             };
@@ -1285,22 +1297,25 @@ where
             let deserialized: O = deserialize_value(
                 &req.ctx,
                 item_fault_name(&req.item_name),
-                serialized,
+                serialized.clone(),
                 serdes,
                 serdes_ctx,
             )
             .await?;
 
-            Ok(BatchItem {
-                index: req.index,
-                name: req.item_name.clone(),
-                status: BatchItemStatus::Succeeded,
-                result: Some(deserialized),
-                error_message: None,
-                error_type: None,
-                error_data: None,
-                stack_trace: Vec::new(),
-            })
+            Ok((
+                BatchItem {
+                    index: req.index,
+                    name: req.item_name.clone(),
+                    status: BatchItemStatus::Succeeded,
+                    result: Some(deserialized),
+                    error_message: None,
+                    error_type: None,
+                    error_data: None,
+                    stack_trace: Vec::new(),
+                },
+                Some(serialized),
+            ))
         }
         Err(child_err) => {
             // Checkpoint failure. The wire record is derived from the
@@ -1342,10 +1357,9 @@ where
                     .await;
             }
 
-            Ok(BatchItem::failed_from_wire(
-                req.index,
-                req.item_name.clone(),
-                &wire,
+            Ok((
+                BatchItem::failed_from_wire(req.index, req.item_name.clone(), &wire),
+                None,
             ))
         }
     }
@@ -1358,7 +1372,7 @@ where
 async fn run_single_item<O, F, Fut, IS>(
     req: ItemRequest<IS>,
     run_item: Arc<F>,
-) -> Result<BatchItem<O>, OperationError>
+) -> Result<ItemOutcome<O>, OperationError>
 where
     O: Send + 'static,
     F: Fn(DurableContext, usize) -> Fut + Send + Sync + 'static,
@@ -1392,7 +1406,7 @@ where
 async fn run_branch_item<O, IS>(
     req: ItemRequest<IS>,
     slots: Arc<Vec<std::sync::Mutex<Option<crate::future::BranchBody<O>>>>>,
-) -> Result<BatchItem<O>, OperationError>
+) -> Result<ItemOutcome<O>, OperationError>
 where
     O: Send + 'static,
     IS: Serdes<O>,
@@ -1512,6 +1526,9 @@ struct BatchProgress<O> {
     tracker: CompletionTracker,
     /// Terminal outcomes, positional by item index.
     results: Vec<Option<BatchItem<O>>>,
+    /// The wire string each succeeded item's child produced, positional by
+    /// item index. The batch record takes each item value from it.
+    wires: Vec<Option<String>>,
     /// Which items were EVER admitted: dispatched live this invocation, or
     /// holding a checkpoint record from a prior one. Ordered admission makes
     /// this a contiguous prefix of the input, and its length is the
@@ -1529,6 +1546,7 @@ impl<O> BatchProgress<O> {
         Self {
             tracker: CompletionTracker::new(names),
             results: (0..total_items).map(|_| None).collect(),
+            wires: vec![None; total_items],
             started: vec![false; total_items],
         }
     }
@@ -1548,18 +1566,21 @@ impl<O> BatchProgress<O> {
     }
 
     /// Records one terminal item outcome: it feeds the completion
-    /// statistics and its result slot.
+    /// statistics, its result slot and its wire slot.
     fn settle_outcome(
         &mut self,
         completion_cfg: &crate::builders::map_parallel::CompletionConfig,
         total_items: usize,
         index: usize,
-        item: BatchItem<O>,
+        (item, wire): ItemOutcome<O>,
     ) {
         self.tracker
             .settle(completion_cfg, total_items, index, item.status);
         if let Some(slot) = self.results.get_mut(index) {
             *slot = Some(item);
+        }
+        if let Some(slot) = self.wires.get_mut(index) {
+            *slot = wire;
         }
     }
 }
@@ -1698,6 +1719,7 @@ async fn execute_batch<O, IS, RS>(
     max_concurrency: Option<usize>,
     completion: Option<crate::builders::map_parallel::CompletionConfig>,
     serdes: IS,
+    encoding: ItemEncoding,
     result_serdes: RS,
     nesting: NestingMode,
     user_names: Vec<Option<String>>,
@@ -1782,7 +1804,7 @@ where
             let decision = if matches!(snapshot.status, CheckpointStatus::Succeeded)
                 && snapshot.replay_children
             {
-                parse_decision_record(snapshot.result.as_deref())?
+                parse_replay_children_payload(snapshot.result.as_deref())?
             } else {
                 None
             };
@@ -1849,6 +1871,8 @@ where
                     parent_name.as_deref(),
                     &snapshot,
                     &serdes,
+                    encoding,
+                    total_items,
                     &result_serdes,
                     &serdes_ctx,
                 )
@@ -1939,8 +1963,7 @@ where
             items: Vec::new(),
             reason,
         };
-        let (payload, result) =
-            from_batch_result(&ctx, result, &serdes, &parent_wire, ctx.execution_arn()).await?;
+        let payload = from_batch_result(&result, &[], encoding);
         let serialized_payload = serialize_value(
             &ctx,
             parent_name.as_deref(),
@@ -1949,15 +1972,14 @@ where
             SerdesContext::new(&parent_wire, ctx.execution_arn()),
         )
         .await?;
-        let decision_json =
-            serialize_decision_record(&build_decision_record(&result.items, 0, result.reason))?;
+        let summary_json = oversized_batch_summary(&result, parent_sub_type);
         checkpoint_batch_success_serialized(
             &ctx,
             &parent_wire,
             parent_name.as_deref(),
             parent_sub_type,
             &serialized_payload,
-            &decision_json,
+            &summary_json,
         )
         .await?;
         return Ok(result);
@@ -2347,6 +2369,7 @@ where
     let BatchProgress {
         tracker,
         mut results,
+        wires,
         started,
     } = progress;
 
@@ -2372,7 +2395,13 @@ where
             }
         }
     }
-    let final_items: Vec<BatchItem<O>> = results.into_iter().flatten().collect();
+    // Each reported item keeps the wire string its child produced, in the
+    // same order, for the batch record.
+    let (final_items, final_wires): (Vec<BatchItem<O>>, Vec<Option<String>>) = results
+        .into_iter()
+        .zip(wires)
+        .filter_map(|(slot, wire)| slot.map(|item| (item, wire)))
+        .unzip();
 
     // 8b. Under a replay plan, the batch outcome is already durably
     // recorded: the reason is taken verbatim from the decision record and
@@ -2395,31 +2424,22 @@ where
         .stop_reason
         .unwrap_or(CompletionReason::AllCompleted);
 
-    // Ordered admission makes the ever-started set the contiguous prefix
-    // `[0, ever_started)`: its length is the `totalCount` the decision
-    // record carries: the number of items ever started, NOT the input
-    // length.
-    let ever_started = started.iter().rposition(|s| *s).map_or(0, |i| i + 1);
-
+    // Ordered admission makes the ever-started set a contiguous prefix of
+    // the input, and every started item is reported (a non-terminal one as
+    // STARTED). So `batch_result.items` is that prefix, and its length is
+    // the `totalCount` the oversized summary carries: the number of items
+    // ever started, NOT the input length.
     let batch_result = BatchResult {
         items: final_items,
         reason,
     };
 
-    // 11. Serialize the batch result BEFORE the async checkpoint call
-    // (avoids requiring O: Sync for the reference across await).
-    // The whole-batch summary goes through the SAME `serialize_value` helper
-    // as every other path, so `result_serdes` receives the typed
+    // 11. Build the batch record from the item wire strings (no serdes
+    // call), then serialize it through the SAME `serialize_value` helper as
+    // every other path, so `result_serdes` receives the typed
     // `BatchSummary` value directly, exactly as an item serdes receives the
     // typed item value.
-    let (payload, batch_result) = from_batch_result(
-        &ctx,
-        batch_result,
-        &serdes,
-        &parent_wire,
-        ctx.execution_arn(),
-    )
-    .await?;
+    let payload = from_batch_result(&batch_result, &final_wires, encoding);
     let serialized_payload = serialize_value(
         &ctx,
         parent_name.as_deref(),
@@ -2429,14 +2449,10 @@ where
     )
     .await?;
 
-    // The decision record travels alongside the payload: when the payload
-    // is too large to checkpoint inline, the record is written in its place
+    // The JS summary travels alongside the payload: when the payload is
+    // too large to checkpoint inline, the summary is written in its place
     // so replay can obey the recorded outcome instead of re-deriving it.
-    let decision_json = serialize_decision_record(&build_decision_record(
-        &batch_result.items,
-        ever_started,
-        batch_result.reason,
-    ))?;
+    let summary_json = oversized_batch_summary(&batch_result, parent_sub_type);
 
     // 12. Checkpoint the parent SUCCEED.
     checkpoint_batch_success_serialized(
@@ -2445,7 +2461,7 @@ where
         parent_name.as_deref(),
         parent_sub_type,
         &serialized_payload,
-        &decision_json,
+        &summary_json,
     )
     .await?;
 
@@ -2457,11 +2473,14 @@ where
 /// Takes the targeted [`crate::engine::TerminalReplaySnapshot`] projection
 /// rather than the full checkpoint record: the status, `replay_children`,
 /// and payload/error strings are all this helper reads.
+#[expect(clippy::too_many_arguments)] // reason: the record check needs the input length beside the serdes inputs
 async fn replay_terminal_batch<O, IS, RS>(
     ctx: &DurableContext,
     name: Option<&str>,
     snapshot: &crate::engine::TerminalReplaySnapshot,
     serdes: &Arc<IS>,
+    encoding: ItemEncoding,
+    total_items: usize,
     result_serdes: &RS,
     serdes_ctx: &SerdesContext,
 ) -> Result<BatchResult<O>, OperationError>
@@ -2490,12 +2509,14 @@ where
                 deserialize_value(ctx, name, payload_str, result_serdes, serdes_ctx.clone())
                     .await?;
             // The batch parent's serdes context carries the parent wire ID and
-            // the execution ARN, which is exactly what the per-item contexts
-            // are derived from.
+            // the execution ARN, which is what the per-item contexts of a
+            // record from an earlier release are derived from.
             to_batch_result(
                 ctx,
                 payload,
                 serdes,
+                encoding,
+                total_items,
                 serdes_ctx.operation_id(),
                 serdes_ctx.durable_execution_arn(),
             )
@@ -2525,7 +2546,7 @@ async fn replay_terminal_child<O, S>(
     item_name: &str,
     serdes: &S,
     serdes_ctx: &SerdesContext,
-) -> Result<BatchItem<O>, OperationError>
+) -> Result<ItemOutcome<O>, OperationError>
 where
     O: Send + 'static,
     S: Serdes<O>,
@@ -2547,34 +2568,40 @@ where
             let value: O = deserialize_value(
                 ctx,
                 item_fault_name(item_name),
-                payload,
+                payload.clone(),
                 serdes,
                 serdes_ctx.clone(),
             )
             .await?;
-            Ok(BatchItem {
-                index,
-                name: item_name.to_owned(),
-                status: BatchItemStatus::Succeeded,
-                result: Some(value),
-                error_message: None,
-                error_type: None,
-                error_data: None,
-                stack_trace: Vec::new(),
-            })
+            Ok((
+                BatchItem {
+                    index,
+                    name: item_name.to_owned(),
+                    status: BatchItemStatus::Succeeded,
+                    result: Some(value),
+                    error_message: None,
+                    error_type: None,
+                    error_data: None,
+                    stack_trace: Vec::new(),
+                },
+                Some(payload),
+            ))
         }
         CheckpointStatus::Failed => {
             let msg = record.error_message.as_deref().unwrap_or("child failed");
-            Ok(BatchItem {
-                index,
-                name: item_name.to_owned(),
-                status: BatchItemStatus::Failed,
-                result: None,
-                error_message: Some(msg.to_owned()),
-                error_type: record.error_type.clone(),
-                error_data: record.error_data.clone(),
-                stack_trace: record.stack_trace.clone().unwrap_or_default(),
-            })
+            Ok((
+                BatchItem {
+                    index,
+                    name: item_name.to_owned(),
+                    status: BatchItemStatus::Failed,
+                    result: None,
+                    error_message: Some(msg.to_owned()),
+                    error_type: record.error_type.clone(),
+                    error_data: record.error_data.clone(),
+                    stack_trace: record.stack_trace.clone().unwrap_or_default(),
+                },
+                None,
+            ))
         }
         _ => Err(batch_error(
             "unexpected non-terminal child status in replay",
@@ -2582,27 +2609,23 @@ where
     }
 }
 
-/// The SDK-owned decision record a batch checkpoints in place of a result
-/// payload too large to store inline.
+/// The decision record that earlier releases checkpointed in place of a
+/// batch result too large to store inline. This release writes the JS
+/// summary instead (see [`oversized_batch_summary`]), and still reads this
+/// record, so executions in flight replay.
 ///
-/// Mirrors the Python SDK's summary envelope: `totalCount` is the number of
-/// items EVER STARTED, not the input length; ordered admission makes the
-/// started set the contiguous prefix `[0, totalCount)`: `completionReason`
-/// is the wire form of [`CompletionReason`], and one of `startedIndexes` /
-/// `completedIndexes` (whichever is shorter) names the partition of that
-/// prefix: `startedIndexes` lists items that began but were not terminal
-/// when the batch completed, `completedIndexes` lists the terminal ones.
-/// The read side accepts either form and reconstructs the other against the
-/// same prefix, so the record stays compact at both early-exit extremes.
+/// `totalCount` is the number of items EVER STARTED, not the input length;
+/// ordered admission makes the started set the contiguous prefix
+/// `[0, totalCount)`. `completionReason` is the wire form of
+/// [`CompletionReason`], and one of `startedIndexes` / `completedIndexes`
+/// names the partition of that prefix: `startedIndexes` lists items that
+/// began but were not terminal when the batch completed, `completedIndexes`
+/// lists the terminal ones. The read side accepts either form and
+/// reconstructs the other against the same prefix.
 ///
-/// The record is plain JSON and deliberately BYPASSES `result_serdes`,
-/// matching Python: it is the SDK's own bookkeeping, carries no user-typed
-/// values, and must stay readable even when the configured serdes is the
-/// reason the real payload outgrew the checkpoint limit. `replay_children`
-/// on the parent record is the discriminator: a `replay_children` payload
-/// is a decision record; a plain payload is the serdes-transformed batch
-/// summary.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// The JS summary is read into this same shape (see
+/// [`parse_replay_children_payload`]), so one [`ReplayPlan`] serves both.
+#[derive(Debug, serde::Deserialize)]
 struct BatchDecisionRecord {
     /// Number of items ever started (the admitted prefix length).
     #[serde(rename = "totalCount")]
@@ -2612,72 +2635,78 @@ struct BatchDecisionRecord {
     #[serde(rename = "completionReason")]
     completion_reason: String,
     /// Indexes (within `[0, totalCount)`) of items that began but were not
-    /// terminal when the batch completed. Written only when it is the
-    /// shorter set.
-    #[serde(
-        rename = "startedIndexes",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// terminal when the batch completed.
+    #[serde(rename = "startedIndexes", default)]
     started_indexes: Option<Vec<usize>>,
     /// Indexes (within `[0, totalCount)`) of items that reached a terminal
-    /// state. Written only when it is the shorter set.
-    #[serde(
-        rename = "completedIndexes",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// state.
+    #[serde(rename = "completedIndexes", default)]
     completed_indexes: Option<Vec<usize>>,
 }
 
-/// Builds the decision record for a completed batch: `ever_started` is the
-/// admitted prefix length, `items` are the reported items, and the shorter
-/// of the two index sets is the one written. Only a `Succeeded` or `Failed`
-/// item counts as completed.
-fn build_decision_record<O>(
-    items: &[BatchItem<O>],
-    ever_started: usize,
-    reason: CompletionReason,
-) -> BatchDecisionRecord {
-    let mut completed_flags = vec![false; ever_started];
-    for item in items {
-        // A STARTED item was not terminal when the batch completed, so it
-        // stays in the started set.
-        if item.status == BatchItemStatus::Started {
-            continue;
-        }
-        if let Some(slot) = completed_flags.get_mut(item.index) {
-            *slot = true;
-        }
-    }
-    let completed: Vec<usize> = completed_flags
-        .iter()
-        .enumerate()
-        .filter_map(|(i, done)| done.then_some(i))
-        .collect();
-    let started_only: Vec<usize> = completed_flags
-        .iter()
-        .enumerate()
-        .filter_map(|(i, done)| (!done).then_some(i))
-        .collect();
-    let (started_indexes, completed_indexes) = if started_only.len() <= completed.len() {
-        (Some(started_only), None)
-    } else {
-        (None, Some(completed))
+/// Reads the payload of a terminal `replay_children` batch parent, in this
+/// order:
+///
+/// 1. An absent or empty payload is a record from before decision records:
+///    `Ok(None)`, and the caller falls back to the unconstrained
+///    re-execution.
+/// 2. A JSON object with the key `itemStatuses` is the JS summary. Its
+///    `itemStatuses` must be a non-empty string of `S`, `F` and `-`; the
+///    started prefix is its length, the terminal indexes are its `S` and
+///    `F` positions, and the reason is `completionReason`. As in JS,
+///    `itemStatuses` is the only per-item field replay reads.
+/// 3. A JSON object with `totalCount` and `startedIndexes` or
+///    `completedIndexes` is the decision record an earlier release wrote
+///    (see [`parse_decision_record`]).
+/// 4. Any other payload is corrupt bookkeeping, and replay fails rather
+///    than re-executing items the recorded batch may never have started.
+fn parse_replay_children_payload(
+    payload: Option<&str>,
+) -> Result<Option<BatchDecisionRecord>, OperationError> {
+    let Some(payload) = payload else {
+        return Ok(None);
     };
-    BatchDecisionRecord {
-        total_count: ever_started,
-        completion_reason: reason.as_str().to_owned(),
-        started_indexes,
-        completed_indexes,
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return Ok(None);
     }
-}
-
-/// Serializes a decision record as plain JSON (never through
-/// `result_serdes`: see [`BatchDecisionRecord`]).
-fn serialize_decision_record(record: &BatchDecisionRecord) -> Result<String, OperationError> {
-    serde_json::to_string(record)
-        .map_err(|e| batch_error(&format!("serialize batch decision record: {e}")))
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|e| batch_error(&format!("malformed batch decision record: {e}")))?;
+    if let Some(statuses) = value.get("itemStatuses") {
+        let statuses = statuses
+            .as_str()
+            .filter(|s| !s.is_empty() && s.chars().all(|c| matches!(c, 'S' | 'F' | '-')))
+            .ok_or_else(|| {
+                batch_error(
+                    "malformed batch decision record: itemStatuses must be a non-empty \
+                     string of S, F and -",
+                )
+            })?;
+        let completed = statuses
+            .chars()
+            .enumerate()
+            .filter_map(|(i, c)| (c != '-').then_some(i))
+            .collect();
+        return Ok(Some(BatchDecisionRecord {
+            total_count: statuses.chars().count(),
+            completion_reason: value
+                .get("completionReason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            started_indexes: None,
+            completed_indexes: Some(completed),
+        }));
+    }
+    if value.get("totalCount").is_some()
+        && (value.get("startedIndexes").is_some() || value.get("completedIndexes").is_some())
+    {
+        return parse_decision_record(Some(payload));
+    }
+    Err(batch_error(
+        "malformed batch decision record: the payload is neither a batch summary \
+         nor a decision record",
+    ))
 }
 
 /// Parses a terminal batch's `replay_children` payload as a decision
@@ -2855,7 +2884,7 @@ where
             Some(&item_name),
         )?;
         let serdes_ctx = SerdesContext::new(op_id.wire().to_owned(), ctx.execution_arn());
-        let item =
+        let (item, _wire) =
             replay_terminal_child(ctx, op_id.positional(), i, &item_name, serdes, &serdes_ctx)
                 .await?;
         items.push(item);
@@ -2869,24 +2898,24 @@ where
 /// Checkpoints the parent batch as SUCCEEDED with the pre-serialized result.
 ///
 /// When the serialized payload exceeds [`CHECKPOINT_SIZE_LIMIT_BYTES`], the
-/// record is written with `replay_children(true)` and `decision_json`, the
-/// batch decision record, as its payload, so replay can obey the recorded
-/// outcome (`totalCount`, `completionReason`, index set) instead of
-/// re-deriving it by re-execution. A modern terminal batch is NEVER written
-/// without its decision record: should the record itself exceed the limit
-/// (a pathological interleaving across tens of thousands of items), the
-/// checkpoint is refused with an error rather than written record-less,
-/// because a record-less write would replay through the unconstrained
-/// re-execution path and could resurrect items the live batch never
-/// started. The refusal is deterministic, replay reaches the same state
-/// and fails the same way, so no false outcome is ever recorded.
+/// record is written with `replay_children(true)` and `summary_json`, the
+/// JS summary of [`oversized_batch_summary`], as its payload, so replay can
+/// obey the recorded outcome (started prefix, terminal items,
+/// `completionReason`) instead of re-deriving it by re-execution. A
+/// terminal batch is NEVER written without its summary: should the summary
+/// itself exceed the limit (one character per item, so only past a quarter
+/// million items), the checkpoint is refused with an error rather than
+/// written summary-less, because a summary-less write would replay through
+/// the unconstrained re-execution path and could resurrect items the live
+/// batch never started. The refusal is deterministic, replay reaches the
+/// same state and fails the same way, so no false outcome is ever recorded.
 async fn checkpoint_batch_success_serialized(
     ctx: &DurableContext,
     parent_wire: &str,
     parent_name: Option<&str>,
     parent_sub_type: &str,
     serialized_payload: &str,
-    decision_json: &str,
+    summary_json: &str,
 ) -> Result<(), OperationError> {
     let mut builder = OperationUpdate::builder()
         .id(parent_wire.to_owned())
@@ -2902,11 +2931,11 @@ async fn checkpoint_batch_success_serialized(
     }
 
     if serialized_payload.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
-        if decision_json.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
-            // Never write a modern terminal batch without its decision
-            // record (see the function docs).
+        if summary_json.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
+            // Never write a terminal batch without its summary (see the
+            // function docs).
             return Err(batch_error(
-                "batch decision record exceeds the checkpoint size limit; \
+                "batch summary exceeds the checkpoint size limit; \
                  refusing to record the batch outcome without it",
             ));
         }
@@ -2916,7 +2945,7 @@ async fn checkpoint_batch_success_serialized(
                     .replay_children(true)
                     .build(),
             )
-            .payload(decision_json.to_owned());
+            .payload(summary_json.to_owned());
     } else {
         builder = builder.payload(serialized_payload.to_owned());
     }
@@ -3315,20 +3344,59 @@ fn item_fault_name(item_name: &str) -> Option<&str> {
     (!item_name.is_empty()).then_some(item_name)
 }
 
-/// Builds the serdes context for an individual batch item result stored
-/// inside the batch summary payload.
+/// How the batch record stores the value of a succeeded item.
 ///
-/// The identity is derived from the batch parent's wire ID plus the item
-/// index, so it is deterministic across replays and distinct per item (a
-/// context-sensitive serdes such as `FileSystemSerdes` must not collapse all
-/// item results onto one path).
-fn item_summary_serdes_ctx(parent_wire: &str, execution_arn: &str, index: usize) -> SerdesContext {
+/// JS stores each item value as a JSON value. A custom item serdes writes a
+/// string that is not JSON in general, so the record stores that string
+/// as it is. The builder knows which serdes it holds: it starts with the
+/// default JSON serdes, and `.serdes(..)` replaces it. The record itself
+/// has no field for the encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ItemEncoding {
+    /// Every item uses the default JSON serdes. The record embeds each
+    /// value as the JSON value of its child wire string.
+    AllJson,
+    /// Every item uses a custom serdes. The record stores each value as its
+    /// child wire string, in a JSON string.
+    AllSerdes,
+}
+
+/// The serdes context of an item value inside a batch record that an
+/// earlier release wrote (the `{results, reason}` form).
+///
+/// That release derived the identity from the batch parent's wire ID plus
+/// the item index. Replay of such a record keeps the identity, so a
+/// context-sensitive serdes resolves the same location it wrote.
+fn preview_item_serdes_ctx(parent_wire: &str, execution_arn: &str, index: usize) -> SerdesContext {
     SerdesContext::new(format!("{parent_wire}/item-{index}"), execution_arn)
 }
 
-/// The whole-batch summary a map/parallel operation checkpoints: one entry
-/// per item (index, status, and the item's serialized result or error)
-/// plus the batch completion reason.
+/// The whole-batch record a map or parallel operation checkpoints.
+///
+/// It serializes in the shape of the JS SDK's batch result:
+///
+/// ```json
+/// {"all": [item, ...], "completionReason": "ALL_COMPLETED"}
+/// ```
+///
+/// `all` holds one item per started index, in index order. Each item has
+/// `index`, `status` (`"SUCCEEDED"`, `"FAILED"` or `"STARTED"`) and `name`,
+/// the recorded item name. JS has no `name` field; this record keeps it so
+/// that per-item errors name the item after replay. A succeeded item has
+/// `result`: the item value as a JSON value with the default item serdes,
+/// or the custom item serdes output as a JSON string. A failed item has
+/// `error`, a one-cause form of JS's recursive error object:
+///
+/// ```json
+/// {"ErrorType": "ChildContextError", "ErrorMessage": "...",
+///  "Cause": {"ErrorType": "<recorded type>", "ErrorMessage": "..."}}
+/// ```
+///
+/// `ErrorData` and `StackTrace` appear at both levels when the item
+/// recorded them. A started item has neither `result` nor `error`.
+///
+/// Replay also reads the `{results, reason}` record that earlier releases
+/// wrote.
 ///
 /// This is the value a **result serdes** (a serdes attached via
 /// `result_serdes(...)` on [`MapBuilder`](crate::builders::MapBuilder) or
@@ -3336,22 +3404,120 @@ fn item_summary_serdes_ctx(parent_wire: &str, execution_arn: &str, index: usize)
 /// fields are private: a result serdes is expected to be type-agnostic (a
 /// blanket `impl<T> Serdes<T>` over `T: serde::Serialize +
 /// serde::de::DeserializeOwned`), transforming the summary through its
-/// serde representation rather than field access.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// serde representation rather than field access. The summary holds item
+/// values as JSON values, so it deserializes only from a self-describing
+/// format, one that supports `deserialize_any`.
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct BatchSummary {
-    results: Vec<BatchCheckpointItem>,
+    record: SummaryRecord,
+}
+
+/// The two record forms a [`BatchSummary`] holds.
+#[derive(Debug)]
+enum SummaryRecord {
+    /// The JS-shaped record this release writes.
+    Js(JsBatchRecord),
+    /// The `{results, reason}` record earlier releases wrote.
+    Preview(PreviewBatchRecord),
+}
+
+impl serde::Serialize for BatchSummary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.record {
+            SummaryRecord::Js(record) => record.serialize(serializer),
+            SummaryRecord::Preview(record) => record.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BatchSummary {
+    /// Reads the record whose top-level object has the key `all` as the JS
+    /// form, and the record whose top-level object has the key `results`
+    /// as the form earlier releases wrote.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let record = if value.get("all").is_some() {
+            SummaryRecord::Js(serde_json::from_value(value).map_err(D::Error::custom)?)
+        } else if value.get("results").is_some() {
+            SummaryRecord::Preview(serde_json::from_value(value).map_err(D::Error::custom)?)
+        } else {
+            return Err(D::Error::custom(
+                "batch summary has neither an `all` nor a `results` key",
+            ));
+        };
+        Ok(Self { record })
+    }
+}
+
+/// The JS-shaped batch record (see [`BatchSummary`]).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct JsBatchRecord {
+    all: Vec<JsBatchItem>,
+    #[serde(rename = "completionReason")]
+    completion_reason: String,
+}
+
+/// One item of a [`JsBatchRecord`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct JsBatchItem {
+    index: usize,
+    status: String,
+    /// Always written. A record without it fails replay, because the
+    /// per-item errors name the item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// Present exactly when the item succeeded. A present `null` is a value
+    /// (the JSON encoding of `()`), so it reads as `Some(Value::Null)`.
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    result: Option<serde_json::Value>,
+    /// Present exactly when the item failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<JsErrorObject>,
+}
+
+/// The error object of a failed [`JsBatchItem`], and its `Cause`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct JsErrorObject {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_data: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    stack_trace: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cause: Option<Box<JsErrorObject>>,
+}
+
+/// Reads a field that is present, including a present `null`, as `Some`.
+/// With `#[serde(default)]`, an absent field reads as `None`.
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    <serde_json::Value as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// The `{results, reason}` batch record that earlier releases wrote.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PreviewBatchRecord {
+    results: Vec<PreviewBatchItem>,
     reason: String,
 }
 
-/// Per-item checkpoint representation.
+/// One item of a [`PreviewBatchRecord`].
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct BatchCheckpointItem {
+struct PreviewBatchItem {
     index: usize,
-    /// The recorded item name: the caller's name, or `map-item-{index}` or
-    /// `parallel-branch-{index}` when it is missing or empty. A summary
-    /// that an earlier release wrote can hold no name, so reading defaults
-    /// it to the empty string.
+    /// The recorded item name. A record that an even earlier release wrote
+    /// can hold no name, so reading defaults it to the empty string.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     name: String,
     status: String,
@@ -3373,32 +3539,269 @@ struct BatchCheckpointItem {
     stack_trace: Vec<String>,
 }
 
-/// Converts a live `BatchResult` into the checkpoint payload format,
-/// round-tripping every successful item value through the item serdes.
+/// The wire form of an item status.
+fn item_status_wire(status: BatchItemStatus) -> &'static str {
+    match status {
+        BatchItemStatus::Succeeded => "SUCCEEDED",
+        BatchItemStatus::Failed => "FAILED",
+        BatchItemStatus::Started => "STARTED",
+    }
+}
+
+/// Reads the wire form of an item status.
+fn parse_item_status(status: &str) -> Result<BatchItemStatus, OperationError> {
+    match status {
+        "SUCCEEDED" => Ok(BatchItemStatus::Succeeded),
+        "FAILED" => Ok(BatchItemStatus::Failed),
+        "STARTED" => Ok(BatchItemStatus::Started),
+        other => Err(batch_error(&format!("unknown item status: {other}"))),
+    }
+}
+
+/// The error object a failed item records: JS's `ChildContextError` with
+/// one cause, which carries the item's own recorded type.
+fn js_item_error<O>(item: &BatchItem<O>) -> JsErrorObject {
+    let message = item.error_message.clone().unwrap_or_default();
+    let cause = JsErrorObject {
+        error_type: Some(
+            item.error_type
+                .clone()
+                .unwrap_or_else(|| "Error".to_owned()),
+        ),
+        error_message: Some(message.clone()),
+        error_data: item.error_data.clone(),
+        stack_trace: item.stack_trace.clone(),
+        cause: None,
+    };
+    JsErrorObject {
+        error_type: Some("ChildContextError".to_owned()),
+        error_message: Some(message),
+        error_data: item.error_data.clone(),
+        stack_trace: item.stack_trace.clone(),
+        cause: Some(Box::new(cause)),
+    }
+}
+
+/// Builds the batch record of a live `BatchResult`.
 ///
-/// The batch result is consumed: each successful item's value transfers by
-/// ownership to `Serdes::serialize` (which lets the serdes move it into a
-/// blocking task without requiring `O: Sync`), and the returned
-/// `BatchResult` carries the values reconstructed from their wire form,
-/// so live and replay observe identical values.
-async fn from_batch_result<O, IS>(
+/// `wires` holds, for each item of `result` in the same order, the wire
+/// string the item's child produced: the string it serialized for its
+/// record or its size check, or the string replay read from its record.
+/// Each value comes from that string, so building the record calls no
+/// serdes.
+fn from_batch_result<O>(
+    result: &BatchResult<O>,
+    wires: &[Option<String>],
+    encoding: ItemEncoding,
+) -> BatchSummary {
+    let all = result
+        .items
+        .iter()
+        .zip(wires)
+        .map(|(item, wire)| {
+            // Only a succeeded item has a wire string.
+            let value = wire.as_ref().map(|wire| match encoding {
+                // The default JSON serdes wrote `wire` with
+                // `serde_json::to_string`, or read it back with
+                // `serde_json::from_str`. Either way it is valid JSON.
+                #[expect(clippy::expect_used)]
+                // reason: the default JSON serdes only produces or accepts valid JSON
+                ItemEncoding::AllJson => {
+                    serde_json::from_str(wire).expect("the default JSON serdes produces valid JSON")
+                }
+                ItemEncoding::AllSerdes => serde_json::Value::String(wire.clone()),
+            });
+            JsBatchItem {
+                index: item.index,
+                status: item_status_wire(item.status).to_owned(),
+                name: Some(item.name.clone()),
+                result: value,
+                error: (item.status == BatchItemStatus::Failed).then(|| js_item_error(item)),
+            }
+        })
+        .collect();
+    BatchSummary {
+        record: SummaryRecord::Js(JsBatchRecord {
+            all,
+            completion_reason: result.reason.as_str().to_owned(),
+        }),
+    }
+}
+
+/// The JS summary an oversized batch checkpoints in place of its record.
+///
+/// A map writes `{"type":"MapResult", totalCount, successCount,
+/// failureCount, completionReason, status, itemStatuses}`; a parallel
+/// writes `"ParallelResult"` and adds `startedCount`. `totalCount` counts
+/// the started items, and `itemStatuses` has one character per started
+/// index: `S` succeeded, `F` failed, `-` started and not terminal. The
+/// summary is plain JSON: it never goes through `result_serdes`, because
+/// it must stay readable even when the result serdes output is what
+/// outgrew the limit.
+fn oversized_batch_summary<O>(result: &BatchResult<O>, parent_sub_type: &str) -> String {
+    let total = result.items.len();
+    let succeeded = result.success_count();
+    let failed = result.failure_count();
+    let item_statuses: String = result
+        .items
+        .iter()
+        .map(|item| match item.status {
+            BatchItemStatus::Succeeded => 'S',
+            BatchItemStatus::Failed => 'F',
+            BatchItemStatus::Started => '-',
+        })
+        .collect();
+    let status = match result.status() {
+        BatchStatus::Failed => "FAILED",
+        BatchStatus::Succeeded => "SUCCEEDED",
+    };
+    let parallel = parent_sub_type == PARALLEL_SUB_TYPE;
+    let mut summary = serde_json::Map::new();
+    let type_name = if parallel {
+        "ParallelResult"
+    } else {
+        "MapResult"
+    };
+    summary.insert("type".to_owned(), type_name.into());
+    summary.insert("totalCount".to_owned(), total.into());
+    summary.insert("successCount".to_owned(), succeeded.into());
+    summary.insert("failureCount".to_owned(), failed.into());
+    if parallel {
+        summary.insert(
+            "startedCount".to_owned(),
+            (total - succeeded - failed).into(),
+        );
+    }
+    summary.insert("completionReason".to_owned(), result.reason.as_str().into());
+    summary.insert("status".to_owned(), status.into());
+    summary.insert("itemStatuses".to_owned(), item_statuses.into());
+    serde_json::Value::Object(summary).to_string()
+}
+
+/// Converts a deserialized batch record back into a `BatchResult`.
+///
+/// A JS-form record decodes each item value with the item serdes and the
+/// child's serdes context. A record from an earlier release decodes it with
+/// the context that release used (see [`preview_item_serdes_ctx`]).
+/// `total_items` is the length of the current input.
+async fn to_batch_result<O, IS>(
     ctx: &DurableContext,
-    result: BatchResult<O>,
+    payload: BatchSummary,
     serdes: &Arc<IS>,
+    encoding: ItemEncoding,
+    total_items: usize,
     parent_wire: &str,
     execution_arn: &str,
-) -> Result<(BatchSummary, BatchResult<O>), OperationError>
+) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
     IS: Serdes<O>,
 {
-    let BatchResult { items, reason } = result;
-    let reason_wire = reason.as_str().to_owned();
+    match payload.record {
+        SummaryRecord::Js(record) => {
+            js_to_batch_result(ctx, record, serdes, encoding, total_items, execution_arn).await
+        }
+        SummaryRecord::Preview(record) => {
+            preview_to_batch_result(ctx, record, serdes, parent_wire, execution_arn).await
+        }
+    }
+}
 
-    let mut summary_items = Vec::with_capacity(items.len());
-    let mut rebuilt_items = Vec::with_capacity(items.len());
-    for item in items {
-        let BatchItem {
+/// Converts a JS-form batch record back into a `BatchResult`.
+///
+/// The child of item `i` holds the `i`-th ID after the batch parent's (see
+/// [`replay_batch_from_record`]), so its serdes context is derived from
+/// that ID. A failed item's type, message and data come from `Cause` when
+/// it has them, else from the top level; its frames come from `Cause` when
+/// it is present.
+///
+/// The record is checked before any item is decoded. Its `all` must hold
+/// the started prefix of the input in index order: item `k` has index `k`,
+/// and there are at most `total_items` items. The SDK writes records in
+/// that form, but a custom `result_serdes` or a corrupt checkpoint can
+/// produce another one. A sparse, duplicate or reordered index would
+/// derive a child serdes context that is not the child's own ID, and an
+/// index past the input would name an ID beyond the counter's range. So
+/// such a record fails the replay with an error.
+async fn js_to_batch_result<O, IS>(
+    ctx: &DurableContext,
+    record: JsBatchRecord,
+    serdes: &Arc<IS>,
+    encoding: ItemEncoding,
+    total_items: usize,
+    execution_arn: &str,
+) -> Result<BatchResult<O>, OperationError>
+where
+    O: Send + 'static,
+    IS: Serdes<O>,
+{
+    if record.all.len() > total_items {
+        return Err(batch_error(&format!(
+            "batch record has {} items but the input has {total_items}",
+            record.all.len()
+        )));
+    }
+    for (position, item) in record.all.iter().enumerate() {
+        if item.index != position {
+            return Err(batch_error(&format!(
+                "batch record item at position {position} has index {}",
+                item.index
+            )));
+        }
+    }
+    let reason = CompletionReason::from_wire(&record.completion_reason);
+    let mut items = Vec::with_capacity(record.all.len());
+    for item in record.all {
+        let index = item.index;
+        let status = parse_item_status(&item.status)?;
+        let name = item
+            .name
+            .ok_or_else(|| batch_error(&format!("batch record item {index}: missing name")))?;
+        let result = match (status, item.result) {
+            (BatchItemStatus::Succeeded, Some(value)) => {
+                let wire = match encoding {
+                    ItemEncoding::AllJson => value.to_string(),
+                    ItemEncoding::AllSerdes => match value {
+                        serde_json::Value::String(wire) => wire,
+                        _ => {
+                            return Err(batch_error(&format!(
+                                "batch record item {index}: expected a string result"
+                            )));
+                        }
+                    },
+                };
+                let item_ctx =
+                    SerdesContext::new(ctx.peek_id_at(index).wire().to_owned(), execution_arn);
+                Some(
+                    deserialize_value::<O, _>(
+                        ctx,
+                        item_fault_name(&name),
+                        wire,
+                        serdes.as_ref(),
+                        item_ctx,
+                    )
+                    .await?,
+                )
+            }
+            _ => None,
+        };
+        let error = item.error.map(|top| match top.cause {
+            Some(cause) => (
+                cause.error_type.or(top.error_type),
+                cause.error_message.or(top.error_message),
+                cause.error_data.or(top.error_data),
+                cause.stack_trace,
+            ),
+            None => (
+                top.error_type,
+                top.error_message,
+                top.error_data,
+                top.stack_trace,
+            ),
+        });
+        let (error_type, error_message, error_data, stack_trace) =
+            error.unwrap_or((None, None, None, Vec::new()));
+        items.push(BatchItem {
             index,
             name,
             status,
@@ -3407,76 +3810,16 @@ where
             error_type,
             error_data,
             stack_trace,
-        } = item;
-        let status_str = match status {
-            BatchItemStatus::Succeeded => "SUCCEEDED",
-            BatchItemStatus::Failed => "FAILED",
-            BatchItemStatus::Started => "STARTED",
-        };
-        let (result_str, rebuilt_value) = match (status, result) {
-            (BatchItemStatus::Succeeded, Some(value)) => {
-                let item_ctx = item_summary_serdes_ctx(parent_wire, execution_arn, index);
-                let item_name = item_fault_name(&name);
-                let wire =
-                    serialize_value(ctx, item_name, value, serdes.as_ref(), item_ctx.clone())
-                        .await?;
-                let back: O =
-                    deserialize_value(ctx, item_name, wire.clone(), serdes.as_ref(), item_ctx)
-                        .await?;
-                (wire, Some(back))
-            }
-            _ => (String::new(), None),
-        };
-        summary_items.push(BatchCheckpointItem {
-            index,
-            name: name.clone(),
-            status: status_str.to_owned(),
-            result: result_str,
-            err_type: if status == BatchItemStatus::Failed {
-                error_type.clone().unwrap_or_else(|| "Error".to_owned())
-            } else {
-                String::new()
-            },
-            err_message: error_message.clone().unwrap_or_default(),
-            err_data: if status == BatchItemStatus::Failed {
-                error_data.clone()
-            } else {
-                None
-            },
-            stack_trace: if status == BatchItemStatus::Failed {
-                stack_trace.clone()
-            } else {
-                Vec::new()
-            },
-        });
-        rebuilt_items.push(BatchItem {
-            index,
-            name,
-            status,
-            result: rebuilt_value,
-            error_message,
-            error_type,
-            error_data,
-            stack_trace,
         });
     }
-
-    Ok((
-        BatchSummary {
-            results: summary_items,
-            reason: reason_wire,
-        },
-        BatchResult {
-            items: rebuilt_items,
-            reason,
-        },
-    ))
+    Ok(BatchResult { items, reason })
 }
 
-/// Converts a deserialized checkpoint payload back into a `BatchResult`.
-async fn to_batch_result<O, IS>(
+/// Converts a `{results, reason}` batch record from an earlier release back
+/// into a `BatchResult`, exactly as that release read it.
+async fn preview_to_batch_result<O, IS>(
     ctx: &DurableContext,
-    payload: BatchSummary,
+    record: PreviewBatchRecord,
     serdes: &Arc<IS>,
     parent_wire: &str,
     execution_arn: &str,
@@ -3485,17 +3828,12 @@ where
     O: Send + 'static,
     IS: Serdes<O>,
 {
-    let reason = CompletionReason::from_wire(&payload.reason);
-    let mut items = Vec::with_capacity(payload.results.len());
-    for cp in payload.results {
-        let status = match cp.status.as_str() {
-            "SUCCEEDED" => BatchItemStatus::Succeeded,
-            "FAILED" => BatchItemStatus::Failed,
-            "STARTED" => BatchItemStatus::Started,
-            other => return Err(batch_error(&format!("unknown item status: {other}"))),
-        };
+    let reason = CompletionReason::from_wire(&record.reason);
+    let mut items = Vec::with_capacity(record.results.len());
+    for cp in record.results {
+        let status = parse_item_status(&cp.status)?;
         let result = if status == BatchItemStatus::Succeeded && !cp.result.is_empty() {
-            let item_ctx = item_summary_serdes_ctx(parent_wire, execution_arn, cp.index);
+            let item_ctx = preview_item_serdes_ctx(parent_wire, execution_arn, cp.index);
             Some(
                 deserialize_value::<O, _>(
                     ctx,
@@ -4115,6 +4453,11 @@ mod tests {
         assert_eq!(errors[0].error_type, Some("ChildFnError"));
     }
 
+    /// The JSON form of a batch summary.
+    fn summary_json(summary: &BatchSummary) -> serde_json::Value {
+        serde_json::to_value(summary).expect("a batch summary serializes")
+    }
+
     /// The batch summary payload the parent recorded: the first recorded
     /// update whose payload decodes as a [`BatchSummary`].
     fn recorded_batch_summary(client: &crate::client::InMemoryExecutionClient) -> BatchSummary {
@@ -4130,7 +4473,7 @@ mod tests {
     /// A failed map item records the type of the error its body returned
     /// (`"Error"` for an untyped error), and the four views of the failure
     /// agree: the child FAIL record, `BatchItem::error_type`,
-    /// `BatchError::error_type` and the summary `errType`.
+    /// `BatchError::error_type` and the summary's `Cause.ErrorType`.
     #[tokio::test]
     async fn map_item_failure_records_body_error_type() {
         let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
@@ -4170,8 +4513,8 @@ mod tests {
 
         let summary = recorded_batch_summary(&client);
         assert_eq!(
-            summary.results.first().map(|r| r.err_type.as_str()),
-            Some("Error")
+            summary_json(&summary).pointer("/all/0/error/Cause/ErrorType"),
+            Some(&serde_json::json!("Error"))
         );
     }
 
@@ -4202,8 +4545,8 @@ mod tests {
 
         let summary = recorded_batch_summary(&client);
         assert_eq!(
-            summary.results.first().map(|r| r.err_type.as_str()),
-            Some("Error")
+            summary_json(&summary).pointer("/all/0/error/Cause/ErrorType"),
+            Some(&serde_json::json!("Error"))
         );
     }
 
@@ -6474,19 +6817,21 @@ mod tests {
         );
 
         let json = Arc::new(crate::serdes::JsonSerdes);
-        let (payload, _rebuilt) = from_batch_result(
-            &test_ctx(CheckpointLog::empty()),
-            original,
-            &json,
-            "parent-wire",
-            "arn:test",
+        let payload = from_batch_result(
+            &original,
+            &[Some("7".to_owned()), None],
+            ItemEncoding::AllJson,
+        );
+        let payload: BatchSummary = serde_json::from_str(
+            &serde_json::to_string(&payload).expect("serializing a batch summary must succeed"),
         )
-        .await
-        .expect("serializing a batch result must succeed");
+        .expect("the batch summary reads back");
         let replayed: BatchResult<i32> = to_batch_result(
             &test_ctx(CheckpointLog::empty()),
             payload,
             &json,
+            ItemEncoding::AllJson,
+            2,
             "parent-wire",
             "arn:test",
         )
@@ -6516,11 +6861,11 @@ mod tests {
         assert_eq!(ok.stack_trace, Vec::<String>::new());
     }
 
-    /// A failed item that recorded no error type (a live item defaults to
-    /// `ChildFnError`) writes the default to the wire, so payloads keep
-    /// the `errType` field older readers expect.
-    #[tokio::test]
-    async fn from_batch_result_defaults_missing_error_type() {
+    /// A failed item that recorded no error type writes the default
+    /// `"Error"` as its `Cause.ErrorType`, and an item that recorded no
+    /// message writes an empty `ErrorMessage`.
+    #[test]
+    fn from_batch_result_defaults_missing_error_type() {
         let original: BatchResult<i32> = BatchResult::new(
             vec![BatchItem::new(
                 0,
@@ -6532,19 +6877,34 @@ mod tests {
             )],
             CompletionReason::AllCompleted,
         );
-        let json = Arc::new(crate::serdes::JsonSerdes);
-        let (payload, _rebuilt) = from_batch_result(
-            &test_ctx(CheckpointLog::empty()),
-            original,
-            &json,
-            "parent-wire",
-            "arn:test",
-        )
-        .await
-        .expect("serializing a batch result must succeed");
+        let payload = summary_json(&from_batch_result(
+            &original,
+            &[None],
+            ItemEncoding::AllJson,
+        ));
         assert_eq!(
-            payload.results.first().map(|r| r.err_type.as_str()),
-            Some("Error")
+            payload.pointer("/all/0/error/Cause/ErrorType"),
+            Some(&serde_json::json!("Error"))
+        );
+        assert_eq!(
+            payload.pointer("/all/0/error/ErrorMessage"),
+            Some(&serde_json::json!("boom"))
+        );
+        let untyped: BatchResult<i32> = BatchResult::new(
+            vec![BatchItem::new(
+                0,
+                String::new(),
+                BatchItemStatus::Failed,
+                None,
+                None,
+                None,
+            )],
+            CompletionReason::AllCompleted,
+        );
+        let payload = summary_json(&from_batch_result(&untyped, &[None], ItemEncoding::AllJson));
+        assert_eq!(
+            payload.pointer("/all/0/error/Cause/ErrorMessage"),
+            Some(&serde_json::json!(""))
         );
     }
 
@@ -6562,6 +6922,8 @@ mod tests {
             &test_ctx(CheckpointLog::empty()),
             payload,
             &json,
+            ItemEncoding::AllJson,
+            2,
             "parent-wire",
             "arn:test",
         )
@@ -7561,9 +7923,9 @@ mod tests {
 
         // map items
         //
-        // The item serdes is consulted twice per item: once for the child's own
-        // checkpoint and once when the item is embedded in the batch summary.
-        // Those two calls diverged before this change; they must now be equal.
+        // The item serdes is consulted once per item, for the child's own
+        // checkpoint. The batch summary takes the item value from the
+        // child's wire string, so it calls no serdes.
         let map_rec = RecordingSerdes::new();
         let (map_ctx, _map_client) = test_ctx_with_client(CheckpointLog::empty());
         let map_value = value.clone();
@@ -7577,10 +7939,11 @@ mod tests {
             .expect("map with a recording item serdes must succeed");
         assert_eq!(map_out, vec![value.clone()]);
         let map_inputs = map_rec.serialize_inputs();
-        assert!(
-            map_inputs.len() >= 2,
-            "the item serdes must see both the child checkpoint and the batch \
-             summary embedding, got {map_inputs:?}"
+        assert_eq!(
+            map_inputs.len(),
+            1,
+            "the item serdes serializes the item once, for the child \
+             checkpoint, got {map_inputs:?}"
         );
         assert_eq!(
             map_rec.distinct_serialize_inputs(),
@@ -7632,21 +7995,21 @@ mod tests {
             .expect("the batch result serdes must be consulted once");
         assert!(
             summary
-                .get("results")
+                .get("all")
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|items| items.len() == 1),
             "the batch result serdes must receive the summary as a structured \
              Value, got {summary}"
         );
-        // Each item is embedded in the summary as its own wire string (here the
-        // plain-`serde_json` default, since no item serdes is attached), so the
+        // With the default item serdes, each item is embedded in the summary
+        // as the JSON value of its wire string, as JS embeds it, so the
         // batch serdes sees structure, not one flat pre-rendered blob.
         assert_eq!(
             summary
-                .get("results")
+                .get("all")
                 .and_then(|r| r.get(0))
                 .and_then(|item| item.get("result")),
-            Some(&serde_json::Value::String(json_encoding.clone())),
+            Some(&serde_json::from_str::<serde_json::Value>(&json_encoding).expect("JSON")),
             "summary: {summary}"
         );
     }
@@ -7898,9 +8261,8 @@ mod tests {
     }
 
     /// A batch whose serialized result exceeds the checkpoint size limit
-    /// records the decision record, `totalCount`, `completionReason`, and
-    /// the shorter index set, as the `replay_children` payload, instead of
-    /// no payload at all.
+    /// records the JS `MapResult` summary as the `replay_children` payload,
+    /// instead of no payload at all.
     #[tokio::test]
     async fn large_batch_result_checkpoints_decision_record() {
         let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
@@ -7921,17 +8283,16 @@ mod tests {
             Some(true),
             "oversized batch payload must set replay_children"
         );
-        let record: BatchDecisionRecord = serde_json::from_str(
+        let summary: serde_json::Value = serde_json::from_str(
             parent
                 .payload()
-                .expect("large-result parent must carry the decision record"),
+                .expect("large-result parent must carry the summary"),
         )
-        .expect("payload must parse as a plain-JSON decision record");
-        assert_eq!(record.total_count, 2);
-        assert_eq!(record.completion_reason, "ALL_COMPLETED");
-        // Everything completed: the empty started set is the shorter form.
-        assert_eq!(record.started_indexes, Some(Vec::new()));
-        assert_eq!(record.completed_indexes, None);
+        .expect("payload must parse as a plain-JSON summary");
+        assert_eq!(summary["totalCount"], 2);
+        assert_eq!(summary["completionReason"], "ALL_COMPLETED");
+        // Everything completed: every started item is terminal.
+        assert_eq!(summary["itemStatuses"], "SS");
     }
 
     /// Acceptance (issue #36): `totalCount` is the number of items EVER
@@ -7955,18 +8316,18 @@ mod tests {
         assert_eq!(batch.items.len(), 1);
 
         let parent = parent_succeed_update(&client);
-        let record: BatchDecisionRecord = serde_json::from_str(
+        let summary: serde_json::Value = serde_json::from_str(
             parent
                 .payload()
-                .expect("large-result parent must carry the decision record"),
+                .expect("large-result parent must carry the summary"),
         )
-        .expect("payload must parse as a plain-JSON decision record");
+        .expect("payload must parse as a plain-JSON summary");
         assert_eq!(
-            record.total_count, 1,
+            summary["totalCount"], 1,
             "totalCount counts items ever started, not the 6 input items"
         );
-        assert_eq!(record.completion_reason, "MIN_SUCCESSFUL_REACHED");
-        assert_eq!(record.started_indexes, Some(Vec::new()));
+        assert_eq!(summary["completionReason"], "MIN_SUCCESSFUL_REACHED");
+        assert_eq!(summary["itemStatuses"], "S");
     }
 
     /// The decision record must be PLAIN JSON even when a custom
@@ -8400,48 +8761,6 @@ mod tests {
         );
     }
     #[test]
-    fn decision_record_writes_the_shorter_index_set() {
-        let items = vec![
-            BatchItem::<u32>::new(
-                0,
-                String::new(),
-                BatchItemStatus::Succeeded,
-                Some(1),
-                None,
-                None,
-            ),
-            BatchItem::<u32>::new(
-                1,
-                String::new(),
-                BatchItemStatus::Succeeded,
-                Some(2),
-                None,
-                None,
-            ),
-            BatchItem::<u32>::new(2, String::new(), BatchItemStatus::Failed, None, None, None),
-        ];
-        // 3 completed of 4 started: the 1-element started set is shorter.
-        let record = build_decision_record(&items, 4, CompletionReason::CustomCompletionSucceeded);
-        assert_eq!(record.total_count, 4);
-        assert_eq!(record.completion_reason, "CUSTOM_COMPLETION_SUCCEEDED");
-        assert_eq!(record.started_indexes, Some(vec![3]));
-        assert_eq!(record.completed_indexes, None);
-
-        // 1 completed of 4 started: the 1-element completed set is shorter.
-        let one = vec![BatchItem::<u32>::new(
-            2,
-            String::new(),
-            BatchItemStatus::Succeeded,
-            Some(1),
-            None,
-            None,
-        )];
-        let record = build_decision_record(&one, 4, CompletionReason::AllCompleted);
-        assert_eq!(record.started_indexes, None);
-        assert_eq!(record.completed_indexes, Some(vec![2]));
-    }
-
-    #[test]
     fn replay_plan_reconstructs_either_index_form() {
         // From the started form.
         let record = BatchDecisionRecord {
@@ -8591,7 +8910,7 @@ mod tests {
         };
         let display = crate::error::chain_string(&err);
         assert!(
-            display.contains("decision record exceeds the checkpoint size limit"),
+            display.contains("batch summary exceeds the checkpoint size limit"),
             "expected the oversized-record error, got: {display}"
         );
         assert!(
@@ -9069,23 +9388,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decision_record_keeps_started_items_out_of_completed() {
-        let item =
-            |index, status| BatchItem::<i32>::new(index, String::new(), status, None, None, None);
-        let record = build_decision_record(
-            &[
-                item(0, BatchItemStatus::Succeeded),
-                item(1, BatchItemStatus::Succeeded),
-                item(2, BatchItemStatus::Started),
-            ],
-            3,
-            CompletionReason::MinSuccessfulReached,
-        );
-        assert_eq!(record.started_indexes, Some(vec![2]));
-        assert_eq!(record.completed_indexes, None);
-    }
-
     #[tokio::test]
     async fn abandoned_item_leaves_no_task_after_invocation() {
         let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
@@ -9486,6 +9788,1147 @@ mod tests {
             !has_start(&client, "escaped"),
             "the escaped step wrote nothing"
         );
+    }
+
+    // The batch record in JS's shape (issue: write the batch record and the
+    // oversized batch summary in JS's shape, and keep empty item payloads
+    // across replay).
+
+    /// A serdes that logs each call as `(method, operation id)` and encodes
+    /// values as JSON.
+    #[derive(Clone, Default)]
+    struct CallLog(Arc<std::sync::Mutex<Vec<(&'static str, String)>>>);
+
+    impl CallLog {
+        fn calls(&self) -> Vec<(&'static str, String)> {
+            let mut calls = self.0.lock().expect("lock").clone();
+            calls.sort();
+            calls
+        }
+    }
+
+    impl<T> Serdes<T> for CallLog
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    {
+        fn serialize(
+            &self,
+            value: T,
+            context: SerdesContext,
+        ) -> impl Future<Output = Result<String, BoxError>> + Send {
+            self.0
+                .lock()
+                .expect("lock")
+                .push(("serialize", context.operation_id().to_owned()));
+            std::future::ready(serde_json::to_string(&value).map_err(Into::into))
+        }
+
+        fn deserialize(
+            &self,
+            wire: String,
+            context: SerdesContext,
+        ) -> impl Future<Output = Result<T, BoxError>> + Send {
+            self.0
+                .lock()
+                .expect("lock")
+                .push(("deserialize", context.operation_id().to_owned()));
+            std::future::ready(serde_json::from_str(&wire).map_err(Into::into))
+        }
+    }
+
+    /// A struct a map item returns.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Order {
+        id: u32,
+        sku: String,
+    }
+
+    /// A serdes for [`Order`] that writes its JSON prefixed with `order:`.
+    struct OrderSerdes;
+
+    impl Serdes<Order> for OrderSerdes {
+        fn serialize(
+            &self,
+            value: Order,
+            _context: SerdesContext,
+        ) -> impl Future<Output = Result<String, BoxError>> + Send {
+            std::future::ready(
+                serde_json::to_string(&value)
+                    .map(|json| format!("order:{json}"))
+                    .map_err(Into::into),
+            )
+        }
+
+        fn deserialize(
+            &self,
+            wire: String,
+            _context: SerdesContext,
+        ) -> impl Future<Output = Result<Order, BoxError>> + Send {
+            std::future::ready(
+                wire.strip_prefix("order:")
+                    .ok_or_else(|| BoxError::from("missing order: prefix"))
+                    .and_then(|json| serde_json::from_str(json).map_err(Into::into)),
+            )
+        }
+    }
+
+    fn order(id: u32) -> Order {
+        Order {
+            id,
+            sku: format!("sku-{id}"),
+        }
+    }
+
+    /// The wire ID of the child at positional ID `positional`.
+    fn wire_of(positional: &str) -> String {
+        crate::engine::compute_wire_id_public(positional)
+    }
+
+    /// The parent payload of a batch as JSON.
+    fn parent_payload_json(client: &crate::client::InMemoryExecutionClient) -> serde_json::Value {
+        serde_json::from_str(&parent_payload(client)).expect("the batch payload is JSON")
+    }
+
+    /// A checkpoint log holding one terminal batch parent at positional ID
+    /// `1` whose payload is `payload`.
+    fn terminal_batch_log(payload: &str) -> CheckpointLog {
+        CheckpointLog::from_records(vec![succeeded_record("1", payload)])
+    }
+
+    /// The JS-form record a summary holds.
+    fn js_record(summary: &BatchSummary) -> &JsBatchRecord {
+        match &summary.record {
+            SummaryRecord::Js(record) => record,
+            SummaryRecord::Preview(_) => unreachable!("expected the JS form"),
+        }
+    }
+
+    #[test]
+    fn batch_checkpoint_item_round_trips_empty_result() {
+        let result: BatchResult<()> = BatchResult::new(
+            vec![BatchItem::new(
+                0,
+                "map-item-0".to_owned(),
+                BatchItemStatus::Succeeded,
+                Some(()),
+                None,
+                None,
+            )],
+            CompletionReason::AllCompleted,
+        );
+        let summary = from_batch_result(&result, &[Some(String::new())], ItemEncoding::AllSerdes);
+        let json = serde_json::to_string(&summary).expect("serializes");
+        assert!(json.contains(r#""result":"""#), "json: {json}");
+        let back: BatchSummary = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(
+            js_record(&back).all[0].result,
+            Some(serde_json::Value::String(String::new()))
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_checkpoint_item_reads_old_records() {
+        let payload: BatchSummary = serde_json::from_str(
+            r#"{"results":[{"index":0,"status":"SUCCEEDED","result":"1"},{"index":1,"status":"SUCCEEDED"}],"reason":"ALL_COMPLETED"}"#,
+        )
+        .expect("a preview summary deserializes");
+        let replayed: BatchResult<u32> = to_batch_result(
+            &test_ctx(CheckpointLog::empty()),
+            payload,
+            &Arc::new(crate::serdes::JsonSerdes),
+            ItemEncoding::AllJson,
+            2,
+            "parent-wire",
+            "arn:test",
+        )
+        .await
+        .expect("a preview summary replays");
+        assert_eq!(replayed.items[0].result, Some(1));
+        assert_eq!(replayed.items[1].result, None);
+
+        let started: BatchResult<u32> = BatchResult::new(
+            vec![BatchItem::new(
+                0,
+                "map-item-0".to_owned(),
+                BatchItemStatus::Started,
+                None,
+                None,
+                None,
+            )],
+            CompletionReason::MinSuccessfulReached,
+        );
+        let json = summary_json(&from_batch_result(&started, &[None], ItemEncoding::AllJson));
+        let item = json.pointer("/all/0").expect("one item");
+        assert!(item.get("result").is_none(), "item: {item}");
+        assert!(item.get("error").is_none(), "item: {item}");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "all": [{"index": 0, "status": "STARTED", "name": "map-item-0"}],
+                "completionReason": "MIN_SUCCESSFUL_REACHED",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn map_struct_values_are_embedded_as_json() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let out = ctx
+            .map(vec![1_u32, 2], |_child, item, _idx| async move {
+                Ok(order(item))
+            })
+            .await
+            .expect("map succeeds");
+        assert_eq!(out, vec![order(1), order(2)]);
+        let payload = parent_payload_json(&client);
+        for (i, id) in [1_u32, 2].into_iter().enumerate() {
+            assert_eq!(
+                payload["all"][i]["result"],
+                serde_json::to_value(order(id)).expect("JSON"),
+                "payload: {payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn map_custom_serdes_values_are_strings() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let out = ctx
+            .map(vec![1_u32, 2], |_child, item, _idx| async move {
+                Ok(order(item))
+            })
+            .serdes(OrderSerdes)
+            .await
+            .expect("map succeeds");
+        assert_eq!(out, vec![order(1), order(2)]);
+        let mut child_payloads = child_success_payloads(&client);
+        child_payloads.sort();
+        let payload = parent_payload_json(&client);
+        let mut results: Vec<String> = payload["all"]
+            .as_array()
+            .expect("all is an array")
+            .iter()
+            .map(|item| item["result"].as_str().expect("a string result").to_owned())
+            .collect();
+        results.sort();
+        assert_eq!(results, child_payloads);
+        assert!(results.iter().all(|r| r.starts_with("order:")));
+    }
+
+    /// `.result_serdes(..)` after `.serdes(..)` keeps the custom item
+    /// encoding.
+    #[tokio::test]
+    async fn result_serdes_keeps_the_custom_item_encoding() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        ctx.map(
+            vec![1_u32],
+            |_child, item, _idx| async move { Ok(order(item)) },
+        )
+        .serdes(OrderSerdes)
+        .result_serdes(crate::serdes::JsonSerdes)
+        .await
+        .expect("map succeeds");
+        assert_eq!(
+            parent_payload_json(&client)["all"][0]["result"],
+            serde_json::json!(r#"order:{"id":1,"sku":"sku-1"}"#)
+        );
+
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        ctx.parallel(vec![crate::future::Branch::new("a", |_c| async {
+            Ok(order(1))
+        })])
+        .serdes(OrderSerdes)
+        .result_serdes(crate::serdes::JsonSerdes)
+        .await
+        .expect("parallel succeeds");
+        assert_eq!(
+            parent_payload_json(&client)["all"][0]["result"],
+            serde_json::json!(r#"order:{"id":1,"sku":"sku-1"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_item_error_has_js_shape() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let live = ctx
+            .map(vec![1_u32], |_child, _item, _idx| async move {
+                Err::<u32, BoxError>(Box::new(
+                    crate::TypedError::with_type("PaymentError", "declined").with_error_data("d"),
+                ))
+            })
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
+            .await_batch()
+            .await
+            .expect("a tolerated failure is a batch result");
+        let message = live.items[0]
+            .error_message
+            .clone()
+            .expect("the failed item has a message");
+        let payload = parent_payload(&client);
+        let json: serde_json::Value = serde_json::from_str(&payload).expect("JSON");
+        assert_eq!(
+            json["all"][0]["error"],
+            serde_json::json!({
+                "ErrorType": "ChildContextError",
+                "ErrorMessage": message,
+                "ErrorData": "d",
+                "Cause": {"ErrorType": "PaymentError", "ErrorMessage": message, "ErrorData": "d"},
+            })
+        );
+
+        let replayed: BatchResult<u32> = test_ctx(terminal_batch_log(&payload))
+            .map(vec![1_u32], |_child, _item, _idx| async move {
+                unreachable!("a terminal batch replays")
+            })
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
+            .await_batch()
+            .await
+            .expect("replay succeeds");
+        assert_eq!(
+            replayed.items[0].error_type.as_deref(),
+            Some("PaymentError")
+        );
+        assert_eq!(replayed.items[0].error_data.as_deref(), Some("d"));
+        assert_eq!(
+            replayed.items[0].error_message.as_deref(),
+            Some(message.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_item_without_recorded_type_falls_back_to_error() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        ctx.map(vec![1_u32], |_child, _item, _idx| async move {
+            Err::<u32, BoxError>("boom".into())
+        })
+        .completion(
+            crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+        )
+        .await_batch()
+        .await
+        .expect("a tolerated failure is a batch result");
+        let payload = parent_payload(&client);
+        let json: serde_json::Value = serde_json::from_str(&payload).expect("JSON");
+        assert_eq!(json["all"][0]["error"]["Cause"]["ErrorType"], "Error");
+
+        let replayed: BatchResult<u32> = test_ctx(terminal_batch_log(&payload))
+            .map(vec![1_u32], |_child, _item, _idx| async move {
+                unreachable!("a terminal batch replays")
+            })
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
+            .await_batch()
+            .await
+            .expect("replay succeeds");
+        assert_eq!(replayed.items[0].error_type.as_deref(), Some("Error"));
+    }
+
+    /// A JS error object without `Cause` reads its fields from the top
+    /// level.
+    #[tokio::test]
+    async fn js_error_without_cause_reads_top_level() {
+        let payload = serde_json::json!({
+            "all": [{
+                "index": 0,
+                "status": "FAILED",
+                "name": "map-item-0",
+                "error": {
+                    "ErrorType": "TopError",
+                    "ErrorMessage": "top",
+                    "ErrorData": "top-data",
+                    "StackTrace": ["top-frame"],
+                },
+                "result": 5,
+            }],
+            "completionReason": "ALL_COMPLETED",
+        });
+        let replayed: BatchResult<u32> = test_ctx(terminal_batch_log(&payload.to_string()))
+            .map(vec![1_u32], |_child, _item, _idx| async move {
+                unreachable!("a terminal batch replays")
+            })
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+            )
+            .await_batch()
+            .await
+            .expect("replay succeeds");
+        let item = &replayed.items[0];
+        assert_eq!(item.error_type.as_deref(), Some("TopError"));
+        assert_eq!(item.error_message.as_deref(), Some("top"));
+        assert_eq!(item.error_data.as_deref(), Some("top-data"));
+        assert_eq!(item.stack_trace, ["top-frame".to_owned()]);
+        // Only a succeeded item decodes a value.
+        assert_eq!(item.result, None);
+    }
+
+    #[tokio::test]
+    async fn preview_record_still_replays() {
+        let payload = serde_json::json!({
+            "results": [
+                {"index": 0, "name": "a", "status": "SUCCEEDED", "result": "\"hello\""},
+                {"index": 1, "name": "b", "status": "FAILED", "errType": "T",
+                 "errMessage": "m", "errData": "d", "stackTrace": ["f"]},
+                {"index": 2, "name": "c", "status": "STARTED"}
+            ],
+            "reason": "MIN_SUCCESSFUL_REACHED"
+        });
+        let calls = CallLog::default();
+        let replayed: BatchResult<String> = test_ctx(terminal_batch_log(&payload.to_string()))
+            .map(vec![0_u32, 1, 2], |_child, _item, _idx| async move {
+                unreachable!("a terminal batch replays")
+            })
+            .item_namer(|_, i| ["a", "b", "c"][i].to_owned())
+            .serdes(calls.clone())
+            .await_batch()
+            .await
+            .expect("a preview record replays");
+        assert_eq!(replayed.reason, CompletionReason::MinSuccessfulReached);
+        let rows: Vec<_> = replayed
+            .items
+            .iter()
+            .map(|i| {
+                (
+                    i.index,
+                    i.name.as_str(),
+                    i.status,
+                    i.result.as_deref(),
+                    i.error_type.as_deref(),
+                    i.error_message.as_deref(),
+                    i.error_data.as_deref(),
+                    i.stack_trace.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    0,
+                    "a",
+                    BatchItemStatus::Succeeded,
+                    Some("hello"),
+                    None,
+                    None,
+                    None,
+                    vec![]
+                ),
+                (
+                    1,
+                    "b",
+                    BatchItemStatus::Failed,
+                    None,
+                    Some("T"),
+                    Some("m"),
+                    Some("d"),
+                    vec!["f".to_owned()]
+                ),
+                (
+                    2,
+                    "c",
+                    BatchItemStatus::Started,
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![]
+                ),
+            ]
+        );
+        // A preview record keeps the serdes context that release used.
+        assert_eq!(
+            calls.calls(),
+            vec![("deserialize", format!("{}/item-0", wire_of("1")))]
+        );
+    }
+
+    /// A preview summary serializes back in its own shape.
+    #[test]
+    fn preview_summary_serializes_in_its_own_shape() {
+        let text = r#"{"results":[{"index":0,"name":"a","status":"SUCCEEDED","result":"1"}],"reason":"ALL_COMPLETED"}"#;
+        let summary: BatchSummary = serde_json::from_str(text).expect("deserializes");
+        assert_eq!(
+            serde_json::to_value(&summary).expect("serializes"),
+            serde_json::from_str::<serde_json::Value>(text).expect("JSON")
+        );
+    }
+
+    #[test]
+    fn summary_without_all_or_results_is_rejected() {
+        let err = serde_json::from_str::<BatchSummary>(r#"{"reason":"ALL_COMPLETED"}"#)
+            .expect_err("a summary needs `all` or `results`");
+        assert!(
+            err.to_string()
+                .contains("neither an `all` nor a `results` key"),
+            "{err}"
+        );
+        assert!(serde_json::from_str::<BatchSummary>("[1]").is_err());
+    }
+
+    /// Replays a JS-form batch record `payload` through a map over one
+    /// `u32` item, with a custom item serdes when `custom` is set, and
+    /// returns the error text.
+    async fn js_replay_error(payload: &serde_json::Value, custom: bool) -> String {
+        async fn never_runs(
+            _child: DurableContext,
+            _item: u32,
+            _idx: usize,
+        ) -> Result<u32, BoxError> {
+            unreachable!("a terminal batch replays")
+        }
+        let ctx = test_ctx(terminal_batch_log(&payload.to_string()));
+        let map = ctx.map(vec![1_u32], never_runs);
+        let err = if custom {
+            map.serdes(CallLog::default()).await_batch().await
+        } else {
+            map.await_batch().await
+        }
+        .expect_err("the record fails replay");
+        crate::error::chain_string(&err)
+    }
+
+    #[tokio::test]
+    async fn serdes_item_with_non_string_result_fails_replay() {
+        let payload = serde_json::json!({
+            "all": [{"index": 0, "status": "SUCCEEDED", "name": "map-item-0", "result": 1}],
+            "completionReason": "ALL_COMPLETED",
+        });
+        let err = js_replay_error(&payload, true).await;
+        assert!(
+            err.contains("batch record item 0: expected a string result"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn js_item_without_name_fails_replay() {
+        let payload = serde_json::json!({
+            "all": [{"index": 0, "status": "SUCCEEDED", "result": 1}],
+            "completionReason": "ALL_COMPLETED",
+        });
+        let err = js_replay_error(&payload, false).await;
+        assert!(err.contains("batch record item 0: missing name"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn js_item_with_unknown_status_fails_replay() {
+        let payload = serde_json::json!({
+            "all": [{"index": 0, "status": "WEIRD", "name": "map-item-0"}],
+            "completionReason": "ALL_COMPLETED",
+        });
+        let err = js_replay_error(&payload, false).await;
+        assert!(err.contains("unknown item status: WEIRD"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn oversized_map_writes_js_summary() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let big = "x".repeat(101 * 1024);
+        ctx.map(vec![0_u32, 1, 2], move |_child, _item, _idx| {
+            let big = big.clone();
+            async move { Ok(big) }
+        })
+        .await
+        .expect("map succeeds");
+        let parent = parent_succeed_update(&client);
+        assert_eq!(
+            parent.context_options().and_then(|c| c.replay_children),
+            Some(true)
+        );
+        assert_eq!(
+            parent_payload_json(&client),
+            serde_json::json!({
+                "type": "MapResult",
+                "totalCount": 3,
+                "successCount": 3,
+                "failureCount": 0,
+                "completionReason": "ALL_COMPLETED",
+                "status": "SUCCEEDED",
+                "itemStatuses": "SSS",
+            })
+        );
+    }
+
+    /// An oversized batch with a failed item records `F` and the status
+    /// `FAILED`.
+    #[tokio::test]
+    async fn oversized_map_with_failure_writes_failed_status() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let big = "x".repeat(300 * 1024);
+        ctx.map(vec![0_u32, 1], move |_child, item, _idx| {
+            let big = big.clone();
+            async move {
+                if item == 0 {
+                    Ok(big)
+                } else {
+                    Err("boom".into())
+                }
+            }
+        })
+        .completion(
+            crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1),
+        )
+        .await_batch()
+        .await
+        .expect("a tolerated failure is a batch result");
+        let summary = parent_payload_json(&client);
+        assert_eq!(summary["status"], "FAILED", "summary: {summary}");
+        assert_eq!(summary["itemStatuses"], "SF");
+        assert_eq!(summary["failureCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_parallel_writes_started_count() {
+        use crate::future::Branch;
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let big = "x".repeat(300 * 1024);
+        let branches = vec![
+            Branch::new("big", move |_c| async move { Ok(big) }),
+            Branch::new("slow", |c| async move {
+                Ok(
+                    c.step(|_| std::future::pending::<Result<String, BoxError>>())
+                        .name("forever")
+                        .await?,
+                )
+            }),
+        ];
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ctx.parallel(branches)
+                .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(1))
+                .await_batch(),
+        )
+        .await
+        .expect("the batch does not wait for the running branch")
+        .expect("the batch succeeds");
+        assert_eq!(batch.items[1].status, BatchItemStatus::Started);
+        assert_eq!(
+            parent_payload_json(&client),
+            serde_json::json!({
+                "type": "ParallelResult",
+                "totalCount": 2,
+                "successCount": 1,
+                "failureCount": 0,
+                "startedCount": 1,
+                "completionReason": "MIN_SUCCESSFUL_REACHED",
+                "status": "SUCCEEDED",
+                "itemStatuses": "S-",
+            })
+        );
+    }
+
+    /// The oversized summary's `status` comes from `BatchResult::status()`:
+    /// a predicate that completed the batch as succeeded writes
+    /// `SUCCEEDED` although an item failed, and one that completed it as
+    /// failed writes `FAILED` although no item failed.
+    #[test]
+    fn oversized_summary_status_follows_custom_completion() {
+        let failed_item = || {
+            BatchItem::<u32>::new(
+                0,
+                "a".to_owned(),
+                BatchItemStatus::Failed,
+                None,
+                Some("boom".to_owned()),
+                None,
+            )
+        };
+        let succeeded_item = || {
+            BatchItem::<u32>::new(
+                0,
+                "a".to_owned(),
+                BatchItemStatus::Succeeded,
+                Some(1),
+                None,
+                None,
+            )
+        };
+        let summary = |items, reason| -> serde_json::Value {
+            let result = BatchResult::new(items, reason);
+            serde_json::from_str(&oversized_batch_summary(&result, MAP_SUB_TYPE))
+                .expect("the summary is JSON")
+        };
+        let custom_ok = summary(
+            vec![failed_item()],
+            CompletionReason::CustomCompletionSucceeded,
+        );
+        assert_eq!(custom_ok["status"], "SUCCEEDED", "summary: {custom_ok}");
+        assert_eq!(custom_ok["itemStatuses"], "F");
+        assert_eq!(custom_ok["completionReason"], "CUSTOM_COMPLETION_SUCCEEDED");
+        let custom_failed = summary(
+            vec![succeeded_item()],
+            CompletionReason::CustomCompletionFailed,
+        );
+        assert_eq!(
+            custom_failed["status"], "FAILED",
+            "summary: {custom_failed}"
+        );
+        assert_eq!(custom_failed["itemStatuses"], "S");
+        assert_eq!(
+            custom_failed["completionReason"],
+            "CUSTOM_COMPLETION_FAILED"
+        );
+    }
+
+    /// A failed item writes its non-empty frames and its data at both
+    /// error levels, under `ChildContextError` with one cause.
+    #[test]
+    fn failed_item_writes_stack_trace_at_both_levels() {
+        let mut item = BatchItem::<u32>::new(
+            0,
+            "a".to_owned(),
+            BatchItemStatus::Failed,
+            None,
+            Some("it broke".to_owned()),
+            Some("CustomFailure".to_owned()),
+        );
+        item.error_data = Some("data".to_owned());
+        item.stack_trace = vec!["frame-a".to_owned(), "frame-b".to_owned()];
+        let result = BatchResult::new(vec![item], CompletionReason::AllCompleted);
+        let payload = summary_json(&from_batch_result(&result, &[None], ItemEncoding::AllJson));
+        assert_eq!(
+            payload.pointer("/all/0/error"),
+            Some(&serde_json::json!({
+                "ErrorType": "ChildContextError",
+                "ErrorMessage": "it broke",
+                "ErrorData": "data",
+                "StackTrace": ["frame-a", "frame-b"],
+                "Cause": {
+                    "ErrorType": "CustomFailure",
+                    "ErrorMessage": "it broke",
+                    "ErrorData": "data",
+                    "StackTrace": ["frame-a", "frame-b"],
+                },
+            }))
+        );
+    }
+
+    /// A failed item reads type, message and data from `Cause` when
+    /// `Cause` has them, and from the top level when `Cause` lacks them.
+    /// Its frames come from `Cause` whenever `Cause` is present.
+    #[tokio::test]
+    async fn js_error_prefers_cause_and_falls_back_per_field() {
+        let payload = serde_json::json!({
+            "all": [
+                {
+                    "index": 0,
+                    "status": "FAILED",
+                    "name": "map-item-0",
+                    "error": {
+                        "ErrorType": "TopError",
+                        "ErrorMessage": "top",
+                        "ErrorData": "top-data",
+                        "StackTrace": ["top-frame"],
+                        "Cause": {
+                            "ErrorType": "CauseError",
+                            "ErrorMessage": "cause",
+                            "ErrorData": "cause-data",
+                            "StackTrace": ["cause-frame"],
+                        },
+                    },
+                },
+                {
+                    "index": 1,
+                    "status": "FAILED",
+                    "name": "map-item-1",
+                    "error": {
+                        "ErrorType": "TopError",
+                        "ErrorMessage": "top",
+                        "ErrorData": "top-data",
+                        "StackTrace": ["top-frame"],
+                        "Cause": {},
+                    },
+                },
+            ],
+            "completionReason": "ALL_COMPLETED",
+        });
+        let replayed: BatchResult<u32> = test_ctx(terminal_batch_log(&payload.to_string()))
+            .map(vec![1_u32, 2], |_child, _item, _idx| async move {
+                unreachable!("a terminal batch replays")
+            })
+            .completion(
+                crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(2),
+            )
+            .await_batch()
+            .await
+            .expect("replay succeeds");
+        let fields = |item: &BatchItem<u32>| {
+            (
+                item.error_type.clone(),
+                item.error_message.clone(),
+                item.error_data.clone(),
+                item.stack_trace.clone(),
+            )
+        };
+        assert_eq!(
+            fields(&replayed.items[0]),
+            (
+                Some("CauseError".to_owned()),
+                Some("cause".to_owned()),
+                Some("cause-data".to_owned()),
+                vec!["cause-frame".to_owned()],
+            )
+        );
+        assert_eq!(
+            fields(&replayed.items[1]),
+            (
+                Some("TopError".to_owned()),
+                Some("top".to_owned()),
+                Some("top-data".to_owned()),
+                Vec::new(),
+            )
+        );
+    }
+
+    /// Replays a JS-form batch record `payload` through a map over
+    /// `inputs` `u32` items with a recording item serdes. Returns the
+    /// error text and the serdes calls.
+    async fn js_replay_error_over(
+        payload: &serde_json::Value,
+        inputs: u32,
+    ) -> (String, Vec<(&'static str, String)>) {
+        async fn never_runs(
+            _child: DurableContext,
+            _item: u32,
+            _idx: usize,
+        ) -> Result<u32, BoxError> {
+            unreachable!("a terminal batch replays")
+        }
+        let calls = CallLog::default();
+        let err = test_ctx(terminal_batch_log(&payload.to_string()))
+            .map((0..inputs).collect::<Vec<_>>(), never_runs)
+            .serdes(calls.clone())
+            .await_batch()
+            .await
+            .expect_err("the record fails replay");
+        (crate::error::chain_string(&err), calls.calls())
+    }
+
+    /// A JS-form record with one succeeded item per index in `indexes`, in
+    /// that order.
+    fn js_record_with_indexes(indexes: &[usize]) -> serde_json::Value {
+        let all: Vec<_> = indexes
+            .iter()
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "status": "SUCCEEDED",
+                    "name": format!("map-item-{index}"),
+                    "result": "1",
+                })
+            })
+            .collect();
+        serde_json::json!({"all": all, "completionReason": "ALL_COMPLETED"})
+    }
+
+    /// A record whose `all` is not the started prefix in index order fails
+    /// the replay before any item value is decoded.
+    #[tokio::test]
+    async fn js_record_with_malformed_indexes_fails_replay() {
+        let cases: [(&[usize], &str); 4] = [
+            (&[0, 2], "batch record item at position 1 has index 2"),
+            (&[0, 0], "batch record item at position 1 has index 0"),
+            (&[1, 0], "batch record item at position 0 has index 1"),
+            (
+                &[usize::MAX],
+                "batch record item at position 0 has index 18446744073709551615",
+            ),
+        ];
+        for (indexes, expected) in cases {
+            let (err, calls) = js_replay_error_over(&js_record_with_indexes(indexes), 3).await;
+            assert!(err.contains(expected), "indexes {indexes:?}: {err}");
+            assert_eq!(calls, vec![], "indexes {indexes:?}");
+        }
+    }
+
+    /// A record with more items than the current input fails the replay
+    /// before any item value is decoded. A record as long as the input
+    /// replays.
+    #[tokio::test]
+    async fn js_record_longer_than_the_input_fails_replay() {
+        let (err, calls) = js_replay_error_over(&js_record_with_indexes(&[0, 1, 2, 3]), 3).await;
+        assert!(
+            err.contains("batch record has 4 items but the input has 3"),
+            "{err}"
+        );
+        assert_eq!(calls, vec![]);
+
+        let replayed: BatchResult<u32> = test_ctx(terminal_batch_log(
+            &js_record_with_indexes(&[0, 1, 2]).to_string(),
+        ))
+        .map(vec![0_u32, 1, 2], |_child, _item, _idx| async move {
+            unreachable!("a terminal batch replays")
+        })
+        .serdes(CallLog::default())
+        .await_batch()
+        .await
+        .expect("a record as long as the input replays");
+        assert_eq!(replayed.items.len(), 3);
+    }
+
+    /// The records of a batch whose items 0 and 2 completed while item 1
+    /// ran, with `payload` as the oversized parent's payload.
+    fn started_middle_log(payload: &str) -> CheckpointLog {
+        CheckpointLog::from_records(vec![
+            decision_record_parent("1", payload),
+            succeeded_record("2", "\"a\""),
+            succeeded_record("4", "\"c\""),
+        ])
+    }
+
+    /// Replays a map of 4 items from `log`, without running a body.
+    async fn replay_started_middle(log: CheckpointLog) -> BatchResult<String> {
+        test_ctx(log)
+            .map(vec![0_usize, 1, 2, 3], |_child, _item, _idx| async move {
+                unreachable!("replay must not re-run any item body")
+            })
+            .completion(crate::builders::map_parallel::CompletionConfig::with_min_successful(2))
+            .await_batch()
+            .await
+            .expect("replay succeeds")
+    }
+
+    fn started_middle_rows(
+        batch: &BatchResult<String>,
+    ) -> Vec<(usize, BatchItemStatus, Option<String>)> {
+        batch
+            .items
+            .iter()
+            .map(|i| (i.index, i.status, i.result.clone()))
+            .collect()
+    }
+
+    const STARTED_MIDDLE: [(usize, BatchItemStatus, Option<&str>); 3] = [
+        (0, BatchItemStatus::Succeeded, Some("a")),
+        (1, BatchItemStatus::Started, None),
+        (2, BatchItemStatus::Succeeded, Some("c")),
+    ];
+
+    fn started_middle_expected() -> Vec<(usize, BatchItemStatus, Option<String>)> {
+        STARTED_MIDDLE
+            .iter()
+            .map(|(i, s, r)| (*i, *s, r.map(str::to_owned)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn preview_decision_record_still_replays() {
+        let batch = replay_started_middle(started_middle_log(
+            r#"{"totalCount":3,"completionReason":"MIN_SUCCESSFUL_REACHED","startedIndexes":[1]}"#,
+        ))
+        .await;
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        assert_eq!(started_middle_rows(&batch), started_middle_expected());
+    }
+
+    /// The JS summary replays to the same result as the preview decision
+    /// record.
+    #[tokio::test]
+    async fn js_summary_replays_like_the_decision_record() {
+        let batch = replay_started_middle(started_middle_log(
+            r#"{"type":"MapResult","totalCount":3,"successCount":2,"failureCount":0,"completionReason":"MIN_SUCCESSFUL_REACHED","status":"SUCCEEDED","itemStatuses":"S-S"}"#,
+        ))
+        .await;
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        assert_eq!(started_middle_rows(&batch), started_middle_expected());
+    }
+
+    /// The order of rule 10: empty, JS summary, preview decision record,
+    /// corrupt.
+    #[test]
+    fn replay_children_payload_is_read_in_order() {
+        assert!(matches!(parse_replay_children_payload(None), Ok(None)));
+        assert!(matches!(parse_replay_children_payload(Some(" ")), Ok(None)));
+
+        let record = parse_replay_children_payload(Some(
+            r#"{"itemStatuses":"S-F","completionReason":"ALL_COMPLETED","totalCount":99}"#,
+        ))
+        .expect("a JS summary parses")
+        .expect("a JS summary is a record");
+        assert_eq!(record.total_count, 3, "the length of itemStatuses wins");
+        assert_eq!(record.completed_indexes, Some(vec![0, 2]));
+        assert_eq!(record.started_indexes, None);
+        assert_eq!(record.completion_reason, "ALL_COMPLETED");
+
+        for statuses in [r#""""#, r#""SX""#, "1", "null"] {
+            let payload =
+                format!(r#"{{"itemStatuses":{statuses},"completionReason":"ALL_COMPLETED"}}"#);
+            let err = parse_replay_children_payload(Some(&payload))
+                .expect_err("an invalid itemStatuses is corrupt");
+            assert!(
+                crate::error::chain_string(&err).contains("itemStatuses must be a non-empty"),
+                "{statuses}"
+            );
+        }
+
+        // Without a completion reason, the plan rejects the record.
+        let record = parse_replay_children_payload(Some(r#"{"itemStatuses":"S"}"#))
+            .expect("parses")
+            .expect("a record");
+        let err = ReplayPlan::from_record(&record, 1).expect_err("no reason");
+        assert!(crate::error::chain_string(&err).contains("unknown completionReason"));
+
+        let record = parse_replay_children_payload(Some(
+            r#"{"totalCount":2,"completionReason":"ALL_COMPLETED","completedIndexes":[0]}"#,
+        ))
+        .expect("a decision record parses")
+        .expect("a record");
+        assert_eq!(record.completed_indexes, Some(vec![0]));
+        let record = parse_replay_children_payload(Some(
+            r#"{"totalCount":2,"completionReason":"ALL_COMPLETED","startedIndexes":[1]}"#,
+        ))
+        .expect("a decision record parses")
+        .expect("a record");
+        assert_eq!(record.started_indexes, Some(vec![1]));
+
+        for corrupt in [
+            "not json",
+            r#"{"unrelated":true}"#,
+            r#"{"totalCount":2,"completionReason":"ALL_COMPLETED"}"#,
+            r#"{"startedIndexes":[]}"#,
+            "[1]",
+        ] {
+            let err = parse_replay_children_payload(Some(corrupt))
+                .expect_err("an unrecognized payload is corrupt");
+            assert!(
+                crate::error::chain_string(&err).contains("malformed batch decision record"),
+                "{corrupt}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn item_serdes_called_once_per_item() {
+        let calls = CallLog::default();
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let out: Vec<u32> = ctx
+            .map(
+                vec![10_u32, 20],
+                |_child, item, _idx| async move { Ok(item) },
+            )
+            .serdes(calls.clone())
+            .await
+            .expect("map succeeds");
+        assert_eq!(out, vec![10, 20]);
+        let (c0, c1) = (wire_of("2"), wire_of("3"));
+        let mut live = vec![
+            ("deserialize", c0.clone()),
+            ("deserialize", c1.clone()),
+            ("serialize", c0.clone()),
+            ("serialize", c1.clone()),
+        ];
+        live.sort();
+        assert_eq!(calls.calls(), live);
+
+        let replay_calls = CallLog::default();
+        let replayed: Vec<u32> = test_ctx(terminal_batch_log(&parent_payload(&client)))
+            .map(vec![10_u32, 20], |_child, _item, _idx| async move {
+                unreachable!("a terminal batch replays")
+            })
+            .serdes(replay_calls.clone())
+            .await
+            .expect("replay succeeds");
+        assert_eq!(replayed, vec![10, 20]);
+        let mut replay = vec![("deserialize", c0), ("deserialize", c1)];
+        replay.sort();
+        assert_eq!(replay_calls.calls(), replay);
+        assert!(
+            calls
+                .calls()
+                .iter()
+                .chain(replay_calls.calls().iter())
+                .all(|(_, id)| !id.contains("/item-"))
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_item_name_survives_summary_replay() {
+        use crate::future::Branch;
+        let branches = || {
+            vec![
+                Branch::new("a", |_c| async { Err::<u32, BoxError>("a failed".into()) }),
+                Branch::unnamed(|_c| async { Err::<u32, BoxError>("b failed".into()) }),
+            ]
+        };
+        let tolerate = || {
+            crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(
+                100.0,
+            )
+        };
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        ctx.parallel(branches())
+            .completion(tolerate())
+            .await_batch()
+            .await
+            .expect("tolerated failures are a batch result");
+
+        let replayed = test_ctx(terminal_batch_log(&parent_payload(&client)))
+            .parallel(vec![
+                Branch::<u32>::new("a", |_c| async { unreachable!("a terminal batch replays") }),
+                Branch::<u32>::unnamed(|_c| async { unreachable!("a terminal batch replays") }),
+            ])
+            .completion(tolerate())
+            .await_batch()
+            .await
+            .expect("replay succeeds");
+        let names: Vec<&str> = replayed.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["a", "parallel-branch-1"]);
+        let error_names: Vec<&str> = replayed.errors().iter().map(|e| e.name).collect();
+        assert_eq!(error_names, names);
+    }
+
+    /// A Flat map writes each item value into the record, and replays it.
+    #[tokio::test]
+    async fn flat_map_values_replay_from_the_record() {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let live: Vec<u32> = ctx
+            .map(
+                vec![1_u32, 2],
+                |_child, item, _idx| async move { Ok(item * 10) },
+            )
+            .nesting(NestingMode::Flat)
+            .await
+            .expect("map succeeds");
+        assert_eq!(live, vec![10, 20]);
+        let payload = parent_payload(&client);
+        let replayed: Vec<u32> = test_ctx(terminal_batch_log(&payload))
+            .map(vec![1_u32, 2], |_child, _item, _idx| async move {
+                unreachable!("a terminal batch replays")
+            })
+            .nesting(NestingMode::Flat)
+            .await
+            .expect("replay succeeds");
+        assert_eq!(replayed, live);
+    }
+
+    /// An item replayed from its terminal child record writes the record's
+    /// wire string into the batch record.
+    #[tokio::test]
+    async fn resumed_terminal_item_writes_its_recorded_value() {
+        let log = CheckpointLog::from_records(vec![
+            (
+                wire_of("1"),
+                CheckpointRecord {
+                    status: CheckpointStatus::Started,
+                    result: None,
+                    ..succeeded_record("1", "").1
+                },
+            ),
+            succeeded_record("2", "\"hello\""),
+        ]);
+        let (ctx, client) = test_ctx_with_client(log);
+        let out: Vec<String> = ctx
+            .map(vec![0_u32], |_child, _item, _idx| async move {
+                unreachable!("a terminal child replays")
+            })
+            .await
+            .expect("map succeeds");
+        assert_eq!(out, vec!["hello"]);
+        assert_eq!(parent_payload_json(&client)["all"][0]["result"], "hello");
     }
 }
 

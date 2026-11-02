@@ -13,7 +13,7 @@ use durable::serdes::SerdesContext;
 /// The whole-batch summary a `result_serdes` transforms is the SDK's
 /// `BatchSummary`, an opaque type. The transform is therefore written as a
 /// type-agnostic blanket `impl<T> Serdes<T>` that works through the value's
-/// serde (JSON) representation: `{"results": [...], "reason": "..."}`.
+/// serde (JSON) representation: `{"all": [...], "completionReason": "..."}`.
 #[derive(Debug)]
 struct OpSerdes;
 
@@ -29,18 +29,16 @@ where
         // Work through the summary's JSON representation.
         let rendered: serde_json::Value = serde_json::from_str(&serde_json::to_string(&value)?)?;
         let results = rendered
-            .get("results")
+            .get("all")
             .and_then(serde_json::Value::as_array)
             .map(|arr| {
                 arr.iter()
                     .filter_map(|item| {
+                        // Each item carries its value as JSON: a string
+                        // here, with the default item serdes.
                         item.get("result")
                             .and_then(serde_json::Value::as_str)
-                            .map(|s| {
-                                // Each item carries its own wire string: a
-                                // JSON-encoded string here, so strip the quotes.
-                                s.trim_matches('"').to_owned()
-                            })
+                            .map(str::to_owned)
                     })
                     .collect::<Vec<_>>()
             })
@@ -70,13 +68,14 @@ where
                 serde_json::json!({
                     "index": i,
                     "status": "SUCCEEDED",
-                    "result": format!("\"{val}\"")
+                    "name": format!("map-item-{i}"),
+                    "result": val
                 })
             })
             .collect();
         let payload = serde_json::json!({
-            "results": results,
-            "reason": "ALL_COMPLETED"
+            "all": results,
+            "completionReason": "ALL_COMPLETED"
         });
         Ok(serde_json::from_str(&serde_json::to_string(&payload)?)?)
     }

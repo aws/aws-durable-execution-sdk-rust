@@ -18,6 +18,7 @@ use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
+use crate::map_parallel::ItemEncoding;
 use crate::serdes::JsonSerdes;
 
 pub use crate::map_parallel::{
@@ -68,6 +69,7 @@ pub struct MapBuilder<I, O, F, Fut, IS = JsonSerdes, RS = JsonSerdes> {
     max_concurrency: Option<usize>,
     completion: Option<CompletionConfig>,
     serdes: IS,
+    encoding: ItemEncoding,
     result_serdes: RS,
     nesting: NestingMode,
     item_namer: Option<crate::map_parallel::ItemNamer<I>>,
@@ -108,6 +110,7 @@ where
             max_concurrency: None,
             completion: None,
             serdes: JsonSerdes,
+            encoding: ItemEncoding::AllJson,
             result_serdes: JsonSerdes,
             nesting: NestingMode::Normal,
             item_namer: None,
@@ -172,6 +175,7 @@ where
             max_concurrency: self.max_concurrency,
             completion: self.completion,
             serdes,
+            encoding: ItemEncoding::AllSerdes,
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             item_namer: self.item_namer,
@@ -187,6 +191,11 @@ where
     /// the entire batch summary ([`BatchSummary`]) rather than individual
     /// items, so it must implement `Serdes<BatchSummary>`: typically
     /// through a type-agnostic blanket `impl<T> Serdes<T>`.
+    ///
+    /// The summary holds item values as JSON values, so the serdes must use
+    /// a self-describing format, one that supports `deserialize_any` (JSON,
+    /// for example). A format that is not self-describing, such as bincode
+    /// or postcard, fails to read the summary back.
     pub fn result_serdes<RS2>(self, serdes: RS2) -> MapBuilder<I, O, F, Fut, IS, RS2>
     where
         RS2: Serdes<BatchSummary>,
@@ -198,6 +207,7 @@ where
             max_concurrency: self.max_concurrency,
             completion: self.completion,
             serdes: self.serdes,
+            encoding: self.encoding,
             result_serdes: serdes,
             nesting: self.nesting,
             item_namer: self.item_namer,
@@ -323,6 +333,7 @@ where
             max_concurrency: self.max_concurrency,
             completion: self.completion,
             serdes: self.serdes,
+            encoding: self.encoding,
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             item_namer: self.item_namer,
@@ -400,6 +411,7 @@ where
             max_concurrency: self.max_concurrency,
             completion: self.completion,
             serdes: self.serdes,
+            encoding: self.encoding,
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             item_namer: self.item_namer,
@@ -446,6 +458,7 @@ pub struct ParallelBuilder<O, IS = JsonSerdes, RS = JsonSerdes> {
     max_concurrency: Option<usize>,
     completion: Option<CompletionConfig>,
     serdes: IS,
+    encoding: ItemEncoding,
     result_serdes: RS,
     nesting: NestingMode,
     branches: Vec<(Option<String>, crate::future::BranchBody<O>)>,
@@ -476,6 +489,7 @@ impl<O: Send + 'static> ParallelBuilder<O> {
             max_concurrency: None,
             completion: None,
             serdes: JsonSerdes,
+            encoding: ItemEncoding::AllJson,
             result_serdes: JsonSerdes,
             nesting: NestingMode::Normal,
             branches,
@@ -533,6 +547,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
             max_concurrency: self.max_concurrency,
             completion: self.completion,
             serdes,
+            encoding: ItemEncoding::AllSerdes,
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
@@ -546,6 +561,11 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// the entire batch summary ([`BatchSummary`]) rather than individual
     /// items, so it must implement `Serdes<BatchSummary>`: typically
     /// through a type-agnostic blanket `impl<T> Serdes<T>`.
+    ///
+    /// The summary holds item values as JSON values, so the serdes must use
+    /// a self-describing format, one that supports `deserialize_any` (JSON,
+    /// for example). A format that is not self-describing, such as bincode
+    /// or postcard, fails to read the summary back.
     pub fn result_serdes<RS2>(self, serdes: RS2) -> ParallelBuilder<O, IS, RS2>
     where
         RS2: Serdes<BatchSummary>,
@@ -557,6 +577,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
             max_concurrency: self.max_concurrency,
             completion: self.completion,
             serdes: self.serdes,
+            encoding: self.encoding,
             result_serdes: serdes,
             nesting: self.nesting,
             branches: self.branches,
@@ -658,6 +679,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
             max_concurrency: self.max_concurrency,
             completion: self.completion,
             serdes: self.serdes,
+            encoding: self.encoding,
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
@@ -729,6 +751,7 @@ where
             max_concurrency: self.max_concurrency,
             completion: self.completion,
             serdes: self.serdes,
+            encoding: self.encoding,
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
