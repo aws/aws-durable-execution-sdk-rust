@@ -2787,6 +2787,40 @@ impl DurableContext {
     ///     Ok(())
     /// }
     /// ```
+    ///
+    /// The closure gets one item. JS passes the whole input array as a
+    /// fourth argument. To read other inputs, clone an `Arc<[I]>` of the
+    /// inputs into the closure:
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// async fn handler(
+    ///     event: Vec<u32>,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<Vec<u32>, durable::BoxError> {
+    ///     let all: Arc<[u32]> = event.clone().into();
+    ///     let shares = ctx
+    ///         .map(event, move |child, item, _idx| {
+    ///             let all = Arc::clone(&all);
+    ///             async move {
+    ///                 let share = child
+    ///                     .step(move |_| async move {
+    ///                         let total: u32 = all.iter().sum();
+    ///                         Ok(item * 100 / total.max(1))
+    ///                     })
+    ///                     .name("share")
+    ///                     .await?;
+    ///                 Ok(share)
+    ///             }
+    ///         })
+    ///         .name("shares")
+    ///         .await?;
+    ///     Ok(shares)
+    /// }
+    /// ```
     pub fn map<Items, I, O, F, Fut>(&self, items: Items, f: F) -> MapBuilder<I, O, F, Fut>
     where
         Items: IntoIterator<Item = I>,

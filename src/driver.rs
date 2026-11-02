@@ -1955,10 +1955,18 @@ mod suspension_containment_and_task_ownership {
         let outcome = drive_ok(
             ctx.clone(),
             async move {
-                // max_concurrency(0) is a validation error, returned as Err.
+                // An out-of-range failure percentage is a validation
+                // error, returned as Err. (`max_concurrency(0)` fails the
+                // execution instead, as JS does.)
                 let r = ctx_h
-                    .parallel(Vec::<crate::Branch<String>>::new())
-                    .max_concurrency(0)
+                    .parallel(vec![crate::Branch::new("b", |_| async {
+                        Ok("b".to_owned())
+                    })])
+                    .completion(
+                        crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(
+                            150.0,
+                        ),
+                    )
                     .await;
                 if r.is_err() {
                     caught_c.store(true, Ordering::SeqCst);

@@ -77,12 +77,24 @@ macro_rules! preflight_identity {
 /// clone of the context that carries a first-poll flag, so the refresh
 /// scheduler refreshes the operation only once the returned handle is
 /// first polled (see [`crate::coordinator`]).
+///
+/// The `batch_future` arm is for `spawn_batch()` on the map and parallel
+/// builders. It is the one-argument form with the builder's
+/// `batch_future()`, which yields the full `BatchResult`, in place of
+/// `into_future`.
 macro_rules! spawn_terminal {
     ($builder:expr) => {{
         let builder = $builder;
         let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
         let coordinator = ::std::sync::Arc::clone(builder.ctx.coordinator());
         let future = ::std::future::IntoFuture::into_future(builder);
+        $crate::future::DurableFuture::spawn_blessed(future, &task_ownership, &coordinator, None)
+    }};
+    ($builder:expr, batch_future) => {{
+        let builder = $builder;
+        let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
+        let coordinator = ::std::sync::Arc::clone(builder.ctx.coordinator());
+        let future = builder.batch_future();
         $crate::future::DurableFuture::spawn_blessed(future, &task_ownership, &coordinator, None)
     }};
     ($builder:expr, awaited) => {{

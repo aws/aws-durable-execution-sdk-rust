@@ -678,6 +678,32 @@ item's status and why the batch ended. `BatchResult::status()` returns a
 `BatchStatus` enum, and `BatchResult::errors()` returns `BatchError` entries
 that tie each failure to the index and name of the item that produced it,
 along with the error's type identifier and message.
+`succeeded()`, `failed()` and `started()` iterate the items with that
+status in input order, and `started_count()` counts the `Started` ones.
+`into_result()` returns the first failed item's error, or the batch
+completion error when the status is `Failed`, and the `BatchResult`
+otherwise. Unlike `.await`, it returns an error for a failure within the
+configured tolerance too.
+
+`.spawn_batch()` starts the batch on its own task at once and returns a
+`DurableFuture<BatchResult<O>>`, as `.spawn()` does for the `Vec<O>` form,
+so the handler can run other operations before it awaits the batch.
+
+```rust ignore
+let batch = ctx
+    .map(items, |child, item, _idx| async move {
+        Ok(child.step(move |_| async move { Ok(item * 10) }).name("scale").await?)
+    })
+    .name("scale-all")
+    .spawn_batch();
+ctx.wait(Duration::from_secs(1)).name("meanwhile").await?;
+let batch = batch.await?.into_result()?;
+```
+
+`.max_concurrency(0)` fails the execution with an error the handler
+cannot catch, and the batch records nothing. Without `.max_concurrency`,
+concurrency is unlimited. A failure percentage applies to `parallel` as
+it does to `map`.
 
 An item that waits on a durable operation keeps its concurrency slot until it
 finishes. When its wait completes while other work runs, it continues in the

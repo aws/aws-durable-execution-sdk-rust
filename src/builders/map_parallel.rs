@@ -135,6 +135,11 @@ where
     }
 
     /// Sets the maximum number of concurrent items to process.
+    ///
+    /// `0` fails the execution with the error `Invalid max_concurrency: 0.
+    /// Must be a positive number or unset for unlimited concurrency.`; it
+    /// cannot be caught, and the map records nothing. Unset means
+    /// unlimited.
     pub fn max_concurrency(mut self, max: usize) -> Self {
         self.max_concurrency = Some(max);
         self
@@ -164,6 +169,8 @@ where
     /// fails at compile time. It goes through the same transform boundary
     /// as every other operation, so a [`Serdes`] attached here behaves
     /// exactly as it does on a step, invoke, callback, or `result_serdes`.
+    ///
+    /// `serdes` corresponds to JS `itemSerdes` and Python `item_serdes`.
     pub fn serdes<IS2>(self, serdes: IS2) -> MapBuilder<I, O, F, Fut, IS2, RS>
     where
         IS2: Serdes<O>,
@@ -196,6 +203,8 @@ where
     /// a self-describing format, one that supports `deserialize_any` (JSON,
     /// for example). A format that is not self-describing, such as bincode
     /// or postcard, fails to read the summary back.
+    ///
+    /// `result_serdes` corresponds to JS and Python `serdes`.
     pub fn result_serdes<RS2>(self, serdes: RS2) -> MapBuilder<I, O, F, Fut, IS, RS2>
     where
         RS2: Serdes<BatchSummary>,
@@ -266,11 +275,18 @@ where
     /// or parked is cancelled at its next `.await` and appears live as
     /// [`BatchItemStatus::Started`].
     ///
+    /// The batch starts when the returned future is first polled. To start
+    /// it at once and run it in the background, use
+    /// [`spawn_batch`](Self::spawn_batch).
+    ///
     /// # Errors
     ///
     /// Returns an error if the batch execution encounters an infrastructure
-    /// failure (checkpoint client error, task-ownership violation, invalid
-    /// configuration). Item-level failures are NOT errors: they appear as
+    /// failure (checkpoint client error, task-ownership violation) or an
+    /// invalid completion configuration, such as a failure percentage outside
+    /// `0.0..=100.0`. `max_concurrency(0)` returns no error: it fails the
+    /// execution, and the handler cannot catch it. Item-level failures are
+    /// NOT errors: they appear as
     /// `BatchItemStatus::Failed` entries in the result, and the batch's
     /// [`CompletionReason`] records why the batch ended.
     ///
@@ -321,11 +337,71 @@ where
         IS: Serdes<O>,
         RS: Serdes<BatchSummary>,
     {
+        self.batch_future().await
+    }
+
+    /// Starts the operation on its own task and returns its full
+    /// [`BatchResult`].
+    ///
+    /// This is [`await_batch`](Self::await_batch) started at once, as
+    /// [`spawn`](Self::spawn) is for the `Vec<O>` form. A handler can run
+    /// other operations before it awaits the returned future.
+    ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
+    /// # Errors
+    ///
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<Vec<u32>, durable::BoxError> {
+    ///     let batch = ctx
+    ///         .map(vec![1_u32, 2], |child, i, _idx| async move {
+    ///             Ok(child.step(move |_| async move { Ok(i * 10) }).name("scale").await?)
+    ///         })
+    ///         .name("scale-all")
+    ///         .spawn_batch();
+    ///     ctx.wait(Duration::from_secs(1)).name("meanwhile").await?;
+    ///     let batch = batch.await?.into_result()?;
+    ///     Ok(batch.results().into_iter().copied().collect())
+    /// }
+    /// ```
+    pub fn spawn_batch(self) -> DurableFuture<BatchResult<O>>
+    where
+        IS: Serdes<O>,
+        RS: Serdes<BatchSummary>,
+    {
+        spawn_terminal!(self, batch_future)
+    }
+
+    /// The lazy terminal of the full [`BatchResult`]: the body of
+    /// `into_future`, with `execute_batch_result` in place of `execute`.
+    /// So `.await`, `await_batch()` and `spawn_batch()` run the same
+    /// replay identity check and the same admission check.
+    fn batch_future(self) -> DurableFuture<BatchResult<O>>
+    where
+        IS: Serdes<O>,
+        RS: Serdes<BatchSummary>,
+    {
         use crate::map_parallel::MapExecution;
 
-        // The admission check every lazy terminal runs in
-        // `DurableFuture::for_operation`.
-        self.ctx.admit_operation().await;
+        preflight_identity!(self, "Context", crate::map_parallel::MAP_SUB_TYPE);
+
+        let gate = self.ctx.clone();
+
         let execution = MapExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -342,7 +418,7 @@ where
             _marker: PhantomData,
         };
 
-        execution.execute_batch_result().await
+        DurableFuture::for_operation(&gate, execution.execute_batch_result())
     }
 
     /// Converts this builder into a [`DurableFuture`] without starting it.
@@ -506,6 +582,11 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     }
 
     /// Sets the maximum number of concurrent branches.
+    ///
+    /// `0` fails the execution with the error `Invalid max_concurrency: 0.
+    /// Must be a positive number or unset for unlimited concurrency.`; it
+    /// cannot be caught, and the parallel records nothing. Unset means
+    /// unlimited.
     pub fn max_concurrency(mut self, max: usize) -> Self {
         self.max_concurrency = Some(max);
         self
@@ -523,6 +604,9 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     ///   [`CompletionConfig::with_tolerated_failure_count(0)`](CompletionConfig::with_tolerated_failure_count)
     /// - tolerate all failures:
     ///   [`CompletionConfig::with_tolerated_failure_percentage(100.0)`](CompletionConfig::with_tolerated_failure_percentage)
+    ///
+    /// A failure percentage applies to `parallel` as it does to `map`, as
+    /// in JS and Python `ParallelConfig`.
     pub fn completion(mut self, config: CompletionConfig) -> Self {
         self.completion = Some(config);
         self
@@ -536,6 +620,8 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// boundary as every other operation, so a [`Serdes`] attached here
     /// behaves exactly as it does on a step, invoke, callback, or
     /// `result_serdes`.
+    ///
+    /// `serdes` corresponds to JS `itemSerdes` and Python `item_serdes`.
     pub fn serdes<IS2>(self, serdes: IS2) -> ParallelBuilder<O, IS2, RS>
     where
         IS2: Serdes<O>,
@@ -566,6 +652,8 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// a self-describing format, one that supports `deserialize_any` (JSON,
     /// for example). A format that is not self-describing, such as bincode
     /// or postcard, fails to read the summary back.
+    ///
+    /// `result_serdes` corresponds to JS and Python `serdes`.
     pub fn result_serdes<RS2>(self, serdes: RS2) -> ParallelBuilder<O, IS, RS2>
     where
         RS2: Serdes<BatchSummary>,
@@ -615,11 +703,18 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// or parked is cancelled at its next `.await` and appears live as
     /// [`BatchItemStatus::Started`].
     ///
+    /// The batch starts when the returned future is first polled. To start
+    /// it at once and run it in the background, use
+    /// [`spawn_batch`](Self::spawn_batch).
+    ///
     /// # Errors
     ///
     /// Returns an error if the batch execution encounters an infrastructure
-    /// failure (checkpoint client error, task-ownership violation, invalid
-    /// configuration). Branch-level failures are NOT errors: they appear as
+    /// failure (checkpoint client error, task-ownership violation) or an
+    /// invalid completion configuration, such as a failure percentage outside
+    /// `0.0..=100.0`. `max_concurrency(0)` returns no error: it fails the
+    /// execution, and the handler cannot catch it. Branch-level failures are
+    /// NOT errors: they appear as
     /// `BatchItemStatus::Failed` entries in the result, and the batch's
     /// [`CompletionReason`] records why the batch ended.
     ///
@@ -667,11 +762,70 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
         IS: Serdes<O>,
         RS: Serdes<BatchSummary>,
     {
+        self.batch_future().await
+    }
+
+    /// Starts the operation on its own task and returns its full
+    /// [`BatchResult`].
+    ///
+    /// This is [`await_batch`](Self::await_batch) started at once, as
+    /// [`spawn`](Self::spawn) is for the `Vec<O>` form. A handler can run
+    /// other operations before it awaits the returned future.
+    ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
+    /// # Errors
+    ///
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<usize, durable::BoxError> {
+    ///     let branches = vec![
+    ///         durable::Branch::new("a", |_| async { Ok(1) }),
+    ///         durable::Branch::new("b", |_| async { Ok(2) }),
+    ///     ];
+    ///     let batch = ctx.parallel(branches).name("fan-out").spawn_batch();
+    ///     ctx.wait(Duration::from_secs(1)).name("meanwhile").await?;
+    ///     let batch = batch.await?;
+    ///     Ok(batch.succeeded().count())
+    /// }
+    /// ```
+    pub fn spawn_batch(self) -> DurableFuture<BatchResult<O>>
+    where
+        IS: Serdes<O>,
+        RS: Serdes<BatchSummary>,
+    {
+        spawn_terminal!(self, batch_future)
+    }
+
+    /// The lazy terminal of the full [`BatchResult`]: the body of
+    /// `into_future`, with `execute_batch_result` in place of `execute`.
+    /// So `.await`, `await_batch()` and `spawn_batch()` run the same
+    /// replay identity check and the same admission check.
+    fn batch_future(self) -> DurableFuture<BatchResult<O>>
+    where
+        IS: Serdes<O>,
+        RS: Serdes<BatchSummary>,
+    {
         use crate::map_parallel::ParallelExecution;
 
-        // The admission check every lazy terminal runs in
-        // `DurableFuture::for_operation`.
-        self.ctx.admit_operation().await;
+        preflight_identity!(self, "Context", crate::map_parallel::PARALLEL_SUB_TYPE);
+
+        let gate = self.ctx.clone();
+
         let execution = ParallelExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -685,7 +839,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
             branches: self.branches,
         };
 
-        execution.execute_batch_result().await
+        DurableFuture::for_operation(&gate, execution.execute_batch_result())
     }
 
     /// Converts this builder into a [`DurableFuture`] without starting it.
@@ -948,6 +1102,9 @@ impl CompletionConfig {
     /// Use `100.0` to tolerate all failures (the failure rate can never
     /// strictly exceed 100%). A value that is not finite or lies outside
     /// `0.0..=100.0` fails the batch at execute time.
+    ///
+    /// The percentage applies to `parallel` as it does to `map`, as in JS
+    /// and Python `ParallelConfig`.
     ///
     /// **Default when unset:** an empty config fails fast on the first
     /// failure; a config with some other criterion set applies only that
@@ -1224,6 +1381,9 @@ impl CompletionConfigBuilder {
     ///
     /// A value that is not finite or lies outside `0.0..=100.0` is rejected
     /// by [`build`](Self::build).
+    ///
+    /// The percentage applies to `parallel` as it does to `map`, as in JS
+    /// and Python `ParallelConfig`.
     pub fn tolerated_failure_percentage(mut self, pct: f64) -> Self {
         self.tolerated_failure_percentage = Some(pct);
         self
@@ -1578,5 +1738,78 @@ mod tests {
                 .contains("tolerated_failure_percentage must be 0-100"),
             "unexpected message: {err}"
         );
+    }
+
+    /// A context whose log holds a succeeded STEP record at position 1,
+    /// where the batch under test claims a `Context` operation.
+    fn ctx_with_step_record_at_1() -> DurableContext {
+        use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
+
+        let wire = crate::engine::compute_wire_id_public("1");
+        let record = CheckpointRecord {
+            id: wire.clone(),
+            status: CheckpointStatus::Succeeded,
+            result: Some("0".to_owned()),
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            due_at: None,
+            op_name: None,
+        };
+        DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(vec![(wire, record)])),
+        )
+    }
+
+    /// `batch_future` checks the replay identity when it is called, before
+    /// the returned future is polled, as `into_future` does. The log holds a
+    /// STEP where the map claims a `Context`. So the fatal mismatch is
+    /// recorded at once. Without the preflight, the mismatch is recorded only
+    /// when the batch first runs.
+    #[tokio::test]
+    async fn map_batch_future_checks_replay_identity_before_first_poll() {
+        let ctx = ctx_with_step_record_at_1();
+        let future = ctx
+            .map(
+                vec![1_i32],
+                |_child, item: i32, _idx| async move { Ok(item) },
+            )
+            .batch_future();
+        let fatal = ctx
+            .coordinator()
+            .fatal_error()
+            .expect("the mismatch is recorded before the first poll");
+        assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
+        drop(future);
+    }
+
+    /// The parallel counterpart of
+    /// `map_batch_future_checks_replay_identity_before_first_poll`.
+    #[tokio::test]
+    async fn parallel_batch_future_checks_replay_identity_before_first_poll() {
+        let ctx = ctx_with_step_record_at_1();
+        let branches = vec![crate::future::Branch::new("b", |_child| async {
+            Ok(1_i32)
+        })];
+        let future = ctx.parallel(branches).batch_future();
+        let fatal = ctx
+            .coordinator()
+            .fatal_error()
+            .expect("the mismatch is recorded before the first poll");
+        assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
+        drop(future);
     }
 }

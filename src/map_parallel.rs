@@ -728,6 +728,60 @@ impl<O> BatchResult<O> {
             })
             .collect()
     }
+
+    /// Returns the items with status [`BatchItemStatus::Succeeded`], in
+    /// input order.
+    pub fn succeeded(&self) -> impl Iterator<Item = &BatchItem<O>> + '_ {
+        self.with_status(BatchItemStatus::Succeeded)
+    }
+
+    /// Returns the items with status [`BatchItemStatus::Failed`], in input
+    /// order.
+    pub fn failed(&self) -> impl Iterator<Item = &BatchItem<O>> + '_ {
+        self.with_status(BatchItemStatus::Failed)
+    }
+
+    /// Returns the items with status [`BatchItemStatus::Started`], in input
+    /// order: the items that were still running when the completion rule
+    /// ended the batch.
+    pub fn started(&self) -> impl Iterator<Item = &BatchItem<O>> + '_ {
+        self.with_status(BatchItemStatus::Started)
+    }
+
+    /// Returns the number of [`BatchItemStatus::Started`] items.
+    pub fn started_count(&self) -> usize {
+        self.started().count()
+    }
+
+    /// Returns `Ok(self)` unless an item failed or the batch status is
+    /// [`BatchStatus::Failed`].
+    ///
+    /// This is JS `throwIfError()`. It returns an error for a failure
+    /// within the configured tolerance too. `.await` on the builder differs:
+    /// it returns an error only when the batch failed.
+    ///
+    /// # Errors
+    ///
+    /// The first failed item's error, in input order: the error `.await`
+    /// returns for that item, of kind
+    /// [`ChildContextErrorKind::ChildFailed`](crate::ChildContextErrorKind::ChildFailed)
+    /// with the item's recorded failure. When no item failed and the
+    /// status is [`BatchStatus::Failed`], the batch completion error, of
+    /// kind
+    /// [`ChildContextErrorKind::BatchCompletionFailed`](crate::ChildContextErrorKind::BatchCompletionFailed).
+    pub fn into_result(self) -> Result<Self, OperationError> {
+        if let Some(item) = self.failed().next() {
+            return Err(item_failure_error(item.failure_wire()));
+        }
+        if self.status() == BatchStatus::Failed {
+            return Err(batch_completion_failed_error());
+        }
+        Ok(self)
+    }
+
+    fn with_status(&self, status: BatchItemStatus) -> impl Iterator<Item = &BatchItem<O>> + '_ {
+        self.items.iter().filter(move |item| item.status == status)
+    }
 }
 
 /// Controls whether batch items run in real or virtual child contexts.
@@ -1742,12 +1796,14 @@ where
     // 1. Task-ownership check.
     ctx.enforce_task_ownership()?;
 
-    // 1b. Validate max_concurrency BEFORE any checkpointing.
-    // Zero is invalid: must be positive or unset (None = unlimited).
+    // 1b. Validate max_concurrency BEFORE any checkpointing. Zero is a
+    // configuration mistake that fails the same way on every retry. A
+    // catchable error would let the handler record a different outcome, so
+    // the execution fails, as in JS, and this future never resolves.
     if max_concurrency == Some(0) {
-        return Err(batch_error(
-            "max concurrency must be positive or unset for unlimited",
-        ));
+        ctx.coordinator()
+            .record_fatal("Error".to_owned(), MAX_CONCURRENCY_ZERO_MESSAGE.to_owned());
+        return std::future::pending().await;
     }
 
     // The caller computed both name lists once per input item, before the
@@ -3877,6 +3933,11 @@ where
 
     Ok(BatchResult { items, reason })
 }
+
+/// The execution error `max_concurrency(0)` records: JS's wording, with the
+/// Rust setter's name.
+const MAX_CONCURRENCY_ZERO_MESSAGE: &str =
+    "Invalid max_concurrency: 0. Must be a positive number or unset for unlimited concurrency.";
 
 /// Constructs a batch operation error for a coordinator defect: an
 /// internal invariant breach or a malformed record, never a user item's
@@ -7102,41 +7163,108 @@ mod tests {
         );
     }
 
-    // Bug 5: max_concurrency=0 validation error
+    // BatchResult views and into_result, over hand-built results.
 
-    #[tokio::test]
-    async fn max_concurrency_zero_returns_validation_error() {
-        let ctx = test_ctx(CheckpointLog::empty());
-        // Attempt parallel with max_concurrency=0.
-        let result: Result<Vec<String>, _> = ctx
-            .parallel(Vec::<crate::Branch<String>>::new())
-            .max_concurrency(0)
-            .await;
-        let err = result.expect_err("max_concurrency=0 must error");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("max concurrency must be positive"),
-            "error message should mention validation: {msg}"
-        );
+    fn item(index: usize, status: BatchItemStatus, result: Option<i32>) -> BatchItem<i32> {
+        BatchItem::new(index, format!("item-{index}"), status, result, None, None)
     }
 
-    #[tokio::test]
-    async fn max_concurrency_zero_map_returns_validation_error() {
-        let ctx = test_ctx(CheckpointLog::empty());
-        // Attempt map with max_concurrency=0.
-        let result: Result<Vec<i32>, _> = ctx
-            .map(
-                vec![1, 2],
-                |_child, item: i32, _idx| async move { Ok(item) },
-            )
-            .max_concurrency(0)
-            .await;
-        let err = result.expect_err("max_concurrency=0 must error");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("max concurrency must be positive"),
-            "error message should mention validation: {msg}"
+    fn failed_item(index: usize, message: &str, error_type: Option<&str>) -> BatchItem<i32> {
+        BatchItem::new(
+            index,
+            format!("item-{index}"),
+            BatchItemStatus::Failed,
+            None,
+            Some(message.to_owned()),
+            error_type.map(str::to_owned),
+        )
+    }
+
+    fn indexes<'a>(items: impl Iterator<Item = &'a BatchItem<i32>>) -> Vec<usize> {
+        items.map(|item| item.index).collect()
+    }
+
+    #[test]
+    fn batch_result_views_split_by_status() {
+        let batch = BatchResult::new(
+            vec![
+                item(0, BatchItemStatus::Succeeded, Some(1)),
+                failed_item(1, "boom", None),
+                item(2, BatchItemStatus::Started, None),
+                item(3, BatchItemStatus::Succeeded, Some(4)),
+            ],
+            CompletionReason::MinSuccessfulReached,
         );
+        assert_eq!(indexes(batch.succeeded()), [0, 3]);
+        assert_eq!(indexes(batch.failed()), [1]);
+        assert_eq!(indexes(batch.started()), [2]);
+        assert_eq!(batch.started_count(), 1);
+    }
+
+    #[test]
+    fn into_result_returns_first_failure() {
+        let batch = BatchResult::new(
+            vec![
+                item(0, BatchItemStatus::Succeeded, Some(1)),
+                failed_item(1, "a", Some("AError")),
+                failed_item(2, "b", None),
+            ],
+            CompletionReason::AllCompleted,
+        );
+        let err = batch.into_result().expect_err("an item failed");
+        let OperationErrorKind::ChildContext(child_err) = err.kind() else {
+            unreachable!("expected a child-context error, got {:?}", err.kind());
+        };
+        assert!(matches!(
+            child_err.kind(),
+            ChildContextErrorKind::ChildFailed
+        ));
+        let wire = err.wire().expect("the item's wire record is attached");
+        assert_eq!(wire.error_type(), Some("AError"));
+        assert_eq!(wire.error_message(), Some("a"));
+    }
+
+    #[test]
+    fn into_result_returns_completion_error_without_failed_item() {
+        let batch = BatchResult::new(
+            vec![item(0, BatchItemStatus::Succeeded, Some(1))],
+            CompletionReason::CustomCompletionFailed,
+        );
+        let err = batch.into_result().expect_err("the batch status is Failed");
+        let OperationErrorKind::ChildContext(child_err) = err.kind() else {
+            unreachable!("expected a child-context error, got {:?}", err.kind());
+        };
+        assert!(matches!(
+            child_err.kind(),
+            ChildContextErrorKind::BatchCompletionFailed
+        ));
+        let wire = err.wire().expect("the completion wire record is attached");
+        assert_eq!(wire.error_type(), Some("BatchCompletionError"));
+    }
+
+    #[test]
+    fn into_result_keeps_a_successful_batch() {
+        let batch = BatchResult::new(
+            vec![
+                item(0, BatchItemStatus::Succeeded, Some(1)),
+                item(1, BatchItemStatus::Started, None),
+            ],
+            CompletionReason::MinSuccessfulReached,
+        );
+        let batch = batch.into_result().expect("no item failed");
+        let items: Vec<_> = batch
+            .items
+            .iter()
+            .map(|item| (item.index, item.status, item.result))
+            .collect();
+        assert_eq!(
+            items,
+            [
+                (0, BatchItemStatus::Succeeded, Some(1)),
+                (1, BatchItemStatus::Started, None),
+            ]
+        );
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
     }
 
     // Checkpoint serialization tests
@@ -11150,5 +11278,374 @@ mod coordinator_tests {
             "the cancelled item wrote no later update"
         );
         assert_eq!(coordinator.tasks().live(), 0);
+    }
+}
+
+/// The batch terminals (`.await`, `await_batch()` and `spawn_batch()`)
+/// driven through `LocalRunner`.
+#[cfg(all(test, feature = "test-util"))]
+mod batch_terminal_tests {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::{BatchItemStatus, BatchResult, CompletionReason, MAX_CONCURRENCY_ZERO_MESSAGE};
+    use crate::builders::map_parallel::CompletionConfig;
+    use crate::test_util::{ExecutionStatus, LocalRunner};
+    use crate::{BoxError, Branch, DurableContext};
+
+    /// `(index, name, status, result)` of each item, and the reason.
+    type Record = (
+        Vec<(usize, String, BatchItemStatus, Option<i32>)>,
+        CompletionReason,
+    );
+
+    fn record_of(batch: &BatchResult<i32>) -> Record {
+        let items = batch
+            .items
+            .iter()
+            .map(|item| (item.index, item.name.clone(), item.status, item.result))
+            .collect();
+        (items, batch.reason)
+    }
+
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    type ItemFuture = std::pin::Pin<Box<dyn Future<Output = Result<i32, BoxError>> + Send>>;
+
+    /// `map(vec![1, 2])` named `m`, where each item's step appends the
+    /// current invocation number to `log` and returns `i * 10`.
+    fn logged_map(
+        ctx: &DurableContext,
+        invocation: usize,
+        log: &Arc<Mutex<Vec<usize>>>,
+    ) -> crate::builders::MapBuilder<
+        i32,
+        i32,
+        impl Fn(DurableContext, i32, usize) -> ItemFuture + Send + Sync + 'static,
+        ItemFuture,
+    > {
+        let log = Arc::clone(log);
+        ctx.map(vec![1, 2], move |child, i: i32, _idx| -> ItemFuture {
+            let log = Arc::clone(&log);
+            Box::pin(async move {
+                child
+                    .step(move |_| async move {
+                        lock(&log).push(invocation);
+                        Ok(i * 10)
+                    })
+                    .name("scale")
+                    .await
+                    .map_err(Into::into)
+            })
+        })
+        .name("m")
+    }
+
+    #[tokio::test]
+    async fn spawn_batch_runs_while_the_handler_waits() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (inv, step_log) = (Arc::clone(&invocations), Arc::clone(&log));
+        let result = LocalRunner::new()
+            .run(
+                move |(): (), ctx: DurableContext| {
+                    let invocation = inv.fetch_add(1, Ordering::SeqCst) + 1;
+                    let log = Arc::clone(&step_log);
+                    async move {
+                        let batch = logged_map(&ctx, invocation, &log).spawn_batch();
+                        ctx.wait(Duration::from_secs(1)).await?;
+                        let batch = batch.await?;
+                        Ok::<_, BoxError>(batch.results().into_iter().copied().collect::<Vec<_>>())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("the run finishes");
+        assert_eq!(result.status(), ExecutionStatus::Succeeded);
+        assert_eq!(result.output(), Some(&vec![10, 20]));
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(*lock(&log), [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn spawn_batch_equals_await_batch() {
+        let spawned: Arc<Mutex<Vec<Record>>> = Arc::default();
+        let awaited: Arc<Mutex<Vec<Record>>> = Arc::default();
+
+        let records = Arc::clone(&spawned);
+        let result = LocalRunner::new()
+            .run(
+                move |(): (), ctx: DurableContext| {
+                    let records = Arc::clone(&records);
+                    async move {
+                        let log = Arc::default();
+                        let batch = logged_map(&ctx, 0, &log).spawn_batch();
+                        ctx.wait(Duration::from_secs(1)).await?;
+                        let batch = batch.await?;
+                        lock(&records).push(record_of(&batch));
+                        Ok::<_, BoxError>(())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("the run finishes");
+        assert_eq!(result.status(), ExecutionStatus::Succeeded);
+
+        let records = Arc::clone(&awaited);
+        let result = LocalRunner::new()
+            .run(
+                move |(): (), ctx: DurableContext| {
+                    let records = Arc::clone(&records);
+                    async move {
+                        let log = Arc::default();
+                        let batch = logged_map(&ctx, 0, &log).await_batch().await?;
+                        lock(&records).push(record_of(&batch));
+                        ctx.wait(Duration::from_secs(1)).await?;
+                        Ok::<_, BoxError>(())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("the run finishes");
+        assert_eq!(result.status(), ExecutionStatus::Succeeded);
+
+        let spawned = lock(&spawned).clone();
+        let awaited = lock(&awaited).clone();
+        let [spawned] = spawned.as_slice() else {
+            unreachable!("A awaits the batch once, after the wait: {spawned:?}");
+        };
+        assert_eq!(awaited.len(), 2, "B awaits the batch in both invocations");
+        for record in &awaited {
+            assert_eq!(record, spawned);
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_tolerated_failure_percentage_fails_the_batch() {
+        let seen: Arc<Mutex<Option<Record>>> = Arc::default();
+        let slot = Arc::clone(&seen);
+        let result = LocalRunner::new()
+            .run(
+                move |(): (), ctx: DurableContext| {
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let branches = vec![
+                            Branch::new("ok", |_| async { Ok(1) }),
+                            Branch::new("bad-1", |_| async { Err::<i32, BoxError>("boom".into()) }),
+                            Branch::new("bad-2", |_| async { Err::<i32, BoxError>("boom".into()) }),
+                        ];
+                        let batch = ctx
+                            .parallel(branches)
+                            .max_concurrency(1)
+                            .completion(CompletionConfig::with_tolerated_failure_percentage(50.0))
+                            .await_batch()
+                            .await?;
+                        *lock(&slot) = Some(record_of(&batch));
+                        Ok::<_, BoxError>(())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("the run finishes");
+        assert_eq!(result.status(), ExecutionStatus::Succeeded);
+        let (items, reason) = lock(&seen).clone().expect("the handler recorded the batch");
+        let statuses: Vec<_> = items
+            .iter()
+            .map(|(index, _, status, value)| (*index, *status, *value))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                (0, BatchItemStatus::Succeeded, Some(1)),
+                (1, BatchItemStatus::Failed, None),
+                (2, BatchItemStatus::Failed, None),
+            ]
+        );
+        assert_eq!(reason, CompletionReason::FailureToleranceExceeded);
+    }
+
+    /// Records a step at the first position in invocation 1, then runs a
+    /// map named `m` there on replay, through `await_batch()` or `.await`.
+    async fn replay_identity_case(
+        use_await_batch: bool,
+    ) -> (Option<String>, Option<String>, usize) {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::clone(&bodies);
+        let result = LocalRunner::new()
+            .run(
+                move |(): (), ctx: DurableContext| {
+                    let first = invocations.fetch_add(1, Ordering::SeqCst) == 0;
+                    let ran = Arc::clone(&ran);
+                    async move {
+                        if first {
+                            ctx.step(|_| async { Ok(1_i32) }).name("s").await?;
+                            ctx.wait(Duration::from_secs(1)).await?;
+                            return Ok::<_, BoxError>(());
+                        }
+                        let map = ctx
+                            .map(vec![1], move |_child, i: i32, _idx| {
+                                let ran = Arc::clone(&ran);
+                                async move {
+                                    ran.fetch_add(1, Ordering::SeqCst);
+                                    Ok(i)
+                                }
+                            })
+                            .name("m");
+                        if use_await_batch {
+                            map.await_batch().await?;
+                        } else {
+                            map.await?;
+                        }
+                        Ok(())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("the run finishes");
+        assert_eq!(result.status(), ExecutionStatus::Failed);
+        (
+            result.error_type().map(str::to_owned),
+            result.error_message().map(str::to_owned),
+            bodies.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn await_batch_checks_replay_identity_like_await() {
+        let batch = replay_identity_case(true).await;
+        let plain = replay_identity_case(false).await;
+        assert_eq!(batch.0.as_deref(), Some("NonDeterministicExecutionError"));
+        assert_eq!(plain.0.as_deref(), Some("NonDeterministicExecutionError"));
+        assert!(batch.1.is_some());
+        assert_eq!(batch.1, plain.1);
+        assert_eq!((batch.2, plain.2), (0, 0), "no item body ran");
+    }
+
+    #[tokio::test]
+    async fn parallel_spawn_batch_returns_branch_statuses() {
+        let seen: Arc<Mutex<Option<Record>>> = Arc::default();
+        let slot = Arc::clone(&seen);
+        let result = LocalRunner::new()
+            .run(
+                move |(): (), ctx: DurableContext| {
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let branches = vec![
+                            Branch::new("ok", |_| async { Ok(1) }),
+                            Branch::new("bad", |_| async { Err::<i32, BoxError>("boom".into()) }),
+                        ];
+                        let batch = ctx
+                            .parallel(branches)
+                            .completion(CompletionConfig::with_tolerated_failure_count(1))
+                            .spawn_batch();
+                        ctx.wait(Duration::from_secs(1)).await?;
+                        let batch = batch.await?;
+                        *lock(&slot) = Some(record_of(&batch));
+                        Ok::<_, BoxError>(())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("the run finishes");
+        assert_eq!(result.status(), ExecutionStatus::Succeeded);
+        let (items, reason) = lock(&seen).clone().expect("the handler recorded the batch");
+        let statuses: Vec<_> = items
+            .iter()
+            .map(|(index, _, status, value)| (*index, *status, *value))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                (0, BatchItemStatus::Succeeded, Some(1)),
+                (1, BatchItemStatus::Failed, None),
+            ]
+        );
+        assert_eq!(reason, CompletionReason::AllCompleted);
+    }
+
+    #[derive(Clone, Copy)]
+    enum Terminal {
+        Await,
+        AwaitBatch,
+        SpawnBatch,
+    }
+
+    async fn max_concurrency_zero_case(terminal: Terminal) {
+        let after = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&after);
+        let result = LocalRunner::new()
+            .run(
+                move |(): (), ctx: DurableContext| {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        let map = ctx
+                            .map(vec![1, 2], |_child, i: i32, _idx| async move { Ok(i) })
+                            .name("m")
+                            .max_concurrency(0);
+                        match terminal {
+                            Terminal::Await => drop(map.await),
+                            Terminal::AwaitBatch => drop(map.await_batch().await),
+                            Terminal::SpawnBatch => drop(map.spawn_batch().await),
+                        }
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, BoxError>(())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("the run finishes");
+        assert_eq!(result.status(), ExecutionStatus::Failed);
+        assert_eq!(result.error_type(), Some("Error"));
+        assert_eq!(result.error_message(), Some(MAX_CONCURRENCY_ZERO_MESSAGE));
+        assert_eq!(
+            MAX_CONCURRENCY_ZERO_MESSAGE,
+            "Invalid max_concurrency: 0. Must be a positive number or unset for unlimited \
+             concurrency."
+        );
+        assert!(
+            result.operation("m").is_none(),
+            "no batch record is written"
+        );
+        assert_eq!(after.load(Ordering::SeqCst), 0, "the await never resolves");
+    }
+
+    #[tokio::test]
+    async fn max_concurrency_zero_fails_the_execution() {
+        max_concurrency_zero_case(Terminal::Await).await;
+        max_concurrency_zero_case(Terminal::AwaitBatch).await;
+        max_concurrency_zero_case(Terminal::SpawnBatch).await;
+    }
+
+    /// The same check on `parallel`, which has its own builder.
+    #[tokio::test]
+    async fn parallel_max_concurrency_zero_fails_the_execution() {
+        let result = LocalRunner::new()
+            .run(
+                |(): (), ctx: DurableContext| async move {
+                    let branches = vec![Branch::new("ok", |_| async { Ok(1) })];
+                    drop(ctx.parallel(branches).name("p").max_concurrency(0).await);
+                    Ok::<_, BoxError>(())
+                },
+                (),
+            )
+            .await
+            .expect("the run finishes");
+        assert_eq!(result.status(), ExecutionStatus::Failed);
+        assert_eq!(result.error_message(), Some(MAX_CONCURRENCY_ZERO_MESSAGE));
+        assert!(result.operation("p").is_none());
     }
 }
