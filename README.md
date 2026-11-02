@@ -727,6 +727,15 @@ failure on both paths. When `try_join_all`, `select_ok` or `race` resolves,
 it cancels every input that is still running, and a cancelled input stops at
 its next `.await`. `join_all` cancels nothing.
 
+A combined result larger than 256 KiB is not stored in the combinator's
+record, which then carries `ReplayChildren`. Replay drives the inputs again
+for `try_join_all` and `join_all`. For `select_ok` and `race` the record
+stores the winner's input index, and replay drives only that input again and
+drops the others without running them. An input whose own terminal record is
+inline replays without running again. An input whose own terminal record has
+`ReplayChildren` runs its body again to rebuild its value, and its recorded
+descendants replay.
+
 `try_join_all` collects every result, propagating the first error:
 
 ```rust ignore

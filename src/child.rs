@@ -31,7 +31,7 @@ pub(crate) const CHILD_SUB_TYPE: &str = "RunInChildContext";
 /// Maximum checkpoint payload size in bytes (256KB). Payloads exceeding
 /// this trigger `ReplayChildren` mode: the child result is not stored in
 /// the checkpoint; instead the child body is re-executed on replay.
-const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
+pub(crate) const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 
 /// Internal state for child context execution passed from the builder.
 ///

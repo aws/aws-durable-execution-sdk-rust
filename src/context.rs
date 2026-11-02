@@ -2890,6 +2890,14 @@ impl DurableContext {
     /// When the combinator resolves, it cancels every input that is still
     /// running. A cancelled input stops at its next `.await`.
     ///
+    /// # Oversized results
+    ///
+    /// A combined result larger than 256 KiB is not stored in the
+    /// combinator's record. Replay then drives the inputs again. An input
+    /// whose own terminal record is inline replays without running again. An
+    /// input whose own terminal record has `ReplayChildren` runs its body
+    /// again to rebuild its value, and its recorded descendants replay.
+    ///
     /// # Empty input
     ///
     /// Called with no futures, resolves to `Ok` with an empty `Vec`,
@@ -2956,6 +2964,14 @@ impl DurableContext {
     /// message, `error_data`), on the first run and on replay. Match on the
     /// `err.wire()` fields, not on the kind of the input that failed.
     ///
+    /// # Oversized results
+    ///
+    /// A combined result larger than 256 KiB is not stored in the
+    /// combinator's record. Replay then drives the inputs again. An input
+    /// whose own terminal record is inline replays without running again. An
+    /// input whose own terminal record has `ReplayChildren` runs its body
+    /// again to rebuild its value, and its recorded descendants replay.
+    ///
     /// # Empty input
     ///
     /// Called with no futures, resolves to `Ok` with an empty `Vec`,
@@ -3006,6 +3022,16 @@ impl DurableContext {
     /// If every future fails, the operation fails with
     /// [`CombinatorErrorKind::AllFailed`](crate::CombinatorErrorKind::AllFailed)
     /// preserving each future's error (see [`CombinatorError::failures`](crate::CombinatorError::failures)).
+    ///
+    /// # Oversized results
+    ///
+    /// A winning value larger than 256 KiB is not stored in the
+    /// combinator's record. The record stores the winner's input index
+    /// instead. Replay then drives only the recorded winner again, and drops
+    /// every other input without running it. The winner replays without
+    /// running again when its own terminal record is inline. A winner whose
+    /// own terminal record has `ReplayChildren` runs its body again to
+    /// rebuild its value, and its recorded descendants replay.
     ///
     /// # Empty input
     ///
@@ -3060,6 +3086,16 @@ impl DurableContext {
     /// [`CombinatorErrorKind::FirstSettledFailed`](crate::CombinatorErrorKind::FirstSettledFailed)
     /// carrying the losing future's error as its source; the same variant
     /// is produced live and on replay.
+    ///
+    /// # Oversized results
+    ///
+    /// A winning value larger than 256 KiB is not stored in the
+    /// combinator's record. The record stores the winner's input index
+    /// instead. Replay then drives only the recorded winner again, and drops
+    /// every other input without running it. The winner replays without
+    /// running again when its own terminal record is inline. A winner whose
+    /// own terminal record has `ReplayChildren` runs its body again to
+    /// rebuild its value, and its recorded descendants replay.
     ///
     /// # Empty input
     ///

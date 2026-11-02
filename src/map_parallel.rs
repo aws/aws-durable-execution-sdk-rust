@@ -31,6 +31,7 @@ use tracing::Instrument as _;
 
 use crate::BoxError;
 use crate::Serdes;
+use crate::child::CHECKPOINT_SIZE_LIMIT_BYTES;
 use crate::context::{ActiveBody, DurableContext, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
@@ -47,9 +48,6 @@ const MAP_ITERATION_SUB_TYPE: &str = "MapIteration";
 pub(crate) const PARALLEL_SUB_TYPE: &str = "Parallel";
 /// Wire sub-type for parallel branch children.
 const PARALLEL_BRANCH_SUB_TYPE: &str = "ParallelBranch";
-
-/// Maximum checkpoint payload size in bytes (256KB). Matches child.rs.
-const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 
 /// Sentinel error message returned by `replay_terminal_batch` when the
 /// batch has `replay_children` set, signalling the caller should fall
