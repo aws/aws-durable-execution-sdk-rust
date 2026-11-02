@@ -248,3 +248,11 @@ required-features = ["test-util"]
 [[test]]
 name = "test_events"
 required-features = ["test-util"]
+
+[[test]]
+name = "task_ownership"
+required-features = ["test-util"]
+
+[[test]]
+name = "handler_bounds"
+required-features = ["test-util"]

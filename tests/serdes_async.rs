@@ -14,7 +14,7 @@
 #![expect(clippy::expect_used)] // reason: test assertions with descriptive messages
 #![expect(clippy::disallowed_methods)]
 // reason: the test deliberately spawns a foreign (unblessed) task to exercise
-// runtime behavior; production spawning is confined to the src/future.rs helpers.
+// runtime behavior; production spawning is confined to the task gateway in src/task.rs.
 
 use std::time::Duration;
 

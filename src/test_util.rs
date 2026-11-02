@@ -5095,7 +5095,7 @@ fn render_update(update: &OperationUpdate) -> String {
 #[expect(clippy::indexing_slicing)]
 // reason: test assertions index known-length op vectors
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
-// behavior; production spawning is confined to the src/future.rs helpers.
+// behavior; production spawning is confined to the src/task.rs gateway.
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -7468,21 +7468,22 @@ mod tests {
 
     // Harness fidelity: production task topology
 
-    /// The runner awaits the handler INLINE under the caller's `block_on`
-    /// (the production `lambda_runtime` topology), so the context is
-    /// created where `tokio::task::try_id()` is `None`, not on a spawned
-    /// task. This is the dimension that previously hid the ownership
-    /// guard's production inertness.
+    /// The runner awaits the invocation INLINE under the caller's
+    /// `block_on` (the production `lambda_runtime` topology), so the context
+    /// is created where `tokio::task::try_id()` is `None`, not on a spawned
+    /// task. The handler itself then runs as the invocation's root task,
+    /// which the SDK blesses, exactly as in production: so it has a task ID,
+    /// and its durable operations pass the ownership guard.
     #[tokio::test]
     async fn runner_topology_matches_production_inline_block_on() {
         let result = LocalRunner::new()
             .run(
                 |(), ctx: DurableContext| async move {
                     // Same task visibility production gives the handler:
-                    // awaited inline under block_on → no task ID.
-                    let inline = tokio::task::try_id().is_none();
+                    // the SDK's root task.
+                    let on_root_task = tokio::task::try_id().is_some();
                     let v = ctx.step(|_| async { Ok(1_i32) }).await?;
-                    Ok::<_, BoxError>((inline, v))
+                    Ok::<_, BoxError>((on_root_task, v))
                 },
                 (),
             )
@@ -7493,7 +7494,7 @@ mod tests {
         assert_eq!(
             result.output(),
             Some(&(true, 1)),
-            "handler must run inline (try_id() == None), matching the deployed topology"
+            "handler must run on the SDK's root task, matching the deployed topology"
         );
     }
 
@@ -8569,14 +8570,27 @@ mod tests {
         let runner = unbatched().checkpoint_latency(std::time::Duration::from_millis(50));
         let backend = Arc::new(runner.new_backend());
 
+        // The handler runs on its own task, so each step lets that task run
+        // before it reads the backend: after it moves the clock, and before
+        // the first move, so the handler reaches its first checkpoint.
+        let settle = || async {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        };
         let steps = async {
+            settle().await;
             tokio::time::advance(std::time::Duration::from_millis(49)).await;
+            settle().await;
             assert!(step_statuses(&backend).is_empty(), "START not applied yet");
             tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            settle().await;
             assert_eq!(step_statuses(&backend), [OperationStatus::Started]);
             tokio::time::advance(std::time::Duration::from_millis(49)).await;
+            settle().await;
             assert_eq!(step_statuses(&backend), [OperationStatus::Started]);
             tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            settle().await;
             assert_eq!(step_statuses(&backend), [OperationStatus::Succeeded]);
         };
         let (delayed, ()) = tokio::join!(

@@ -86,7 +86,7 @@ macro_rules! spawn_terminal {
         let future = ::std::future::IntoFuture::into_future(builder);
         $crate::future::DurableFuture::spawn_blessed(
             future,
-            task_ownership,
+            &task_ownership,
             owner_scope,
             spawn_scope,
         )

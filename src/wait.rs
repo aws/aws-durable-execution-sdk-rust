@@ -140,7 +140,7 @@ fn build_wait_start_update(
 
 #[cfg(test)]
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
-// behavior; production spawning is confined to the src/future.rs helpers.
+// behavior; production spawning is confined to the src/task.rs gateway.
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -229,7 +229,12 @@ mod tests {
         };
 
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -322,7 +327,12 @@ mod tests {
         };
 
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -347,7 +357,12 @@ mod tests {
         // Execute via IntoFuture
         let signal = Arc::clone(ctx.suspension_signal());
         // Should suspend (not panic): name was propagated successfully.
-        let outcome = crate::driver::test_support::outcome_of(signal, builder).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            builder,
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -370,7 +385,12 @@ mod tests {
         let handle = ctx.wait(Duration::from_secs(2)).name("spawned").spawn();
         // Blessed spawn: the op suspends (no ownership error), so the driver
         // reports Pending rather than Failed.
-        let outcome = crate::driver::test_support::outcome_of(signal, handle).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            handle,
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -433,7 +453,12 @@ mod tests {
         );
 
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, ctx.wait(duration)).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            ctx.wait(duration),
+        )
+        .await;
         assert_eq!(
             outcome,
             crate::driver::InvocationOutcome::Pending,

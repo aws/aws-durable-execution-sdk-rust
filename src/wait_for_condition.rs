@@ -893,6 +893,7 @@ mod tests {
         let seen_check = Arc::clone(&seen);
 
         let signal = Arc::clone(ctx.suspension_signal());
+        let ownership = Arc::clone(ctx.task_ownership());
         let exec = WaitForConditionExecution {
             ctx,
             op_id,
@@ -917,7 +918,8 @@ mod tests {
         // Continues (state 1 -> 2, still < 3) and suspends (parks). Drive
         // through the driver so it terminates as Pending; the point of the
         // test is the state the check FN observed, not the result.
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome =
+            crate::driver::test_support::outcome_of(ownership, signal, exec.execute()).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
 
         let observed = seen
@@ -1104,6 +1106,7 @@ mod tests {
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id(); // mints "1"
         let signal = Arc::clone(ctx.suspension_signal());
+        let ownership = Arc::clone(ctx.task_ownership());
 
         let exec = WaitForConditionExecution {
             ctx,
@@ -1124,7 +1127,8 @@ mod tests {
         // State was 1 (from checkpoint), check fn produces 2, strategy says
         // continue (< 3), so it checkpoints RETRY and suspends (parks) rather
         // than surfacing a fabricated error to the caller.
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome =
+            crate::driver::test_support::outcome_of(ownership, signal, exec.execute()).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 

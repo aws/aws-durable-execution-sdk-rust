@@ -181,9 +181,15 @@ impl<O: Send + 'static> DurableFuture<O> {
     /// handle: the runtime always polls a live task, but nothing guarantees the
     /// handle is ever polled. A task cancelled before it settles reports
     /// `Aborted` from its RAII guard.
+    ///
+    /// The task starts through the task gateway
+    /// ([`crate::task::spawn_tracked`]). A panic in the operation resumes on
+    /// the task that awaits the handle, with its original payload. When no
+    /// Tokio runtime is running, the returned future resolves to an error
+    /// and the operation records nothing.
     pub(crate) fn spawn_blessed(
         future: Self,
-        task_ownership: std::sync::Arc<crate::driver::TaskOwnership>,
+        task_ownership: &std::sync::Arc<crate::driver::TaskOwnership>,
         owner_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
         spawn_scope: std::sync::Arc<crate::driver::SuspensionSignal>,
     ) -> Self
@@ -191,7 +197,6 @@ impl<O: Send + 'static> DurableFuture<O> {
         O: Send + 'static,
     {
         use crate::driver::{ScopeOutcome, SpawnSettlement, drive_scope};
-        use tokio::sync::oneshot;
 
         /// Reports `Aborted` if the task is dropped before it settles, so a
         /// cancelled spawn can never leave the owner's counter stuck above
@@ -216,8 +221,6 @@ impl<O: Send + 'static> DurableFuture<O> {
             }
         }
 
-        let (tx, rx) = oneshot::channel();
-
         // Park-redirect cell: the handle reads this at park-time. A
         // combinator's `.spawn()` may set it to the combinator's spawn scope
         // before polling the handle, redirecting parking away from the
@@ -235,34 +238,20 @@ impl<O: Send + 'static> DurableFuture<O> {
         // this guard with it, settling `Aborted`. Constructing the guard
         // inside the task body instead would leave that window unguarded,
         // permanently counting a phantom outstanding spawn that parks the
-        // owner forever (issue #48).
+        // owner forever (issue #48). When no runtime is running, the spawn
+        // below drops the body, and this guard settles `Aborted` at once.
         let mut accounting = SpawnAccounting {
             scope: std::sync::Arc::clone(&owner_scope),
             settled: false,
         };
 
-        let handle = spawn_raw(async move {
-            // Register this task as blessed AFTER spawn (we need the task ID).
-            if let Some(task_id) = tokio::task::try_id() {
-                task_ownership.bless_task(task_id);
-            }
-            // Catch a panic in the operation body INSIDE the task so the
-            // payload can be shipped through the channel instead of being
-            // lost to a `JoinError` nobody observes (the JoinHandle is held
-            // only for abort-on-drop, never awaited).
-            let mut future = future;
-            let body = std::future::poll_fn(move |cx| {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    Pin::new(&mut future).poll(cx)
-                })) {
-                    Ok(Poll::Ready(outcome)) => Poll::Ready(Ok(outcome)),
-                    Ok(Poll::Pending) => Poll::Pending,
-                    Err(payload) => Poll::Ready(Err(payload)),
-                }
-            });
+        let tasks = std::sync::Arc::clone(owner_scope.tasks());
+        // The gateway blesses the task before the body's first poll, catches
+        // a panic of the body, and hands it to the handle below.
+        let spawned = crate::task::spawn_tracked(&tasks, task_ownership, async move {
             // Drive the operation in its OWN scope: a park inside it suspends
             // that scope only, and surfaces here as `Suspended`.
-            let settled = match drive_scope(body, spawn_scope).await {
+            match drive_scope(future, spawn_scope).await {
                 ScopeOutcome::Completed(result) => {
                     accounting.settle(SpawnSettlement::Completed);
                     SpawnMessage::Settled(result)
@@ -271,49 +260,37 @@ impl<O: Send + 'static> DurableFuture<O> {
                     accounting.settle(SpawnSettlement::Parked);
                     SpawnMessage::Parked
                 }
-            };
-            // Ignore send error: receiver was dropped.
-            let _ = tx.send(settled);
+            }
         });
-
-        // Own the spawned task: hold its abort-on-drop guard inside the
-        // returned future so that dropping this `DurableFuture` cancels the
-        // task. Without this the task would be detached and could outlive
-        // the invocation.
-        let guard = crate::driver::AbortOnDrop::new(handle);
+        let task = match spawned {
+            Ok(task) => task,
+            // No Tokio runtime is running on this thread: the operation
+            // records nothing and resolves to an error.
+            Err(no_runtime) => {
+                return Self::from_async(async move {
+                    Err(crate::task::NoRuntime::operation_error(no_runtime))
+                });
+            }
+        };
 
         Self {
             inner: Box::pin(async move {
-                let _guard = guard;
-                match rx.await {
-                    Ok(SpawnMessage::Settled(Ok(result))) => result,
-                    // The operation body panicked: re-raise the ORIGINAL panic
-                    // payload on the awaiting task, exactly as the lazy
-                    // (non-spawned) path would have, instead of masking it as a
-                    // fabricated step error.
-                    Ok(SpawnMessage::Settled(Err(panic_payload))) => {
-                        std::panic::resume_unwind(panic_payload)
-                    }
+                // Dropping `task` (this future) aborts the spawned task, so
+                // spawned durable work never outlives its handle.
+                match task.await.into_value() {
+                    SpawnMessage::Settled(result) => result,
                     // The operation parked durably: it resumes on a later
                     // invocation, so this handle can never resolve now. Park
                     // the effective scope, either the redirect target (when
                     // this future is a constituent of a spawned combinator) or
                     // the original owner scope, then never return.
-                    Ok(SpawnMessage::Parked) => {
+                    SpawnMessage::Parked => {
                         let park_target = redirect_handle
                             .get()
                             .unwrap_or_else(|| std::sync::Arc::clone(&owner_scope));
                         park_target.park_owner();
                         std::future::pending().await
                     }
-                    // The sender was dropped without a value: the task was
-                    // cancelled (aborted) before completing.
-                    Err(_) => Err(OperationError::from_kind(
-                        crate::error::OperationErrorKind::Step(crate::error::StepError::new(
-                            crate::error::StepErrorKind::ExecutionFailed,
-                            Some("spawned task was cancelled".into()),
-                        )),
-                    )),
                 }
             }),
             park_redirect: Some(redirect),
@@ -321,46 +298,10 @@ impl<O: Send + 'static> DurableFuture<O> {
     }
 }
 
-/// The single production `tokio::spawn` call site in the crate.
-///
-/// The `clippy.toml` `disallowed-methods` rule bans bare `tokio::spawn`
-/// everywhere; this helper carries the crate's one production exception.
-/// Both faces of the spawn abstraction route through it:
-/// [`DurableFuture::spawn_blessed`], which registers the task with the
-/// task-ownership and suspension-scope accounting, and [`spawn_detached`],
-/// the abstraction's detached mode for internal bookkeeping tasks.
-fn spawn_raw<F>(future: F) -> tokio::task::JoinHandle<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    #[expect(clippy::disallowed_methods)]
-    // reason: the one production spawn call site the lint points everything
-    // else at; all production spawning routes through this helper
-    tokio::spawn(future)
-}
-
-/// The spawn abstraction's detached mode: runs an internal SDK bookkeeping
-/// future on its own task, deliberately unowned.
-///
-/// A detached task runs no user future and creates no durable operations,
-/// so the task-ownership blessing and scope accounting that
-/// [`DurableFuture::spawn_blessed`] provides do not apply. Nor is it
-/// abort-on-drop; that is the point: the checkpoint batch flusher must
-/// survive a cancelled contributor (a lost `race`, a dropped
-/// `DurableFuture`) whose drop would otherwise cancel an in-flight batch
-/// write that other contributors are waiting on.
-pub(crate) fn spawn_detached<F>(future: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    drop(spawn_raw(future));
-}
-
 /// What a spawned task reports to its handle.
 enum SpawnMessage<O> {
-    /// The operation resolved (`Ok`) or its body panicked (`Err(payload)`).
-    Settled(Result<Result<O, OperationError>, Box<dyn std::any::Any + Send>>),
+    /// The operation resolved.
+    Settled(Result<O, OperationError>),
     /// The operation suspended durably; it resumes on a later invocation.
     Parked,
 }
@@ -693,7 +634,7 @@ impl<O: Send + 'static> Callback<O> {
 #[expect(clippy::panic)]
 // reason: test assertions
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
-// behavior; production spawning is confined to the src/future.rs helpers.
+// behavior; production spawning is confined to the src/task.rs gateway.
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -734,6 +675,51 @@ mod tests {
             msg.contains("kaboom-spawn"),
             "original panic payload must be preserved, got: {msg}"
         );
+    }
+
+    /// `.spawn()` on a thread with no Tokio runtime resolves to the error
+    /// the task-ownership check would return, records nothing, and never
+    /// runs the body.
+    #[tokio::test]
+    async fn spawn_outside_runtime_returns_error() {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let thread_ctx = ctx.clone();
+        let thread_ran = Arc::clone(&ran);
+        let polled = crate::task::test_support::poll_once_without_runtime(move || {
+            thread_ctx
+                .step(move |_| async move {
+                    thread_ran.store(true, Ordering::SeqCst);
+                    Ok(1_i32)
+                })
+                .spawn()
+        });
+        let Poll::Ready(Err(err)) = polled else {
+            panic!("expected an immediate error, got {polled:?}");
+        };
+        let crate::error::OperationErrorKind::Step(step_err) = err.kind() else {
+            panic!(
+                "expected the task-ownership error kind, got {:?}",
+                err.kind()
+            );
+        };
+        assert!(matches!(
+            step_err.kind(),
+            crate::error::StepErrorKind::ExecutionFailed
+        ));
+        assert!(
+            format!("{err:#}").contains(crate::task::NO_RUNTIME_MESSAGE),
+            "unexpected error: {err:#}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "the body must not run");
+        assert!(client.recorded_updates().is_empty(), "nothing is recorded");
     }
 
     /// Dropping the handle of a `.spawn()`ed operation cancels the spawned

@@ -340,7 +340,7 @@ fn build_chained_invoke_start(
 #[expect(clippy::indexing_slicing)]
 // reason: test assertions on known-populated vectors
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
-// behavior; production spawning is confined to the src/future.rs helpers.
+// behavior; production spawning is confined to the src/task.rs gateway.
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -614,7 +614,12 @@ mod tests {
         };
 
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -646,7 +651,12 @@ mod tests {
         };
 
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -725,7 +735,12 @@ mod tests {
 
         // Should not panic, should suspend.
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -751,7 +766,12 @@ mod tests {
             .spawn();
         // Blessed spawn: the op suspends (no ownership error), so the driver
         // reports Pending rather than Failed.
-        let outcome = crate::driver::test_support::outcome_of(signal, handle).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            handle,
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -902,7 +922,12 @@ mod tests {
         // Execute: checkpoints then suspends (parks); drive through the
         // driver so it terminates as Pending instead of parking forever.
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
 
         // Verify that the checkpointed payload was uppercased.
@@ -1104,6 +1129,7 @@ mod tests {
 
         let signal = Arc::clone(ctx.suspension_signal());
         crate::driver::test_support::expect_serdes_fault(
+            Arc::clone(ctx.task_ownership()),
             signal,
             exec.execute(),
             "serdes serialize failed",
@@ -1159,6 +1185,7 @@ mod tests {
 
         let signal = Arc::clone(ctx.suspension_signal());
         crate::driver::test_support::expect_serdes_fault(
+            Arc::clone(ctx.task_ownership()),
             signal,
             exec.execute(),
             "serdes deserialize failed",

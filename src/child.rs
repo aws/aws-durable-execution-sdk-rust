@@ -959,6 +959,7 @@ mod tests {
             .name("rebuild")
             .serdes(MarkedFailure);
         crate::driver::test_support::expect_serdes_fault(
+            Arc::clone(ctx.task_ownership()),
             signal,
             child,
             "serdes serialize failed for operation \"rebuild\"",

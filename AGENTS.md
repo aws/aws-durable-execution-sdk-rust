@@ -112,8 +112,9 @@ These rules apply to the SDK code in `src/`.
   unit-test exemption in `src/lib.rs` is the one `allow`.
 - **Do not call `tokio::spawn`.** The SDK's task-ownership checks and
   suspension accounting do not cover a task that `tokio::spawn` starts.
-  `clippy.toml` disallows the call. Spawn through the helpers in
-  `src/future.rs`.
+  `clippy.toml` disallows the call, and also `JoinSet::spawn` and
+  `spawn_blocking`. Start every task through the task gateway in
+  `src/task.rs`.
 - **Do not add a production dependency as part of another change.**
   `scripts/check-direct-deps.sh` fails on a direct dependency outside its
   allowlist. Adding one needs its own pull request. See

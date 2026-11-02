@@ -172,6 +172,15 @@ destinations do not trigger, and X-Ray does not mark the trace as an error.
 Monitor and alarm on the durable execution status instead, via
 `get-durable-execution` or `list-durable-executions-by-function`.
 
+An `Err` is a recoverable operation failure. A panic fails the Lambda
+invocation. A panic in a step body, a map item, a parallel branch or a
+combinator input propagates unchanged, the SDK records nothing for it, and
+the service invokes the function again. A panic that happens on every
+attempt therefore repeats until the execution times out. Return an `Err` to
+fail an operation. Before the panic leaves the SDK, the SDK cancels every
+task it started and waits until each has stopped. With `panic = "abort"`
+the process exits at the panic and no cleanup runs.
+
 `DurableContext` is a cheap-to-clone handle backed by an `Arc`, and it is
 `Send + Sync`, so clone it across async boundaries at will. Besides the
 operations below it exposes `execution_arn()`, `lambda_context()` for the

@@ -101,6 +101,7 @@ mod operation;
 mod options;
 pub mod serdes;
 pub(crate) mod step;
+mod task;
 #[cfg(feature = "test-util")]
 pub mod test_util;
 pub(crate) mod tracing_layer;
@@ -1039,17 +1040,27 @@ where
             // The handler runs as the root context's body, so an operation
             // called on a child context that escaped its closure fails the
             // execution with a context usage error.
-            let outcome = driver::drive_invocation(
-                context::run_body(context::ActiveBody::Context(String::new()), async {
-                    match (handler)(customer_input, ctx).await {
-                        Ok(result) => serialize_handler_result(&result),
-                        Err(e) => Err(wire_error_from_box_error(e)),
-                    }
-                })
-                .instrument(replay_span),
-                suspension_signal,
-            )
-            .await;
+            //
+            // The root adapter owns everything it captures (the handler, the
+            // event, the context and the span), so it is `'static` and the
+            // driver can run it as the invocation's root task, while the
+            // handler's own future needs no `'static` bound.
+            let task_ownership = StdArc::clone(ctx.task_ownership());
+            let root = context::run_body(context::ActiveBody::Context(String::new()), async move {
+                match (handler)(customer_input, ctx).await {
+                    Ok(result) => serialize_handler_result(&result),
+                    Err(e) => Err(wire_error_from_box_error(e)),
+                }
+            })
+            .instrument(replay_span);
+            // A handler panic returns here only after the driver cleaned up
+            // every task, and leaves the SDK with its original payload.
+            // Nothing runs between the cleanup and the resume.
+            let outcome =
+                match driver::drive_invocation(root, task_ownership, suspension_signal).await {
+                    Ok(outcome) => outcome,
+                    Err(payload) => std::panic::resume_unwind(payload),
+                };
 
             // Unconditional flush point of the checkpoint buffering
             // contract (`checkpoint_delay` / `checkpoint_batching`):
@@ -1533,6 +1544,49 @@ mod tests {
             .expect("Result should be a serialized JSON string");
         let echoed: serde_json::Value = serde_json::from_str(result_json).unwrap();
         assert_eq!(echoed, serde_json::json!({ "count": 42 }));
+    }
+
+    /// A handler panic leaves the service function with its original
+    /// payload, after the SDK cleaned up its tasks, and no envelope is
+    /// produced.
+    #[tokio::test]
+    // reason: the test calls the service on its own task so the panic is
+    // observable as that task's `JoinError`.
+    #[expect(clippy::disallowed_methods)]
+    async fn handler_panic_leaves_sdk_with_original_payload() {
+        #[expect(clippy::panic)] // reason: the handler panic under test
+        fn boom() -> Result<(), BoxError> {
+            panic!("root boom")
+        }
+        let client: std::sync::Arc<dyn ExecutionClient> =
+            std::sync::Arc::new(client::InMemoryExecutionClient::new(Vec::new()));
+        let service = wrap_with_provider(
+            |_event: serde_json::Value, _ctx: DurableContext| async move { boom() },
+            ClientProvider::new(Some(client)),
+            None,
+        );
+        let payload = serde_json::json!({
+            "DurableExecutionArn": "arn:aws:lambda:us-east-1:1:function:test",
+            "CheckpointToken": "token-abc",
+            "InitialExecutionState": {
+                "Operations": [{
+                    "Id": "root",
+                    "Type": "Execution",
+                    "Status": "STARTED",
+                    "ExecutionDetails": { "InputPayload": "{}" }
+                }]
+            }
+        });
+        let event = lambda_runtime::LambdaEvent::new(
+            InvocationPayload(payload),
+            lambda_runtime::Context::default(),
+        );
+        let join_err = tokio::spawn(service(event))
+            .await
+            .expect_err("the handler panic leaves the service, and no envelope is produced");
+        assert!(join_err.is_panic(), "a panic, not a cancellation");
+        let payload = join_err.into_panic();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"root boom"));
     }
 
     // Bootstrap state read errors

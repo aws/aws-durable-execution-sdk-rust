@@ -264,9 +264,10 @@ where
 
     /// Eagerly spawns the step on a tokio task.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called outside a tokio runtime.
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
     ///
     /// # Examples
     ///

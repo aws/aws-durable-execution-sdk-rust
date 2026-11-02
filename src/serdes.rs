@@ -594,10 +594,12 @@ impl FileSystemSerdesConfigBuilder {
 /// spawn its own blocking task).
 ///
 /// Because of this, the returned futures must be awaited **inside a Tokio
-/// runtime**; awaiting them elsewhere panics in `spawn_blocking`. A
-/// blocking-task join failure (the task panicked or the runtime shut
-/// down) is mapped to an ordinary [`BoxError`] rather than propagating a
-/// panic.
+/// runtime**; awaited elsewhere, they return an error. A panic in the
+/// blocking work resumes unwinding with its original payload.
+///
+/// The blocking work is counted on the invocation that started it, so an
+/// invocation returns only after every write it started has finished, even
+/// when the operation that started it was cancelled.
 ///
 /// # Envelope format
 ///
@@ -644,8 +646,8 @@ impl FileSystemSerdesConfigBuilder {
 ///
 /// Every other failure is permanent: JSON rendering and parsing, an
 /// invalid envelope, an unsupported envelope version or kind, a missing
-/// envelope field, every `base_path` containment check, and a blocking
-/// task that did not complete. A containment check guards against path
+/// envelope field, every `base_path` containment check, and a call made
+/// while no Tokio runtime is running. A containment check guards against path
 /// traversal, so a retry must never turn its rejection into a different
 /// outcome.
 ///
@@ -1086,8 +1088,8 @@ impl FileSystemSerdes {
 /// resolution. Each call moves the complete synchronous path, including
 /// JSON rendering or parsing, into a single
 /// [`tokio::task::spawn_blocking`] task, so the executor thread never
-/// touches the filesystem. Blocking-task join failures are mapped to
-/// [`BoxError`].
+/// touches the filesystem. A panic in the blocking work resumes unwinding
+/// with its original payload.
 ///
 /// There is no context-free fallback: both trait methods carry the
 /// context, so there is no path on which `FileSystemSerdes` silently
@@ -1103,11 +1105,9 @@ where
     ) -> impl Future<Output = Result<String, BoxError>> + Send {
         let this = self.clone();
         async move {
-            tokio::task::spawn_blocking(move || this.serialize_sync(&value, &context))
-                .await
-                .map_err(|e| -> BoxError {
-                    format!("filesystem serdes serialize task did not complete: {e}").into()
-                })?
+            crate::task::run_blocking(move || this.serialize_sync(&value, &context))
+                .await?
+                .into_value()
         }
     }
 
@@ -1118,11 +1118,9 @@ where
     ) -> impl Future<Output = Result<T, BoxError>> + Send {
         let this = self.clone();
         async move {
-            tokio::task::spawn_blocking(move || this.deserialize_sync(&wire, &context))
-                .await
-                .map_err(|e| -> BoxError {
-                    format!("filesystem serdes deserialize task did not complete: {e}").into()
-                })?
+            crate::task::run_blocking(move || this.deserialize_sync(&wire, &context))
+                .await?
+                .into_value()
         }
     }
 }
@@ -1733,6 +1731,125 @@ mod tests {
         assert!(
             parse_durable_execution_arn("arn:aws:lambda:us-east-1:123:function:fn:1").is_none()
         );
+    }
+
+    /// Counts the regular files under `dir`, recursively.
+    fn count_files(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() { count_files(&path) } else { 1 }
+            })
+            .sum()
+    }
+
+    /// A context whose ARN `FileSystemSerdes` resolves to a directory.
+    fn fs_context() -> SerdesContext {
+        SerdesContext::new(
+            "step-1".to_owned(),
+            "arn:aws:lambda:us-east-1:123:function:my-fn:1/durable-execution/exec-1/inv-1"
+                .to_owned(),
+        )
+    }
+
+    /// A write that an aborted operation started is counted on the
+    /// invocation, so the invocation's wait for idle returns only once the
+    /// payload file exists.
+    #[test]
+    // reason: the test occupies the only blocking thread on purpose, so the
+    // write it starts stays queued.
+    #[expect(clippy::disallowed_methods)]
+    fn dropped_filesystem_serdes_write_finishes_before_idle() {
+        let tmp = std::env::temp_dir().join("fs_serdes_test_dropped_write");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (release, wait_for_release) = std::sync::mpsc::channel::<()>();
+            let occupier = tokio::task::spawn_blocking(move || {
+                let _ = wait_for_release.recv();
+            });
+            let tasks = std::sync::Arc::new(crate::task::TaskTracker::new());
+            let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+            let mut write = Box::pin(Serdes::<serde_json::Value>::serialize(
+                &serdes,
+                serde_json::json!({"value": 1}),
+                fs_context(),
+            ));
+            let polled = crate::task::test_support::with_current_tasks(&tasks, || {
+                write
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            });
+            assert!(
+                polled.is_pending(),
+                "the write waits for the blocking thread"
+            );
+            drop(write);
+            assert_eq!(tasks.live(), 1, "the queued write is counted");
+            release.send(()).expect("the occupier waits");
+            occupier.await.expect("the occupier returns");
+            tasks.wait_idle().await;
+            assert_eq!(tasks.live(), 0);
+        });
+        assert_eq!(count_files(&tmp), 1, "the payload file was written");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Without a Tokio runtime, `FileSystemSerdes` returns an error that
+    /// is not marked retryable, and does not panic.
+    #[test]
+    fn filesystem_serdes_without_runtime_is_unmarked() {
+        let tmp = std::env::temp_dir().join("fs_serdes_test_no_runtime");
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
+            Serdes::<serde_json::Value>::serialize(&serdes, serde_json::json!(1), fs_context())
+                .await
+        });
+        let std::task::Poll::Ready(Err(err)) = polled else {
+            unreachable!("expected an immediate error, got {polled:?}");
+        };
+        assert!(
+            !is_retryable_serdes_error(err.as_ref()),
+            "a missing runtime is not a transient failure: {err}"
+        );
+        assert_eq!(err.to_string(), crate::task::NO_RUNTIME_MESSAGE);
+    }
+
+    /// A panic in the blocking work resumes on the awaiting task with its
+    /// original payload, and writes no file.
+    #[tokio::test]
+    // reason: the test awaits the serdes on its own task so the resumed
+    // panic is observable as that task's `JoinError`.
+    #[expect(clippy::disallowed_methods)]
+    async fn filesystem_serdes_blocking_panic_resumes_payload() {
+        #[derive(serde::Deserialize)]
+        struct PanicsOnSerialize;
+        impl Serialize for PanicsOnSerialize {
+            #[expect(clippy::panic)] // reason: the panic under test
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                panic!("blocking boom")
+            }
+        }
+
+        let tmp = std::env::temp_dir().join("fs_serdes_test_blocking_panic");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
+        let join_err = tokio::spawn(async move {
+            Serdes::<PanicsOnSerialize>::serialize(&serdes, PanicsOnSerialize, fs_context()).await
+        })
+        .await
+        .expect_err("the blocking panic resumes on the awaiting task");
+        assert!(join_err.is_panic(), "a panic, not a cancellation");
+        let payload = join_err.into_panic();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"blocking boom"));
+        assert_eq!(count_files(&tmp), 0, "no payload file was written");
     }
 
     #[test]

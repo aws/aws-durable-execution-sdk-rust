@@ -24,7 +24,6 @@ use std::future::Future;
 use std::sync::Arc;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
-use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
 use crate::BoxError;
@@ -36,6 +35,7 @@ use crate::error::{
     ChildContextError, ChildContextErrorKind, ChildFnError, OperationError, OperationErrorKind,
 };
 use crate::serdes::SerdesContext;
+use crate::task::{NoRuntime, TaskOutcome, TrackedJoinSet};
 
 /// Wire sub-type for map operations.
 pub(crate) const MAP_SUB_TYPE: &str = "Map";
@@ -883,24 +883,6 @@ struct PreClaimed {
     has_record: bool,
 }
 
-/// Per-in-flight-branch metadata the coordinator retains so it can record a
-/// controlled failure for a branch whose task ends via a `JoinError` (a panic
-/// in user branch code, or a cancellation) instead of producing an outcome.
-struct BranchMeta {
-    index: usize,
-    child_wire: String,
-    item_name: String,
-}
-
-/// Extracts a human-readable message from a captured panic payload.
-fn panic_message(payload: &dyn std::any::Any) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_owned())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "branch panicked".to_owned())
-}
-
 /// How one branch resolved within a single invocation.
 ///
 /// A `Terminal` branch (succeeded or failed) frees its concurrency slot; a
@@ -914,7 +896,7 @@ enum ItemOutcome<O> {
     Suspended,
 }
 
-/// The payload a branch task delivers through the coordinator's `JoinSet`:
+/// The payload a branch task delivers through the coordinator's join set:
 /// the item index plus how the item resolved.
 type ItemJoin<O> = (usize, Result<ItemOutcome<O>, OperationError>);
 
@@ -1361,23 +1343,24 @@ fn take_branch_body<O>(
 }
 
 /// Object-safe item dispatcher: spawns one item body onto the coordinator's
-/// [`JoinSet`] as a CONCRETE (unboxed) future.
+/// [`TrackedJoinSet`] as a CONCRETE (unboxed) future.
 ///
 /// This boundary is what keeps [`execute_batch`], the batch checkpoint
 /// state machine, non-generic over the user's closure: only the dispatcher
 /// and the thin wrapper it spawns ([`run_single_item`]) monomorphize per
-/// call site, while the futures inside the `JoinSet` stay unboxed.
+/// call site, while the futures inside the join set stay unboxed.
 trait ItemDispatch<O, IS>: Send + Sync {
-    /// Spawns the item body for `req` and returns the task's abort handle.
+    /// Spawns the item body for `req` and returns the task's ID. The join
+    /// set blesses the task before the body's first poll.
     fn spawn_item(
         &self,
-        set: &mut JoinSet<ItemJoin<O>>,
+        set: &mut TrackedJoinSet<ItemJoin<O>>,
         req: ItemRequest<IS>,
-    ) -> tokio::task::AbortHandle;
+    ) -> Result<tokio::task::Id, NoRuntime>;
 }
 
 /// Map dispatcher: shares the user closure as `Arc<F>` and produces one
-/// concrete future per item: the `JoinSet` holds no per-item box.
+/// concrete future per item: the join set holds no per-item box.
 struct MapDispatch<F> {
     run_item: Arc<F>,
 }
@@ -1391,14 +1374,12 @@ where
 {
     fn spawn_item(
         &self,
-        set: &mut JoinSet<ItemJoin<O>>,
+        set: &mut TrackedJoinSet<ItemJoin<O>>,
         req: ItemRequest<IS>,
-    ) -> tokio::task::AbortHandle {
+    ) -> Result<tokio::task::Id, NoRuntime> {
         let run_item = Arc::clone(&self.run_item);
-        set.spawn(async move {
-            // Bless this task for task-ownership checks.
-            let task_ownership = req.ctx.task_ownership().clone();
-            crate::combinator::bless_current_task(&task_ownership);
+        let ownership = Arc::clone(req.ctx.task_ownership());
+        set.spawn(&ownership, async move {
             let index = req.index;
             (index, run_single_item(req, run_item).await)
         })
@@ -1419,14 +1400,12 @@ where
 {
     fn spawn_item(
         &self,
-        set: &mut JoinSet<ItemJoin<O>>,
+        set: &mut TrackedJoinSet<ItemJoin<O>>,
         req: ItemRequest<IS>,
-    ) -> tokio::task::AbortHandle {
+    ) -> Result<tokio::task::Id, NoRuntime> {
         let slots = Arc::clone(&self.slots);
-        set.spawn(async move {
-            // Bless this task for task-ownership checks.
-            let task_ownership = req.ctx.task_ownership().clone();
-            crate::combinator::bless_current_task(&task_ownership);
+        let ownership = Arc::clone(req.ctx.task_ownership());
+        set.spawn(&ownership, async move {
             let index = req.index;
             (index, run_branch_item(req, slots).await)
         })
@@ -1512,131 +1491,41 @@ where
     O: Send + 'static,
     IS: Serdes<O>,
 {
-    /// Processes one joined branch task: a produced outcome feeds the
-    /// progress accounting; a `JoinError` (a panic in user branch code, or a
-    /// cancellation) is recorded as a controlled BRANCH FAILURE, mirroring
-    /// the failure a normal branch would have produced so accounting and the
-    /// completion threshold treat it identically, with a best-effort child
-    /// FAIL checkpoint so a retry does not repeat already-started work.
-    ///
-    /// The `JoinError` arm applies to LIVE branches only. A `ReplayChildren`
-    /// reconstruction task never reaches it: [`Self::resolve_terminal_inline`]
-    /// handles its own join event, because a panic while reconstructing a
-    /// recorded terminal SUCCESS must unwind the coordinator: not
-    /// checkpoint `Fail` over durable success history.
-    async fn settle_joined(
+    /// Processes one joined branch task: its outcome feeds the progress
+    /// accounting, and a coordinator-level error (e.g. a failed checkpoint
+    /// call) is returned. A panic of the task resumes unwinding here, with
+    /// its original payload, and nothing is recorded for it: a panic fails
+    /// the invocation, not the item.
+    fn settle_joined(
         &self,
-        joined: Result<(tokio::task::Id, ItemJoin<O>), tokio::task::JoinError>,
-        branch_meta: &mut std::collections::HashMap<tokio::task::Id, BranchMeta>,
+        joined: TaskOutcome<ItemJoin<O>>,
         progress: &mut BatchProgress<O>,
     ) -> Result<(), OperationError> {
-        match joined {
-            Ok((task_id, (index, outcome))) => {
-                branch_meta.remove(&task_id);
-                match outcome {
-                    Ok(outcome) => {
-                        progress.settle_outcome(
-                            self.completion_cfg,
-                            self.total_items,
-                            index,
-                            outcome,
-                        );
-                        Ok(())
-                    }
-                    // Coordinator-level failure (e.g. a checkpoint call
-                    // failed): surface; the caller's JoinSet drop aborts
-                    // remaining branches.
-                    Err(e) => Err(e),
-                }
-            }
-            Err(join_err) => {
-                // The branch task terminated without producing an outcome.
-                let Some(meta) = branch_meta.remove(&join_err.id()) else {
-                    return Err(batch_error(
-                        "branch task terminated with an unrecognized task id",
-                    ));
-                };
-                let message = match join_err.try_into_panic() {
-                    Ok(payload) => panic_message(payload.as_ref()),
-                    Err(_) => "branch task was cancelled".to_owned(),
-                };
-                // A panicked/cancelled branch has no escaping error to
-                // walk, so its wire record is just the type and message;
-                // the checkpointed child FAIL and the settled item carry
-                // the SAME record, keeping live and replay identical.
-                let wire = crate::error::WireError::new(Some("ChildFnError"), Some(message));
-
-                // Child FAIL checkpoint for the panicked/cancelled branch.
-                // Skipped in FLAT mode, which emits no child-context
-                // events (mirrors the normal fail path).
-                if self.nesting != NestingMode::Flat {
-                    let update = OperationUpdate::builder()
-                        .id(meta.child_wire.clone())
-                        .r#type(OperationType::Context)
-                        .sub_type(self.child_sub_type.to_owned())
-                        .action(OperationAction::Fail)
-                        .parent_id(self.parent_wire.to_owned())
-                        .error(wire.to_error_object());
-                    if let Ok(update) = update.build()
-                        && let Err(client_err) = self.ctx.checkpoint_updates(vec![update]).await
-                    {
-                        // Audit (#43): batch child FAIL (panicked
-                        // branch): the item closure ran; the failed FAIL
-                        // write routes unrecoverable with a minimal
-                        // terminal FAIL retry.
-                        let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                        let terminal = build_child_fail_update(
-                            &meta.child_wire,
-                            &meta.item_name,
-                            self.child_sub_type,
-                            self.parent_wire,
-                            &cwire,
-                        );
-                        return self
-                            .ctx
-                            .checkpoint_failure_unrecoverable(
-                                &meta.child_wire,
-                                client_err,
-                                Some(terminal),
-                            )
-                            .await;
-                    }
-                }
-
-                progress.settle_outcome(
-                    self.completion_cfg,
-                    self.total_items,
-                    meta.index,
-                    ItemOutcome::Terminal(BatchItem::failed_from_wire(
-                        meta.index,
-                        meta.item_name,
-                        &wire,
-                    )),
-                );
-                Ok(())
-            }
-        }
+        let (index, outcome) = joined.into_value();
+        // A coordinator-level failure surfaces; the caller's join set drop
+        // aborts the remaining branches.
+        let outcome = outcome?;
+        progress.settle_outcome(self.completion_cfg, self.total_items, index, outcome);
+        Ok(())
     }
 
     /// Resolves a recorded-terminal child inline on the coordinator, in
     /// input order. The common case decodes the recorded outcome without
     /// touching the item body; a `ReplayChildren` child (result too large to
     /// checkpoint) is re-executed through the dispatcher and drained
-    /// immediately, so input order is preserved and the `JoinSet` still
+    /// immediately, so input order is preserved and the join set still
     /// holds only concrete futures.
     ///
-    /// A panic during that re-execution is rethrown (unwinding the
-    /// coordinator) rather than graded as a branch failure: the child's
-    /// durable record is a terminal SUCCESS, and checkpointing `Fail` over
-    /// it would permanently fail the batch over a transient reconstruction
-    /// crash. See the `JoinError` arm below.
+    /// A panic during that re-execution resumes unwinding (through
+    /// [`Self::settle_joined`]) and checkpoints nothing, as every panic
+    /// does: the child's durable record stays a terminal SUCCESS for the
+    /// next attempt to reconstruct.
     async fn resolve_terminal_inline(
         &self,
         op_id: &OperationId,
         index: usize,
         item_name: &str,
-        join_set: &mut JoinSet<ItemJoin<O>>,
-        branch_meta: &mut std::collections::HashMap<tokio::task::Id, BranchMeta>,
+        join_set: &mut TrackedJoinSet<ItemJoin<O>>,
         progress: &mut BatchProgress<O>,
     ) -> Result<(), OperationError> {
         let child_positional = op_id.positional().to_owned();
@@ -1682,62 +1571,24 @@ where
                     nesting: self.nesting,
                     serdes: Arc::clone(self.serdes),
                 };
-                let abort = self.dispatch.spawn_item(join_set, req);
-                let reconstruction_id = abort.id();
-                branch_meta.insert(
-                    reconstruction_id,
-                    BranchMeta {
-                        index,
-                        child_wire: op_id.wire().to_owned(),
-                        item_name: item_name.to_owned(),
-                    },
-                );
-                let Some(joined) = join_set.join_next_with_id().await else {
+                let reconstruction_id = self
+                    .dispatch
+                    .spawn_item(join_set, req)
+                    .map_err(NoRuntime::operation_error)?;
+                let Some((joined_id, joined)) = join_set.join_next_with_id().await else {
                     return Err(batch_error(
                         "re-executed replay child produced no join event",
                     ));
                 };
                 // Verify (rather than assume) the quiescence invariant: the
                 // join event must belong to the reconstruction task spawned
-                // above, because the JoinError arm below applies
-                // reconstruction-specific panic semantics.
-                let joined_id = match &joined {
-                    Ok((task_id, _)) => *task_id,
-                    Err(join_err) => join_err.id(),
-                };
+                // above.
                 if joined_id != reconstruction_id {
                     return Err(batch_error(
                         "re-executed replay child joined an unexpected task",
                     ));
                 }
-                match joined {
-                    Ok(ok) => self.settle_joined(Ok(ok), branch_meta, progress).await,
-                    Err(join_err) => {
-                        branch_meta.remove(&join_err.id());
-                        // This child's durable record is a terminal SUCCESS
-                        // (`replay_children = true`); the task that ended
-                        // without an outcome was merely RECONSTRUCTING that
-                        // recorded result. Grading this as a branch failure
-                        // (as `settle_joined` does for live branches) would
-                        // checkpoint `Fail` over recorded success history
-                        // and permanently fail the batch because of a
-                        // transient reconstruction crash. Mirror the
-                        // pre-JoinSet inline await instead: rethrow the
-                        // panic payload so the coordinator unwinds with the
-                        // original panic, no failure is checkpointed, and
-                        // the recorded terminal state stays untouched for
-                        // the next attempt to reconstruct.
-                        match join_err.try_into_panic() {
-                            Ok(payload) => std::panic::resume_unwind(payload),
-                            // A cancelled task carries no payload to
-                            // rethrow: surface a coordinator error, still
-                            // without checkpointing failure.
-                            Err(join_err) => Err(batch_error(&format!(
-                                "replay child reconstruction task was cancelled: {join_err}"
-                            ))),
-                        }
-                    }
-                }
+                self.settle_joined(joined, progress)
             }
         }
     }
@@ -2080,21 +1931,14 @@ where
     // under its own scope so a park resolves to `ItemOutcome::Suspended`
     // locally rather than tearing down the whole invocation.
     let child_sub_type_owned = child_sub_type.to_owned();
-    // Coordinator-owned, observable task set. Dropping the `JoinSet` (on error
-    // return OR when the driver drops this coordinator on invocation teardown)
-    // aborts every still-running branch task, so no branch task outlives the
-    // invocation: the same abort-on-drop ownership as the `.spawn()` path.
-    // Unlike a plain result channel, `join_next_with_id` also surfaces a
-    // `JoinError` when a task ends WITHOUT producing an outcome (a panic in
-    // user branch code, or a cancellation), so the coordinator accounts for
-    // every terminated task rather than waiting forever for a value a panicked
-    // task will never deliver.
-    let mut join_set: JoinSet<ItemJoin<O>> = JoinSet::new();
-    // Maps a branch task's id to the metadata needed to record a controlled
-    // failure if that task ends via a `JoinError`. Removed on both the value
-    // and the error arm, so it never outgrows the in-flight set.
-    let mut branch_meta: std::collections::HashMap<tokio::task::Id, BranchMeta> =
-        std::collections::HashMap::with_capacity(total_items);
+    // Coordinator-owned task set. Dropping it (on error return OR when the
+    // driver drops this coordinator on invocation teardown) aborts every
+    // still-running branch task, and the invocation driver waits for each
+    // aborted task to unwind, so no branch task outlives the invocation.
+    // Every task delivers its outcome through the set, including a panic,
+    // which `settle_joined` resumes.
+    let mut join_set: TrackedJoinSet<ItemJoin<O>> =
+        TrackedJoinSet::new(Arc::clone(ctx.suspension_signal().tasks()));
 
     let mut progress = BatchProgress::<O>::new(total_items);
     let mut running: usize = 0;
@@ -2157,15 +2001,8 @@ where
             let item_name = item_namer
                 .as_ref()
                 .map_or_else(String::new, |namer| namer(i));
-            env.resolve_terminal_inline(
-                &pre.op_id,
-                i,
-                &item_name,
-                &mut join_set,
-                &mut branch_meta,
-                &mut progress,
-            )
-            .await?;
+            env.resolve_terminal_inline(&pre.op_id, i, &item_name, &mut join_set, &mut progress)
+                .await?;
         }
     }
 
@@ -2283,16 +2120,14 @@ where
                     pc.index,
                     &item_name,
                     &mut join_set,
-                    &mut branch_meta,
                     &mut progress,
                 )
                 .await?;
                 continue;
             }
 
-            // Compute the item name in the coordinator so it is available both
-            // for the branch body and for a controlled-failure checkpoint if
-            // the branch task ends via a `JoinError`.
+            // Compute the item name in the coordinator: the start checkpoint
+            // and the branch body both carry it.
             let item_name = item_namer
                 .as_ref()
                 .map_or_else(String::new, |namer| namer(pc.index));
@@ -2338,15 +2173,9 @@ where
                 nesting,
                 serdes: Arc::clone(&serdes),
             };
-            let abort = dispatch.spawn_item(&mut join_set, req);
-            branch_meta.insert(
-                abort.id(),
-                BranchMeta {
-                    index: branch_index,
-                    child_wire: branch_wire,
-                    item_name,
-                },
-            );
+            dispatch
+                .spawn_item(&mut join_set, req)
+                .map_err(NoRuntime::operation_error)?;
             running += 1;
         }
 
@@ -2357,16 +2186,13 @@ where
             break;
         }
 
-        // Await the next branch task to terminate. `join_next_with_id` yields a
-        // produced outcome (`Ok`) OR a `JoinError` (`Err`) for a task that ended
-        // without one: a panic in user branch code (library code forbids
-        // panics), or, defensively, a cancellation.
-        let Some(joined) = join_set.join_next_with_id().await else {
+        // Await the next branch task to terminate. A panic in user branch
+        // code resumes in `settle_joined`.
+        let Some((_, joined)) = join_set.join_next_with_id().await else {
             break; // set is empty: unreachable while running > 0
         };
         running -= 1;
-        env.settle_joined(joined, &mut branch_meta, &mut progress)
-            .await?;
+        env.settle_joined(joined, &mut progress)?;
     }
 
     let BatchProgress {
@@ -3086,7 +2912,7 @@ fn build_parent_fail_update(
 /// completion trigger to fire.
 ///
 /// Every settlement, a recorded-terminal child applied inline in input
-/// order, a live join, or a controlled `JoinError` failure, flows through
+/// order, or a live join, flows through
 /// [`settle`](Self::settle), so the statistics a completion trigger sees are
 /// updated and evaluated in exactly one place.
 ///
@@ -3627,7 +3453,7 @@ fn take_item<I>(items: &[std::sync::Mutex<Option<I>>], index: usize) -> Result<I
 #[cfg(test)]
 #[expect(clippy::indexing_slicing)]
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
-// behavior; production spawning is confined to the src/future.rs helpers.
+// behavior; production spawning is confined to the src/task.rs gateway.
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -5791,87 +5617,198 @@ mod tests {
         );
     }
 
+    /// Drives `run` through the invocation driver over a fresh recording
+    /// context, asserts that the driver returned a panic, and returns its
+    /// `&'static str` payload and whether any recorded update has action `FAIL`.
+    async fn panic_of<F, Fut>(run: F) -> (Option<&'static str>, bool)
+    where
+        F: FnOnce(DurableContext) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let handler = run(ctx);
+        let outcome = crate::driver::drive_invocation(
+            async move {
+                handler.await;
+                Ok::<_, crate::error::WireError>("done".to_owned())
+            },
+            ownership,
+            signal,
+        )
+        .await;
+        let Err(payload) = outcome else {
+            unreachable!("the item panic must reach the invocation driver, got {outcome:?}");
+        };
+        let wrote_fail = client
+            .recorded_updates()
+            .iter()
+            .any(|u| matches!(u.action(), OperationAction::Fail));
+        (
+            crate::task::test_support::str_payload(payload.as_ref()),
+            wrote_fail,
+        )
+    }
+
+    /// A panic in a map item fails the invocation with its original
+    /// payload, and the batch records no failure for it.
+    #[tokio::test]
+    async fn map_item_panic_propagates_payload() {
+        let (message, wrote_fail) = panic_of(|ctx| async move {
+            let _ = ctx
+                .map(vec![0_i32, 1], |_child, _item: i32, idx| async move {
+                    assert!(idx != 1, "boom in map branch");
+                    Ok(idx)
+                })
+                .await;
+        })
+        .await;
+        assert_eq!(message, Some("boom in map branch"));
+        assert!(!wrote_fail, "a panic records no FAIL");
+    }
+
+    /// A panic in a parallel branch fails the invocation with its original
+    /// payload, and the batch records no failure for it.
     #[tokio::test]
     #[expect(clippy::panic)] // reason: the branch panic under test is the behavior being asserted
-    async fn map_branch_panic_fails_batch_without_hanging() {
-        // A panic in a user map-branch closure must surface as a controlled
-        // batch failure promptly, not hang the coordinator to its Lambda
-        // timeout. The branch task aborts on panic and never delivers an
-        // outcome; the coordinator observes the JoinError and records a branch
-        // failure instead of waiting forever for a value that never arrives.
-        let client = Arc::new(TokenValidatingClient::new("initial-token"));
-        let log = Arc::new(CheckpointLog::empty());
-        let ctx = DurableContext::new_root_with_client(
-            "arn:test".to_owned(),
-            lambda_runtime::Context::default(),
-            Arc::clone(&log),
-            client.clone() as Arc<dyn crate::client::ExecutionClient>,
-            "initial-token".to_owned(),
-        );
+    async fn parallel_branch_panic_propagates_payload() {
+        use crate::future::Branch;
 
-        let run = async move {
-            ctx.map(vec![0_i32], |_child, _item: i32, _idx| async move {
-                panic!("boom in map branch")
-            })
-            .completion(
-                crate::builders::map_parallel::CompletionConfig::builder()
-                    .tolerated_failure_count(0)
-                    .build()
-                    .expect("valid completion config"),
-            )
-            .await
+        let (message, wrote_fail) = panic_of(|ctx| async move {
+            let _ = ctx
+                .parallel(vec![
+                    Branch::new("steady", |_ctx| async move { Ok(1_i32) }),
+                    Branch::new(
+                        "boom",
+                        |_ctx| async move { panic!("boom in parallel branch") },
+                    ),
+                ])
+                .await;
+        })
+        .await;
+        assert_eq!(message, Some("boom in parallel branch"));
+        assert!(!wrote_fail, "a panic records no FAIL");
+    }
+
+    /// A child `FAIL` that an earlier release wrote for a panicked map item
+    /// still replays as a failed item, without running the item body.
+    #[tokio::test]
+    async fn map_item_panic_record_from_an_earlier_release_still_replays() {
+        fn panic_record(positional_id: &str) -> (String, CheckpointRecord) {
+            let (wire_id, mut record) = failed_record(positional_id, "boom in map branch");
+            record.error_data = None;
+            record.stack_trace = None;
+            (wire_id, record)
+        }
+        let log = || {
+            let (parent_wire, mut parent) = succeeded_record("1", "null");
+            parent.status = CheckpointStatus::Started;
+            parent.result = None;
+            CheckpointLog::from_records(vec![
+                (parent_wire, parent),
+                succeeded_record("2", "1"),
+                panic_record("3"),
+            ])
+        };
+        let ran = Arc::new(AtomicBool::new(false));
+        let body = |ran: Arc<AtomicBool>| {
+            move |_child: DurableContext, item: i32, _idx: usize| {
+                let ran = Arc::clone(&ran);
+                async move {
+                    ran.store(true, Ordering::SeqCst);
+                    Ok(item)
+                }
+            }
         };
 
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
-        let result: Result<Vec<i32>, OperationError> =
-            outcome.expect("map with a panicking branch must resolve, not hang");
-        let err =
-            result.expect_err("a panicking branch must surface as a controlled batch failure");
+        let (ctx, _client) = test_ctx_with_client(log());
+        let err = ctx
+            .map(vec![0_i32, 1], body(Arc::clone(&ran)))
+            .await
+            .expect_err("the replayed failed item fails the batch");
+        let OperationErrorKind::ChildContext(child_err) = err.kind() else {
+            unreachable!("expected a child-context error, got {:?}", err.kind());
+        };
+        assert!(
+            matches!(child_err.kind(), ChildContextErrorKind::ChildFailed),
+            "expected ChildFailed, got {:?}",
+            child_err.kind()
+        );
         assert!(
             format!("{err:#}").contains("boom in map branch"),
-            "batch failure should carry the branch panic message, got: {err:#}"
+            "unexpected error: {err:#}"
+        );
+
+        let (ctx, _client) = test_ctx_with_client(log());
+        let batch = ctx
+            .map(vec![0_i32, 1], body(Arc::clone(&ran)))
+            .await_batch()
+            .await
+            .expect("await_batch reports the replayed items");
+        let failed = batch
+            .items
+            .iter()
+            .find(|i| i.index == 1)
+            .expect("item 1 is in the batch");
+        assert_eq!(failed.status, BatchItemStatus::Failed);
+        assert_eq!(failed.error_type.as_deref(), Some("ChildFnError"));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "no item body may run on replay"
         );
     }
 
-    #[tokio::test]
-    #[expect(clippy::panic)] // reason: the branch panic under test is the behavior being asserted
-    async fn parallel_branch_panic_fails_batch_without_hanging() {
+    /// Polls `run` once on a thread with no Tokio runtime and asserts that
+    /// the batch resolved to the no-runtime error, instead of panicking.
+    fn assert_batch_no_runtime_error<F, Fut>(log: CheckpointLog, run: F)
+    where
+        F: FnOnce(DurableContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Vec<i32>, OperationError>>,
+    {
+        let (ctx, _client) = test_ctx_with_client(log);
+        let polled = crate::task::test_support::poll_once_without_runtime(move || run(ctx));
+        let std::task::Poll::Ready(Err(err)) = polled else {
+            unreachable!("expected an immediate error, got {polled:?}");
+        };
+        assert!(
+            format!("{err:#}").contains(crate::task::NO_RUNTIME_MESSAGE),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn map_without_runtime_returns_error() {
+        assert_batch_no_runtime_error(CheckpointLog::empty(), |ctx| {
+            ctx.map(
+                vec![0_i32],
+                |_child, item: i32, _idx| async move { Ok(item) },
+            )
+            .into_future()
+        });
+    }
+
+    #[test]
+    fn parallel_without_runtime_returns_error() {
         use crate::future::Branch;
 
-        // Same guarantee for parallel: a panicking branch is a controlled
-        // failure delivered promptly, never a hang.
-        let client = Arc::new(TokenValidatingClient::new("initial-token"));
-        let log = Arc::new(CheckpointLog::empty());
-        let ctx = DurableContext::new_root_with_client(
-            "arn:test".to_owned(),
-            lambda_runtime::Context::default(),
-            Arc::clone(&log),
-            client.clone() as Arc<dyn crate::client::ExecutionClient>,
-            "initial-token".to_owned(),
-        );
+        assert_batch_no_runtime_error(CheckpointLog::empty(), |ctx| {
+            ctx.parallel(vec![Branch::new("one", |_ctx| async move { Ok(1_i32) })])
+                .into_future()
+        });
+    }
 
-        let run = async move {
-            ctx.parallel(vec![Branch::new("boom", |_ctx| {
-                Box::pin(async { panic!("boom in parallel branch") })
-            })])
-            .completion(
-                crate::builders::map_parallel::CompletionConfig::builder()
-                    .tolerated_failure_count(0)
-                    .build()
-                    .expect("valid completion config"),
+    /// The reconstruction of a `ReplayChildren` item needs a task too.
+    #[test]
+    fn map_reconstruction_without_runtime_returns_error() {
+        let log = CheckpointLog::from_records(vec![replay_children_success_record("2")]);
+        assert_batch_no_runtime_error(log, |ctx| {
+            ctx.map(
+                vec![1_i32],
+                |_child, item: i32, _idx| async move { Ok(item) },
             )
-            .await
-        };
-
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
-        let result: Result<Vec<i32>, OperationError> =
-            outcome.expect("parallel with a panicking branch must resolve, not hang");
-        let err =
-            result.expect_err("a panicking branch must surface as a controlled batch failure");
-        assert!(
-            format!("{err:#}").contains("boom in parallel branch"),
-            "batch failure should carry the branch panic message, got: {err:#}"
-        );
+            .into_future()
+        });
     }
 
     #[tokio::test]
@@ -6174,7 +6111,12 @@ mod tests {
         let invoke_fut = invoke_ctx
             .invoke::<String, String>("target-fn", value.clone())
             .payload_serdes(invoke_rec.clone());
-        let outcome = crate::driver::test_support::outcome_of(signal, invoke_fut).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(invoke_ctx.task_ownership()),
+            signal,
+            invoke_fut,
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
         assert_eq!(
             invoke_rec.serialize_inputs(),

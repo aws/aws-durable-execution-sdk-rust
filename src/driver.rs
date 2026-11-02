@@ -174,6 +174,10 @@ pub(crate) struct SuspensionSignal {
     fatal: Arc<std::sync::Mutex<Option<FatalError>>>,
     /// Settle accounting for the operations spawned into this scope.
     quiescence: ScopeQuiescence,
+    /// Invocation-wide count of the SDK tasks still running, shared by every
+    /// scope in the tree exactly like `fatal`. The invocation driver waits
+    /// for it to reach zero before it returns.
+    tasks: Arc<crate::task::TaskTracker>,
 }
 
 /// An unrecoverable error recorded by an operation, together with the
@@ -248,6 +252,7 @@ impl SuspensionSignal {
             invocation_waker: Arc::new(std::sync::Mutex::new(None)),
             fatal: Arc::new(std::sync::Mutex::new(None)),
             quiescence: ScopeQuiescence::default(),
+            tasks: Arc::new(crate::task::TaskTracker::new()),
         }
     }
 
@@ -264,7 +269,13 @@ impl SuspensionSignal {
             invocation_waker: Arc::clone(&self.invocation_waker),
             fatal: Arc::clone(&self.fatal),
             quiescence: ScopeQuiescence::default(),
+            tasks: Arc::clone(&self.tasks),
         }
+    }
+
+    /// Returns the invocation-wide tracker of the SDK tasks still running.
+    pub(crate) fn tasks(&self) -> &Arc<crate::task::TaskTracker> {
+        &self.tasks
     }
 
     /// Records an execution-fatal error into the shared slot (first record
@@ -446,17 +457,18 @@ fn set_slot(slot: &std::sync::Mutex<Option<Waker>>, waker: &Waker) {
 /// created it. Durable operations check ownership before proceeding:
 /// operations from a foreign task fail fast.
 ///
-/// **Production topology**: `lambda_runtime` awaits the handler future
+/// **Production topology**: `lambda_runtime` awaits the invocation future
 /// inline under `block_on`, so `tokio::task::try_id()` returns `None` at
 /// context-creation time. The guard handles this as an explicit
 /// "root-context" marker: operations invoked from the same inline context
 /// (where `try_id()` is also `None`) pass, but operations invoked from a
 /// foreign `tokio::spawn` (where `try_id()` returns `Some`) are rejected
-/// unless the task was blessed by the SDK (`.spawn()`, combinators, etc.).
+/// unless the task was blessed by the SDK.
 ///
-/// The `.spawn()` terminal registers the spawned task's ID as "blessed",
-/// exempting it from the ownership check. This catches user
-/// `tokio::spawn` misuse while allowing the SDK's own spawn mechanism.
+/// The task gateway (`crate::task`) blesses every operation task it starts:
+/// the handler itself, each `.spawn()`, each map item and parallel branch,
+/// and each combinator input. This catches user `tokio::spawn` misuse while
+/// allowing the SDK's own tasks.
 #[derive(Debug)]
 pub(crate) struct TaskOwnership {
     /// The task ID that owns this context. `None` if created outside a
@@ -464,13 +476,11 @@ pub(crate) struct TaskOwnership {
     /// owner acts as a root-context marker: inline callers (also `None`)
     /// pass, but unblessed spawned tasks are rejected.
     owner_task_id: Option<tokio::task::Id>,
-    /// Task IDs blessed by `.spawn()`: these are exempt from the check.
-    /// We use a Mutex<Vec> because spawn registrations are rare relative
-    /// to ownership checks, and the set is small: the list grows by one
-    /// entry per `.spawn()` call per invocation and is never larger than
-    /// the number of spawns the handler makes, so the linear scan in
-    /// `check_current_task` is intentional at that size.
-    blessed_tasks: std::sync::Mutex<Vec<tokio::task::Id>>,
+    /// The IDs of the running SDK operation tasks: these are exempt from
+    /// the check. The task gateway (`crate::task`) inserts a task's ID
+    /// before the task's first poll and removes it before the task exits,
+    /// so tokio can reuse an ID only for a task that is not in the set.
+    blessed_tasks: std::sync::Mutex<std::collections::HashSet<tokio::task::Id>>,
 }
 
 impl TaskOwnership {
@@ -485,7 +495,7 @@ impl TaskOwnership {
     pub(crate) fn new_current() -> Self {
         Self {
             owner_task_id: tokio::task::try_id(),
-            blessed_tasks: std::sync::Mutex::new(Vec::new()),
+            blessed_tasks: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -498,7 +508,25 @@ impl TaskOwnership {
             .blessed_tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        blessed.push(task_id);
+        blessed.insert(task_id);
+    }
+
+    /// Removes a task ID from the blessed set. The task gateway calls it
+    /// before a blessed task exits.
+    pub(crate) fn unbless_task(&self, task_id: tokio::task::Id) {
+        self.blessed_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&task_id);
+    }
+
+    /// Returns the number of blessed task IDs.
+    #[cfg(test)]
+    pub(crate) fn blessed_count(&self) -> usize {
+        self.blessed_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Checks whether the calling task is authorized to perform durable
@@ -561,34 +589,6 @@ impl TaskOwnership {
     }
 }
 
-/// Retains a spawned tokio task's `JoinHandle` and aborts the task when
-/// dropped.
-///
-/// Holding this alongside (or inside) the future that owns a spawned
-/// durable task makes the owner responsible for the task's lifetime:
-/// dropping the owner aborts the task. This prevents spawned durable work
-/// from outliving the invocation that created it: a dropped oneshot
-/// receiver alone does NOT cancel a tokio task, so without this the task
-/// would survive the invocation boundary and could resume on a later warm
-/// invocation.
-#[derive(Debug)]
-pub(crate) struct AbortOnDrop {
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl AbortOnDrop {
-    /// Wraps a spawned task's handle so it is aborted on drop.
-    pub(crate) fn new(handle: tokio::task::JoinHandle<()>) -> Self {
-        Self { handle }
-    }
-}
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
-
 /// How one watched drive of a future ended: the shared vocabulary of
 /// [`drive_watched`], the poll loop `drive_invocation` and `drive_scope`
 /// both build on.
@@ -615,9 +615,9 @@ enum DrivenToEnd<T> {
 /// - `interrupted` is checked before each poll and again when the future
 ///   returns `Pending`, so a pending interruption drops the future
 ///   rather than waiting for it;
-/// - `interrupted_on_ready` is checked when the future resolves, letting
-///   a same-poll interruption (or a durably parked `.spawn()`ed
-///   operation) take precedence over the resolved value.
+/// - `interrupted_on_ready` is checked with the resolved value when the
+///   future resolves, letting a same-poll interruption (or a durably
+///   parked `.spawn()`ed operation) take precedence over that value.
 ///
 /// The caller re-reads its signal after the drive to decide what an
 /// interruption means; this loop only reports THAT one happened.
@@ -631,7 +631,7 @@ where
     F: Future + Send,
     R: Fn(&Waker),
     P: Fn() -> bool,
-    Q: Fn() -> bool,
+    Q: Fn(&F::Output) -> bool,
 {
     let mut pinned = std::pin::pin!(future);
     std::future::poll_fn(move |cx: &mut Context<'_>| {
@@ -645,7 +645,7 @@ where
 
         match pinned.as_mut().poll(cx) {
             Poll::Ready(value) => {
-                if interrupted_on_ready() {
+                if interrupted_on_ready(&value) {
                     Poll::Ready(DrivenToEnd::Interrupted)
                 } else {
                     Poll::Ready(DrivenToEnd::Completed(value))
@@ -685,45 +685,95 @@ where
 /// every check point (including a fatal recorded during the poll that
 /// resolved the future), and the post-drive fatal read maps the
 /// interruption to the dedicated outcome.
+///
+/// The handler runs as the invocation's root task, started through the
+/// task gateway (`crate::task::spawn_root`). When the drive ends, the driver
+/// aborts the root task and waits for it, aborts every other tracked task,
+/// and waits until every tracked task has unwound. Only then does it
+/// return. A handler panic is returned as `Err` with its original payload;
+/// the caller resumes it.
 pub(crate) async fn drive_invocation<F>(
     handler_future: F,
+    task_ownership: Arc<TaskOwnership>,
     suspension_signal: Arc<SuspensionSignal>,
-) -> InvocationOutcome
+) -> Result<InvocationOutcome, Box<dyn std::any::Any + Send + 'static>>
 where
-    F: Future<Output = Result<String, crate::error::WireError>> + Send,
+    F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
 {
+    let tasks = Arc::clone(suspension_signal.tasks());
+    // The handler runs as an operation task, so every SDK poll of user code
+    // runs on a Tokio worker with the gateway wrapper.
+    #[expect(clippy::expect_used)]
+    // reason: this function awaits Tokio timers and tasks itself, so it is
+    // always polled inside a Tokio runtime.
+    let (mut root, root_join) = crate::task::spawn_root(&task_ownership, &tasks, handler_future)
+        .expect("the invocation driver runs inside a Tokio runtime");
+
     let ended = {
         let register_signal = Arc::clone(&suspension_signal);
         let pre_signal = Arc::clone(&suspension_signal);
         let ready_signal = Arc::clone(&suspension_signal);
         drive_watched(
-            handler_future,
+            &mut root,
             // Register this poll loop's waker so an operation that
             // suspends (or a fatal recorded) from a spawned task wakes
             // the driver to observe it.
             move |waker| register_signal.register_driver_waker(waker),
             move || pre_signal.fatal_error().is_some() || pre_signal.is_suspend_requested(),
-            move || {
+            // A handler panic reached the invocation root, so only a fatal
+            // error takes precedence over it. A suspension request or a
+            // parked `.spawn()` takes precedence only over a value.
+            move |outcome| {
                 ready_signal.fatal_error().is_some()
-                    || ready_signal.is_suspend_requested()
-                    || ready_signal.any_spawn_parked()
+                    || (matches!(outcome, crate::task::TaskOutcome::Value(_))
+                        && (ready_signal.is_suspend_requested() || ready_signal.any_spawn_parked()))
             },
         )
         .await
     };
 
+    // Cleanup, whatever ended the drive. Abort the root task if it has not
+    // finished, and await it, so the handler has unwound, and dropped every
+    // handle it held, before the other tasks are aborted. Then every task
+    // still running is aborted, and the driver waits until each one has
+    // unwound, so no SDK task outlives the invocation.
+    root.abort();
+    drop(root_join.await);
+    // The drive can end on a suspension request after the handler already
+    // panicked, before the driver polled the root's outcome. The root task
+    // has exited, so its outcome, if it stored one, is in the slot. A
+    // stored value is discarded, as the interruption decides the outcome.
+    // A completed drive already took the outcome from the slot, so the
+    // slot is empty then.
+    let late = root.take_finished();
+    drop(root);
+    tasks.abort_all();
+    tasks.wait_idle().await;
+
     // Fatal precedence: whatever ended the drive, a recorded fatal error
     // is the outcome (the mismatch may have been stringified through
     // child/batch boundaries, so the handler's own error shape is never
-    // preferred over the dedicated report).
+    // preferred over the dedicated report). This read runs after every
+    // tracked task has unwound, so a fatal that a task records during the
+    // cleanup also wins over a handler panic.
     if let Some(fatal) = suspension_signal.fatal_error() {
-        return fatal.into_outcome();
+        return Ok(fatal.into_outcome());
     }
 
+    // A handler panic, observed by the drive or found late in the slot,
+    // leaves the SDK only after the cleanup above. The caller resumes it.
     match ended {
-        DrivenToEnd::Interrupted => InvocationOutcome::Pending,
-        DrivenToEnd::Completed(Ok(result)) => InvocationOutcome::Complete(result),
-        DrivenToEnd::Completed(Err(err)) => InvocationOutcome::Failed { error: err },
+        DrivenToEnd::Completed(crate::task::TaskOutcome::Panicked(payload)) => Err(payload),
+        DrivenToEnd::Completed(crate::task::TaskOutcome::Value(Ok(result))) => {
+            Ok(InvocationOutcome::Complete(result))
+        }
+        DrivenToEnd::Completed(crate::task::TaskOutcome::Value(Err(err))) => {
+            Ok(InvocationOutcome::Failed { error: err })
+        }
+        DrivenToEnd::Interrupted => match late {
+            Some(crate::task::TaskOutcome::Panicked(payload)) => Err(payload),
+            _ => Ok(InvocationOutcome::Pending),
+        },
     }
 }
 
@@ -770,7 +820,7 @@ where
             // a sub-task within this scope re-polls us to observe the flag.
             move |waker| register_scope.register_scope_waker(waker),
             move || pre_scope.is_suspend_requested(),
-            move || ready_scope.is_suspend_requested() || ready_scope.any_spawn_parked(),
+            move |_| ready_scope.is_suspend_requested() || ready_scope.any_spawn_parked(),
         )
         .await
     };
@@ -782,8 +832,25 @@ where
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{InvocationOutcome, SuspensionSignal, drive_invocation};
+    use super::{InvocationOutcome, SuspensionSignal, TaskOwnership, drive_invocation};
+    use std::future::Future;
     use std::sync::Arc;
+
+    /// Drives `fut` through [`drive_invocation`] and resumes a handler
+    /// panic, for tests that expect an outcome.
+    pub(crate) async fn drive_ok<F>(
+        fut: F,
+        ownership: Arc<TaskOwnership>,
+        signal: Arc<SuspensionSignal>,
+    ) -> InvocationOutcome
+    where
+        F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
+    {
+        match drive_invocation(fut, ownership, signal).await {
+            Ok(outcome) => outcome,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
 
     /// Drives an operation future through the real suspension driver and
     /// returns the invocation outcome. The operation's own result is
@@ -793,10 +860,17 @@ pub(crate) mod test_support {
     /// `Complete`. Used by operation unit tests to drive a suspending
     /// future to an outcome instead of awaiting it directly (a direct
     /// await would park forever).
-    pub(crate) async fn outcome_of<F>(signal: Arc<SuspensionSignal>, fut: F) -> InvocationOutcome
+    ///
+    /// `ownership` is the task-ownership tracker of the context the
+    /// operation runs on: the driver blesses its root task there.
+    pub(crate) async fn outcome_of<F>(
+        ownership: Arc<TaskOwnership>,
+        signal: Arc<SuspensionSignal>,
+        fut: F,
+    ) -> InvocationOutcome
     where
-        F: IntoFuture + Send,
-        F::IntoFuture: Send,
+        F: IntoFuture + Send + 'static,
+        F::IntoFuture: Send + 'static,
     {
         // Box the operation future: `drive_invocation` stack-pins its
         // argument, so a large operation future would otherwise inflate
@@ -807,21 +881,30 @@ pub(crate) mod test_support {
             let _ = fut.await;
             Ok::<_, crate::error::WireError>("ok".to_owned())
         });
-        drive_invocation(fut, signal).await
+        match drive_invocation(fut, ownership, signal).await {
+            Ok(outcome) => outcome,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Drives `fut` to its invocation outcome and asserts that it ended the
     /// invocation with a fault whose message contains `needle`.
     #[expect(clippy::panic)] // reason: test assertion on an unexpected outcome
-    pub(crate) async fn expect_serdes_fault<F>(signal: Arc<SuspensionSignal>, fut: F, needle: &str)
-    where
-        F: IntoFuture + Send,
-        F::IntoFuture: Send,
+    pub(crate) async fn expect_serdes_fault<F>(
+        ownership: Arc<TaskOwnership>,
+        signal: Arc<SuspensionSignal>,
+        fut: F,
+        needle: &str,
+    ) where
+        F: IntoFuture + Send + 'static,
+        F::IntoFuture: Send + 'static,
     {
-        let outcome =
-            tokio::time::timeout(std::time::Duration::from_secs(5), outcome_of(signal, fut))
-                .await
-                .expect("the operation must reach an invocation outcome within 5 s");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            outcome_of(ownership, signal, fut),
+        )
+        .await
+        .expect("the operation must reach an invocation outcome within 5 s");
         let InvocationOutcome::Fault { message } = outcome else {
             panic!("expected an invocation fault, got {outcome:?}");
         };
@@ -834,9 +917,10 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
-// behavior; production spawning is confined to the src/future.rs helpers.
+// behavior; production spawning is confined to the src/task.rs gateway.
 #[expect(clippy::disallowed_methods)]
 mod tests {
+    use super::test_support::drive_ok;
     use super::*;
     use std::sync::atomic::AtomicU32;
 
@@ -864,7 +948,7 @@ mod tests {
         let drop_clone = Arc::clone(&drop_observed);
         let after_clone = Arc::clone(&after_await_ran);
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let _guard = DropGuard {
                     dropped: drop_clone,
@@ -880,6 +964,7 @@ mod tests {
                 after_clone.store(true, Ordering::SeqCst);
                 Ok("should not reach".to_owned())
             },
+            Arc::new(TaskOwnership::new_current()),
             Arc::clone(&signal),
         )
         .await;
@@ -905,7 +990,7 @@ mod tests {
         let signal_clone = Arc::clone(&signal);
         let after_clone = Arc::clone(&after_catch_ran);
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 // User tries a "catch-all" pattern: wrapping in a closure
                 // that catches panics. This cannot catch future-drop.
@@ -920,6 +1005,7 @@ mod tests {
                 after_clone.store(true, Ordering::SeqCst);
                 result
             },
+            Arc::new(TaskOwnership::new_current()),
             Arc::clone(&signal),
         )
         .await;
@@ -938,12 +1024,13 @@ mod tests {
         let signal = Arc::new(SuspensionSignal::new());
         let signal_clone = Arc::clone(&signal);
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 signal_clone.request_suspend();
                 tokio::task::yield_now().await;
                 Ok("unreachable".to_owned())
             },
+            Arc::new(TaskOwnership::new_current()),
             Arc::clone(&signal),
         )
         .await;
@@ -957,8 +1044,9 @@ mod tests {
     async fn driver_returns_complete_on_success() {
         let signal = Arc::new(SuspensionSignal::new());
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move { Ok::<_, crate::error::WireError>("done".to_owned()) },
+            Arc::new(TaskOwnership::new_current()),
             Arc::clone(&signal),
         )
         .await;
@@ -970,13 +1058,14 @@ mod tests {
     async fn driver_returns_failed_on_error() {
         let signal = Arc::new(SuspensionSignal::new());
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 Err(crate::error::WireError::new(
                     Some("Error".to_owned()),
                     Some("boom".to_owned()),
                 ))
             },
+            Arc::new(TaskOwnership::new_current()),
             Arc::clone(&signal),
         )
         .await;
@@ -1253,7 +1342,8 @@ mod tests {
 #[cfg(test)]
 #[expect(clippy::panic)] // reason: test module
 mod suspension_containment_and_task_ownership {
-    use super::{InvocationOutcome, drive_invocation};
+    use super::InvocationOutcome;
+    use super::test_support::drive_ok;
     use crate::client::{ExecutionClient, InMemoryExecutionClient, TestResponse};
     use crate::context::DurableContext;
     use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
@@ -1306,12 +1396,13 @@ mod suspension_containment_and_task_ownership {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let _ = ctx_h.wait(Duration::from_secs(30)).await;
                 ran_c.store(true, Ordering::SeqCst);
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1329,7 +1420,7 @@ mod suspension_containment_and_task_ownership {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let _ = ctx_h
                     .invoke::<serde_json::Value, _>("target-fn", "input".to_owned())
@@ -1337,6 +1428,7 @@ mod suspension_containment_and_task_ownership {
                 ran_c.store(true, Ordering::SeqCst);
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1354,7 +1446,7 @@ mod suspension_containment_and_task_ownership {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 // Body fails; the default retry strategy schedules a retry,
                 // which suspends (parks) on the backend timer.
@@ -1365,6 +1457,7 @@ mod suspension_containment_and_task_ownership {
                 ran_c.store(true, Ordering::SeqCst);
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1382,7 +1475,7 @@ mod suspension_containment_and_task_ownership {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let _ = ctx_h
                     .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)
@@ -1395,6 +1488,7 @@ mod suspension_containment_and_task_ownership {
                 ran_c.store(true, Ordering::SeqCst);
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1412,7 +1506,7 @@ mod suspension_containment_and_task_ownership {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let Ok(cb) = ctx_h.create_callback::<serde_json::Value>().await else {
                     return Err(crate::error::WireError::new(
@@ -1425,6 +1519,7 @@ mod suspension_containment_and_task_ownership {
                 ran_c.store(true, Ordering::SeqCst);
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1453,7 +1548,7 @@ mod suspension_containment_and_task_ownership {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 ctx_h
                     .wait(Duration::from_secs(30))
@@ -1462,6 +1557,7 @@ mod suspension_containment_and_task_ownership {
                 ran_c.store(true, Ordering::SeqCst);
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1481,7 +1577,7 @@ mod suspension_containment_and_task_ownership {
         let caught = Arc::new(AtomicBool::new(false));
         let caught_c = Arc::clone(&caught);
         let ctx_h = ctx.clone();
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 // max_concurrency(0) is a validation error, returned as Err.
                 let r = ctx_h
@@ -1493,6 +1589,7 @@ mod suspension_containment_and_task_ownership {
                 }
                 Ok::<_, crate::error::WireError>("handled".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1518,7 +1615,7 @@ mod suspension_containment_and_task_ownership {
         let caught = Arc::new(AtomicBool::new(false));
         let caught_c = Arc::clone(&caught);
         let ctx_h = ctx.clone();
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 // The live wait's START checkpoint fails non-retryably.
                 // Pre-#43 this surfaced as a catchable Err; now the future
@@ -1530,6 +1627,7 @@ mod suspension_containment_and_task_ownership {
                 }
                 Ok::<_, crate::error::WireError>("handled".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1567,7 +1665,7 @@ mod suspension_containment_and_task_ownership {
         let caught = Arc::new(AtomicBool::new(false));
         let caught_c = Arc::clone(&caught);
         let ctx_h = ctx.clone();
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let r = ctx_h.wait(Duration::from_secs(5)).await;
                 if r.is_err() {
@@ -1575,6 +1673,7 @@ mod suspension_containment_and_task_ownership {
                 }
                 Ok::<_, crate::error::WireError>("handled".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1651,8 +1750,11 @@ mod suspension_containment_and_task_ownership {
     }
 
     // 4 + 6. A spawned straggler (non-durable `pending()` body) holds the
-    // invocation until the Lambda timeout fires. The timeout DROPS the handler
-    // future, which drops the AbortOnDrop guard, aborting the straggler. No
+    // invocation until the Lambda timeout fires. The timeout drops the
+    // `drive_invocation` future, so the driver's cleanup never runs. Dropping
+    // it drops the root task's `TrackedTask` handle, which aborts the root
+    // task. When tokio unwinds the root task, the handler drops the
+    // straggler's `TrackedTask` handle, which aborts the straggler. No
     // SUCCEED checkpoint is made for the aborted straggler. This is Case G
     // from the S2a diagnosis: the bounded timeout simulates the Lambda
     // platform's execution timeout backstop.
@@ -1679,7 +1781,7 @@ mod suspension_containment_and_task_ownership {
         // Lambda timeout is the backstop that aborts the straggler.
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            drive_invocation(
+            drive_ok(
                 async move {
                     // Sibling task: starts, then blocks on non-durable
                     // pending(). Under the new semantics, drive_scope for this
@@ -1717,6 +1819,7 @@ mod suspension_containment_and_task_ownership {
                     let _ = sib.await;
                     Ok::<_, crate::error::WireError>("done".to_owned())
                 },
+                Arc::clone(ctx.task_ownership()),
                 signal,
             ),
         )
@@ -1762,7 +1865,8 @@ mod suspension_containment_and_task_ownership {
 
 #[cfg(test)]
 mod scoped_suspension {
-    use super::{InvocationOutcome, ScopeOutcome, SuspensionSignal, drive_invocation, drive_scope};
+    use super::test_support::drive_ok;
+    use super::{InvocationOutcome, ScopeOutcome, SuspensionSignal, drive_scope};
     use crate::client::{ExecutionClient, InMemoryExecutionClient};
     use crate::context::DurableContext;
     use crate::engine::CheckpointLog;
@@ -1801,7 +1905,7 @@ mod scoped_suspension {
         let b_ran_c = Arc::clone(&b_ran);
         let ctx_h = ctx.clone();
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let flag = b_ran_c;
                 let branches = vec![
@@ -1822,6 +1926,7 @@ mod scoped_suspension {
                 let _ = ctx_h.parallel(branches).await;
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1842,7 +1947,7 @@ mod scoped_suspension {
         let signal = Arc::clone(ctx.suspension_signal());
         let ctx_h = ctx.clone();
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let branches = vec![
                     Branch::new("a", |cc: DurableContext| {
@@ -1861,6 +1966,7 @@ mod scoped_suspension {
                 let _ = ctx_h.parallel(branches).await;
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1887,7 +1993,7 @@ mod scoped_suspension {
         let active_h = Arc::clone(&active);
         let peak_h = Arc::clone(&peak);
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let mut branches = Vec::new();
                 for i in 0..4 {
@@ -1905,6 +2011,7 @@ mod scoped_suspension {
                 let _ = ctx_h.parallel(branches).max_concurrency(2).await;
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1937,7 +2044,7 @@ mod scoped_suspension {
         let second_h = Arc::clone(&second_ran);
         let ctx_h = ctx.clone();
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let flag = second_h;
                 let branches = vec![
@@ -1956,6 +2063,7 @@ mod scoped_suspension {
                 let r = ctx_h.parallel(branches).max_concurrency(1).await;
                 Ok::<_, crate::error::WireError>(format!("{}", r.is_ok()))
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -1976,7 +2084,7 @@ mod scoped_suspension {
         let signal = Arc::clone(ctx.suspension_signal());
         let ctx_h = ctx.clone();
 
-        let fut = drive_invocation(
+        let fut = drive_ok(
             async move {
                 let outer = vec![Branch::new("outer", |cc: DurableContext| {
                     Box::pin(async move {
@@ -1998,6 +2106,7 @@ mod scoped_suspension {
                 let _ = ctx_h.parallel(outer).await;
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         );
 
@@ -2021,7 +2130,7 @@ mod scoped_suspension {
         let signal = Arc::clone(ctx.suspension_signal());
         let ctx_h = ctx.clone();
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 let branches = vec![
                     Branch::new("ok", |cc: DurableContext| async move {
@@ -2046,6 +2155,7 @@ mod scoped_suspension {
                     .await;
                 Ok::<_, crate::error::WireError>(format!("ok={}", r.is_ok()))
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -2066,7 +2176,7 @@ mod scoped_suspension {
         let after_c = Arc::clone(&after);
         let ctx_h = ctx.clone();
 
-        let outcome = drive_invocation(
+        let outcome = drive_ok(
             async move {
                 ctx_h.wait(Duration::from_secs(30)).await.map_err(|e| {
                     crate::error::WireError::new(Some("W".to_owned()), Some(e.to_string()))
@@ -2074,6 +2184,7 @@ mod scoped_suspension {
                 after_c.store(true, Ordering::SeqCst);
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
+            Arc::clone(ctx.task_ownership()),
             signal,
         )
         .await;
@@ -2111,17 +2222,18 @@ mod scoped_suspension {
 // `.spawn()` used to hand the operation future to `DurableFuture::spawn_blessed`
 // WITHOUT creating a child suspension scope, so a parking operation inside a
 // top-level `.spawn()` set the ROOT flag. `drive_invocation` then returned
-// `Poll::Ready(Pending)` on its next poll and dropped the handler future, which
-// fired `AbortOnDrop` on every sibling spawned task, including one mid-flight
-// that had already checkpointed STARTED. This was fixed by scope-quiescence
-// accounting: each `.spawn()` now runs in its own child scope, and the owner
-// parks only at quiescence.
+// `Poll::Ready(Pending)` on its next poll and dropped the handler future. That
+// dropped the handle of every sibling spawned task, which aborted each task,
+// including one mid-flight that had already checkpointed STARTED. This was
+// fixed by scope-quiescence accounting: each `.spawn()` now runs in its own
+// child scope, and the owner parks only at quiescence.
 //
 // These tests encode the CORRECT behaviour and run as part of `make check`.
 // See .agents/scratchpad/s2a-diagnosis.md for the root-cause analysis.
 #[cfg(test)]
 mod spawn_scope_regressions {
-    use super::{InvocationOutcome, drive_invocation};
+    use super::InvocationOutcome;
+    use super::test_support::drive_ok;
     use crate::client::{ExecutionClient, InMemoryExecutionClient};
     use crate::context::DurableContext;
     use crate::engine::CheckpointLog;
@@ -2167,7 +2279,7 @@ mod spawn_scope_regressions {
 
         let outcome = tokio::time::timeout(
             BOUND,
-            drive_invocation(
+            drive_ok(
                 async move {
                     // Parks: no timer result is available on a first invocation.
                     let wait = ctx_h.wait(Duration::from_secs(10)).spawn();
@@ -2188,6 +2300,7 @@ mod spawn_scope_regressions {
                     let _ = wait.await;
                     Ok::<_, crate::error::WireError>("done".to_owned())
                 },
+                Arc::clone(ctx.task_ownership()),
                 signal,
             ),
         )
@@ -2221,7 +2334,7 @@ mod spawn_scope_regressions {
 
         let outcome = tokio::time::timeout(
             BOUND,
-            drive_invocation(
+            drive_ok(
                 async move {
                     let wait = ctx_h.wait(Duration::from_secs(10)).spawn();
                     let work = ctx_h
@@ -2238,6 +2351,7 @@ mod spawn_scope_regressions {
                     let (_timer, _result) = tokio::join!(wait, work);
                     Ok::<_, crate::error::WireError>("done".to_owned())
                 },
+                Arc::clone(ctx.task_ownership()),
                 signal,
             ),
         )
@@ -2272,11 +2386,11 @@ mod spawn_scope_regressions {
 
         let outcome = tokio::time::timeout(
             BOUND,
-            drive_invocation(
+            drive_ok(
                 async move {
                     // Spawn a wait: it parks immediately (no timer result on
-                    // first invocation). Hold the handle so its AbortOnDrop
-                    // doesn't fire, but never await it.
+                    // first invocation). Hold the handle so dropping it
+                    // does not abort the task, but never await it.
                     let _wait = ctx_h.wait(Duration::from_secs(10)).spawn();
 
                     // Yield once so the spawned wait task has a chance to run
@@ -2300,6 +2414,7 @@ mod spawn_scope_regressions {
                     // parked spawn and report Pending instead of Complete.
                     Ok::<_, crate::error::WireError>("done".to_owned())
                 },
+                Arc::clone(ctx.task_ownership()),
                 signal,
             ),
         )
@@ -2343,7 +2458,7 @@ mod spawn_scope_regressions {
 
         let outcome = tokio::time::timeout(
             BOUND,
-            drive_invocation(
+            drive_ok(
                 async move {
                     // Parking input: a spawned wait (will park on first
                     // invocation since no timer has elapsed).
@@ -2372,6 +2487,7 @@ mod spawn_scope_regressions {
                     let _ = tokio::join!(combo, sibling);
                     Ok::<_, crate::error::WireError>("done".to_owned())
                 },
+                Arc::clone(ctx.task_ownership()),
                 signal,
             ),
         )
@@ -2392,5 +2508,367 @@ mod spawn_scope_regressions {
             "the sibling must reach its terminal Succeed checkpoint \
              before the invocation reports Pending"
         );
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::panic)] // reason: the handler panics under test and test assertions
+mod task_gateway {
+    use super::{InvocationOutcome, drive_invocation};
+    use crate::client::{ExecutionClient, InMemoryExecutionClient};
+    use crate::context::DurableContext;
+    use crate::engine::CheckpointLog;
+    use crate::future::DurableFuture;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn live_ctx() -> DurableContext {
+        DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::new(InMemoryExecutionClient::new(Vec::new())) as Arc<dyn ExecutionClient>,
+            "token0".to_owned(),
+        )
+    }
+
+    /// Sets its flag when dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Spawns a step whose body holds a drop guard and awaits `pending()`.
+    fn spawn_holding_step(ctx: &DurableContext, dropped: &Arc<AtomicBool>) -> DurableFuture<()> {
+        let dropped = Arc::clone(dropped);
+        ctx.step(move |_| {
+            let dropped = Arc::clone(&dropped);
+            async move {
+                let _guard = DropFlag(dropped);
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        })
+        .name("hold")
+        .spawn()
+    }
+
+    async fn yield_three_times() {
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A spawned step body still mid-await when the invocation suspends is
+    /// dropped before `drive_invocation` returns.
+    #[tokio::test]
+    async fn aborted_spawned_body_drops_before_invocation_returns() {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let handler_dropped = Arc::clone(&dropped);
+        let outcome = drive_invocation(
+            async move {
+                let _wait = ctx.wait(Duration::from_secs(10)).name("timer").spawn();
+                let _step = spawn_holding_step(&ctx, &handler_dropped);
+                yield_three_times().await;
+                Ok::<_, crate::error::WireError>("done".to_owned())
+            },
+            ownership,
+            signal,
+        )
+        .await
+        .expect("the handler does not panic");
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the step body must be dropped before the invocation returns"
+        );
+    }
+
+    /// A handler panic returns its payload only after every tracked task
+    /// has unwound.
+    #[tokio::test]
+    async fn handler_panic_returns_payload_after_cleanup() {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let tasks = Arc::clone(signal.tasks());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let handler_dropped = Arc::clone(&dropped);
+        let outcome = drive_invocation(
+            async move {
+                let _step = spawn_holding_step(&ctx, &handler_dropped);
+                yield_three_times().await;
+                panic!("handler boom");
+            },
+            ownership,
+            signal,
+        )
+        .await;
+        let Err(payload) = outcome else {
+            panic!("expected the handler panic, got {outcome:?}");
+        };
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"handler boom"));
+        assert!(dropped.load(Ordering::SeqCst), "the step body was dropped");
+        assert_eq!(tasks.live(), 0);
+    }
+
+    /// After a handler panic, the driver also aborts a task whose handle
+    /// the handler moved out of its own future.
+    #[tokio::test]
+    async fn handler_panic_aborts_task_whose_handle_left_the_handler() {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let tasks = Arc::clone(signal.tasks());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let handler_dropped = Arc::clone(&dropped);
+        let escaped: Arc<Mutex<Option<DurableFuture<()>>>> = Arc::new(Mutex::new(None));
+        let handler_escaped = Arc::clone(&escaped);
+        let outcome = drive_invocation(
+            async move {
+                let step = spawn_holding_step(&ctx, &handler_dropped);
+                *handler_escaped.lock().expect("lock") = Some(step);
+                yield_three_times().await;
+                panic!("handler boom");
+            },
+            ownership,
+            signal,
+        )
+        .await;
+        assert!(outcome.is_err(), "expected the handler panic");
+        assert!(
+            escaped.lock().expect("lock").is_some(),
+            "the test still holds the handle"
+        );
+        assert!(dropped.load(Ordering::SeqCst), "the step body was dropped");
+        assert_eq!(tasks.live(), 0);
+    }
+
+    /// A handler that panics while a `.spawn()`ed wait is parked returns the
+    /// panic payload, not `Pending`. A parked spawn takes precedence over a
+    /// handler's value, never over its panic.
+    #[tokio::test]
+    async fn handler_panic_with_parked_spawn_returns_payload() {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let tasks = Arc::clone(signal.tasks());
+        let parked_signal = Arc::clone(&signal);
+        let outcome = drive_invocation(
+            async move {
+                let _wait = ctx.wait(Duration::from_secs(10)).name("timer").spawn();
+                yield_three_times().await;
+                assert!(parked_signal.any_spawn_parked(), "the wait is parked");
+                panic!("handler boom");
+            },
+            ownership,
+            signal,
+        )
+        .await;
+        let Err(payload) = outcome else {
+            panic!("expected the handler panic, got {outcome:?}");
+        };
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"handler boom"));
+        assert_eq!(tasks.live(), 0);
+    }
+
+    /// A handler that panics after a suspension was requested, before the
+    /// driver polled the handler's outcome, returns the panic payload.
+    #[tokio::test]
+    async fn handler_panic_after_suspend_request_returns_payload() {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let tasks = Arc::clone(signal.tasks());
+        let handler_signal = Arc::clone(&signal);
+        let outcome = drive_invocation(
+            async move {
+                let _ctx = ctx;
+                handler_signal.request_suspend();
+                panic!("handler boom");
+            },
+            ownership,
+            signal,
+        )
+        .await;
+        let Err(payload) = outcome else {
+            panic!("expected the handler panic, got {outcome:?}");
+        };
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"handler boom"));
+        assert_eq!(tasks.live(), 0);
+    }
+
+    /// A recorded fatal error takes precedence over a handler panic.
+    #[tokio::test]
+    async fn fatal_error_wins_over_handler_panic() {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let handler_signal = Arc::clone(&signal);
+        let outcome = drive_invocation(
+            async move {
+                let _ctx = ctx;
+                handler_signal.record_fatal("Fatal".to_owned(), "mismatch".to_owned());
+                panic!("handler boom");
+            },
+            ownership,
+            signal,
+        )
+        .await
+        .expect("the fatal error takes precedence over the panic");
+        assert_eq!(
+            outcome,
+            InvocationOutcome::Failed {
+                error: crate::error::WireError::new(
+                    Some("Fatal".to_owned()),
+                    Some("mismatch".to_owned()),
+                ),
+            }
+        );
+    }
+
+    /// Records a fatal error on the invocation's signal when it is dropped.
+    struct FatalOnDrop(Arc<crate::driver::SuspensionSignal>);
+
+    impl Drop for FatalOnDrop {
+        fn drop(&mut self) {
+            self.0
+                .record_fatal("Fatal".to_owned(), "mismatch during cleanup".to_owned());
+        }
+    }
+
+    /// A fatal error that a tracked task records while the driver cleans up
+    /// after a handler panic still takes precedence over that panic. The
+    /// handler moves the step's handle out of its own future, so only the
+    /// driver's `abort_all` drops the step body, after the drive observed
+    /// the panic. Dropping the body records the fatal error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fatal_recorded_during_panic_cleanup_wins_over_panic() {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let tasks = Arc::clone(signal.tasks());
+        let body_signal = Arc::clone(&signal);
+        let started = Arc::new(AtomicBool::new(false));
+        let body_started = Arc::clone(&started);
+        let escaped: Arc<Mutex<Option<DurableFuture<()>>>> = Arc::new(Mutex::new(None));
+        let handler_escaped = Arc::clone(&escaped);
+        let check_signal = Arc::clone(&signal);
+        let outcome = drive_invocation(
+            async move {
+                let step = ctx
+                    .step(move |_| {
+                        let guard = FatalOnDrop(Arc::clone(&body_signal));
+                        let started = Arc::clone(&body_started);
+                        async move {
+                            let _guard = guard;
+                            started.store(true, Ordering::SeqCst);
+                            std::future::pending::<()>().await;
+                            Ok(())
+                        }
+                    })
+                    .name("hold")
+                    .spawn();
+                *handler_escaped.lock().expect("lock") = Some(step);
+                yield_three_times().await;
+                assert!(check_signal.fatal_error().is_none(), "no fatal yet");
+                panic!("handler boom");
+            },
+            ownership,
+            signal,
+        )
+        .await
+        .expect("the fatal error recorded during cleanup takes precedence over the panic");
+        assert!(started.load(Ordering::SeqCst), "the step body started");
+        assert_eq!(
+            outcome,
+            InvocationOutcome::Failed {
+                error: crate::error::WireError::new(
+                    Some("Fatal".to_owned()),
+                    Some("mismatch during cleanup".to_owned()),
+                ),
+            }
+        );
+        assert_eq!(tasks.live(), 0);
+    }
+
+    /// A handler that returns a value after a suspension was requested still
+    /// yields `Pending`: the interruption decides the outcome.
+    #[tokio::test]
+    async fn handler_value_after_suspend_request_is_pending() {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let handler_signal = Arc::clone(&signal);
+        let outcome = drive_invocation(
+            async move {
+                let _ctx = ctx;
+                handler_signal.request_suspend();
+                Ok::<_, crate::error::WireError>("done".to_owned())
+            },
+            ownership,
+            signal,
+        )
+        .await
+        .expect("the handler does not panic");
+        assert_eq!(outcome, InvocationOutcome::Pending);
+    }
+
+    /// The handler runs on a blessed task of its own, and its blessing is
+    /// removed once the drive ends.
+    #[tokio::test]
+    async fn handler_runs_as_blessed_operation_task() {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let outcome = drive_invocation(
+            async move {
+                let on_task = tokio::task::try_id().is_some();
+                let value = ctx
+                    .step(|_| async { Ok(1_i32) })
+                    .name("s")
+                    .await
+                    .map_err(|e| {
+                        crate::error::WireError::new(None::<String>, Some(e.to_string()))
+                    })?;
+                Ok::<_, crate::error::WireError>(format!("{on_task}:{value}"))
+            },
+            Arc::clone(&ownership),
+            signal,
+        )
+        .await
+        .expect("the handler does not panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("true:1".to_owned()));
+        assert_eq!(ownership.blessed_count(), 0);
+    }
+
+    /// The root task is not counted on the tracker, so a handler that waits
+    /// for idle does not wait for itself.
+    #[tokio::test]
+    async fn wait_idle_in_handler_does_not_wait_for_handler() {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let tasks = Arc::clone(signal.tasks());
+        let outcome = drive_invocation(
+            async move {
+                let step = ctx.step(|_| async { Ok(1_i32) }).name("quick").spawn();
+                let _ = step.await;
+                let idle = tokio::time::timeout(Duration::from_secs(1), tasks.wait_idle()).await;
+                Ok::<_, crate::error::WireError>(idle.is_ok().to_string())
+            },
+            ownership,
+            signal,
+        )
+        .await
+        .expect("the handler does not panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("true".to_owned()));
     }
 }

@@ -20,7 +20,9 @@ use crate::builders::{
 use crate::checkpoint_coalescer::{
     BatchLimits, CheckpointBatch, CheckpointCoalescer, TrackedUpdate, split_into_requests,
 };
-use crate::client::{CheckpointOutput, ExecutionClient, ExecutionClientError};
+use crate::client::{
+    CheckpointOutput, ExecutionClient, ExecutionClientError, ExecutionClientErrorScope,
+};
 use crate::driver::{SuspensionSignal, TaskOwnership};
 use crate::engine::{
     CheckpointLog, CheckpointRecord, CheckpointStatus, CheckpointStatusView, EngineState,
@@ -1300,11 +1302,13 @@ impl DurableContext {
     ) {
         let ctx = self.clone();
         let coalescer = Arc::clone(coalescer);
+        let publish_to = Arc::clone(batch);
         let batch = Arc::clone(batch);
-        // Detached mode of the spawn abstraction (src/future.rs): this
-        // internal task runs no user future and creates no durable
-        // operations, and it must survive a cancelled contributor.
-        crate::future::spawn_detached(async move {
+        // Detached mode of the task gateway (src/task.rs): this internal
+        // task runs no user future and creates no durable operations, and it
+        // must survive a cancelled contributor. It is still counted, so the
+        // invocation waits for an in-flight write before it returns.
+        let spawned = crate::task::spawn_detached(self.suspension_signal().tasks(), async move {
             let _writer = coalescer.writer_lock().lock().await;
             if let Some(updates) = coalescer.take_batch(&batch) {
                 // Failure latch (issue #43): once any buffered write has
@@ -1345,6 +1349,16 @@ impl DurableContext {
                 batch.publish(result);
             }
         });
+        // No Tokio runtime is running on this thread, so nothing can write
+        // the batch: every contributor receives the error instead of waiting
+        // forever. Nothing was written, so the invocation fails and the
+        // service invokes the function again.
+        if let Err(no_runtime) = spawned {
+            publish_to.publish(Err(ExecutionClientError::new(
+                ExecutionClientErrorScope::Invocation,
+                no_runtime.to_string(),
+            )));
+        }
     }
 
     /// Writes a sealed batch, splitting it into request-sized chunks that
@@ -2162,6 +2176,9 @@ impl DurableContext {
     /// Each item gets its own child context with an independent operation
     /// namespace.
     ///
+    /// A panic in an item propagates to the caller with its original
+    /// payload, and the SDK records nothing for it.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -2211,6 +2228,9 @@ impl DurableContext {
     /// Creates a parallel operation that executes named branches
     /// concurrently.
     ///
+    /// A panic in a branch propagates to the caller with its original
+    /// payload, and the SDK records nothing for it.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -2252,6 +2272,9 @@ impl DurableContext {
     /// Called with no futures, resolves to `Ok` with an empty `Vec`,
     /// matching `futures::future::try_join_all`.
     ///
+    /// A panic in an input propagates to the caller with its original
+    /// payload, and the SDK records nothing for it.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -2289,6 +2312,9 @@ impl DurableContext {
     ///
     /// Called with no futures, resolves to `Ok` with an empty `Vec`,
     /// matching `futures::future::join_all`.
+    ///
+    /// A panic in an input propagates to the caller with its original
+    /// payload, and the SDK records nothing for it.
     ///
     /// # Examples
     ///
@@ -2330,6 +2356,9 @@ impl DurableContext {
     /// Called with no futures, fails with
     /// [`CombinatorErrorKind::EmptyInput`](crate::CombinatorErrorKind::EmptyInput):
     /// there is no future that could succeed.
+    ///
+    /// A panic in an input propagates to the caller with its original
+    /// payload, and the SDK records nothing for it.
     ///
     /// # Examples
     ///
@@ -2373,6 +2402,9 @@ impl DurableContext {
     /// Called with no futures, fails with
     /// [`CombinatorErrorKind::EmptyInput`](crate::CombinatorErrorKind::EmptyInput):
     /// there is no future that could settle.
+    ///
+    /// A panic in an input propagates to the caller with its original
+    /// payload, and the SDK records nothing for it.
     ///
     /// # Examples
     ///
@@ -2575,7 +2607,7 @@ fn format_op_identity(op_type: &str, sub_type: Option<&str>, name: Option<&str>)
 
 #[cfg(test)]
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
-// behavior; production spawning is confined to the src/future.rs helpers.
+// behavior; production spawning is confined to the src/task.rs gateway.
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -3831,6 +3863,27 @@ mod tests {
             .action(aws_sdk_lambda::types::OperationAction::Start)
             .build()
             .expect("all required OperationUpdate fields set")
+    }
+
+    /// Without a Tokio runtime the batch flusher cannot start: every
+    /// contributor receives an invocation-scoped error instead of waiting
+    /// forever, and nothing is written.
+    #[test]
+    fn batch_flush_without_runtime_returns_invocation_error() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = coalescing_ctx(client.clone(), Duration::ZERO);
+        let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
+            ctx.checkpoint_updates(vec![make_update("op-a")]).await
+        });
+        let std::task::Poll::Ready(Err(err)) = polled else {
+            unreachable!("expected an immediate error, got {polled:?}");
+        };
+        assert_eq!(err.scope(), ExecutionClientErrorScope::Invocation);
+        assert!(
+            err.to_string().contains(crate::task::NO_RUNTIME_MESSAGE),
+            "unexpected error: {err}"
+        );
+        assert!(client.recorded_updates().is_empty(), "nothing is written");
     }
 
     /// Two concurrent checkpoint calls inside the delay window coalesce

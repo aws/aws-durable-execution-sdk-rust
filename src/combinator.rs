@@ -36,13 +36,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::context::DurableContext;
-use crate::driver::TaskOwnership;
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     ChildContextError, ChildContextErrorKind, CombinatorError, CombinatorErrorKind, OperationError,
     OperationErrorKind,
 };
 use crate::future::{DurableFuture, Settled};
+use crate::task::{NoRuntime, TrackedJoinSet};
 
 /// Wire sub-type for combinator operations (shared with child context
 /// since combinators ARE child-context ops with a combinator-flavored closure).
@@ -219,57 +219,34 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         // here instead of parking the caller's scope.
         let count = self.futures.len();
         let mut results: Vec<Option<O>> = (0..count).map(|_| None).collect();
-        let mut join_set = tokio::task::JoinSet::new();
-        // Maps a task's id back to its input index so a `JoinError` (panic
-        // or cancellation loses the task's payload, including the index) is
-        // still attributed to the correct position.
-        let mut task_index: std::collections::HashMap<tokio::task::Id, usize> =
-            std::collections::HashMap::with_capacity(count);
+        let mut join_set = constituent_set(&self.ctx);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            let abort = spawn_constituent(&self.ctx, &mut join_set, idx, future);
-            task_index.insert(abort.id(), idx);
+            spawn_constituent(&self.ctx, &mut join_set, idx, future)?;
         }
 
         let mut first_error: Option<(usize, OperationError)> = None;
         let mut parked = 0_usize;
-        while let Some(task_result) = join_set.join_next_with_id().await {
-            match task_result {
-                Ok((task_id, (idx, ConstituentOutcome::Settled(Ok(value))))) => {
-                    task_index.remove(&task_id);
+        while let Some((_, joined)) = join_set.join_next_with_id().await {
+            // A panicked input resumes its panic here.
+            match joined.into_value() {
+                (idx, ConstituentOutcome::Settled(Ok(value))) => {
                     if let Some(slot) = results.get_mut(idx) {
                         *slot = Some(value);
                     }
                 }
-                Ok((task_id, (idx, ConstituentOutcome::Settled(Err(op_err))))) => {
-                    task_index.remove(&task_id);
+                (idx, ConstituentOutcome::Settled(Err(op_err))) => {
                     first_error = Some((idx, op_err));
                     // Abort remaining tasks (fail-fast + loser-drop).
                     join_set.abort_all();
                     break;
                 }
-                Ok((task_id, (_idx, ConstituentOutcome::Parked))) => {
+                (_idx, ConstituentOutcome::Parked) => {
                     // The input parked its own scope; the join cannot
                     // complete this invocation, but runnable siblings keep
                     // going (they checkpoint their own results) and a
                     // settling error can still fail fast.
-                    task_index.remove(&task_id);
                     parked += 1;
-                }
-                Err(join_err) => {
-                    // JoinError means the task panicked or was cancelled.
-                    // Recover the input index from the task id.
-                    let Some(idx) = task_index.remove(&join_err.id()) else {
-                        return Err(combinator_internal_error(
-                            "task terminated with an unrecognized task id",
-                        ));
-                    };
-                    first_error = Some((
-                        idx,
-                        combinator_internal_error(&format!("task join failed: {join_err}")),
-                    ));
-                    join_set.abort_all();
-                    break;
                 }
             }
         }
@@ -433,51 +410,31 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
         // caller's scope.
         let count = self.futures.len();
         let mut settled: Vec<Option<Settled<O>>> = (0..count).map(|_| None).collect();
-        let mut join_set = tokio::task::JoinSet::new();
-        // Maps a task's id back to its input index so a `JoinError` is
-        // attributed to the correct slot instead of the first empty one.
-        let mut task_index: std::collections::HashMap<tokio::task::Id, usize> =
-            std::collections::HashMap::with_capacity(count);
+        let mut join_set = constituent_set(&self.ctx);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            let abort = spawn_constituent(&self.ctx, &mut join_set, idx, future);
-            task_index.insert(abort.id(), idx);
+            spawn_constituent(&self.ctx, &mut join_set, idx, future)?;
         }
 
         let mut parked = 0_usize;
-        while let Some(task_result) = join_set.join_next_with_id().await {
-            match task_result {
-                Ok((task_id, (idx, ConstituentOutcome::Settled(Ok(value))))) => {
-                    task_index.remove(&task_id);
+        while let Some((_, joined)) = join_set.join_next_with_id().await {
+            // A panicked input resumes its panic here.
+            match joined.into_value() {
+                (idx, ConstituentOutcome::Settled(Ok(value))) => {
                     if let Some(slot) = settled.get_mut(idx) {
                         *slot = Some(Settled::Fulfilled(value));
                     }
                 }
-                Ok((task_id, (idx, ConstituentOutcome::Settled(Err(op_err))))) => {
-                    task_index.remove(&task_id);
+                (idx, ConstituentOutcome::Settled(Err(op_err))) => {
                     if let Some(slot) = settled.get_mut(idx) {
                         *slot = Some(Settled::Rejected(op_err));
                     }
                 }
-                Ok((task_id, (_idx, ConstituentOutcome::Parked))) => {
+                (_idx, ConstituentOutcome::Parked) => {
                     // The input parked its own scope; its slot stays empty.
                     // Siblings keep running, a parked input never blocks
                     // them, and the decision is made after the drain.
-                    task_index.remove(&task_id);
                     parked += 1;
-                }
-                Err(join_err) => {
-                    // Task panicked or was cancelled: record as rejected at
-                    // ITS OWN index, recovered from the task id.
-                    let msg = format!("task join failed: {join_err}");
-                    let Some(idx) = task_index.remove(&join_err.id()) else {
-                        return Err(combinator_internal_error(
-                            "task terminated with an unrecognized task id",
-                        ));
-                    };
-                    if let Some(slot) = settled.get_mut(idx) {
-                        *slot = Some(Settled::Rejected(combinator_internal_error(&msg)));
-                    }
                 }
             }
         }
@@ -630,24 +587,19 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         // fail. Each constituent runs under its own suspension scope (see
         // `drive_constituent`), so a parked input surfaces as `Parked` here
         // instead of parking the caller's scope after a sibling succeeded.
-        let count = self.futures.len();
-        let mut join_set = tokio::task::JoinSet::new();
-        // Maps a task's id back to its input index so a `JoinError` is
-        // attributed to the correct position in the aggregate error list.
-        let mut task_index: std::collections::HashMap<tokio::task::Id, usize> =
-            std::collections::HashMap::with_capacity(count);
+        let mut join_set = constituent_set(&self.ctx);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            let abort = spawn_constituent(&self.ctx, &mut join_set, idx, future);
-            task_index.insert(abort.id(), idx);
+            spawn_constituent(&self.ctx, &mut join_set, idx, future)?;
         }
 
         let mut errors: Vec<(usize, crate::error::Source)> = Vec::new();
         let mut parked = 0_usize;
 
-        while let Some(task_result) = join_set.join_next_with_id().await {
-            match task_result {
-                Ok((_task_id, (_idx, ConstituentOutcome::Settled(Ok(value))))) => {
+        while let Some((_, joined)) = join_set.join_next_with_id().await {
+            // A panicked input resumes its panic here.
+            match joined.into_value() {
+                (_idx, ConstituentOutcome::Settled(Ok(value))) => {
                     // First success: cancel losers (drop via abort_all).
                     // Parked losers only ever parked their own constituent
                     // scopes, so recording the winner is not blocked by them.
@@ -661,30 +613,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                         .await?;
                     return Ok(value);
                 }
-                Ok((task_id, (idx, ConstituentOutcome::Settled(Err(op_err))))) => {
-                    task_index.remove(&task_id);
+                (idx, ConstituentOutcome::Settled(Err(op_err))) => {
                     errors.push((idx, Box::new(op_err)));
                 }
-                Ok((task_id, (_idx, ConstituentOutcome::Parked))) => {
+                (_idx, ConstituentOutcome::Parked) => {
                     // The input parked its own scope; it may still succeed on
                     // a later invocation, so it neither wins nor counts as a
                     // failure now.
-                    task_index.remove(&task_id);
                     parked += 1;
-                }
-                Err(join_err) => {
-                    let Some(idx) = task_index.remove(&join_err.id()) else {
-                        return Err(combinator_internal_error(
-                            "task terminated with an unrecognized task id",
-                        ));
-                    };
-                    errors.push((
-                        idx,
-                        crate::error::ContextualError::source_from(
-                            "task join failed",
-                            Box::new(join_err) as crate::error::Source,
-                        ),
-                    ));
                 }
             }
         }
@@ -767,7 +703,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
     /// Live path: races all futures; returns the first settled (success OR
     /// failure). Losers are dropped (cancelled).
     /// Replay path: returns the frozen result.
-    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         self.ctx.enforce_task_ownership()?;
 
@@ -842,30 +777,30 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
         // a losing input's park surfaces as `Parked` here instead of
         // suspending the caller after the winner already settled: the
         // defect that let replay pick a different winner (issue #49).
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut join_set = constituent_set(&self.ctx);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
-            spawn_constituent(&self.ctx, &mut join_set, idx, future);
+            spawn_constituent(&self.ctx, &mut join_set, idx, future)?;
         }
 
         // Wait for the first SETTLED task; parked inputs do not settle and
         // do not block a later sibling from winning.
-        while let Some(task_result) = join_set.join_next().await {
-            let settled_result = match task_result {
-                Ok((_idx, ConstituentOutcome::Parked)) => {
+        while let Some((_, joined)) = join_set.join_next_with_id().await {
+            // A panicked input resumes its panic here.
+            let settled_result = match joined.into_value() {
+                (_idx, ConstituentOutcome::Parked) => {
                     // The input parked its own scope; keep waiting for a
                     // sibling to settle.
                     continue;
                 }
-                Ok((_idx, ConstituentOutcome::Settled(result))) => Ok(result),
-                Err(join_err) => Err(join_err),
+                (_idx, ConstituentOutcome::Settled(result)) => result,
             };
 
             // Cancel all remaining losers.
             join_set.abort_all();
 
             match settled_result {
-                Ok(Ok(value)) => {
+                Ok(value) => {
                     // Winner is a success.
                     let serialized = serde_json::to_string(&value).map_err(|e| {
                         combinator_internal_error(&format!("serialization failed: {e}"))
@@ -874,7 +809,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                         .await?;
                     return Ok(value);
                 }
-                Ok(Err(op_err)) => {
+                Err(op_err) => {
                     // Winner is a failure: race propagates it. The losing
                     // error is preserved as the combinator error's source;
                     // the wire `error_type` carries the discriminator so
@@ -896,26 +831,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                     .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
                     .with_wire(wire));
                 }
-                Err(join_err) => {
-                    let wire = crate::error::WireError::new(
-                        Some(COMBINATOR_ERROR_TYPE),
-                        Some(format!("task join failed: {join_err}")),
-                    );
-                    checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
-                    // Attach the checkpointed context so the live error
-                    // matches what a replay of this record reconstructs.
-                    return Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                        CombinatorError::new(
-                            CombinatorErrorKind::Internal,
-                            vec![crate::error::ContextualError::source_from(
-                                "task join failed",
-                                Box::new(join_err) as crate::error::Source,
-                            )],
-                        ),
-                    ))
-                    .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
-                    .with_wire(wire));
-                }
             }
         }
 
@@ -923,19 +838,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
         // this invocation, so the race itself suspends. Nothing is
         // recorded: the winner is frozen only once an input settles.
         Ok(self.ctx.suspend_now().await)
-    }
-}
-
-/// Blesses the current task for task-ownership checks.
-///
-/// Call this at the top of a spawned async block (in `JoinSet` tasks) to
-/// register the task with the ownership guard. This is a shared helper to
-/// ensure the obligation cannot be forgotten when adding new spawn sites.
-///
-/// Does nothing if called outside a tokio spawned task (`try_id()` returns `None`).
-pub(crate) fn bless_current_task(task_ownership: &TaskOwnership) {
-    if let Some(task_id) = tokio::task::try_id() {
-        task_ownership.bless_task(task_id);
     }
 }
 
@@ -958,24 +860,37 @@ enum ConstituentOutcome<O> {
 /// This is what keeps a losing input's suspension from ending the
 /// invocation after a winner already settled (issue #49), and what lets
 /// the combinator decide for itself when no input can make progress.
+///
+/// The join set blesses the task before its first poll. When no Tokio
+/// runtime is running, the input is dropped and the combinator returns the
+/// error.
 fn spawn_constituent<O: Send + 'static>(
     ctx: &DurableContext,
-    join_set: &mut tokio::task::JoinSet<(usize, ConstituentOutcome<O>)>,
+    join_set: &mut TrackedJoinSet<(usize, ConstituentOutcome<O>)>,
     idx: usize,
     future: DurableFuture<O>,
-) -> tokio::task::AbortHandle {
+) -> Result<(), OperationError> {
     use crate::driver::{ScopeOutcome, drive_scope};
 
     let scope = Arc::new(ctx.suspension_signal().new_child_scope());
     future.set_park_scope(Arc::clone(&scope));
-    let task_ownership = ctx.task_ownership().clone();
-    join_set.spawn(async move {
-        bless_current_task(&task_ownership);
-        match drive_scope(future, scope).await {
-            ScopeOutcome::Completed(result) => (idx, ConstituentOutcome::Settled(result)),
-            ScopeOutcome::Suspended => (idx, ConstituentOutcome::Parked),
-        }
-    })
+    join_set
+        .spawn(ctx.task_ownership(), async move {
+            match drive_scope(future, scope).await {
+                ScopeOutcome::Completed(result) => (idx, ConstituentOutcome::Settled(result)),
+                ScopeOutcome::Suspended => (idx, ConstituentOutcome::Parked),
+            }
+        })
+        .map(drop)
+        .map_err(NoRuntime::operation_error)
+}
+
+/// Creates the join set of one combinator's inputs, counted on the
+/// invocation's task tracker.
+fn constituent_set<O: Send + 'static>(
+    ctx: &DurableContext,
+) -> TrackedJoinSet<(usize, ConstituentOutcome<O>)> {
+    TrackedJoinSet::new(Arc::clone(ctx.suspension_signal().tasks()))
 }
 
 /// Refuses a combinator's terminal checkpoint once an execution-fatal error
@@ -1323,11 +1238,13 @@ fn replay_combinator_failure(
 )]
 // reason: test assertions
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
-// behavior; production spawning is confined to the src/future.rs helpers.
+// behavior; production spawning is confined to the src/task.rs gateway.
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::client::InMemoryExecutionClient;
     use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
+    use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1548,124 +1465,351 @@ mod tests {
         assert!(matches!(err.kind(), OperationErrorKind::Combinator(_)));
     }
 
-    // === panic attribution tests ===
+    // === panic propagation tests ===
     //
-    // A panicking future surfaces as a `JoinError` with no payload; these
-    // tests pin that the error is attributed to the panicking future's OWN
-    // index even when a slower, earlier-indexed future is still running.
+    // A panic in a combinator input fails the invocation: the combinator
+    // resumes it with its original payload and records nothing for it.
 
-    #[tokio::test]
-    async fn try_join_all_panic_reports_panicking_index() {
-        let ctx = test_ctx_with_client(CheckpointLog::empty());
-        // Index 0 is slow; index 1 panics first.
-        let a = DurableFuture::from_async(async {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            Ok(1)
-        });
-        let b: DurableFuture<i32> = DurableFuture::from_async(async { panic!("boom-idx1") });
+    /// A context over an in-memory client, whose recorded updates a test
+    /// reads.
+    fn recording_ctx(log: CheckpointLog) -> (DurableContext, Arc<InMemoryExecutionClient>) {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token-1".to_owned(),
+        );
+        (ctx, client)
+    }
 
-        let op_id = ctx.mint_id();
-        let exec = TryJoinAllExecution {
-            ctx,
-            op_id,
-            name: None,
-            futures: vec![a, b],
-        };
-        let err = exec.execute().await.unwrap_err();
-        match err.kind() {
-            OperationErrorKind::Combinator(ce) => match ce.kind() {
-                CombinatorErrorKind::JoinFailed(details) => {
-                    assert_eq!(
-                        details.failed_index(),
-                        1,
-                        "panic must be attributed to the panicking future's index"
-                    );
-                }
-                other => panic!("expected JoinFailed, got: {other:?}"),
+    /// Drives the combinator `run` builds through the invocation driver,
+    /// asserts that the driver returned a panic, and returns its `&'static str`
+    /// payload and whether any recorded update has action `FAIL`.
+    async fn panic_of<F, Fut>(run: F) -> (Option<&'static str>, bool)
+    where
+        F: FnOnce(DurableContext) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (ctx, client) = recording_ctx(CheckpointLog::empty());
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.suspension_signal());
+        let handler = run(ctx);
+        let outcome = crate::driver::drive_invocation(
+            async move {
+                handler.await;
+                Ok::<_, crate::error::WireError>("done".to_owned())
             },
-            other => panic!("expected Combinator, got: {other:?}"),
-        }
+            ownership,
+            signal,
+        )
+        .await;
+        let Err(payload) = outcome else {
+            panic!("the input panic must reach the invocation driver, got {outcome:?}");
+        };
+        let wrote_fail = client
+            .recorded_updates()
+            .iter()
+            .any(|u| u.action() == &aws_sdk_lambda::types::OperationAction::Fail);
+        (
+            crate::task::test_support::str_payload(payload.as_ref()),
+            wrote_fail,
+        )
     }
 
     #[tokio::test]
-    async fn join_all_panic_lands_in_its_own_slot() {
-        let ctx = test_ctx_with_client(CheckpointLog::empty());
-        // Index 0 is slow and succeeds; index 1 panics BEFORE index 0
-        // completes: the rejection must land in slot 1, not slot 0.
-        let a = DurableFuture::from_async(async {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            Ok(1)
-        });
-        let b: DurableFuture<i32> = DurableFuture::from_async(async { panic!("boom-idx1") });
+    async fn try_join_all_input_panic_propagates_payload() {
+        let (message, wrote_fail) = panic_of(|ctx| async move {
+            let a = DurableFuture::from_async(async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(1)
+            });
+            let b: DurableFuture<i32> = DurableFuture::from_async(async { panic!("boom-idx1") });
+            let op_id = ctx.mint_id();
+            let exec = TryJoinAllExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![a, b],
+            };
+            let _ = exec.execute().await;
+        })
+        .await;
+        assert_eq!(message, Some("boom-idx1"));
+        assert!(!wrote_fail, "a panic records no FAIL");
+    }
 
+    #[tokio::test]
+    async fn join_all_input_panic_propagates_payload() {
+        let (message, wrote_fail) = panic_of(|ctx| async move {
+            let a = DurableFuture::from_async(async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(1)
+            });
+            let b: DurableFuture<i32> = DurableFuture::from_async(async { panic!("boom-idx1") });
+            let op_id = ctx.mint_id();
+            let exec = JoinAllExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![a, b],
+            };
+            let _ = exec.execute().await;
+        })
+        .await;
+        assert_eq!(message, Some("boom-idx1"));
+        assert!(!wrote_fail, "a panic records no FAIL");
+    }
+
+    #[tokio::test]
+    async fn select_ok_input_panic_propagates_payload() {
+        let (message, wrote_fail) = panic_of(|ctx| async move {
+            let a: DurableFuture<String> = DurableFuture::from_async(async { panic!("boom-idx0") });
+            let b: DurableFuture<String> = DurableFuture::from_async(std::future::pending());
+            let op_id = ctx.mint_id();
+            let exec = SelectOkExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![a, b],
+            };
+            let _ = exec.execute().await;
+        })
+        .await;
+        assert_eq!(message, Some("boom-idx0"));
+        assert!(!wrote_fail, "a panic records no FAIL");
+    }
+
+    #[tokio::test]
+    async fn race_input_panic_propagates_payload() {
+        let (message, wrote_fail) = panic_of(|ctx| async move {
+            let a: DurableFuture<String> = DurableFuture::from_async(async { panic!("boom-idx0") });
+            let b: DurableFuture<String> = DurableFuture::from_async(std::future::pending());
+            let op_id = ctx.mint_id();
+            let exec = RaceExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![a, b],
+            };
+            let _ = exec.execute().await;
+        })
+        .await;
+        assert_eq!(message, Some("boom-idx0"));
+        assert!(!wrote_fail, "a panic records no FAIL");
+    }
+
+    // === replay of panic records an earlier release wrote ===
+
+    #[tokio::test]
+    async fn join_failed_record_from_a_panic_still_replays() {
+        let (wire_id, record) = failed_record(
+            "1",
+            "CombinatorError.JoinFailed.1",
+            r#"task join failed: task 7 panicked with message "boom""#,
+        );
+        let ctx = test_ctx(CheckpointLog::from_records(vec![(wire_id, record)]));
         let op_id = ctx.mint_id();
-        let exec = JoinAllExecution {
+        let exec = TryJoinAllExecution::<i32> {
             ctx,
             op_id,
             name: None,
-            futures: vec![a, b],
+            futures: vec![],
+        };
+        let err = exec.execute().await.unwrap_err();
+        let OperationErrorKind::Combinator(ce) = err.kind() else {
+            panic!("expected Combinator, got: {:?}", err.kind());
+        };
+        let CombinatorErrorKind::JoinFailed(details) = ce.kind() else {
+            panic!("expected JoinFailed, got: {:?}", ce.kind());
+        };
+        assert_eq!(details.failed_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn join_all_panic_slot_from_an_earlier_release_still_replays() {
+        let payload = r#"[{"status":"fulfilled","value":1},{"status":"rejected","message":"task join failed: task 7 panicked with message \"boom\"","error_type":"CombinatorError"}]"#;
+        let (wire_id, record) = succeeded_record("1", payload);
+        let ctx = test_ctx(CheckpointLog::from_records(vec![(wire_id, record)]));
+        let op_id = ctx.mint_id();
+        let exec = JoinAllExecution::<i32> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
         };
         let result = exec.execute().await.unwrap();
         assert_eq!(result.len(), 2);
-        assert!(
-            matches!(&result[0], Settled::Fulfilled(1)),
-            "slow earlier future must keep its own slot"
-        );
-        assert!(
-            matches!(&result[1], Settled::Rejected(_)),
-            "panic must land in the panicking future's slot"
+        assert!(matches!(&result[0], Settled::Fulfilled(1)));
+        let Settled::Rejected(err) = &result[1] else {
+            panic!("slot 1 must be rejected, got {:?}", result[1]);
+        };
+        let wire = err.wire().expect("the replayed slot carries its record");
+        assert_eq!(wire.error_type(), Some("CombinatorError"));
+        assert_eq!(
+            wire.error_message(),
+            Some(r#"task join failed: task 7 panicked with message "boom""#)
         );
     }
 
     #[tokio::test]
-    async fn select_ok_panic_error_keeps_input_order() {
-        let ctx = test_ctx_with_client(CheckpointLog::empty());
-        // Index 0 panics immediately; index 1 fails slowly. All fail, and the
-        // aggregate error list must be in INPUT order (panic first).
-        let a: DurableFuture<String> = DurableFuture::from_async(async { panic!("boom-idx0") });
-        let b: DurableFuture<String> = DurableFuture::from_async(async {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                CombinatorError::new(
-                    CombinatorErrorKind::Internal,
-                    vec!["err-idx1".to_owned().into()],
-                ),
-            )))
-        });
-
+    async fn select_ok_panic_loser_from_an_earlier_release_still_replays() {
+        let losers_payload = serde_json::to_string(&vec![
+            SerializedLoser {
+                error_type: Some("CombinatorError".to_owned()),
+                message: Some("task join failed".to_owned()),
+                error_data: None,
+                stack_trace: Vec::new(),
+            },
+            SerializedLoser {
+                error_type: Some("Error".to_owned()),
+                message: Some("err-idx1".to_owned()),
+                error_data: None,
+                stack_trace: Vec::new(),
+            },
+        ])
+        .expect("payload serializes");
+        let (wire_id, record) = failed_record_with_data(
+            "1",
+            "CombinatorError.AllFailed",
+            "all 2 futures failed: [0] task join failed; [1] err-idx1",
+            Some(losers_payload),
+        );
+        let ctx = test_ctx(CheckpointLog::from_records(vec![(wire_id, record)]));
         let op_id = ctx.mint_id();
-        let exec = SelectOkExecution {
+        let exec = SelectOkExecution::<String> {
             ctx,
             op_id,
             name: None,
-            futures: vec![a, b],
+            futures: vec![],
         };
         let err = exec.execute().await.unwrap_err();
-        match err.kind() {
-            OperationErrorKind::Combinator(ce) => match ce.kind() {
-                CombinatorErrorKind::AllFailed => {
-                    let errors: Vec<String> = ce
-                        .failures()
-                        .iter()
-                        .map(|e| crate::error::chain_string(&**e))
-                        .collect();
-                    assert_eq!(errors.len(), 2);
-                    assert!(
-                        errors[0].contains("task join failed"),
-                        "index 0 (the panic) must sort first: {errors:?}"
-                    );
-                    assert!(
-                        errors[1].contains("err-idx1"),
-                        "index 1 must sort second: {errors:?}"
-                    );
-                }
-                other => panic!("expected AllFailed, got: {other:?}"),
-            },
-            other => panic!("expected Combinator, got: {other:?}"),
-        }
+        let OperationErrorKind::Combinator(ce) = err.kind() else {
+            panic!("expected Combinator, got: {:?}", err.kind());
+        };
+        assert!(matches!(ce.kind(), CombinatorErrorKind::AllFailed));
+        let failures = ce.failures();
+        assert_eq!(failures.len(), 2);
+        let first = failures[0]
+            .downcast_ref::<crate::error::ReplayedFailure>()
+            .expect("replayed loser is a ReplayedFailure")
+            .wire();
+        assert_eq!(first.error_type(), Some("CombinatorError"));
+        assert_eq!(first.error_message(), Some("task join failed"));
     }
 
-    // === join_all tests ===
+    #[tokio::test]
+    async fn race_panic_record_from_an_earlier_release_still_replays() {
+        let message = r#"task join failed: task 7 panicked with message "boom""#;
+        let (wire_id, record) = failed_record("1", "CombinatorError", message);
+        let ctx = test_ctx(CheckpointLog::from_records(vec![(wire_id, record)]));
+        let op_id = ctx.mint_id();
+        let exec = RaceExecution::<String> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        };
+        let err = exec.execute().await.unwrap_err();
+        let OperationErrorKind::Combinator(ce) = err.kind() else {
+            panic!("expected Combinator, got: {:?}", err.kind());
+        };
+        assert!(matches!(ce.kind(), CombinatorErrorKind::Internal));
+        let failure = ce.failures()[0]
+            .downcast_ref::<crate::error::ReplayedFailure>()
+            .expect("replayed failure is a ReplayedFailure")
+            .wire();
+        assert_eq!(failure.error_message(), Some(message));
+    }
+
+    // === no Tokio runtime ===
+    //
+    // Each combinator returns the no-runtime error when it cannot start an
+    // input's task, instead of panicking.
+
+    /// Polls the combinator `run` builds once on a thread with no Tokio
+    /// runtime, and asserts that it resolved to the no-runtime error.
+    fn assert_no_runtime_error<F, Fut, T>(run: F)
+    where
+        F: FnOnce(DurableContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, OperationError>>,
+        T: Send + std::fmt::Debug + 'static,
+    {
+        let ctx = test_ctx_with_client(CheckpointLog::empty());
+        let polled = crate::task::test_support::poll_once_without_runtime(move || run(ctx));
+        let std::task::Poll::Ready(Err(err)) = polled else {
+            panic!("expected an immediate error, got {polled:?}");
+        };
+        assert!(
+            format!("{err:#}").contains(crate::task::NO_RUNTIME_MESSAGE),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Two inputs that each succeed at once.
+    fn two_inputs() -> Vec<DurableFuture<i32>> {
+        vec![
+            DurableFuture::from_async(async { Ok(1) }),
+            DurableFuture::from_async(async { Ok(2) }),
+        ]
+    }
+
+    #[test]
+    fn try_join_all_without_runtime_returns_error() {
+        assert_no_runtime_error(|ctx| {
+            let op_id = ctx.mint_id();
+            TryJoinAllExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: two_inputs(),
+            }
+            .execute()
+        });
+    }
+
+    #[test]
+    fn join_all_without_runtime_returns_error() {
+        assert_no_runtime_error(|ctx| {
+            let op_id = ctx.mint_id();
+            JoinAllExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: two_inputs(),
+            }
+            .execute()
+        });
+    }
+
+    #[test]
+    fn select_ok_without_runtime_returns_error() {
+        assert_no_runtime_error(|ctx| {
+            let op_id = ctx.mint_id();
+            SelectOkExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: two_inputs(),
+            }
+            .execute()
+        });
+    }
+
+    #[test]
+    fn race_without_runtime_returns_error() {
+        assert_no_runtime_error(|ctx| {
+            let op_id = ctx.mint_id();
+            RaceExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: two_inputs(),
+            }
+            .execute()
+        });
+    }
 
     #[tokio::test]
     async fn join_all_mixed_outcomes() {
@@ -2303,14 +2447,14 @@ mod tests {
 
     // === Task-ownership tests ===
     //
-    // These verify that combinator-spawned JoinSet tasks are blessed and
-    // do NOT trigger ownership errors when the guard is active (context
-    // created inside tokio::spawn where try_id() returns Some).
+    // These verify that combinator input tasks are blessed and do NOT
+    // trigger ownership errors when the guard is active (context created
+    // inside tokio::spawn where try_id() returns Some).
     //
     // Each branch calls `ctx.enforce_task_ownership()`: the same check
     // that every durable operation (step, invoke, etc.) performs at entry.
-    // Without the bless_current_task() call in the combinator spawn sites,
-    // these tests FAIL with ownership errors.
+    // Without the blessing in the task gateway's wrapper, these tests FAIL
+    // with ownership errors.
 
     #[tokio::test]
     async fn try_join_all_ownership_blessed() {

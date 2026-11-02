@@ -97,9 +97,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called outside a tokio runtime.
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
     pub fn spawn(self) -> DurableFuture<Vec<O>> {
         spawn_terminal!(self)
     }
@@ -210,9 +211,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called outside a tokio runtime.
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
     pub fn spawn(self) -> DurableFuture<Vec<Settled<O>>> {
         spawn_terminal!(self)
     }
@@ -320,9 +322,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called outside a tokio runtime.
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
     pub fn spawn(self) -> DurableFuture<O> {
         spawn_terminal!(self)
     }
@@ -430,9 +433,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called outside a tokio runtime.
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
     pub fn spawn(self) -> DurableFuture<O> {
         spawn_terminal!(self)
     }

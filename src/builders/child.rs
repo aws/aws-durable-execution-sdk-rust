@@ -136,9 +136,10 @@ where
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called outside a tokio runtime.
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
     ///
     /// # Examples
     ///

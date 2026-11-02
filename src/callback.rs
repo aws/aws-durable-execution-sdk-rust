@@ -825,7 +825,7 @@ fn wfcb_internal_error(msg: &str) -> OperationError {
 
 #[cfg(test)]
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
-// behavior; production spawning is confined to the src/future.rs helpers.
+// behavior; production spawning is confined to the src/task.rs gateway.
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -1388,7 +1388,12 @@ mod tests {
         // retry (backend-owned timer), which suspends the invocation instead
         // of surfacing a fabricated error to the caller.
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -1500,6 +1505,7 @@ mod tests {
         // will error at cb.result(). We just need to verify that the
         // submitter ran and checkpoints were produced.
         let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
             Arc::clone(ctx.suspension_signal()),
             exec.execute(),
         )
@@ -1640,6 +1646,7 @@ mod tests {
         // Execution should suspend at callback.result() since the callback
         // is pending. But the submitter must NOT have been re-invoked.
         let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
             Arc::clone(ctx.suspension_signal()),
             exec.execute(),
         )
@@ -1685,7 +1692,12 @@ mod tests {
         // retry (backend-owned timer), which suspends the invocation instead
         // of surfacing a fabricated error to the caller.
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
 
         // Verify checkpoint calls were made for the step execution path:
@@ -1785,6 +1797,7 @@ mod tests {
 
         // Execute: will suspend at callback result, but submitter runs.
         let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
             Arc::clone(ctx.suspension_signal()),
             exec.execute(),
         )

@@ -887,7 +887,7 @@ const STEP_INTERRUPTED_MESSAGE: &str = "The step execution process was initiated
 #[expect(clippy::panic)]
 // reason: test assertions with descriptive messages
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
-// behavior; production spawning is confined to the src/future.rs helpers.
+// behavior; production spawning is confined to the src/task.rs gateway.
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -1530,7 +1530,12 @@ mod tests {
         // Attempt 1: the strategy retries, so the step suspends.
         let (ctx, client) = context_over(Vec::new());
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, execution(ctx)).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            execution(ctx),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
         assert!(
             client
@@ -1676,7 +1681,12 @@ mod tests {
         let signal = Arc::clone(ctx.suspension_signal());
         // Retry timer is backend-owned: the operation suspends (parks) rather
         // than surfacing a fabricated error to the caller.
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -1717,7 +1727,12 @@ mod tests {
         };
 
         let signal = Arc::clone(ctx.suspension_signal());
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome = crate::driver::test_support::outcome_of(
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
 
         // The RETRY update must carry the rounded-up delay.
@@ -1908,11 +1923,13 @@ mod tests {
             delay: Duration::from_secs(5),
         });
         let signal = Arc::clone(ctx.suspension_signal());
+        let ownership = Arc::clone(ctx.task_ownership());
         let exec = at_most_once_over_started(ctx, Some(strategy), Arc::clone(&executed));
 
         // Retry timer is backend-owned: the operation suspends (parks) rather
         // than surfacing a fabricated retry-schedule error to the caller.
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome =
+            crate::driver::test_support::outcome_of(ownership, signal, exec.execute()).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
         assert_eq!(*seen.lock().expect("kind log lock"), ["step interrupted"]);
         let retry = recorded_error_for(&client, &OperationAction::Retry);
@@ -1931,9 +1948,11 @@ mod tests {
         let executed = Arc::new(AtomicBool::new(false));
         let (ctx, client) = context_over(vec![step_record(CheckpointStatus::Started, 0, None)]);
         let signal = Arc::clone(ctx.suspension_signal());
+        let ownership = Arc::clone(ctx.task_ownership());
         let exec = at_most_once_over_started(ctx, None, executed);
 
-        let outcome = crate::driver::test_support::outcome_of(signal, exec.execute()).await;
+        let outcome =
+            crate::driver::test_support::outcome_of(ownership, signal, exec.execute()).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
         let retry = recorded_error_for(&client, &OperationAction::Retry);
         assert_eq!(retry.error_type(), Some(STEP_INTERRUPTED_ERROR_TYPE));

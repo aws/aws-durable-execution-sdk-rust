@@ -151,9 +151,10 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called outside a tokio runtime.
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
     pub fn spawn(self) -> DurableFuture<Callback<O>>
     where
         S: Serdes<O>,
@@ -431,9 +432,10 @@ where
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called outside a tokio runtime.
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
     pub fn spawn(self) -> DurableFuture<O> {
         spawn_terminal!(self)
     }
