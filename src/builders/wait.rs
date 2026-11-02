@@ -118,7 +118,7 @@ impl WaitBuilder {
     /// }
     /// ```
     pub fn spawn(self) -> DurableFuture<()> {
-        spawn_terminal!(self)
+        spawn_terminal!(self, awaited)
     }
 }
 

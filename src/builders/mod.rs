@@ -71,13 +71,33 @@ macro_rules! preflight_identity {
 /// The builder must have a `ctx: DurableContext` field and implement
 /// [`IntoFuture`] with
 /// `IntoFuture = DurableFuture<_>`.
+///
+/// The `awaited` arm is for an operation that waits on the service: a
+/// wait, an invoke or a `wait_for_condition`. It runs the operation on a
+/// clone of the context that carries a first-poll flag, so the refresh
+/// scheduler refreshes the operation only once the returned handle is
+/// first polled (see [`crate::coordinator`]).
 macro_rules! spawn_terminal {
     ($builder:expr) => {{
         let builder = $builder;
         let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
         let coordinator = ::std::sync::Arc::clone(builder.ctx.coordinator());
         let future = ::std::future::IntoFuture::into_future(builder);
-        $crate::future::DurableFuture::spawn_blessed(future, &task_ownership, &coordinator)
+        $crate::future::DurableFuture::spawn_blessed(future, &task_ownership, &coordinator, None)
+    }};
+    ($builder:expr, awaited) => {{
+        let mut builder = $builder;
+        let flag = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
+        builder.ctx = builder.ctx.with_awaited(::std::sync::Arc::clone(&flag));
+        let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
+        let coordinator = ::std::sync::Arc::clone(builder.ctx.coordinator());
+        let future = ::std::future::IntoFuture::into_future(builder);
+        $crate::future::DurableFuture::spawn_blessed(
+            future,
+            &task_ownership,
+            &coordinator,
+            Some(flag),
+        )
     }};
 }
 

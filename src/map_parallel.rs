@@ -3644,6 +3644,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )
@@ -3671,6 +3672,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )
@@ -3701,6 +3703,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )
@@ -4273,6 +4276,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             )
@@ -5186,6 +5190,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             )
@@ -5599,6 +5604,7 @@ mod tests {
         let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let handler = run(ctx);
         let outcome = crate::driver::drive_invocation(
             async move {
@@ -5607,6 +5613,7 @@ mod tests {
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await;
@@ -6084,6 +6091,7 @@ mod tests {
             .invoke::<String, String>("target-fn", value.clone())
             .payload_serdes(invoke_rec.clone());
         let outcome = crate::driver::test_support::outcome_of(
+            invoke_ctx.clone(),
             Arc::clone(invoke_ctx.task_ownership()),
             signal,
             invoke_fut,
@@ -6249,6 +6257,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             ),
@@ -6272,6 +6281,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             ),
@@ -6325,6 +6335,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )]);
@@ -6584,6 +6595,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )
@@ -6663,6 +6675,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             )
@@ -6741,6 +6754,7 @@ mod tests {
                     callback_id: None,
                     op_type: Some("Step".to_owned()),
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             )
@@ -6814,6 +6828,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             ),
@@ -7189,6 +7204,7 @@ mod tests {
                     callback_id: None,
                     op_type: Some("Context".to_owned()),
                     sub_type: Some("ParallelBranch".to_owned()),
+                    due_at: None,
                     op_name: None,
                 },
             )
@@ -7646,6 +7662,7 @@ mod tests {
         let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let guard = no_guard();
         let handler = {
             let ctx = ctx.clone();
@@ -7663,7 +7680,7 @@ mod tests {
         };
         let outcome = tokio::time::timeout(
             EARLY_BOUND,
-            crate::driver::drive_invocation(handler, ownership, signal, None),
+            crate::driver::drive_invocation(handler, ownership, signal, root, None),
         )
         .await
         .expect("the invocation does not wait for the abandoned item");

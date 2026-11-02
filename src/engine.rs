@@ -287,6 +287,12 @@ pub(crate) struct CheckpointRecord {
     /// The operation name assigned by the user (if any). Used for
     /// non-determinism detection.
     pub(crate) op_name: Option<String>,
+    /// When the operation is next due: a wait's scheduled end, or a
+    /// step's next attempt. `None` when the service sent neither, or sent
+    /// a value that does not convert. The refresh scheduler
+    /// ([`crate::coordinator`]) arms a waiting operation's first refresh
+    /// at this time.
+    pub(crate) due_at: Option<std::time::SystemTime>,
 }
 
 #[cfg(test)]
@@ -312,6 +318,7 @@ impl CheckpointRecord {
             op_type: None,
             sub_type: None,
             op_name: None,
+            due_at: None,
         }
     }
 }
@@ -369,9 +376,14 @@ pub(crate) struct TerminalReplaySnapshot {
 ///
 /// The log is populated from the backend on invocation start, then updated
 /// during execution as checkpoint responses merge backend-assigned fields
-/// (e.g. `callback_id`) into the live log via [`Self::insert`]. Results of
-/// operations completed by other invocations still only become visible when
-/// the next invocation reloads the log from the backend.
+/// (e.g. `callback_id`) into the live log via [`Self::insert`]. Every merged
+/// response also carries the operations the service changed since the last
+/// one, so an operation that an external caller or a timer completed
+/// becomes visible in this invocation when the next checkpoint response
+/// arrives. While an operation waits beside other SDK work, the refresh
+/// scheduler (see [`crate::coordinator`]) sends checkpoints with no updates
+/// to get such a response. Without one, the result becomes visible when the
+/// next invocation reloads the log from the backend.
 #[derive(Debug)]
 pub(crate) struct CheckpointLog {
     /// Records keyed by wire operation ID for fast lookup during replay.
@@ -784,6 +796,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )]);
@@ -817,6 +830,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )]);
@@ -856,6 +870,7 @@ mod tests {
             callback_id: Some("cb-123".to_owned()),
             op_type: Some("Step".to_owned()),
             sub_type: Some("Step".to_owned()),
+            due_at: None,
             op_name: Some("my-step".to_owned()),
         }
     }
@@ -943,6 +958,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             ),
@@ -966,6 +982,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             ),
@@ -1031,6 +1048,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )]));
@@ -1072,6 +1090,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             ),
@@ -1095,6 +1114,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             ),

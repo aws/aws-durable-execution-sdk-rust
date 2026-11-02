@@ -172,16 +172,26 @@ destinations do not trigger, and X-Ray does not mark the trace as an error.
 Monitor and alarm on the durable execution status instead, via
 `get-durable-execution` or `list-durable-executions-by-function`.
 
-Rust returns `PENDING` only when no SDK-owned local work can make progress
-and at least one attached service wait remains.
+Durable operations are normal Rust futures. A waiting operation stays
+pending. While other SDK work runs, the SDK refreshes service state and may
+continue the operation in the same invocation. When no SDK work remains,
+the invocation ends with `PENDING`, every future is dropped, and replay
+resumes them later. A durable wait is a possible invocation boundary, not a
+certain one, so correctness must not depend on which. Rust returns
+`PENDING` only when no SDK-owned local work can make progress and at least
+one attached service wait remains. Tokio tasks, blocking tasks and threads
+that your code creates are outside that guarantee.
 
 An `Err` is a recoverable operation failure. A panic fails the Lambda
 invocation. A panic in a step body, a map item, a parallel branch or a
 combinator input propagates unchanged, the SDK records nothing for it, and
 the service invokes the function again. A panic that happens on every
 attempt therefore repeats until the execution times out. Return an `Err` to
-fail an operation. Before the panic leaves the SDK, the SDK cancels every
-task it started and waits until each has stopped. With `panic = "abort"`
+fail an operation. A panic in a task whose handle was dropped also fails
+the invocation. When several panics happen in one invocation, the SDK
+resumes the first one it records and drops the others. Before the panic
+leaves the SDK, the SDK cancels every task it started and waits until each
+has stopped. With `panic = "abort"`
 the process exits at the panic and no cleanup runs.
 
 `DurableContext` is a cheap-to-clone handle backed by an `Arc`, and it is
@@ -378,7 +388,8 @@ ctx.wait(Duration::from_secs(60)).name("cooldown").await?;
 ```
 
 The duration is rounded up to whole seconds, so a wait never ends early, and
-a wait shorter than one second waits one second.
+a wait shorter than one second waits one second. A wait that ends while
+other work runs continues in the same invocation.
 
 ### invoke
 
@@ -391,6 +402,9 @@ let receipt = ctx
     .name("delegate")
     .await?;
 ```
+
+An invoke whose target finishes while other work runs continues in the same
+invocation.
 
 ### wait_for_condition
 
@@ -426,7 +440,8 @@ argument, so an unbounded strategy cannot be constructed), and the
 remaining knobs default to 60 attempts, 5 second initial delay, 5 minute
 maximum delay, 1.5 backoff rate, and full jitter, matching the JS and
 Python SDKs. With no strategy set at all, the check runs exactly once and
-the operation completes with that state.
+the operation completes with that state. A check that becomes due while
+other work runs continues in the same invocation.
 
 ### callbacks
 
@@ -459,6 +474,10 @@ let approval: String = ctx
 Both builders take `.timeout(...)` and `.heartbeat(...)`.
 `wait_for_callback` also takes `.submitter_retry(...)`, which retries the
 submitter with the same retry strategy shape a step uses.
+
+A callback that an external system completes while other work runs
+continues in the same invocation. `cb.spawn_result()` waits for the result
+on its own task, as `.spawn()` does for other operations.
 
 ### child contexts
 

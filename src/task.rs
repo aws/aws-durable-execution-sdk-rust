@@ -22,6 +22,16 @@
 //! original payload. So tokio never sees a panic from an SDK task, and no
 //! consumer handles a `JoinError`.
 //!
+//! An outcome can have no reader: the task is detached, or its handle, its
+//! join set or its blocking waiter was dropped. A panic in such an outcome
+//! still fails the invocation. So it is recorded on the invocation's
+//! [`InvocationCoordinator`], which keeps the first invocation-failing
+//! panic for the driver. A value without a reader is dropped inside a
+//! catch, and a panic from its destructor is recorded the same way. A panic
+//! of a task's future while the task is aborted is recorded too. At the end
+//! of the drive, [`TaskTracker::claim_unread_panics`] records every panic
+//! that still sits unread in a slot whose handle is alive.
+//!
 //! The wrapper of an operation task registers the task with the
 //! task-ownership check before the first poll of its future, and removes
 //! it before the task exits. So every task that can run a durable
@@ -46,15 +56,15 @@
 //! 4. Once the phase is not `Running`, the wrapper no longer polls its
 //!    future.
 //!
-//! Detached tasks run no user code, take no activity permit and ignore the
-//! phase.
+//! Detached tasks run the user's checkpoint client, but no handler code.
+//! They take no activity permit and ignore the phase.
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
 use tokio::task::{AbortHandle, Id, JoinSet};
@@ -117,6 +127,16 @@ pub(crate) struct TaskTracker {
     abortable: Mutex<Abortable>,
     /// Woken when `live` reaches zero.
     idle: tokio::sync::Notify,
+    /// The slots that received an outcome while their reader was alive
+    /// (see [`Self::claim_unread_panics`]).
+    unread: Mutex<Vec<Weak<dyn UnreadPanic>>>,
+}
+
+/// A slot that can hold an outcome nobody has read yet.
+trait UnreadPanic: Send + Sync {
+    /// Takes the panic payload the slot holds, if it holds one. Leaves any
+    /// other outcome in the slot.
+    fn claim_panic(&self) -> Option<Payload>;
 }
 
 impl TaskTracker {
@@ -129,6 +149,33 @@ impl TaskTracker {
                 aborting: false,
             }),
             idle: tokio::sync::Notify::new(),
+            unread: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Remembers a slot that received an outcome, so the cleanup can claim
+    /// a panic in it that no reader takes.
+    fn watch_unread(&self, slot: Weak<dyn UnreadPanic>) {
+        self.unread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(slot);
+    }
+
+    /// Records on `coordinator` every panic that is still unread in a
+    /// slot, including a slot whose handle is alive outside the handler.
+    ///
+    /// The driver calls it after every task has stopped, so no task
+    /// delivers an outcome after it. A handle that is polled afterwards
+    /// reads an unread value. It finds a claimed panic's slot empty and
+    /// stays pending.
+    pub(crate) fn claim_unread_panics(&self, coordinator: &InvocationCoordinator) {
+        let slots =
+            std::mem::take(&mut *self.unread.lock().unwrap_or_else(PoisonError::into_inner));
+        for slot in slots {
+            if let Some(payload) = slot.upgrade().and_then(|slot| slot.claim_panic()) {
+                record_or_discard(coordinator, payload);
+            }
         }
     }
 
@@ -310,9 +357,56 @@ fn current_task_id() -> Id {
     tokio::task::try_id().expect("a future that tokio spawned runs with a task ID")
 }
 
-/// Runs `f` and discards a panic from it.
-fn discard_panic(f: impl FnOnce()) {
-    drop(catch_unwind(AssertUnwindSafe(f)));
+/// Drops a panic payload that cannot become the invocation's outcome.
+///
+/// It is used only for a payload the coordinator rejected, a kept payload
+/// that a cancelled drive disposes of, a payload that a recorded fatal
+/// error outranks, and a second panic a task's gateway catches after it
+/// chose the task's first panic as the outcome.
+///
+/// A payload is a value of any type, and its destructor can panic too. So
+/// the payload is dropped inside a catch. When that destructor panics, the
+/// payload of that second panic is leaked with `mem::forget` instead of
+/// dropped, because its destructor can panic again. So no panic escapes.
+pub(crate) fn discard_panic(payload: Payload) {
+    if let Err(nested) = catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+        std::mem::forget(nested);
+    }
+}
+
+/// Hands an invocation-failing panic to `coordinator`, and drops a payload
+/// it does not keep through [`discard_panic`].
+pub(crate) fn record_or_discard(coordinator: &InvocationCoordinator, payload: Payload) {
+    if let Some(rejected) = coordinator.record_panic(payload) {
+        discard_panic(rejected);
+    }
+}
+
+/// Drops `value`, which no reader receives, inside a catch. A panic from
+/// its destructor is invocation-failing, so it is recorded on
+/// `coordinator`.
+pub(crate) fn drop_recorded<T>(coordinator: &InvocationCoordinator, value: T) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(value))) {
+        record_or_discard(coordinator, payload);
+    }
+}
+
+/// Drops `value` after the gateway chose an earlier panic as the task's
+/// outcome. A panic from its destructor is that task's second panic, so
+/// it goes to [`discard_panic`].
+fn drop_after_first_panic<T>(value: T) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(value))) {
+        discard_panic(payload);
+    }
+}
+
+/// Disposes of an outcome that no reader receives: a panic is recorded on
+/// `coordinator`, and a value is dropped by [`drop_recorded`].
+fn dispose<T>(coordinator: &InvocationCoordinator, outcome: TaskOutcome<T>) {
+    match outcome {
+        TaskOutcome::Panicked(payload) => record_or_discard(coordinator, payload),
+        TaskOutcome::Value(value) => drop_recorded(coordinator, value),
+    }
 }
 
 /// The scheduling state of one permit-aware task.
@@ -494,32 +588,50 @@ impl Wake for Schedule {
 struct SlotState<T> {
     outcome: Option<TaskOutcome<T>>,
     waker: Option<Waker>,
+    /// Set when the reader is gone. An outcome delivered after that has no
+    /// reader, so it is disposed of at once.
+    closed: bool,
 }
 
 /// The slot a task stores its outcome in, shared with its handle.
 struct Slot<T> {
     state: Mutex<SlotState<T>>,
+    /// The coordinator that records an outcome without a reader. `None` for
+    /// blocking work outside an invocation and for a refused spawn.
+    coordinator: Option<Arc<InvocationCoordinator>>,
 }
 
 impl<T> Slot<T> {
-    fn new() -> Self {
+    fn new(coordinator: Option<Arc<InvocationCoordinator>>) -> Self {
         Self {
             state: Mutex::new(SlotState {
                 outcome: None,
                 waker: None,
+                closed: false,
             }),
+            coordinator,
         }
     }
 
-    /// Stores the outcome and wakes the consumer that registered a waker.
-    fn deliver(&self, outcome: TaskOutcome<T>) {
-        let waker = {
+    /// Disposes of an outcome that no reader receives. Without a
+    /// coordinator nothing owns the outcome, so it is dropped.
+    fn dispose(&self, outcome: TaskOutcome<T>) {
+        match &self.coordinator {
+            Some(coordinator) => dispose(coordinator, outcome),
+            None => drop(outcome),
+        }
+    }
+
+    /// Marks the reader gone, and disposes of an outcome it did not read.
+    fn close(&self) {
+        let unread = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.outcome = Some(outcome);
-            state.waker.take()
+            state.closed = true;
+            state.waker = None;
+            state.outcome.take()
         };
-        if let Some(waker) = waker {
-            waker.wake();
+        if let Some(outcome) = unread {
+            self.dispose(outcome);
         }
     }
 
@@ -534,7 +646,52 @@ impl<T> Slot<T> {
     }
 }
 
-/// Waits for the outcome a task stores in its slot.
+impl<T: Send + 'static> Slot<T> {
+    /// Stores the outcome and wakes the consumer that registered a waker.
+    /// After the reader is gone, disposes of the outcome instead. A stored
+    /// outcome is watched, so the cleanup records it if it is a panic that
+    /// no reader takes.
+    fn deliver(self: &Arc<Self>, outcome: TaskOutcome<T>) {
+        let (waker, unread) = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.closed {
+                (None, Some(outcome))
+            } else {
+                state.outcome = Some(outcome);
+                (state.waker.take(), None)
+            }
+        };
+        if let Some(outcome) = unread {
+            self.dispose(outcome);
+            return;
+        }
+        if let Some(coordinator) = &self.coordinator {
+            let slot: Weak<dyn UnreadPanic> = Arc::downgrade(self) as Weak<dyn UnreadPanic>;
+            coordinator.tasks().watch_unread(slot);
+        }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl<T: Send + 'static> UnreadPanic for Slot<T> {
+    /// Takes an unread panic. An unread value stays in the slot, so a
+    /// handle that outlives the drive still reads it.
+    fn claim_panic(&self) -> Option<Payload> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.outcome.take() {
+            Some(TaskOutcome::Panicked(payload)) => Some(payload),
+            value => {
+                state.outcome = value;
+                None
+            }
+        }
+    }
+}
+
+/// Waits for the outcome blocking work stores in its slot. Dropping it
+/// closes the slot, so an outcome the work stores later is disposed of.
 struct SlotWait<T>(Arc<Slot<T>>);
 
 impl<T> Future for SlotWait<T> {
@@ -545,10 +702,19 @@ impl<T> Future for SlotWait<T> {
     }
 }
 
+impl<T> Drop for SlotWait<T> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// The queue a join set's tasks store their outcomes in.
 struct JoinState<T> {
     outcomes: VecDeque<(Id, TaskOutcome<T>)>,
     waker: Option<Waker>,
+    /// Set when the join set is dropped. An outcome delivered after that is
+    /// disposed of at once.
+    closed: bool,
 }
 
 /// Where the gateway wrapper stores its task's outcome.
@@ -557,26 +723,34 @@ enum Sink<T> {
     Slot(Arc<Slot<T>>),
     /// The queue of a [`TrackedJoinSet`].
     Queue(Arc<Mutex<JoinState<T>>>),
-    /// Nowhere: a detached task's outcome has no consumer.
-    Discard,
+    /// The coordinator: a detached task's outcome has no reader, so a panic
+    /// is recorded there.
+    Record,
 }
 
-impl<T> Sink<T> {
-    fn deliver(&self, outcome: TaskOutcome<T>) {
+impl<T: Send + 'static> Sink<T> {
+    fn deliver(&self, outcome: TaskOutcome<T>, coordinator: &InvocationCoordinator) {
         match self {
             Self::Slot(slot) => slot.deliver(outcome),
             Self::Queue(queue) => {
                 let id = current_task_id();
-                let waker = {
+                let (waker, unread) = {
                     let mut state = queue.lock().unwrap_or_else(PoisonError::into_inner);
-                    state.outcomes.push_back((id, outcome));
-                    state.waker.take()
+                    if state.closed {
+                        (None, Some(outcome))
+                    } else {
+                        state.outcomes.push_back((id, outcome));
+                        (state.waker.take(), None)
+                    }
                 };
+                if let Some(outcome) = unread {
+                    dispose(coordinator, outcome);
+                }
                 if let Some(waker) = waker {
                     waker.wake();
                 }
             }
-            Self::Discard => {}
+            Self::Record => dispose(coordinator, outcome),
         }
     }
 }
@@ -662,7 +836,11 @@ fn scheduled(schedule: Arc<Schedule>, root: bool) -> Gate {
     }
 }
 
-impl<F: Future> Future for Wrapped<F> {
+impl<F> Future for Wrapped<F>
+where
+    F: Future,
+    F::Output: Send + 'static,
+{
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -718,18 +896,18 @@ impl<F: Future> Future for Wrapped<F> {
                 match catch_unwind(AssertUnwindSafe(move || drop(inner))) {
                     Ok(()) => TaskOutcome::Value(value),
                     Err(payload) => {
-                        // The destructor's panic is the outcome; a panic
-                        // while dropping the value has nowhere to go.
-                        discard_panic(move || drop(value));
+                        // The destructor's panic is the outcome. A panic
+                        // while dropping the value is the task's second
+                        // panic, so it is discarded.
+                        drop_after_first_panic(value);
                         TaskOutcome::Panicked(payload)
                     }
                 }
             }
             Err(payload) => {
                 // The poll's panic is the outcome. A destructor panic after
-                // it is a second, caught panic, and is discarded.
-                let inner = this.inner.take();
-                discard_panic(move || drop(inner));
+                // it is the task's second panic, so it is discarded.
+                drop_after_first_panic(this.inner.take());
                 TaskOutcome::Panicked(payload)
             }
         };
@@ -740,7 +918,7 @@ impl<F: Future> Future for Wrapped<F> {
             Gate::Scheduled { schedule, .. } => schedule.end_ready(),
             Gate::Detached => None,
         };
-        this.sink.deliver(outcome);
+        this.sink.deliver(outcome, &this.coordinator);
         if let Gate::Scheduled { root: true, .. } = &this.gate {
             this.coordinator.finish();
         }
@@ -752,11 +930,11 @@ impl<F: Future> Future for Wrapped<F> {
 
 impl<F: Future> Drop for Wrapped<F> {
     fn drop(&mut self) {
-        // An aborted task: its outcome has no consumer, so a panic from the
-        // inner future's destructor is discarded, as tokio discards the
-        // panic of an aborted task whose handle is gone.
+        // An aborted task: its future is dropped before it finished, and
+        // nobody reads an outcome. A panic from the future's destructor is
+        // invocation-failing, so it is recorded.
         if let Some(inner) = self.inner.take() {
-            discard_panic(move || drop(inner));
+            drop_recorded(&self.coordinator, inner);
         }
         // A waker that outlives the task takes no permit from now on.
         if let Gate::Scheduled { schedule, .. } = &self.gate {
@@ -800,6 +978,10 @@ mod raw {
 /// Aborts its task on drop. Holds the outcome slot it shares with its
 /// task, and the task's `AbortHandle`. A handle without an abort handle
 /// belongs to a spawn the coordinator refused: it never resolves.
+///
+/// Dropping the handle closes the slot. An outcome the task stored before
+/// and did not hand over, or stores after, is disposed of: a panic is
+/// recorded on the coordinator, and a value is dropped inside a catch.
 pub(crate) struct TrackedTask<T> {
     slot: Arc<Slot<T>>,
     abort: Option<AbortHandle>,
@@ -817,7 +999,7 @@ impl<T> TrackedTask<T> {
     /// A handle of a spawn that started nothing: it never resolves.
     fn refused() -> Self {
         Self {
-            slot: Arc::new(Slot::new()),
+            slot: Arc::new(Slot::new(None)),
             abort: None,
         }
     }
@@ -842,6 +1024,7 @@ impl<T> Future for TrackedTask<T> {
 impl<T> Drop for TrackedTask<T> {
     fn drop(&mut self) {
         self.abort();
+        self.slot.close();
     }
 }
 
@@ -866,7 +1049,7 @@ where
     };
     let tasks = coordinator.tasks();
     let permit = tasks.acquire();
-    let slot = Arc::new(Slot::new());
+    let slot = Arc::new(Slot::new(Some(Arc::clone(coordinator))));
     let handle = raw::spawn(Wrapped::new(
         future,
         Some(Arc::clone(ownership)),
@@ -903,7 +1086,7 @@ where
     // root then starts idle and is never polled.
     let schedule = Schedule::queued(coordinator)
         .unwrap_or_else(|| Schedule::with_state(coordinator, ScheduleState::Idle));
-    let slot = Arc::new(Slot::new());
+    let slot = Arc::new(Slot::new(Some(Arc::clone(coordinator))));
     let handle = raw::spawn(Wrapped::new(
         future,
         Some(Arc::clone(ownership)),
@@ -922,8 +1105,16 @@ where
 /// Not aborted on drop or by `abort_all`, still counted. For the batch
 /// flusher and for detached checkpoint writes. Takes no ownership handle
 /// and never blesses its task, because this work never creates a durable
-/// operation. Takes no activity permit and is polled whatever the phase:
-/// the checkpoint permit of the write it carries keeps the invocation open.
+/// operation. Takes no activity permit and is polled whatever the phase.
+/// The task's outcome has no reader: a panic of its future, while it is
+/// polled or dropped, is recorded on the coordinator.
+/// While the phase is `Running`, a permit keeps the invocation open until
+/// the write's response is merged: the checkpoint permit of a buffered or
+/// direct write, or the refresh scheduler's permit for an unbatched
+/// refresh, which the scheduler holds until it gets the result. The
+/// scheduler is dropped when the drive ends, and its permit with it. From
+/// then on only the task count keeps the write alive: the cleanup's
+/// `wait_idle` waits for it.
 pub(crate) fn spawn_detached<F>(
     coordinator: &Arc<InvocationCoordinator>,
     future: F,
@@ -938,62 +1129,19 @@ where
         None,
         Arc::clone(coordinator),
         Gate::Detached,
-        Sink::Discard,
+        Sink::Record,
         Some(permit),
     )));
     Ok(())
-}
-
-/// Polls `future` to completion and returns its value, or the payload of a
-/// panic from one of its polls or from its destructor.
-///
-/// A detached task delivers its outcome nowhere. A detached task whose
-/// consumer awaits a result therefore runs its work through this function
-/// and sends the outcome itself. So a panic in that work resumes on the
-/// consumer with its original payload, as for every other SDK task.
-///
-/// The precedence is the task gateway's (see `Wrapped`). A poll that
-/// returns `Ready` drops the future at once; when that destructor panics,
-/// its panic is the outcome and the value is dropped. A poll that panics is
-/// the outcome, and a destructor panic after it is discarded.
-pub(crate) async fn catch_panic<F: Future>(future: F) -> TaskOutcome<F::Output> {
-    let mut inner = Some(Box::pin(future));
-    std::future::poll_fn(move |cx| {
-        #[expect(clippy::expect_used)]
-        // reason: the future is taken only when this poll returns `Ready`,
-        // and the `.await` below never polls a finished `poll_fn` again.
-        let future = inner
-            .as_mut()
-            .expect("a finished catch_panic is never polled");
-        let polled = catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)));
-        let outcome = match polled {
-            Ok(Poll::Pending) => return Poll::Pending,
-            Ok(Poll::Ready(value)) => {
-                let finished = inner.take();
-                match catch_unwind(AssertUnwindSafe(move || drop(finished))) {
-                    Ok(()) => TaskOutcome::Value(value),
-                    Err(payload) => {
-                        discard_panic(move || drop(value));
-                        TaskOutcome::Panicked(payload)
-                    }
-                }
-            }
-            Err(payload) => {
-                let finished = inner.take();
-                discard_panic(move || drop(finished));
-                TaskOutcome::Panicked(payload)
-            }
-        };
-        Poll::Ready(outcome)
-    })
-    .await
 }
 
 /// A set of operation tasks whose outcomes are joined in completion order.
 ///
 /// The outcomes of finished tasks wait in a queue it shares with its tasks;
 /// the `JoinSet<()>` is used only to abort. Dropping the set aborts every
-/// task in it.
+/// task in it and closes the queue. An outcome still in the queue, or
+/// delivered after the drop, is disposed of: a panic is recorded on the
+/// coordinator, and a value is dropped inside a catch.
 pub(crate) struct TrackedJoinSet<T> {
     outcomes: Arc<Mutex<JoinState<T>>>,
     tasks: JoinSet<()>,
@@ -1018,6 +1166,7 @@ impl<T: Send + 'static> TrackedJoinSet<T> {
             outcomes: Arc::new(Mutex::new(JoinState {
                 outcomes: VecDeque::new(),
                 waker: None,
+                closed: false,
             })),
             tasks: JoinSet::new(),
             coordinator,
@@ -1088,6 +1237,20 @@ impl<T: Send + 'static> TrackedJoinSet<T> {
     }
 }
 
+impl<T> Drop for TrackedJoinSet<T> {
+    fn drop(&mut self) {
+        let unread = {
+            let mut state = self.outcomes.lock().unwrap_or_else(PoisonError::into_inner);
+            state.closed = true;
+            state.waker = None;
+            std::mem::take(&mut state.outcomes)
+        };
+        for (_, outcome) in unread {
+            dispose(&self.coordinator, outcome);
+        }
+    }
+}
+
 /// Runs `f` on the blocking pool.
 ///
 /// With a current coordinator (the `CURRENT_COORDINATOR` task-local), the
@@ -1098,6 +1261,11 @@ impl<T: Send + 'static> TrackedJoinSet<T> {
 /// When the coordinator refuses the permit, nothing runs and the future
 /// never resolves. Without a current coordinator the work is not counted.
 ///
+/// Dropping the returned future before it resolves closes the work's
+/// slot. Inside an invocation, an outcome the work stored and nobody read,
+/// or stores later, is then disposed of: a panic is recorded on the
+/// coordinator, and a value is dropped inside a catch.
+///
 /// Takes no ownership handle and never blesses, because blocking serdes
 /// work never creates a durable operation.
 pub(crate) async fn run_blocking<F, R>(f: F) -> Result<TaskOutcome<R>, NoRuntime>
@@ -1106,16 +1274,17 @@ where
     R: Send + 'static,
 {
     ensure_runtime()?;
-    let permits = match CURRENT_COORDINATOR.try_with(Arc::clone) {
-        Ok(coordinator) => {
+    let coordinator = CURRENT_COORDINATOR.try_with(Arc::clone).ok();
+    let permits = match &coordinator {
+        Some(coordinator) => {
             let Some(activity) = coordinator.acquire(PermitKind::Activity) else {
                 return std::future::pending().await;
             };
             Some((activity, coordinator.tasks().acquire()))
         }
-        Err(_) => None,
+        None => None,
     };
-    let slot = Arc::new(Slot::new());
+    let slot = Arc::new(Slot::new(coordinator));
     let task_slot = Arc::clone(&slot);
     raw::spawn_blocking(move || {
         // `f` is consumed by the call, so a capture whose destructor panics
@@ -1227,7 +1396,7 @@ pub(crate) mod test_support {
     /// An outcome slot whose consumer registered `waker`.
     pub(crate) struct TestSlot<T>(Arc<Slot<T>>);
 
-    impl<T> TestSlot<T> {
+    impl<T: Send + 'static> TestSlot<T> {
         /// Stores `value` as the outcome and wakes the consumer.
         pub(crate) fn deliver_value(&self, value: T) {
             self.0.deliver(TaskOutcome::Value(value));
@@ -1236,7 +1405,7 @@ pub(crate) mod test_support {
 
     /// A slot whose consumer is `waker`.
     pub(crate) fn slot_with_waker<T>(waker: &Waker) -> TestSlot<T> {
-        let slot = Arc::new(Slot::new());
+        let slot = Arc::new(Slot::new(None));
         let cx = Context::from_waker(waker);
         assert!(slot.poll_take(&cx).is_pending());
         TestSlot(slot)
@@ -1282,8 +1451,8 @@ mod tests {
 
     use super::test_support::{poll_once_without_runtime, str_payload, with_current_coordinator};
     use super::{
-        NoRuntime, TaskOutcome, TrackedJoinSet, catch_panic, run_blocking, spawn_detached,
-        spawn_root, spawn_tracked,
+        NoRuntime, TaskOutcome, TrackedJoinSet, run_blocking, spawn_detached, spawn_root,
+        spawn_tracked,
     };
     use crate::coordinator::{InvocationCoordinator, PermitKind, Phase};
     use crate::driver::TaskOwnership;
@@ -1314,6 +1483,47 @@ mod tests {
         fn drop(&mut self) {
             panic!("drop boom");
         }
+    }
+
+    /// A panic payload whose destructor panics with a `DropPanics`
+    /// payload, whose destructor panics again.
+    struct PayloadDropPanics;
+
+    impl Drop for PayloadDropPanics {
+        fn drop(&mut self) {
+            std::panic::panic_any(DropPanics);
+        }
+    }
+
+    /// Counts its drops.
+    struct DropCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// `discard_panic` drops the payload it is given.
+    #[test]
+    fn discard_panic_drops_the_payload() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        super::discard_panic(Box::new(DropCounter(Arc::clone(&drops))));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// The payload's destructor panics with a payload whose destructor
+    /// panics too. `discard_panic` catches the first destructor's panic and
+    /// leaks its payload, so it returns normally.
+    #[test]
+    fn discard_panic_forgets_a_nested_panicking_payload() {
+        let returned = std::panic::catch_unwind(|| {
+            super::discard_panic(Box::new(PayloadDropPanics));
+        });
+        assert!(
+            returned.is_ok(),
+            "a nested payload's destructor panic escaped"
+        );
     }
 
     /// Returns `Ready(7)` on its first poll and panics when dropped.
@@ -1446,6 +1656,27 @@ mod tests {
     async fn blocking_work_without_tracker_is_not_counted() {
         let outcome = run_blocking(|| 5).await.expect("runtime");
         assert!(matches!(outcome, TaskOutcome::Value(5)));
+    }
+
+    /// Outside an invocation no coordinator owns the outcome. A value the
+    /// work returns after its waiter dropped is still dropped.
+    #[tokio::test]
+    async fn blocking_value_after_waiter_drop_outside_invocation_is_dropped() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let value = DropFlag(Arc::clone(&dropped));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut work = Box::pin(run_blocking(move || {
+            release_rx.recv().expect("the test releases the closure");
+            let _done = done_tx;
+            value
+        }));
+        let polled = work.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(polled.is_pending());
+        drop(work);
+        release_tx.send(()).expect("the closure waits");
+        drop(done_rx.await);
+        spin_until("the value is dropped", || dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1868,82 +2099,336 @@ mod tests {
         drop(waker);
     }
 
-    /// A value whose destructor panics with `payload`.
-    struct PanicOnDrop(&'static str);
+    /// A panic payload, identified by its tag, that counts its drops.
+    struct TaggedPayload(&'static str, Arc<std::sync::atomic::AtomicUsize>);
 
-    impl Drop for PanicOnDrop {
+    impl Drop for TaggedPayload {
         fn drop(&mut self) {
-            panic!("{}", self.0);
+            self.1.fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    /// A future that returns `Ready` with a value whose destructor panics,
-    /// and whose own destructor panics with `"future drop"`.
-    struct ReadyThenDropPanic;
+    /// A value whose destructor panics with the `&'static str` it holds.
+    struct PanicsWith(&'static str);
 
-    impl Future for ReadyThenDropPanic {
-        type Output = PanicOnDrop;
-
-        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<PanicOnDrop> {
-            Poll::Ready(PanicOnDrop("value drop"))
-        }
-    }
-
-    impl Drop for ReadyThenDropPanic {
+    impl Drop for PanicsWith {
         fn drop(&mut self) {
-            panic!("future drop");
+            std::panic::panic_any(self.0);
         }
     }
 
-    /// A future whose poll panics with `"poll"` and whose destructor
-    /// panics with `"future drop"`.
-    struct PollPanicThenDropPanic;
+    /// The tag of a [`TaggedPayload`], or `None` for another payload type.
+    fn tag(payload: &(dyn std::any::Any + Send)) -> Option<&'static str> {
+        payload.downcast_ref::<TaggedPayload>().map(|p| p.0)
+    }
 
-    impl Future for PollPanicThenDropPanic {
+    /// Blocking work whose closure waits for `release` and then panics
+    /// with "blocking boom" or, with `value`, returns a value whose
+    /// destructor panics with "value boom". The work is started inside an
+    /// invocation by one poll with `coord` as the current coordinator.
+    fn started_blocking(
+        coord: &Arc<InvocationCoordinator>,
+        release: std::sync::mpsc::Receiver<()>,
+        value: bool,
+    ) -> Pin<Box<impl Future<Output = Result<TaskOutcome<PanicsWith>, NoRuntime>>>> {
+        let mut work = Box::pin(run_blocking(move || {
+            release.recv().expect("the test releases the closure");
+            if !value {
+                std::panic::panic_any("blocking boom");
+            }
+            PanicsWith("value boom")
+        }));
+        let polled = with_current_coordinator(coord, || {
+            work.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        });
+        assert!(polled.is_pending());
+        work
+    }
+
+    /// The future of `run_blocking` is dropped while the closure runs, and
+    /// the closure then panics. Nobody reads the outcome, so the panic is
+    /// recorded on the coordinator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_panic_after_waiter_drop_is_recorded() {
+        let coord = coordinator();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let work = started_blocking(&coord, release_rx, false);
+        drop(work);
+        release_tx.send(()).expect("the closure waits");
+        coord.tasks().wait_idle().await;
+        let payload = coord.take_panic().expect("the closure's panic is recorded");
+        assert_eq!(str_payload(payload.as_ref()), Some("blocking boom"));
+    }
+
+    /// The closure panics, and the future of `run_blocking` is dropped
+    /// before it is polled again. The panic sits unread in the slot, so the
+    /// drop records it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_panic_before_waiter_drop_is_recorded() {
+        let coord = coordinator();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let work = started_blocking(&coord, release_rx, false);
+        release_tx.send(()).expect("the closure waits");
+        coord.tasks().wait_idle().await;
+        assert!(!coord.has_panic(), "the slot holds the panic");
+        drop(work);
+        let payload = coord.take_panic().expect("the closure's panic is recorded");
+        assert_eq!(str_payload(payload.as_ref()), Some("blocking boom"));
+    }
+
+    /// Returns `Ready` with a [`PanicsWith`] value.
+    struct ReadyPanicsWith(&'static str);
+
+    impl Future for ReadyPanicsWith {
+        type Output = PanicsWith;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<PanicsWith> {
+            Poll::Ready(PanicsWith(self.0))
+        }
+    }
+
+    /// Takes the coordinator's kept panic and checks that it is the
+    /// destructor's payload `expected`.
+    fn assert_recorded(coord: &InvocationCoordinator, expected: &str) {
+        let payload = coord
+            .take_panic()
+            .expect("the destructor's panic is recorded");
+        assert_eq!(str_payload(payload.as_ref()), Some(expected));
+    }
+
+    /// A value that a dropped reader would have received is dropped inside
+    /// a catch, and its destructor's panic is recorded. Six cases: a
+    /// tracked slot, a join-set queue and a blocking slot, each (a) with
+    /// the value delivered before the reader drops, and (b) after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undelivered_value_drop_panic_is_recorded() {
+        let own = ownership();
+
+        // Tracked slot, (a): the task stores the value, then the handle drops.
+        let coord = coordinator();
+        let task = spawn_tracked(&coord, &own, ReadyPanicsWith("tracked a")).expect("runtime");
+        coord.tasks().wait_idle().await;
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(task))).is_ok());
+        assert_recorded(&coord, "tracked a");
+
+        // Tracked slot, (b): the handle drops, then the value arrives.
+        let coord = coordinator();
+        let slot = Arc::new(super::Slot::new(Some(Arc::clone(&coord))));
+        drop(super::TrackedTask {
+            slot: Arc::clone(&slot),
+            abort: None,
+        });
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                slot.deliver(TaskOutcome::Value(PanicsWith("tracked b")));
+            }))
+            .is_ok()
+        );
+        assert_recorded(&coord, "tracked b");
+
+        // Join-set queue, (a): the item stores the value, then the set drops.
+        let coord = coordinator();
+        let mut set = TrackedJoinSet::new(Arc::clone(&coord));
+        set.spawn(&own, ReadyPanicsWith("queue a"))
+            .expect("runtime");
+        coord.tasks().wait_idle().await;
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(set))).is_ok());
+        assert_recorded(&coord, "queue a");
+
+        // Join-set queue, (b): the set drops, then the value arrives.
+        let coord = coordinator();
+        let set = TrackedJoinSet::<PanicsWith>::new(Arc::clone(&coord));
+        let queue = Arc::clone(&set.outcomes);
+        drop(set);
+        let deliver_coord = Arc::clone(&coord);
+        super::raw::spawn(async move {
+            super::Sink::Queue(queue)
+                .deliver(TaskOutcome::Value(PanicsWith("queue b")), &deliver_coord);
+        })
+        .await
+        .expect("the delivery does not panic");
+        assert_recorded(&coord, "queue b");
+
+        // Blocking slot, (a): the closure returns the value, then the
+        // waiter drops.
+        let coord = coordinator();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let work = started_blocking(&coord, release_rx, true);
+        release_tx.send(()).expect("the closure waits");
+        coord.tasks().wait_idle().await;
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(work))).is_ok());
+        assert_recorded(&coord, "value boom");
+
+        // Blocking slot, (b): the waiter drops, then the closure returns
+        // the value.
+        let coord = coordinator();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let work = started_blocking(&coord, release_rx, true);
+        drop(work);
+        release_tx.send(()).expect("the closure waits");
+        coord.tasks().wait_idle().await;
+        assert_recorded(&coord, "value boom");
+    }
+
+    /// Panics with `TaggedPayload("A")` when polled and with
+    /// `TaggedPayload("B")` when dropped.
+    struct PollPanicsADropPanicsB(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Future for PollPanicsADropPanicsB {
         type Output = ();
 
         fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-            panic!("poll");
+            std::panic::panic_any(TaggedPayload(
+                "A",
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ));
         }
     }
 
-    impl Drop for PollPanicThenDropPanic {
+    impl Drop for PollPanicsADropPanicsB {
         fn drop(&mut self) {
-            panic!("future drop");
+            std::panic::panic_any(TaggedPayload("B", Arc::clone(&self.0)));
         }
     }
 
-    /// A future that returns `Ready` and then panics in its destructor:
-    /// that panic is the outcome, as in the task gateway, and the value's
-    /// own destructor panic is discarded.
-    #[tokio::test]
-    async fn catch_panic_returns_a_destructor_panic_after_ready() {
-        let TaskOutcome::Panicked(payload) = catch_panic(ReadyThenDropPanic).await else {
-            panic!("expected the destructor's panic");
-        };
-        let message = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| str_payload(payload.as_ref()));
-        assert_eq!(message, Some("future drop"));
+    /// A value whose destructor panics with `TaggedPayload("B")`.
+    struct ValuePanicsB(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for ValuePanicsB {
+        fn drop(&mut self) {
+            std::panic::panic_any(TaggedPayload("B", Arc::clone(&self.0)));
+        }
     }
 
-    /// A poll's panic wins over a destructor panic after it.
+    /// Returns a [`ValuePanicsB`] and panics with `TaggedPayload("A")` when
+    /// dropped.
+    struct ReadyDropPanicsA(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Future for ReadyDropPanicsA {
+        type Output = ValuePanicsB;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<ValuePanicsB> {
+            Poll::Ready(ValuePanicsB(Arc::clone(&self.0)))
+        }
+    }
+
+    impl Drop for ReadyDropPanicsA {
+        fn drop(&mut self) {
+            std::panic::panic_any(TaggedPayload(
+                "A",
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ));
+        }
+    }
+
+    /// The gateway keeps a task's first panic when disposing of the task
+    /// panics again, and drops the second panic's payload through
+    /// `discard_panic`. Two cases: (a) the poll panics with A and dropping
+    /// the future panics with B; (b) the poll returns, dropping the future
+    /// panics with A, and dropping the returned value panics with B.
     #[tokio::test]
-    async fn catch_panic_prefers_the_poll_panic() {
-        let TaskOutcome::Panicked(payload) = catch_panic(PollPanicThenDropPanic).await else {
+    async fn task_keeps_its_first_panic_when_disposal_panics() {
+        let coord = coordinator();
+        let own = ownership();
+
+        let b_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = spawn_tracked(&coord, &own, PollPanicsADropPanicsB(Arc::clone(&b_drops)))
+            .expect("runtime");
+        let TaskOutcome::Panicked(payload) = task.await else {
             panic!("expected the poll's panic");
         };
-        assert_eq!(str_payload(payload.as_ref()), Some("poll"));
+        assert_eq!(tag(payload.as_ref()), Some("A"));
+        assert_eq!(b_drops.load(Ordering::SeqCst), 1, "B was dropped");
+
+        let b_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task =
+            spawn_tracked(&coord, &own, ReadyDropPanicsA(Arc::clone(&b_drops))).expect("runtime");
+        let TaskOutcome::Panicked(payload) = task.await else {
+            panic!("expected the destructor's panic");
+        };
+        assert_eq!(tag(payload.as_ref()), Some("A"));
+        assert_eq!(b_drops.load(Ordering::SeqCst), 1, "B was dropped");
+        assert!(!coord.has_panic(), "a second panic is not recorded");
     }
 
-    /// A future that finishes normally gives its value.
+    /// The cleanup claim records a panic that is still unread in a slot
+    /// whose handle is alive. A panic its handle already read, and a slot
+    /// that no longer exists, give nothing.
     #[tokio::test]
-    async fn catch_panic_returns_the_value() {
-        let TaskOutcome::Value(value) = catch_panic(async { 7_u32 }).await else {
-            panic!("expected the value");
+    async fn claim_unread_panics_records_only_unread_panics() {
+        let coord = coordinator();
+        let own = ownership();
+        let read = spawn_tracked(&coord, &own, async { panic!("read") }).expect("runtime");
+        assert_eq!(panicked_with(read.await), Some("read"));
+        let gone = Arc::new(super::Slot::<()>::new(Some(Arc::clone(&coord))));
+        gone.deliver(TaskOutcome::Panicked(Box::new("gone")));
+        drop(gone);
+        let unread: super::TrackedTask<()> =
+            spawn_tracked(&coord, &own, async { panic!("unread") }).expect("runtime");
+        coord.tasks().wait_idle().await;
+        assert!(!coord.has_panic());
+        coord.tasks().claim_unread_panics(&coord);
+        let payload = coord.take_panic().expect("the unread panic is recorded");
+        assert_eq!(str_payload(payload.as_ref()), Some("unread"));
+        // A second claim finds nothing: the claim took the slots.
+        coord.tasks().claim_unread_panics(&coord);
+        assert!(coord.take_panic().is_none());
+        drop(unread);
+    }
+
+    /// The cleanup claim leaves an unread value in its slot. So a handle
+    /// that outlives the drive still reads the task's value, and the claim
+    /// records nothing.
+    #[tokio::test]
+    async fn claim_unread_panics_keeps_an_unread_value() {
+        let coord = coordinator();
+        let own = ownership();
+        let task = spawn_tracked(&coord, &own, async { 7_u32 }).expect("runtime");
+        coord.tasks().wait_idle().await;
+        coord.tasks().claim_unread_panics(&coord);
+        assert!(coord.take_panic().is_none(), "a value is not recorded");
+        let mut task = std::pin::pin!(task);
+        let polled = task.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        let Poll::Ready(TaskOutcome::Value(value)) = polled else {
+            panic!("the handle reads the value the claim left in the slot");
         };
         assert_eq!(value, 7);
+    }
+
+    /// Returns `Ready(())` and panics with the `&'static str` it holds when
+    /// dropped.
+    struct ReadyUnitDropPanics(&'static str);
+
+    impl Future for ReadyUnitDropPanics {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Ready(())
+        }
+    }
+
+    impl Drop for ReadyUnitDropPanics {
+        fn drop(&mut self) {
+            std::panic::panic_any(self.0);
+        }
+    }
+
+    /// A detached task's panic, while its future is polled or when the
+    /// finished future is dropped, is recorded on the coordinator: its
+    /// outcome has no reader.
+    #[tokio::test]
+    async fn detached_task_panic_is_recorded() {
+        let coord = coordinator();
+        spawn_detached(&coord, async { std::panic::panic_any("detached poll") }).expect("runtime");
+        coord.tasks().wait_idle().await;
+        let payload = coord.take_panic().expect("recorded");
+        assert_eq!(str_payload(payload.as_ref()), Some("detached poll"));
+
+        let coord = coordinator();
+        spawn_detached(&coord, ReadyUnitDropPanics("detached drop")).expect("runtime");
+        coord.tasks().wait_idle().await;
+        let payload = coord.take_panic().expect("recorded");
+        assert_eq!(str_payload(payload.as_ref()), Some("detached drop"));
     }
 
     /// Waits, polling the condition, until it holds or 5 s passed.
@@ -1963,7 +2448,9 @@ mod tests {
         use crate::task::test_support::{Schedule, ScheduleState};
 
         let coord = coordinator();
-        let _wait = coord.register_wait("op", Waker::noop()).expect("running");
+        let _wait = coord
+            .register_test_wait("op", Waker::noop())
+            .expect("running");
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let consumer = Schedule::idle(&coord);
         let mut work = Box::pin(run_blocking(move || {
@@ -1997,7 +2484,9 @@ mod tests {
     #[tokio::test]
     async fn spawn_after_suspension_spawns_nothing() {
         let coord = coordinator();
-        let _wait = coord.register_wait("op", Waker::noop()).expect("running");
+        let _wait = coord
+            .register_test_wait("op", Waker::noop())
+            .expect("running");
         drop(coord.acquire(PermitKind::Activity));
         assert_eq!(coord.phase(), Phase::Suspending);
 
@@ -2028,7 +2517,9 @@ mod tests {
     #[tokio::test]
     async fn blocking_work_after_suspension_never_runs() {
         let coord = coordinator();
-        let _wait = coord.register_wait("op", Waker::noop()).expect("running");
+        let _wait = coord
+            .register_test_wait("op", Waker::noop())
+            .expect("running");
         drop(coord.acquire(PermitKind::Activity));
         let ran = Arc::new(AtomicBool::new(false));
         let work_ran = Arc::clone(&ran);
@@ -2083,7 +2574,9 @@ mod tests {
     #[tokio::test]
     async fn root_sets_finished_before_release() {
         let coord = coordinator();
-        let _wait = coord.register_wait("op", Waker::noop()).expect("running");
+        let _wait = coord
+            .register_test_wait("op", Waker::noop())
+            .expect("running");
         let (root, join) = spawn_root(&ownership(), &coord, async { 3 }).expect("runtime");
         assert!(matches!(root.await, TaskOutcome::Value(3)));
         drop(join.await);

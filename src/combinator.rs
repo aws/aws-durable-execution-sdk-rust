@@ -1238,6 +1238,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )
@@ -1281,6 +1282,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )
@@ -1401,6 +1403,7 @@ mod tests {
         let (ctx, client) = recording_ctx(CheckpointLog::empty());
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let handler = run(ctx);
         let outcome = crate::driver::drive_invocation(
             async move {
@@ -1409,6 +1412,7 @@ mod tests {
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await;

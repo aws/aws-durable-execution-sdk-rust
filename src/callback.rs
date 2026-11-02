@@ -938,6 +938,7 @@ mod tests {
                 callback_id: callback_id.map(String::from),
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )
@@ -1452,6 +1453,7 @@ mod tests {
         // of surfacing a fabricated error to the caller.
         let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             exec.execute(),
@@ -1568,6 +1570,7 @@ mod tests {
         // will error at cb.result(). We just need to verify that the
         // submitter ran and checkpoints were produced.
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             Arc::clone(ctx.coordinator()),
             exec.execute(),
@@ -1634,6 +1637,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             ),
@@ -1658,6 +1662,7 @@ mod tests {
                     callback_id: Some("cb-replay-test".to_owned()),
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             ),
@@ -1682,6 +1687,7 @@ mod tests {
                     callback_id: None,
                     op_type: None,
                     sub_type: None,
+                    due_at: None,
                     op_name: None,
                 },
             ),
@@ -1709,6 +1715,7 @@ mod tests {
         // Execution should suspend at callback.result() since the callback
         // is pending. But the submitter must NOT have been re-invoked.
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             Arc::clone(ctx.coordinator()),
             exec.execute(),
@@ -1756,6 +1763,7 @@ mod tests {
         // of surfacing a fabricated error to the caller.
         let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             exec.execute(),
@@ -1867,6 +1875,7 @@ mod tests {
 
         // Execute: will suspend at callback result, but submitter runs.
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             Arc::clone(ctx.coordinator()),
             exec.execute(),
@@ -2300,5 +2309,100 @@ mod coordinator_tests {
             format!("{:?}", replayed.kind())
         );
         assert_eq!(live.wire(), replayed.wire());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_result_settled_and_direct_result() {
+        // (a) A settled callback: the stored outcome, and no task.
+        let start = OperationUpdate::builder()
+            .id(crate::engine::compute_wire_id_public("1"))
+            .r#type(OperationType::Callback)
+            .sub_type(super::CALLBACK_SUB_TYPE)
+            .action(OperationAction::Start)
+            .name("cb")
+            .build()
+            .expect("all required fields set");
+        let log = crate::client::operations_to_checkpoint_log(&[succeeded(&start)]);
+        let ctx = crate::DurableContext::new_root(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+        );
+        let tasks = Arc::clone(ctx.coordinator().tasks());
+        let cb = ctx
+            .create_callback::<String>()
+            .name("cb")
+            .await
+            .expect("the record replays");
+        let handle = cb.spawn_result();
+        assert_eq!(tasks.live(), 0, "a settled callback starts no task");
+        let value = handle.await.expect("the callback succeeded");
+        assert_eq!(value, "ok");
+        assert_eq!(tasks.live(), 0);
+
+        // (b) A pending callback awaited directly is refreshed without a
+        // first-poll flag.
+        let client = Arc::new(crate::driver::test_support::RefreshClient::new(|req| {
+            let mut ops = crate::driver::test_support::callback_starts(req.updates);
+            if req.empty_number == 1
+                && let Some(start) = named(req.history, "cb", &OperationAction::Start)
+            {
+                ops.push(succeeded(start));
+            }
+            Ok(ops)
+        }));
+        let ctx = crate::driver::test_support::refresh_ctx(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let step = ctx
+                .step(|_| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    Ok(1_u32)
+                })
+                .name("s")
+                .future();
+            let (result, step) = tokio::join!(cb.result(), step);
+            step.map_err(wire_err)?;
+            result.map_err(wire_err)
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("ok".to_owned()));
+        crate::driver::test_support::assert_times(
+            &client.empty_calls(),
+            &[std::time::Duration::from_secs(1)],
+        );
+    }
+
+    /// `spawn_result()` on a thread with no Tokio runtime resolves to the
+    /// error `.spawn()` returns.
+    #[tokio::test]
+    async fn spawn_result_outside_runtime_returns_error() {
+        let client = Arc::new(ScriptedClient::new(|updates, _| {
+            updates
+                .iter()
+                .filter(|u| u.r#type() == &OperationType::Callback)
+                .map(started)
+                .collect()
+        }));
+        let ctx = scripted_ctx(&client);
+        let cb = ctx
+            .create_callback::<String>()
+            .name("cb")
+            .await
+            .expect("the callback starts");
+        let polled =
+            crate::task::test_support::poll_once_without_runtime(move || cb.spawn_result());
+        let std::task::Poll::Ready(Err(err)) = polled else {
+            unreachable!("expected an immediate error, got {polled:?}");
+        };
+        assert!(
+            format!("{err:#}").contains(crate::task::NO_RUNTIME_MESSAGE),
+            "unexpected error: {err:#}"
+        );
     }
 }

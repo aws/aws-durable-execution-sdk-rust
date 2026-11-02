@@ -196,6 +196,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
@@ -238,6 +239,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
@@ -257,6 +259,7 @@ mod tests {
 
         let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             exec.execute(),
@@ -286,6 +289,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
@@ -355,6 +359,7 @@ mod tests {
 
         let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             exec.execute(),
@@ -385,6 +390,7 @@ mod tests {
         let signal = Arc::clone(ctx.coordinator());
         // Should suspend (not panic): name was propagated successfully.
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             builder,
@@ -413,6 +419,7 @@ mod tests {
         // Blessed spawn: the op suspends (no ownership error), so the driver
         // reports Pending rather than Failed.
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             handle,
@@ -481,6 +488,7 @@ mod tests {
 
         let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             ctx.wait(duration),

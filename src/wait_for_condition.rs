@@ -867,6 +867,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
 
@@ -901,6 +902,7 @@ mod tests {
 
         let signal = Arc::clone(ctx.coordinator());
         let ownership = Arc::clone(ctx.task_ownership());
+        let root = ctx.clone();
         let exec = WaitForConditionExecution {
             ctx,
             op_id,
@@ -926,7 +928,7 @@ mod tests {
         // through the driver so it terminates as Pending; the point of the
         // test is the state the check FN observed, not the result.
         let outcome =
-            crate::driver::test_support::outcome_of(ownership, signal, exec.execute()).await;
+            crate::driver::test_support::outcome_of(root, ownership, signal, exec.execute()).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
 
         let observed = seen
@@ -993,6 +995,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
 
@@ -1108,12 +1111,14 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id(); // mints "1"
         let signal = Arc::clone(ctx.coordinator());
         let ownership = Arc::clone(ctx.task_ownership());
+        let root = ctx.clone();
 
         let exec = WaitForConditionExecution {
             ctx,
@@ -1135,7 +1140,7 @@ mod tests {
         // continue (< 3), so it checkpoints RETRY and suspends (parks) rather
         // than surfacing a fabricated error to the caller.
         let outcome =
-            crate::driver::test_support::outcome_of(ownership, signal, exec.execute()).await;
+            crate::driver::test_support::outcome_of(root, ownership, signal, exec.execute()).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
     }
 
@@ -1217,6 +1222,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
@@ -1306,6 +1312,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
@@ -1353,6 +1360,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
@@ -1410,6 +1418,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);

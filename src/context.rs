@@ -39,6 +39,31 @@ use crate::future::{Branch, DurableFuture};
 use aws_sdk_lambda::types::OperationUpdate;
 use tokio::sync::Mutex;
 
+/// The receiving half of a detached write, which drops a result that
+/// arrived but was never read inside a catch when it is dropped.
+///
+/// The channel carries only the write's result, never a panic payload: a
+/// panic of the checkpoint client is recorded by the task gateway. The
+/// result can hold an error of the user's checkpoint client, whose
+/// destructor can panic, and such a panic is invocation-failing. The write
+/// task can send its result after the caller's last poll and before the
+/// caller is dropped. Closing the channel first makes the result go to
+/// exactly one place: either this guard takes it, or the sender's `send`
+/// fails and the sender disposes of it.
+struct UnreadResultGuard<T> {
+    receiver: tokio::sync::oneshot::Receiver<T>,
+    coordinator: Arc<InvocationCoordinator>,
+}
+
+impl<T> Drop for UnreadResultGuard<T> {
+    fn drop(&mut self) {
+        self.receiver.close();
+        if let Ok(unread) = self.receiver.try_recv() {
+            crate::task::drop_recorded(&self.coordinator, unread);
+        }
+    }
+}
+
 /// The user-code body the SDK is polling on the current task.
 ///
 /// [`DurableContext::claim_operation_id`] compares it with the context an
@@ -218,6 +243,12 @@ impl std::fmt::Debug for Inner {
 #[non_exhaustive]
 pub struct DurableContext {
     inner: Arc<Inner>,
+    /// The first-poll flag of the handle an operation started on its own
+    /// task returns. `None` on every context except the clone that starts
+    /// such an operation (see [`Self::with_awaited`]). Every wait
+    /// registration of an operation run on that clone carries the flag, so
+    /// the refresh scheduler skips it until the handle is first polled.
+    awaited: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl std::fmt::Debug for DurableContext {
@@ -303,6 +334,7 @@ impl DurableContext {
                 owners: Arc::from(Vec::new()),
                 replay_span,
             }),
+            awaited: None,
         }
     }
 
@@ -337,6 +369,7 @@ impl DurableContext {
                 owners: Arc::from(Vec::new()),
                 replay_span,
             }),
+            awaited: None,
         }
     }
 
@@ -371,6 +404,7 @@ impl DurableContext {
                 owners: Arc::from(Vec::new()),
                 replay_span,
             }),
+            awaited: None,
         }
     }
 
@@ -411,6 +445,7 @@ impl DurableContext {
                 owners: Arc::from(Vec::new()),
                 replay_span,
             }),
+            awaited: None,
         }
     }
 
@@ -447,6 +482,7 @@ impl DurableContext {
                 owners: Arc::from(Vec::new()),
                 replay_span,
             }),
+            awaited: None,
         }
     }
     pub(crate) fn new_child(&self, parent_positional_id: &str) -> Self {
@@ -479,6 +515,7 @@ impl DurableContext {
                 owners: self.owners_with(parent_positional_id),
                 replay_span,
             }),
+            awaited: None,
         }
     }
 
@@ -624,6 +661,7 @@ impl DurableContext {
                 owners: self.owners_with(child_positional_id),
                 replay_span,
             }),
+            awaited: None,
         }
     }
 
@@ -649,6 +687,7 @@ impl DurableContext {
                 owners: self.owners_with(positional_id),
                 replay_span: self.inner.replay_span.clone(),
             }),
+            awaited: None,
         }
     }
 
@@ -756,12 +795,25 @@ impl DurableContext {
     ) {
         let mut registration: Option<crate::coordinator::WaitRegistration> = None;
         std::future::poll_fn(|cx| {
-            match &registration {
-                Some(live) => live.update_waker(cx.waker()),
-                None => match self.inner.coordinator.register_wait(wire_id, cx.waker()) {
+            if let Some(live) = &registration {
+                live.update_waker(cx.waker());
+            } else {
+                // The refresh schedule starts from the record's end time
+                // and status. A missing record is taken as `STARTED` with
+                // no end time.
+                let (status, due_at) = self
+                    .refresh_view(wire_id)
+                    .unwrap_or((CheckpointStatus::Started, None));
+                match self.inner.coordinator.register_wait(
+                    wire_id,
+                    due_at,
+                    &status,
+                    self.awaited.clone(),
+                    cx.waker(),
+                ) {
                     Some(live) => registration = Some(live),
                     None => return std::task::Poll::Pending,
-                },
+                }
             }
             let is_ready = self
                 .inner
@@ -773,10 +825,36 @@ impl DurableContext {
                 registration = None;
                 std::task::Poll::Ready(())
             } else {
+                if let Some(live) = &registration {
+                    live.resume_schedule();
+                }
                 std::task::Poll::Pending
             }
         })
         .await;
+    }
+
+    /// The status and end time of the record of `wire_id`, as the refresh
+    /// scheduler reads them.
+    pub(crate) fn refresh_view(
+        &self,
+        wire_id: &str,
+    ) -> Option<(CheckpointStatus, Option<std::time::SystemTime>)> {
+        self.inner
+            .engine
+            .checkpoint_log
+            .with_record(wire_id, |record| (record.status.clone(), record.due_at))
+    }
+
+    /// A clone of this context whose wait registrations carry `flag`, the
+    /// first-poll flag of the handle of an operation started on its own
+    /// task. The refresh scheduler skips those registrations until the
+    /// handle is first polled and sets the flag.
+    pub(crate) fn with_awaited(&self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            awaited: Some(flag),
+        }
     }
 
     /// Waits until the record of the operation at `positional_id` satisfies
@@ -1163,6 +1241,36 @@ impl DurableContext {
         {
             return T::no_runtime(*no_runtime);
         }
+        if !err.is_retryable()
+            && let Some(update) = terminal_fail
+        {
+            // Direct write: the coalescing buffer may hold the very
+            // updates the service just rejected, and this record must
+            // not queue behind them.
+            if let Err(fail_err) = self.checkpoint_updates_direct(vec![update]).await {
+                tracing::error!(
+                    operation_id = %op_wire_id,
+                    error = %fail_err,
+                    "terminal FAIL write also failed after non-retryable checkpoint \
+                     failure; failing the execution without a recorded outcome"
+                );
+            }
+        }
+        self.record_checkpoint_failure(op_wire_id, &err);
+        std::future::pending::<T>().await
+    }
+
+    /// Records the classification of a failed checkpoint write of
+    /// `op_wire_id` in the fatal slot, and returns at once.
+    ///
+    /// A retryable failure fails the invocation. A non-retryable failure
+    /// fails the execution with the record of
+    /// [`checkpoint_execution_failure_wire`](crate::error::checkpoint_execution_failure_wire).
+    /// [`Self::checkpoint_failure_unrecoverable`] calls it after its
+    /// terminal `FAIL` write. A refresh write calls it on the task that
+    /// receives the response, so the classification is recorded even when
+    /// the refresh's caller was dropped.
+    pub(crate) fn record_checkpoint_failure(&self, op_wire_id: &str, err: &ExecutionClientError) {
         let message = format!("checkpoint write failed for operation {op_wire_id}: {err}");
         if err.is_retryable() {
             tracing::error!(
@@ -1176,29 +1284,14 @@ impl DurableContext {
             tracing::error!(
                 operation_id = %op_wire_id,
                 error = %err,
-                "non-retryable checkpoint failure; recording terminal FAIL and failing \
-                 the execution"
+                "non-retryable checkpoint failure; failing the execution"
             );
-            if let Some(update) = terminal_fail {
-                // Direct write: the coalescing buffer may hold the very
-                // updates the service just rejected, and this record must
-                // not queue behind them.
-                if let Err(fail_err) = self.checkpoint_updates_direct(vec![update]).await {
-                    tracing::error!(
-                        operation_id = %op_wire_id,
-                        error = %fail_err,
-                        "terminal FAIL write also failed after non-retryable checkpoint \
-                         failure; failing the execution without a recorded outcome"
-                    );
-                }
-            }
-            let wire = crate::error::checkpoint_execution_failure_wire(&err);
+            let wire = crate::error::checkpoint_execution_failure_wire(err);
             self.inner.coordinator.record_fatal(
                 wire.error_type().unwrap_or_default().to_owned(),
                 wire.error_message().unwrap_or_default().to_owned(),
             );
         }
-        std::future::pending::<T>().await
     }
 
     /// Ends the invocation because a serdes call failed with a marked
@@ -1288,6 +1381,36 @@ impl DurableContext {
         self.checkpoint_with_urgency(updates, true).await
     }
 
+    /// Sends one checkpoint with no updates for the refresh scheduler, and
+    /// records the classification of a failure for `first_wire_id` before
+    /// it returns the error.
+    ///
+    /// The driver drops the scheduler, and so this future, when the
+    /// handler returns. A failure must still decide the invocation's
+    /// outcome, so it is never left to this future alone:
+    ///
+    /// - Without buffering, the detached write task records the failure
+    ///   itself (see [`Self::write_direct_detached`]).
+    /// - With buffering, the refresh joins the batch with `first_wire_id`
+    ///   as a failure owner, and the detached flusher that publishes the
+    ///   batch's failure records it (see [`Self::publish_batch`]).
+    pub(crate) async fn checkpoint_refresh(
+        &self,
+        first_wire_id: &str,
+    ) -> Result<CheckpointOutput, ExecutionClientError> {
+        if self.inner.coalescer.is_some() {
+            return self
+                .write_with_urgency(Vec::new(), true, Some(first_wire_id))
+                .await;
+        }
+        // No checkpoint permit: the scheduler's permit keeps the invocation
+        // open until the response is merged and the readied operations are
+        // woken. The write task is counted, so the drive's cleanup waits
+        // for it after the scheduler is dropped.
+        self.write_direct_detached(Vec::new(), Vec::new(), None, Some(first_wire_id.to_owned()))
+            .await
+    }
+
     /// Shared body of the buffered checkpoint paths: pairs each update
     /// with its captured lifecycle-event metadata, then hands the pairs to
     /// the write path, which emits each event as soon as the write that
@@ -1328,7 +1451,7 @@ impl DurableContext {
             })
             .collect();
 
-        self.write_with_urgency(tracked, urgent).await
+        self.write_with_urgency(tracked, urgent, None).await
     }
 
     /// Dispatches a checkpoint write: joins the coalescing batch when one
@@ -1344,10 +1467,15 @@ impl DurableContext {
     /// event to the coalescer: the flush task that persists the update
     /// emits it, so this future can be dropped mid-await without losing
     /// telemetry for a transition the flush still records.
+    ///
+    /// `failure_owner` applies only with buffering: the joined batch
+    /// records a failed write's classification for it when the flusher
+    /// publishes the failure (see [`Self::publish_batch`]).
     async fn write_with_urgency(
         &self,
         updates: Vec<TrackedUpdate>,
         urgent: bool,
+        failure_owner: Option<&str>,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
         let Some(coalescer) = self.inner.coalescer.clone() else {
             let (updates, events): (Vec<_>, Vec<_>) =
@@ -1358,7 +1486,7 @@ impl DurableContext {
                 return std::future::pending().await;
             };
             return self
-                .write_direct_detached(updates, events, Some(permit))
+                .write_direct_detached(updates, events, Some(permit), None)
                 .await;
         };
 
@@ -1367,9 +1495,13 @@ impl DurableContext {
         // cancelled. Returning `Ok` instead would let an operation continue
         // as if its update were recorded. The admitted join holds a
         // checkpoint permit until the batch's response is merged.
-        let Some((batch, opened)) =
-            coalescer.join(self.admission(), self.coordinator(), self.owners(), updates)
-        else {
+        let Some((batch, opened)) = coalescer.join_owned(
+            self.admission(),
+            self.coordinator(),
+            self.owners(),
+            updates,
+            failure_owner,
+        ) else {
             return std::future::pending().await;
         };
         if urgent || coalescer.delay().is_zero() {
@@ -1435,7 +1567,10 @@ impl DurableContext {
     ///
     /// `permit` is the write's checkpoint permit, held until the response is
     /// merged, the operations it readied are woken, and the result is
-    /// handed to the caller. `None` is passed only after the drive ended.
+    /// handed to the caller. `None` is passed in two cases: after the drive
+    /// ended, and for an unbatched refresh, whose scheduler permit holds the
+    /// invocation open instead (see [`Self::checkpoint_refresh`]). In both
+    /// cases the cleanup's `wait_idle` waits for the counted task.
     ///
     /// The write runs on its own task because a cancelled caller must not
     /// cancel an admitted request. A batch abandons its running items at
@@ -1453,28 +1588,42 @@ impl DurableContext {
     ///   [`Self::checkpoint_failure_unrecoverable`]).
     /// - The admission check rejects the write: nothing is sent, and the
     ///   returned future never resolves (see [`Admission`]).
-    /// - The write panics: the panic resumes on the caller.
+    /// - The checkpoint client panics: the task gateway records the panic on
+    ///   the coordinator, which ends the drive. The channel carries no
+    ///   payload, so the caller stays pending until the drive's cleanup
+    ///   cancels it.
     /// - Otherwise: the caller gets the write's result.
+    ///
+    /// With `failure_owner` set, the task itself records a failed write's
+    /// classification for that operation (see
+    /// [`Self::record_checkpoint_failure`]) before it releases the permit.
+    /// A refresh sets it, because the driver drops the refresh's caller
+    /// when the handler returns, and the failure must still decide the
+    /// invocation's outcome.
     async fn write_direct_detached(
         &self,
         updates: Vec<OperationUpdate>,
         events: Vec<crate::tracing_layer::PendingTransitionEvent>,
         permit: Option<crate::coordinator::Permit>,
+        failure_owner: Option<String>,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let ctx = self.clone();
         let spawned = crate::task::spawn_detached(self.coordinator(), async move {
-            let written = crate::task::catch_panic(ctx.checkpoint_direct_with_events(
-                updates,
-                &events,
-                Some(ctx.owners()),
-            ))
-            .await;
-            // A dropped receiver means the caller was cancelled: the write
-            // already happened, and its result has no reader. The caller's
-            // wake takes its own permit before the write's permit is
-            // released.
-            drop(sender.send(written));
+            let written = ctx
+                .checkpoint_direct_with_events(updates, &events, Some(ctx.owners()))
+                .await;
+            if let (Some(owner), Some(Err(err))) = (&failure_owner, &written) {
+                ctx.record_checkpoint_failure(owner, err);
+            }
+            // A dropped receiver means the caller was cancelled, or the
+            // driver dropped the refresh scheduler when the drive ended:
+            // the write already happened, and its result has no reader. The
+            // result is then dropped inside a catch. The caller's wake takes
+            // its own permit before the write's permit is released.
+            if let Err(unread) = sender.send(written) {
+                crate::task::drop_recorded(ctx.coordinator(), unread);
+            }
             drop(permit);
         });
         if let Err(no_runtime) = spawned {
@@ -1487,14 +1636,18 @@ impl DurableContext {
                 no_runtime,
             ));
         }
-        #[expect(clippy::expect_used)]
-        // reason: the task always sends before it exits, a panic included,
-        // and a detached task is never aborted. So the sender is never
-        // dropped unsent while this future is polled.
-        let written = receiver
-            .await
-            .expect("a detached write task always sends its outcome");
-        match written.into_value() {
+        let mut receiver = UnreadResultGuard {
+            receiver,
+            coordinator: Arc::clone(self.coordinator()),
+        };
+        // A detached task is never aborted, so the sender is dropped unsent
+        // only when the checkpoint client panicked. The gateway recorded
+        // that panic, so the caller stays pending until the cleanup cancels
+        // it.
+        let Ok(written) = (&mut receiver.receiver).await else {
+            return std::future::pending().await;
+        };
+        match written {
             Some(result) => result,
             None => std::future::pending().await,
         }
@@ -1525,12 +1678,16 @@ impl DurableContext {
         let publish_to = Arc::clone(batch);
         let batch = Arc::clone(batch);
         // Detached mode of the task gateway (src/task.rs): this internal
-        // task runs no user future and creates no durable operations, and it
+        // task runs no handler code and creates no durable operations, and it
         // must survive a cancelled contributor. It is still counted, so the
         // invocation waits for an in-flight write before it returns. The
         // batch's checkpoint permits keep the invocation from suspending
         // until the response is merged and published.
-        let spawned = crate::task::spawn_detached(self.coordinator(), async move {
+        // A panic of the checkpoint client unwinds the flush, and nothing
+        // publishes the batch. The task gateway records the panic on the
+        // coordinator, which ends the drive. The contributors stay pending
+        // until the drive's cleanup cancels them.
+        let flush = async move {
             if !delay.is_zero() {
                 // The window ends early when the invocation would suspend
                 // but for buffered writes, or when the drive ended. A
@@ -1558,7 +1715,7 @@ impl DurableContext {
                         prior.clone(),
                         updates.into_iter().map(|t| t.update).collect(),
                     );
-                    batch.publish(Err(prior));
+                    ctx.publish_batch(&batch, Err(prior));
                     drop(permits);
                     return;
                 }
@@ -1580,20 +1737,46 @@ impl DurableContext {
                 // The merge already woke the operations the response
                 // readied. The contributors' wakes take their own permits
                 // before the batch's permits are released.
-                batch.publish(result);
+                ctx.publish_batch(&batch, result);
                 drop(permits);
             }
-        });
+        };
+        let spawned = crate::task::spawn_detached(self.coordinator(), flush);
         // No Tokio runtime is running on this thread, so nothing can write
         // the batch: every contributor receives the error instead of waiting
         // forever. Nothing was written, so the invocation fails and the
         // service invokes the function again.
         if let Err(no_runtime) = spawned {
-            publish_to.publish(Err(ExecutionClientError::new(
-                ExecutionClientErrorScope::Invocation,
-                no_runtime.to_string(),
-            )));
+            self.publish_batch(
+                &publish_to,
+                Err(ExecutionClientError::new(
+                    ExecutionClientErrorScope::Invocation,
+                    no_runtime.to_string(),
+                )),
+            );
         }
+    }
+
+    /// Publishes a spawned flush's `result` to `batch`'s contributors.
+    ///
+    /// A failure is first recorded for each of the batch's failure owners
+    /// (see [`Self::record_checkpoint_failure`]). The publisher runs on the
+    /// detached flush task, which the drive's cleanup waits for, so the
+    /// classification is in the fatal slot before the driver reads the
+    /// outcome, even when every contributor was dropped. The
+    /// end-of-invocation flush point publishes without this record,
+    /// because it classifies the failures it drains itself.
+    fn publish_batch(
+        &self,
+        batch: &CheckpointBatch,
+        result: Result<CheckpointOutput, ExecutionClientError>,
+    ) {
+        if let Err(err) = &result {
+            for owner in batch.take_failure_owners() {
+                self.record_checkpoint_failure(&owner, err);
+            }
+        }
+        batch.publish(result);
     }
 
     /// Writes a sealed batch, splitting it into request-sized chunks that
@@ -1902,7 +2085,7 @@ impl DurableContext {
             // from an abandoned owner is.
             return std::future::pending().await;
         };
-        self.write_direct_detached(updates, Vec::new(), Some(permit))
+        self.write_direct_detached(updates, Vec::new(), Some(permit), None)
             .await
     }
 
@@ -1912,7 +2095,8 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
-        self.write_direct_detached(updates, Vec::new(), None).await
+        self.write_direct_detached(updates, Vec::new(), None, None)
+            .await
     }
 
     /// Body of [`Self::checkpoint_updates_direct`] that additionally owns
@@ -2947,6 +3131,57 @@ mod tests {
     use aws_sdk_lambda::types::Operation;
     use std::sync::Arc;
 
+    /// Panics with "value drop" when dropped.
+    struct DropPanics;
+
+    impl Drop for DropPanics {
+        #[expect(clippy::panic)]
+        // reason: the test checks that the guard records this panic.
+        fn drop(&mut self) {
+            panic!("value drop");
+        }
+    }
+
+    /// Wraps the receiving half of a fresh channel in an
+    /// [`UnreadResultGuard`].
+    fn guarded<T>(
+        coordinator: &Arc<InvocationCoordinator>,
+    ) -> (tokio::sync::oneshot::Sender<T>, UnreadResultGuard<T>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let guard = UnreadResultGuard {
+            receiver,
+            coordinator: Arc::clone(coordinator),
+        };
+        (sender, guard)
+    }
+
+    /// A result sent but never read is dropped inside a catch when the
+    /// guard is dropped. Its destructor's panic does not escape the drop,
+    /// and it is recorded on the coordinator.
+    #[test]
+    fn unread_result_guard_records_a_destructor_panic() {
+        let coordinator = InvocationCoordinator::new();
+        let (sender, guard) = guarded::<DropPanics>(&coordinator);
+        assert!(sender.send(DropPanics).is_ok());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(guard))).is_ok()
+        );
+        let payload = coordinator.take_panic().expect("recorded");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"value drop"));
+    }
+
+    /// A guard with no unread result records nothing. After the guard is
+    /// dropped, the sender's `send` fails, so the sender disposes of the
+    /// result itself.
+    #[test]
+    fn unread_result_guard_closes_the_channel() {
+        let coordinator = InvocationCoordinator::new();
+        let (sender, guard) = guarded::<u32>(&coordinator);
+        drop(guard);
+        assert!(!coordinator.has_panic());
+        assert_eq!(sender.send(7), Err(7));
+    }
+
     /// A claim outside any `run_body` scope does no check.
     #[test]
     fn claim_without_active_body_records_nothing() {
@@ -3312,6 +3547,7 @@ mod tests {
             callback_id: None,
             op_type: Some("Step".to_owned()),
             sub_type: Some("Step".to_owned()),
+            due_at: None,
             op_name: Some("my-step".to_owned()),
         };
 
@@ -3354,6 +3590,7 @@ mod tests {
             callback_id: None,
             op_type: Some("Step".to_owned()),
             sub_type: Some("Step".to_owned()),
+            due_at: None,
             op_name: Some("my-step".to_owned()),
         });
 
@@ -3392,6 +3629,7 @@ mod tests {
             callback_id: None,
             op_type: Some("Step".to_owned()),
             sub_type: Some("Step".to_owned()),
+            due_at: None,
             op_name: None,
         });
 
@@ -3435,6 +3673,7 @@ mod tests {
             callback_id: None,
             op_type: Some("Step".to_owned()),
             sub_type: Some("Step".to_owned()),
+            due_at: None,
             op_name: None,
         });
 
@@ -3497,6 +3736,7 @@ mod tests {
             callback_id: None,
             op_type: Some("Step".to_owned()),
             sub_type: Some("Step".to_owned()),
+            due_at: None,
             op_name: None,
         });
 
@@ -3525,6 +3765,7 @@ mod tests {
             callback_id: Some("cb-42".to_owned()),
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         });
 
@@ -3572,6 +3813,7 @@ mod tests {
             callback_id: Some("cb-99".to_owned()),
             op_type: Some("Context".to_owned()),
             sub_type: Some("Map".to_owned()),
+            due_at: None,
             op_name: Some("batch".to_owned()),
         });
 
@@ -3619,6 +3861,7 @@ mod tests {
             callback_id: None,
             op_type: Some("Step".to_owned()),
             sub_type: Some("Step".to_owned()),
+            due_at: None,
             op_name: None,
         };
 
@@ -3667,6 +3910,7 @@ mod tests {
             callback_id: None,
             op_type: Some("Step".to_owned()),
             sub_type: Some("Step".to_owned()),
+            due_at: None,
             op_name: None,
         };
 
@@ -3707,6 +3951,7 @@ mod tests {
             callback_id: None,
             op_type: Some("Step".to_owned()),
             sub_type: Some("Step".to_owned()),
+            due_at: None,
             op_name: Some("fetch-user".to_owned()),
         };
 
@@ -3758,6 +4003,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
 
@@ -3793,6 +4039,7 @@ mod tests {
             callback_id: None,
             op_type: Some("STEP".to_owned()),
             sub_type: Some("STEP".to_owned()),
+            due_at: None,
             op_name: None,
         };
 
@@ -3834,6 +4081,7 @@ mod tests {
             // envelope: the raw wire `Type` value.
             op_type: Some("CHAINED_INVOKE".to_owned()),
             sub_type: Some("ChainedInvoke".to_owned()),
+            due_at: None,
             op_name: None,
         };
 
@@ -3878,6 +4126,7 @@ mod tests {
             callback_id: None,
             op_type: Some("CHAINED_INVOKE".to_owned()),
             sub_type: Some("ChainedInvoke".to_owned()),
+            due_at: None,
             op_name: None,
         };
 
@@ -3939,6 +4188,7 @@ mod tests {
             callback_id: None,
             op_type: op_type.map(ToOwned::to_owned),
             sub_type: sub_type.map(ToOwned::to_owned),
+            due_at: None,
             op_name: op_name.map(ToOwned::to_owned),
         }
     }
@@ -5420,6 +5670,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let log = CheckpointLog::from_records(vec![(wire, record)]);
@@ -5473,6 +5724,7 @@ mod tests {
                 callback_id: None,
                 op_type: Some("Wait".to_owned()),
                 sub_type: Some("Wait".to_owned()),
+                due_at: None,
                 op_name: None,
             };
             (wire, record)
@@ -5553,6 +5805,7 @@ mod tests {
             callback_id: Some("cb-1".to_owned()),
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire, record)]));
@@ -5679,6 +5932,7 @@ mod tests {
             callback_id: None,
             op_type: Some("Context".to_owned()),
             sub_type: Some(crate::child::CHILD_SUB_TYPE.to_owned()),
+            due_at: None,
             op_name: None,
         };
         let ctx = DurableContext::new_root_with_client_and_defaults(
@@ -5738,24 +5992,148 @@ mod tests {
         }
     }
 
-    /// A panic in a direct write's task resumes on the caller with its
-    /// original payload.
-    #[tokio::test]
-    async fn direct_write_panic_resumes_on_caller() {
+    /// Writes one update directly through `client`, and returns the
+    /// coordinator's kept panic after the write task stopped. The caller
+    /// must stay pending: the write channel carries no panic payload.
+    async fn direct_write_kept_panic(
+        client: Arc<dyn ExecutionClient>,
+    ) -> Box<dyn std::any::Any + Send + 'static> {
         let root = DurableContext::new_root_with_client_and_defaults(
             "arn:test".to_owned(),
             lambda_runtime::Context::default(),
             Arc::new(CheckpointLog::empty()),
-            Arc::new(PanickingClient) as Arc<dyn ExecutionClient>,
+            client,
             "token-0".to_owned(),
             None,
         );
-        let caller =
-            tokio::spawn(async move { root.checkpoint_updates(vec![make_update("u")]).await });
-        let joined = tokio::time::timeout(ADMISSION_BOUND, caller)
+        let coordinator = Arc::clone(root.coordinator());
+        let mut write = std::pin::pin!(root.checkpoint_updates(vec![make_update("u")]));
+        let waited = tokio::time::timeout(ADMISSION_BOUND, async {
+            tokio::select! {
+                _ = &mut write => false,
+                () = async {
+                    // Wait until the write task has stopped, then poll the
+                    // caller once more.
+                    tokio::task::yield_now().await;
+                    coordinator.tasks().wait_idle().await;
+                } => true,
+            }
+        })
+        .await
+        .expect("the write task stops");
+        assert!(waited, "the caller resolved");
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(write.as_mut().poll(cx))).await;
+        assert!(
+            polled.is_pending(),
+            "the caller stays pending after the client panicked"
+        );
+        coordinator.take_panic().expect("the panic is kept")
+    }
+
+    /// An error source whose destructor panics with "source drop".
+    #[derive(Debug)]
+    struct DropPanickingSource;
+
+    impl std::fmt::Display for DropPanickingSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("drop-panicking source")
+        }
+    }
+
+    impl std::error::Error for DropPanickingSource {}
+
+    impl Drop for DropPanickingSource {
+        #[expect(clippy::panic)] // reason: the panic is the behavior under test
+        fn drop(&mut self) {
+            panic!("source drop");
+        }
+    }
+
+    /// A client whose checkpoint call waits for `release`, then fails with
+    /// an error whose source panics when dropped.
+    #[derive(Debug)]
+    struct GatedFailingClient {
+        release: tokio::sync::Notify,
+    }
+
+    impl ExecutionClient for GatedFailingClient {
+        fn checkpoint(
+            &self,
+            _arn: &str,
+            _token: &str,
+            _updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                self.release.notified().await;
+                Err(ExecutionClientError::with_source(
+                    ExecutionClientErrorScope::Invocation,
+                    "gated failure",
+                    DropPanickingSource,
+                ))
+            })
+        }
+
+        fn get_state(
+            &self,
+            _arn: &str,
+            _token: &str,
+            _marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Ok(GetStateOutput {
+                    operations: Vec::new(),
+                    next_marker: None,
+                })
+            })
+        }
+    }
+
+    /// The caller of a direct write is dropped before the write returns. The
+    /// write task drops the unread result inside a catch, and the panic of
+    /// its destructor is recorded on the coordinator.
+    #[tokio::test]
+    async fn unread_direct_write_result_drop_panic_is_recorded() {
+        let client = Arc::new(GatedFailingClient {
+            release: tokio::sync::Notify::new(),
+        });
+        let root = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "token-0".to_owned(),
+            None,
+        );
+        let coordinator = Arc::clone(root.coordinator());
+        let mut write = Box::pin(root.checkpoint_updates(vec![make_update("u")]));
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(write.as_mut().poll(cx))).await;
+        assert!(polled.is_pending());
+        drop(write);
+        client.release.notify_one();
+        tokio::time::timeout(ADMISSION_BOUND, coordinator.tasks().wait_idle())
             .await
-            .expect("the caller resolves");
-        let payload = joined.expect_err("the caller panicked").into_panic();
+            .expect("the write task stops");
+        let payload = coordinator
+            .take_panic()
+            .expect("the destructor's panic is recorded");
+        assert_eq!(
+            crate::task::test_support::str_payload(payload.as_ref()),
+            Some("source drop")
+        );
+    }
+
+    /// A panic of the checkpoint client in a direct write's task is kept
+    /// by the coordinator with its original payload, and the caller stays
+    /// pending.
+    #[tokio::test]
+    async fn direct_write_panic_is_recorded_and_caller_stays_pending() {
+        let payload = direct_write_kept_panic(Arc::new(PanickingClient)).await;
         assert_eq!(
             crate::task::test_support::str_payload(payload.as_ref()),
             Some("boom in checkpoint")
@@ -5822,24 +6200,11 @@ mod tests {
     }
 
     /// A panic from the destructor of a checkpoint future that returned
-    /// `Ready` resumes on the caller of the direct write with its original
-    /// payload.
+    /// `Ready` is kept by the coordinator with its original payload, and the
+    /// caller of the direct write stays pending.
     #[tokio::test]
-    async fn direct_write_drop_panic_resumes_on_caller() {
-        let root = DurableContext::new_root_with_client_and_defaults(
-            "arn:test".to_owned(),
-            lambda_runtime::Context::default(),
-            Arc::new(CheckpointLog::empty()),
-            Arc::new(DropPanickingClient) as Arc<dyn ExecutionClient>,
-            "token-0".to_owned(),
-            None,
-        );
-        let caller =
-            tokio::spawn(async move { root.checkpoint_updates(vec![make_update("u")]).await });
-        let joined = tokio::time::timeout(ADMISSION_BOUND, caller)
-            .await
-            .expect("the caller resolves");
-        let payload = joined.expect_err("the caller panicked").into_panic();
+    async fn direct_write_drop_panic_is_recorded_and_caller_stays_pending() {
+        let payload = direct_write_kept_panic(Arc::new(DropPanickingClient)).await;
         assert_eq!(
             crate::task::test_support::str_payload(payload.as_ref()),
             Some("boom in checkpoint drop")
@@ -5990,6 +6355,46 @@ mod coordinator_tests {
         // The context reads its own Lambda deadline.
         let ctx = DurableContext::test_context();
         assert_eq!(ctx.remaining_time(), None, "the default deadline is 0");
+    }
+
+    /// A wait on a missing record starts its schedule as a `STARTED` record
+    /// with no end time: a first refresh after 1 s, and a backoff when the
+    /// refresh finds the record `STARTED`.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_record_without_record_starts_as_started() {
+        let ctx = DurableContext::test_context();
+        let coordinator = Arc::clone(ctx.coordinator());
+        let registered = tokio::time::Instant::now();
+        let wire = "missing".to_owned();
+        let mut wait = Box::pin(ctx.wait_for_record(&wire, |s| *s == CheckpointStatus::Succeeded));
+        let polled = futures_poll_once(wait.as_mut());
+        assert!(polled.is_pending());
+        assert_eq!(
+            coordinator.next_refresh_at(),
+            Some(registered + Duration::from_secs(1))
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let crate::coordinator::DueRefresh::Due { keys, .. } =
+            coordinator.take_due(tokio::time::Instant::now())
+        else {
+            unreachable!("the registration is due");
+        };
+        let records =
+            std::collections::BTreeMap::from([(wire.clone(), (CheckpointStatus::Started, None))]);
+        coordinator.after_refresh(&keys, &records);
+        assert_eq!(
+            coordinator.next_refresh_at(),
+            Some(registered + Duration::from_secs(2)),
+            "an unchanged STARTED record backs off"
+        );
+    }
+
+    /// Polls `fut` once with a no-op waker.
+    fn futures_poll_once<F: Future + ?Sized>(
+        fut: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        fut.poll(&mut cx)
     }
 
     #[test]

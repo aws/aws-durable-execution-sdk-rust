@@ -7,7 +7,11 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+
+use crate::coordinator::InvocationCoordinator;
 
 use crate::BoxError;
 use crate::DurableContext;
@@ -51,6 +55,10 @@ use crate::error::{ChildFnError, OperationError};
 #[non_exhaustive]
 pub struct DurableFuture<O> {
     inner: Pin<Box<dyn Future<Output = Result<O, OperationError>> + Send>>,
+    /// The first-poll flag of an operation started on its own task, with
+    /// the coordinator to notify when the handle is first polled. `None`
+    /// for every other handle, and after the first poll.
+    awaited: Option<(Arc<AtomicBool>, Arc<InvocationCoordinator>)>,
 }
 
 impl<O> std::fmt::Debug for DurableFuture<O> {
@@ -67,6 +75,7 @@ impl<O: Send + 'static> DurableFuture<O> {
     {
         Self {
             inner: Box::pin(fut),
+            awaited: None,
         }
     }
 
@@ -99,13 +108,23 @@ impl<O: Send + 'static> DurableFuture<O> {
     /// operation resumes on the task that awaits the handle, with its
     /// original payload. When no Tokio runtime is running, the returned
     /// future resolves to an error and the operation records nothing.
+    ///
+    /// `awaited` is the first-poll flag the operation's wait registrations
+    /// carry. The returned handle sets it on its first poll and asks the
+    /// coordinator to arm those registrations' refreshes (see
+    /// [`crate::coordinator`]).
     pub(crate) fn spawn_blessed(
         future: Self,
-        task_ownership: &std::sync::Arc<crate::driver::TaskOwnership>,
-        coordinator: &std::sync::Arc<crate::coordinator::InvocationCoordinator>,
+        task_ownership: &Arc<crate::driver::TaskOwnership>,
+        coordinator: &Arc<InvocationCoordinator>,
+        awaited: Option<Arc<AtomicBool>>,
     ) -> Self {
         match crate::task::spawn_tracked(coordinator, task_ownership, future) {
-            Ok(task) => Self::from_async(async move { task.await.into_value() }),
+            Ok(task) => {
+                let mut handle = Self::from_async(async move { task.await.into_value() });
+                handle.awaited = awaited.map(|flag| (flag, Arc::clone(coordinator)));
+                handle
+            }
             // No Tokio runtime is running on this thread: the operation
             // records nothing and resolves to an error.
             Err(no_runtime) => {
@@ -121,6 +140,12 @@ impl<O: Send + 'static> Future for DurableFuture<O> {
     type Output = Result<O, OperationError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // The first poll of the handle of an operation started on its own
+        // task: from now on the scheduler refreshes its registrations.
+        if let Some((flag, coordinator)) = self.awaited.take() {
+            flag.store(true, Ordering::SeqCst);
+            coordinator.notify_awaited();
+        }
         self.inner.as_mut().poll(cx)
     }
 }
@@ -457,23 +482,81 @@ impl<O: Send + 'static> Callback<O> {
                 ctx,
                 wire_id,
                 resolver,
+            } => Self::pending_result(ctx, wire_id, resolver),
+        }
+    }
+
+    /// Waits for the callback result on its own SDK task, as `.spawn()` does
+    /// for other operations, and returns its handle. The SDK refreshes the
+    /// callback's status only after the handle is first polled. Dropping the
+    /// handle cancels the wait.
+    ///
+    /// For a settled callback (replay) it returns the same future as
+    /// [`result()`](Self::result), which resolves with the stored outcome
+    /// and starts no task.
+    ///
+    /// # Errors
+    ///
+    /// For a pending callback, when no Tokio runtime is running, the
+    /// returned future resolves to an error. A settled callback needs no
+    /// runtime.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, durable::BoxError> {
+    ///     let cb = ctx.create_callback::<String>().name("approval").await?;
+    ///     let approval = cb.spawn_result();
+    ///     ctx.step(|_| async { Ok(()) }).name("other-work").await?;
+    ///     Ok(approval.await?)
+    /// }
+    /// ```
+    pub fn spawn_result(self) -> DurableFuture<O> {
+        match self.state {
+            CallbackState::Settled(_) => self.result(),
+            CallbackState::Pending {
+                ctx,
+                wire_id,
+                resolver,
             } => {
-                // Live path: wait until the record is terminal, then build
-                // the outcome from it, as the create-time replay does.
-                let gate = ctx.clone();
-                DurableFuture::for_operation(&gate, async move {
-                    ctx.wait_for_record(&wire_id, |status| {
-                        !matches!(
-                            status,
-                            crate::engine::CheckpointStatus::Started
-                                | crate::engine::CheckpointStatus::Pending
-                        )
-                    })
-                    .await;
-                    resolver().await
-                })
+                let flag = Arc::new(AtomicBool::new(false));
+                let waiting = ctx.with_awaited(Arc::clone(&flag));
+                let future = Self::pending_result(waiting, wire_id, resolver);
+                DurableFuture::spawn_blessed(
+                    future,
+                    ctx.task_ownership(),
+                    ctx.coordinator(),
+                    Some(flag),
+                )
             }
         }
+    }
+
+    /// The future of a pending callback's result: it waits until the record
+    /// is terminal, then builds the outcome from it, as the create-time
+    /// replay does.
+    fn pending_result(
+        ctx: DurableContext,
+        wire_id: String,
+        resolver: CallbackResolver<O>,
+    ) -> DurableFuture<O> {
+        let gate = ctx.clone();
+        DurableFuture::for_operation(&gate, async move {
+            ctx.wait_for_record(&wire_id, |status| {
+                !matches!(
+                    status,
+                    crate::engine::CheckpointStatus::Started
+                        | crate::engine::CheckpointStatus::Pending
+                )
+            })
+            .await;
+            resolver().await
+        })
     }
 }
 

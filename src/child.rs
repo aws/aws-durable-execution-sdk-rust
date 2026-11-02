@@ -854,6 +854,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )
@@ -886,6 +887,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )
@@ -974,6 +976,7 @@ mod tests {
             .name("rebuild")
             .serdes(MarkedFailure);
         crate::driver::test_support::expect_serdes_fault(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             child,

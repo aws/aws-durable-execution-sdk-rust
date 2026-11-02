@@ -1205,6 +1205,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));

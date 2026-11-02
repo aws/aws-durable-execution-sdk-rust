@@ -1013,8 +1013,27 @@ fn operation_to_record(op: &Operation) -> (String, CheckpointRecord) {
         op_type: Some(operation_type_to_string(&op.r#type)),
         sub_type: op.sub_type.clone(),
         op_name: op.name.clone(),
+        due_at: operation_due_at(op),
     };
     (op.id().to_owned(), record)
+}
+
+/// When `op` is next due: a WAIT's scheduled end, or a STEP's next attempt.
+/// `None` for any other type, a missing value, or a value outside the range
+/// of `SystemTime`.
+fn operation_due_at(op: &Operation) -> Option<std::time::SystemTime> {
+    let timestamp = match op.r#type() {
+        OperationType::Wait => op
+            .wait_details
+            .as_ref()
+            .and_then(|d| d.scheduled_end_timestamp),
+        OperationType::Step => op
+            .step_details
+            .as_ref()
+            .and_then(|d| d.next_attempt_timestamp),
+        _ => None,
+    }?;
+    crate::to_system_time(timestamp)
 }
 
 /// Converts an `OperationType` enum to a string for identity comparison.
@@ -1266,6 +1285,56 @@ fn extract_wire_error_field<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn due_at_from_wait_and_step_details() {
+        let op = |r#type: OperationType| {
+            Operation::builder()
+                .id("op")
+                .r#type(r#type)
+                .status(aws_sdk_lambda::types::OperationStatus::Started)
+                .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+        };
+        let wait = op(OperationType::Wait)
+            .wait_details(
+                aws_sdk_lambda::types::WaitDetails::builder()
+                    .scheduled_end_timestamp(aws_smithy_types::DateTime::from_secs(100))
+                    .build(),
+            )
+            .build()
+            .expect("all required fields set");
+        let step = op(OperationType::Step)
+            .step_details(
+                aws_sdk_lambda::types::StepDetails::builder()
+                    .next_attempt_timestamp(aws_smithy_types::DateTime::from_secs(200))
+                    .build(),
+            )
+            .build()
+            .expect("all required fields set");
+        let neither = op(OperationType::Wait)
+            .build()
+            .expect("all required fields set");
+        // Only a WAIT and a STEP carry an end time.
+        let callback = op(OperationType::Callback)
+            .wait_details(
+                aws_sdk_lambda::types::WaitDetails::builder()
+                    .scheduled_end_timestamp(aws_smithy_types::DateTime::from_secs(300))
+                    .build(),
+            )
+            .build()
+            .expect("all required fields set");
+        let epoch = std::time::UNIX_EPOCH;
+        assert_eq!(
+            operation_to_record(&wait).1.due_at,
+            Some(epoch + std::time::Duration::from_secs(100))
+        );
+        assert_eq!(
+            operation_to_record(&step).1.due_at,
+            Some(epoch + std::time::Duration::from_secs(200))
+        );
+        assert_eq!(operation_to_record(&neither).1.due_at, None);
+        assert_eq!(operation_to_record(&callback).1.due_at, None);
+    }
 
     // Request mapping (aws-smithy-mocks)
     //
@@ -2431,6 +2500,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )]);

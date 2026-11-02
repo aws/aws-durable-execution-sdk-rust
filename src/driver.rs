@@ -279,12 +279,33 @@ impl TaskOwnership {
     }
 }
 
-/// How the drive of the root task ended.
+/// How the drive of the root task ended. It carries no panic payload: the
+/// coordinator owns every invocation-failing panic.
 enum DriveEnd<T> {
-    /// The root task resolved or panicked.
-    Completed(crate::task::TaskOutcome<T>),
-    /// A fatal error was recorded, or the phase became `Suspending`.
+    /// The root task returned the handler's result.
+    Completed(T),
+    /// A fatal error or a panic was recorded, or the phase became
+    /// `Suspending`.
     Interrupted,
+}
+
+/// Closes panic ownership when the drive is dropped before it arbitrated.
+///
+/// A kept payload can hold a `DurableContext`, which keeps the coordinator
+/// alive, so the coordinator's own drop cannot be relied on to drop it.
+/// The guard takes the payload out under the coordinator lock, which also
+/// closes ownership, and drops it through [`crate::task::discard_panic`].
+/// A detached task that panics after that gets its payload back from
+/// `record_panic` and disposes of it. After the arbitration, `take_panic`
+/// returns nothing, so the guard's drop does nothing.
+struct PanicOwnershipGuard(Arc<InvocationCoordinator>);
+
+impl Drop for PanicOwnershipGuard {
+    fn drop(&mut self) {
+        if let Some(payload) = self.0.take_panic() {
+            crate::task::discard_panic(payload);
+        }
+    }
 }
 
 /// Drives a single invocation of the user's handler future.
@@ -293,34 +314,90 @@ enum DriveEnd<T> {
 /// task gateway (`crate::task::spawn_root`), and polled by its
 /// permit-aware wrapper. The drive ends in one of four ways:
 ///
-/// 1. A fatal error is recorded: the fatal outcome, with precedence over
-///    everything else.
-/// 2. The phase becomes `Suspending`: `Pending`.
-/// 3. The handler resolves: `Complete` or `Failed`. A wait whose handle the
-///    handler dropped does not change that; its record can stay `STARTED`.
-/// 4. The handler panics: `Err` with the original payload, which the caller
-///    resumes.
+/// 1. A fatal error is recorded.
+/// 2. An invocation-failing panic is recorded on the coordinator: the
+///    handler panicked, the refresh scheduler panicked, a detached task
+///    (the batch flusher or a direct write, which run the checkpoint
+///    client) panicked, or a task's outcome holding a panic lost its
+///    reader.
+/// 3. The phase becomes `Suspending`.
+/// 4. The handler resolves. A wait whose handle the handler dropped does
+///    not change that; its record can stay `STARTED`.
+///
+/// The outcome is decided once, after the cleanup below, from the fatal
+/// error and the panic the coordinator keeps, read together:
+///
+/// 1. A fatal error was recorded: the fatal outcome. A kept panic is
+///    dropped through [`crate::task::discard_panic`].
+/// 2. Otherwise a panic is kept: `Err` with its original payload, which
+///    the caller resumes. The coordinator keeps the first panic recorded;
+///    every later one is dropped.
+/// 3. Otherwise the handler's result: `Complete` or `Failed`, or `Pending`
+///    when the drive ended by suspension.
 ///
 /// When `remaining` is `Some(d)`, the driver also polls a sleep of `d`
 /// directly, so a timer wake takes no permit. When it fires while the
 /// phase is `Running`, no permit is held and no wait is live, it logs
-/// [`UNTRACKED_DEADLINE_WARNING`] once.
+/// [`UNTRACKED_DEADLINE_WARNING`] once. The coordinator also counts its
+/// refresh deadline down from `d` in tokio time.
 ///
-/// Cleanup, after every ending: the phase becomes `Finished`, the root task
-/// is aborted and awaited, every other tracked task is aborted, and the
-/// driver waits until every tracked task has unwound. Dropping the futures
-/// retires their wait registrations and releases their permits. So when
-/// this function returns, no SDK task, permit or wait registration of this
-/// invocation remains.
+/// While the phase is `Running`, the driver polls the refresh scheduler
+/// ([`refresh_scheduler`]) beside the handler, directly, so a timer wake
+/// takes no permit. The scheduler sends its refreshes through `root`, a
+/// clone of the root context. When the drive ends the scheduler is
+/// dropped. A refresh it started runs on a detached task, so the cleanup
+/// waits for its response to be merged.
+///
+/// Cleanup, after every ending: the scheduler is dropped, the phase
+/// becomes `Finished`, the root task is aborted and awaited, every other
+/// tracked task is aborted, and the driver waits until every tracked task
+/// has unwound. Dropping the futures retires their wait registrations and
+/// releases their permits. A panic during the cleanup is recorded, and the
+/// cleanup continues to its end. Last, every panic still unread in a task
+/// slot is recorded, including one whose handle outlives the handler. So
+/// when this function returns, no SDK task, permit or wait registration of
+/// this invocation remains.
+///
+/// When this future is dropped before it decides the outcome, a guard
+/// closes panic ownership and drops a kept panic (see
+/// [`PanicOwnershipGuard`]).
 pub(crate) async fn drive_invocation<F>(
     handler_future: F,
     task_ownership: Arc<TaskOwnership>,
     coordinator: Arc<InvocationCoordinator>,
+    root: crate::DurableContext,
     remaining: Option<Duration>,
 ) -> Result<InvocationOutcome, Box<dyn std::any::Any + Send + 'static>>
 where
     F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
 {
+    drive_with_scheduler(
+        handler_future,
+        task_ownership,
+        coordinator,
+        refresh_scheduler(root),
+        remaining,
+    )
+    .await
+}
+
+/// [`drive_invocation`] with `scheduler` polled in place of the refresh
+/// scheduler. Tests pass a scheduler of their own.
+async fn drive_with_scheduler<F, S>(
+    handler_future: F,
+    task_ownership: Arc<TaskOwnership>,
+    coordinator: Arc<InvocationCoordinator>,
+    scheduler: S,
+    remaining: Option<Duration>,
+) -> Result<InvocationOutcome, Box<dyn std::any::Any + Send + 'static>>
+where
+    F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
+    S: Future<Output = ()>,
+{
+    let ownership_guard = PanicOwnershipGuard(Arc::clone(&coordinator));
+    coordinator.start_deadline(remaining);
+    // Boxed, so the cleanup below can drop it before it waits for the tasks.
+    let mut scheduler = Box::pin(scheduler);
     // The handler runs as an operation task, so every SDK poll of user code
     // runs on a Tokio worker with the gateway wrapper.
     #[expect(clippy::expect_used)]
@@ -333,13 +410,35 @@ where
     let mut deadline = remaining.map(|d| Box::pin(tokio::time::sleep(d)));
     let ended = std::future::poll_fn(|cx| {
         coordinator.register_driver_waker(cx.waker());
-        if coordinator.fatal_error().is_some() {
+        if coordinator.fatal_error().is_some() || coordinator.has_panic() {
             return Poll::Ready(DriveEnd::Interrupted);
         }
-        if let Poll::Ready(outcome) = Pin::new(&mut root).poll(cx) {
-            return Poll::Ready(DriveEnd::Completed(outcome));
+        match Pin::new(&mut root).poll(cx) {
+            Poll::Ready(crate::task::TaskOutcome::Value(result)) => {
+                return Poll::Ready(DriveEnd::Completed(result));
+            }
+            Poll::Ready(crate::task::TaskOutcome::Panicked(payload)) => {
+                crate::task::record_or_discard(&coordinator, payload);
+                return Poll::Ready(DriveEnd::Interrupted);
+            }
+            Poll::Pending => {}
         }
         if coordinator.phase() == Phase::Suspending {
+            return Poll::Ready(DriveEnd::Interrupted);
+        }
+        // A fatal error or `Suspending` ended the drive above. The phase can
+        // still be `Finished` for one poll, between the root task's finish
+        // and its outcome. The coordinator then refuses the scheduler's
+        // permit, so the scheduler sends nothing. It loops until it is
+        // dropped, so it never resolves.
+        //
+        // The scheduler is polled here, outside every task, so a panic in
+        // it would unwind this function and skip the cleanup below. The
+        // panic is caught and recorded, which ends the drive.
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scheduler.as_mut().poll(cx)))
+        {
+            crate::task::record_or_discard(&coordinator, payload);
             return Poll::Ready(DriveEnd::Interrupted);
         }
         if let Some(sleep) = deadline.as_mut()
@@ -355,10 +454,16 @@ where
     .await;
 
     // Cleanup, whatever ended the drive. No task is polled from here on.
-    // The root task is aborted and awaited, so the handler has unwound and
-    // dropped every handle it held before the other tasks are aborted.
-    // Then the driver waits until every tracked task has unwound, so no SDK
-    // task outlives the invocation.
+    // The scheduler stops; a refresh it started runs on a detached task,
+    // which the cleanup waits for. Its drop runs inside a catch, so a panic
+    // is recorded and the cleanup goes on. The root task is aborted and
+    // awaited, so the handler has unwound and dropped every handle it held
+    // before the other tasks are aborted. The task gateway records a panic
+    // of any future it drops, and a dropped handle records a panic it did
+    // not read. Then the driver waits until every tracked task has unwound,
+    // so no SDK task outlives the invocation, and claims every panic still
+    // unread in a slot.
+    crate::task::drop_recorded(&coordinator, scheduler);
     coordinator.finish();
     root.abort();
     drop(root);
@@ -366,24 +471,89 @@ where
     let tasks = Arc::clone(coordinator.tasks());
     tasks.abort_all();
     tasks.wait_idle().await;
+    tasks.claim_unread_panics(&coordinator);
 
-    // Fatal precedence: whatever ended the drive, a recorded fatal error
-    // is the outcome. This read runs after every tracked task has unwound,
-    // so a fatal that a task records during the cleanup also wins over a
-    // handler panic.
-    if let Some(fatal) = coordinator.fatal_error() {
+    // The arbitration. Every task has stopped, so nothing records after
+    // this point. `take_panic` closes panic ownership, so a later record
+    // is returned to its caller.
+    let fatal = coordinator.fatal_error();
+    let panic = coordinator.take_panic();
+    drop(ownership_guard);
+    if let Some(fatal) = fatal {
+        if let Some(payload) = panic {
+            crate::task::discard_panic(payload);
+        }
         return Ok(fatal.into_outcome());
     }
+    if let Some(payload) = panic {
+        return Err(payload);
+    }
+    Ok(match ended {
+        DriveEnd::Completed(Ok(result)) => InvocationOutcome::Complete(result),
+        DriveEnd::Completed(Err(err)) => InvocationOutcome::Failed { error: err },
+        DriveEnd::Interrupted => InvocationOutcome::Pending,
+    })
+}
 
-    match ended {
-        DriveEnd::Completed(crate::task::TaskOutcome::Panicked(payload)) => Err(payload),
-        DriveEnd::Completed(crate::task::TaskOutcome::Value(Ok(result))) => {
-            Ok(InvocationOutcome::Complete(result))
+/// Refreshes waiting operations on the schedule of [`crate::coordinator`],
+/// until it is dropped.
+///
+/// It sleeps until the earliest due refresh, and re-arms when a
+/// registration is added, armed or retired. When refreshes are due it
+/// takes a scheduler permit, which the coordinator grants only beside an
+/// activity or checkpoint permit. It sends one checkpoint with no updates
+/// through `root`, whose merge wakes every operation the response
+/// readied, and then schedules each due registration's next refresh. Only
+/// then does it release the permit. A refused permit stops the scheduler.
+/// A failed refresh is classified as a failed checkpoint write of the
+/// first due operation, and stops the scheduler. The classification is
+/// recorded where the response arrives, not here, so a refresh that is
+/// in flight when the handler returns still decides the outcome (see
+/// [`crate::DurableContext::checkpoint_refresh`]).
+async fn refresh_scheduler(root: crate::DurableContext) {
+    use crate::coordinator::{DueRefresh, PermitKind};
+
+    let coordinator = Arc::clone(root.coordinator());
+    loop {
+        match coordinator.next_refresh_at() {
+            None => {
+                coordinator.rearmed().await;
+                continue;
+            }
+            Some(at) => {
+                tokio::select! {
+                    biased;
+                    () = coordinator.rearmed() => continue,
+                    () = tokio::time::sleep_until(at) => {}
+                }
+            }
         }
-        DriveEnd::Completed(crate::task::TaskOutcome::Value(Err(err))) => {
-            Ok(InvocationOutcome::Failed { error: err })
+        let (keys, first_wire_id) = match coordinator.take_due(tokio::time::Instant::now()) {
+            DueRefresh::Nothing | DueRefresh::UnderFloor => continue,
+            DueRefresh::Due {
+                keys,
+                first_wire_id,
+            } => (keys, first_wire_id),
+        };
+        let Some(permit) = coordinator.acquire(PermitKind::Scheduler) else {
+            return std::future::pending().await;
+        };
+        if root.checkpoint_refresh(&first_wire_id).await.is_err() {
+            // `checkpoint_refresh` recorded the failure before it returned
+            // it, and the permit was held until then, so the invocation
+            // cannot suspend before it.
+            drop(permit);
+            return std::future::pending().await;
         }
-        DriveEnd::Interrupted => Ok(InvocationOutcome::Pending),
+        let records = keys
+            .iter()
+            .filter_map(|(wire_id, _)| {
+                root.refresh_view(wire_id)
+                    .map(|view| (wire_id.clone(), view))
+            })
+            .collect();
+        coordinator.after_refresh(&keys, &records);
+        drop(permit);
     }
 }
 
@@ -401,6 +571,7 @@ pub(crate) mod test_support {
     /// Drives `fut` through [`drive_invocation`] and resumes a handler
     /// panic, for tests that expect an outcome.
     pub(crate) async fn drive_ok<F>(
+        root: crate::DurableContext,
         fut: F,
         ownership: Arc<TaskOwnership>,
         coordinator: Arc<InvocationCoordinator>,
@@ -408,7 +579,7 @@ pub(crate) mod test_support {
     where
         F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
     {
-        match drive_invocation(fut, ownership, coordinator, None).await {
+        match drive_invocation(fut, ownership, coordinator, root, None).await {
             Ok(outcome) => outcome,
             Err(payload) => std::panic::resume_unwind(payload),
         }
@@ -425,6 +596,7 @@ pub(crate) mod test_support {
     /// `ownership` is the task-ownership tracker of the context the
     /// operation runs on: the driver blesses its root task there.
     pub(crate) async fn outcome_of<F>(
+        root: crate::DurableContext,
         ownership: Arc<TaskOwnership>,
         coordinator: Arc<InvocationCoordinator>,
         fut: F,
@@ -442,7 +614,7 @@ pub(crate) mod test_support {
             let _ = fut.await;
             Ok::<_, crate::error::WireError>("ok".to_owned())
         });
-        match drive_invocation(fut, ownership, coordinator, None).await {
+        match drive_invocation(fut, ownership, coordinator, root, None).await {
             Ok(outcome) => outcome,
             Err(payload) => std::panic::resume_unwind(payload),
         }
@@ -452,6 +624,7 @@ pub(crate) mod test_support {
     /// invocation with a fault whose message contains `needle`.
     #[expect(clippy::panic)] // reason: test assertion on an unexpected outcome
     pub(crate) async fn expect_serdes_fault<F>(
+        root: crate::DurableContext,
         ownership: Arc<TaskOwnership>,
         coordinator: Arc<InvocationCoordinator>,
         fut: F,
@@ -462,7 +635,7 @@ pub(crate) mod test_support {
     {
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            outcome_of(ownership, coordinator, fut),
+            outcome_of(root, ownership, coordinator, fut),
         )
         .await
         .expect("the operation must reach an invocation outcome within 5 s");
@@ -603,6 +776,266 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Polls `f` once with the calling task's context, and returns.
+    pub(crate) async fn poll_once<F: Future>(mut f: Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            // The handle stays pending: the tests that call this await it
+            // later.
+            let _ = f.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// One request a [`RefreshClient`] answers.
+    pub(crate) struct RefreshRequest<'a> {
+        /// The request's updates.
+        pub(crate) updates: &'a [OperationUpdate],
+        /// Every update received so far, this request's included.
+        pub(crate) history: &'a [OperationUpdate],
+        /// The 1-based number of this request among the requests with no
+        /// updates. 0 for a request with updates.
+        pub(crate) empty_number: usize,
+        /// The tokio time since the client was created, when the response
+        /// is built.
+        pub(crate) now: Duration,
+        /// The wall-clock time when the client was created.
+        pub(crate) base: std::time::SystemTime,
+    }
+
+    impl RefreshRequest<'_> {
+        /// The timestamp `in_` after the request's tokio time, in the
+        /// wall-clock time the SDK reads under paused tokio time: the
+        /// client's creation time plus the tokio time since.
+        pub(crate) fn timestamp_in(&self, in_: Duration) -> aws_smithy_types::DateTime {
+            aws_smithy_types::DateTime::from(self.base + self.now + in_)
+        }
+    }
+
+    /// Decides the response to one request.
+    type RefreshResponder =
+        dyn Fn(&RefreshRequest<'_>) -> Result<Vec<Operation>, ExecutionClientError> + Send + Sync;
+
+    /// A test `ExecutionClient` for the refresh scheduler. It records the
+    /// tokio time of every call and of every answer to a call with no
+    /// updates, delays the answer to such a call by a fixed time, and
+    /// builds each response when it answers.
+    pub(crate) struct RefreshClient {
+        respond: Box<RefreshResponder>,
+        empty_delay: Duration,
+        start: tokio::time::Instant,
+        base: std::time::SystemTime,
+        calls: Mutex<Vec<(Duration, Vec<OperationUpdate>)>>,
+        empty_answers: Mutex<Vec<Duration>>,
+        tokens: Mutex<u32>,
+    }
+
+    impl RefreshClient {
+        /// A client whose responses `respond` builds. Create it inside the
+        /// test's runtime: its clock starts here.
+        pub(crate) fn new(
+            respond: impl Fn(&RefreshRequest<'_>) -> Result<Vec<Operation>, ExecutionClientError>
+            + Send
+            + Sync
+            + 'static,
+        ) -> Self {
+            Self {
+                respond: Box::new(respond),
+                empty_delay: Duration::ZERO,
+                start: tokio::time::Instant::now(),
+                base: std::time::SystemTime::now(),
+                calls: Mutex::new(Vec::new()),
+                empty_answers: Mutex::new(Vec::new()),
+                tokens: Mutex::new(0),
+            }
+        }
+
+        /// Answers each call with no updates after `delay` of tokio time.
+        pub(crate) fn with_empty_delay(mut self, delay: Duration) -> Self {
+            self.empty_delay = delay;
+            self
+        }
+
+        /// The tokio time since the client was created.
+        pub(crate) fn elapsed(&self) -> Duration {
+            self.start.elapsed()
+        }
+
+        /// The tokio time of each call with no updates, in call order.
+        pub(crate) fn empty_calls(&self) -> Vec<Duration> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(_, updates)| updates.is_empty())
+                .map(|(at, _)| *at)
+                .collect()
+        }
+
+        /// The tokio time of each answer to a call with no updates.
+        pub(crate) fn empty_answers(&self) -> Vec<Duration> {
+            self.empty_answers.lock().expect("lock").clone()
+        }
+
+        /// The tokio time of the first call that carried an update of
+        /// `name` with `action`.
+        pub(crate) fn time_of(
+            &self,
+            name: &str,
+            action: &aws_sdk_lambda::types::OperationAction,
+        ) -> Option<Duration> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|(_, updates)| named(updates, name, action).is_some())
+                .map(|(at, _)| *at)
+        }
+
+        /// Every update received, in call order.
+        pub(crate) fn updates(&self) -> Vec<OperationUpdate> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .flat_map(|(_, u)| u.iter().cloned())
+                .collect()
+        }
+
+        /// Whether an update of `name` with `action` was received.
+        pub(crate) fn received(
+            &self,
+            name: &str,
+            action: &aws_sdk_lambda::types::OperationAction,
+        ) -> bool {
+            self.time_of(name, action).is_some()
+        }
+    }
+
+    impl ExecutionClient for RefreshClient {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
+            let (history, empty_number) = {
+                let mut calls = self.calls.lock().expect("lock");
+                calls.push((self.start.elapsed(), updates.clone()));
+                let history: Vec<OperationUpdate> =
+                    calls.iter().flat_map(|(_, u)| u.iter().cloned()).collect();
+                let empty_number = if updates.is_empty() {
+                    calls.iter().filter(|(_, u)| u.is_empty()).count()
+                } else {
+                    0
+                };
+                (history, empty_number)
+            };
+            let token = {
+                let mut tokens = self.tokens.lock().expect("lock");
+                *tokens += 1;
+                format!("t{tokens}")
+            };
+            Box::pin(async move {
+                if empty_number > 0 && !self.empty_delay.is_zero() {
+                    tokio::time::sleep(self.empty_delay).await;
+                }
+                let now = self.start.elapsed();
+                let operations = (self.respond)(&RefreshRequest {
+                    updates: &updates,
+                    history: &history,
+                    empty_number,
+                    now,
+                    base: self.base,
+                })?;
+                if empty_number > 0 {
+                    self.empty_answers.lock().expect("lock").push(now);
+                }
+                Ok(CheckpointOutput::new(Some(token), operations, None))
+            })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _marker: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(GetStateOutput::new(Vec::new(), None)) })
+        }
+    }
+
+    /// A root context on `client`, with an empty checkpoint log, whose
+    /// Lambda deadline is 0 (none).
+    pub(crate) fn refresh_ctx(client: &Arc<RefreshClient>) -> crate::DurableContext {
+        crate::DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::engine::CheckpointLog::empty()),
+            Arc::clone(client) as Arc<dyn ExecutionClient>,
+            "t0".to_owned(),
+        )
+    }
+
+    /// The record of a callback whose START is `start`, with `status`, its
+    /// callback ID and `result`.
+    pub(crate) fn callback_record(
+        start: &OperationUpdate,
+        status: OperationStatus,
+        result: Option<&str>,
+    ) -> Operation {
+        let mut details = aws_sdk_lambda::types::CallbackDetails::builder().callback_id("cb-1");
+        if let Some(result) = result {
+            details = details.result(result);
+        }
+        operation_like(start, status)
+            .callback_details(details.build())
+            .build()
+            .expect("all required fields set")
+    }
+
+    /// Answers the START of every callback among `updates` with `STARTED`
+    /// and its callback ID.
+    pub(crate) fn callback_starts(updates: &[OperationUpdate]) -> Vec<Operation> {
+        updates
+            .iter()
+            .filter(|u| {
+                u.r#type() == &aws_sdk_lambda::types::OperationType::Callback
+                    && u.action() == &aws_sdk_lambda::types::OperationAction::Start
+            })
+            .map(|start| callback_record(start, OperationStatus::Started, None))
+            .collect()
+    }
+
+    /// Asserts that `actual` is `expected` within 50 ms. The end times a
+    /// response carries are wall-clock times taken when the response is
+    /// built, so a delay computed from one can be off by the real time a
+    /// test takes between two steps.
+    #[track_caller]
+    pub(crate) fn assert_near(actual: Duration, expected: Duration) {
+        let diff = actual.abs_diff(expected);
+        assert!(
+            diff <= Duration::from_millis(50),
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    /// Asserts that `actual` holds one time per entry of `expected`, each
+    /// within 50 ms (see [`assert_near`]).
+    #[track_caller]
+    pub(crate) fn assert_times(actual: &[Duration], expected: &[Duration]) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "expected times {expected:?}, got {actual:?}"
+        );
+        for (a, e) in actual.iter().zip(expected) {
+            assert_near(*a, *e);
+        }
+    }
+
     /// A root context on `client`, with an empty checkpoint log.
     pub(crate) fn scripted_ctx(client: &Arc<ScriptedClient>) -> crate::DurableContext {
         crate::DurableContext::new_root_with_client(
@@ -662,8 +1095,9 @@ pub(crate) mod test_support {
     {
         let ownership = Arc::clone(ctx.task_ownership());
         let coordinator = Arc::clone(ctx.coordinator());
-        let root = Box::pin(handler(ctx));
-        drive_invocation(root, ownership, coordinator, remaining).await
+        let root = ctx.clone();
+        let handler = Box::pin(handler(ctx));
+        drive_invocation(handler, ownership, coordinator, root, remaining).await
     }
 
     /// Records the level and message of every event while installed as
@@ -776,6 +1210,7 @@ mod tests {
         let coordinator = Arc::clone(ctx.coordinator());
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let _guard = DropGuard {
                     dropped: drop_clone,
@@ -816,6 +1251,7 @@ mod tests {
         let coordinator = Arc::clone(ctx.coordinator());
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 // User tries a "catch-all" pattern: wrapping in a closure
                 // that catches panics. This cannot catch future-drop.
@@ -850,6 +1286,7 @@ mod tests {
         let coordinator = Arc::clone(ctx.coordinator());
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let _ = ctx.wait(Duration::from_secs(30)).await;
                 Ok("unreachable".to_owned())
@@ -866,11 +1303,13 @@ mod tests {
 
     #[tokio::test]
     async fn driver_returns_complete_on_success() {
-        let signal = InvocationCoordinator::new();
+        let ctx = crate::DurableContext::test_context();
+        let signal = Arc::clone(ctx.coordinator());
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move { Ok::<_, crate::error::WireError>("done".to_owned()) },
-            Arc::new(TaskOwnership::new_current()),
+            Arc::clone(ctx.task_ownership()),
             Arc::clone(&signal),
         )
         .await;
@@ -880,16 +1319,18 @@ mod tests {
 
     #[tokio::test]
     async fn driver_returns_failed_on_error() {
-        let signal = InvocationCoordinator::new();
+        let ctx = crate::DurableContext::test_context();
+        let signal = Arc::clone(ctx.coordinator());
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 Err(crate::error::WireError::new(
                     Some("Error".to_owned()),
                     Some("boom".to_owned()),
                 ))
             },
-            Arc::new(TaskOwnership::new_current()),
+            Arc::clone(ctx.task_ownership()),
             Arc::clone(&signal),
         )
         .await;
@@ -932,6 +1373,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         )]));
@@ -1148,6 +1590,7 @@ mod suspension_containment_and_task_ownership {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         }
     }
@@ -1164,6 +1607,7 @@ mod suspension_containment_and_task_ownership {
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let _ = ctx_h.wait(Duration::from_secs(30)).await;
                 ran_c.store(true, Ordering::SeqCst);
@@ -1188,6 +1632,7 @@ mod suspension_containment_and_task_ownership {
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let _ = ctx_h
                     .invoke::<serde_json::Value, _>("target-fn", "input".to_owned())
@@ -1214,6 +1659,7 @@ mod suspension_containment_and_task_ownership {
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 // Body fails; the default retry strategy schedules a retry,
                 // which suspends (parks) on the backend timer.
@@ -1243,6 +1689,7 @@ mod suspension_containment_and_task_ownership {
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let _ = ctx_h
                     .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)
@@ -1274,6 +1721,7 @@ mod suspension_containment_and_task_ownership {
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let Ok(cb) = ctx_h.create_callback::<serde_json::Value>().await else {
                     return Err(crate::error::WireError::new(
@@ -1316,6 +1764,7 @@ mod suspension_containment_and_task_ownership {
         let ran_c = Arc::clone(&ran);
         let ctx_h = ctx.clone();
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 ctx_h
                     .wait(Duration::from_secs(30))
@@ -1345,6 +1794,7 @@ mod suspension_containment_and_task_ownership {
         let caught_c = Arc::clone(&caught);
         let ctx_h = ctx.clone();
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 // max_concurrency(0) is a validation error, returned as Err.
                 let r = ctx_h
@@ -1383,6 +1833,7 @@ mod suspension_containment_and_task_ownership {
         let caught_c = Arc::clone(&caught);
         let ctx_h = ctx.clone();
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 // The live wait's START checkpoint fails non-retryably.
                 // Pre-#43 this surfaced as a catchable Err; now the future
@@ -1433,6 +1884,7 @@ mod suspension_containment_and_task_ownership {
         let caught_c = Arc::clone(&caught);
         let ctx_h = ctx.clone();
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let r = ctx_h.wait(Duration::from_secs(5)).await;
                 if r.is_err() {
@@ -1549,6 +2001,7 @@ mod suspension_containment_and_task_ownership {
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             drive_ok(
+                ctx.clone(),
                 async move {
                     // Sibling task: starts, then blocks on non-durable
                     // pending(). Its body never returns, so it is a
@@ -1672,6 +2125,7 @@ mod scoped_suspension {
         let ctx_h = ctx.clone();
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let flag = b_ran_c;
                 let branches = vec![
@@ -1714,6 +2168,7 @@ mod scoped_suspension {
         let ctx_h = ctx.clone();
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let branches = vec![
                     Branch::new("a", |cc: DurableContext| {
@@ -1760,6 +2215,7 @@ mod scoped_suspension {
         let peak_h = Arc::clone(&peak);
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let mut branches = Vec::new();
                 for i in 0..4 {
@@ -1811,6 +2267,7 @@ mod scoped_suspension {
         let ctx_h = ctx.clone();
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let flag = second_h;
                 let branches = vec![
@@ -1851,6 +2308,7 @@ mod scoped_suspension {
         let ctx_h = ctx.clone();
 
         let fut = drive_ok(
+            ctx.clone(),
             async move {
                 let outer = vec![Branch::new("outer", |cc: DurableContext| {
                     Box::pin(async move {
@@ -1897,6 +2355,7 @@ mod scoped_suspension {
         let ctx_h = ctx.clone();
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 let branches = vec![
                     Branch::new("ok", |cc: DurableContext| async move {
@@ -1943,6 +2402,7 @@ mod scoped_suspension {
         let ctx_h = ctx.clone();
 
         let outcome = drive_ok(
+            ctx.clone(),
             async move {
                 ctx_h.wait(Duration::from_secs(30)).await.map_err(|e| {
                     crate::error::WireError::new(Some("W".to_owned()), Some(e.to_string()))
@@ -2020,6 +2480,7 @@ mod spawn_scope_regressions {
         let outcome = tokio::time::timeout(
             BOUND,
             drive_ok(
+                ctx.clone(),
                 async move {
                     // Parks: no timer result is available on a first invocation.
                     let wait = ctx_h.wait(Duration::from_secs(10)).spawn();
@@ -2075,6 +2536,7 @@ mod spawn_scope_regressions {
         let outcome = tokio::time::timeout(
             BOUND,
             drive_ok(
+                ctx.clone(),
                 async move {
                     let wait = ctx_h.wait(Duration::from_secs(10)).spawn();
                     let work = ctx_h
@@ -2126,6 +2588,7 @@ mod spawn_scope_regressions {
         let outcome = tokio::time::timeout(
             BOUND,
             drive_ok(
+                ctx.clone(),
                 async move {
                     // Spawn a wait: it parks immediately (no timer result on
                     // first invocation). Hold the handle so dropping it
@@ -2192,6 +2655,7 @@ mod spawn_scope_regressions {
         let outcome = tokio::time::timeout(
             BOUND,
             drive_ok(
+                ctx.clone(),
                 async move {
                     // Parking input: a spawned wait (will park on first
                     // invocation since no timer has elapsed).
@@ -2304,6 +2768,7 @@ mod task_gateway {
         let ctx = live_ctx();
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let dropped = Arc::new(AtomicBool::new(false));
         let handler_dropped = Arc::clone(&dropped);
         let outcome = drive_invocation(
@@ -2315,6 +2780,7 @@ mod task_gateway {
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await
@@ -2333,6 +2799,7 @@ mod task_gateway {
         let ctx = live_ctx();
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let tasks = Arc::clone(signal.tasks());
         let dropped = Arc::new(AtomicBool::new(false));
         let handler_dropped = Arc::clone(&dropped);
@@ -2344,6 +2811,7 @@ mod task_gateway {
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await;
@@ -2362,6 +2830,7 @@ mod task_gateway {
         let ctx = live_ctx();
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let tasks = Arc::clone(signal.tasks());
         let dropped = Arc::new(AtomicBool::new(false));
         let handler_dropped = Arc::clone(&dropped);
@@ -2376,6 +2845,7 @@ mod task_gateway {
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await;
@@ -2395,6 +2865,7 @@ mod task_gateway {
         let ctx = live_ctx();
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let tasks = Arc::clone(signal.tasks());
         let parked_signal = Arc::clone(&signal);
         let outcome = drive_invocation(
@@ -2416,6 +2887,7 @@ mod task_gateway {
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await;
@@ -2433,16 +2905,19 @@ mod task_gateway {
         let ctx = live_ctx();
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let tasks = Arc::clone(signal.tasks());
         let handler_signal = Arc::clone(&signal);
         let outcome = drive_invocation(
             async move {
                 let _ctx = ctx;
-                let _registration = handler_signal.register_wait("op", std::task::Waker::noop());
+                let _registration =
+                    handler_signal.register_test_wait("op", std::task::Waker::noop());
                 panic!("handler boom");
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await;
@@ -2459,6 +2934,7 @@ mod task_gateway {
         let ctx = live_ctx();
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let handler_signal = Arc::clone(&signal);
         let outcome = drive_invocation(
             async move {
@@ -2468,6 +2944,7 @@ mod task_gateway {
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await
@@ -2481,6 +2958,24 @@ mod task_gateway {
                 ),
             }
         );
+    }
+
+    /// Panics with an [`InnerPanicPayload`] when dropped.
+    pub(super) struct NestedPanicPayload;
+
+    impl Drop for NestedPanicPayload {
+        fn drop(&mut self) {
+            std::panic::panic_any(InnerPanicPayload);
+        }
+    }
+
+    /// Panics when dropped.
+    pub(super) struct InnerPanicPayload;
+
+    impl Drop for InnerPanicPayload {
+        fn drop(&mut self) {
+            panic!("inner payload drop");
+        }
     }
 
     /// Records a fatal error on the invocation's coordinator when it is
@@ -2504,6 +2999,7 @@ mod task_gateway {
         let ctx = live_ctx();
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let tasks = Arc::clone(signal.tasks());
         let body_signal = Arc::clone(&signal);
         let started = Arc::new(AtomicBool::new(false));
@@ -2533,6 +3029,7 @@ mod task_gateway {
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await
@@ -2550,6 +3047,79 @@ mod task_gateway {
         assert_eq!(tasks.live(), 0);
     }
 
+    /// Runs its closure on the invocation's coordinator when it is dropped.
+    struct OnDrop(
+        Arc<crate::coordinator::InvocationCoordinator>,
+        Arc<dyn Fn(&crate::coordinator::InvocationCoordinator) + Send + Sync>,
+    );
+
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            (self.1)(&self.0);
+        }
+    }
+
+    /// Drives a handler that panics with a [`NestedPanicPayload`] while a
+    /// step body holds an [`OnDrop`] running `on_cleanup`. Only the
+    /// driver's `abort_all` drops the body, after the drive observed the
+    /// handler panic, as in `fatal_recorded_during_panic_cleanup_wins_over_panic`.
+    async fn drive_nested_handler_panic_with_cleanup(
+        on_cleanup: Arc<dyn Fn(&crate::coordinator::InvocationCoordinator) + Send + Sync>,
+    ) -> (
+        Result<InvocationOutcome, Box<dyn std::any::Any + Send + 'static>>,
+        usize,
+    ) {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
+        let tasks = Arc::clone(signal.tasks());
+        let body_signal = Arc::clone(&signal);
+        let escaped: Arc<Mutex<Option<DurableFuture<()>>>> = Arc::new(Mutex::new(None));
+        let handler_escaped = Arc::clone(&escaped);
+        let outcome = drive_invocation(
+            async move {
+                let step = ctx
+                    .step(move |_| {
+                        let guard = OnDrop(Arc::clone(&body_signal), Arc::clone(&on_cleanup));
+                        async move {
+                            let _guard = guard;
+                            std::future::pending::<()>().await;
+                            Ok(())
+                        }
+                    })
+                    .name("hold")
+                    .spawn();
+                *handler_escaped.lock().expect("lock") = Some(step);
+                yield_three_times().await;
+                std::panic::panic_any(NestedPanicPayload);
+            },
+            ownership,
+            signal,
+            root,
+            None,
+        )
+        .await;
+        (outcome, tasks.live())
+    }
+
+    /// A fatal error recorded during the cleanup takes precedence over a
+    /// handler panic whose payload panics on drop with a payload that
+    /// panics on drop again. The driver drops the handler's payload inside
+    /// a catch and leaks the nested payload, so no panic escapes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fatal_during_cleanup_wins_over_nested_panicking_handler_payload() {
+        let (outcome, live) = drive_nested_handler_panic_with_cleanup(Arc::new(|coordinator| {
+            coordinator.record_fatal("Fatal".to_owned(), "during cleanup".to_owned());
+        }))
+        .await;
+        let Ok(InvocationOutcome::Failed { error }) = &outcome else {
+            panic!("expected the fatal outcome, got {outcome:?}");
+        };
+        assert_eq!(error.error_message(), Some("during cleanup"));
+        assert_eq!(live, 0);
+    }
+
     /// A handler that returns a value while a wait registration is live
     /// completes with that value: the resolved handler decides the outcome.
     #[tokio::test]
@@ -2557,15 +3127,18 @@ mod task_gateway {
         let ctx = live_ctx();
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let handler_signal = Arc::clone(&signal);
         let outcome = drive_invocation(
             async move {
                 let _ctx = ctx;
-                let _registration = handler_signal.register_wait("op", std::task::Waker::noop());
+                let _registration =
+                    handler_signal.register_test_wait("op", std::task::Waker::noop());
                 Ok::<_, crate::error::WireError>("done".to_owned())
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await
@@ -2580,6 +3153,7 @@ mod task_gateway {
         let ctx = live_ctx();
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let outcome = drive_invocation(
             async move {
                 let on_task = tokio::task::try_id().is_some();
@@ -2594,6 +3168,7 @@ mod task_gateway {
             },
             Arc::clone(&ownership),
             signal,
+            root,
             None,
         )
         .await
@@ -2609,6 +3184,7 @@ mod task_gateway {
         let ctx = live_ctx();
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
+        let root = ctx.clone();
         let tasks = Arc::clone(signal.tasks());
         let outcome = drive_invocation(
             async move {
@@ -2619,6 +3195,7 @@ mod task_gateway {
             },
             ownership,
             signal,
+            root,
             None,
         )
         .await
@@ -3270,5 +3847,2176 @@ mod coordinator_suspension {
             .expect("no panic");
         assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
         assert_eq!(coordinator.phase(), Phase::Finished);
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::panic)] // reason: test assertions
+mod refresh_scheduler {
+    use super::InvocationOutcome;
+    use super::test_support::{
+        RefreshClient, RefreshRequest, assert_near, assert_times, callback_record, callback_starts,
+        drive_handler, named, operation_like, poll_once, refresh_ctx, wire_err,
+    };
+    use crate::BoxError;
+    use crate::builders::wait_for_condition::WaitDecision;
+    use crate::client::ExecutionClientError;
+    use crate::coordinator::PermitKind;
+    use crate::engine::CheckpointStatus;
+    use aws_sdk_lambda::types::{
+        ChainedInvokeDetails, Operation, OperationAction, OperationStatus, OperationUpdate,
+        StepDetails, WaitDetails,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    const fn millis(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
+
+    /// A wait record of `start` with `status`, whose scheduled end is
+    /// `end_in` from now when `end_in` is `Some`.
+    fn wait_record(
+        req: &RefreshRequest<'_>,
+        start: &OperationUpdate,
+        status: OperationStatus,
+        end_in: Option<Duration>,
+    ) -> Operation {
+        let mut builder = operation_like(start, status);
+        if let Some(end_in) = end_in {
+            builder = builder.wait_details(
+                WaitDetails::builder()
+                    .scheduled_end_timestamp(req.timestamp_in(end_in))
+                    .build(),
+            );
+        }
+        builder.build().expect("all required fields set")
+    }
+
+    /// An invoke record of `start` with `status` and `result`.
+    fn invoke_record(
+        start: &OperationUpdate,
+        status: OperationStatus,
+        result: Option<&str>,
+    ) -> Operation {
+        let mut details = ChainedInvokeDetails::builder();
+        if let Some(result) = result {
+            details = details.result(result);
+        }
+        operation_like(start, status)
+            .chained_invoke_details(details.build())
+            .build()
+            .expect("all required fields set")
+    }
+
+    /// A `wait_for_condition` record of `update` with `status`, carrying
+    /// the update's payload as the state and, when `next_in` is `Some`, a
+    /// next attempt `next_in` from now.
+    fn condition_record(
+        req: &RefreshRequest<'_>,
+        update: &OperationUpdate,
+        status: OperationStatus,
+        payload: Option<&str>,
+        next_in: Option<Duration>,
+    ) -> Operation {
+        let mut details = StepDetails::builder().attempt(1);
+        if let Some(payload) = payload {
+            details = details.result(payload);
+        }
+        if let Some(next_in) = next_in {
+            details = details.next_attempt_timestamp(req.timestamp_in(next_in));
+        }
+        operation_like(update, status)
+            .step_details(details.build())
+            .build()
+            .expect("all required fields set")
+    }
+
+    /// The first update of `name` with `action` among the request's
+    /// updates.
+    fn this<'a>(
+        req: &'a RefreshRequest<'_>,
+        name: &str,
+        action: &OperationAction,
+    ) -> Option<&'a OperationUpdate> {
+        named(req.updates, name, action)
+    }
+
+    /// The first update of `name` with `action` received so far.
+    fn ever<'a>(
+        req: &'a RefreshRequest<'_>,
+        name: &str,
+        action: &OperationAction,
+    ) -> Option<&'a OperationUpdate> {
+        named(req.history, name, action)
+    }
+
+    /// A step that sleeps `d` of tokio time.
+    fn sleeping_step(
+        ctx: &crate::DurableContext,
+        name: &str,
+        d: Duration,
+    ) -> crate::DurableFuture<u32> {
+        ctx.step(move |_| async move {
+            tokio::time::sleep(d).await;
+            Ok(1_u32)
+        })
+        .name(name)
+        .future()
+    }
+
+    /// A spawned step that sleeps `d` of tokio time.
+    fn spawned_sleeping_step(
+        ctx: &crate::DurableContext,
+        name: &str,
+        d: Duration,
+    ) -> crate::DurableFuture<u32> {
+        ctx.step(move |_| async move {
+            tokio::time::sleep(d).await;
+            Ok(1_u32)
+        })
+        .name(name)
+        .spawn()
+    }
+
+    /// The test-3 handler: branch A waits 5 s and runs step `a`, branch B
+    /// runs a step of 60 s.
+    async fn parallel_wait_then_step(ctx: crate::DurableContext) -> Result<String, BoxError> {
+        let branches: Vec<crate::Branch<u32>> = vec![
+            crate::Branch::new("A", |child: crate::DurableContext| async move {
+                child.wait(secs(5)).name("w").await?;
+                let a = child.step(|_| async { Ok(1_u32) }).name("a").await?;
+                Ok(a)
+            }),
+            crate::Branch::new("B", |child: crate::DurableContext| async move {
+                let b = child
+                    .step(|_| async {
+                        tokio::time::sleep(secs(60)).await;
+                        Ok(2_u32)
+                    })
+                    .name("b")
+                    .await?;
+                Ok(b)
+            }),
+        ];
+        let results = ctx.parallel(branches).name("p").await?;
+        Ok(format!("{results:?}"))
+    }
+
+    /// The client of test 3: the wait's START carries an end 5 s ahead,
+    /// and the first refresh finds it `SUCCEEDED`. Every other update is
+    /// answered with the status it records, so the log holds every
+    /// operation's final status.
+    fn test3_client() -> RefreshClient {
+        RefreshClient::new(|req| {
+            let mut ops: Vec<Operation> = req
+                .updates
+                .iter()
+                .map(|u| {
+                    let status = match u.action() {
+                        OperationAction::Succeed => OperationStatus::Succeeded,
+                        OperationAction::Fail => OperationStatus::Failed,
+                        _ => OperationStatus::Started,
+                    };
+                    let end_in = (u.name() == Some("w")).then_some(secs(5));
+                    wait_record(req, u, status, end_in)
+                })
+                .collect();
+            if req.empty_number == 1
+                && let Some(start) = ever(req, "w", &OperationAction::Start)
+            {
+                ops.push(wait_record(req, start, OperationStatus::Succeeded, None));
+            }
+            Ok(ops)
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parallel_wait_then_step_finishes_in_one_invocation() {
+        let client = Arc::new(test3_client());
+        let ctx = refresh_ctx(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            parallel_wait_then_step(ctx)
+                .await
+                .map_err(|e| crate::error::WireError::new(None::<String>, Some(e.to_string())))
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("[1, 2]".to_owned()));
+        assert_times(&client.empty_calls(), &[secs(5)]);
+        assert_near(
+            client
+                .time_of("a", &OperationAction::Start)
+                .expect("a started"),
+            secs(5),
+        );
+    }
+
+    /// Runs the callback scenario of test 4: a callback result started with
+    /// `spawn_result()` and polled once, and a step of `step` beside it.
+    /// Returns the outcome; the handler returns the callback's value.
+    async fn callback_beside_step(
+        client: &Arc<RefreshClient>,
+        remaining: Option<Duration>,
+        step: Duration,
+    ) -> InvocationOutcome {
+        let ctx = refresh_ctx(client);
+        drive_handler(ctx, remaining, move |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let mut h = std::pin::pin!(cb.spawn_result());
+            poll_once(h.as_mut()).await;
+            sleeping_step(&ctx, "s", step).await.map_err(wire_err)?;
+            h.await.map_err(wire_err)
+        })
+        .await
+        .expect("no panic")
+    }
+
+    /// A client that answers the callback START, and completes the callback
+    /// with `"ok"` on the first refresh when `complete` is set.
+    fn callback_client(complete: bool) -> RefreshClient {
+        RefreshClient::new(move |req| {
+            let mut ops = callback_starts(req.updates);
+            if complete
+                && req.empty_number == 1
+                && let Some(start) = ever(req, "cb", &OperationAction::Start)
+            {
+                ops.push(callback_record(
+                    start,
+                    OperationStatus::Succeeded,
+                    Some("\"ok\""),
+                ));
+            }
+            Ok(ops)
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_refresh_continues_in_invocation() {
+        let client = Arc::new(callback_client(true));
+        let outcome = callback_beside_step(&client, None, secs(3)).await;
+        assert_eq!(outcome, InvocationOutcome::Complete("ok".to_owned()));
+        assert_times(&client.empty_calls(), &[secs(1)]);
+    }
+
+    /// Runs a spawned invoke, polled once, beside a step of 5 s, and returns
+    /// the outcome; the handler returns the invoke's value.
+    async fn invoke_beside_step(client: &Arc<RefreshClient>) -> InvocationOutcome {
+        let ctx = refresh_ctx(client);
+        drive_handler(ctx, None, |ctx| async move {
+            let mut h = std::pin::pin!(ctx.invoke::<u32, _>("target", 1_u32).name("inv").spawn());
+            poll_once(h.as_mut()).await;
+            sleeping_step(&ctx, "s", secs(5)).await.map_err(wire_err)?;
+            let value = h.await.map_err(wire_err)?;
+            Ok(value.to_string())
+        })
+        .await
+        .expect("no panic")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invoke_refresh_backs_off() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            let Some(start) = ever(req, "inv", &OperationAction::Start) else {
+                return Ok(Vec::new());
+            };
+            Ok(match req.empty_number {
+                1 | 2 => vec![invoke_record(start, OperationStatus::Started, None)],
+                3 => vec![invoke_record(start, OperationStatus::Succeeded, Some("7"))],
+                _ => Vec::new(),
+            })
+        }));
+        let outcome = invoke_beside_step(&client).await;
+        assert_eq!(outcome, InvocationOutcome::Complete("7".to_owned()));
+        assert_times(&client.empty_calls(), &[secs(1), secs(2), secs(4)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn changed_status_restarts_schedule() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            let Some(start) = ever(req, "inv", &OperationAction::Start) else {
+                return Ok(Vec::new());
+            };
+            Ok(match req.empty_number {
+                1 => vec![invoke_record(start, OperationStatus::Pending, None)],
+                2 => vec![invoke_record(start, OperationStatus::Succeeded, Some("7"))],
+                _ => Vec::new(),
+            })
+        }));
+        let outcome = invoke_beside_step(&client).await;
+        assert_eq!(outcome, InvocationOutcome::Complete("7".to_owned()));
+        assert_times(&client.empty_calls(), &[secs(1), secs(2)]);
+    }
+
+    /// The check future of [`condition`].
+    type CheckFuture = std::future::Ready<Result<i32, BoxError>>;
+
+    /// A `wait_for_condition` that continues with 1 s until its state is at
+    /// least 2. Each check records the tokio time it ran at in `checks`.
+    fn condition(
+        ctx: &crate::DurableContext,
+        start: tokio::time::Instant,
+        checks: &Arc<Mutex<Vec<Duration>>>,
+    ) -> crate::builders::WaitForConditionBuilder<
+        i32,
+        impl Fn(crate::StepContext, i32) -> CheckFuture + Send + Sync + 'static,
+        CheckFuture,
+    > {
+        let checks = Arc::clone(checks);
+        ctx.wait_for_condition(
+            move |_ctx, state: i32| {
+                checks.lock().expect("lock").push(start.elapsed());
+                std::future::ready(Ok::<i32, BoxError>(state + 1))
+            },
+            0,
+        )
+        .wait_strategy_fn(|state: i32, _attempt| {
+            if state >= 2 {
+                WaitDecision::complete()
+            } else {
+                WaitDecision::continue_with(secs(1))
+            }
+        })
+        .name("cond")
+    }
+
+    /// Answers a condition RETRY with `PENDING` and a next attempt 1 s
+    /// ahead, and the refresh numbered `ready_on` with `READY`.
+    fn condition_client(ready_on: usize) -> RefreshClient {
+        RefreshClient::new(move |req| {
+            let mut ops = Vec::new();
+            if let Some(retry) = this(req, "cond", &OperationAction::Retry) {
+                ops.push(condition_record(
+                    req,
+                    retry,
+                    OperationStatus::Pending,
+                    retry.payload(),
+                    Some(secs(1)),
+                ));
+            }
+            if req.empty_number == ready_on
+                && let Some(retry) = ever(req, "cond", &OperationAction::Retry)
+            {
+                ops.push(condition_record(
+                    req,
+                    retry,
+                    OperationStatus::Ready,
+                    retry.payload(),
+                    None,
+                ));
+            }
+            Ok(ops)
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn condition_check_refreshes_at_next_attempt() {
+        let client = Arc::new(condition_client(1));
+        let ctx = refresh_ctx(&client);
+        let start = tokio::time::Instant::now();
+        let checks = Arc::new(Mutex::new(Vec::new()));
+        let handler_checks = Arc::clone(&checks);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let mut h = std::pin::pin!(condition(&ctx, start, &handler_checks).spawn());
+            poll_once(h.as_mut()).await;
+            sleeping_step(&ctx, "s", secs(3)).await.map_err(wire_err)?;
+            let state = h.await.map_err(wire_err)?;
+            Ok(state.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("2".to_owned()));
+        let checks = checks.lock().expect("lock").clone();
+        assert_times(&checks, &[secs(0), secs(1)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_wakes_ready_operations_in_sorted_order() {
+        let end = std::time::SystemTime::now() + secs(1);
+        let client = Arc::new(RefreshClient::new(move |req| {
+            let mut ops = Vec::new();
+            for name in ["w1", "w2"] {
+                if let Some(start) = this(req, name, &OperationAction::Start) {
+                    ops.push(
+                        operation_like(start, OperationStatus::Started)
+                            .wait_details(
+                                WaitDetails::builder()
+                                    .scheduled_end_timestamp(aws_smithy_types::DateTime::from(end))
+                                    .build(),
+                            )
+                            .build()
+                            .expect("all required fields set"),
+                    );
+                }
+                if req.empty_number == 1
+                    && let Some(start) = ever(req, name, &OperationAction::Start)
+                {
+                    ops.push(wait_record(req, start, OperationStatus::Succeeded, None));
+                }
+            }
+            Ok(ops)
+        }));
+        let ctx = refresh_ctx(&client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let w1 = ctx.wait(secs(1)).name("w1").spawn();
+            let w2 = ctx.wait(secs(1)).name("w2").spawn();
+            let s = spawned_sleeping_step(&ctx, "s", secs(3));
+            let (a, b) = tokio::join!(w1, w2);
+            a.map_err(wire_err)?;
+            b.map_err(wire_err)?;
+            s.await.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        assert_eq!(client.empty_calls().len(), 1);
+        let updates = client.updates();
+        let mut expected: Vec<String> = ["w1", "w2"]
+            .iter()
+            .map(|n| {
+                named(&updates, n, &OperationAction::Start)
+                    .expect("the wait started")
+                    .id()
+                    .to_owned()
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(coordinator.wake_log(), expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lone_wait_starts_no_refresh() {
+        let client = Arc::new(RefreshClient::new(|_| Ok(Vec::new())));
+        let ctx = refresh_ctx(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            ctx.wait(secs(1)).await.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        tokio::time::sleep(secs(60)).await;
+        assert_eq!(client.empty_calls(), Vec::<Duration>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_in_flight_finishes_and_readies_first() {
+        let client = Arc::new(
+            RefreshClient::new(|req| {
+                let mut ops = Vec::new();
+                if let Some(start) = this(req, "w", &OperationAction::Start) {
+                    ops.push(wait_record(
+                        req,
+                        start,
+                        OperationStatus::Started,
+                        Some(secs(1)),
+                    ));
+                }
+                if req.empty_number == 1
+                    && let Some(start) = ever(req, "w", &OperationAction::Start)
+                {
+                    ops.push(wait_record(req, start, OperationStatus::Succeeded, None));
+                }
+                Ok(ops)
+            })
+            .with_empty_delay(secs(1)),
+        );
+        let ctx = refresh_ctx(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let w = ctx.wait(secs(1)).name("w").spawn();
+            let s = spawned_sleeping_step(&ctx, "s", millis(1500));
+            w.await.map_err(wire_err)?;
+            s.await.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        assert_times(&client.empty_answers(), &[secs(2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_refresh_within_one_second_of_deadline() {
+        let client = Arc::new(callback_client(true));
+        let outcome = callback_beside_step(&client, Some(millis(1500)), secs(3)).await;
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert_eq!(client.empty_calls(), Vec::<Duration>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_stops_under_one_second_left() {
+        let client = Arc::new(callback_client(false));
+        let outcome = callback_beside_step(&client, Some(millis(2500)), secs(3)).await;
+        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert_times(&client.empty_calls(), &[secs(1)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure_keeps_classification() {
+        // A retryable failure fails the invocation.
+        let client = Arc::new(RefreshClient::new(|req| {
+            if req.empty_number > 0 {
+                return Err(ExecutionClientError::from_retryable(
+                    "throttled refresh".to_owned(),
+                ));
+            }
+            Ok(callback_starts(req.updates))
+        }));
+        let outcome = callback_beside_step(&client, None, secs(3)).await;
+        let InvocationOutcome::Fault { message } = &outcome else {
+            panic!("expected a fault, got {outcome:?}");
+        };
+        assert!(message.contains("throttled refresh"), "got {message}");
+        assert_eq!(client.empty_calls().len(), 1, "no refresh after a failure");
+
+        // A non-retryable failure fails the execution.
+        let rejected = ExecutionClientError::new_non_retryable("rejected refresh");
+        let expected = crate::error::checkpoint_execution_failure_wire(&rejected);
+        let client = Arc::new(RefreshClient::new(move |req| {
+            if req.empty_number > 0 {
+                return Err(rejected.clone());
+            }
+            Ok(callback_starts(req.updates))
+        }));
+        let outcome = callback_beside_step(&client, None, secs(3)).await;
+        let InvocationOutcome::Failed { error } = &outcome else {
+            panic!("expected a failed execution, got {outcome:?}");
+        };
+        assert_eq!(error.error_type(), expected.error_type());
+        assert_eq!(client.empty_calls().len(), 1, "no refresh after a failure");
+    }
+
+    /// A pending callback whose result is spawned and polled once, beside
+    /// 3 s of activity that writes no checkpoint, then awaited.
+    async fn callback_beside_activity(ctx: crate::DurableContext) -> InvocationOutcome {
+        drive_handler(ctx, None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let mut h = std::pin::pin!(cb.spawn_result());
+            poll_once(h.as_mut()).await;
+            ctx.hold_activity(tokio::time::sleep(secs(3))).await;
+            h.await.map_err(wire_err)
+        })
+        .await
+        .expect("no panic")
+    }
+
+    /// A refresh failure under checkpoint batching is recorded by the
+    /// detached flush task that publishes the batch, for the batch's
+    /// failure owner. No later write observes the failed batch, so without
+    /// that record the invocation would suspend on the callback instead.
+    #[tokio::test(start_paused = true)]
+    async fn batched_refresh_failure_keeps_classification() {
+        let batched_ctx = |client: &Arc<RefreshClient>| {
+            crate::DurableContext::new_root_with_client_and_coalescer(
+                "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(crate::engine::CheckpointLog::empty()),
+                Arc::clone(client) as Arc<dyn crate::client::ExecutionClient>,
+                "t0".to_owned(),
+                crate::checkpoint_coalescer::CheckpointCoalescer::new(Duration::ZERO),
+            )
+        };
+
+        // A retryable failure fails the invocation.
+        let client = Arc::new(RefreshClient::new(|req| {
+            if req.empty_number > 0 {
+                return Err(ExecutionClientError::from_retryable(
+                    "throttled refresh".to_owned(),
+                ));
+            }
+            Ok(callback_starts(req.updates))
+        }));
+        let outcome = callback_beside_activity(batched_ctx(&client)).await;
+        let InvocationOutcome::Fault { message } = &outcome else {
+            panic!("expected a fault, got {outcome:?}");
+        };
+        assert!(message.contains("throttled refresh"), "got {message}");
+
+        // A non-retryable failure fails the execution.
+        let rejected = ExecutionClientError::new_non_retryable("rejected refresh");
+        let expected = crate::error::checkpoint_execution_failure_wire(&rejected);
+        let client = Arc::new(RefreshClient::new(move |req| {
+            if req.empty_number > 0 {
+                return Err(rejected.clone());
+            }
+            Ok(callback_starts(req.updates))
+        }));
+        let outcome = callback_beside_activity(batched_ctx(&client)).await;
+        let InvocationOutcome::Failed { error } = &outcome else {
+            panic!("expected a failed execution, got {outcome:?}");
+        };
+        assert_eq!(error.error_type(), expected.error_type());
+    }
+
+    /// The payload of a `panic!` or a failed `assert!` with a message.
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+        payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+    }
+
+    /// The checkpoint client panics during a refresh under checkpoint
+    /// batching, the default. The refresh is written by a detached flush
+    /// task, whose outcome has no reader, while the scheduler waits for
+    /// the batch holding its permit. The task gateway records the panic,
+    /// which ends the drive although the batch is never published. So the
+    /// drive ends, cleans up, and returns the original payload. The
+    /// virtual-time timeout bounds the test if the drive hangs.
+    #[tokio::test(start_paused = true)]
+    async fn batched_client_panic_fails_invocation() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            assert!(req.empty_number == 0, "batched refresh client panic");
+            Ok(callback_starts(req.updates))
+        }));
+        let ctx = crate::DurableContext::new_root_with_client_and_coalescer(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::engine::CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+            crate::checkpoint_coalescer::CheckpointCoalescer::new(Duration::ZERO),
+        );
+        let coordinator = Arc::clone(ctx.coordinator());
+        let ended = tokio::time::timeout(
+            secs(600),
+            drive_handler(ctx, None, |ctx| async move {
+                let cb = ctx
+                    .create_callback::<String>()
+                    .name("cb")
+                    .await
+                    .map_err(wire_err)?;
+                let mut h = std::pin::pin!(cb.spawn_result());
+                poll_once(h.as_mut()).await;
+                ctx.hold_activity(tokio::time::sleep(secs(3))).await;
+                h.await.map_err(wire_err)
+            }),
+        )
+        .await
+        .expect("the drive ends");
+        let Err(payload) = ended else {
+            panic!("expected the client panic, got {ended:?}");
+        };
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            Some("batched refresh client panic")
+        );
+        assert_eq!(coordinator.tasks().live(), 0);
+        assert_eq!(coordinator.live_waits(), 0);
+        assert_times(&client.empty_calls(), &[secs(1)]);
+    }
+
+    /// A kept panic ends a drive whose handler holds an activity permit
+    /// and never resolves, and the driver returns its payload.
+    #[tokio::test(start_paused = true)]
+    async fn kept_panic_ends_the_drive() {
+        let client = Arc::new(callback_client(false));
+        let ctx = refresh_ctx(&client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        let ended = tokio::time::timeout(
+            secs(600),
+            drive_handler(ctx, None, |ctx| async move {
+                assert!(
+                    ctx.coordinator()
+                        .record_panic(Box::new("detached boom"))
+                        .is_none()
+                );
+                ctx.hold_activity(std::future::pending::<()>()).await;
+                Ok("unreachable".to_owned())
+            }),
+        )
+        .await
+        .expect("the drive ends");
+        let Err(payload) = ended else {
+            panic!("expected the kept panic, got {ended:?}");
+        };
+        assert_eq!(panic_message(payload.as_ref()), Some("detached boom"));
+        assert_eq!(coordinator.tasks().live(), 0);
+    }
+
+    /// A fatal error takes precedence over a panic recorded after it, as
+    /// it does over every other ending. The panic payload is dropped, and a
+    /// panic from its destructor is discarded.
+    #[tokio::test(start_paused = true)]
+    async fn fatal_takes_precedence_over_kept_panic() {
+        struct PanicsOnDrop;
+        impl Drop for PanicsOnDrop {
+            #[expect(clippy::panic)]
+            // reason: the test checks that the driver discards a panic
+            // from the payload's destructor.
+            fn drop(&mut self) {
+                panic!("payload drop");
+            }
+        }
+        let client = Arc::new(callback_client(false));
+        let ctx = refresh_ctx(&client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        let ended = drive_handler(ctx, None, |ctx| async move {
+            ctx.coordinator()
+                .record_invocation_fault("fatal first".to_owned());
+            assert!(
+                ctx.coordinator()
+                    .record_panic(Box::new(PanicsOnDrop))
+                    .is_none()
+            );
+            Ok("done".to_owned())
+        })
+        .await;
+        let Ok(InvocationOutcome::Fault { message }) = &ended else {
+            panic!("expected the fatal outcome, got {ended:?}");
+        };
+        assert!(message.contains("fatal first"), "{message}");
+        assert!(!coordinator.has_panic());
+    }
+
+    /// The kept panic's payload panics on drop with a payload that panics
+    /// on drop again. The driver discards the first destructor panic and
+    /// leaks its payload, so the fatal outcome still returns.
+    #[tokio::test(start_paused = true)]
+    async fn fatal_takes_precedence_over_nested_panicking_kept_payload() {
+        let client = Arc::new(callback_client(false));
+        let ctx = refresh_ctx(&client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        let ended = drive_handler(ctx, None, |ctx| async move {
+            ctx.coordinator()
+                .record_invocation_fault("fatal first".to_owned());
+            assert!(
+                ctx.coordinator()
+                    .record_panic(Box::new(super::task_gateway::NestedPanicPayload))
+                    .is_none()
+            );
+            Ok("done".to_owned())
+        })
+        .await;
+        let Ok(InvocationOutcome::Fault { message }) = &ended else {
+            panic!("expected the fatal outcome, got {ended:?}");
+        };
+        assert!(message.contains("fatal first"), "{message}");
+        assert!(!coordinator.has_panic());
+    }
+
+    /// The handler returns while a refresh is in flight, without
+    /// checkpoint batching. The driver drops the scheduler at once, so
+    /// only the write task can record the failure. A retryable failure
+    /// must still fail the invocation, and a non-retryable one the
+    /// execution, instead of the handler's `Complete`.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure_in_flight_when_handler_returns_keeps_classification() {
+        async fn run(failure: ExecutionClientError) -> (InvocationOutcome, Arc<RefreshClient>) {
+            let client = Arc::new(
+                RefreshClient::new(move |req| {
+                    if req.empty_number > 0 {
+                        return Err(failure.clone());
+                    }
+                    Ok(callback_starts(req.updates))
+                })
+                .with_empty_delay(millis(500)),
+            );
+            let ctx = refresh_ctx(&client);
+            let coordinator = Arc::clone(ctx.coordinator());
+            let outcome = drive_handler(ctx, None, |ctx| async move {
+                let cb = ctx
+                    .create_callback::<String>()
+                    .name("cb")
+                    .await
+                    .map_err(wire_err)?;
+                let mut h = std::pin::pin!(cb.spawn_result());
+                poll_once(h.as_mut()).await;
+                ctx.hold_activity(tokio::time::sleep(millis(1200))).await;
+                Ok("done".to_owned())
+            })
+            .await
+            .expect("no panic");
+            assert_eq!(coordinator.tasks().live(), 0);
+            (outcome, client)
+        }
+
+        let (outcome, client) = run(ExecutionClientError::from_retryable(
+            "throttled refresh".to_owned(),
+        ))
+        .await;
+        let InvocationOutcome::Fault { message } = &outcome else {
+            panic!("expected a fault, got {outcome:?}");
+        };
+        assert!(message.contains("throttled refresh"), "got {message}");
+        assert_times(&client.empty_calls(), &[secs(1)]);
+
+        let rejected = ExecutionClientError::new_non_retryable("rejected refresh");
+        let expected = crate::error::checkpoint_execution_failure_wire(&rejected);
+        let (outcome, client) = run(rejected).await;
+        let InvocationOutcome::Failed { error } = &outcome else {
+            panic!("expected a failed execution, got {outcome:?}");
+        };
+        assert_eq!(error.error_type(), expected.error_type());
+        assert_times(&client.empty_calls(), &[secs(1)]);
+    }
+
+    /// The panic payload of the unbatched refresh tests below.
+    struct RefreshPanic(u32);
+
+    /// Drives a handler that returns while an unbatched refresh is in
+    /// flight, after recording a fatal error when `fatal` is set. The
+    /// checkpoint client panics with `RefreshPanic(7)` after the handler
+    /// returned, so the driver has already dropped the scheduler, and with
+    /// it the refresh's receiver.
+    async fn drive_unbatched_refresh_panic_after_return(
+        fatal: bool,
+    ) -> (
+        Result<InvocationOutcome, Box<dyn std::any::Any + Send + 'static>>,
+        Arc<crate::coordinator::InvocationCoordinator>,
+    ) {
+        let client = Arc::new(
+            RefreshClient::new(|req| {
+                if req.empty_number > 0 {
+                    std::panic::panic_any(RefreshPanic(7));
+                }
+                Ok(callback_starts(req.updates))
+            })
+            .with_empty_delay(millis(500)),
+        );
+        let ctx = refresh_ctx(&client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let mut h = std::pin::pin!(cb.spawn_result());
+            poll_once(h.as_mut()).await;
+            ctx.hold_activity(tokio::time::sleep(millis(1200))).await;
+            if fatal {
+                ctx.coordinator()
+                    .record_invocation_fault("fatal first".to_owned());
+            }
+            Ok("done".to_owned())
+        })
+        .await;
+        (outcome, coordinator)
+    }
+
+    /// The checkpoint client panics during an unbatched refresh after the
+    /// handler returned, so the driver has already dropped the scheduler.
+    /// The task gateway records the panic of the detached write task on
+    /// the coordinator, and the drive returns that payload instead of the
+    /// handler's `Complete`.
+    #[tokio::test(start_paused = true)]
+    async fn unbatched_refresh_panic_after_handler_returns() {
+        let (outcome, coordinator) = drive_unbatched_refresh_panic_after_return(false).await;
+        let Err(payload) = outcome else {
+            panic!("expected the refresh panic, got {outcome:?}");
+        };
+        assert_eq!(payload.downcast_ref::<RefreshPanic>().map(|p| p.0), Some(7));
+        assert_eq!(coordinator.tasks().live(), 0);
+    }
+
+    /// A fatal error recorded before the unbatched refresh panic still
+    /// takes precedence over it.
+    #[tokio::test(start_paused = true)]
+    async fn fatal_wins_over_unbatched_refresh_panic_after_handler_returns() {
+        let (outcome, coordinator) = drive_unbatched_refresh_panic_after_return(true).await;
+        let Ok(InvocationOutcome::Fault { message }) = &outcome else {
+            panic!("expected the fatal outcome, got {outcome:?}");
+        };
+        assert!(message.contains("fatal first"), "{message}");
+        assert!(!coordinator.has_panic());
+        assert_eq!(coordinator.tasks().live(), 0);
+    }
+
+    /// The handler panics while a batched refresh is in flight. The driver
+    /// drops the scheduler, and so the refresh's caller, when the handler
+    /// panics, and the end-of-invocation flush point never runs after a
+    /// panic. So only the flusher that publishes the batch's failure can
+    /// record it. Its classification must win over the handler's panic.
+    #[tokio::test(start_paused = true)]
+    async fn batched_refresh_failure_when_handler_panics_keeps_classification() {
+        async fn run(failure: ExecutionClientError) -> InvocationOutcome {
+            let client = Arc::new(
+                RefreshClient::new(move |req| {
+                    if req.empty_number > 0 {
+                        return Err(failure.clone());
+                    }
+                    Ok(callback_starts(req.updates))
+                })
+                .with_empty_delay(millis(500)),
+            );
+            let ctx = crate::DurableContext::new_root_with_client_and_coalescer(
+                "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(crate::engine::CheckpointLog::empty()),
+                Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+                "t0".to_owned(),
+                crate::checkpoint_coalescer::CheckpointCoalescer::new(Duration::ZERO),
+            );
+            let coordinator = Arc::clone(ctx.coordinator());
+            let outcome = drive_handler(ctx, None, |ctx| async move {
+                let cb = ctx
+                    .create_callback::<String>()
+                    .name("cb")
+                    .await
+                    .map_err(wire_err)?;
+                let mut h = std::pin::pin!(cb.spawn_result());
+                poll_once(h.as_mut()).await;
+                ctx.hold_activity(tokio::time::sleep(millis(1200))).await;
+                panic!("handler panic beside a refresh");
+            })
+            .await
+            .expect("the refresh failure wins over the handler panic");
+            assert_eq!(coordinator.tasks().live(), 0);
+            assert_times(&client.empty_calls(), &[secs(1)]);
+            outcome
+        }
+
+        let outcome = run(ExecutionClientError::from_retryable(
+            "throttled refresh".to_owned(),
+        ))
+        .await;
+        let InvocationOutcome::Fault { message } = &outcome else {
+            panic!("expected a fault, got {outcome:?}");
+        };
+        assert!(message.contains("throttled refresh"), "got {message}");
+
+        let rejected = ExecutionClientError::new_non_retryable("rejected refresh");
+        let expected = crate::error::checkpoint_execution_failure_wire(&rejected);
+        let outcome = run(rejected).await;
+        let InvocationOutcome::Failed { error } = &outcome else {
+            panic!("expected a failed execution, got {outcome:?}");
+        };
+        assert_eq!(error.error_type(), expected.error_type());
+    }
+
+    /// The checkpoint client panics during an unbatched refresh while the
+    /// handler runs. The task gateway records the panic of the detached
+    /// write task, and the scheduler waits on a channel that never carries
+    /// it. The driver must still run its cleanup, so no task outlives the
+    /// drive, and then return the original payload.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_client_panic_cleans_up_and_propagates() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            assert!(req.empty_number == 0, "refresh client panic");
+            Ok(callback_starts(req.updates))
+        }));
+        let ctx = refresh_ctx(&client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        let ended = drive_handler(ctx, None, |ctx| async move {
+            let step = spawned_sleeping_step(&ctx, "s", secs(3));
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let mut h = std::pin::pin!(cb.spawn_result());
+            poll_once(h.as_mut()).await;
+            step.await.map_err(wire_err)?;
+            h.await.map_err(wire_err)
+        })
+        .await;
+        let Err(payload) = ended else {
+            panic!("expected the client panic, got {ended:?}");
+        };
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied());
+        assert_eq!(message, Some("refresh client panic"));
+        assert_eq!(coordinator.tasks().live(), 0);
+        assert_eq!(coordinator.live_waits(), 0);
+        assert_times(&client.empty_calls(), &[secs(1)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_refresh_after_invocation_ends() {
+        let client = Arc::new(callback_client(false));
+        let ctx = refresh_ctx(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let mut h = std::pin::pin!(cb.spawn_result());
+            poll_once(h.as_mut()).await;
+            sleeping_step(&ctx, "s", millis(2500))
+                .await
+                .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        tokio::time::sleep(secs(120)).await;
+        assert_times(&client.empty_calls(), &[secs(1), secs(2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_in_flight_when_handler_returns_completes() {
+        let client = Arc::new(
+            RefreshClient::new(|req| {
+                let mut ops = callback_starts(req.updates);
+                if req.empty_number > 0
+                    && req.now >= millis(1400)
+                    && let Some(start) = ever(req, "cb", &OperationAction::Start)
+                {
+                    ops.push(callback_record(
+                        start,
+                        OperationStatus::Succeeded,
+                        Some("\"ok\""),
+                    ));
+                }
+                Ok(ops)
+            })
+            .with_empty_delay(millis(500)),
+        );
+        let ctx = refresh_ctx(&client);
+        let log_ctx = ctx.clone();
+        let coordinator = Arc::clone(ctx.coordinator());
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let mut h = std::pin::pin!(cb.spawn_result());
+            poll_once(h.as_mut()).await;
+            ctx.hold_activity(tokio::time::sleep(millis(1200))).await;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        let returned = client.elapsed();
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        assert_times(&client.empty_answers(), &[millis(1500)]);
+        assert!(returned >= millis(1500), "returned at {returned:?}");
+        let cb_id = named(&client.updates(), "cb", &OperationAction::Start)
+            .expect("the callback started")
+            .id()
+            .to_owned();
+        assert_eq!(
+            log_ctx.refresh_view(&cb_id).map(|(status, _)| status),
+            Some(CheckpointStatus::Succeeded)
+        );
+        assert_eq!(coordinator.tasks().live(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_earlier_registration_rearms_scheduler() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            let mut ops = callback_starts(req.updates);
+            if let Some(start) = this(req, "w", &OperationAction::Start) {
+                ops.push(wait_record(
+                    req,
+                    start,
+                    OperationStatus::Started,
+                    Some(millis(300)),
+                ));
+            }
+            if req.empty_number == 1
+                && let Some(start) = ever(req, "w", &OperationAction::Start)
+            {
+                ops.push(wait_record(req, start, OperationStatus::Succeeded, None));
+            }
+            Ok(ops)
+        }));
+        let ctx = refresh_ctx(&client);
+        let waited = Arc::new(Mutex::new(None));
+        let handler_waited = Arc::clone(&waited);
+        let handler_client = Arc::clone(&client);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let s = spawned_sleeping_step(&ctx, "s", secs(10));
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let mut h = std::pin::pin!(cb.spawn_result());
+            poll_once(h.as_mut()).await;
+            tokio::time::sleep(millis(200)).await;
+            let result = ctx.wait(secs(1)).name("w").await;
+            *handler_waited.lock().expect("lock") =
+                Some((result.is_ok(), handler_client.elapsed()));
+            s.await.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let first = *client.empty_calls().first().expect("a refresh was sent");
+        assert_near(first, millis(500));
+        let (ok, at) = waited.lock().expect("lock").expect("the wait returned");
+        assert!(ok, "the wait returns Ok(())");
+        assert_near(at, millis(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retired_earliest_registration_rearms_scheduler() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            let mut ops = callback_starts(req.updates);
+            if let Some(start) = this(req, "w", &OperationAction::Start) {
+                ops.push(wait_record(
+                    req,
+                    start,
+                    OperationStatus::Started,
+                    Some(secs(3)),
+                ));
+            }
+            if req.empty_number == 1
+                && let Some(start) = ever(req, "w", &OperationAction::Start)
+            {
+                ops.push(wait_record(req, start, OperationStatus::Succeeded, None));
+            }
+            Ok(ops)
+        }));
+        let ctx = refresh_ctx(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let s = spawned_sleeping_step(&ctx, "s", secs(10));
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let mut cb_h = cb.spawn_result();
+            poll_once(std::pin::Pin::new(&mut cb_h)).await;
+            let w = ctx.wait(secs(3)).name("w").spawn();
+            let (waited, ()) = tokio::join!(w, async move {
+                tokio::time::sleep(millis(500)).await;
+                drop(cb_h);
+            });
+            waited.map_err(wire_err)?;
+            s.await.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        assert_times(&client.empty_calls(), &[secs(3)]);
+    }
+
+    /// The kinds of operation tests 21 and 22 start with `.spawn()` or
+    /// `spawn_result()`.
+    #[derive(Debug, Clone, Copy)]
+    enum Spawned {
+        Wait,
+        Callback,
+        Invoke,
+        Condition,
+    }
+
+    const SPAWNED: [Spawned; 4] = [
+        Spawned::Wait,
+        Spawned::Callback,
+        Spawned::Invoke,
+        Spawned::Condition,
+    ];
+
+    impl Spawned {
+        /// The name the operation gets.
+        fn name(self) -> &'static str {
+            match self {
+                Self::Wait => "w",
+                Self::Callback => "cb",
+                Self::Invoke => "inv",
+                Self::Condition => "cond",
+            }
+        }
+
+        /// A client whose responses start the operation, and make it ready
+        /// on the first refresh.
+        fn client(self) -> RefreshClient {
+            RefreshClient::new(move |req| {
+                let mut ops = callback_starts(req.updates);
+                if let Some(start) = this(req, "w", &OperationAction::Start) {
+                    ops.push(wait_record(
+                        req,
+                        start,
+                        OperationStatus::Started,
+                        Some(secs(1)),
+                    ));
+                }
+                if let Some(retry) = this(req, "cond", &OperationAction::Retry) {
+                    ops.push(condition_record(
+                        req,
+                        retry,
+                        OperationStatus::Pending,
+                        retry.payload(),
+                        Some(secs(1)),
+                    ));
+                }
+                if req.empty_number == 1 {
+                    let ready = match self {
+                        Self::Wait => ever(req, "w", &OperationAction::Start)
+                            .map(|s| wait_record(req, s, OperationStatus::Succeeded, None)),
+                        Self::Callback => ever(req, "cb", &OperationAction::Start).map(|s| {
+                            callback_record(s, OperationStatus::Succeeded, Some("\"ok\""))
+                        }),
+                        Self::Invoke => ever(req, "inv", &OperationAction::Start)
+                            .map(|s| invoke_record(s, OperationStatus::Succeeded, Some("7"))),
+                        Self::Condition => ever(req, "cond", &OperationAction::Retry).map(|r| {
+                            condition_record(req, r, OperationStatus::Ready, r.payload(), None)
+                        }),
+                    };
+                    ops.extend(ready);
+                }
+                Ok(ops)
+            })
+        }
+
+        /// Starts the operation on `ctx` and returns its handle, whose
+        /// value is rendered as a string.
+        async fn start(
+            self,
+            ctx: &crate::DurableContext,
+            checks: &Arc<Mutex<Vec<Duration>>>,
+        ) -> Result<crate::DurableFuture<String>, crate::error::WireError> {
+            Ok(match self {
+                Self::Wait => {
+                    let h = ctx.wait(secs(1)).name("w").spawn();
+                    crate::DurableFuture::from_async(
+                        async move { h.await.map(|()| "()".to_owned()) },
+                    )
+                }
+                Self::Callback => {
+                    let cb = ctx
+                        .create_callback::<String>()
+                        .name("cb")
+                        .await
+                        .map_err(wire_err)?;
+                    cb.spawn_result()
+                }
+                Self::Invoke => {
+                    let h = ctx.invoke::<u32, _>("target", 1_u32).name("inv").spawn();
+                    crate::DurableFuture::from_async(async move { h.await.map(|v| v.to_string()) })
+                }
+                Self::Condition => {
+                    let h = condition(ctx, tokio::time::Instant::now(), checks).spawn();
+                    crate::DurableFuture::from_async(async move { h.await.map(|v| v.to_string()) })
+                }
+            })
+        }
+
+        /// The value the handle resolves with once the operation is ready.
+        fn value(self) -> &'static str {
+            match self {
+                Self::Wait => "()",
+                Self::Callback => "ok",
+                Self::Invoke => "7",
+                Self::Condition => "2",
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unawaited_spawned_operation_is_not_refreshed() {
+        for kind in SPAWNED {
+            let client = Arc::new(kind.client());
+            let ctx = refresh_ctx(&client);
+            let coordinator = Arc::clone(ctx.coordinator());
+            let seen = Arc::new(Mutex::new(None));
+            let handler_seen = Arc::clone(&seen);
+            let handler_client = Arc::clone(&client);
+            let checks = Arc::new(Mutex::new(Vec::new()));
+            let outcome = drive_handler(ctx, None, move |ctx| async move {
+                // The wrapper future is never polled, so its handle is not.
+                let _h = kind.start(&ctx, &checks).await?;
+                let live = ctx
+                    .hold_activity(async {
+                        for _ in 0..1000 {
+                            if handler_client.received(kind.name(), &OperationAction::Start)
+                                && ctx.coordinator().live_waits() == 1
+                            {
+                                return Some(ctx.coordinator().live_waits());
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        None
+                    })
+                    .await;
+                *handler_seen.lock().expect("lock") = Some(live);
+                sleeping_step(&ctx, "s", secs(3)).await.map_err(wire_err)?;
+                Ok("done".to_owned())
+            })
+            .await
+            .expect("no panic");
+            let live = seen.lock().expect("lock").expect("the handler ran");
+            assert_eq!(live, Some(1), "{kind:?}: the operation is a live wait");
+            assert_eq!(
+                client.empty_calls(),
+                Vec::<Duration>::new(),
+                "{kind:?}: no refresh"
+            );
+            assert_eq!(
+                outcome,
+                InvocationOutcome::Complete("done".to_owned()),
+                "{kind:?}"
+            );
+            assert_eq!(coordinator.live_waits(), 0, "{kind:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawned_operation_refresh_starts_at_first_poll() {
+        for kind in SPAWNED {
+            let client = Arc::new(kind.client());
+            let ctx = refresh_ctx(&client);
+            let resolved = Arc::new(Mutex::new(None));
+            let handler_resolved = Arc::clone(&resolved);
+            let handler_client = Arc::clone(&client);
+            let checks = Arc::new(Mutex::new(Vec::new()));
+            let outcome = drive_handler(ctx, None, move |ctx| async move {
+                let h = kind.start(&ctx, &checks).await?;
+                let s = spawned_sleeping_step(&ctx, "s", secs(4));
+                tokio::time::sleep(secs(2)).await;
+                let value = h.await.map_err(wire_err)?;
+                *handler_resolved.lock().expect("lock") = Some(handler_client.elapsed());
+                s.await.map_err(wire_err)?;
+                Ok(value)
+            })
+            .await
+            .expect("no panic");
+            let expected_at = match kind {
+                Spawned::Wait | Spawned::Condition => secs(2),
+                Spawned::Callback | Spawned::Invoke => secs(3),
+            };
+            assert_eq!(
+                outcome,
+                InvocationOutcome::Complete(kind.value().to_owned()),
+                "{kind:?}"
+            );
+            let first = *client.empty_calls().first().expect("a refresh was sent");
+            assert_near(first, expected_at);
+            let at = resolved.lock().expect("lock").expect("the handle resolved");
+            assert_near(at, expected_at);
+        }
+    }
+
+    /// The scheduler of a drive whose only work holds no permit sends
+    /// nothing. A recorded fatal error keeps the phase `Running` with a due
+    /// registration and no permit, the one state in which the coordinator
+    /// refuses the scheduler's permit while the scheduler is polled.
+    #[tokio::test(start_paused = true)]
+    async fn refused_scheduler_permit_sends_nothing() {
+        let client = Arc::new(RefreshClient::new(|_| Ok(Vec::new())));
+        let ctx = refresh_ctx(&client);
+        let coordinator = Arc::clone(ctx.coordinator());
+        coordinator.record_fatal("Fatal".to_owned(), "stop".to_owned());
+        let _wait = coordinator
+            .register_test_wait("op", std::task::Waker::noop())
+            .expect("running");
+        let mut scheduler = std::pin::pin!(super::refresh_scheduler(ctx));
+        let polled = tokio::time::timeout(secs(30), scheduler.as_mut()).await;
+        assert!(polled.is_err(), "the scheduler stays pending");
+        assert_eq!(client.empty_calls(), Vec::<Duration>::new());
+        assert_eq!(coordinator.permits(PermitKind::Scheduler), 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(start_paused = true)]
+    async fn replay_after_suspension_matches_in_process() {
+        // In process: the wait continues inside the one invocation.
+        let client = Arc::new(test3_client());
+        let ctx = refresh_ctx(&client);
+        let log_ctx = ctx.clone();
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            parallel_wait_then_step(ctx)
+                .await
+                .map_err(|e| crate::error::WireError::new(None::<String>, Some(e.to_string())))
+        })
+        .await
+        .expect("no panic");
+        let InvocationOutcome::Complete(in_process) = outcome else {
+            panic!("expected Complete, got {outcome:?}");
+        };
+        let mut seen: Vec<String> = Vec::new();
+        let mut in_process_ops = Vec::new();
+        for update in client.updates() {
+            if seen.contains(&update.id().to_owned()) {
+                continue;
+            }
+            seen.push(update.id().to_owned());
+            let (status, _) = log_ctx.refresh_view(update.id()).expect("recorded");
+            in_process_ops.push((
+                update.name().map(str::to_owned),
+                update.r#type().as_str().to_owned(),
+                status,
+            ));
+        }
+
+        // Through LocalRunner, which suspends at the wait and replays.
+        let result = crate::test_util::LocalRunner::new()
+            .run(
+                |(): (), ctx: crate::DurableContext| parallel_wait_then_step(ctx),
+                (),
+            )
+            .await
+            .expect("the run finishes");
+        assert!(result.invocation_count() > 1, "LocalRunner suspended");
+        assert_eq!(
+            result.output().map(String::as_str),
+            Some(in_process.as_str())
+        );
+        let replayed_ops: Vec<_> = result
+            .operations()
+            .iter()
+            .map(|op| {
+                let status = match op.status() {
+                    crate::OperationStatus::Succeeded => CheckpointStatus::Succeeded,
+                    crate::OperationStatus::Failed => CheckpointStatus::Failed,
+                    other => CheckpointStatus::Unknown(format!("{other:?}")),
+                };
+                (
+                    op.name().map(str::to_owned),
+                    op.kind().wire_str().to_owned(),
+                    status,
+                )
+            })
+            .collect();
+        assert_eq!(replayed_ops, in_process_ops);
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::panic)] // reason: handlers and destructors panic under test, and test assertions
+mod panic_owner {
+    //! The invocation coordinator owns every invocation-failing panic, and
+    //! the driver resumes the first one after its cleanup.
+
+    use super::{InvocationOutcome, drive_invocation, drive_with_scheduler};
+    use crate::client::{
+        CheckpointOutput, ExecutionClient, ExecutionClientError, GetStateOutput,
+        InMemoryExecutionClient,
+    };
+    use crate::context::DurableContext;
+    use crate::coordinator::InvocationCoordinator;
+    use crate::engine::CheckpointLog;
+    use crate::future::DurableFuture;
+    use crate::task::TrackedJoinSet;
+    use aws_sdk_lambda::types::OperationUpdate;
+    use std::any::Any;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    type Payload = Box<dyn Any + Send + 'static>;
+    type Driven = Result<InvocationOutcome, Payload>;
+
+    fn ctx_with(client: Arc<dyn ExecutionClient>) -> DurableContext {
+        DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client,
+            "token0".to_owned(),
+        )
+    }
+
+    fn live_ctx() -> DurableContext {
+        ctx_with(Arc::new(InMemoryExecutionClient::new(Vec::new())))
+    }
+
+    /// A panic payload identified by its number. It counts its drops, so a
+    /// test can check that a payload was dropped through `discard_panic`.
+    struct Tagged(u32, Arc<AtomicUsize>);
+
+    impl Drop for Tagged {
+        fn drop(&mut self) {
+            self.1.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Panics with `Tagged(n)`, whose drops `drops` counts.
+    fn panic_tagged(n: u32, drops: &Arc<AtomicUsize>) -> ! {
+        std::panic::panic_any(Tagged(n, Arc::clone(drops)))
+    }
+
+    /// A new drop counter.
+    fn counter() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
+    /// The number of a [`Tagged`] payload, or `None` for another type.
+    fn tag(payload: &(dyn Any + Send)) -> Option<u32> {
+        payload.downcast_ref::<Tagged>().map(|p| p.0)
+    }
+
+    /// The tag of the panic the drive returned. Fails on any other outcome.
+    fn returned_tag(driven: &Driven) -> Option<u32> {
+        let Err(payload) = driven else {
+            panic!("expected a panic, got {driven:?}");
+        };
+        tag(payload.as_ref())
+    }
+
+    /// Panics with `Tagged(n)` when dropped.
+    struct PanicsOnDrop(u32, Arc<AtomicUsize>);
+
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            panic_tagged(self.0, &self.1);
+        }
+    }
+
+    /// Sets its flag when dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Yields, holding an activity permit, until `done` holds. Fails after
+    /// 1,000 yields.
+    async fn until(ctx: &DurableContext, done: impl Fn() -> bool) {
+        ctx.hold_activity(async {
+            for _ in 0..1000 {
+                if done() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("the condition did not hold within 1,000 yields");
+        })
+        .await;
+    }
+
+    /// Drives `handler` on `ctx` and returns the drive's result and the
+    /// number of live tasks after it.
+    async fn drive<F, Fut>(ctx: DurableContext, handler: F) -> (Driven, usize)
+    where
+        F: FnOnce(DurableContext) -> Fut,
+        Fut: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
+    {
+        let ownership = Arc::clone(ctx.task_ownership());
+        let coordinator = Arc::clone(ctx.coordinator());
+        let tasks = Arc::clone(coordinator.tasks());
+        let root = ctx.clone();
+        let driven = drive_invocation(handler(ctx), ownership, coordinator, root, None).await;
+        (driven, tasks.live())
+    }
+
+    /// Spawns a step whose body holds `guard` and stays pending, and sets
+    /// `started` once the body runs.
+    fn spawn_holding<G: Send + 'static>(
+        ctx: &DurableContext,
+        name: &str,
+        guard: G,
+        started: &Arc<AtomicBool>,
+    ) -> DurableFuture<()> {
+        let guard = Arc::new(Mutex::new(Some(guard)));
+        let started = Arc::clone(started);
+        ctx.step(move |_| {
+            let guard = guard.lock().expect("lock").take();
+            let started = Arc::clone(&started);
+            async move {
+                let _guard = guard;
+                started.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        })
+        .name(name)
+        .spawn()
+    }
+
+    /// Spawns a step whose body panics with `Tagged(n)`.
+    fn spawn_panicking(
+        ctx: &DurableContext,
+        n: u32,
+        drops: &Arc<AtomicUsize>,
+    ) -> DurableFuture<()> {
+        let drops = Arc::clone(drops);
+        ctx.step(move |_| {
+            let drops = Arc::clone(&drops);
+            async move { panic_tagged(n, &drops) }
+        })
+        .name("boom")
+        .spawn()
+    }
+
+    /// Test 6. The handler drops the handle of a step that panicked and
+    /// returns `Ok`. The handle's drop records the unread panic.
+    #[tokio::test]
+    async fn dropped_handle_of_panicked_task_fails_invocation() {
+        let (driven, live) = drive(live_ctx(), |ctx| async move {
+            let step = spawn_panicking(&ctx, 6, &counter());
+            let tasks = Arc::clone(ctx.coordinator().tasks());
+            until(&ctx, || tasks.live() == 0).await;
+            drop(step);
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(returned_tag(&driven), Some(6));
+        assert_eq!(live, 0);
+    }
+
+    /// Test 7. The handler moves the handle of a step that panicked into a
+    /// value the test keeps, and returns `Ok`. The cleanup claims the
+    /// unread panic.
+    #[tokio::test]
+    async fn escaped_handle_with_unread_panic_fails_invocation() {
+        let escaped: Arc<Mutex<Option<DurableFuture<()>>>> = Arc::new(Mutex::new(None));
+        let kept = Arc::clone(&escaped);
+        let (driven, live) = drive(live_ctx(), |ctx| async move {
+            let step = spawn_panicking(&ctx, 7, &counter());
+            let tasks = Arc::clone(ctx.coordinator().tasks());
+            until(&ctx, || tasks.live() == 0).await;
+            *kept.lock().expect("lock") = Some(step);
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(returned_tag(&driven), Some(7));
+        assert!(
+            escaped.lock().expect("lock").is_some(),
+            "the test still holds the handle"
+        );
+        assert_eq!(live, 0);
+    }
+
+    /// Test 8. The handler drops the handle of a pending step whose body
+    /// panics when it is dropped. The abort drops the body, and the
+    /// gateway records that panic.
+    #[tokio::test]
+    async fn panic_while_aborting_dropped_task_fails_invocation() {
+        let (driven, live) = drive(live_ctx(), |ctx| async move {
+            let started = Arc::new(AtomicBool::new(false));
+            let step = spawn_holding(&ctx, "hold", PanicsOnDrop(8, counter()), &started);
+            until(&ctx, || started.load(Ordering::SeqCst)).await;
+            drop(step);
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(returned_tag(&driven), Some(8));
+        assert_eq!(live, 0);
+    }
+
+    /// Test 9. A join set's item has delivered its panic to the queue, and
+    /// the set drops without joining it.
+    #[tokio::test]
+    async fn queued_join_set_panic_fails_invocation() {
+        let (driven, live) = drive(live_ctx(), |ctx| async move {
+            let drops = counter();
+            let mut set = TrackedJoinSet::<()>::new(Arc::clone(ctx.coordinator()));
+            set.spawn(ctx.task_ownership(), async move { panic_tagged(9, &drops) })
+                .expect("runtime");
+            let tasks = Arc::clone(ctx.coordinator().tasks());
+            until(&ctx, || tasks.live() == 0).await;
+            drop(set);
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(returned_tag(&driven), Some(9));
+        assert_eq!(live, 0);
+    }
+
+    /// Stays pending, sets its flag at its first poll, and panics with
+    /// `Tagged(n)` when dropped.
+    struct PendingThenDropPanics {
+        started: Arc<AtomicBool>,
+        _guard: PanicsOnDrop,
+    }
+
+    impl Future for PendingThenDropPanics {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            self.started.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    /// Test 10. A join set drops while its item is pending, and the item's
+    /// future panics when the abort drops it.
+    #[tokio::test]
+    async fn join_set_panic_after_drop_fails_invocation() {
+        let (driven, live) = drive(live_ctx(), |ctx| async move {
+            let started = Arc::new(AtomicBool::new(false));
+            let mut set = TrackedJoinSet::<()>::new(Arc::clone(ctx.coordinator()));
+            set.spawn(
+                ctx.task_ownership(),
+                PendingThenDropPanics {
+                    started: Arc::clone(&started),
+                    _guard: PanicsOnDrop(10, counter()),
+                },
+            )
+            .expect("runtime");
+            until(&ctx, || started.load(Ordering::SeqCst)).await;
+            drop(set);
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(returned_tag(&driven), Some(10));
+        assert_eq!(live, 0);
+    }
+
+    /// Records a fatal error when dropped.
+    struct FatalOnDrop(Arc<InvocationCoordinator>);
+
+    impl Drop for FatalOnDrop {
+        fn drop(&mut self) {
+            self.0
+                .record_fatal("Fatal".to_owned(), "during cleanup".to_owned());
+        }
+    }
+
+    /// Test 4. The handler panics; during the cleanup a task records a
+    /// fatal error. The fatal outcome wins, and the handler's payload is
+    /// dropped through `discard_panic`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fatal_after_panic_wins() {
+        let drops = counter();
+        let handler_drops = Arc::clone(&drops);
+        let escaped: Arc<Mutex<Option<DurableFuture<()>>>> = Arc::new(Mutex::new(None));
+        let kept = Arc::clone(&escaped);
+        let (driven, live) = drive(live_ctx(), |ctx| async move {
+            let started = Arc::new(AtomicBool::new(false));
+            let guard = FatalOnDrop(Arc::clone(ctx.coordinator()));
+            *kept.lock().expect("lock") = Some(spawn_holding(&ctx, "hold", guard, &started));
+            until(&ctx, || started.load(Ordering::SeqCst)).await;
+            assert!(ctx.coordinator().fatal_error().is_none(), "no fatal yet");
+            panic_tagged(4, &handler_drops)
+        })
+        .await;
+        let Ok(InvocationOutcome::Failed { error }) = &driven else {
+            panic!("expected the fatal outcome, got {driven:?}");
+        };
+        assert_eq!(error.error_message(), Some("during cleanup"));
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "the payload was dropped");
+        assert_eq!(live, 0);
+    }
+
+    /// Test 5. A fatal error is recorded, then the handler panics. The
+    /// fatal outcome wins, and the payload is dropped through
+    /// `discard_panic`.
+    #[tokio::test]
+    async fn fatal_before_panic_wins() {
+        let drops = counter();
+        let handler_drops = Arc::clone(&drops);
+        let (driven, live) = drive(live_ctx(), |ctx| async move {
+            ctx.coordinator()
+                .record_fatal("Fatal".to_owned(), "first".to_owned());
+            panic_tagged(5, &handler_drops)
+        })
+        .await;
+        let Ok(InvocationOutcome::Failed { error }) = &driven else {
+            panic!("expected the fatal outcome, got {driven:?}");
+        };
+        assert_eq!(error.error_message(), Some("first"));
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "the payload was dropped");
+        assert_eq!(live, 0);
+    }
+
+    /// Test 18. The handler panics with A. The cleanup then aborts a
+    /// pending task whose future panics with B when dropped. A is
+    /// resumed, and B is dropped through `discard_panic`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_recorded_panic_wins() {
+        let a_drops = counter();
+        let b_drops = counter();
+        let (handler_a, handler_b) = (Arc::clone(&a_drops), Arc::clone(&b_drops));
+        let escaped: Arc<Mutex<Option<DurableFuture<()>>>> = Arc::new(Mutex::new(None));
+        let kept = Arc::clone(&escaped);
+        let (driven, live) = drive(live_ctx(), |ctx| async move {
+            let started = Arc::new(AtomicBool::new(false));
+            let guard = PanicsOnDrop(182, handler_b);
+            *kept.lock().expect("lock") = Some(spawn_holding(&ctx, "hold", guard, &started));
+            until(&ctx, || started.load(Ordering::SeqCst)).await;
+            panic_tagged(181, &handler_a)
+        })
+        .await;
+        assert_eq!(returned_tag(&driven), Some(181));
+        assert_eq!(b_drops.load(Ordering::SeqCst), 1, "B was dropped");
+        assert_eq!(
+            a_drops.load(Ordering::SeqCst),
+            0,
+            "A is returned, not dropped"
+        );
+        assert_eq!(live, 0);
+    }
+
+    /// Test 19. The handler returns `Ok`. One task the cleanup aborts
+    /// panics when dropped; another holds a drop flag. The cleanup goes on
+    /// after the panic, so the second task is dropped too.
+    #[tokio::test]
+    async fn cleanup_continues_after_a_panic() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let handler_flag = Arc::clone(&flag);
+        let escaped: Arc<Mutex<Vec<DurableFuture<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&escaped);
+        let (driven, live) = drive(live_ctx(), |ctx| async move {
+            let first = Arc::new(AtomicBool::new(false));
+            let second = Arc::new(AtomicBool::new(false));
+            let a = spawn_holding(&ctx, "panics", PanicsOnDrop(19, counter()), &first);
+            let b = spawn_holding(&ctx, "flag", DropFlag(handler_flag), &second);
+            kept.lock().expect("lock").extend([a, b]);
+            until(&ctx, || {
+                first.load(Ordering::SeqCst) && second.load(Ordering::SeqCst)
+            })
+            .await;
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_eq!(returned_tag(&driven), Some(19));
+        assert!(flag.load(Ordering::SeqCst), "the second task was dropped");
+        assert_eq!(live, 0);
+    }
+
+    /// Test 20. The handler future holds a value that panics when the
+    /// cleanup drops the root task, after the drive ended by suspension.
+    #[tokio::test]
+    async fn root_drop_panic_during_cleanup_fails_invocation() {
+        let (driven, live) = drive(live_ctx(), |ctx| async move {
+            let _guard = PanicsOnDrop(20, counter());
+            ctx.wait(Duration::from_secs(10))
+                .name("timer")
+                .await
+                .map_err(|err| {
+                    crate::error::WireError::new(None::<String>, Some(err.to_string()))
+                })?;
+            Ok("unreachable".to_owned())
+        })
+        .await;
+        assert_eq!(returned_tag(&driven), Some(20));
+        assert_eq!(live, 0);
+    }
+
+    /// A test scheduler that panics with `Tagged(n)` at its first poll.
+    struct PanickingScheduler(u32);
+
+    impl Future for PanickingScheduler {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            panic_tagged(self.0, &counter())
+        }
+    }
+
+    /// A test scheduler that stays pending and panics with `Tagged(n)` when
+    /// dropped.
+    struct DropPanickingScheduler {
+        _guard: PanicsOnDrop,
+    }
+
+    impl Future for DropPanickingScheduler {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+
+    /// Drives a handler that holds a step and returns once the step runs,
+    /// with `scheduler` polled in place of the refresh scheduler.
+    async fn drive_with<S: Future<Output = ()>>(
+        scheduler: S,
+        wait_forever: bool,
+    ) -> (Driven, usize, bool) {
+        let ctx = live_ctx();
+        let ownership = Arc::clone(ctx.task_ownership());
+        let coordinator = Arc::clone(ctx.coordinator());
+        let tasks = Arc::clone(coordinator.tasks());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let body_dropped = Arc::clone(&dropped);
+        let handler = async move {
+            let started = Arc::new(AtomicBool::new(false));
+            let _step = spawn_holding(&ctx, "hold", DropFlag(body_dropped), &started);
+            if wait_forever {
+                ctx.hold_activity(std::future::pending::<()>()).await;
+            }
+            until(&ctx, || started.load(Ordering::SeqCst)).await;
+            Ok("done".to_owned())
+        };
+        let driven = drive_with_scheduler(handler, ownership, coordinator, scheduler, None).await;
+        (driven, tasks.live(), dropped.load(Ordering::SeqCst))
+    }
+
+    /// Test 21. (a) The scheduler panics at its first poll while the
+    /// handler's work is live; (b) a pending scheduler panics when the
+    /// cleanup drops it after the handler returned. Each fails the
+    /// invocation after the cleanup.
+    #[tokio::test]
+    async fn scheduler_poll_or_drop_panic_fails_after_cleanup() {
+        let (driven, live, _) = drive_with(PanickingScheduler(211), true).await;
+        assert_eq!(returned_tag(&driven), Some(211));
+        assert_eq!(live, 0);
+
+        let (driven, live, dropped) = drive_with(
+            DropPanickingScheduler {
+                _guard: PanicsOnDrop(212, counter()),
+            },
+            false,
+        )
+        .await;
+        assert_eq!(returned_tag(&driven), Some(212));
+        assert!(dropped, "the cleanup dropped the step after the panic");
+        assert_eq!(live, 0);
+    }
+
+    /// A payload that holds a context, counts its drops, and panics when
+    /// dropped with a payload whose destructor panics again.
+    struct SelfReferential(Option<DurableContext>, Arc<AtomicUsize>);
+
+    impl Drop for SelfReferential {
+        fn drop(&mut self) {
+            drop(self.0.take());
+            self.1.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(super::task_gateway::NestedPanicPayload);
+        }
+    }
+
+    /// Polls `drive` until the handler was dropped and the drive is in its
+    /// cleanup, waiting for a detached task.
+    async fn poll_into_cleanup(
+        drive: &mut Pin<Box<impl Future<Output = Driven>>>,
+        coordinator: &InvocationCoordinator,
+        handler_dropped: &AtomicBool,
+    ) {
+        for _ in 0..1000 {
+            let polled = std::future::poll_fn(|cx| Poll::Ready(drive.as_mut().poll(cx))).await;
+            assert!(polled.is_pending(), "the drive waits for the detached task");
+            if handler_dropped.load(Ordering::SeqCst)
+                && coordinator.phase() == crate::coordinator::Phase::Finished
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the drive did not reach its cleanup");
+    }
+
+    /// Test 3. A payload holds the only remaining `DurableContext` clone,
+    /// so it keeps the coordinator alive. (a) It is recorded, and the drive
+    /// is dropped before the arbitration: the guard drops it. (b) A
+    /// detached task is in flight when the drive is dropped, and panics
+    /// with it afterwards: the payload comes back to the task, which drops
+    /// it. In both cases the payload is dropped once, no panic escapes, and
+    /// the coordinator keeps nothing.
+    #[tokio::test]
+    async fn cancelled_drive_discards_self_referential_panic() {
+        for late in [false, true] {
+            let ctx = live_ctx();
+            let ownership = Arc::clone(ctx.task_ownership());
+            let coordinator = Arc::clone(ctx.coordinator());
+            let root = ctx.clone();
+            let drops = counter();
+            let handler_drops = Arc::clone(&drops);
+            let handler_dropped = Arc::new(AtomicBool::new(false));
+            let flag = DropFlag(Arc::clone(&handler_dropped));
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let handler = async move {
+                let _flag = flag;
+                if late {
+                    // The detached task takes the only context clone left
+                    // after the drive is dropped.
+                    let payload_ctx = ctx.clone();
+                    let detached = async move {
+                        drop(release_rx.await);
+                        std::panic::panic_any(SelfReferential(Some(payload_ctx), handler_drops));
+                    };
+                    crate::task::spawn_detached(ctx.coordinator(), detached).expect("runtime");
+                } else {
+                    // A detached task keeps the cleanup waiting until the
+                    // test releases it.
+                    let detached = async move {
+                        drop(release_rx.await);
+                    };
+                    crate::task::spawn_detached(ctx.coordinator(), detached).expect("runtime");
+                    let payload = SelfReferential(Some(ctx.clone()), handler_drops);
+                    assert!(ctx.coordinator().record_panic(Box::new(payload)).is_none());
+                }
+                drop(ctx);
+                if late {
+                    // The handler returns, so the cleanup waits for the
+                    // detached task.
+                    return Ok("done".to_owned());
+                }
+                std::future::pending::<Result<String, crate::error::WireError>>().await
+            };
+            let mut drive = Box::pin(drive_invocation(
+                handler,
+                ownership,
+                Arc::clone(&coordinator),
+                root,
+                None,
+            ));
+            poll_into_cleanup(&mut drive, &coordinator, &handler_dropped).await;
+            let dropped =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(drive)));
+            assert!(dropped.is_ok(), "no panic escapes the drop");
+            release_tx.send(()).expect("the detached task waits");
+            coordinator.tasks().wait_idle().await;
+            assert_eq!(drops.load(Ordering::SeqCst), 1, "late = {late}");
+            assert!(!coordinator.has_panic(), "late = {late}");
+            assert!(coordinator.take_panic().is_none());
+        }
+    }
+
+    /// A client whose checkpoint future panics with `Tagged(n)`, at its
+    /// poll or, with `on_drop`, when it is dropped after it returned.
+    #[derive(Debug)]
+    struct PanickingClient {
+        n: u32,
+        on_drop: bool,
+    }
+
+    /// Returns a checkpoint output and panics with `Tagged(n)` when
+    /// dropped.
+    struct ReadyThenDropPanics(u32);
+
+    impl Future for ReadyThenDropPanics {
+        type Output = Result<CheckpointOutput, ExecutionClientError>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(Ok(CheckpointOutput {
+                checkpoint_token: Some("token1".to_owned()),
+                updated_operations: Vec::new(),
+                next_marker: None,
+            }))
+        }
+    }
+
+    impl Drop for ReadyThenDropPanics {
+        fn drop(&mut self) {
+            panic_tagged(self.0, &counter());
+        }
+    }
+
+    impl ExecutionClient for PanickingClient {
+        fn checkpoint(
+            &self,
+            _arn: &str,
+            _token: &str,
+            _updates: Vec<OperationUpdate>,
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
+            let n = self.n;
+            if self.on_drop {
+                return Box::pin(ReadyThenDropPanics(n));
+            }
+            Box::pin(async move { panic_tagged(n, &counter()) })
+        }
+
+        fn get_state(
+            &self,
+            _arn: &str,
+            _token: &str,
+            _marker: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
+            Box::pin(async {
+                Ok(GetStateOutput {
+                    operations: Vec::new(),
+                    next_marker: None,
+                })
+            })
+        }
+    }
+
+    /// Test 15. With checkpoint batching, the client's checkpoint future
+    /// returns and then panics when the flusher drops it. The gateway
+    /// records the flusher's panic.
+    #[tokio::test]
+    async fn detached_future_drop_panic_fails_invocation() {
+        let ctx = DurableContext::new_root_with_client_and_coalescer(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::new(PanickingClient {
+                n: 15,
+                on_drop: true,
+            }) as Arc<dyn ExecutionClient>,
+            "token0".to_owned(),
+            crate::checkpoint_coalescer::CheckpointCoalescer::new(Duration::ZERO),
+        );
+        let (driven, live) = tokio::time::timeout(
+            Duration::from_secs(10),
+            drive(ctx, |ctx| async move {
+                ctx.step(|_| async { Ok(1_u32) })
+                    .name("s")
+                    .await
+                    .map_err(|err| {
+                        crate::error::WireError::new(None::<String>, Some(err.to_string()))
+                    })?;
+                Ok("done".to_owned())
+            }),
+        )
+        .await
+        .expect("the drive ends");
+        assert_eq!(returned_tag(&driven), Some(15));
+        assert_eq!(live, 0);
+    }
+
+    /// Test 17. Without batching, an operation's write future is polled
+    /// after its client panicked: it stays pending, because the write
+    /// channel carries no payload. The drive returns the client's payload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_waiter_stays_pending_when_client_panics() {
+        let ctx = ctx_with(Arc::new(PanickingClient {
+            n: 17,
+            on_drop: false,
+        }));
+        let second_poll: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&second_poll);
+        let (driven, live) = tokio::time::timeout(
+            Duration::from_secs(10),
+            drive(ctx, |ctx| async move {
+                let update = OperationUpdate::builder()
+                    .id("w")
+                    .r#type(aws_sdk_lambda::types::OperationType::Step)
+                    .action(aws_sdk_lambda::types::OperationAction::Start)
+                    .build()
+                    .expect("valid update");
+                let mut write = std::pin::pin!(ctx.checkpoint_updates(vec![update]));
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        write.as_mut().poll(cx).is_pending(),
+                        "the write runs on its task"
+                    );
+                    // The write task runs on the other worker. Wait for its
+                    // panic inside this poll, so the driver cannot end the
+                    // drive between the two polls.
+                    // `block_in_place` hands this worker's other tasks,
+                    // the new write task among them, to another worker.
+                    tokio::task::block_in_place(|| {
+                        let start = std::time::Instant::now();
+                        while !ctx.coordinator().has_panic() {
+                            assert!(
+                                start.elapsed() < Duration::from_secs(5),
+                                "the client panics"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    });
+                    *observed.lock().expect("lock") = Some(write.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                std::future::pending::<Result<String, crate::error::WireError>>().await
+            }),
+        )
+        .await
+        .expect("the drive ends");
+        assert_eq!(
+            *second_poll.lock().expect("lock"),
+            Some(true),
+            "the waiter stays pending"
+        );
+        assert_eq!(returned_tag(&driven), Some(17));
+        assert_eq!(live, 0);
     }
 }

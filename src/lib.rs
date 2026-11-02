@@ -620,6 +620,31 @@ fn parse_inline_operations(payload: &serde_json::Value) -> (engine::CheckpointLo
     (engine::CheckpointLog::from_records(records), next_marker)
 }
 
+/// Parses a timestamp of the invocation payload.
+///
+/// The payload carries a timestamp as an ISO-8601 string. An integer is
+/// read as milliseconds since the Unix epoch, as the Python SDK writes it.
+/// Any other JSON type, a string that does not parse, or a value outside
+/// the range of `SystemTime` gives `None`.
+pub(crate) fn parse_envelope_timestamp(value: &serde_json::Value) -> Option<std::time::SystemTime> {
+    use aws_sdk_lambda::primitives::{DateTime, DateTimeFormat};
+    let parsed = match value {
+        serde_json::Value::String(s) => DateTime::from_str(s, DateTimeFormat::DateTime).ok()?,
+        serde_json::Value::Number(n) => DateTime::from_millis(n.as_i64()?),
+        _ => return None,
+    };
+    to_system_time(parsed)
+}
+
+/// Converts a service timestamp to a `SystemTime`. A value outside the
+/// range of `SystemTime` on this platform gives `None`, so an out-of-range
+/// timestamp reads as a missing one.
+pub(crate) fn to_system_time<T: TryInto<std::time::SystemTime>>(
+    timestamp: T,
+) -> Option<std::time::SystemTime> {
+    timestamp.try_into().ok()
+}
+
 /// Parses a single operation JSON object into a checkpoint record.
 #[expect(clippy::too_many_lines)] // reason: sequential detail extraction reads better as one flow
 fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::CheckpointRecord)> {
@@ -676,6 +701,13 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
         .and_then(|d| d.get("Attempt"))
         .and_then(serde_json::Value::as_i64)
         .map_or(0, |a| a.clamp(0, i64::from(u32::MAX)) as u32);
+
+    // A wait's scheduled end, or a step's next attempt.
+    let due_at = op
+        .get("WaitDetails")
+        .and_then(|d| d.get("ScheduledEndTimestamp"))
+        .or_else(|| step_details.and_then(|d| d.get("NextAttemptTimestamp")))
+        .and_then(parse_envelope_timestamp);
 
     // Parse ChainedInvokeDetails (for invoke operations).
     let invoke_details = op.get("ChainedInvokeDetails");
@@ -799,6 +831,7 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
                 .get("Name")
                 .and_then(serde_json::Value::as_str)
                 .map(String::from),
+            due_at,
         },
     ))
 }
@@ -1055,13 +1088,19 @@ where
                 }
             })
             .instrument(replay_span);
-            // A handler panic returns here only after the driver cleaned up
-            // every task, and leaves the SDK with its original payload.
-            // Nothing runs between the cleanup and the resume.
+            // An invocation-failing panic (of the handler, of the
+            // checkpoint client, or of any task the SDK started) returns
+            // here only after the driver cleaned up every task, and leaves
+            // the SDK with its original payload. When several panic, the
+            // first one recorded is resumed. A recorded fatal error takes
+            // precedence over a panic, so the driver then returns the fatal
+            // outcome instead. Nothing runs between the cleanup and the
+            // resume.
             let outcome = match driver::drive_invocation(
                 root,
                 task_ownership,
                 coordinator,
+                flush_ctx.clone(),
                 remaining,
             )
             .await
@@ -1365,6 +1404,61 @@ mod tests {
     use std::future::IntoFuture;
 
     use super::*;
+
+    #[test]
+    fn due_at_from_inline_timestamps() {
+        let payload = serde_json::json!({
+            "InitialExecutionState": {
+                "Operations": [
+                    { "Id": "w1", "Type": "WAIT", "Status": "STARTED",
+                      "WaitDetails": { "ScheduledEndTimestamp": "2026-01-01T00:00:00Z" } },
+                    { "Id": "s1", "Type": "STEP", "Status": "PENDING",
+                      "StepDetails": { "NextAttemptTimestamp": "2026-01-01T00:00:05.5Z" } },
+                    { "Id": "w2", "Type": "WAIT", "Status": "STARTED",
+                      "WaitDetails": { "ScheduledEndTimestamp": 1_767_225_600_000_i64 } },
+                    { "Id": "w3", "Type": "WAIT", "Status": "STARTED",
+                      "WaitDetails": { "ScheduledEndTimestamp": "not a date" } },
+                    { "Id": "w4", "Type": "WAIT", "Status": "STARTED",
+                      "WaitDetails": { "ScheduledEndTimestamp": 1.5 } },
+                    { "Id": "w5", "Type": "WAIT", "Status": "STARTED",
+                      "WaitDetails": { "ScheduledEndTimestamp": true } },
+                ]
+            }
+        });
+        let (log, _) = parse_inline_operations(&payload);
+        let due = |id: &str| log.get(id).expect("parsed").due_at;
+        let new_year = std::time::UNIX_EPOCH + Duration::from_hours(490_896);
+        assert_eq!(due("w1"), Some(new_year));
+        assert_eq!(due("s1"), Some(new_year + Duration::from_millis(5_500)));
+        assert_eq!(due("w2"), Some(new_year), "epoch milliseconds");
+        assert_eq!(due("w3"), None, "a string that does not parse");
+        assert_eq!(due("w4"), None, "a number that is not an integer");
+        assert_eq!(due("w5"), None, "another JSON type");
+    }
+
+    /// A timestamp that no platform's `SystemTime` can hold.
+    struct OutOfRange;
+
+    impl TryFrom<OutOfRange> for std::time::SystemTime {
+        type Error = &'static str;
+
+        fn try_from(_: OutOfRange) -> Result<Self, Self::Error> {
+            Err("outside the range of SystemTime")
+        }
+    }
+
+    /// Both `due_at` mappings convert through `to_system_time`. A timestamp
+    /// in range converts, and one outside the range of `SystemTime` gives
+    /// `None`, as a missing timestamp does.
+    #[test]
+    fn to_system_time_maps_an_out_of_range_timestamp_to_none() {
+        let millis = aws_sdk_lambda::primitives::DateTime::from_millis(1_500);
+        assert_eq!(
+            to_system_time(millis),
+            Some(std::time::UNIX_EPOCH + Duration::from_millis(1_500))
+        );
+        assert_eq!(to_system_time(OutOfRange), None);
+    }
 
     #[derive(Debug)]
     struct PlainUserError;
@@ -2179,6 +2273,7 @@ mod tests {
                 callback_id: None,
                 op_type: None,
                 sub_type: None,
+                due_at: None,
                 op_name: None,
             },
         );

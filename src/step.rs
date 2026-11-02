@@ -1228,6 +1228,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
@@ -1289,6 +1290,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
@@ -1403,6 +1405,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         (wire_key, record)
@@ -1550,6 +1553,7 @@ mod tests {
         let (ctx, client) = context_over(Vec::new());
         let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             execution(ctx),
@@ -1701,6 +1705,7 @@ mod tests {
         // Retry timer is backend-owned: the operation suspends (parks) rather
         // than surfacing a fabricated error to the caller.
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             exec.execute(),
@@ -1747,6 +1752,7 @@ mod tests {
 
         let signal = Arc::clone(ctx.coordinator());
         let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
             Arc::clone(ctx.task_ownership()),
             signal,
             exec.execute(),
@@ -1943,12 +1949,13 @@ mod tests {
         });
         let signal = Arc::clone(ctx.coordinator());
         let ownership = Arc::clone(ctx.task_ownership());
+        let root = ctx.clone();
         let exec = at_most_once_over_started(ctx, Some(strategy), Arc::clone(&executed));
 
         // Retry timer is backend-owned: the operation suspends (parks) rather
         // than surfacing a fabricated retry-schedule error to the caller.
         let outcome =
-            crate::driver::test_support::outcome_of(ownership, signal, exec.execute()).await;
+            crate::driver::test_support::outcome_of(root, ownership, signal, exec.execute()).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
         assert_eq!(*seen.lock().expect("kind log lock"), ["step interrupted"]);
         let retry = recorded_error_for(&client, &OperationAction::Retry);
@@ -1968,10 +1975,11 @@ mod tests {
         let (ctx, client) = context_over(vec![step_record(CheckpointStatus::Started, 0, None)]);
         let signal = Arc::clone(ctx.coordinator());
         let ownership = Arc::clone(ctx.task_ownership());
+        let root = ctx.clone();
         let exec = at_most_once_over_started(ctx, None, executed);
 
         let outcome =
-            crate::driver::test_support::outcome_of(ownership, signal, exec.execute()).await;
+            crate::driver::test_support::outcome_of(root, ownership, signal, exec.execute()).await;
         assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
         let retry = recorded_error_for(&client, &OperationAction::Retry);
         assert_eq!(retry.error_type(), Some(STEP_INTERRUPTED_ERROR_TYPE));
@@ -2077,6 +2085,7 @@ mod tests {
             callback_id: None,
             op_type: None,
             sub_type: None,
+            due_at: None,
             op_name: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));

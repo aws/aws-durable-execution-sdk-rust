@@ -244,7 +244,7 @@ where
     /// }
     /// ```
     pub fn spawn(self) -> DurableFuture<O> {
-        spawn_terminal!(self)
+        spawn_terminal!(self, awaited)
     }
 }
 

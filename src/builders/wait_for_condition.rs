@@ -272,7 +272,7 @@ where
     where
         SD: Serdes<S>,
     {
-        spawn_terminal!(self)
+        spawn_terminal!(self, awaited)
     }
 }
 

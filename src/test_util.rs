@@ -60,8 +60,11 @@
 //!   callback timeout or heartbeat timer; [`CallbackReply::timeout`] and
 //!   [`CallbackReply::heartbeat_timeout`] deliver the records those timers
 //!   produce.
-//! - Time never moves while an invocation runs. So a local run can use
-//!   more invocations than the same execution uses on the service.
+//! - `LocalRunner` moves time only between invocations. On the service, a
+//!   wait or a condition check can end while other work runs, and the SDK
+//!   continues it in the same invocation. Locally its record never changes
+//!   during an invocation. So a local run can take more invocations than
+//!   the same execution takes on the service.
 //! - [`LocalRunner::checkpoint_latency`] delays each checkpoint response in
 //!   tokio time. It does not move the virtual clock.
 //! - The backend stores each operation's `ParentId` and the `ReplayChildren`

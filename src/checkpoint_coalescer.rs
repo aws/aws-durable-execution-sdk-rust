@@ -348,6 +348,12 @@ pub(crate) struct FailedFlush {
 pub(crate) struct CheckpointBatch {
     notify: Notify,
     result: Mutex<Option<Result<CheckpointOutput, ExecutionClientError>>>,
+    /// The wire IDs whose classification a failed write of this batch
+    /// records. A refresh joins with its first due registration's wire ID,
+    /// because the driver can drop the refresh's caller before the batch
+    /// is written. The publisher records the failure for each ID, so the
+    /// failure decides the invocation's outcome with or without a reader.
+    failure_owners: Mutex<Vec<String>>,
 }
 
 impl CheckpointBatch {
@@ -364,6 +370,17 @@ impl CheckpointBatch {
     pub(crate) fn publish(&self, result: Result<CheckpointOutput, ExecutionClientError>) {
         *self.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
         self.notify.notify_waiters();
+    }
+
+    /// Takes the wire IDs whose classification a failed write of this
+    /// batch records (see [`CheckpointCoalescer::join_owned`]).
+    pub(crate) fn take_failure_owners(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .failure_owners
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     /// Returns a future that resolves when the batch result is published.
@@ -410,6 +427,18 @@ impl CheckpointCoalescer {
         &self.writer
     }
 
+    /// [`Self::join_owned`] without a failure owner. Tests use it.
+    #[cfg(test)]
+    pub(crate) fn join(
+        &self,
+        admission: &Admission,
+        coordinator: &Arc<InvocationCoordinator>,
+        owners: &[String],
+        updates: Vec<TrackedUpdate>,
+    ) -> Option<(Arc<CheckpointBatch>, bool)> {
+        self.join_owned(admission, coordinator, owners, updates, None)
+    }
+
     /// Adds `updates` to the buffer and returns the batch they joined,
     /// opening a new batch if none is pending, and whether this join opened
     /// it. The buffer takes ownership of each update's lifecycle event along
@@ -425,12 +454,18 @@ impl CheckpointCoalescer {
     /// permit. The checks run under the buffer lock. So an update is either
     /// buffered before its owner is abandoned, and written before any update
     /// buffered later, or it is rejected.
-    pub(crate) fn join(
+    ///
+    /// With `failure_owner` set, the join adds it to the batch's failure
+    /// owners under the buffer lock. A batch is claimed under the same
+    /// lock, so the owner is in place before the batch can be written and
+    /// its result published.
+    pub(crate) fn join_owned(
         &self,
         admission: &Admission,
         coordinator: &Arc<InvocationCoordinator>,
         owners: &[String],
         updates: Vec<TrackedUpdate>,
+        failure_owner: Option<&str>,
     ) -> Option<(Arc<CheckpointBatch>, bool)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if !admission.admits(owners) {
@@ -440,10 +475,15 @@ impl CheckpointCoalescer {
         state.pending.extend(updates);
         state.permits.push(permit);
         let opened = state.batch.is_none();
-        Some((
-            Arc::clone(state.batch.get_or_insert_with(Arc::default)),
-            opened,
-        ))
+        let batch = Arc::clone(state.batch.get_or_insert_with(Arc::default));
+        if let Some(owner) = failure_owner {
+            batch
+                .failure_owners
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(owner.to_owned());
+        }
+        Some((batch, opened))
     }
 
     /// Claims `target`'s buffered updates for flushing, if `target` is still
