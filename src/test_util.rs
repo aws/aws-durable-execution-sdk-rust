@@ -5102,7 +5102,7 @@ fn render_update(update: &OperationUpdate) -> String {
 #[expect(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use crate::builders::map_parallel::CompletionConfig;
+    use crate::builders::map_parallel::{CompletionConfig, CompletionDecision, CompletionOutcome};
     use crate::{RetryDecision, StepError};
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -5718,7 +5718,7 @@ mod tests {
     /// suspends mid-batch (a timer inside an item), resumes on a later
     /// invocation, replays the already-settled item from its checkpoint
     /// record without re-running its body, and the custom predicate then
-    /// ends the batch early with the `PREDICATE_MATCHED` reason.
+    /// ends the batch early with the `CUSTOM_COMPLETION_SUCCEEDED` reason.
     #[tokio::test]
     async fn map_completion_predicate_survives_replay() {
         let item0_runs = Arc::new(AtomicU32::new(0));
@@ -5757,7 +5757,15 @@ mod tests {
                             .max_concurrency(1)
                             .completion(
                                 CompletionConfig::builder()
-                                    .completion_predicate(|stats| stats.settled() >= 2)
+                                    .completion_predicate(|stats| {
+                                        if stats.settled() >= 2 {
+                                            CompletionDecision::Complete(
+                                                CompletionOutcome::Succeeded,
+                                            )
+                                        } else {
+                                            CompletionDecision::Continue
+                                        }
+                                    })
                                     .build()?,
                             )
                             .await_batch()
@@ -5776,7 +5784,10 @@ mod tests {
 
         assert!(result.is_success(), "{:?}", result.error_message());
         // The predicate fired after two settles; item 2 never started.
-        assert_eq!(result.output(), Some(&"PREDICATE_MATCHED:2".to_owned()));
+        assert_eq!(
+            result.output(),
+            Some(&"CUSTOM_COMPLETION_SUCCEEDED:2".to_owned())
+        );
         // The timer forced at least one suspension, so the batch spanned
         // several invocations and item 0 was replayed at least once.
         assert!(
@@ -5794,22 +5805,19 @@ mod tests {
     }
 
     /// Completion-trigger evaluation is deterministic under replay for a
-    /// CONCURRENT batch: recorded-terminal children feed the statistics
-    /// inline, in input order, before any resumed (live) branch joins.
+    /// CONCURRENT batch: on resume, recorded-terminal children settle
+    /// first, before any resumed (live) branch joins.
     ///
     /// Three items at `max_concurrency(2)`: items 0 and 2 succeed on the
     /// first invocation, item 1 parks on a timer and fails after resume.
-    /// The order-sensitive predicate `failed() > succeeded()` must never
-    /// fire: on the resumed invocation the two recorded successes are
-    /// applied (in input order) before item 1's live failure joins, so the
-    /// predicate always sees 2 succeeded before it sees 1 failed:
-    /// regardless of how the scheduler orders the join events. Without
-    /// canonical ordering, resumed item 1's failure could join before
-    /// item 0's recorded success replays, the predicate would see
-    /// 1 failed / 0 succeeded and stop the batch, and item 2, whose
-    /// success is already in the checkpoint log, would be dropped from
-    /// the result: a different operation history from identical recorded
-    /// state.
+    /// The predicate `failed() > succeeded()` must never fire: on the
+    /// resumed invocation the two recorded successes settle before item 1's
+    /// live failure joins, so the predicate sees 2 succeeded before it sees
+    /// 1 failed, regardless of how the scheduler orders the join events. If
+    /// resumed item 1's failure could join before item 0's recorded success,
+    /// the predicate would see 1 failed / 0 succeeded and stop the batch,
+    /// and item 2, whose success is already in the checkpoint log, would be
+    /// dropped from the result.
     #[tokio::test]
     async fn map_completion_predicate_replay_order_is_canonical() {
         let result = LocalRunner::new()
@@ -5834,10 +5842,15 @@ mod tests {
                         .max_concurrency(2)
                         .completion(
                             CompletionConfig::builder()
-                                // Keep the fixed failure trigger out of the
-                                // way; only the predicate could stop early.
-                                .tolerated_failure_count(10)
-                                .completion_predicate(|stats| stats.failed() > stats.succeeded())
+                                // A predicate-only config: only the
+                                // predicate could stop early.
+                                .completion_predicate(|stats| {
+                                    if stats.failed() > stats.succeeded() {
+                                        CompletionDecision::Complete(CompletionOutcome::Succeeded)
+                                    } else {
+                                        CompletionDecision::Continue
+                                    }
+                                })
                                 .build()?,
                         )
                         .await_batch()
@@ -5869,123 +5882,13 @@ mod tests {
         );
     }
 
-    /// Regression for reversed LIVE settlement order (finding: replay
-    /// ordering nondeterminism). Three items at `max_concurrency(3)`:
-    /// item 1 succeeds BEFORE the deliberately delayed item 0 fails, and
-    /// item 2 parks on a timer. The order-sensitive predicate
-    /// `failed() > succeeded()` must make the same decision however the
-    /// scheduler interleaves the live settlements: outcomes commit to the
-    /// statistics strictly in input order, so the predicate's first
-    /// evaluation is on the prefix `[item 0: failed]`, one failure, zero
-    /// successes, and it fires, on the FIRST invocation, before any
-    /// suspension. Under settlement-order evaluation the fresh run would
-    /// instead see `[1 succeeded]` then `[1 succeeded, 1 failed]`, never
-    /// fire, suspend on item 2, and then the resumed invocation, replaying
-    /// recorded outcomes in input order, would fire where the original run
-    /// did not: two runs of the same execution disagreeing (the exact
-    /// reviewed defect).
-    #[tokio::test]
-    async fn map_predicate_deterministic_under_reversed_live_settlement() {
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let gate_handle = Arc::clone(&gate);
-
-        let result = LocalRunner::new()
-            .run(
-                move |(), ctx: DurableContext| {
-                    let gate = Arc::clone(&gate_handle);
-                    async move {
-                        let batch = ctx
-                            .map(vec![10_u32, 20, 30], move |child, item, idx| {
-                                let gate = Arc::clone(&gate);
-                                async move {
-                                    match idx {
-                                        0 => {
-                                            // Settle strictly after item 1:
-                                            // wait for its signal, then let
-                                            // its join drain first.
-                                            // The gate and the yields are
-                                            // not SDK operations: they run
-                                            // under a held activity permit,
-                                            // so a waiting sibling cannot
-                                            // suspend the invocation here.
-                                            child
-                                                .hold_activity(async {
-                                                    gate.notified().await;
-                                                    for _ in 0..16 {
-                                                        tokio::task::yield_now().await;
-                                                    }
-                                                })
-                                                .await;
-                                            Err("item 0 fails last".into())
-                                        }
-                                        1 => {
-                                            gate.notify_one();
-                                            Ok(item)
-                                        }
-                                        _ => {
-                                            // Parks; reported as STARTED
-                                            // once the trigger fires.
-                                            child
-                                                .wait(std::time::Duration::from_secs(1))
-                                                .name("stall")
-                                                .await?;
-                                            Ok(item)
-                                        }
-                                    }
-                                }
-                            })
-                            .name("reversed-order")
-                            .max_concurrency(3)
-                            .completion(
-                                CompletionConfig::builder()
-                                    // Keep the fixed failure trigger out of
-                                    // the way; only the predicate can stop
-                                    // the batch.
-                                    .tolerated_failure_count(10)
-                                    .completion_predicate(|stats| {
-                                        stats.failed() > stats.succeeded()
-                                    })
-                                    .build()?,
-                            )
-                            .await_batch()
-                            .await?;
-                        Ok::<_, BoxError>(format!(
-                            "{}:{}:{}:{}",
-                            batch.reason.as_str(),
-                            batch.items.len(),
-                            batch.success_count(),
-                            batch.failure_count()
-                        ))
-                    }
-                },
-                (),
-            )
-            .await
-            .expect("runner");
-
-        assert!(result.is_success(), "{:?}", result.error_message());
-        // The predicate fired at item 0's committed failure; items 0 and 1
-        // both settled and are in the result, and parked item 2 is reported
-        // as STARTED, so the batch counts three items.
-        assert_eq!(result.output(), Some(&"PREDICATE_MATCHED:3:1:1".to_owned()));
-        // The trigger fired on the first invocation: the batch never
-        // suspended, so the fresh run and any replay cannot disagree.
-        assert_eq!(
-            result.invocation_count(),
-            1,
-            "the predicate must fire before the batch suspends"
-        );
-    }
-
     /// Reversed live settlement order PLUS a genuine suspension: item 1
     /// succeeds before the delayed item 0 fails (both on the first
     /// invocation), item 2 parks and only succeeds after resume. The
-    /// order-sensitive predicate stays false on every committed prefix:
-    /// `[0: failed]`, `[0: failed, 1: succeeded]`, then after resume
-    /// `[.., 2: succeeded]`, and those are the SAME prefixes the resumed
-    /// invocation derives from the recorded outcomes, so the batch runs to
-    /// completion with every item's outcome in the result, on both sides
-    /// of the suspension boundary.
+    /// predicate `failed() > succeeded() + 1` stays false on every snapshot,
+    /// live and on resume, so the batch runs to completion with every
+    /// item's outcome in the result, on both sides of the suspension
+    /// boundary.
     #[tokio::test]
     async fn map_predicate_reversed_settlement_with_suspension_replays_stably() {
         let gate = Arc::new(tokio::sync::Notify::new());
@@ -6039,12 +5942,16 @@ mod tests {
                             .max_concurrency(3)
                             .completion(
                                 CompletionConfig::builder()
-                                    .tolerated_failure_count(10)
-                                    // Order-sensitive but never true here:
-                                    // one failure can never outnumber the
-                                    // successes by two.
+                                    // Never true here: one failure can never
+                                    // outnumber the successes by two.
                                     .completion_predicate(|stats| {
-                                        stats.failed() > stats.succeeded() + 1
+                                        if stats.failed() > stats.succeeded() + 1 {
+                                            CompletionDecision::Complete(
+                                                CompletionOutcome::Succeeded,
+                                            )
+                                        } else {
+                                            CompletionDecision::Continue
+                                        }
                                     })
                                     .build()?,
                             )

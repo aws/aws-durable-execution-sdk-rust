@@ -1450,6 +1450,10 @@ pub enum ChildContextErrorKind {
     /// An internal error occurred setting up the child context.
     #[non_exhaustive]
     Internal,
+    /// A map or parallel completion predicate completed the batch as failed
+    /// (`CUSTOM_COMPLETION_FAILED`), and no item failed.
+    #[non_exhaustive]
+    BatchCompletionFailed,
 }
 
 impl fmt::Display for ChildContextErrorKind {
@@ -1457,6 +1461,7 @@ impl fmt::Display for ChildContextErrorKind {
         match self {
             Self::ChildFailed => write!(f, "child failed"),
             Self::Internal => write!(f, "internal error"),
+            Self::BatchCompletionFailed => write!(f, "batch completed as failed"),
         }
     }
 }

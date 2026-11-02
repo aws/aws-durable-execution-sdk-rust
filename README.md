@@ -595,26 +595,74 @@ let results = ctx.parallel(branches).name("fan-out").await?;
 
 Both accept `.max_concurrency(...)` and `.completion(...)`. By default
 (with no `.completion(...)` call, or with an empty `CompletionConfig`) the
-first item failure fails the batch, matching the Python and JS SDKs;
-configuring any criterion replaces that implicit fail-fast (use
-`with_tolerated_failure_count(0)` for explicit fail-fast, or
-`with_tolerated_failure_percentage(100)` to tolerate all failures). A
-`CompletionConfig` ends the batch early: `with_min_successful(n)` stops once
-`n` items succeed, `with_tolerated_failure_count(0)` fails fast on the first
-error, and `CompletionConfig::builder()` combines thresholds so the first one
-to fire wins; its `build()` validates the combination and rejects a
-misconfiguration (such as a percentage above 100) at construction time. The
-builder's `.completion_predicate(...)` adds a custom trigger: a function of
-the running batch statistics (succeeded count, failed count, total items,
-and the settled outcomes so far) that returns `true` to end the batch with
-the `PredicateMatched` reason. The predicate must be a deterministic, pure
-function of the statistics it receives: the SDK evaluates it only on state
-derived from recorded results, and anything else (clock, randomness, outside
-state) can make replay diverge. To keep those statistics reproducible, item
-outcomes feed them strictly in input order (item `i` enters only once items
-`0..i` have all settled), whatever order the items actually finished in. It
-composes with the fixed thresholds under the same first-trigger-wins rule,
-checked after them.
+first item failure fails the batch, matching the Python and JS SDKs.
+Configuring any criterion, including a predicate, replaces that implicit
+fail-fast: use `with_tolerated_failure_count(0)` for explicit fail-fast, or
+`with_tolerated_failure_percentage(100.0)` to tolerate all failures.
+
+A `CompletionConfig` can end the batch early with fixed thresholds.
+`with_min_successful(n)` stops once `n` items succeed, and
+`with_tolerated_failure_count(n)` and `with_tolerated_failure_percentage(pct)`
+fail the batch once the failures exceed the tolerance.
+`CompletionConfig::builder()` combines thresholds, and the first to fire
+wins. After each settle the SDK checks them in JS's order: the failure
+tolerance first, then "every item finished" (`ALL_COMPLETED`), then the
+minimum. So `min_successful(2)` over two items records `ALL_COMPLETED`.
+`min_successful(0)` completes a non-empty batch at its first settle. The
+percentage is an `f64` and accepts a fraction such as `12.5`; the batch fails
+when the failure rate strictly exceeds it. The SDK compares
+`failures * 100 > pct * total` rather than dividing, so 7 failures of 50 do
+not exceed `14.0`. `build()` rejects a percentage that is not finite or lies
+outside `0.0..=100.0`.
+
+The builder's `.completion_predicate(...)` sets a custom rule instead. The
+predicate receives a `BatchStats` snapshot and returns a `CompletionDecision`:
+`Continue`, `Complete(CompletionOutcome::Succeeded)`, which records
+`CUSTOM_COMPLETION_SUCCEEDED`, or `Complete(CompletionOutcome::Failed)`, which
+records `CUSTOM_COMPLETION_FAILED`. A batch the predicate completed as failed
+has the status `Failed`, and awaiting it returns the first failed item's
+error, or a `BatchCompletionFailed` error when no item failed. A predicate
+that never completes the batch leaves the reason `ALL_COMPLETED`. As in JS, a
+predicate cannot be combined with a threshold: `build()` rejects the mix.
+
+The SDK asks the predicate before each item starts and after each item
+settles, and a zero-item batch asks it once. The snapshot counts follow the
+settle order, and `items()` holds every input item by index, with the name
+the caller gave it and its status: `None` before it starts, `Started` while
+it runs, then `Succeeded` or `Failed`. So a predicate can complete the batch
+as soon as the items it names have settled, without waiting for earlier
+items, and it can complete the batch before the first item starts.
+
+The live settle order is not recorded, and on resume the recorded items
+settle first, in index order. So the sequence of snapshots can differ between
+runs, and the predicate must be a pure function of `BatchStats` and
+monotonic. A predicate is monotonic when, after it returns `Complete(outcome)`
+for a snapshot, it returns `Complete(outcome)` with the same outcome for every
+later snapshot of the same batch, where each item's status is the same or
+further along. The SDK stops asking once the first trigger fires, so within
+one run a predicate is never asked to reverse a decision; monotonicity is
+what keeps two runs in agreement. A predicate such as
+`succeeded() == 1 && failed() == 0` is not monotonic: it can complete on one
+run and never complete on resume, as
+[JS's own advice](https://github.com/aws/aws-durable-execution-sdk-js/blob/67549feacd5568ea305b7c2d533d3549974f8c9c/packages/aws-durable-execution-sdk-js/src/types/batch.ts#L276-L282)
+explains. A rule such as "item 0 succeeded, or items 1 and 2 both
+succeeded" is monotonic.
+
+```rust ignore
+let quorum = CompletionConfig::builder()
+    .completion_predicate(|stats| {
+        let ok = |i: usize| {
+            stats.items()[i].status == Some(BatchItemStatus::Succeeded)
+        };
+        if ok(0) || (ok(1) && ok(2)) {
+            CompletionDecision::Complete(CompletionOutcome::Succeeded)
+        } else {
+            CompletionDecision::Continue
+        }
+    })
+    .build()?;
+```
+
 `MapBuilder` and `ParallelBuilder` also expose `.await_batch()`:
 await it instead of the builder to get a `BatchResult<O>` that reports each
 item's status and why the batch ended. `BatchResult::status()` returns a

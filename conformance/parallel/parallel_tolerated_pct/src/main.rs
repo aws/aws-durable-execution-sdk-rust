@@ -21,7 +21,7 @@ async fn handler(
         .parallel(branches)
         .name("tolerated-pct")
         .max_concurrency(1)
-        .completion(CompletionConfig::with_tolerated_failure_percentage(25))
+        .completion(CompletionConfig::with_tolerated_failure_percentage(25.0))
         .await;
 
     match result {

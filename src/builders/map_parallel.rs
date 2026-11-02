@@ -22,7 +22,7 @@ use crate::serdes::JsonSerdes;
 
 pub use crate::map_parallel::{
     BatchError, BatchItem, BatchItemStatus, BatchResult, BatchStats, BatchStatus, BatchSummary,
-    CompletionReason, NestingMode, SettledOutcome,
+    CompletionDecision, CompletionItem, CompletionOutcome, CompletionReason, NestingMode,
 };
 
 /// Builder for a durable map operation.
@@ -148,7 +148,7 @@ where
     /// - explicit fail-fast:
     ///   [`CompletionConfig::with_tolerated_failure_count(0)`](CompletionConfig::with_tolerated_failure_count)
     /// - tolerate all failures:
-    ///   [`CompletionConfig::with_tolerated_failure_percentage(100)`](CompletionConfig::with_tolerated_failure_percentage)
+    ///   [`CompletionConfig::with_tolerated_failure_percentage(100.0)`](CompletionConfig::with_tolerated_failure_percentage)
     pub fn completion(mut self, config: CompletionConfig) -> Self {
         self.completion = Some(config);
         self
@@ -231,8 +231,11 @@ where
     /// Use this when you need to inspect batch completion details (e.g., when
     /// using a completion config that tolerates failures). The standard
     /// `.await` returns `Vec<O>` with only the successful items and cannot
-    /// report which items failed; it returns an error only when the batch
-    /// ends because the configured failure tolerance was exceeded.
+    /// report which items failed. It returns an error when the batch ends
+    /// because the configured failure tolerance was exceeded, or because
+    /// the completion predicate completed it as failed
+    /// ([`CompletionReason::CustomCompletionFailed`]). This method returns
+    /// the `BatchResult` in both cases.
     ///
     /// Always returns the full `BatchResult<O>` including per-item outcomes.
     /// [`BatchResult::status`] reports the overall outcome as a
@@ -494,7 +497,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// - explicit fail-fast:
     ///   [`CompletionConfig::with_tolerated_failure_count(0)`](CompletionConfig::with_tolerated_failure_count)
     /// - tolerate all failures:
-    ///   [`CompletionConfig::with_tolerated_failure_percentage(100)`](CompletionConfig::with_tolerated_failure_percentage)
+    ///   [`CompletionConfig::with_tolerated_failure_percentage(100.0)`](CompletionConfig::with_tolerated_failure_percentage)
     pub fn completion(mut self, config: CompletionConfig) -> Self {
         self.completion = Some(config);
         self
@@ -566,9 +569,11 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// Use this when you need to inspect batch completion details (e.g., when
     /// using a completion config that tolerates failures). The standard
     /// `.await` returns `Vec<O>` with only the successful branches and
-    /// cannot report which branches failed; it returns an error only when
-    /// the batch ends because the configured failure tolerance was
-    /// exceeded.
+    /// cannot report which branches failed. It returns an error when the
+    /// batch ends because the configured failure tolerance was exceeded, or
+    /// because the completion predicate completed it as failed
+    /// ([`CompletionReason::CustomCompletionFailed`]). This method returns
+    /// the `BatchResult` in both cases.
     ///
     /// Always returns the full `BatchResult<O>` including per-branch
     /// outcomes. [`BatchResult::status`] reports the overall outcome as a
@@ -724,8 +729,8 @@ where
 
 /// A shared completion predicate consulted by map/parallel batch execution.
 ///
-/// Receives the running [`BatchStats`] after each item settles and returns
-/// `true` to end the batch early.
+/// Receives a [`BatchStats`] snapshot before each item starts and after
+/// each item settles, and returns a [`CompletionDecision`].
 ///
 /// Crate-internal: the `Arc` wrapping is an implementation detail (it is what
 /// keeps [`CompletionConfig`] cheaply cloneable with a closure inside, the
@@ -733,15 +738,17 @@ where
 /// ([`CompletionConfig::with_completion_predicate`],
 /// [`CompletionConfigBuilder::completion_predicate`]) take a generic closure
 /// and wrap it here.
-pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send + Sync>;
+pub(crate) type CompletionPredicate =
+    Arc<dyn Fn(&BatchStats<'_>) -> CompletionDecision + Send + Sync>;
 
 /// Configuration for completion behavior in map and parallel operations.
 ///
 /// Controls early-completion thresholds: how many items must succeed and
-/// how many failures are tolerated before stopping. Thresholds may be
-/// combined: when multiple are set (including a
-/// [completion predicate](Self::with_completion_predicate)), the first
-/// trigger to fire wins.
+/// how many failures are tolerated before stopping. Thresholds can be
+/// combined, and the first to fire wins. A
+/// [completion predicate](Self::with_completion_predicate) cannot be
+/// combined with a threshold: [`CompletionConfigBuilder::build`] rejects
+/// the mix.
 ///
 /// # Default: fail fast
 ///
@@ -752,7 +759,7 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 /// hands the decision to the configured criteria:
 ///
 /// - explicit fail-fast: [`with_tolerated_failure_count(0)`](Self::with_tolerated_failure_count)
-/// - tolerate all failures: [`with_tolerated_failure_percentage(100)`](Self::with_tolerated_failure_percentage)
+/// - tolerate all failures: [`with_tolerated_failure_percentage(100.0)`](Self::with_tolerated_failure_percentage)
 ///
 /// Construct with [`CompletionConfig::builder`] (which combines thresholds
 /// and validates them at [`build`](CompletionConfigBuilder::build) time) or
@@ -762,7 +769,9 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 /// # Examples
 ///
 /// ```
-/// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
+/// use aws_durable_execution_sdk::builders::map_parallel::{
+///     CompletionConfig, CompletionDecision, CompletionOutcome,
+/// };
 ///
 /// // Fail-fast: stop on the first failure.
 /// let fail_fast = CompletionConfig::with_tolerated_failure_count(0);
@@ -772,8 +781,14 @@ pub(crate) type CompletionPredicate = Arc<dyn Fn(&BatchStats<'_>) -> bool + Send
 /// let min_success = CompletionConfig::with_min_successful(2);
 /// assert_eq!(min_success.min_successful(), Some(2));
 ///
-/// // Custom predicate: stop once two items have settled either way.
-/// let custom = CompletionConfig::with_completion_predicate(|stats| stats.settled() >= 2);
+/// // Custom predicate: complete as a success once two items have settled.
+/// let custom = CompletionConfig::with_completion_predicate(|stats| {
+///     if stats.settled() >= 2 {
+///         CompletionDecision::Complete(CompletionOutcome::Succeeded)
+///     } else {
+///         CompletionDecision::Continue
+///     }
+/// });
 /// assert!(custom.has_completion_predicate());
 ///
 /// // Combined thresholds: first to fire wins.
@@ -801,16 +816,16 @@ pub struct CompletionConfig {
     tolerated_failure_count: Option<usize>,
 
     /// Fails the batch once the failure percentage strictly exceeds this
-    /// threshold (integer 0-100).  Uses cross-multiplication to avoid
-    /// integer-division truncation.
-    /// `Some(0)` means fail-fast (stop on first failure).
+    /// threshold (0.0 to 100.0, fractions allowed). Uses
+    /// cross-multiplication rather than a division.
+    /// `Some(0.0)` means fail-fast (stop on first failure).
     /// `None` means no percentage-based failure tolerance.
-    tolerated_failure_percentage: Option<usize>,
+    tolerated_failure_percentage: Option<f64>,
 
-    /// User-supplied completion predicate over the running batch
-    /// statistics. Consulted after the fixed thresholds (first trigger
-    /// wins); returning `true` completes the batch with
-    /// [`CompletionReason::PredicateMatched`].
+    /// User-supplied completion predicate over the batch view. It cannot be
+    /// combined with a threshold. A `Complete` decision records
+    /// [`CompletionReason::CustomCompletionSucceeded`] or
+    /// [`CompletionReason::CustomCompletionFailed`].
     /// `None` means no custom predicate.
     completion_predicate: Option<CompletionPredicate>,
 }
@@ -858,6 +873,11 @@ impl CompletionConfig {
     /// tolerance configured, so item failures are tolerated while the
     /// batch waits to reach `min` successes: the implicit fail-fast of an
     /// empty config no longer applies once any criterion is set.
+    ///
+    /// `with_min_successful(0)` completes a non-empty batch at its first
+    /// settle, as in JS. A batch of one item then records
+    /// [`CompletionReason::AllCompleted`], because the batch checks "every
+    /// item finished" before the minimum.
     #[must_use]
     pub fn with_min_successful(min: usize) -> Self {
         Self {
@@ -884,20 +904,22 @@ impl CompletionConfig {
     /// Creates a config with just a `tolerated_failure_percentage` threshold.
     ///
     /// The batch stops once the true failure rate **strictly exceeds** the
-    /// given percentage.  Internally this uses cross-multiplication
-    /// (`failure_count * 100 > pct * total_items`) to avoid integer-division
-    /// truncation, so a failure rate of 33.3% (1 of 3) correctly exceeds a
-    /// 33% threshold.
+    /// given percentage. It accepts a fraction such as `12.5`; the batch
+    /// fails when the failure rate strictly exceeds it. Internally this uses
+    /// cross-multiplication (`failure_count * 100.0 > pct * total_items`)
+    /// rather than a division, so 7 failures of 50 do not exceed `14.0`.
+    /// The check is exact for integer percentages and totals below 2^53.
     ///
-    /// Use `0` for explicit fail-fast behavior (stop on first failure).
-    /// Use `100` to tolerate all failures (the failure rate can never
-    /// strictly exceed 100%).
+    /// Use `0.0` for explicit fail-fast behavior (stop on first failure).
+    /// Use `100.0` to tolerate all failures (the failure rate can never
+    /// strictly exceed 100%). A value that is not finite or lies outside
+    /// `0.0..=100.0` fails the batch at execute time.
     ///
     /// **Default when unset:** an empty config fails fast on the first
     /// failure; a config with some other criterion set applies only that
     /// criterion.
     #[must_use]
-    pub fn with_tolerated_failure_percentage(pct: usize) -> Self {
+    pub fn with_tolerated_failure_percentage(pct: f64) -> Self {
         Self {
             tolerated_failure_percentage: Some(pct),
             ..Self::default()
@@ -906,54 +928,69 @@ impl CompletionConfig {
 
     /// Creates a config with just a custom completion predicate.
     ///
-    /// The predicate receives the running [`BatchStats`] and returns `true`
-    /// to end the batch early. A batch completed
-    /// this way records [`CompletionReason::PredicateMatched`], and: like a
-    /// [`min_successful`](Self::with_min_successful) completion: item
-    /// failures inside it are tolerated rather than propagated as errors.
-    /// Setting a predicate counts as a completion criterion, so it also
-    /// replaces the implicit fail-fast of an empty config: the predicate
-    /// owns the completion decision.
+    /// The predicate receives a [`BatchStats`] snapshot and returns a
+    /// [`CompletionDecision`]:
     ///
-    /// When combined with fixed thresholds (via
-    /// [`CompletionConfig::builder`]), the first trigger to fire wins,
-    /// matching the existing threshold semantics: the SDK checks
-    /// `min_successful`, then the failure tolerances, then this predicate.
+    /// - [`CompletionDecision::Continue`] keeps starting and awaiting items.
+    ///   A batch whose predicate never completes it records
+    ///   [`CompletionReason::AllCompleted`].
+    /// - `Complete(CompletionOutcome::Succeeded)` ends the batch now and
+    ///   records [`CompletionReason::CustomCompletionSucceeded`]. Item
+    ///   failures inside it are tolerated rather than propagated as errors.
+    /// - `Complete(CompletionOutcome::Failed)` ends the batch now and records
+    ///   [`CompletionReason::CustomCompletionFailed`]. Awaiting the batch
+    ///   returns the first failed item's error, or a
+    ///   [`BatchCompletionFailed`](crate::ChildContextErrorKind::BatchCompletionFailed)
+    ///   error when no item failed.
+    ///
+    /// A predicate counts as a completion criterion, so the implicit
+    /// fail-fast of an empty config does not apply. A predicate cannot be
+    /// combined with a threshold. A zero-item batch asks the predicate once,
+    /// on an empty view.
+    ///
+    /// # When the predicate runs
+    ///
+    /// The SDK asks the predicate before each item starts and after each
+    /// item settles. The counts follow the settle order, and
+    /// [`BatchStats::items`] holds every input item by index. The SDK stops
+    /// asking once the first trigger fires, so within one run a predicate is
+    /// never asked to reverse a decision.
     ///
     /// # Determinism: read this before using
     ///
-    /// **The predicate MUST be a deterministic, pure function of the
-    /// [`BatchStats`] it receives.** If the predicate consults anything
-    /// else, the clock, random numbers, environment state, an external
-    /// service, or mutable captured state, replays can diverge from the
-    /// original run, which corrupts the execution history. Put
-    /// nondeterminism inside a step body, never inside a completion
-    /// predicate.
-    ///
-    /// The SDK evaluates the predicate only on state derivable from
-    /// recorded checkpoint results: item outcomes feed the statistics
-    /// strictly in input order, whatever order the items actually finished
-    /// in at run time, so a pure predicate sees the identical sequence of
-    /// [`BatchStats`] snapshots on the original run and on every replay.
-    /// See [`CompletionConfigBuilder::completion_predicate`] for the full
-    /// ordering contract.
+    /// The live settle order is not recorded. On resume, the recorded items
+    /// settle first, in index order. So the predicate MUST be a pure function
+    /// of the [`BatchStats`] it receives, and it MUST be monotonic. A
+    /// predicate is monotonic when, after it returns `Complete(outcome)` for
+    /// a snapshot, it returns `Complete(outcome)` with the same outcome for
+    /// every later snapshot of the same batch. A later snapshot is one where
+    /// each item's status is the same or further along, in the order `None`,
+    /// `Started`, then `Succeeded` or `Failed`. Under that rule the recorded
+    /// reason and outcome do not depend on the settle order, so two runs
+    /// agree. See [`CompletionConfigBuilder::completion_predicate`] for a
+    /// counterexample.
     ///
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
+    /// use aws_durable_execution_sdk::builders::map_parallel::{
+    ///     CompletionConfig, CompletionDecision, CompletionOutcome,
+    /// };
     ///
-    /// // End the batch once half the items have settled.
-    /// let config =
-    ///     CompletionConfig::with_completion_predicate(|stats| {
-    ///         stats.settled() * 2 >= stats.total_items()
-    ///     });
+    /// // Complete as a success once half the items have settled.
+    /// let config = CompletionConfig::with_completion_predicate(|stats| {
+    ///     if stats.settled() * 2 >= stats.total_items() {
+    ///         CompletionDecision::Complete(CompletionOutcome::Succeeded)
+    ///     } else {
+    ///         CompletionDecision::Continue
+    ///     }
+    /// });
     /// assert!(config.has_completion_predicate());
     /// ```
     #[must_use]
     pub fn with_completion_predicate<F>(predicate: F) -> Self
     where
-        F: Fn(&BatchStats<'_>) -> bool + Send + Sync + 'static,
+        F: Fn(&BatchStats<'_>) -> CompletionDecision + Send + Sync + 'static,
     {
         Self {
             completion_predicate: Some(Arc::new(predicate)),
@@ -972,7 +1009,7 @@ impl CompletionConfig {
     }
 
     /// Returns the percentage-based failure tolerance, if set.
-    pub fn tolerated_failure_percentage(&self) -> Option<usize> {
+    pub fn tolerated_failure_percentage(&self) -> Option<f64> {
         self.tolerated_failure_percentage
     }
 
@@ -999,14 +1036,11 @@ impl CompletionConfig {
             || self.completion_predicate.is_some()
     }
 
-    /// Evaluates the custom completion predicate against the running batch
-    /// statistics. Returns `false` when no predicate is configured
-    /// (crate-internal; called by the batch coordinator after each settled
-    /// item).
-    pub(crate) fn predicate_matches(&self, stats: &BatchStats<'_>) -> bool {
+    /// Calls the predicate. Returns `CompletionDecision::Continue` when none is set.
+    pub(crate) fn predicate_decision(&self, stats: &BatchStats<'_>) -> CompletionDecision {
         self.completion_predicate
             .as_ref()
-            .is_some_and(|predicate| predicate(stats))
+            .map_or(CompletionDecision::Continue, |predicate| predicate(stats))
     }
 
     /// Validates the completion config, returning an error message when the
@@ -1019,14 +1053,18 @@ impl CompletionConfig {
     /// [`CompletionConfig::with_tolerated_failure_percentage`]), which do
     /// not validate.
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if let Some(pct) = self.tolerated_failure_percentage
-            && pct > 100
-        {
-            return Err(format!(
-                "tolerated_failure_percentage must be 0-100, got {pct}"
-            ));
-        }
-        Ok(())
+        check_percentage(self.tolerated_failure_percentage)
+    }
+}
+
+/// Checks the failure percentage: it must be finite and lie in
+/// `0.0..=100.0`. Returns the message both validation paths report.
+fn check_percentage(pct: Option<f64>) -> Result<(), String> {
+    match pct {
+        Some(pct) if !(pct.is_finite() && (0.0..=100.0).contains(&pct)) => Err(format!(
+            "tolerated_failure_percentage must be 0-100, got {pct}"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1042,7 +1080,7 @@ impl CompletionConfig {
 /// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
 ///
 /// let err = CompletionConfig::builder()
-///     .tolerated_failure_percentage(101)
+///     .tolerated_failure_percentage(101.0)
 ///     .build()
 ///     .unwrap_err();
 /// assert!(err.to_string().contains("tolerated_failure_percentage"));
@@ -1076,9 +1114,9 @@ impl std::error::Error for CompletionConfigValidationError {}
 ///
 /// let config = CompletionConfig::builder()
 ///     .min_successful(2)
-///     .tolerated_failure_percentage(25)
+///     .tolerated_failure_percentage(25.0)
 ///     .build()?;
-/// assert_eq!(config.tolerated_failure_percentage(), Some(25));
+/// assert_eq!(config.tolerated_failure_percentage(), Some(25.0));
 /// # Ok::<(), aws_durable_execution_sdk::builders::map_parallel::CompletionConfigValidationError>(())
 /// ```
 #[derive(Clone, Default)]
@@ -1087,7 +1125,7 @@ impl std::error::Error for CompletionConfigValidationError {}
 pub struct CompletionConfigBuilder {
     min_successful: Option<usize>,
     tolerated_failure_count: Option<usize>,
-    tolerated_failure_percentage: Option<usize>,
+    tolerated_failure_percentage: Option<f64>,
     completion_predicate: Option<CompletionPredicate>,
 }
 
@@ -1117,6 +1155,10 @@ impl CompletionConfigBuilder {
     /// Setting this (or any other criterion) replaces the implicit
     /// fail-fast of an empty config; a config carrying only this threshold
     /// tolerates item failures while waiting to reach `min` successes.
+    ///
+    /// `min_successful(0)` completes a non-empty batch at its first settle,
+    /// as in JS. A batch of one item then records
+    /// [`CompletionReason::AllCompleted`].
     pub fn min_successful(mut self, min: usize) -> Self {
         self.min_successful = Some(min);
         self
@@ -1135,72 +1177,103 @@ impl CompletionConfigBuilder {
     }
 
     /// Fails the batch once the failure percentage strictly exceeds this
-    /// threshold (integer 0-100).
+    /// threshold (0.0 to 100.0).
     ///
-    /// Use `0` for explicit fail-fast behavior (stop on first failure).
-    /// Use `100` to tolerate all failures (the failure rate can never
-    /// strictly exceed 100%).
+    /// It accepts a fraction such as `12.5`; the batch fails when the
+    /// failure rate strictly exceeds it. Use `0.0` for explicit fail-fast
+    /// behavior (stop on first failure). Use `100.0` to tolerate all
+    /// failures (the failure rate can never strictly exceed 100%).
     ///
     /// **Default when unset:** an empty config fails fast on the first
     /// failure; a config with some other criterion set applies only that
     /// criterion.
     ///
-    /// A value above 100 is rejected by [`build`](Self::build).
-    pub fn tolerated_failure_percentage(mut self, pct: usize) -> Self {
+    /// A value that is not finite or lies outside `0.0..=100.0` is rejected
+    /// by [`build`](Self::build).
+    pub fn tolerated_failure_percentage(mut self, pct: f64) -> Self {
         self.tolerated_failure_percentage = Some(pct);
         self
     }
 
-    /// Sets a custom completion predicate over the running batch statistics.
+    /// Sets a custom completion predicate over the batch view.
     ///
-    /// The predicate receives the running [`BatchStats`] and returns `true`
-    /// to end the batch early with
-    /// [`CompletionReason::PredicateMatched`]. It composes with the fixed
-    /// thresholds: the SDK checks `min_successful`, then the failure
-    /// tolerances, then this predicate: the first trigger to fire wins,
-    /// matching the existing threshold semantics. Setting a predicate
-    /// counts as a completion criterion, so it also replaces the implicit
-    /// fail-fast of an empty config: the predicate owns the completion
-    /// decision.
+    /// The predicate receives a [`BatchStats`] snapshot and returns a
+    /// [`CompletionDecision`]. `Continue` keeps the batch running, and a
+    /// batch whose predicate never completes it records
+    /// [`CompletionReason::AllCompleted`].
+    /// `Complete(CompletionOutcome::Succeeded)` ends the batch and records
+    /// [`CompletionReason::CustomCompletionSucceeded`].
+    /// `Complete(CompletionOutcome::Failed)` ends the batch and records
+    /// [`CompletionReason::CustomCompletionFailed`]; awaiting the batch then
+    /// returns an error. A predicate counts as a completion criterion, so
+    /// the implicit fail-fast of an empty config does not apply. A
+    /// zero-item batch asks the predicate once, on an empty view.
+    ///
+    /// A predicate cannot be combined with `min_successful`,
+    /// `tolerated_failure_count` or `tolerated_failure_percentage`:
+    /// [`build`](Self::build) rejects the mix, as JS does.
+    ///
+    /// # When the predicate runs
+    ///
+    /// The SDK asks the predicate before each item starts and after each
+    /// item settles. The counts follow the settle order, and
+    /// [`BatchStats::items`] holds every input item by index, with its name
+    /// and status. The SDK calls the predicate only until the first trigger
+    /// fires, so a predicate is never asked to reverse a decision within one
+    /// run.
     ///
     /// # Determinism: read this before using
     ///
-    /// **The predicate MUST be a deterministic, pure function of the
-    /// [`BatchStats`] it receives.** If the predicate consults anything
-    /// else, the clock, random numbers, environment state, an external
-    /// service, or mutable captured state, replays can diverge from the
-    /// original run, which corrupts the execution history. Put
-    /// nondeterminism inside a step body, never inside a completion
-    /// predicate.
+    /// The live settle order is not recorded. On resume, the recorded items
+    /// settle first, in index order. So the sequence of snapshots can differ
+    /// between the original run and a resume.
     ///
-    /// The SDK holds up its half of that contract by evaluating the
-    /// predicate only on state derivable from recorded checkpoint results:
-    /// item outcomes feed the statistics strictly in input order (item `i`
-    /// enters only after items `0..i` have all settled), whatever order
-    /// the items actually finished in at run time. Live settlement order
-    /// is scheduler-timed and unrecorded, so it never influences the
-    /// statistics: a pure predicate therefore sees the identical sequence
-    /// of [`BatchStats`] snapshots on the original run and on every
-    /// replay. The corollary: a slow or suspended item holds later items'
-    /// outcomes out of the statistics until it settles.
+    /// So the predicate MUST be a pure function of the [`BatchStats`] it
+    /// receives, and it MUST be monotonic. A predicate is monotonic when,
+    /// after it returns `Complete(outcome)` for a snapshot, it returns
+    /// `Complete(outcome)` with the same outcome for every later snapshot of
+    /// the same batch. A later snapshot is one where each item's status is
+    /// the same or further along, in the order `None`, `Started`, then
+    /// `Succeeded` or `Failed`. Under that rule the recorded reason and
+    /// outcome do not depend on the settle order. Monotonicity is what keeps
+    /// two runs in agreement.
+    ///
+    /// A counterexample, as JS gives one: `succeeded() == 1 && failed() == 0`
+    /// is not monotonic. One run can see one success first and complete. A
+    /// resume can see the failure first, then `(1, 1)`, and never complete.
+    /// See JS's own advice in
+    /// [batch.ts](https://github.com/aws/aws-durable-execution-sdk-js/blob/67549feacd5568ea305b7c2d533d3549974f8c9c/packages/aws-durable-execution-sdk-js/src/types/batch.ts#L276-L282).
     ///
     /// # Examples
     ///
     /// ```
-    /// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
+    /// use aws_durable_execution_sdk::builders::map_parallel::{
+    ///     BatchItemStatus, CompletionConfig, CompletionDecision, CompletionOutcome,
+    /// };
     ///
-    /// // Stop early once 2 items succeed OR any 3 items settle,
-    /// // whichever fires first.
+    /// // Complete when item 0 succeeds, or when items 1 and 2 both succeed.
+    /// // The rule stays met once it is met, so it is monotonic.
     /// let config = CompletionConfig::builder()
-    ///     .min_successful(2)
-    ///     .completion_predicate(|stats| stats.settled() >= 3)
+    ///     .completion_predicate(|stats| {
+    ///         let ok = |i: usize| {
+    ///             stats
+    ///                 .items()
+    ///                 .get(i)
+    ///                 .is_some_and(|item| item.status == Some(BatchItemStatus::Succeeded))
+    ///         };
+    ///         if ok(0) || (ok(1) && ok(2)) {
+    ///             CompletionDecision::Complete(CompletionOutcome::Succeeded)
+    ///         } else {
+    ///             CompletionDecision::Continue
+    ///         }
+    ///     })
     ///     .build()?;
     /// assert!(config.has_completion_predicate());
     /// # Ok::<(), aws_durable_execution_sdk::builders::map_parallel::CompletionConfigValidationError>(())
     /// ```
     pub fn completion_predicate<F>(mut self, predicate: F) -> Self
     where
-        F: Fn(&BatchStats<'_>) -> bool + Send + Sync + 'static,
+        F: Fn(&BatchStats<'_>) -> CompletionDecision + Send + Sync + 'static,
     {
         self.completion_predicate = Some(Arc::new(predicate));
         self
@@ -1211,17 +1284,32 @@ impl CompletionConfigBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`CompletionConfigValidationError`] when
-    /// `tolerated_failure_percentage` is outside the 0-100 range.
+    /// Returns [`CompletionConfigValidationError`] in two cases, checked in
+    /// this order:
+    ///
+    /// 1. `tolerated_failure_percentage` is not finite or lies outside
+    ///    `0.0..=100.0`.
+    /// 2. A completion predicate is set together with `min_successful`,
+    ///    `tolerated_failure_count` or `tolerated_failure_percentage`. The
+    ///    message is `completion_predicate is mutually exclusive with
+    ///    min_successful, tolerated_failure_count and
+    ///    tolerated_failure_percentage`.
+    ///
     /// Item-count-dependent checks (for example `min_successful` against
     /// the actual number of items) happen at execute time, where the item
     /// count is first known.
     pub fn build(self) -> Result<CompletionConfig, CompletionConfigValidationError> {
-        if let Some(pct) = self.tolerated_failure_percentage
-            && pct > 100
+        check_percentage(self.tolerated_failure_percentage)
+            .map_err(|message| CompletionConfigValidationError { message })?;
+        if self.completion_predicate.is_some()
+            && (self.min_successful.is_some()
+                || self.tolerated_failure_count.is_some()
+                || self.tolerated_failure_percentage.is_some())
         {
             return Err(CompletionConfigValidationError {
-                message: format!("tolerated_failure_percentage must be 0-100, got {pct}"),
+                message: "completion_predicate is mutually exclusive with min_successful, \
+                          tolerated_failure_count and tolerated_failure_percentage"
+                    .to_owned(),
             });
         }
         Ok(CompletionConfig {
@@ -1245,13 +1333,13 @@ mod tests {
         let combined = CompletionConfig::builder()
             .min_successful(2)
             .tolerated_failure_count(1)
-            .tolerated_failure_percentage(25)
+            .tolerated_failure_percentage(25.0)
             .build()
             .expect("valid config");
 
         assert_eq!(combined.min_successful(), Some(2));
         assert_eq!(combined.tolerated_failure_count(), Some(1));
-        assert_eq!(combined.tolerated_failure_percentage(), Some(25));
+        assert_eq!(combined.tolerated_failure_percentage(), Some(25.0));
         assert!(combined.validate().is_ok());
 
         // An unset threshold stays `None`.
@@ -1290,7 +1378,7 @@ mod tests {
     #[test]
     fn completion_config_builder_percentage_is_validated() {
         let err = CompletionConfig::builder()
-            .tolerated_failure_percentage(101)
+            .tolerated_failure_percentage(101.0)
             .build()
             .expect_err("a percentage above 100 must be rejected at build time");
         assert!(
@@ -1301,13 +1389,13 @@ mod tests {
         // The boundary value 100 is accepted.
         assert!(
             CompletionConfig::builder()
-                .tolerated_failure_percentage(100)
+                .tolerated_failure_percentage(100.0)
                 .build()
                 .is_ok()
         );
 
         // The constructor path is still guarded by the execute-time check.
-        let constructed = CompletionConfig::with_tolerated_failure_percentage(101);
+        let constructed = CompletionConfig::with_tolerated_failure_percentage(101.0);
         let msg = constructed
             .validate()
             .expect_err("execute-time validation must reject the constructor path");
@@ -1324,15 +1412,20 @@ mod tests {
     #[test]
     fn completion_config_predicate_clone_and_debug() {
         let config = CompletionConfig::builder()
-            .min_successful(2)
-            .completion_predicate(|stats| stats.settled() >= 3)
+            .completion_predicate(|stats| {
+                if stats.settled() >= 3 {
+                    CompletionDecision::Complete(CompletionOutcome::Succeeded)
+                } else {
+                    CompletionDecision::Continue
+                }
+            })
             .build()
             .expect("valid config");
         assert!(config.has_completion_predicate());
 
         let cloned = config.clone();
         assert!(cloned.has_completion_predicate());
-        assert_eq!(cloned.min_successful(), Some(2));
+        assert_eq!(cloned.min_successful(), None);
 
         let debugged = format!("{config:?}");
         assert!(
@@ -1342,22 +1435,114 @@ mod tests {
 
         // Constructor parity: `with_completion_predicate` sets only the
         // predicate.
-        let only_predicate =
-            CompletionConfig::with_completion_predicate(|stats| stats.failed() > stats.succeeded());
+        let only_predicate = CompletionConfig::with_completion_predicate(|stats| {
+            if stats.failed() > stats.succeeded() {
+                CompletionDecision::Complete(CompletionOutcome::Succeeded)
+            } else {
+                CompletionDecision::Continue
+            }
+        });
         assert!(only_predicate.has_completion_predicate());
         assert_eq!(only_predicate.min_successful(), None);
 
         // The predicate is evaluated against the stats it receives.
-        let outcomes = [
-            SettledOutcome::new(0, BatchItemStatus::Failed),
-            SettledOutcome::new(1, BatchItemStatus::Failed),
-            SettledOutcome::new(2, BatchItemStatus::Succeeded),
+        let more_failed = [
+            CompletionItem::new(0, None, Some(BatchItemStatus::Failed)),
+            CompletionItem::new(1, None, Some(BatchItemStatus::Failed)),
+            CompletionItem::new(2, None, Some(BatchItemStatus::Succeeded)),
         ];
-        let stats = BatchStats::new(1, 2, 5, &outcomes);
-        assert!(only_predicate.predicate_matches(&stats));
-        let stats_even = BatchStats::new(2, 2, 5, &outcomes);
-        assert!(!only_predicate.predicate_matches(&stats_even));
-        // No predicate configured → never matches.
-        assert!(!CompletionConfig::default().predicate_matches(&stats));
+        let stats = BatchStats::new(&more_failed);
+        assert_eq!(
+            only_predicate.predicate_decision(&stats),
+            CompletionDecision::Complete(CompletionOutcome::Succeeded)
+        );
+        let even = [
+            CompletionItem::new(0, None, Some(BatchItemStatus::Failed)),
+            CompletionItem::new(1, None, Some(BatchItemStatus::Succeeded)),
+        ];
+        assert_eq!(
+            only_predicate.predicate_decision(&BatchStats::new(&even)),
+            CompletionDecision::Continue
+        );
+        // No predicate configured: the decision is `Continue`.
+        assert_eq!(
+            CompletionConfig::default().predicate_decision(&stats),
+            CompletionDecision::Continue
+        );
+    }
+
+    fn complete_on_first_settle(stats: &BatchStats<'_>) -> CompletionDecision {
+        if stats.settled() >= 1 {
+            CompletionDecision::Complete(CompletionOutcome::Succeeded)
+        } else {
+            CompletionDecision::Continue
+        }
+    }
+
+    /// `build()` rejects a predicate together with `min_successful`, as JS
+    /// rejects `shouldComplete` with a threshold.
+    #[test]
+    fn build_rejects_predicate_with_min_successful() {
+        let err = CompletionConfig::builder()
+            .min_successful(1)
+            .completion_predicate(complete_on_first_settle)
+            .build()
+            .expect_err("a predicate with min_successful must be rejected");
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "invalid CompletionConfig: completion_predicate is mutually exclusive with \
+             min_successful, tolerated_failure_count and tolerated_failure_percentage"
+        );
+    }
+
+    /// `build()` rejects a predicate together with `tolerated_failure_count`.
+    #[test]
+    fn build_rejects_predicate_with_failure_count() {
+        let result = CompletionConfig::builder()
+            .tolerated_failure_count(0)
+            .completion_predicate(complete_on_first_settle)
+            .build();
+        assert!(result.is_err());
+    }
+
+    /// `build()` rejects a predicate together with
+    /// `tolerated_failure_percentage`.
+    #[test]
+    fn build_rejects_predicate_with_failure_percentage() {
+        let result = CompletionConfig::builder()
+            .tolerated_failure_percentage(10.0)
+            .completion_predicate(complete_on_first_settle)
+            .build();
+        assert!(result.is_err());
+    }
+
+    /// A predicate alone is a valid config.
+    #[test]
+    fn build_accepts_predicate_alone() {
+        let config = CompletionConfig::builder()
+            .completion_predicate(complete_on_first_settle)
+            .build()
+            .expect("a predicate alone is valid");
+        assert!(config.has_completion_predicate());
+    }
+
+    /// `build()` checks the percentage before the predicate exclusion, so a
+    /// config that breaks both rules reports the percentage.
+    #[test]
+    fn build_checks_percentage_before_predicate_exclusion() {
+        let err = CompletionConfig::builder()
+            .tolerated_failure_percentage(150.0)
+            .completion_predicate(complete_on_first_settle)
+            .build()
+            .expect_err("both rules are broken");
+        assert!(
+            err.to_string()
+                .contains("tolerated_failure_percentage must be 0-100"),
+            "unexpected message: {err}"
+        );
     }
 }
