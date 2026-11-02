@@ -359,6 +359,9 @@ let result = ctx
 
 `StepSemantics::AtLeastOncePerRetry` is the default: the SDK re-executes the
 body on resume if the previous attempt started but recorded no outcome.
+The body starts without waiting for the `START` checkpoint. The outcome is
+written only after `START` is acknowledged; if `START` fails, the outcome is
+not written and the invocation fails.
 `AtMostOncePerRetry` treats that interruption as a failure and consults the
 retry strategy, so a non-idempotent body never runs twice for the same
 attempt. The strategy sees `StepErrorKind::Interrupted`, and the recorded

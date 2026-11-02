@@ -213,9 +213,13 @@ where
     /// interrupted (checkpoint status `Started` with no recorded outcome).
     ///
     /// - [`StepSemantics::AtLeastOncePerRetry`](crate::StepSemantics::AtLeastOncePerRetry) (default): re-execute the
-    ///   step body on replay.
+    ///   step body on replay. The body starts without waiting for the
+    ///   `START` checkpoint. The outcome is written only after `START` is
+    ///   acknowledged; if `START` fails, the outcome is not written and the
+    ///   invocation fails.
     /// - [`StepSemantics::AtMostOncePerRetry`](crate::StepSemantics::AtMostOncePerRetry): treat the interruption as a
-    ///   failure and consult the retry strategy without re-executing.
+    ///   failure and consult the retry strategy without re-executing. The
+    ///   body starts only after `START` is acknowledged.
     ///
     /// This is a client-side configuration only: it does not affect the
     /// wire protocol.

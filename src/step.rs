@@ -16,7 +16,9 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use tracing::Instrument;
 
 use crate::builders::{JitterStrategy, RetryStrategyConfig};
-use crate::context::{ActiveBody, DurableContext, StepContext, run_body, run_body_sync};
+use crate::context::{
+    ActiveBody, DurableContext, StepContext, SubmittedWrite, run_body, run_body_sync,
+};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
 use crate::serdes::SerdesContext;
@@ -143,6 +145,10 @@ pub enum StepSemantics {
     /// idempotent operations. The step may execute more than once per retry
     /// attempt if the process is interrupted between `Start` checkpoint and
     /// the outcome checkpoint.
+    ///
+    /// The body starts without waiting for the `START` checkpoint. The
+    /// outcome is written only after `START` is acknowledged; if `START`
+    /// fails, the outcome is not written and the invocation fails.
     #[default]
     AtLeastOncePerRetry,
 
@@ -228,7 +234,11 @@ where
             match core.before(resumed).await? {
                 StepPrelude::Done(result) => return result,
                 StepPrelude::Wait => {}
-                StepPrelude::Run { attempt, span } => {
+                StepPrelude::Run {
+                    attempt,
+                    span,
+                    start,
+                } => {
                     // The step body runs as a `Step` body: an operation
                     // claimed inside it fails the execution with a context
                     // usage error. It holds an activity permit from its call
@@ -246,6 +256,7 @@ where
                                 .instrument(span),
                         )
                         .await;
+                    core.await_start(start).await?;
                     match core.settle(attempt, result).await? {
                         StepSettled::Done(value) => return Ok(value),
                         StepSettled::Retry => {}
@@ -300,6 +311,11 @@ enum StepPrelude<O> {
         attempt: u32,
         /// The operation span the body runs under.
         span: tracing::Span,
+        /// The in-flight `START` write of an at-least-once attempt, awaited
+        /// after the body returns and before the outcome is written. `None`
+        /// when START was awaited before the body, or was already recorded.
+        /// A body that panics drops it, and the write continues.
+        start: Option<SubmittedWrite>,
     },
 }
 
@@ -432,10 +448,18 @@ where
         let attempt = self.ctx.get_attempt(&self.op_id).saturating_add(1);
 
         // Checkpoint START (skip if step was already in Started state).
+        // An at-least-once attempt runs its body while START is in flight
+        // and awaits it before the outcome write (see `StepPrelude::Run`).
+        // An at-most-once body must not run without a recorded START, so
+        // that attempt awaits START here.
+        let mut start = None;
         if !already_started {
             let start_update =
                 build_start_update(wire_id, self.name.as_deref(), self.ctx.parent_wire_id());
-            if let Err(err) = self.ctx.checkpoint_updates(vec![start_update]).await {
+            let submitted = self.ctx.submit_checkpoint_updates(vec![start_update]);
+            if self.semantics == StepSemantics::AtLeastOncePerRetry {
+                start = Some(submitted);
+            } else if let Err(err) = submitted.await {
                 // Audit (#43): step START: no user code has run for this
                 // attempt, so there is no side effect needing a recorded
                 // outcome. No terminal FAIL: the invocation dies, the
@@ -459,7 +483,29 @@ where
             is_replay,
         );
 
-        Ok(StepPrelude::Run { attempt, span })
+        Ok(StepPrelude::Run {
+            attempt,
+            span,
+            start,
+        })
+    }
+
+    /// Awaits the `START` write an at-least-once attempt submitted before
+    /// its body ran, once the body has returned.
+    ///
+    /// A failed write fails the invocation, and no outcome is written. No
+    /// terminal `FAIL` is needed: at-least-once semantics allow the body to
+    /// run again in the next invocation.
+    async fn await_start(&self, start: Option<SubmittedWrite>) -> Result<(), OperationError> {
+        if let Some(start) = start
+            && let Err(err) = start.await
+        {
+            return self
+                .ctx
+                .checkpoint_failure_unrecoverable(self.op_id.wire(), err, None)
+                .await;
+        }
+        Ok(())
     }
 
     /// Settles one attempt: checkpoints success or consults the retry
@@ -2689,5 +2735,258 @@ mod coordinator_tests {
             .action(OperationAction::Start)
             .build()
             .expect("all required fields set")
+    }
+}
+
+/// When an attempt's body runs relative to its `START` write. Every test
+/// runs under paused tokio time, with a client that answers each
+/// checkpoint call 500 ms after it receives it.
+#[cfg(test)]
+mod start_write_tests {
+    use crate::StepSemantics;
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{LatencyClient, drive_handler, latency_ctx, wire_err};
+    use aws_sdk_lambda::types::OperationAction;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const LATENCY: Duration = Duration::from_millis(500);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// Runs, on a client with [`LATENCY`] and `buffer_window`, a handler
+    /// whose step records the tokio time its body starts and returns `1`.
+    /// Returns the client, the time the body started, and the handler's
+    /// outcome: the step's value and the time the step returned.
+    async fn timed_step(
+        buffer_window: Option<Duration>,
+        semantics: StepSemantics,
+    ) -> (Arc<LatencyClient>, Duration, InvocationOutcome) {
+        let client = Arc::new(LatencyClient::new(LATENCY));
+        let ctx = latency_ctx(&client, buffer_window);
+        let started = Arc::new(Mutex::new(None));
+        let body_started = Arc::clone(&started);
+        let clock = Arc::clone(&client);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let body_clock = Arc::clone(&clock);
+            let value = ctx
+                .step(move |_| {
+                    let started = Arc::clone(&body_started);
+                    let clock = Arc::clone(&body_clock);
+                    async move {
+                        *started.lock().expect("lock") = Some(clock.elapsed());
+                        Ok(1_u32)
+                    }
+                })
+                .name("s")
+                .semantics(semantics)
+                .await
+                .map_err(wire_err)?;
+            Ok(format!("{value}@{}", clock.elapsed().as_millis()))
+        })
+        .await
+        .expect("no panic");
+        let started = started.lock().expect("lock").expect("the body ran");
+        (client, started, outcome)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn at_least_once_body_starts_before_start_response() {
+        let (client, started, outcome) = timed_step(None, StepSemantics::AtLeastOncePerRetry).await;
+        assert_eq!(started, ms(0), "the body starts before START is answered");
+        let start = client.request_with(&OperationAction::Start).expect("START");
+        let succeed = client
+            .request_with(&OperationAction::Succeed)
+            .expect("SUCCEED");
+        assert_eq!(start.received, ms(0));
+        assert_eq!(succeed.received, ms(500), "SUCCEED waits for START");
+        assert_eq!(outcome, InvocationOutcome::Complete("1@1000".to_owned()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_start_precedes_outcome() {
+        let (client, started, outcome) =
+            timed_step(Some(ms(50)), StepSemantics::AtLeastOncePerRetry).await;
+        assert_eq!(started, ms(0), "the body starts before START is answered");
+        let requests = client.requests();
+        let first = requests.first().expect("a request");
+        let actions: Vec<&OperationAction> = first
+            .updates
+            .iter()
+            .map(aws_sdk_lambda::types::OperationUpdate::action)
+            .collect();
+        assert_eq!(
+            actions,
+            vec![&OperationAction::Start],
+            "the first request carries only START"
+        );
+        assert!(
+            requests.iter().skip(1).any(|r| r
+                .updates
+                .iter()
+                .any(|u| u.action() == &OperationAction::Succeed)),
+            "SUCCEED is in a later request"
+        );
+        assert!(matches!(outcome, InvocationOutcome::Complete(ref v) if v.starts_with("1@")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn at_most_once_body_waits_for_start_response() {
+        let (_client, started, outcome) = timed_step(None, StepSemantics::AtMostOncePerRetry).await;
+        assert_eq!(started, ms(500), "the body starts after START is answered");
+        assert!(matches!(outcome, InvocationOutcome::Complete(ref v) if v.starts_with("1@")));
+    }
+
+    /// Asserts that a drive whose `START` write failed failed the
+    /// execution with the checkpoint error's type, and wrote no outcome.
+    fn assert_failed_without_outcome(client: &LatencyClient, outcome: &InvocationOutcome) {
+        let InvocationOutcome::Failed { error } = outcome else {
+            unreachable!("expected a failed execution, got {outcome:?}");
+        };
+        assert_eq!(
+            error.error_type(),
+            Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+        assert!(client.request_with(&OperationAction::Start).is_some());
+        assert!(!client.received_outcome(), "no outcome update was sent");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_start_write_writes_no_outcome() {
+        // (a) A step.
+        let client = Arc::new(LatencyClient::new(LATENCY).failing_start());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let body_runs = Arc::clone(&runs);
+        let outcome = drive_handler(latency_ctx(&client, None), None, move |ctx| async move {
+            ctx.step(move |_| async move {
+                body_runs.fetch_add(1, Ordering::SeqCst);
+                Ok(1_u32)
+            })
+            .name("s")
+            .await
+            .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran once");
+        assert_failed_without_outcome(&client, &outcome);
+
+        // (b) A condition check.
+        let client = Arc::new(LatencyClient::new(LATENCY).failing_start());
+        let checks = Arc::new(AtomicUsize::new(0));
+        let check_runs = Arc::clone(&checks);
+        let outcome = drive_handler(latency_ctx(&client, None), None, move |ctx| async move {
+            ctx.wait_for_condition(
+                move |_, state: u32| {
+                    let checks = Arc::clone(&check_runs);
+                    async move {
+                        checks.fetch_add(1, Ordering::SeqCst);
+                        Ok(state + 1)
+                    }
+                },
+                0,
+            )
+            .name("c")
+            .await
+            .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(checks.load(Ordering::SeqCst), 1, "the check ran once");
+        assert_failed_without_outcome(&client, &outcome);
+    }
+
+    /// Asserts that a drive whose body or check panicked with `"boom"`
+    /// before its `START` was answered kept the `START` write: the write
+    /// was answered, no outcome was sent, the record is `STARTED`, and the
+    /// panic left the drive only after the answer.
+    fn assert_start_kept(
+        client: &LatencyClient,
+        ctx: &crate::DurableContext,
+        result: Result<InvocationOutcome, Box<dyn std::any::Any + Send + 'static>>,
+        returned: Duration,
+    ) {
+        let start = client.request_with(&OperationAction::Start).expect("START");
+        let answered = start.answered.expect("START was answered");
+        assert_eq!(answered, start.received + LATENCY);
+        assert!(!client.received_outcome(), "no outcome update was sent");
+        let wire_id = start.updates.first().expect("an update").id();
+        assert_eq!(crate::engine::compute_wire_id_public("1"), wire_id);
+        let view = ctx.checkpoint_status_view("1").expect("a record");
+        assert_eq!(view.status, crate::engine::CheckpointStatus::Started);
+        let payload = result.expect_err("the panic leaves the drive");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+        assert!(
+            returned >= answered,
+            "the drive returned at {returned:?}, before {answered:?}"
+        );
+    }
+
+    /// Drives, on a client with [`LATENCY`] and `buffer_window`, a step
+    /// whose body panics with `"boom"` at once, and asserts the `START`
+    /// write was kept.
+    async fn panicking_step(buffer_window: Option<Duration>) {
+        let client = Arc::new(LatencyClient::new(LATENCY));
+        let ctx = latency_ctx(&client, buffer_window);
+        let clock = Arc::clone(&client);
+        let result = drive_handler(ctx.clone(), None, |ctx| async move {
+            #[expect(clippy::panic)] // reason: the scenario is a panicking body
+            let (): () = ctx
+                .step(move |_| async move {
+                    assert_eq!(
+                        clock.elapsed(),
+                        ms(0),
+                        "the body runs before START is answered"
+                    );
+                    panic!("boom")
+                })
+                .name("s")
+                .await
+                .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_start_kept(&client, &ctx, result, client.elapsed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_panic_before_start_response_keeps_start_write() {
+        // (a) Batching off.
+        panicking_step(None).await;
+        // (b) Batching on, with a 50 ms delay.
+        panicking_step(Some(ms(50))).await;
+
+        // (c) A condition check, batching off.
+        let client = Arc::new(LatencyClient::new(LATENCY));
+        let ctx = latency_ctx(&client, None);
+        let clock = Arc::clone(&client);
+        let result = drive_handler(ctx.clone(), None, |ctx| async move {
+            #[expect(clippy::panic)] // reason: the scenario is a panicking check
+            ctx.wait_for_condition(
+                move |_, _state: u32| {
+                    let clock = Arc::clone(&clock);
+                    async move {
+                        assert_eq!(
+                            clock.elapsed(),
+                            ms(0),
+                            "the check runs before START is answered"
+                        );
+                        panic!("boom")
+                    }
+                },
+                0,
+            )
+            .name("c")
+            .await
+            .map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await;
+        assert_start_kept(&client, &ctx, result, client.elapsed());
     }
 }

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 
-use crate::context::{ActiveBody, DurableContext, StepContext, run_body};
+use crate::context::{ActiveBody, DurableContext, StepContext, SubmittedWrite, run_body};
 use crate::engine::CheckpointStatus;
 use crate::engine::OperationId;
 use crate::error::{
@@ -157,7 +157,11 @@ where
             match core.before(resumed).await? {
                 WfcPrelude::Done(result) => return result,
                 WfcPrelude::Wait => {}
-                WfcPrelude::Run { attempt, state } => {
+                WfcPrelude::Run {
+                    attempt,
+                    state,
+                    start,
+                } => {
                     // Execute the check function. The check runs as a
                     // `Step` body: an operation claimed inside it fails the
                     // execution with a context usage error. It holds an
@@ -168,6 +172,7 @@ where
                         .ctx
                         .hold_activity(run_body(body, async { (check)(step_ctx, state).await }))
                         .await;
+                    core.await_start(start).await?;
                     match core.settle(attempt, check_result).await? {
                         WfcSettled::Done(value) => return Ok(value),
                         WfcSettled::Retry => {}
@@ -216,6 +221,10 @@ enum WfcPrelude<S> {
         attempt: u32,
         /// The carried state the check receives.
         state: S,
+        /// The in-flight `START` write, awaited after the check returns and
+        /// before the outcome is written. `None` when START is already
+        /// recorded. A check that panics drops it, and the write continues.
+        start: Option<SubmittedWrite>,
     },
 }
 
@@ -358,7 +367,10 @@ where
                 self.initial_state.clone()
             };
 
-        // Checkpoint START if not already started.
+        // Checkpoint START if not already started. The check runs while
+        // START is in flight; the write is awaited after the check returns
+        // and before the outcome write (see `WfcPrelude::Run`).
+        let mut start = None;
         if !already_started {
             let start_update = build_wfc_update(
                 &wire_id,
@@ -368,21 +380,32 @@ where
                 None,
                 None,
             );
-            if let Err(err) = self.ctx.checkpoint_updates(vec![start_update]).await {
-                // Audit (#43): wait-for-condition START: no user code ran
-                // for this attempt, so no terminal FAIL is needed;
-                // re-invocation reconverges on the same write.
-                return self
-                    .ctx
-                    .checkpoint_failure_unrecoverable(&wire_id, err, None)
-                    .await;
-            }
+            start = Some(self.ctx.submit_checkpoint_updates(vec![start_update]));
         }
 
         Ok(WfcPrelude::Run {
             attempt,
             state: current_state,
+            start,
         })
+    }
+
+    /// Awaits the `START` write a check cycle submitted before its check
+    /// ran, once the check has returned.
+    ///
+    /// Audit (#43): a failed write fails the invocation, and no outcome is
+    /// written. No terminal `FAIL` is needed: the check may run again in
+    /// the next invocation, which re-attempts the same write.
+    async fn await_start(&self, start: Option<SubmittedWrite>) -> Result<(), OperationError> {
+        if let Some(start) = start
+            && let Err(err) = start.await
+        {
+            return self
+                .ctx
+                .checkpoint_failure_unrecoverable(self.op_id.wire(), err, None)
+                .await;
+        }
+        Ok(())
     }
 
     /// Settles one check cycle: serializes the new state, consults the wait
@@ -1624,6 +1647,63 @@ mod coordinator_tests {
             events.replayed(),
             0,
             "a resumed record emits no replay event"
+        );
+    }
+}
+
+/// When a condition check runs relative to its `START` write, under paused
+/// tokio time, with a client that answers each checkpoint call 500 ms after
+/// it receives it.
+#[cfg(test)]
+mod start_write_tests {
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{LatencyClient, drive_handler, latency_ctx, wire_err};
+    use aws_sdk_lambda::types::OperationAction;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn condition_check_starts_before_start_response() {
+        let client = Arc::new(LatencyClient::new(Duration::from_millis(500)));
+        let ctx = latency_ctx(&client, None);
+        let started = Arc::new(Mutex::new(None));
+        let check_started = Arc::clone(&started);
+        let clock = Arc::clone(&client);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let state = ctx
+                .wait_for_condition(
+                    move |_, state: u32| {
+                        let started = Arc::clone(&check_started);
+                        let clock = Arc::clone(&clock);
+                        async move {
+                            *started.lock().expect("lock") = Some(clock.elapsed());
+                            Ok(state + 1)
+                        }
+                    },
+                    0,
+                )
+                .name("c")
+                .await
+                .map_err(wire_err)?;
+            Ok(state.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("1".to_owned()));
+        assert_eq!(
+            *started.lock().expect("lock"),
+            Some(Duration::ZERO),
+            "the check starts before START is answered"
+        );
+        let start = client.request_with(&OperationAction::Start).expect("START");
+        let succeed = client
+            .request_with(&OperationAction::Succeed)
+            .expect("SUCCEED");
+        assert_eq!(start.received, Duration::ZERO);
+        assert_eq!(
+            succeed.received,
+            Duration::from_millis(500),
+            "SUCCEED waits for START"
         );
     }
 }

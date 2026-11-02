@@ -64,6 +64,48 @@ impl<T> Drop for UnreadResultGuard<T> {
     }
 }
 
+/// A checkpoint write that has already started, and the future of its
+/// result.
+///
+/// [`DurableContext::submit_checkpoint_updates`] starts the write before it
+/// returns: the updates are admitted to the buffer, or a detached task
+/// sends them. Awaiting the value only waits for the result. Dropping it
+/// does not cancel the write, because the batch flusher and the direct
+/// write task do not depend on the caller. An at-least-once step uses this
+/// to run its body while its `START` write is in flight.
+pub(crate) struct SubmittedWrite {
+    result: std::pin::Pin<
+        Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send>,
+    >,
+}
+
+impl SubmittedWrite {
+    fn new(
+        result: impl Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + 'static,
+    ) -> Self {
+        Self {
+            result: Box::pin(result),
+        }
+    }
+
+    /// A rejected write: nothing is sent, and the result never resolves.
+    /// The rejected caller's task is being cancelled (see [`Admission`]).
+    fn rejected() -> Self {
+        Self::new(std::future::pending())
+    }
+}
+
+impl Future for SubmittedWrite {
+    type Output = Result<CheckpointOutput, ExecutionClientError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.get_mut().result.as_mut().poll(cx)
+    }
+}
+
 /// The user-code body the SDK is polling on the current task.
 ///
 /// [`DurableContext::claim_operation_id`] compares it with the context an
@@ -1372,7 +1414,21 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
-        self.checkpoint_with_urgency(updates, false).await
+        self.submit_checkpoint_updates(updates).await
+    }
+
+    /// Starts the checkpoint write of [`Self::checkpoint_updates`] before
+    /// it returns, and returns the future of its result.
+    ///
+    /// With buffering, the updates join the batch and take their checkpoint
+    /// permit under the buffer lock. Without it, a detached task sends them.
+    /// So the write keeps its place in the write order, and continues when
+    /// the returned value is dropped.
+    pub(crate) fn submit_checkpoint_updates(
+        &self,
+        updates: Vec<OperationUpdate>,
+    ) -> SubmittedWrite {
+        self.checkpoint_with_urgency(updates, false)
     }
 
     /// Checkpoints operation updates, flushing the coalescing buffer
@@ -1425,12 +1481,12 @@ impl DurableContext {
     /// Shared body of the buffered checkpoint paths: pairs each update
     /// with its captured lifecycle-event metadata, then hands the pairs to
     /// the write path, which emits each event as soon as the write that
-    /// persists its update succeeds.
-    async fn checkpoint_with_urgency(
+    /// persists its update succeeds. The write starts before this returns.
+    fn checkpoint_with_urgency(
         &self,
         updates: Vec<OperationUpdate>,
         urgent: bool,
-    ) -> Result<CheckpointOutput, ExecutionClientError> {
+    ) -> SubmittedWrite {
         // Lifecycle events (see `crate::observability`): every operation
         // transition the SDK records passes through here, so this one site
         // covers `operation_started` / `operation_succeeded` /
@@ -1462,7 +1518,7 @@ impl DurableContext {
             })
             .collect();
 
-        self.write_with_urgency(tracked, urgent, None).await
+        self.write_with_urgency(tracked, urgent, None)
     }
 
     /// Dispatches a checkpoint write: joins the coalescing batch when one
@@ -1482,23 +1538,24 @@ impl DurableContext {
     /// `failure_owner` applies only with buffering: the joined batch
     /// records a failed write's classification for it when the flusher
     /// publishes the failure (see [`Self::publish_batch`]).
-    async fn write_with_urgency(
+    ///
+    /// The join or the direct write happens before this returns, so the
+    /// returned [`SubmittedWrite`] only waits for the result.
+    fn write_with_urgency(
         &self,
         updates: Vec<TrackedUpdate>,
         urgent: bool,
         failure_owner: Option<&str>,
-    ) -> Result<CheckpointOutput, ExecutionClientError> {
+    ) -> SubmittedWrite {
         let Some(coalescer) = self.inner.coalescer.clone() else {
             let (updates, events): (Vec<_>, Vec<_>) =
                 updates.into_iter().map(|t| (t.update, t.event)).unzip();
             let Some(permit) = self.inner.coordinator.acquire(PermitKind::Checkpoint) else {
                 // The phase left `Running`: the write is rejected, as a
                 // write from an abandoned owner is.
-                return std::future::pending().await;
+                return SubmittedWrite::rejected();
             };
-            return self
-                .write_direct_detached(updates, events, Some(permit), None)
-                .await;
+            return self.write_direct_detached(updates, events, Some(permit), None);
         };
 
         // Admission (see `Admission`): an update from an abandoned owner is
@@ -1513,7 +1570,7 @@ impl DurableContext {
             updates,
             failure_owner,
         ) else {
-            return std::future::pending().await;
+            return SubmittedWrite::rejected();
         };
         if urgent || coalescer.delay().is_zero() {
             self.spawn_batch_flush(&coalescer, &batch, Duration::ZERO);
@@ -1524,16 +1581,19 @@ impl DurableContext {
             self.spawn_batch_flush(&coalescer, &batch, coalescer.delay());
         }
 
-        loop {
-            // `enable()` registers the waiter BEFORE the result check, so a
-            // publish landing between the check and the await still wakes us.
-            let mut notified = std::pin::pin!(batch.notified());
-            notified.as_mut().enable();
-            if let Some(result) = batch.result_clone() {
-                return result;
+        SubmittedWrite::new(async move {
+            loop {
+                // `enable()` registers the waiter BEFORE the result check, so
+                // a publish landing between the check and the await still
+                // wakes us.
+                let mut notified = std::pin::pin!(batch.notified());
+                notified.as_mut().enable();
+                if let Some(result) = batch.result_clone() {
+                    return result;
+                }
+                notified.await;
             }
-            notified.await;
-        }
+        })
     }
 
     /// Writes one request's worth of tracked updates immediately and, if,
@@ -1611,13 +1671,16 @@ impl DurableContext {
     /// A refresh sets it, because the driver drops the refresh's caller
     /// when the handler returns, and the failure must still decide the
     /// invocation's outcome.
-    async fn write_direct_detached(
+    ///
+    /// The task is started before this returns, so the returned
+    /// [`SubmittedWrite`] only waits for the result.
+    fn write_direct_detached(
         &self,
         updates: Vec<OperationUpdate>,
         events: Vec<crate::tracing_layer::PendingTransitionEvent>,
         permit: Option<crate::coordinator::Permit>,
         failure_owner: Option<String>,
-    ) -> Result<CheckpointOutput, ExecutionClientError> {
+    ) -> SubmittedWrite {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let ctx = self.clone();
         let spawned = crate::task::spawn_detached(self.coordinator(), async move {
@@ -1641,11 +1704,12 @@ impl DurableContext {
             // The source marks the error, so that
             // `checkpoint_failure_unrecoverable` returns the operation error
             // `.spawn()` returns instead of failing the invocation.
-            return Err(ExecutionClientError::with_source(
+            let err = ExecutionClientError::with_source(
                 ExecutionClientErrorScope::Invocation,
                 no_runtime.to_string(),
                 no_runtime,
-            ));
+            );
+            return SubmittedWrite::new(async move { Err(err) });
         }
         let mut receiver = UnreadResultGuard {
             receiver,
@@ -1655,13 +1719,15 @@ impl DurableContext {
         // only when the checkpoint client panicked. The gateway recorded
         // that panic, so the caller stays pending until the cleanup cancels
         // it.
-        let Ok(written) = (&mut receiver.receiver).await else {
-            return std::future::pending().await;
-        };
-        match written {
-            Some(result) => result,
-            None => std::future::pending().await,
-        }
+        SubmittedWrite::new(async move {
+            let Ok(written) = (&mut receiver.receiver).await else {
+                return std::future::pending().await;
+            };
+            match written {
+                Some(result) => result,
+                None => std::future::pending().await,
+            }
+        })
     }
 
     /// Spawns a task that claims `batch` (if it is still the open batch)

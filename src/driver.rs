@@ -1166,6 +1166,165 @@ pub(crate) mod test_support {
     pub(crate) fn wire_err(err: crate::OperationError) -> crate::error::WireError {
         crate::error::WireError::new(None::<String>, Some(format!("{err:#}")))
     }
+
+    /// One checkpoint request a [`LatencyClient`] received.
+    #[derive(Clone)]
+    pub(crate) struct LatencyRequest {
+        /// The tokio time since the client was created, when it received
+        /// the request.
+        pub(crate) received: Duration,
+        /// The tokio time when it answered the request. `None` until then.
+        pub(crate) answered: Option<Duration>,
+        /// The request's updates.
+        pub(crate) updates: Vec<OperationUpdate>,
+    }
+
+    /// A test `ExecutionClient` that answers each checkpoint call
+    /// `latency` of tokio time after it receives it, and records the time
+    /// of each request and of each answer.
+    ///
+    /// It answers a `START` with a `STARTED` record of the operation, so
+    /// the checkpoint log holds the record the service would return. With
+    /// `fail_start`, it answers a request that carries a `START` with a
+    /// non-retryable error instead.
+    pub(crate) struct LatencyClient {
+        latency: Duration,
+        fail_start: bool,
+        start: tokio::time::Instant,
+        requests: Arc<Mutex<Vec<LatencyRequest>>>,
+        tokens: Mutex<u32>,
+    }
+
+    impl LatencyClient {
+        /// A client that answers after `latency`. Create it inside the
+        /// test's runtime: its clock starts here.
+        pub(crate) fn new(latency: Duration) -> Self {
+            Self {
+                latency,
+                fail_start: false,
+                start: tokio::time::Instant::now(),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                tokens: Mutex::new(0),
+            }
+        }
+
+        /// Answers a request that carries a `START` with a non-retryable
+        /// error.
+        pub(crate) fn failing_start(mut self) -> Self {
+            self.fail_start = true;
+            self
+        }
+
+        /// The tokio time since the client was created.
+        pub(crate) fn elapsed(&self) -> Duration {
+            self.start.elapsed()
+        }
+
+        /// Every request received, in order.
+        pub(crate) fn requests(&self) -> Vec<LatencyRequest> {
+            self.requests.lock().expect("lock").clone()
+        }
+
+        /// The first request that carries an update with `action`.
+        pub(crate) fn request_with(
+            &self,
+            action: &aws_sdk_lambda::types::OperationAction,
+        ) -> Option<LatencyRequest> {
+            self.requests()
+                .into_iter()
+                .find(|r| r.updates.iter().any(|u| u.action() == action))
+        }
+
+        /// Whether any request carried a `SUCCEED`, `RETRY` or `FAIL`
+        /// update.
+        pub(crate) fn received_outcome(&self) -> bool {
+            use aws_sdk_lambda::types::OperationAction;
+            self.requests()
+                .iter()
+                .flat_map(|r| r.updates.clone())
+                .any(|u| {
+                    matches!(
+                        u.action(),
+                        OperationAction::Succeed | OperationAction::Retry | OperationAction::Fail
+                    )
+                })
+        }
+    }
+
+    impl ExecutionClient for LatencyClient {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
+            use aws_sdk_lambda::types::OperationAction;
+            let index = {
+                let mut requests = self.requests.lock().expect("lock");
+                requests.push(LatencyRequest {
+                    received: self.start.elapsed(),
+                    answered: None,
+                    updates: updates.clone(),
+                });
+                requests.len() - 1
+            };
+            let token = {
+                let mut tokens = self.tokens.lock().expect("lock");
+                *tokens += 1;
+                format!("t{tokens}")
+            };
+            Box::pin(async move {
+                tokio::time::sleep(self.latency).await;
+                if let Some(request) = self.requests.lock().expect("lock").get_mut(index) {
+                    request.answered = Some(self.start.elapsed());
+                }
+                let starts: Vec<&OperationUpdate> = updates
+                    .iter()
+                    .filter(|u| u.action() == &OperationAction::Start)
+                    .collect();
+                if self.fail_start && !starts.is_empty() {
+                    return Err(ExecutionClientError::new_non_retryable("START rejected"));
+                }
+                let operations = starts
+                    .into_iter()
+                    .map(|u| {
+                        operation_like(u, OperationStatus::Started)
+                            .build()
+                            .expect("all required fields set")
+                    })
+                    .collect();
+                Ok(CheckpointOutput::new(Some(token), operations, None))
+            })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _marker: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(GetStateOutput::new(Vec::new(), None)) })
+        }
+    }
+
+    /// A root context on `client`, with an empty checkpoint log.
+    /// `buffer_window` is `None` for direct writes (batching off), and
+    /// `Some(delay)` for batching with `checkpoint_delay(delay)`.
+    pub(crate) fn latency_ctx(
+        client: &Arc<LatencyClient>,
+        buffer_window: Option<Duration>,
+    ) -> crate::DurableContext {
+        crate::DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::engine::CheckpointLog::empty()),
+            Arc::clone(client) as Arc<dyn ExecutionClient>,
+            "t0".to_owned(),
+            buffer_window,
+        )
+    }
 }
 
 #[cfg(test)]
