@@ -1,11 +1,13 @@
 //! Step operation execution engine.
 //!
 //! Implements the live path (run closure, serialize, checkpoint), replay path
-//! (return frozen result), and retry strategy (checkpoint-suspend for delays).
+//! (return frozen result), and retry strategy (backend-owned retry timer).
 //!
-//! Retry delays use checkpoint-suspend rather than in-process sleep:
+//! Retry delays use the backend's timer rather than an in-process sleep:
 //! a RETRY action with `NextAttemptDelaySeconds` is checkpointed, then the
-//! function suspends; the backend owns the timer.
+//! step waits for its record to leave `PENDING`. When the record turns
+//! `READY` while other work runs, the next attempt runs in the same
+//! invocation; otherwise the invocation suspends.
 
 use std::future::Future;
 use std::time::Duration;
@@ -14,7 +16,7 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use tracing::Instrument;
 
 use crate::builders::{JitterStrategy, RetryStrategyConfig};
-use crate::context::{ActiveBody, DurableContext, StepContext, run_body};
+use crate::context::{ActiveBody, DurableContext, StepContext, run_body, run_body_sync};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
 use crate::serdes::SerdesContext;
@@ -183,17 +185,21 @@ pub(crate) struct StepExecution<O, F, S> {
 impl<O, F, Fut, S> StepExecution<O, F, S>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext) -> Fut + Send + 'static,
+    F: FnOnce(StepContext) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
-    /// Executes the step operation: replay path or live path with retry.
+    /// Executes the step operation: one loop over its record.
     ///
     /// Thin generic wrapper: the ONLY code monomorphized per step call
     /// site. The replay/checkpoint state machine lives in the non-generic
-    /// [`StepCore`] / [`StepLive`] halves (generic over the result type `O`
-    /// only); this wrapper just polls the user's concrete future between
-    /// them.
+    /// [`StepCore`] (generic over the result type `O` only); this wrapper
+    /// polls the user's concrete future between its halves, one attempt
+    /// per cycle, and waits for the retry timer between cycles.
+    ///
+    /// Each attempt calls a fresh clone of the closure. The original stays
+    /// here for the next attempt, so its captures never move into an
+    /// attempt.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         let Self {
             ctx,
@@ -205,9 +211,6 @@ where
             closure,
             _marker,
         } = self;
-        // The step body runs as a `Step` body: an operation claimed inside
-        // it fails the execution with a context usage error.
-        let body = ActiveBody::Step(op_id.positional().to_owned());
         let core = StepCore {
             ctx,
             op_id,
@@ -217,35 +220,62 @@ where
             semantics,
             _marker: std::marker::PhantomData,
         };
-        match core.before().await? {
-            StepPrelude::Done(result) => result,
-            StepPrelude::Run {
-                attempt,
-                span,
-                live,
-            } => {
-                // Execute the step body inside a tracing span carrying the
-                // structured-log field contract.
-                let step_ctx = StepContext::new(attempt);
-                // The body holds an activity permit from its call until it
-                // returns, so the invocation does not suspend while it runs.
-                let activity = live.ctx.clone();
-                let result = activity
-                    .hold_activity(
-                        run_body(body, async move { (closure)(step_ctx).await }).instrument(span),
-                    )
-                    .await;
-                live.settle(attempt, result).await
+        // True once the step has waited for its record in this invocation.
+        // A terminal record found after that wait changed during this
+        // invocation, so it is a continuation, not a replay.
+        let mut resumed = false;
+        loop {
+            match core.before(resumed).await? {
+                StepPrelude::Done(result) => return result,
+                StepPrelude::Wait => {}
+                StepPrelude::Run { attempt, span } => {
+                    // The step body runs as a `Step` body: an operation
+                    // claimed inside it fails the execution with a context
+                    // usage error. It holds an activity permit from its call
+                    // until it returns, so the invocation does not suspend
+                    // while it runs.
+                    let body = ActiveBody::Step(core.op_id.positional().to_owned());
+                    let step_ctx = StepContext::new(attempt);
+                    // The clone runs the captures' `Clone` implementations,
+                    // which are user code, so it runs under the same body.
+                    let attempt_closure = run_body_sync(body.clone(), || closure.clone());
+                    let result = core
+                        .ctx
+                        .hold_activity(
+                            run_body(body, async move { (attempt_closure)(step_ctx).await })
+                                .instrument(span),
+                        )
+                        .await;
+                    match core.settle(attempt, result).await? {
+                        StepSettled::Done(value) => return Ok(value),
+                        StepSettled::Retry => {}
+                    }
+                }
             }
+            // The record is PENDING until its retry timer fires. Wait until
+            // a checkpoint response carries READY or a terminal status, as
+            // the Go SDK does, then handle the record as a new invocation
+            // would: READY runs the next attempt, a terminal status returns
+            // its outcome. The service never answers a RETRY with STARTED,
+            // so a STARTED record (a response that did not carry the
+            // RETRY's result) keeps waiting rather than starting another
+            // attempt at once. When no other SDK work runs, the invocation
+            // suspends here instead.
+            core.ctx
+                .wait_for_record(core.op_id.wire(), |status| {
+                    *status == CheckpointStatus::Ready || status.is_terminal()
+                })
+                .await;
+            resumed = true;
         }
     }
 }
 
-/// The pre-closure half of a step: task-ownership check, replay resolution,
-/// attempt derivation, and the START checkpoint. Generic only over the
-/// result type `O`, no user closure reaches this state machine, so its
-/// substantial replay/checkpoint logic compiles once per result type
-/// instead of once per step call site.
+/// The non-generic half of a step: task-ownership check, replay
+/// resolution, attempt derivation, the START checkpoint, and outcome
+/// checkpointing. Generic only over the result type `O`, no user closure
+/// reaches this state machine, so its substantial replay/checkpoint logic
+/// compiles once per result type instead of once per step call site.
 struct StepCore<O, S> {
     ctx: DurableContext,
     op_id: OperationId,
@@ -256,33 +286,29 @@ struct StepCore<O, S> {
     _marker: std::marker::PhantomData<fn() -> O>,
 }
 
-/// What [`StepCore::before`] decided: the step is already resolved from the
-/// checkpoint log (or suspended), or the body must run live.
-enum StepPrelude<O, S> {
-    /// Resolved without running the body (replay, suspension, or an
-    /// `AtMostOncePerRetry` interruption verdict).
+/// What [`StepCore::before`] decided for one cycle of the step loop.
+enum StepPrelude<O> {
+    /// Resolved without running the body: a recorded terminal outcome, or
+    /// an `AtMostOncePerRetry` interruption the retry strategy stopped.
     Done(Result<O, OperationError>),
-    /// The body must run at `attempt`, instrumented with `span`; `live`
-    /// settles the outcome afterwards.
+    /// The record is `PENDING`, or a `RETRY` was just recorded for an
+    /// interrupted `AtMostOncePerRetry` attempt: wait for the retry timer.
+    Wait,
+    /// The body must run at `attempt`, instrumented with `span`.
     Run {
         /// 1-based attempt number for this live execution.
         attempt: u32,
         /// The operation span the body runs under.
         span: tracing::Span,
-        /// The post-closure half that checkpoints the outcome.
-        live: StepLive<O, S>,
     },
 }
 
-/// The post-closure half of a step: outcome checkpointing (success payload
-/// or retry-strategy failure handling). Generic only over the result type.
-struct StepLive<O, S> {
-    ctx: DurableContext,
-    wire_id: String,
-    name: Option<String>,
-    retry_strategy: Option<RetryStrategy>,
-    serdes: S,
-    _marker: std::marker::PhantomData<fn() -> O>,
+/// How [`StepCore::settle`] ended one attempt.
+enum StepSettled<O> {
+    /// The step succeeded with this value.
+    Done(O),
+    /// A `RETRY` was checkpointed: the next cycle waits for its timer.
+    Retry,
 }
 
 impl<O, S> StepCore<O, S>
@@ -290,23 +316,41 @@ where
     O: Send + 'static,
     S: Serdes<O>,
 {
-    /// Runs everything that precedes the user closure: replay path, or the
-    /// live-path preamble ending at the START checkpoint.
-    #[expect(clippy::too_many_lines)] // reason: validation adds lines but splitting would obscure flow
-    async fn before(self) -> Result<StepPrelude<O, S>, OperationError> {
+    /// Emits `operation_replayed` for a recorded terminal outcome, unless
+    /// the record changed during this invocation (`resumed`).
+    fn emit_replayed(&self, resumed: bool, attempt: u32) {
+        if !resumed {
+            self.ctx.emit_operation_replayed(
+                self.op_id.wire(),
+                self.name.as_deref(),
+                "Step",
+                Some(STEP_SUB_TYPE),
+                attempt,
+            );
+        }
+    }
+
+    /// Runs everything that precedes the user closure in one cycle: replay
+    /// resolution, or the live-path preamble ending at the START
+    /// checkpoint.
+    ///
+    /// `resumed` is true when the step waited for its record in this
+    /// invocation. A terminal record then changed during this invocation,
+    /// so it returns its outcome without an `operation_replayed` event.
+    async fn before(&self, resumed: bool) -> Result<StepPrelude<O>, OperationError> {
         // 1. Task-ownership check.
         self.ctx.enforce_task_ownership()?;
 
-        let positional_id = self.op_id.positional().to_owned();
-        let wire_id = self.op_id.wire().to_owned();
+        let positional_id = self.op_id.positional();
+        let wire_id = self.op_id.wire();
 
         // 2. Check checkpoint log for replay. The validated view covers the
         // non-terminal branches without cloning; the terminal branches fetch
         // only the one field they consume.
         let mut already_started = false;
         if let Some(view) = self.ctx.checkpoint_view_validated(
-            &positional_id,
-            &wire_id,
+            positional_id,
+            wire_id,
             "Step",
             Some(STEP_SUB_TYPE),
             self.name.as_deref(),
@@ -317,8 +361,8 @@ where
                     // promises a recorded terminal outcome was returned, so a
                     // corrupt payload or failing serdes surfaces as an error
                     // without the event.
-                    let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
-                    let payload = self.ctx.checkpoint_result_payload(&positional_id);
+                    let serdes_ctx = SerdesContext::new(wire_id, self.ctx.execution_arn());
+                    let payload = self.ctx.checkpoint_result_payload(positional_id);
                     let value = replay_success(
                         &self.ctx,
                         self.name.as_deref(),
@@ -327,32 +371,20 @@ where
                         serdes_ctx,
                     )
                     .await?;
-                    self.ctx.emit_operation_replayed(
-                        &wire_id,
-                        self.name.as_deref(),
-                        "Step",
-                        Some(STEP_SUB_TYPE),
-                        view.attempt,
-                    );
+                    self.emit_replayed(resumed, view.attempt);
                     return Ok(StepPrelude::Done(Ok(value)));
                 }
                 CheckpointStatus::Failed => {
-                    self.ctx.emit_operation_replayed(
-                        &wire_id,
-                        self.name.as_deref(),
-                        "Step",
-                        Some(STEP_SUB_TYPE),
-                        view.attempt,
-                    );
+                    self.emit_replayed(resumed, view.attempt);
                     let wire = self
                         .ctx
-                        .checkpoint_wire_error(&positional_id)
+                        .checkpoint_wire_error(positional_id)
                         .unwrap_or_default();
-                    return Ok(StepPrelude::Done(Err(replay_failure(wire, &wire_id))));
+                    return Ok(StepPrelude::Done(Err(replay_failure(wire, wire_id))));
                 }
                 CheckpointStatus::Pending => {
                     // Retry timer hasn't fired yet: wait for it.
-                    return Ok(StepPrelude::Done(wait_for_retry(&self.ctx, &wire_id).await));
+                    return Ok(StepPrelude::Wait);
                 }
                 CheckpointStatus::Started => {
                     // Already started: behavior depends on semantics.
@@ -362,18 +394,17 @@ where
                         // a step-interrupted failure and consult the retry
                         // strategy to decide FAIL or RETRY.
                         let attempt = self.ctx.get_attempt(&self.op_id).saturating_add(1);
-                        return Ok(StepPrelude::Done(
-                            handle_failure::<O>(
-                                &self.ctx,
-                                &wire_id,
-                                self.name.as_deref(),
-                                self.retry_strategy.as_ref(),
-                                StepErrorKind::Interrupted,
-                                STEP_INTERRUPTED_MESSAGE.into(),
-                                attempt,
-                            )
-                            .await,
-                        ));
+                        handle_failure(
+                            &self.ctx,
+                            wire_id,
+                            self.name.as_deref(),
+                            self.retry_strategy.as_ref(),
+                            StepErrorKind::Interrupted,
+                            STEP_INTERRUPTED_MESSAGE.into(),
+                            attempt,
+                        )
+                        .await?;
+                        return Ok(StepPrelude::Wait);
                     }
                     // AtLeastOncePerRetry (default): skip re-checkpointing
                     // START but re-execute the body.
@@ -390,7 +421,7 @@ where
                     // already failed the execution (issue #45). Kept as a
                     // typed arm so a future bypass cannot fall through to
                     // live execution and re-run a possibly-terminal step.
-                    return Err(self.ctx.unrecognized_status_error(&wire_id, raw));
+                    return Err(self.ctx.unrecognized_status_error(wire_id, raw));
                 }
             }
         }
@@ -400,26 +431,19 @@ where
         // recorded operation with step details, attempt = recorded + 1.
         let attempt = self.ctx.get_attempt(&self.op_id).saturating_add(1);
 
-        // Destructure self so the live half owns exactly what it needs.
-        let Self {
-            ctx,
-            name,
-            retry_strategy,
-            serdes,
-            ..
-        } = self;
-
         // Checkpoint START (skip if step was already in Started state).
         if !already_started {
-            let start_update = build_start_update(&wire_id, name.as_deref(), ctx.parent_wire_id());
-            if let Err(err) = ctx.checkpoint_updates(vec![start_update]).await {
+            let start_update =
+                build_start_update(wire_id, self.name.as_deref(), self.ctx.parent_wire_id());
+            if let Err(err) = self.ctx.checkpoint_updates(vec![start_update]).await {
                 // Audit (#43): step START: no user code has run for this
                 // attempt, so there is no side effect needing a recorded
                 // outcome. No terminal FAIL: the invocation dies, the
                 // service re-invokes, and replay reaches this point and
                 // attempts the same write, losing only one invocation.
-                return ctx
-                    .checkpoint_failure_unrecoverable(&wire_id, err, None)
+                return self
+                    .ctx
+                    .checkpoint_failure_unrecoverable(wire_id, err, None)
                     .await;
             }
         }
@@ -428,58 +452,46 @@ where
         // field contract.
         let is_replay = false; // Live execution is never replay.
         let span = tracing_layer::operation_span(
-            ctx.execution_arn(),
-            &ctx.lambda_context().request_id,
-            &wire_id,
+            self.ctx.execution_arn(),
+            &self.ctx.lambda_context().request_id,
+            wire_id,
             attempt,
             is_replay,
         );
 
-        Ok(StepPrelude::Run {
-            attempt,
-            span,
-            live: StepLive {
-                ctx,
-                wire_id,
-                name,
-                retry_strategy,
-                serdes,
-                _marker: std::marker::PhantomData,
-            },
-        })
+        Ok(StepPrelude::Run { attempt, span })
     }
-}
 
-impl<O, S> StepLive<O, S>
-where
-    O: Send + 'static,
-    S: Serdes<O>,
-{
-    /// Settles a live step outcome: checkpoints success or consults the
-    /// retry strategy on failure.
-    async fn settle(self, attempt: u32, result: Result<O, BoxError>) -> Result<O, OperationError> {
+    /// Settles one attempt: checkpoints success or consults the retry
+    /// strategy on failure.
+    async fn settle(
+        &self,
+        attempt: u32,
+        result: Result<O, BoxError>,
+    ) -> Result<StepSettled<O>, OperationError> {
+        let wire_id = self.op_id.wire();
         match result {
-            Ok(value) => {
-                handle_success(
-                    &self.ctx,
-                    &self.wire_id,
-                    self.name.as_deref(),
-                    &self.serdes,
-                    value,
-                )
-                .await
-            }
+            Ok(value) => handle_success(
+                &self.ctx,
+                wire_id,
+                self.name.as_deref(),
+                &self.serdes,
+                value,
+            )
+            .await
+            .map(StepSettled::Done),
             Err(err) => {
-                handle_failure::<O>(
+                handle_failure(
                     &self.ctx,
-                    &self.wire_id,
+                    wire_id,
                     self.name.as_deref(),
                     self.retry_strategy.as_ref(),
                     StepErrorKind::ExecutionFailed,
                     err,
                     attempt,
                 )
-                .await
+                .await?;
+                Ok(StepSettled::Retry)
             }
         }
     }
@@ -557,24 +569,16 @@ async fn handle_success<O, S: Serdes<O>>(
     deserialize_result(ctx, name, serdes, serialized, serdes_ctx).await
 }
 
-/// Waits for a retry timer the backend owns.
-///
-/// The step body is `FnOnce`, so the step never resumes in this
-/// invocation: it registers a wait that is never ready. The invocation
-/// suspends once no other SDK work can make progress, and the backend
-/// invokes the function again when the timer fires.
-async fn wait_for_retry<T>(ctx: &DurableContext, wire_id: &str) -> T {
-    ctx.wait_for_record(wire_id, |_| false).await;
-    std::future::pending().await
-}
-
 /// Handles a failed step: consult retry strategy, checkpoint accordingly.
 ///
 /// `kind` is `StepErrorKind::ExecutionFailed` when the body returned
 /// `err`, and `StepErrorKind::Interrupted` when an `AtMostOncePerRetry`
 /// attempt started but recorded no outcome. The retry strategy sees
 /// `kind`, and the error returned when the strategy stops carries it.
-async fn handle_failure<O>(
+///
+/// Returns `Ok(())` once a `RETRY` is recorded: the caller then waits for
+/// the retry timer. Returns the step error once a `FAIL` is recorded.
+async fn handle_failure(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
@@ -582,7 +586,7 @@ async fn handle_failure<O>(
     kind: StepErrorKind,
     err: BoxError,
     attempt: u32,
-) -> Result<O, OperationError> {
+) -> Result<(), OperationError> {
     // Derive the wire failure record from the escaping error before it is
     // moved into the step error: message flattening, `error_type`
     // pass-through, and the `error_data` chain walk all happen here, at
@@ -626,9 +630,7 @@ async fn handle_failure<O>(
                     .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
                     .await;
             }
-
-            // The backend owns the retry timer: wait for it.
-            wait_for_retry(ctx, wire_id).await
+            Ok(())
         }
         RetryDecision::Stop => {
             // Checkpoint FAIL (permanent).
@@ -1884,7 +1886,7 @@ mod tests {
         executed: Arc<std::sync::atomic::AtomicBool>,
     ) -> StepExecution<
         i32,
-        impl FnOnce(StepContext) -> std::future::Ready<Result<i32, BoxError>>,
+        impl FnOnce(StepContext) -> std::future::Ready<Result<i32, BoxError>> + Clone,
         crate::serdes::JsonSerdes,
     > {
         let op_id = ctx.mint_id();
@@ -2305,71 +2307,387 @@ mod tests {
 mod coordinator_tests {
     use crate::driver::InvocationOutcome;
     use crate::driver::test_support::{
-        ScriptedClient, drive_handler, named, operation_like, scripted_ctx, wire_err,
+        RefreshClient, RefreshRequest, assert_near, drive_handler, named, operation_like,
+        poll_once, refresh_ctx, wire_err,
     };
-    use aws_sdk_lambda::types::{OperationAction, OperationStatus};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use aws_sdk_lambda::types::{
+        ErrorObject, Operation, OperationAction, OperationStatus, OperationType, OperationUpdate,
+        StepDetails,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    #[tokio::test(start_paused = true)]
-    async fn step_retry_stays_waiting_in_invocation() {
-        let client = Arc::new(ScriptedClient::new(|updates, history| {
-            if named(updates, "root", &OperationAction::Succeed).is_none() {
-                return Vec::new();
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// A step record of `update` with `status` and `attempt`, and, when
+    /// `next_in` is `Some`, a next attempt `next_in` from now.
+    fn step_record(
+        req: &RefreshRequest<'_>,
+        update: &OperationUpdate,
+        status: OperationStatus,
+        next_in: Option<Duration>,
+    ) -> Operation {
+        let mut details = StepDetails::builder().attempt(1);
+        if let Some(next_in) = next_in {
+            details = details.next_attempt_timestamp(req.timestamp_in(next_in));
+        }
+        operation_like(update, status)
+            .step_details(details.build())
+            .build()
+            .expect("all required fields set")
+    }
+
+    /// Answers a RETRY of `name` with `PENDING` and a next attempt 1 s
+    /// ahead, and the first refresh with `name` `READY`.
+    fn retry_client(name: &'static str) -> RefreshClient {
+        RefreshClient::new(move |req| {
+            let mut ops = Vec::new();
+            if let Some(retry) = named(req.updates, name, &OperationAction::Retry) {
+                ops.push(step_record(
+                    req,
+                    retry,
+                    OperationStatus::Pending,
+                    Some(secs(1)),
+                ));
             }
-            named(history, "flaky", &OperationAction::Start)
-                .map(|start| {
-                    operation_like(start, OperationStatus::Ready)
-                        .build()
-                        .expect("all required fields set")
-                })
-                .into_iter()
-                .collect()
-        }));
-        let ctx = scripted_ctx(&client);
-        let runs = Arc::new(AtomicU32::new(0));
-        let body_runs = Arc::clone(&runs);
-        let body_client = Arc::clone(&client);
-        let outcome = drive_handler(ctx, None, |ctx| async move {
-            let flaky = ctx
-                .step(move |_| {
-                    let runs = Arc::clone(&body_runs);
+            if req.empty_number == 1
+                && let Some(retry) = named(req.history, name, &OperationAction::Retry)
+            {
+                ops.push(step_record(req, retry, OperationStatus::Ready, None));
+            }
+            Ok(ops)
+        })
+    }
+
+    /// Retries attempt 1 after 1 s and stops at attempt 2.
+    fn retry_once(_err: &crate::StepError, attempt: u32) -> crate::RetryDecision {
+        if attempt < 2 {
+            crate::RetryDecision::Retry { delay: secs(1) }
+        } else {
+            crate::RetryDecision::Stop
+        }
+    }
+
+    /// A step that sleeps 3 s of tokio time.
+    async fn sleeping_step(ctx: &crate::DurableContext) -> Result<u32, crate::error::WireError> {
+        ctx.step(|_| async {
+            tokio::time::sleep(secs(3)).await;
+            Ok(1_u32)
+        })
+        .name("s")
+        .await
+        .map_err(wire_err)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn step_retry_runs_next_attempt_in_invocation() {
+        let client = Arc::new(retry_client("flaky"));
+        let ctx = refresh_ctx(&client);
+        let start = tokio::time::Instant::now();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let body_attempts = Arc::clone(&attempts);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let mut flaky = std::pin::pin!(
+                ctx.step(move |step_ctx| {
+                    let attempts = Arc::clone(&body_attempts);
                     async move {
-                        runs.fetch_add(1, Ordering::SeqCst);
-                        Err::<u32, crate::BoxError>("transient".into())
+                        attempts
+                            .lock()
+                            .expect("lock")
+                            .push((step_ctx.attempt(), start.elapsed()));
+                        if step_ctx.attempt() < 2 {
+                            return Err::<u32, crate::BoxError>("transient".into());
+                        }
+                        Ok(7)
                     }
                 })
                 .name("flaky")
-                .retry_strategy(|_err, attempt| {
-                    if attempt < 2 {
-                        crate::RetryDecision::Retry {
-                            delay: Duration::from_secs(1),
-                        }
-                    } else {
-                        crate::RetryDecision::Stop
+                .retry_strategy(retry_once)
+                .spawn()
+            );
+            poll_once(flaky.as_mut()).await;
+            sleeping_step(&ctx).await?;
+            let value = flaky.await.map_err(wire_err)?;
+            Ok(value.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("7".to_owned()));
+        let attempts = attempts.lock().expect("lock").clone();
+        let numbers: Vec<u32> = attempts.iter().map(|(n, _)| *n).collect();
+        assert_eq!(numbers, vec![1, 2]);
+        assert_near(attempts.get(1).expect("attempt 2 ran").1, secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_attempt_starts_from_original_captures() {
+        let client = Arc::new(retry_client("vec"));
+        let ctx = refresh_ctx(&client);
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let v = vec![0_u32];
+            let mut step = std::pin::pin!(
+                ctx.step(move |step_ctx| async move {
+                    let mut v = v;
+                    v.push(step_ctx.attempt());
+                    if step_ctx.attempt() < 2 {
+                        return Err::<Vec<u32>, crate::BoxError>("transient".into());
                     }
+                    Ok(v)
                 })
-                .spawn();
-            ctx.step(move |_| async move {
-                // The READY arrives only after the retry was recorded.
-                for _ in 0..1000 {
-                    if body_client.received("flaky", &OperationAction::Retry) {
-                        return Ok(1_u32);
+                .name("vec")
+                .retry_strategy(retry_once)
+                .spawn()
+            );
+            poll_once(step.as_mut()).await;
+            sleeping_step(&ctx).await?;
+            let v = step.await.map_err(wire_err)?;
+            Ok(format!("{v:?}"))
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("[0, 2]".to_owned()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arc_capture_is_shared_across_attempts_in_invocation() {
+        let client = Arc::new(retry_client("arc"));
+        let ctx = refresh_ctx(&client);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handler_counter = Arc::clone(&counter);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let mut step = std::pin::pin!(
+                ctx.step(move |step_ctx| async move {
+                    handler_counter.fetch_add(1, Ordering::SeqCst);
+                    if step_ctx.attempt() < 2 {
+                        return Err::<u32, crate::BoxError>("transient".into());
                     }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                Err("the flaky step never retried".into())
+                    Ok(1)
+                })
+                .name("arc")
+                .retry_strategy(retry_once)
+                .spawn()
+            );
+            poll_once(step.as_mut()).await;
+            sleeping_step(&ctx).await?;
+            step.await.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lone_step_retry_suspends() {
+        let client = Arc::new(retry_client("lone"));
+        let ctx = refresh_ctx(&client);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let body_runs = Arc::clone(&runs);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            ctx.step(move |_| async move {
+                body_runs.fetch_add(1, Ordering::SeqCst);
+                Err::<u32, crate::BoxError>("transient".into())
             })
-            .name("root")
+            .name("lone")
+            .retry_strategy(retry_once)
             .await
             .map_err(wire_err)?;
-            flaky.await.map_err(wire_err)?;
             Ok("done".to_owned())
         })
         .await
         .expect("no panic");
         assert_eq!(outcome, InvocationOutcome::Pending);
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "the retrying body ran once");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran once");
+        assert!(client.empty_calls().is_empty(), "no refresh was sent");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replayed_pending_step_runs_next_attempt_in_invocation() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            let mut ops = Vec::new();
+            if req.empty_number == 1 {
+                ops.push(
+                    operation_like(&flaky_update(), OperationStatus::Ready)
+                        .step_details(StepDetails::builder().attempt(1).build())
+                        .build()
+                        .expect("all required fields set"),
+                );
+            }
+            Ok(ops)
+        }));
+        let ctx = pending_flaky_ctx(&client);
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let body_attempts = Arc::clone(&attempts);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let mut flaky = std::pin::pin!(
+                ctx.step(move |step_ctx| {
+                    let attempts = Arc::clone(&body_attempts);
+                    async move {
+                        attempts.lock().expect("lock").push(step_ctx.attempt());
+                        Ok::<u32, crate::BoxError>(7)
+                    }
+                })
+                .name("flaky")
+                .retry_strategy(retry_once)
+                .spawn()
+            );
+            poll_once(flaky.as_mut()).await;
+            sleeping_step(&ctx).await?;
+            let value = flaky.await.map_err(wire_err)?;
+            Ok(value.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("7".to_owned()));
+        assert_eq!(*attempts.lock().expect("lock"), vec![2]);
+    }
+
+    /// The root context over a log that holds the step `flaky` `PENDING`
+    /// after attempt 1, with its next attempt 1 s ahead.
+    fn pending_flaky_ctx(client: &Arc<RefreshClient>) -> crate::DurableContext {
+        let pending = operation_like(&flaky_update(), OperationStatus::Pending)
+            .step_details(
+                StepDetails::builder()
+                    .attempt(1)
+                    .next_attempt_timestamp(aws_smithy_types::DateTime::from(
+                        std::time::SystemTime::now() + secs(1),
+                    ))
+                    .build(),
+            )
+            .build()
+            .expect("all required fields set");
+        crate::DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::client::operations_to_checkpoint_log(&[pending])),
+            Arc::clone(client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+        )
+    }
+
+    /// A waiting step whose record turns terminal returns the recorded
+    /// outcome in the invocation, without running the body and without an
+    /// `operation_replayed` event.
+    #[tokio::test(start_paused = true)]
+    async fn pending_step_returns_terminal_record_in_invocation() {
+        let (events, _guard) = crate::driver::test_support::EventMessages::install();
+        let client = Arc::new(RefreshClient::new(|req| {
+            let mut ops = Vec::new();
+            if req.empty_number == 1 {
+                ops.push(
+                    operation_like(&flaky_update(), OperationStatus::Succeeded)
+                        .step_details(StepDetails::builder().attempt(2).result("5").build())
+                        .build()
+                        .expect("all required fields set"),
+                );
+            }
+            Ok(ops)
+        }));
+        let ctx = pending_flaky_ctx(&client);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let body_runs = Arc::clone(&runs);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let mut flaky = std::pin::pin!(
+                ctx.step(move |_| async move {
+                    body_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, crate::BoxError>(7)
+                })
+                .name("flaky")
+                .spawn()
+            );
+            poll_once(flaky.as_mut()).await;
+            sleeping_step(&ctx).await?;
+            let value = flaky.await.map_err(wire_err)?;
+            Ok(value.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("5".to_owned()));
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the body never ran");
+        assert_eq!(
+            events.replayed(),
+            0,
+            "a resumed record emits no replay event"
+        );
+    }
+
+    /// A waiting step whose record turns FAILED returns the recorded error
+    /// in the invocation, without running the body and without an
+    /// `operation_replayed` event.
+    #[tokio::test(start_paused = true)]
+    async fn pending_step_returns_failed_record_in_invocation() {
+        let (events, _guard) = crate::driver::test_support::EventMessages::install();
+        let client = Arc::new(RefreshClient::new(|req| {
+            let mut ops = Vec::new();
+            if req.empty_number == 1 {
+                ops.push(
+                    operation_like(&flaky_update(), OperationStatus::Failed)
+                        .step_details(
+                            StepDetails::builder()
+                                .attempt(2)
+                                .error(
+                                    ErrorObject::builder()
+                                        .error_type("PaymentError")
+                                        .error_message("declined")
+                                        .build(),
+                                )
+                                .build(),
+                        )
+                        .build()
+                        .expect("all required fields set"),
+                );
+            }
+            Ok(ops)
+        }));
+        let ctx = pending_flaky_ctx(&client);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let body_runs = Arc::clone(&runs);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let mut flaky = std::pin::pin!(
+                ctx.step(move |_| async move {
+                    body_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, crate::BoxError>(7)
+                })
+                .name("flaky")
+                .spawn()
+            );
+            poll_once(flaky.as_mut()).await;
+            sleeping_step(&ctx).await?;
+            let err = flaky.await.expect_err("the recorded failure returns");
+            let error_type = err
+                .wire()
+                .and_then(crate::WireError::error_type)
+                .unwrap_or_default()
+                .to_owned();
+            Ok(error_type)
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(
+            outcome,
+            InvocationOutcome::Complete("PaymentError".to_owned())
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the body never ran");
+        assert_eq!(
+            events.replayed(),
+            0,
+            "a resumed record emits no replay event"
+        );
+    }
+
+    /// The identity of the first root step, named `flaky`, as an update.
+    fn flaky_update() -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(crate::engine::compute_wire_id_public("1"))
+            .r#type(OperationType::Step)
+            .sub_type(super::STEP_SUB_TYPE)
+            .name("flaky")
+            .action(OperationAction::Start)
+            .build()
+            .expect("all required fields set")
     }
 }

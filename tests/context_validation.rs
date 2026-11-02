@@ -92,6 +92,67 @@ async fn context_used_inside_step_body_fails() {
     assert_context_usage_failure(&result, &message_b("step", "1"));
 }
 
+/// A capture whose `Clone` implementation claims a durable operation.
+///
+/// The SDK clones a step body before each attempt, and a terminal record
+/// replays without cloning. So a claim inside `clone` must fail the
+/// execution as a claim inside the body does.
+struct CloneCallsWait(DurableContext);
+
+impl Clone for CloneCallsWait {
+    fn clone(&self) -> Self {
+        drop(self.0.wait(Duration::from_secs(1)).name("in-clone"));
+        Self(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn context_used_inside_step_capture_clone_fails() {
+    let result = LocalRunner::new()
+        .run(
+            |_event: (), ctx: DurableContext| async move {
+                let capture = CloneCallsWait(ctx.clone());
+                let value = ctx
+                    .step(move |_| async move {
+                        let _capture = capture;
+                        Ok(1_u32)
+                    })
+                    .name("outer")
+                    .await?;
+                Ok::<_, durable::BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_context_usage_failure(&result, &message_b("wait", "1"));
+}
+
+#[tokio::test]
+#[expect(clippy::expect_used)] // reason: the queued reply encodes a string, which cannot fail
+async fn context_used_inside_submitter_capture_clone_fails() {
+    let result = LocalRunner::new()
+        .callback(CallbackReply::success(&"approved".to_owned()).expect("encodes"))
+        .run(
+            |_event: (), ctx: DurableContext| async move {
+                let capture = CloneCallsWait(ctx.clone());
+                let value: String = ctx
+                    .wait_for_callback::<String, _, _>(move |_step_ctx, _callback_id| async move {
+                        let _capture = capture;
+                        Ok(())
+                    })
+                    .name("approval")
+                    .await?;
+                Ok::<_, durable::BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    // wait_for_callback "1" runs its submitter step as "1-2".
+    assert_context_usage_failure(&result, &message_b("wait", "1-2"));
+}
+
 #[tokio::test]
 async fn context_used_inside_condition_check_fails() {
     let result = LocalRunner::new()

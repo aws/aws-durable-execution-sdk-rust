@@ -208,8 +208,9 @@ pub mod event_names {
     /// The SDK recorded an operation's permanent failure.
     pub const OPERATION_FAILED: &str = "operation_failed";
 
-    /// A retry strategy scheduled another attempt; the execution suspends
-    /// for the recorded delay.
+    /// A retry strategy scheduled another attempt after the recorded delay.
+    /// The operation waits for that delay. The invocation suspends during
+    /// the wait only when no other SDK work can make progress.
     pub const OPERATION_RETRY_SCHEDULED: &str = "operation_retry_scheduled";
 
     /// A recorded terminal outcome was returned without re-running the

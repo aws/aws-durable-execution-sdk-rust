@@ -298,7 +298,7 @@ pub(crate) struct WaitForCallbackExecution<O, F, S> {
 impl<O, F, Fut, S> WaitForCallbackExecution<O, F, S>
 where
     O: DeserializeOwned + Serialize + Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
@@ -593,7 +593,7 @@ async fn run_wfcb_body<O, F, Fut, S>(
 ) -> Result<O, OperationError>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
@@ -2404,5 +2404,103 @@ mod coordinator_tests {
             format!("{err:#}").contains(crate::task::NO_RUNTIME_MESSAGE),
             "unexpected error: {err:#}"
         );
+    }
+
+    /// The first unnamed step update with `action` among `updates`: the
+    /// submitter step of a `wait_for_callback`.
+    fn submitter<'a>(
+        updates: &'a [OperationUpdate],
+        action: &OperationAction,
+    ) -> Option<&'a OperationUpdate> {
+        updates.iter().find(|u| {
+            u.r#type() == &OperationType::Step && u.name().is_none() && u.action() == action
+        })
+    }
+
+    /// The submitter step record of `update` with `status` after attempt 1.
+    fn submitter_record(
+        req: &crate::driver::test_support::RefreshRequest<'_>,
+        update: &OperationUpdate,
+        status: OperationStatus,
+        next_in: Option<std::time::Duration>,
+    ) -> Operation {
+        let mut details = aws_sdk_lambda::types::StepDetails::builder().attempt(1);
+        if let Some(next_in) = next_in {
+            details = details.next_attempt_timestamp(req.timestamp_in(next_in));
+        }
+        operation_like(update, status)
+            .step_details(details.build())
+            .build()
+            .expect("all required fields set")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submitter_retry_runs_in_invocation() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+        let client = Arc::new(crate::driver::test_support::RefreshClient::new(|req| {
+            let mut ops = crate::driver::test_support::callback_starts(req.updates);
+            if let Some(retry) = submitter(req.updates, &OperationAction::Retry) {
+                ops.push(submitter_record(
+                    req,
+                    retry,
+                    OperationStatus::Pending,
+                    Some(Duration::from_secs(1)),
+                ));
+            }
+            if req.empty_number == 1
+                && let Some(retry) = submitter(req.history, &OperationAction::Retry)
+            {
+                ops.push(submitter_record(req, retry, OperationStatus::Ready, None));
+            }
+            if req.empty_number >= 2
+                && let Some(start) = req.history.iter().find(|u| {
+                    u.r#type() == &OperationType::Callback && u.action() == &OperationAction::Start
+                })
+            {
+                ops.push(succeeded(start));
+            }
+            Ok(ops)
+        }));
+        let ctx = crate::driver::test_support::refresh_ctx(&client);
+        let runs = Arc::new(AtomicU32::new(0));
+        let submitter_runs = Arc::clone(&runs);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let wfcb = ctx
+                .wait_for_callback::<String, _, _>(move |_, _callback_id| {
+                    let runs = Arc::clone(&submitter_runs);
+                    async move {
+                        if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return Err("transient".into());
+                        }
+                        Ok(())
+                    }
+                })
+                .name("wfcb")
+                .submitter_retry(|_err, attempt| {
+                    if attempt < 2 {
+                        crate::RetryDecision::Retry {
+                            delay: Duration::from_secs(1),
+                        }
+                    } else {
+                        crate::RetryDecision::Stop
+                    }
+                })
+                .future();
+            let step = ctx
+                .step(|_| async {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Ok(1_u32)
+                })
+                .name("s")
+                .future();
+            let (result, step) = tokio::join!(wfcb, step);
+            step.map_err(wire_err)?;
+            result.map_err(wire_err)
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("ok".to_owned()));
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "the submitter ran twice");
     }
 }

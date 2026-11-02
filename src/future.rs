@@ -657,6 +657,7 @@ mod tests {
     /// body down without unwinding anything into the caller.
     #[tokio::test]
     async fn dropped_spawned_future_cancels_task_without_panic() {
+        #[derive(Clone)]
         struct DropGuard(Arc<AtomicBool>);
         impl Drop for DropGuard {
             fn drop(&mut self) {

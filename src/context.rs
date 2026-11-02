@@ -94,6 +94,17 @@ pub(crate) fn run_body<F: Future>(body: ActiveBody, fut: F) -> impl Future<Outpu
     ACTIVE_BODY.scope(body, fut)
 }
 
+/// Calls `f` with `body` as the active body.
+///
+/// A step clones the user closure before each attempt. The clone runs the
+/// captures' `Clone` implementations, which are user code. A terminal
+/// record replays without cloning. So an operation claimed inside a clone
+/// would claim an ID on a live attempt only. This scope makes such a claim
+/// fail the execution with a context usage error instead.
+pub(crate) fn run_body_sync<R>(body: ActiveBody, f: impl FnOnce() -> R) -> R {
+    ACTIVE_BODY.sync_scope(body, f)
+}
+
 /// The time left from `now` until `deadline_ms` (milliseconds since the
 /// Unix epoch): `None` when the deadline is 0, `Duration::ZERO` once it
 /// passed.
@@ -2329,6 +2340,11 @@ impl DurableContext {
     /// result is checkpointed on success; on failure the retry strategy
     /// determines whether to retry.
     ///
+    /// The step body is `FnOnce + Clone`. The SDK keeps the original closure
+    /// and calls a fresh clone of it for each attempt. Each capture follows
+    /// its type's `Clone` implementation: a cloned `Vec` or `String` has its
+    /// own contents, and a cloned `Arc` shares its allocation.
+    ///
     /// The operation ID is claimed synchronously at this call site.
     ///
     /// # Examples
@@ -2349,7 +2365,7 @@ impl DurableContext {
     /// ```
     pub fn step<O, F, Fut>(&self, f: F) -> StepBuilder<O, F, Fut>
     where
-        F: FnOnce(StepContext) -> Fut + Send + 'static,
+        F: FnOnce(StepContext) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
         O: Send + 'static,
     {
@@ -2630,6 +2646,11 @@ impl DurableContext {
     /// [`String`] and is responsible for delivering it to the external
     /// system that will complete it.
     ///
+    /// The submitter is `FnOnce + Clone`. The SDK keeps the original closure
+    /// and calls a fresh clone of it for each attempt. Each capture follows
+    /// its type's `Clone` implementation: a cloned `Vec` or `String` has its
+    /// own contents, and a cloned `Arc` shares its allocation.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -2655,7 +2676,7 @@ impl DurableContext {
     /// ```
     pub fn wait_for_callback<O, F, Fut>(&self, submitter: F) -> WaitForCallbackBuilder<O, F, Fut>
     where
-        F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+        F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
         O: DeserializeOwned + Send + 'static,
     {

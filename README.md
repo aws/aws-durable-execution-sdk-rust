@@ -310,6 +310,17 @@ than once per retry attempt if an interruption occurs in that window. Design
 step bodies to be idempotent, or use `StepSemantics::AtMostOncePerRetry` to
 treat an interrupted attempt as a failure rather than re-executing it.
 
+A step body is `FnOnce + Clone`. The SDK keeps the original closure and calls
+a fresh clone of it for each attempt. Each capture follows its type's `Clone`
+implementation: a cloned `Vec` or `String` has its own contents, and a cloned
+`Arc` shares its allocation. A later invocation runs the handler again and
+builds the step closure again; state that comes from outside that handler call
+can still be shared. A retry whose delay ends while other work runs makes its
+attempt in the same invocation. Wrap a capture that is not `Clone` in an
+`Arc`. A value the body must consume, such as a `oneshot::Sender`, can go in an
+`Arc<std::sync::Mutex<Option<_>>>`; every clone shares that `Arc`, so the first
+attempt that takes the value consumes it.
+
 ```rust ignore
 let value = ctx
     .step(|_| async { Ok("step completed".to_owned()) })
@@ -318,9 +329,10 @@ let value = ctx
 
 Add `.retry_strategy(...)` to turn transient failures into retries. The
 strategy takes the error and the 1-based attempt number and returns
-`RetryDecision::Retry { delay }` or `RetryDecision::Stop`. The execution
-suspends for the delay between attempts, so a retrying step does not hold the
-invocation open.
+`RetryDecision::Retry { delay }` or `RetryDecision::Stop`. Between attempts
+the step waits for the delay. The invocation suspends during that wait only
+when no other SDK work can make progress, so a lone retrying step does not
+hold the invocation open.
 
 ```rust ignore
 let result = ctx

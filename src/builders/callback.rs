@@ -253,7 +253,7 @@ impl<O, F, Fut, S> std::fmt::Debug for WaitForCallbackBuilder<O, F, Fut, S> {
 impl<O, F, Fut> WaitForCallbackBuilder<O, F, Fut>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
 {
     /// Creates a new builder (internal). Taking the submitter here keeps
@@ -277,7 +277,7 @@ where
 impl<O, F, Fut, S> WaitForCallbackBuilder<O, F, Fut, S>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
 {
     /// Sets a human-readable name for this operation.
@@ -409,7 +409,7 @@ where
 impl<O, F, Fut, S> WaitForCallbackBuilder<O, F, Fut, S>
 where
     O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
@@ -448,7 +448,7 @@ where
 impl<O, F, Fut, S> IntoFuture for WaitForCallbackBuilder<O, F, Fut, S>
 where
     O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
-    F: FnOnce(StepContext, String) -> Fut + Send + 'static,
+    F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     S: Serdes<O>,
 {

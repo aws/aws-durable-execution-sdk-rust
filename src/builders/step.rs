@@ -77,7 +77,7 @@ impl<O, F, Fut, S> std::fmt::Debug for StepBuilder<O, F, Fut, S> {
 impl<O, F, Fut> StepBuilder<O, F, Fut>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext) -> Fut + Send + 'static,
+    F: FnOnce(StepContext) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     /// Creates a new step builder (internal). Taking the closure here keeps
@@ -99,7 +99,7 @@ where
 impl<O, F, Fut, S> StepBuilder<O, F, Fut, S>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext) -> Fut + Send + 'static,
+    F: FnOnce(StepContext) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     /// Sets a human-readable name for this step.
@@ -246,7 +246,7 @@ where
 impl<O, F, Fut, S> StepBuilder<O, F, Fut, S>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext) -> Fut + Send + 'static,
+    F: FnOnce(StepContext) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
@@ -297,7 +297,7 @@ where
 impl<O, F, Fut, S> IntoFuture for StepBuilder<O, F, Fut, S>
 where
     O: Send + 'static,
-    F: FnOnce(StepContext) -> Fut + Send + 'static,
+    F: FnOnce(StepContext) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
