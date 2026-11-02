@@ -8,9 +8,14 @@
 //! individual failures. Errors inside the settled results are preserved through
 //! checkpointing, so replay reproduces the same successes and failures.
 //!
+//! A rejected item is a child-context error that carries the input's recorded
+//! failure in its `wire()` record, on the first run and on replay alike. So
+//! match on the `wire()` fields rather than on the kind of the input that
+//! failed.
+//!
 //! This example joins one succeeding and one failing step and summarizes both
 //! outcomes, completing successfully because `join_all` does not propagate the
-//! failure.
+//! failure. Its output is `ok:1,err:operation error: child_context`.
 //!
 //! [`join_all`]: aws_durable_execution_sdk::DurableContext::join_all
 //! [`Settled`]: aws_durable_execution_sdk::Settled

@@ -22,6 +22,12 @@ use crate::future::{DurableFuture, Settled};
 /// Awaits all futures concurrently and returns `Vec<O>` on success,
 /// or propagates the first [`OperationError`] encountered.
 ///
+/// The returned value has passed through the combinator's JSON encoding,
+/// so it equals the value replay returns.
+///
+/// When the combinator resolves, it cancels every input that is still
+/// running. A cancelled input stops at its next `.await`.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -141,6 +147,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// Never short-circuits: every future runs to completion regardless
 /// of individual failures.
 ///
+/// A rejected item is a `ChildContext` error of kind `ChildFailed` whose
+/// `wire()` carries the input's recorded failure, on the first run and on
+/// replay. Match on the `err.wire()` fields, not on the kind of the input
+/// that failed. `join_all` cancels no input.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -256,7 +267,13 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
 /// Builder for [`DurableContext::select_ok`]: first success wins.
 ///
-/// Returns the first successful `O`; losers are cancelled.
+/// Returns the first successful `O`.
+///
+/// The returned value has passed through the combinator's JSON encoding,
+/// so it equals the value replay returns.
+///
+/// When the combinator resolves, it cancels every input that is still
+/// running. A cancelled input stops at its next `.await`.
 ///
 /// # Examples
 ///
@@ -372,7 +389,13 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
 /// Builder for [`DurableContext::race`]: first settled wins.
 ///
-/// Returns the first result (success or failure); losers are cancelled.
+/// Returns the first result (success or failure).
+///
+/// The returned value has passed through the combinator's JSON encoding,
+/// so it equals the value replay returns.
+///
+/// When the combinator resolves, it cancels every input that is still
+/// running. A cancelled input stops at its next `.await`.
 ///
 /// # Examples
 ///

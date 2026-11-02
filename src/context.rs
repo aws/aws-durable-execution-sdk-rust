@@ -2881,6 +2881,15 @@ impl DurableContext {
     /// Returns `Vec<O>` on success, or the first `OperationError`
     /// encountered.
     ///
+    /// The returned value has passed through the combinator's JSON
+    /// encoding: the SDK decodes the payload it recorded and returns that.
+    /// So the first run returns the value a replay returns, and data that
+    /// the value's serde form omits, such as a `#[serde(skip)]` field, is
+    /// absent on both paths.
+    ///
+    /// When the combinator resolves, it cancels every input that is still
+    /// running. A cancelled input stops at its next `.await`.
+    ///
     /// # Empty input
     ///
     /// Called with no futures, resolves to `Ok` with an empty `Vec`,
@@ -2922,6 +2931,15 @@ impl DurableContext {
     /// Never fails fast: all futures run to completion regardless of
     /// individual errors.
     ///
+    /// A rejected item is a
+    /// [`OperationErrorKind::ChildContext`](crate::OperationErrorKind::ChildContext)
+    /// error of kind
+    /// [`ChildContextErrorKind::ChildFailed`](crate::ChildContextErrorKind::ChildFailed),
+    /// whose `wire()` carries the input's recorded failure (`error_type`,
+    /// message, `error_data`), on the first run and on replay. Match on the
+    /// `err.wire()` fields, not on the kind of the input that failed.
+    /// `join_all` cancels no input.
+    ///
     /// # Empty input
     ///
     /// Called with no futures, resolves to `Ok` with an empty `Vec`,
@@ -2960,7 +2978,15 @@ impl DurableContext {
 
     /// Returns the first successful result.
     ///
-    /// Losers are dropped (cancelled) when the first success resolves.
+    /// When the combinator resolves, it cancels every input that is still
+    /// running. A cancelled input stops at its next `.await`.
+    ///
+    /// The returned value has passed through the combinator's JSON
+    /// encoding: the SDK decodes the payload it recorded and returns that.
+    /// So the first run returns the value a replay returns, and data that
+    /// the value's serde form omits, such as a `#[serde(skip)]` field, is
+    /// absent on both paths.
+    ///
     /// If every future fails, the operation fails with
     /// [`CombinatorErrorKind::AllFailed`](crate::CombinatorErrorKind::AllFailed)
     /// preserving each future's error (see [`CombinatorError::failures`](crate::CombinatorError::failures)).
@@ -3004,7 +3030,15 @@ impl DurableContext {
 
     /// Returns the first settled result, whether success or failure.
     ///
-    /// Losers are dropped (cancelled) when the first future resolves.
+    /// When the combinator resolves, it cancels every input that is still
+    /// running. A cancelled input stops at its next `.await`.
+    ///
+    /// The returned value has passed through the combinator's JSON
+    /// encoding: the SDK decodes the payload it recorded and returns that.
+    /// So the first run returns the value a replay returns, and data that
+    /// the value's serde form omits, such as a `#[serde(skip)]` field, is
+    /// absent on both paths.
+    ///
     /// When the first settled outcome is a failure, the operation fails
     /// with
     /// [`CombinatorErrorKind::FirstSettledFailed`](crate::CombinatorErrorKind::FirstSettledFailed)

@@ -17,9 +17,16 @@
 //! collection (matching `futures-rs`); `select_ok` and `race` fail with
 //! `CombinatorErrorKind::EmptyInput` since no winner can exist.
 //!
-//! Losers are dropped (cancelled) when a combinator resolves; each
-//! combinator runs inside a child context so the combined result is
-//! checkpointed atomically.
+//! When `try_join_all`, `select_ok` or `race` resolves, it cancels every
+//! input that is still running, and a cancelled input stops at its next
+//! `.await`. `join_all` cancels nothing. Each combinator runs inside a
+//! child context so the combined result is checkpointed atomically.
+//!
+//! A combinator's first run returns the value decoded from the payload it
+//! just recorded, with the same helper its replay path uses. So the first
+//! run returns what a replay of the record returns: a `join_all` rejection
+//! is `ChildContext(ChildFailed)` on both paths, and a value whose serde
+//! form omits data omits it on both paths.
 //!
 //! Each input runs on its own task in the combinator's join set
 //! ([`spawn_constituent`]). An input that waits (a pending wait, an
@@ -280,8 +287,13 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         let serialized = serde_json::to_string(&collected)
             .map_err(|e| combinator_internal_error(&format!("serialization failed: {e}")))?;
         checkpoint_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized).await?;
+        drop(collected);
 
-        Ok(collected)
+        // Return the value decoded from the payload just written, so the
+        // first run returns what a replay of this record returns: a value
+        // whose serde form drops data loses it on both paths, and a decode
+        // failure is the same `Combinator(Internal)` error on both paths.
+        replay_vec_success::<O>(Some(&serialized))
     }
 }
 
@@ -452,8 +464,13 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
                 .map_err(|e| combinator_internal_error(&format!("serialization failed: {e}")))?
         };
         checkpoint_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized).await?;
+        drop(collected);
 
-        Ok(collected)
+        // Return the outcomes decoded from the payload just written, so the
+        // first run returns what a replay of this record returns: every
+        // rejected item is a `ChildContext(ChildFailed)` error whose
+        // `wire()` carries the input's recorded failure, on both paths.
+        replay_settled_success::<O>(Some(&serialized))
     }
 }
 
@@ -470,7 +487,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
     ///
     /// Live path: races all futures; returns the first success.
     /// If all fail, returns `CombinatorError::AllFailed` with all error messages.
-    /// Losers are dropped (cancelled) on first success.
+    /// On the first success it cancels every input that is still running;
+    /// a cancelled input stops at its next `.await`.
     /// Replay path: returns the frozen winner.
     #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
@@ -567,7 +585,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                     })?;
                     checkpoint_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized)
                         .await?;
-                    return Ok(value);
+                    drop(value);
+                    // Return the winner decoded from the payload just
+                    // written, so the first run returns what replay returns.
+                    return replay_single_success::<O>(Some(&serialized));
                 }
                 (idx, Err(op_err)) => {
                     errors.push((idx, Box::new(op_err)));
@@ -643,7 +664,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
     /// Executes the `race` combinator.
     ///
     /// Live path: races all futures; returns the first settled (success OR
-    /// failure). Losers are dropped (cancelled).
+    /// failure), and cancels every input that is still running; a
+    /// cancelled input stops at its next `.await`.
     /// Replay path: returns the frozen result.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         self.ctx.enforce_task_ownership()?;
@@ -747,7 +769,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                     combinator_internal_error(&format!("serialization failed: {e}"))
                 })?;
                 checkpoint_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized).await?;
-                Ok(value)
+                drop(value);
+                // Return the winner decoded from the payload just written,
+                // so the first run returns what replay returns.
+                replay_single_success::<O>(Some(&serialized))
             }
             Err(op_err) => {
                 // Winner is a failure: race propagates it. The losing
@@ -2518,6 +2543,297 @@ mod tests {
         // Must succeed, no ownership errors.
         let value = result.unwrap();
         assert_eq!(value, "fast");
+    }
+
+    // === live value equals replayed value (issue #111) ===
+
+    /// A value whose serde form omits `cached`, so a JSON round trip drops it.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Tagged {
+        value: u32,
+        #[serde(skip)]
+        cached: Option<String>,
+    }
+
+    /// An input that resolves to a `Tagged` carrying live-only data.
+    fn tagged_input() -> DurableFuture<Tagged> {
+        DurableFuture::from_async(async {
+            Ok(Tagged {
+                value: 7,
+                cached: Some("live-only".to_owned()),
+            })
+        })
+    }
+
+    /// An input that fails with a typed wire record.
+    fn failing_input<O: Send + 'static>() -> DurableFuture<O> {
+        DurableFuture::from_async(async {
+            Err(
+                OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
+                    CombinatorErrorKind::Internal,
+                    vec!["input failed".to_owned().into()],
+                )))
+                .with_wire(crate::error::WireError::new(
+                    Some("InputFailure"),
+                    Some("input failed"),
+                )),
+            )
+        })
+    }
+
+    /// Returns the payload of the one SUCCEED update the client recorded.
+    fn succeed_payload(client: &InMemoryExecutionClient) -> String {
+        let succeeds: Vec<String> = client
+            .recorded_updates()
+            .iter()
+            .filter(|u| u.action() == &aws_sdk_lambda::types::OperationAction::Succeed)
+            .map(|u| u.payload().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(succeeds.len(), 1, "one SUCCEED update: {succeeds:?}");
+        succeeds[0].clone()
+    }
+
+    /// A context whose log holds a SUCCEED record at positional ID "1"
+    /// carrying `payload`, so the first combinator replays it.
+    fn replay_ctx(payload: &str) -> DurableContext {
+        let (wire_id, record) = succeeded_record("1", payload);
+        test_ctx(CheckpointLog::from_records(vec![(wire_id, record)]))
+    }
+
+    #[tokio::test]
+    async fn try_join_all_live_value_equals_replay() {
+        let (ctx, client) = recording_ctx(CheckpointLog::empty());
+        let op_id = ctx.mint_id();
+        let live = TryJoinAllExecution {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![tagged_input(), tagged_input()],
+        }
+        .execute()
+        .await
+        .unwrap();
+        let payload = succeed_payload(&client);
+
+        let ctx = replay_ctx(&payload);
+        let op_id = ctx.mint_id();
+        let replayed = TryJoinAllExecution::<Tagged> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        }
+        .execute()
+        .await
+        .unwrap();
+
+        assert_eq!(live, replayed);
+        assert!(live.iter().all(|t| t.cached.is_none() && t.value == 7));
+    }
+
+    /// Renders a `join_all` result so a live and a replayed run compare.
+    fn render_settled(settled: &[Settled<Tagged>]) -> Vec<String> {
+        settled
+            .iter()
+            .map(|s| match s {
+                Settled::Fulfilled(t) => format!("ok:{}:{:?}", t.value, t.cached),
+                Settled::Rejected(err) => format!(
+                    "err:{:?}:{:?}:{:?}",
+                    err.kind(),
+                    err.wire().and_then(crate::error::WireError::error_type),
+                    err.wire().and_then(crate::error::WireError::error_message),
+                ),
+            })
+            .collect()
+    }
+
+    /// Runs `join_all` live over one `Tagged` input and one failing input,
+    /// and returns the result with the SUCCEED payload it wrote.
+    async fn join_all_live() -> (Vec<Settled<Tagged>>, String) {
+        let (ctx, client) = recording_ctx(CheckpointLog::empty());
+        let op_id = ctx.mint_id();
+        let live = JoinAllExecution {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![tagged_input(), failing_input()],
+        }
+        .execute()
+        .await
+        .unwrap();
+        (live, succeed_payload(&client))
+    }
+
+    #[tokio::test]
+    async fn join_all_live_value_equals_replay() {
+        let (live, payload) = join_all_live().await;
+
+        let ctx = replay_ctx(&payload);
+        let op_id = ctx.mint_id();
+        let replayed = JoinAllExecution::<Tagged> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        }
+        .execute()
+        .await
+        .unwrap();
+
+        assert_eq!(render_settled(&live), render_settled(&replayed));
+        assert!(live.iter().all(|s| match s {
+            Settled::Fulfilled(t) => t.cached.is_none(),
+            _ => true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn join_all_live_rejection_is_child_failed() {
+        let (live, payload) = join_all_live().await;
+
+        let Some(Settled::Rejected(err)) = live.get(1) else {
+            panic!("item 1 must be rejected: {live:?}");
+        };
+        let OperationErrorKind::ChildContext(child) = err.kind() else {
+            panic!("expected a ChildContext error, got {:?}", err.kind());
+        };
+        assert!(matches!(child.kind(), ChildContextErrorKind::ChildFailed));
+
+        let recorded: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let recorded_type = recorded[1]["error_type"].as_str();
+        assert_eq!(recorded_type, Some("InputFailure"));
+        assert_eq!(
+            err.wire().and_then(crate::error::WireError::error_type),
+            recorded_type
+        );
+    }
+
+    #[tokio::test]
+    async fn select_ok_live_value_equals_replay() {
+        let (ctx, client) = recording_ctx(CheckpointLog::empty());
+        let op_id = ctx.mint_id();
+        let live = SelectOkExecution {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![tagged_input()],
+        }
+        .execute()
+        .await
+        .unwrap();
+        let payload = succeed_payload(&client);
+
+        let ctx = replay_ctx(&payload);
+        let op_id = ctx.mint_id();
+        let replayed = SelectOkExecution::<Tagged> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        }
+        .execute()
+        .await
+        .unwrap();
+
+        assert_eq!(live, replayed);
+        assert_eq!(live.cached, None);
+    }
+
+    #[tokio::test]
+    async fn race_live_value_equals_replay() {
+        let (ctx, client) = recording_ctx(CheckpointLog::empty());
+        let op_id = ctx.mint_id();
+        let live = RaceExecution {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![tagged_input()],
+        }
+        .execute()
+        .await
+        .unwrap();
+        let payload = succeed_payload(&client);
+
+        let ctx = replay_ctx(&payload);
+        let op_id = ctx.mint_id();
+        let replayed = RaceExecution::<Tagged> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        }
+        .execute()
+        .await
+        .unwrap();
+
+        assert_eq!(live, replayed);
+        assert_eq!(live.cached, None);
+    }
+
+    /// A type whose `Serialize` writes `0` and whose `Deserialize` always
+    /// fails, so the payload a combinator writes cannot be decoded.
+    #[derive(Debug)]
+    struct Unreadable;
+
+    impl Serialize for Unreadable {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_u32(0)
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for Unreadable {
+        fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+            Err(serde::de::Error::custom("unreadable"))
+        }
+    }
+
+    /// Returns the message of a `Combinator(Internal)` error.
+    fn internal_message(err: &OperationError) -> String {
+        let OperationErrorKind::Combinator(ce) = err.kind() else {
+            panic!("expected a Combinator error, got {:?}", err.kind());
+        };
+        assert!(
+            matches!(ce.kind(), CombinatorErrorKind::Internal),
+            "expected Internal, got {:?}",
+            ce.kind()
+        );
+        ce.failures()[0].to_string()
+    }
+
+    #[tokio::test]
+    async fn try_join_all_live_decode_failure_matches_replay() {
+        let (ctx, client) = recording_ctx(CheckpointLog::empty());
+        let op_id = ctx.mint_id();
+        let live = TryJoinAllExecution {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![DurableFuture::from_async(async { Ok(Unreadable) })],
+        }
+        .execute()
+        .await
+        .unwrap_err();
+        let payload = succeed_payload(&client);
+        assert_eq!(payload, "[0]");
+
+        let ctx = replay_ctx(&payload);
+        let op_id = ctx.mint_id();
+        let replayed = TryJoinAllExecution::<Unreadable> {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![],
+        }
+        .execute()
+        .await
+        .unwrap_err();
+
+        let live_message = internal_message(&live);
+        assert_eq!(live_message, internal_message(&replayed));
+        assert!(
+            live_message.starts_with("replay deserialization failed"),
+            "{live_message}"
+        );
     }
 }
 

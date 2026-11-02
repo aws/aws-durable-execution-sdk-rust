@@ -506,3 +506,61 @@ async fn select_ok_all_failed_loser_identities_survive_replay() {
         "live and replayed losers must be indistinguishable: {seen:#?}"
     );
 }
+
+/// A rejected `join_all` item has the same error kind on the first run and
+/// on replay: `ChildContext` on both, not the failed input's own `Step`
+/// kind on the first run (issue #111).
+#[tokio::test]
+async fn join_all_rejection_kind_matches_live_and_replay() {
+    let observed: Arc<Mutex<Vec<(bool, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_clone = Arc::clone(&observed);
+
+    let result = LocalRunner::new()
+        .run(
+            move |_event: (), ctx: durable::DurableContext| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let good = ctx.step(|_| async { Ok(1_u32) }).name("good").future();
+                    let bad = ctx
+                        .step(|_| async { Err::<u32, durable::BoxError>("boom".into()) })
+                        .name("bad")
+                        .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                        .future();
+
+                    let settled = ctx.join_all([good, bad]).name("collect").await?;
+                    let family = settled
+                        .iter()
+                        .find_map(|outcome| match outcome {
+                            durable::Settled::Rejected(err) => Some(match err.kind() {
+                                OperationErrorKind::Step(_) => "Step",
+                                OperationErrorKind::ChildContext(_) => "ChildContext",
+                                _ => "other",
+                            }),
+                            _ => None,
+                        })
+                        .unwrap_or("none");
+                    if let Ok(mut seen) = observed.lock() {
+                        seen.push((ctx.is_replaying(), family.to_owned()));
+                    }
+
+                    ctx.wait(Duration::from_secs(1)).name("suspend").await?;
+                    Ok::<_, durable::BoxError>("done".to_owned())
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+
+    assert!(
+        result.is_success(),
+        "handler should complete: {:?}",
+        result.error_message()
+    );
+    let seen = observed.lock().expect("observation lock").clone();
+    assert_eq!(seen.len(), 2, "one record per invocation: {seen:?}");
+    assert!(
+        seen.iter().all(|(_, family)| family == "ChildContext"),
+        "the rejected item is a ChildContext error live and on replay: {seen:?}"
+    );
+}

@@ -293,7 +293,7 @@ durable::wrap(handler, options);
 | `ctx.parallel(branches)` | Runs named branches concurrently. |
 | `ctx.try_join_all(futures)` | Collects every result, failing on the first error. |
 | `ctx.join_all(futures)` | Collects every outcome as `Settled<O>`, never failing fast. |
-| `ctx.select_ok(futures)` | Returns the first success and drops the losers. |
+| `ctx.select_ok(futures)` | Returns the first success and cancels the inputs still running. |
 | `ctx.race(futures)` | Returns the first outcome to settle, success or failure. |
 
 ### step
@@ -720,6 +720,13 @@ The four combinators take `DurableFuture` values, which `.future()` and
 that waits stays pending. When every remaining input waits and nothing else
 runs, the invocation suspends.
 
+A combinator returns the value decoded from the payload it records, so the
+first run returns the value a replay returns. A `join_all` rejection is
+therefore a child-context error whose `wire()` carries the input's recorded
+failure on both paths. When `try_join_all`, `select_ok` or `race` resolves,
+it cancels every input that is still running, and a cancelled input stops at
+its next `.await`. `join_all` cancels nothing.
+
 `try_join_all` collects every result, propagating the first error:
 
 ```rust ignore
@@ -751,7 +758,7 @@ for outcome in &settled {
 }
 ```
 
-`select_ok` returns the first success, dropping losers:
+`select_ok` returns the first success, cancelling the inputs still running:
 
 ```rust ignore
 let primary = ctx
