@@ -874,6 +874,18 @@ and `.serdes(...)` swaps that parameter; `.await` still produces a
 with different serdes implementations coexist in one combinator input
 collection. `WaitBuilder` and the combinator builders carry no serdes
 method because their payloads are structural, not user-typed.
+`MapBuilder` and `ParallelBuilder` also carry a result serdes, set with
+`.result_serdes(...)`, which defaults to `PassthroughSerdes`, not
+`JsonSerdes`.
+
+On `MapBuilder` and `ParallelBuilder` the two serdes do different jobs.
+The item `.serdes(...)` is a `Serdes<O>` for each item's value, as on any
+other operation. `.result_serdes(...)` is a `Serdes<String>` over the
+batch record's JSON text, in the shape of the JS SDK's batch result. It
+must be lossless: its deserializer must return the exact record text its
+serializer received, though the stored payload may use any format.
+`PassthroughSerdes` stores the record text unchanged, and `JsonSerdes`
+stores it as a quoted JSON string.
 
 There is no execution-wide serdes slot: a single trait-object slot cannot
 represent `Serdes<T>` for every operation output type without erasing the

@@ -113,6 +113,7 @@ dependencies = [
  "aws-smithy-mocks",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "ciborium",
  "lambda_runtime",
  "serde",
  "serde_json",

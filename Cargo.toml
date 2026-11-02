@@ -208,6 +208,9 @@ aws-smithy-mocks = "0.3"
 aws-smithy-http-client = { version = "1", default-features = false, features = ["test-util"] }
 aws-sdk-lambda = { version = "1", default-features = false, features = ["test-util"] }
 tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
+# A CBOR result serdes in the batch record tests stores the record in a
+# binary format.
+ciborium = "0.2"
 
 [[test]]
 name = "nondeterminism"
@@ -259,4 +262,8 @@ required-features = ["test-util"]
 
 [[test]]
 name = "batch_result_views"
+required-features = ["test-util"]
+
+[[test]]
+name = "batch_item_exact_values"
 required-features = ["test-util"]

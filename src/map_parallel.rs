@@ -39,6 +39,7 @@ use crate::error::{
 };
 use crate::serdes::SerdesContext;
 use crate::task::{NoRuntime, TaskOutcome, TrackedJoinSet};
+use serde_json::value::RawValue;
 
 /// Wire sub-type for map operations.
 pub(crate) const MAP_SUB_TYPE: &str = "Map";
@@ -315,7 +316,7 @@ pub struct BatchError<'a> {
 ///
 /// Earlier previews of this SDK wrote `PREDICATE_MATCHED` for a predicate
 /// completion, a value JS and Python never write. This version does not
-/// read that value: a small batch summary that recorded it replays as
+/// read that value: an ordinary inline batch record that recorded it replays as
 /// `ALL_COMPLETED`, and the decision record of an oversized batch that
 /// recorded it fails replay. So an execution that recorded it must finish,
 /// or be restarted, before you upgrade.
@@ -845,7 +846,7 @@ where
     F: Fn(DurableContext, I, usize) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     IS: Serdes<O>,
-    RS: Serdes<BatchSummary>,
+    RS: Serdes<String>,
 {
     /// Executes the map operation.
     pub(crate) async fn execute(self) -> Result<Vec<O>, OperationError> {
@@ -928,7 +929,7 @@ impl<O, IS, RS> ParallelExecution<O, IS, RS>
 where
     O: Send + 'static,
     IS: Serdes<O>,
-    RS: Serdes<BatchSummary>,
+    RS: Serdes<String>,
 {
     /// Executes the parallel operation.
     pub(crate) async fn execute(self) -> Result<Vec<O>, OperationError> {
@@ -1197,7 +1198,7 @@ where
                 // settles as a failed `BatchItem` instead of yielding a
                 // catchable coordinator error with no record (issue #43).
                 // FLAT items have no per-child record: the failure is
-                // recorded inside the parent batch's summary payload when
+                // recorded inside the parent batch's record when
                 // the parent checkpoints, and replay reconstructs the same
                 // failed item from it, so live and replayed batches agree.
                 let round_trip = async {
@@ -1784,7 +1785,7 @@ async fn execute_batch<O, IS, RS>(
 where
     O: Send + 'static,
     IS: Serdes<O>,
-    RS: Serdes<BatchSummary>,
+    RS: Serdes<String>,
 {
     // Share the item serdes across items behind one `Arc`: the forwarding
     // `impl Serdes for Arc<S>` makes the handle itself a serdes, so no
@@ -1933,7 +1934,7 @@ where
                 .await
                 {
                     Ok(result) => {
-                        // Recorded terminal batch summary returned without
+                        // Recorded terminal batch record returned without
                         // re-running the batch (see `crate::observability`).
                         ctx.emit_operation_replayed(
                             &parent_wire,
@@ -2488,11 +2489,10 @@ where
         reason,
     };
 
-    // 11. Build the batch record from the item wire strings (no serdes
-    // call), then serialize it through the SAME `serialize_value` helper as
-    // every other path, so `result_serdes` receives the typed
-    // `BatchSummary` value directly, exactly as an item serdes receives the
-    // typed item value.
+    // 11. Build the batch record text from the item wire strings (no
+    // serdes call), then pass it through the SAME `serialize_value` helper
+    // as every other path. `result_serdes` receives the record's JSON text
+    // and returns the payload to store.
     let payload = from_batch_result(&batch_result, &final_wires, encoding);
     let serialized_payload = serialize_value(
         &ctx,
@@ -2541,7 +2541,7 @@ async fn replay_terminal_batch<O, IS, RS>(
 where
     O: Send + 'static,
     IS: Serdes<O>,
-    RS: Serdes<BatchSummary>,
+    RS: Serdes<String>,
 {
     match &snapshot.status {
         CheckpointStatus::Succeeded => {
@@ -2552,14 +2552,14 @@ where
                 // catches to continue normal execution.
                 return Err(batch_error(REPLAY_CHILDREN_SENTINEL));
             }
-            // Deserialize the stored batch summary.
+            // Read the stored batch record.
             let payload_str = snapshot
                 .result
                 .clone()
                 .ok_or_else(|| batch_error("terminal batch has no result payload"))?;
             // Reverse the result serdes transform: through the same helper
             // every other path uses.
-            let payload: BatchSummary =
+            let record_text: String =
                 deserialize_value(ctx, name, payload_str, result_serdes, serdes_ctx.clone())
                     .await?;
             // The batch parent's serdes context carries the parent wire ID and
@@ -2567,7 +2567,7 @@ where
             // record from an earlier release are derived from.
             to_batch_result(
                 ctx,
-                payload,
+                &record_text,
                 serdes,
                 encoding,
                 total_items,
@@ -3425,88 +3425,41 @@ fn preview_item_serdes_ctx(parent_wire: &str, execution_arn: &str, index: usize)
     SerdesContext::new(format!("{parent_wire}/item-{index}"), execution_arn)
 }
 
-/// The whole-batch record a map or parallel operation checkpoints.
-///
-/// It serializes in the shape of the JS SDK's batch result:
-///
-/// ```json
-/// {"all": [item, ...], "completionReason": "ALL_COMPLETED"}
-/// ```
-///
-/// `all` holds one item per started index, in index order. Each item has
-/// `index`, `status` (`"SUCCEEDED"`, `"FAILED"` or `"STARTED"`) and `name`,
-/// the recorded item name. JS has no `name` field; this record keeps it so
-/// that per-item errors name the item after replay. A succeeded item has
-/// `result`: the item value as a JSON value with the default item serdes,
-/// or the custom item serdes output as a JSON string. A failed item has
-/// `error`, a one-cause form of JS's recursive error object:
-///
-/// ```json
-/// {"ErrorType": "ChildContextError", "ErrorMessage": "...",
-///  "Cause": {"ErrorType": "<recorded type>", "ErrorMessage": "..."}}
-/// ```
-///
-/// `ErrorData` and `StackTrace` appear at both levels when the item
-/// recorded them. A started item has neither `result` nor `error`.
-///
-/// Replay also reads the `{results, reason}` record that earlier releases
-/// wrote.
-///
-/// This is the value a **result serdes** (a serdes attached via
-/// `result_serdes(...)` on [`MapBuilder`](crate::builders::MapBuilder) or
-/// [`ParallelBuilder`](crate::builders::ParallelBuilder)) transforms. Its
-/// fields are private: a result serdes is expected to be type-agnostic (a
-/// blanket `impl<T> Serdes<T>` over `T: serde::Serialize +
-/// serde::de::DeserializeOwned`), transforming the summary through its
-/// serde representation rather than field access. The summary holds item
-/// values as JSON values, so it deserializes only from a self-describing
-/// format, one that supports `deserialize_any`.
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct BatchSummary {
-    record: SummaryRecord,
-}
+// The batch record a map or parallel operation checkpoints.
+//
+// It serializes in the shape of the JS SDK's batch result:
+//
+// ```json
+// {"all": [item, ...], "completionReason": "ALL_COMPLETED"}
+// ```
+//
+// `all` holds one item per started index, in index order. Each item has
+// `index`, `status` (`"SUCCEEDED"`, `"FAILED"` or `"STARTED"`) and `name`,
+// the recorded item name. JS has no `name` field; this record keeps it so
+// that per-item errors name the item after replay. A succeeded item has
+// `result`: the exact JSON text the default item serdes wrote, or the
+// custom item serdes output as a JSON string. A failed item has `error`, a
+// one-cause form of JS's recursive error object:
+//
+// ```json
+// {"ErrorType": "ChildContextError", "ErrorMessage": "...",
+//  "Cause": {"ErrorType": "<recorded type>", "ErrorMessage": "..."}}
+// ```
+//
+// `ErrorData` and `StackTrace` appear at both levels when the item
+// recorded them. A started item has neither `result` nor `error`.
+//
+// The SDK writes and reads this record with serde_json only. A JSON item
+// value is a `RawValue`, which keeps its text only through serde_json's own
+// serializer and deserializer. So the result serdes receives the finished
+// record text as a `String`, never the record itself (see
+// [`from_batch_result`] and [`parse_batch_record`]).
+//
+// Replay also reads the `{results, reason}` record that earlier releases
+// wrote.
 
-/// The two record forms a [`BatchSummary`] holds.
-#[derive(Debug)]
-enum SummaryRecord {
-    /// The JS-shaped record this release writes.
-    Js(JsBatchRecord),
-    /// The `{results, reason}` record earlier releases wrote.
-    Preview(PreviewBatchRecord),
-}
-
-impl serde::Serialize for BatchSummary {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match &self.record {
-            SummaryRecord::Js(record) => record.serialize(serializer),
-            SummaryRecord::Preview(record) => record.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for BatchSummary {
-    /// Reads the record whose top-level object has the key `all` as the JS
-    /// form, and the record whose top-level object has the key `results`
-    /// as the form earlier releases wrote.
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error as _;
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let record = if value.get("all").is_some() {
-            SummaryRecord::Js(serde_json::from_value(value).map_err(D::Error::custom)?)
-        } else if value.get("results").is_some() {
-            SummaryRecord::Preview(serde_json::from_value(value).map_err(D::Error::custom)?)
-        } else {
-            return Err(D::Error::custom(
-                "batch summary has neither an `all` nor a `results` key",
-            ));
-        };
-        Ok(Self { record })
-    }
-}
-
-/// The JS-shaped batch record (see [`BatchSummary`]).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// The JS-shaped batch record this release writes.
+#[derive(Debug, serde::Serialize)]
 struct JsBatchRecord {
     all: Vec<JsBatchItem>,
     #[serde(rename = "completionReason")]
@@ -3522,14 +3475,15 @@ struct JsBatchItem {
     /// per-item errors name the item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
-    /// Present exactly when the item succeeded. A present `null` is a value
-    /// (the JSON encoding of `()`), so it reads as `Some(Value::Null)`.
+    /// Present exactly when the item succeeded. The value is the exact JSON
+    /// text of the item value. A present `null` is a value (the JSON
+    /// encoding of `()`), so it reads as `Some`.
     #[serde(
         default,
-        deserialize_with = "present_value",
+        deserialize_with = "present_raw_value",
         skip_serializing_if = "Option::is_none"
     )]
-    result: Option<serde_json::Value>,
+    result: Option<Box<RawValue>>,
     /// Present exactly when the item failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<JsErrorObject>,
@@ -3551,45 +3505,178 @@ struct JsErrorObject {
     cause: Option<Box<JsErrorObject>>,
 }
 
-/// Reads a field that is present, including a present `null`, as `Some`.
-/// With `#[serde(default)]`, an absent field reads as `None`.
-fn present_value<'de, D: serde::Deserializer<'de>>(
+/// Reads a field that is present, including a present `null`, as `Some`,
+/// and keeps its exact JSON text. With `#[serde(default)]`, an absent
+/// field reads as `None`.
+fn present_raw_value<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<Option<serde_json::Value>, D::Error> {
-    <serde_json::Value as serde::Deserialize>::deserialize(deserializer).map(Some)
+) -> Result<Option<Box<RawValue>>, D::Error> {
+    <Box<RawValue> as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// A batch record that replay read: one of the two record forms.
+#[derive(Debug)]
+enum BatchRecord {
+    /// The JS-shaped record this release writes.
+    Js(JsBatchRecord),
+    /// The `{results, reason}` record earlier releases wrote.
+    Preview(PreviewBatchRecord),
+}
+
+/// The top-level fields of a batch record text, read in one pass.
+///
+/// Each field is optional, and a field whose value is `null` reads as
+/// absent. [`parse_batch_record`] then requires exactly one complete field
+/// pair. Other fields are ignored.
+#[derive(Debug, Default)]
+struct BatchRecordFields {
+    all: Option<Vec<JsBatchItem>>,
+    completion_reason: Option<String>,
+    results: Option<Vec<PreviewBatchItem>>,
+    reason: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for BatchRecordFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(BatchRecordFieldsVisitor)
+    }
+}
+
+/// Visits the top-level map of a batch record. It accepts only a map, so a
+/// top-level array or scalar fails before the field pairs are checked.
+struct BatchRecordFieldsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for BatchRecordFieldsVisitor {
+    type Value = BatchRecordFields;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a batch record object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut fields = BatchRecordFields::default();
+        // A field counts as seen even when its value is `null`, so a
+        // duplicate after a `null` still fails.
+        let mut seen = [false; 4];
+        let [seen_all, seen_completion_reason, seen_results, seen_reason] = &mut seen;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "all" => read_field_once(&mut map, seen_all, "all", &mut fields.all)?,
+                "completionReason" => read_field_once(
+                    &mut map,
+                    seen_completion_reason,
+                    "completionReason",
+                    &mut fields.completion_reason,
+                )?,
+                "results" => {
+                    read_field_once(&mut map, seen_results, "results", &mut fields.results)?;
+                }
+                "reason" => read_field_once(&mut map, seen_reason, "reason", &mut fields.reason)?,
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(fields)
+    }
+}
+
+/// Reads the value of a recognized batch record field into `slot`. A
+/// `null` value leaves the field absent. A second occurrence of the field
+/// fails, also when the first value was `null`.
+fn read_field_once<'de, A, T>(
+    map: &mut A,
+    seen: &mut bool,
+    name: &'static str,
+    slot: &mut Option<T>,
+) -> Result<(), A::Error>
+where
+    A: serde::de::MapAccess<'de>,
+    T: serde::Deserialize<'de>,
+{
+    if *seen {
+        return Err(<A::Error as serde::de::Error>::duplicate_field(name));
+    }
+    *seen = true;
+    *slot = map.next_value()?;
+    Ok(())
+}
+
+/// Parses a batch record text in one pass with `serde_json`.
+///
+/// Exactly one complete field pair must be present: `all` with
+/// `completionReason` (the JS form), or `results` with `reason` (the form
+/// earlier releases wrote). Fields of both pairs, an incomplete pair, or no
+/// pair each fail with an error that names the problem.
+fn parse_batch_record(text: &str) -> Result<BatchRecord, String> {
+    let fields: BatchRecordFields =
+        serde_json::from_str(text).map_err(|err| format!("batch record is not valid: {err}"))?;
+    let problem = batch_record_shape_problem(&fields);
+    match fields {
+        BatchRecordFields {
+            all: Some(all),
+            completion_reason: Some(completion_reason),
+            results: None,
+            reason: None,
+        } => Ok(BatchRecord::Js(JsBatchRecord {
+            all,
+            completion_reason,
+        })),
+        BatchRecordFields {
+            all: None,
+            completion_reason: None,
+            results: Some(results),
+            reason: Some(reason),
+        } => Ok(BatchRecord::Preview(PreviewBatchRecord { results, reason })),
+        _ => Err(format!("batch record {problem}")),
+    }
+}
+
+/// Names what is wrong with the top-level fields of a batch record that
+/// holds no single complete field pair. [`parse_batch_record`] uses it only
+/// when no pair matched.
+fn batch_record_shape_problem(fields: &BatchRecordFields) -> &'static str {
+    let js = fields.all.is_some() || fields.completion_reason.is_some();
+    let preview = fields.results.is_some() || fields.reason.is_some();
+    match (js, preview) {
+        (true, true) => {
+            "mixes the `all`/`completionReason` fields with the `results`/`reason` fields"
+        }
+        (true, false) if fields.all.is_some() => "has `all` without `completionReason`",
+        (true, false) => "has `completionReason` without `all`",
+        (false, true) if fields.results.is_some() => "has `results` without `reason`",
+        (false, true) => "has `reason` without `results`",
+        (false, false) => "has neither `all` with `completionReason` nor `results` with `reason`",
+    }
 }
 
 /// The `{results, reason}` batch record that earlier releases wrote.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 struct PreviewBatchRecord {
     results: Vec<PreviewBatchItem>,
     reason: String,
 }
 
 /// One item of a [`PreviewBatchRecord`].
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct PreviewBatchItem {
     index: usize,
     /// The recorded item name. A record that an even earlier release wrote
     /// can hold no name, so reading defaults it to the empty string.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     name: String,
     status: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     result: String,
-    #[serde(default, rename = "errType", skip_serializing_if = "String::is_empty")]
+    #[serde(default, rename = "errType")]
     err_type: String,
-    #[serde(
-        default,
-        rename = "errMessage",
-        skip_serializing_if = "String::is_empty"
-    )]
+    #[serde(default, rename = "errMessage")]
     err_message: String,
     /// Opaque per-item error payload, passed through verbatim.
-    #[serde(default, rename = "errData", skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "errData")]
     err_data: Option<String>,
     /// Recorded per-item stack trace frames.
-    #[serde(default, rename = "stackTrace", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, rename = "stackTrace")]
     stack_trace: Vec<String>,
 }
 
@@ -3636,34 +3723,42 @@ fn js_item_error<O>(item: &BatchItem<O>) -> JsErrorObject {
     }
 }
 
-/// Builds the batch record of a live `BatchResult`.
+/// Builds the batch record text of a live `BatchResult`.
 ///
 /// `wires` holds, for each item of `result` in the same order, the wire
 /// string the item's child produced: the string it serialized for its
 /// record or its size check, or the string replay read from its record.
 /// Each value comes from that string, so building the record calls no
-/// serdes.
+/// serdes. A JSON item's value is its wire string, unchanged. A
+/// custom-serdes item's value is the JSON string encoding of its wire
+/// string.
 fn from_batch_result<O>(
     result: &BatchResult<O>,
     wires: &[Option<String>],
     encoding: ItemEncoding,
-) -> BatchSummary {
+) -> String {
     let all = result
         .items
         .iter()
         .zip(wires)
         .map(|(item, wire)| {
             // Only a succeeded item has a wire string.
-            let value = wire.as_ref().map(|wire| match encoding {
+            let value = wire.as_ref().map(|wire| {
+                let text = match encoding {
+                    ItemEncoding::AllJson => wire.clone(),
+                    #[expect(clippy::expect_used)]
+                    // reason: serializing a `String` to JSON cannot fail
+                    ItemEncoding::AllSerdes => {
+                        serde_json::to_string(wire).expect("a string serializes to JSON")
+                    }
+                };
                 // The default JSON serdes wrote `wire` with
                 // `serde_json::to_string`, or read it back with
-                // `serde_json::from_str`. Either way it is valid JSON.
+                // `serde_json::from_str`, so it is valid JSON. A JSON string
+                // encoding is valid JSON too.
                 #[expect(clippy::expect_used)]
-                // reason: the default JSON serdes only produces or accepts valid JSON
-                ItemEncoding::AllJson => {
-                    serde_json::from_str(wire).expect("the default JSON serdes produces valid JSON")
-                }
-                ItemEncoding::AllSerdes => serde_json::Value::String(wire.clone()),
+                // reason: the default JSON serdes and a JSON string encoding only produce valid JSON
+                RawValue::from_string(text).expect("the item value is valid JSON")
             });
             JsBatchItem {
                 index: item.index,
@@ -3674,12 +3769,13 @@ fn from_batch_result<O>(
             }
         })
         .collect();
-    BatchSummary {
-        record: SummaryRecord::Js(JsBatchRecord {
-            all,
-            completion_reason: result.reason.as_str().to_owned(),
-        }),
-    }
+    let record = JsBatchRecord {
+        all,
+        completion_reason: result.reason.as_str().to_owned(),
+    };
+    #[expect(clippy::expect_used)]
+    // reason: the record holds only strings, integers, valid raw JSON and nested records of those, all of which serialize to JSON
+    serde_json::to_string(&record).expect("the batch record serializes to JSON")
 }
 
 /// The JS summary an oversized batch checkpoints in place of its record.
@@ -3732,7 +3828,7 @@ fn oversized_batch_summary<O>(result: &BatchResult<O>, parent_sub_type: &str) ->
     serde_json::Value::Object(summary).to_string()
 }
 
-/// Converts a deserialized batch record back into a `BatchResult`.
+/// Parses a batch record text and converts it back into a `BatchResult`.
 ///
 /// A JS-form record decodes each item value with the item serdes and the
 /// child's serdes context. A record from an earlier release decodes it with
@@ -3740,7 +3836,7 @@ fn oversized_batch_summary<O>(result: &BatchResult<O>, parent_sub_type: &str) ->
 /// `total_items` is the length of the current input.
 async fn to_batch_result<O, IS>(
     ctx: &DurableContext,
-    payload: BatchSummary,
+    record_text: &str,
     serdes: &Arc<IS>,
     encoding: ItemEncoding,
     total_items: usize,
@@ -3751,11 +3847,11 @@ where
     O: Send + 'static,
     IS: Serdes<O>,
 {
-    match payload.record {
-        SummaryRecord::Js(record) => {
+    match parse_batch_record(record_text).map_err(|message| batch_error(&message))? {
+        BatchRecord::Js(record) => {
             js_to_batch_result(ctx, record, serdes, encoding, total_items, execution_arn).await
         }
-        SummaryRecord::Preview(record) => {
+        BatchRecord::Preview(record) => {
             preview_to_batch_result(ctx, record, serdes, parent_wire, execution_arn).await
         }
     }
@@ -3814,15 +3910,14 @@ where
         let result = match (status, item.result) {
             (BatchItemStatus::Succeeded, Some(value)) => {
                 let wire = match encoding {
-                    ItemEncoding::AllJson => value.to_string(),
-                    ItemEncoding::AllSerdes => match value {
-                        serde_json::Value::String(wire) => wire,
-                        _ => {
-                            return Err(batch_error(&format!(
+                    // The item serdes reads the exact JSON text it wrote.
+                    ItemEncoding::AllJson => value.get().to_owned(),
+                    ItemEncoding::AllSerdes => serde_json::from_str::<String>(value.get())
+                        .map_err(|_| {
+                            batch_error(&format!(
                                 "batch record item {index}: expected a string result"
-                            )));
-                        }
-                    },
+                            ))
+                        })?,
                 };
                 let item_ctx =
                     SerdesContext::new(ctx.peek_id_at(index).wire().to_owned(), execution_arn);
@@ -4512,21 +4607,23 @@ mod tests {
         assert_eq!(errors[0].error_type, Some("ChildFnError"));
     }
 
-    /// The JSON form of a batch summary.
-    fn summary_json(summary: &BatchSummary) -> serde_json::Value {
-        serde_json::to_value(summary).expect("a batch summary serializes")
+    /// The JSON structure of a batch record text, for assertions on its
+    /// shape. Exact-text assertions read the text itself instead.
+    fn record_json(record_text: &str) -> serde_json::Value {
+        serde_json::from_str(record_text).expect("a batch record is JSON")
     }
 
-    /// The batch summary payload the parent recorded: the first recorded
-    /// update whose payload decodes as a [`BatchSummary`].
-    fn recorded_batch_summary(client: &crate::client::InMemoryExecutionClient) -> BatchSummary {
+    /// The batch record text the parent recorded: the first recorded
+    /// update payload that parses as a batch record.
+    fn recorded_batch_record(client: &crate::client::InMemoryExecutionClient) -> String {
         client
             .recorded_updates()
             .iter()
             .filter(|u| u.parent_id().is_none())
             .filter_map(|u| u.payload())
-            .find_map(|p| serde_json::from_str::<BatchSummary>(p).ok())
-            .expect("the parent records a batch summary payload")
+            .find(|p| parse_batch_record(p).is_ok())
+            .map(str::to_owned)
+            .expect("the parent records a batch record payload")
     }
 
     /// A failed map item records the type of the error its body returned
@@ -4570,9 +4667,9 @@ mod tests {
         assert_eq!(item.error_type.as_deref(), Some("Error"));
         assert_eq!(batch.errors()[0].error_type, Some("Error"));
 
-        let summary = recorded_batch_summary(&client);
+        let record = recorded_batch_record(&client);
         assert_eq!(
-            summary_json(&summary).pointer("/all/0/error/Cause/ErrorType"),
+            record_json(&record).pointer("/all/0/error/Cause/ErrorType"),
             Some(&serde_json::json!("Error"))
         );
     }
@@ -4602,9 +4699,9 @@ mod tests {
         assert_eq!(item.status, BatchItemStatus::Failed);
         assert_eq!(item.error_type.as_deref(), Some("Error"));
 
-        let summary = recorded_batch_summary(&client);
+        let record = recorded_batch_record(&client);
         assert_eq!(
-            summary_json(&summary).pointer("/all/0/error/Cause/ErrorType"),
+            record_json(&record).pointer("/all/0/error/Cause/ErrorType"),
             Some(&serde_json::json!("Error"))
         );
     }
@@ -6881,13 +6978,9 @@ mod tests {
             &[Some("7".to_owned()), None],
             ItemEncoding::AllJson,
         );
-        let payload: BatchSummary = serde_json::from_str(
-            &serde_json::to_string(&payload).expect("serializing a batch summary must succeed"),
-        )
-        .expect("the batch summary reads back");
         let replayed: BatchResult<i32> = to_batch_result(
             &test_ctx(CheckpointLog::empty()),
-            payload,
+            &payload,
             &json,
             ItemEncoding::AllJson,
             2,
@@ -6936,7 +7029,7 @@ mod tests {
             )],
             CompletionReason::AllCompleted,
         );
-        let payload = summary_json(&from_batch_result(
+        let payload = record_json(&from_batch_result(
             &original,
             &[None],
             ItemEncoding::AllJson,
@@ -6960,7 +7053,7 @@ mod tests {
             )],
             CompletionReason::AllCompleted,
         );
-        let payload = summary_json(&from_batch_result(&untyped, &[None], ItemEncoding::AllJson));
+        let payload = record_json(&from_batch_result(&untyped, &[None], ItemEncoding::AllJson));
         assert_eq!(
             payload.pointer("/all/0/error/Cause/ErrorMessage"),
             Some(&serde_json::json!(""))
@@ -6972,10 +7065,7 @@ mod tests {
     /// fabricated type.
     #[tokio::test]
     async fn to_batch_result_missing_err_type_is_none() {
-        let payload: BatchSummary = serde_json::from_str(
-            r#"{"results":[{"index":0,"status":"FAILED","errMessage":"boom"}],"reason":"ALL_COMPLETED"}"#,
-        )
-        .expect("payload literal must deserialize");
+        let payload = r#"{"results":[{"index":0,"status":"FAILED","errMessage":"boom"}],"reason":"ALL_COMPLETED"}"#;
         let json = Arc::new(crate::serdes::JsonSerdes);
         let replayed: BatchResult<i32> = to_batch_result(
             &test_ctx(CheckpointLog::empty()),
@@ -7943,20 +8033,21 @@ mod tests {
         );
     }
 
-    /// ONE RULE ON EVERY PATH.
+    /// Every path hands a custom serdes its own typed value.
     ///
-    /// The shape a custom serdes is handed must be the identical
-    /// `serde_json::Value` on the step, invoke, callback, map/parallel item
-    /// and batch-result paths. Nothing asserted this before, which is how a
-    /// quoting divergence between items (`X`) and everything else (`"X"`)
-    /// survived all the way to conformance case 9-14.
+    /// The step, invoke, callback and map/parallel item serdes are handed
+    /// the identical typed value. A quoting divergence between items (`X`)
+    /// and everything else (`"X"`) once survived all the way to
+    /// conformance case 9-14, so this test asserts every path. The batch
+    /// result serdes is a `Serdes<String>`: it is handed a `String` that
+    /// holds the batch record text.
     ///
     /// The probe payload is a bare `String`, the one case where the old split
     /// was visible, and the fixture's wire form is deliberately NOT JSON, so
     /// a path that bypassed the serdes would fail rather than quietly pass.
     #[tokio::test]
     #[expect(clippy::too_many_lines)] // reason: one test per path is the point; splitting it would let the paths drift apart again
-    async fn custom_serdes_receives_the_same_value_shape_on_every_path() {
+    async fn custom_serdes_receives_its_typed_value_on_every_path() {
         use crate::future::Branch;
         use crate::serdes::test_support::{RecordingSerdes, hex_envelope_of};
 
@@ -8099,9 +8190,10 @@ mod tests {
 
         // whole batch result
         //
-        // The batch-result serdes is handed the batch summary, so its value
-        // differs by nature, but it must arrive through the SAME boundary: a
-        // `serde_json::Value`, not pre-rendered text.
+        // The batch result serdes is a `Serdes<String>`. It is handed one
+        // `String`: the batch record text. With the default item serdes,
+        // the item's JSON text is embedded unchanged, as JS embeds the
+        // value.
         let batch_rec = RecordingSerdes::new();
         let (batch_ctx, _batch_client) = test_ctx_with_client(CheckpointLog::empty());
         let batch_value = value.clone();
@@ -8115,28 +8207,12 @@ mod tests {
             .expect("map with a recording result serdes must succeed");
         assert_eq!(batch_out, vec![value]);
         let batch_inputs = batch_rec.serialize_inputs();
-        assert_eq!(batch_inputs.len(), 1, "inputs: {batch_inputs:?}");
-        let summary = batch_inputs
-            .first()
-            .expect("the batch result serdes must be consulted once");
-        assert!(
-            summary
-                .get("all")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|items| items.len() == 1),
-            "the batch result serdes must receive the summary as a structured \
-             Value, got {summary}"
-        );
-        // With the default item serdes, each item is embedded in the summary
-        // as the JSON value of its wire string, as JS embeds it, so the
-        // batch serdes sees structure, not one flat pre-rendered blob.
         assert_eq!(
-            summary
-                .get("all")
-                .and_then(|r| r.get(0))
-                .and_then(|item| item.get("result")),
-            Some(&serde_json::from_str::<serde_json::Value>(&json_encoding).expect("JSON")),
-            "summary: {summary}"
+            batch_inputs,
+            vec![serde_json::Value::String(format!(
+                r#"{{"all":[{{"index":0,"status":"SUCCEEDED","name":"map-item-0","result":{json_encoding}}}],"completionReason":"ALL_COMPLETED"}}"#
+            ))],
+            "the batch result serdes must be handed the record text once"
         );
     }
 
@@ -8216,11 +8292,11 @@ mod tests {
         assert_eq!(out, vec![probe_doc()]);
     }
 
-    /// The batch summary embeds each item result as its own transformed
-    /// payload, so replaying a terminal batch must reverse the item transform
-    /// per item.
+    /// An earlier `{results, reason}` record embeds each item result as its
+    /// own transformed payload, so replaying a terminal batch must reverse
+    /// the item transform per item.
     #[tokio::test]
-    async fn custom_serdes_batch_summary_replay_reverses_item_transforms() {
+    async fn custom_serdes_earlier_record_replay_reverses_item_transforms() {
         use crate::serdes::test_support::{HexEnvelopeSerdes, hex_envelope};
 
         let first = hex_envelope(r#""hello""#);
@@ -8268,7 +8344,7 @@ mod tests {
             )
             .serdes(HexEnvelopeSerdes)
             .await
-            .expect("batch summary replay with an item serdes must succeed");
+            .expect("earlier record replay with an item serdes must succeed");
         assert_eq!(values, vec!["hello", "world"]);
     }
 
@@ -8456,12 +8532,12 @@ mod tests {
         assert_eq!(summary["itemStatuses"], "S");
     }
 
-    /// The decision record must be PLAIN JSON even when a custom
-    /// `result_serdes` transforms the batch summary: it is the SDK's own
+    /// The oversized summary must be PLAIN JSON even when a custom
+    /// `result_serdes` transforms the batch record: it is the SDK's own
     /// bookkeeping and must stay readable when the configured serdes is the
     /// reason the payload outgrew the limit.
     #[tokio::test]
-    async fn decision_record_bypasses_result_serdes() {
+    async fn oversized_summary_bypasses_result_serdes() {
         use crate::serdes::test_support::HexEnvelopeSerdes;
 
         let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
@@ -10015,17 +10091,29 @@ mod tests {
         serde_json::from_str(&parent_payload(client)).expect("the batch payload is JSON")
     }
 
+    /// The JSON structure of the batch record that an explicit
+    /// `.result_serdes(JsonSerdes)` stored: the payload is a quoted JSON
+    /// string, and its content is the record text.
+    fn json_serdes_record_json(
+        client: &crate::client::InMemoryExecutionClient,
+    ) -> serde_json::Value {
+        let payload = parent_payload(client);
+        let record_text: String =
+            serde_json::from_str(&payload).expect("JsonSerdes stores a quoted JSON string");
+        record_json(&record_text)
+    }
+
     /// A checkpoint log holding one terminal batch parent at positional ID
     /// `1` whose payload is `payload`.
     fn terminal_batch_log(payload: &str) -> CheckpointLog {
         CheckpointLog::from_records(vec![succeeded_record("1", payload)])
     }
 
-    /// The JS-form record a summary holds.
-    fn js_record(summary: &BatchSummary) -> &JsBatchRecord {
-        match &summary.record {
-            SummaryRecord::Js(record) => record,
-            SummaryRecord::Preview(_) => unreachable!("expected the JS form"),
+    /// The JS-form record a batch record text holds.
+    fn js_record(record_text: &str) -> JsBatchRecord {
+        match parse_batch_record(record_text).expect("the record parses") {
+            BatchRecord::Js(record) => record,
+            BatchRecord::Preview(_) => unreachable!("expected the JS form"),
         }
     }
 
@@ -10042,22 +10130,18 @@ mod tests {
             )],
             CompletionReason::AllCompleted,
         );
-        let summary = from_batch_result(&result, &[Some(String::new())], ItemEncoding::AllSerdes);
-        let json = serde_json::to_string(&summary).expect("serializes");
+        let json = from_batch_result(&result, &[Some(String::new())], ItemEncoding::AllSerdes);
         assert!(json.contains(r#""result":"""#), "json: {json}");
-        let back: BatchSummary = serde_json::from_str(&json).expect("deserializes");
+        let back = js_record(&json);
         assert_eq!(
-            js_record(&back).all[0].result,
-            Some(serde_json::Value::String(String::new()))
+            back.all[0].result.as_deref().map(RawValue::get),
+            Some(r#""""#)
         );
     }
 
     #[tokio::test]
     async fn batch_checkpoint_item_reads_old_records() {
-        let payload: BatchSummary = serde_json::from_str(
-            r#"{"results":[{"index":0,"status":"SUCCEEDED","result":"1"},{"index":1,"status":"SUCCEEDED"}],"reason":"ALL_COMPLETED"}"#,
-        )
-        .expect("a preview summary deserializes");
+        let payload = r#"{"results":[{"index":0,"status":"SUCCEEDED","result":"1"},{"index":1,"status":"SUCCEEDED"}],"reason":"ALL_COMPLETED"}"#;
         let replayed: BatchResult<u32> = to_batch_result(
             &test_ctx(CheckpointLog::empty()),
             payload,
@@ -10083,7 +10167,7 @@ mod tests {
             )],
             CompletionReason::MinSuccessfulReached,
         );
-        let json = summary_json(&from_batch_result(&started, &[None], ItemEncoding::AllJson));
+        let json = record_json(&from_batch_result(&started, &[None], ItemEncoding::AllJson));
         let item = json.pointer("/all/0").expect("one item");
         assert!(item.get("result").is_none(), "item: {item}");
         assert!(item.get("error").is_none(), "item: {item}");
@@ -10155,7 +10239,7 @@ mod tests {
         .await
         .expect("map succeeds");
         assert_eq!(
-            parent_payload_json(&client)["all"][0]["result"],
+            json_serdes_record_json(&client)["all"][0]["result"],
             serde_json::json!(r#"order:{"id":1,"sku":"sku-1"}"#)
         );
 
@@ -10168,7 +10252,7 @@ mod tests {
         .await
         .expect("parallel succeeds");
         assert_eq!(
-            parent_payload_json(&client)["all"][0]["result"],
+            json_serdes_record_json(&client)["all"][0]["result"],
             serde_json::json!(r#"order:{"id":1,"sku":"sku-1"}"#)
         );
     }
@@ -10372,27 +10456,404 @@ mod tests {
         );
     }
 
-    /// A preview summary serializes back in its own shape.
-    #[test]
-    fn preview_summary_serializes_in_its_own_shape() {
-        let text = r#"{"results":[{"index":0,"name":"a","status":"SUCCEEDED","result":"1"}],"reason":"ALL_COMPLETED"}"#;
-        let summary: BatchSummary = serde_json::from_str(text).expect("deserializes");
+    /// The batch record text of `wires`, one succeeded `map` item per wire.
+    fn record_of_wires(wires: &[&str], encoding: ItemEncoding) -> String {
+        let items = (0..wires.len())
+            .map(|index| {
+                BatchItem::new(
+                    index,
+                    format!("map-item-{index}"),
+                    BatchItemStatus::Succeeded,
+                    Some(()),
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        let result: BatchResult<()> = BatchResult::new(items, CompletionReason::AllCompleted);
+        let wires: Vec<Option<String>> = wires.iter().map(|w| Some((*w).to_owned())).collect();
+        from_batch_result(&result, &wires, encoding)
+    }
+
+    /// The exact `result` texts of a JS-form record text.
+    fn result_texts(record_text: &str) -> Vec<Option<String>> {
+        js_record(record_text)
+            .all
+            .iter()
+            .map(|item| item.result.as_deref().map(|raw| raw.get().to_owned()))
+            .collect()
+    }
+
+    /// A `Serdes<String>` item serdes that returns each wire unchanged and
+    /// logs the serdes context it was handed.
+    #[derive(Clone, Default)]
+    struct WireLog(Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl WireLog {
+        fn calls(&self) -> Vec<(String, String)> {
+            self.0.lock().expect("lock").clone()
+        }
+    }
+
+    impl Serdes<String> for WireLog {
+        fn serialize(
+            &self,
+            value: String,
+            _context: SerdesContext,
+        ) -> impl Future<Output = Result<String, BoxError>> + Send {
+            std::future::ready(Ok(value))
+        }
+
+        fn deserialize(
+            &self,
+            wire: String,
+            context: SerdesContext,
+        ) -> impl Future<Output = Result<String, BoxError>> + Send {
+            self.0
+                .lock()
+                .expect("lock")
+                .push((context.operation_id().to_owned(), wire.clone()));
+            std::future::ready(Ok(wire))
+        }
+    }
+
+    /// A JSON item value keeps its exact text through the record and back:
+    /// the record embeds the wire string unchanged, and replay hands the
+    /// item serdes that same text.
+    #[tokio::test]
+    async fn record_round_trip_keeps_exact_json_item_text() {
+        let wires = [
+            "null",
+            r#""a string""#,
+            "[1,2,3]",
+            r#"{"n":340282366920938463463374607431768211455,"m":{"k":-170141183460469231731687303715884105728}}"#,
+            "1e2",
+            "1.0",
+            "-0",
+        ];
+        let text = record_of_wires(&wires, ItemEncoding::AllJson);
+        for wire in wires {
+            assert!(
+                text.contains(&format!(r#""result":{wire}}}"#)),
+                "the record embeds {wire} unchanged: {text}"
+            );
+        }
         assert_eq!(
-            serde_json::to_value(&summary).expect("serializes"),
-            serde_json::from_str::<serde_json::Value>(text).expect("JSON")
+            result_texts(&text),
+            wires
+                .iter()
+                .map(|w| Some((*w).to_owned()))
+                .collect::<Vec<_>>()
+        );
+
+        let log = WireLog::default();
+        let ctx = test_ctx(CheckpointLog::empty());
+        let replayed: BatchResult<String> = to_batch_result(
+            &ctx,
+            &text,
+            &Arc::new(log.clone()),
+            ItemEncoding::AllJson,
+            wires.len(),
+            "parent-wire",
+            "arn:test",
+        )
+        .await
+        .expect("the record replays");
+        let values: Vec<String> = replayed
+            .items
+            .into_iter()
+            .map(|item| item.result.expect("a value"))
+            .collect();
+        assert_eq!(values, wires);
+        let handed: Vec<String> = log.calls().into_iter().map(|(_, wire)| wire).collect();
+        assert_eq!(handed, wires);
+    }
+
+    /// A custom-serdes item records its wire string as a JSON string, also
+    /// when the wire is empty or looks like JSON, and replay hands the item
+    /// serdes the original wire.
+    #[tokio::test]
+    async fn custom_serdes_item_records_a_json_string() {
+        let wires = [
+            "",
+            r#"{"a":1}"#,
+            "340282366920938463463374607431768211455",
+            "plain",
+        ];
+        let text = record_of_wires(&wires, ItemEncoding::AllSerdes);
+        assert_eq!(
+            result_texts(&text),
+            vec![
+                Some(r#""""#.to_owned()),
+                Some(r#""{\"a\":1}""#.to_owned()),
+                Some(r#""340282366920938463463374607431768211455""#.to_owned()),
+                Some(r#""plain""#.to_owned()),
+            ]
+        );
+        let replayed: BatchResult<String> = to_batch_result(
+            &test_ctx(CheckpointLog::empty()),
+            &text,
+            &Arc::new(WireLog::default()),
+            ItemEncoding::AllSerdes,
+            wires.len(),
+            "parent-wire",
+            "arn:test",
+        )
+        .await
+        .expect("the record replays");
+        let values: Vec<String> = replayed
+            .items
+            .into_iter()
+            .map(|item| item.result.expect("a value"))
+            .collect();
+        assert_eq!(values, wires);
+    }
+
+    /// An earlier `{results, reason}` record unwraps a non-empty result
+    /// string to the old child wire, treats an empty or absent result as
+    /// absent, and decodes with the context that release used.
+    #[tokio::test]
+    async fn earlier_record_unwraps_the_old_child_wire() {
+        let text = r#"{"results":[{"index":0,"name":"a","status":"SUCCEEDED","result":"\"x\""},{"index":1,"name":"b","status":"SUCCEEDED","result":""},{"index":2,"name":"c","status":"SUCCEEDED"}],"reason":"ALL_COMPLETED"}"#;
+        let log = WireLog::default();
+        let replayed: BatchResult<String> = to_batch_result(
+            &test_ctx(CheckpointLog::empty()),
+            text,
+            &Arc::new(log.clone()),
+            ItemEncoding::AllJson,
+            3,
+            "parent-wire",
+            "arn:test",
+        )
+        .await
+        .expect("the earlier record replays");
+        let values: Vec<Option<String>> =
+            replayed.items.into_iter().map(|item| item.result).collect();
+        assert_eq!(values, vec![Some(r#""x""#.to_owned()), None, None]);
+        assert_eq!(
+            log.calls(),
+            vec![("parent-wire/item-0".to_owned(), r#""x""#.to_owned())]
         );
     }
 
+    /// The error `parse_batch_record` returns for `text`.
+    fn record_error(text: &str) -> String {
+        parse_batch_record(text).expect_err("the record must be rejected")
+    }
+
     #[test]
-    fn summary_without_all_or_results_is_rejected() {
-        let err = serde_json::from_str::<BatchSummary>(r#"{"reason":"ALL_COMPLETED"}"#)
-            .expect_err("a summary needs `all` or `results`");
-        assert!(
-            err.to_string()
-                .contains("neither an `all` nor a `results` key"),
-            "{err}"
-        );
-        assert!(serde_json::from_str::<BatchSummary>("[1]").is_err());
+    fn record_parser_reads_both_forms() {
+        let js = r#"{"all":[{"index":0,"status":"SUCCEEDED","name":"a","result":7}],"completionReason":"ALL_COMPLETED"}"#;
+        match parse_batch_record(js).expect("the JS form parses") {
+            BatchRecord::Js(record) => {
+                assert_eq!(record.completion_reason, "ALL_COMPLETED");
+                assert_eq!(
+                    record
+                        .all
+                        .first()
+                        .and_then(|i| i.result.as_deref())
+                        .map(RawValue::get),
+                    Some("7")
+                );
+            }
+            BatchRecord::Preview(_) => unreachable!("expected the JS form"),
+        }
+        let earlier = r#"{"results":[{"index":0,"status":"SUCCEEDED","result":"7"}],"reason":"MIN_SUCCESSFUL_REACHED"}"#;
+        match parse_batch_record(earlier).expect("the earlier form parses") {
+            BatchRecord::Preview(record) => {
+                assert_eq!(record.reason, "MIN_SUCCESSFUL_REACHED");
+                assert_eq!(record.results.first().map(|i| i.result.as_str()), Some("7"));
+            }
+            BatchRecord::Js(_) => unreachable!("expected the earlier form"),
+        }
+    }
+
+    #[test]
+    fn record_parser_rejects_non_records() {
+        assert!(record_error(r#"{"all":"#).contains("batch record is not valid"));
+        let trailing = record_error(r#"{"all":[],"completionReason":"ALL_COMPLETED"} {}"#);
+        assert!(trailing.contains("trailing characters"), "{trailing}");
+        for text in [
+            "[]",
+            r#"[{"all":[],"completionReason":"ALL_COMPLETED"}]"#,
+            "5",
+            r#""s""#,
+            "null",
+            "true",
+        ] {
+            let err = record_error(text);
+            assert!(
+                err.contains("expected a batch record object"),
+                "{text}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_parser_requires_one_complete_pair() {
+        let neither =
+            "batch record has neither `all` with `completionReason` nor `results` with `reason`";
+        let mixed = "batch record mixes the `all`/`completionReason` fields with the `results`/`reason` fields";
+        let cases = [
+            ("{}", neither),
+            (
+                r#"{"all":[],"completionReason":"ALL_COMPLETED","results":[],"reason":"ALL_COMPLETED"}"#,
+                mixed,
+            ),
+            (
+                r#"{"all":[]}"#,
+                "batch record has `all` without `completionReason`",
+            ),
+            (
+                r#"{"completionReason":"ALL_COMPLETED"}"#,
+                "batch record has `completionReason` without `all`",
+            ),
+            (
+                r#"{"results":[]}"#,
+                "batch record has `results` without `reason`",
+            ),
+            (
+                r#"{"reason":"ALL_COMPLETED"}"#,
+                "batch record has `reason` without `results`",
+            ),
+            (r#"{"all":[],"reason":"ALL_COMPLETED"}"#, mixed),
+            (
+                r#"{"results":[],"completionReason":"ALL_COMPLETED"}"#,
+                mixed,
+            ),
+            (
+                r#"{"all":[],"completionReason":"ALL_COMPLETED","reason":"ALL_COMPLETED"}"#,
+                mixed,
+            ),
+            (r#"{"results":[],"reason":"ALL_COMPLETED","all":[]}"#, mixed),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(record_error(text), expected, "{text}");
+        }
+    }
+
+    /// A recognized field whose value is `null` counts as absent.
+    #[test]
+    fn record_parser_reads_null_fields_as_absent() {
+        let cases = [
+            (
+                r#"{"all":null,"completionReason":"ALL_COMPLETED"}"#,
+                "batch record has `completionReason` without `all`",
+            ),
+            (
+                r#"{"all":[],"completionReason":null}"#,
+                "batch record has `all` without `completionReason`",
+            ),
+            (
+                r#"{"results":null,"reason":"ALL_COMPLETED"}"#,
+                "batch record has `reason` without `results`",
+            ),
+            (
+                r#"{"results":[],"reason":null}"#,
+                "batch record has `results` without `reason`",
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(record_error(text), expected, "{text}");
+        }
+        for text in [
+            r#"{"all":[],"completionReason":"ALL_COMPLETED","results":null}"#,
+            r#"{"all":[],"completionReason":"ALL_COMPLETED","reason":null}"#,
+        ] {
+            assert!(
+                matches!(parse_batch_record(text), Ok(BatchRecord::Js(_))),
+                "{text}"
+            );
+        }
+        for text in [
+            r#"{"results":[],"reason":"ALL_COMPLETED","all":null}"#,
+            r#"{"results":[],"reason":"ALL_COMPLETED","completionReason":null}"#,
+        ] {
+            assert!(
+                matches!(parse_batch_record(text), Ok(BatchRecord::Preview(_))),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_parser_rejects_wrong_field_types() {
+        for (text, field_type) in [
+            (
+                r#"{"all":5,"completionReason":"ALL_COMPLETED"}"#,
+                "invalid type: integer `5`, expected a sequence",
+            ),
+            (
+                r#"{"all":[],"completionReason":5}"#,
+                "invalid type: integer `5`, expected a string",
+            ),
+            (
+                r#"{"results":"x","reason":"ALL_COMPLETED"}"#,
+                "invalid type: string \"x\", expected a sequence",
+            ),
+            (
+                r#"{"results":[],"reason":[]}"#,
+                "invalid type: sequence, expected a string",
+            ),
+        ] {
+            let err = record_error(text);
+            assert!(err.contains(field_type), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn record_parser_rejects_duplicate_fields() {
+        for (text, field) in [
+            (
+                r#"{"all":[],"all":[],"completionReason":"ALL_COMPLETED"}"#,
+                "all",
+            ),
+            (
+                r#"{"all":null,"all":[],"completionReason":"ALL_COMPLETED"}"#,
+                "all",
+            ),
+            (
+                r#"{"all":[],"completionReason":"ALL_COMPLETED","completionReason":"ALL_COMPLETED"}"#,
+                "completionReason",
+            ),
+            (
+                r#"{"all":[],"completionReason":null,"completionReason":"ALL_COMPLETED"}"#,
+                "completionReason",
+            ),
+            (
+                r#"{"results":[],"results":[],"reason":"ALL_COMPLETED"}"#,
+                "results",
+            ),
+            (
+                r#"{"results":null,"results":[],"reason":"ALL_COMPLETED"}"#,
+                "results",
+            ),
+            (
+                r#"{"results":[],"reason":"ALL_COMPLETED","reason":"ALL_COMPLETED"}"#,
+                "reason",
+            ),
+            (
+                r#"{"results":[],"reason":null,"reason":"ALL_COMPLETED"}"#,
+                "reason",
+            ),
+        ] {
+            let err = record_error(text);
+            assert!(
+                err.contains(&format!("duplicate field `{field}`")),
+                "{text}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_parser_ignores_unknown_fields() {
+        let js = r#"{"extra":{"nested":[1,{"a":null}]},"all":[],"completionReason":"ALL_COMPLETED","type":"MapResult"}"#;
+        assert!(matches!(parse_batch_record(js), Ok(BatchRecord::Js(_))));
+        let earlier = r#"{"results":[],"extra":7,"reason":"ALL_COMPLETED"}"#;
+        assert!(matches!(
+            parse_batch_record(earlier),
+            Ok(BatchRecord::Preview(_))
+        ));
     }
 
     /// Replays a JS-form batch record `payload` through a map over one
@@ -10415,6 +10876,18 @@ mod tests {
         }
         .expect_err("the record fails replay");
         crate::error::chain_string(&err)
+    }
+
+    /// A stored record that is not one complete field pair fails replay
+    /// with the parser's error.
+    #[tokio::test]
+    async fn malformed_stored_record_fails_replay() {
+        let payload = serde_json::json!({"reason": "ALL_COMPLETED"});
+        let err = js_replay_error(&payload, false).await;
+        assert!(
+            err.contains("batch record has `reason` without `results`"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -10615,7 +11088,7 @@ mod tests {
         item.error_data = Some("data".to_owned());
         item.stack_trace = vec!["frame-a".to_owned(), "frame-b".to_owned()];
         let result = BatchResult::new(vec![item], CompletionReason::AllCompleted);
-        let payload = summary_json(&from_batch_result(&result, &[None], ItemEncoding::AllJson));
+        let payload = record_json(&from_batch_result(&result, &[None], ItemEncoding::AllJson));
         assert_eq!(
             payload.pointer("/all/0/error"),
             Some(&serde_json::json!({

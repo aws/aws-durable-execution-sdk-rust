@@ -10,6 +10,11 @@
 //! Serdes are configured **per operation**: every serdes-bearing builder
 //! carries its serdes implementation as a generic type parameter defaulting
 //! to [`JsonSerdes`], and its `.serdes(...)` method swaps that parameter.
+//! The one exception is the result serdes of a map or parallel, set with
+//! `.result_serdes(...)`. It is a `Serdes<String>` over the batch record's
+//! JSON text, and it defaults to [`PassthroughSerdes`], which stores that
+//! text unchanged. The item serdes of a map or parallel defaults to
+//! [`JsonSerdes`], as every other serdes does.
 //! There is no execution-wide serdes slot: a single trait-object slot
 //! cannot represent `Serdes<T>` for every operation output type without
 //! erasing the value again. To share one instance across a handler, create
@@ -269,6 +274,12 @@ where
 
 /// The default serdes: compact JSON via `serde_json`.
 ///
+/// It is the default of every serdes, including the item serdes of a map
+/// or parallel, except the result serdes of a map or parallel. That one
+/// defaults to [`PassthroughSerdes`], because the batch record is already
+/// JSON text. `.result_serdes(JsonSerdes)` stores the record as a quoted
+/// JSON string.
+///
 /// Implements [`Serdes<T>`] for every `T` that is `Serialize +
 /// DeserializeOwned + Send + 'static`, so a builder that never calls
 /// `.serdes(...)` needs no configuration and no type annotation.
@@ -294,7 +305,8 @@ where
 /// ```
 // `#[non_exhaustive]` exemption: a stateless marker constructed by value in
 // user code (`JsonSerdes.serialize(...)`, `.serdes(JsonSerdes)`) and the
-// default for every builder's serdes type parameter. The attribute would
+// default for every builder's serdes type parameter except the result serdes
+// of map and parallel, whose default is `PassthroughSerdes`. The attribute would
 // remove that bare-name construction path, and the type's whole contract is
 // to carry no configuration: a configurable JSON serdes would be a new
 // type, not a field here.
@@ -319,6 +331,60 @@ where
         _context: SerdesContext,
     ) -> impl Future<Output = Result<T, BoxError>> + Send {
         std::future::ready(serde_json::from_str(&wire).map_err(Into::into))
+    }
+}
+
+/// Passes a payload string through unchanged in both directions.
+///
+/// Implements [`Serdes<String>`]. It is the default result serdes of
+/// [`MapBuilder`](crate::builders::MapBuilder) and
+/// [`ParallelBuilder`](crate::builders::ParallelBuilder): the batch record
+/// is already JSON text, so the default stores that text unchanged.
+/// [`JsonSerdes`] stays the default of every other serdes, including the
+/// item serdes of a map or parallel.
+///
+/// Both methods run inline in the returned future.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk::BoxError;
+/// use aws_durable_execution_sdk::serdes::{PassthroughSerdes, Serdes, SerdesContext};
+///
+/// # tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+/// let context = SerdesContext::new("map-1", "arn:test");
+/// let wire = PassthroughSerdes
+///     .serialize(r#"{"all":[]}"#.to_owned(), context.clone())
+///     .await?;
+/// assert_eq!(wire, r#"{"all":[]}"#);
+/// let back = PassthroughSerdes.deserialize(wire, context).await?;
+/// assert_eq!(back, r#"{"all":[]}"#);
+/// # Ok::<(), BoxError>(())
+/// # }).unwrap();
+/// ```
+// `#[non_exhaustive]` exemption: a stateless marker that user code
+// constructs by its bare name (`.result_serdes(PassthroughSerdes)`), and
+// the default for the result serdes type parameter of the map and parallel
+// builders. The attribute would remove that bare-name construction path,
+// and the type's whole contract is to carry no configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PassthroughSerdes;
+
+impl Serdes<String> for PassthroughSerdes {
+    fn serialize(
+        &self,
+        value: String,
+        _context: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
+        std::future::ready(Ok(value))
+    }
+
+    fn deserialize(
+        &self,
+        wire: String,
+        _context: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
+        std::future::ready(Ok(wire))
     }
 }
 
@@ -2413,6 +2479,23 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// `PassthroughSerdes` returns its input unchanged in both directions,
+    /// also when the input is not JSON.
+    #[tokio::test]
+    async fn passthrough_serdes_is_identity() {
+        let ctx = SerdesContext::new("op-1", "arn:test");
+        let wire = PassthroughSerdes
+            .serialize("approved".to_owned(), ctx.clone())
+            .await
+            .expect("serialize");
+        assert_eq!(wire, "approved");
+        let back = PassthroughSerdes
+            .deserialize("not json {".to_owned(), ctx)
+            .await
+            .expect("deserialize");
+        assert_eq!(back, "not json {");
     }
 
     /// `JsonSerdes` behaves exactly like plain `serde_json`: compact

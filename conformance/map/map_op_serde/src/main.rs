@@ -5,80 +5,99 @@
 //! `"OPSERDE:X,Y"` for the whole map result payload.
 
 use aws_durable_execution_sdk as durable;
-use durable::{DurableContext, Serdes};
 use durable::serdes::SerdesContext;
+use durable::{DurableContext, Serdes};
 
 /// Custom operation-level serializer that emits `OPSERDE:<comma-joined results>`.
 ///
-/// The whole-batch summary a `result_serdes` transforms is the SDK's
-/// `BatchSummary`, an opaque type. The transform is therefore written as a
-/// type-agnostic blanket `impl<T> Serdes<T>` that works through the value's
-/// serde (JSON) representation: `{"all": [...], "completionReason": "..."}`.
+/// A `result_serdes` is a `Serdes<String>` over the batch record's JSON
+/// text, `{"all": [...], "completionReason": "..."}`. `serialize` reads the
+/// item results from that text, and `deserialize` rebuilds the same record
+/// text from them.
 #[derive(Debug)]
 struct OpSerdes;
 
-impl<T> Serdes<T> for OpSerdes
-where
-    T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
-{
-    async fn serialize(
+/// One succeeded item of the rebuilt batch record, in the SDK's field order.
+#[derive(serde::Serialize)]
+struct RecordItem<'a> {
+    index: usize,
+    status: &'static str,
+    name: String,
+    result: &'a str,
+}
+
+/// The rebuilt batch record, in the SDK's field order.
+#[derive(serde::Serialize)]
+struct Record<'a> {
+    all: Vec<RecordItem<'a>>,
+    #[serde(rename = "completionReason")]
+    completion_reason: &'static str,
+}
+
+impl Serdes<String> for OpSerdes {
+    fn serialize(
         &self,
-        value: T,
+        value: String,
         _context: SerdesContext,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Work through the summary's JSON representation.
-        let rendered: serde_json::Value = serde_json::from_str(&serde_json::to_string(&value)?)?;
-        let results = rendered
-            .get("all")
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| {
-                        // Each item carries its value as JSON: a string
-                        // here, with the default item serdes.
-                        item.get("result")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Ok(format!("OPSERDE:{}", results.join(",")))
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(op_serialize(&value))
     }
 
-    async fn deserialize(
+    fn deserialize(
         &self,
         wire: String,
         _context: SerdesContext,
-    ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
-        let body = wire
-            .strip_prefix("OPSERDE:")
-            .ok_or("missing OPSERDE: prefix")?;
-        let items: Vec<&str> = if body.is_empty() {
-            Vec::new()
-        } else {
-            body.split(',').collect()
-        };
-        // Reconstruct the batch summary's JSON representation, then parse it
-        // back into the summary type.
-        let results: Vec<serde_json::Value> = items
+    ) -> impl Future<Output = Result<String, durable::BoxError>> + Send {
+        std::future::ready(op_deserialize(&wire))
+    }
+}
+
+/// Writes `OPSERDE:<comma-joined results>` from a batch record text.
+fn op_serialize(value: &str) -> Result<String, durable::BoxError> {
+    let record: serde_json::Value = serde_json::from_str(value)?;
+    let results = record
+        .get("all")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    // Each item carries its value as JSON: a string
+                    // here, with the default item serdes.
+                    item.get("result")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(format!("OPSERDE:{}", results.join(",")))
+}
+
+/// Rebuilds the batch record text from `OPSERDE:<comma-joined results>`.
+fn op_deserialize(wire: &str) -> Result<String, durable::BoxError> {
+    let body = wire
+        .strip_prefix("OPSERDE:")
+        .ok_or("missing OPSERDE: prefix")?;
+    let items: Vec<&str> = if body.is_empty() {
+        Vec::new()
+    } else {
+        body.split(',').collect()
+    };
+    // Rebuild the batch record text.
+    let record = Record {
+        all: items
             .into_iter()
             .enumerate()
-            .map(|(i, val)| {
-                serde_json::json!({
-                    "index": i,
-                    "status": "SUCCEEDED",
-                    "name": format!("map-item-{i}"),
-                    "result": val
-                })
+            .map(|(index, result)| RecordItem {
+                index,
+                status: "SUCCEEDED",
+                name: format!("map-item-{index}"),
+                result,
             })
-            .collect();
-        let payload = serde_json::json!({
-            "all": results,
-            "completionReason": "ALL_COMPLETED"
-        });
-        Ok(serde_json::from_str(&serde_json::to_string(&payload)?)?)
-    }
+            .collect(),
+        completion_reason: "ALL_COMPLETED",
+    };
+    Ok(serde_json::to_string(&record)?)
 }
 
 /// Handler: map items to uppercase with operation-level serdes.

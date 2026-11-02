@@ -136,7 +136,7 @@ pub use self::error::{
 pub use self::future::{Branch, DurableFuture};
 pub use self::operation::{OperationKind, OperationStatus};
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
-pub use self::serdes::{JsonSerdes, Serdes};
+pub use self::serdes::{JsonSerdes, PassthroughSerdes, Serdes};
 pub use self::step::StepSemantics;
 
 // Re-export rule: every foreign type in the public surface is re-exported.

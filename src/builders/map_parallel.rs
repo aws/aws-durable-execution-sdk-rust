@@ -19,10 +19,10 @@ use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
 use crate::map_parallel::ItemEncoding;
-use crate::serdes::JsonSerdes;
+use crate::serdes::{JsonSerdes, PassthroughSerdes};
 
 pub use crate::map_parallel::{
-    BatchError, BatchItem, BatchItemStatus, BatchResult, BatchStats, BatchStatus, BatchSummary,
+    BatchError, BatchItem, BatchItemStatus, BatchResult, BatchStats, BatchStatus,
     CompletionDecision, CompletionItem, CompletionOutcome, CompletionReason, NestingMode,
 };
 
@@ -62,7 +62,7 @@ pub use crate::map_parallel::{
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
 #[non_exhaustive]
-pub struct MapBuilder<I, O, F, Fut, IS = JsonSerdes, RS = JsonSerdes> {
+pub struct MapBuilder<I, O, F, Fut, IS = JsonSerdes, RS = PassthroughSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
@@ -111,7 +111,7 @@ where
             completion: None,
             serdes: JsonSerdes,
             encoding: ItemEncoding::AllJson,
-            result_serdes: JsonSerdes,
+            result_serdes: PassthroughSerdes,
             nesting: NestingMode::Normal,
             item_namer: None,
             items,
@@ -168,7 +168,8 @@ where
     /// map's item output type: attaching a serdes for a different type
     /// fails at compile time. It goes through the same transform boundary
     /// as every other operation, so a [`Serdes`] attached here behaves
-    /// exactly as it does on a step, invoke, callback, or `result_serdes`.
+    /// exactly as it does on a step, invoke or callback. It is a different
+    /// serdes from `result_serdes`, which transforms the whole batch record.
     ///
     /// `serdes` corresponds to JS `itemSerdes` and Python `item_serdes`.
     pub fn serdes<IS2>(self, serdes: IS2) -> MapBuilder<I, O, F, Fut, IS2, RS>
@@ -192,22 +193,28 @@ where
         }
     }
 
-    /// Sets a custom serializer/deserializer for the whole batch result.
+    /// Sets a custom serializer/deserializer for the whole batch record.
     ///
-    /// This is the operation-level serdes: it serializes and deserializes
-    /// the entire batch summary ([`BatchSummary`]) rather than individual
-    /// items, so it must implement `Serdes<BatchSummary>`: typically
-    /// through a type-agnostic blanket `impl<T> Serdes<T>`.
+    /// The serdes is a [`Serdes<String>`](crate::Serdes). Its serializer
+    /// receives the batch record as JSON text, in the shape of the JS SDK's
+    /// batch result (`{"all": [...], "completionReason": "..."}`), and
+    /// returns the payload to store. Its deserializer receives that stored
+    /// payload on replay, and must reconstruct the exact input record text:
+    /// `deserialize(serialize(record_text))` must return `record_text`
+    /// unchanged. The stored payload may use any format, for example a
+    /// compressed or binary encoding of the text. The SDK does not read the
+    /// record back on the live path, so a serdes that changes the record
+    /// text is not supported.
     ///
-    /// The summary holds item values as JSON values, so the serdes must use
-    /// a self-describing format, one that supports `deserialize_any` (JSON,
-    /// for example). A format that is not self-describing, such as bincode
-    /// or postcard, fails to read the summary back.
+    /// The default, [`PassthroughSerdes`], stores
+    /// the record text unchanged. [`JsonSerdes`] stores it as a quoted JSON
+    /// string.
     ///
-    /// `result_serdes` corresponds to JS and Python `serdes`.
+    /// `result_serdes` corresponds to JS and Python `serdes`. Those receive
+    /// the batch result object.
     pub fn result_serdes<RS2>(self, serdes: RS2) -> MapBuilder<I, O, F, Fut, IS, RS2>
     where
-        RS2: Serdes<BatchSummary>,
+        RS2: Serdes<String>,
     {
         MapBuilder {
             ctx: self.ctx,
@@ -335,7 +342,7 @@ where
     pub async fn await_batch(self) -> Result<BatchResult<O>, OperationError>
     where
         IS: Serdes<O>,
-        RS: Serdes<BatchSummary>,
+        RS: Serdes<String>,
     {
         self.batch_future().await
     }
@@ -382,7 +389,7 @@ where
     pub fn spawn_batch(self) -> DurableFuture<BatchResult<O>>
     where
         IS: Serdes<O>,
-        RS: Serdes<BatchSummary>,
+        RS: Serdes<String>,
     {
         spawn_terminal!(self, batch_future)
     }
@@ -394,7 +401,7 @@ where
     fn batch_future(self) -> DurableFuture<BatchResult<O>>
     where
         IS: Serdes<O>,
-        RS: Serdes<BatchSummary>,
+        RS: Serdes<String>,
     {
         use crate::map_parallel::MapExecution;
 
@@ -432,7 +439,7 @@ where
     pub fn future(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
-        RS: Serdes<BatchSummary>,
+        RS: Serdes<String>,
     {
         self.into_future()
     }
@@ -455,7 +462,7 @@ where
     pub fn spawn(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
-        RS: Serdes<BatchSummary>,
+        RS: Serdes<String>,
     {
         spawn_terminal!(self)
     }
@@ -468,7 +475,7 @@ where
     F: Fn(DurableContext, I, usize) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     IS: Serdes<O>,
-    RS: Serdes<BatchSummary>,
+    RS: Serdes<String>,
 {
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;
@@ -527,7 +534,7 @@ where
 /// ```
 #[must_use = "builders do nothing unless awaited or spawned"]
 #[non_exhaustive]
-pub struct ParallelBuilder<O, IS = JsonSerdes, RS = JsonSerdes> {
+pub struct ParallelBuilder<O, IS = JsonSerdes, RS = PassthroughSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
@@ -566,7 +573,7 @@ impl<O: Send + 'static> ParallelBuilder<O> {
             completion: None,
             serdes: JsonSerdes,
             encoding: ItemEncoding::AllJson,
-            result_serdes: JsonSerdes,
+            result_serdes: PassthroughSerdes,
             nesting: NestingMode::Normal,
             branches,
             _marker: PhantomData,
@@ -618,8 +625,9 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// operation's branch output type: attaching a serdes for a different
     /// type fails at compile time. It goes through the same transform
     /// boundary as every other operation, so a [`Serdes`] attached here
-    /// behaves exactly as it does on a step, invoke, callback, or
-    /// `result_serdes`.
+    /// behaves exactly as it does on a step, invoke or callback. It is a
+    /// different serdes from `result_serdes`, which transforms the whole
+    /// batch record.
     ///
     /// `serdes` corresponds to JS `itemSerdes` and Python `item_serdes`.
     pub fn serdes<IS2>(self, serdes: IS2) -> ParallelBuilder<O, IS2, RS>
@@ -641,22 +649,28 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
         }
     }
 
-    /// Sets a custom serializer/deserializer for the whole batch result.
+    /// Sets a custom serializer/deserializer for the whole batch record.
     ///
-    /// This is the operation-level serdes: it serializes and deserializes
-    /// the entire batch summary ([`BatchSummary`]) rather than individual
-    /// items, so it must implement `Serdes<BatchSummary>`: typically
-    /// through a type-agnostic blanket `impl<T> Serdes<T>`.
+    /// The serdes is a [`Serdes<String>`](crate::Serdes). Its serializer
+    /// receives the batch record as JSON text, in the shape of the JS SDK's
+    /// batch result (`{"all": [...], "completionReason": "..."}`), and
+    /// returns the payload to store. Its deserializer receives that stored
+    /// payload on replay, and must reconstruct the exact input record text:
+    /// `deserialize(serialize(record_text))` must return `record_text`
+    /// unchanged. The stored payload may use any format, for example a
+    /// compressed or binary encoding of the text. The SDK does not read the
+    /// record back on the live path, so a serdes that changes the record
+    /// text is not supported.
     ///
-    /// The summary holds item values as JSON values, so the serdes must use
-    /// a self-describing format, one that supports `deserialize_any` (JSON,
-    /// for example). A format that is not self-describing, such as bincode
-    /// or postcard, fails to read the summary back.
+    /// The default, [`PassthroughSerdes`], stores
+    /// the record text unchanged. [`JsonSerdes`] stores it as a quoted JSON
+    /// string.
     ///
-    /// `result_serdes` corresponds to JS and Python `serdes`.
+    /// `result_serdes` corresponds to JS and Python `serdes`. Those receive
+    /// the batch result object.
     pub fn result_serdes<RS2>(self, serdes: RS2) -> ParallelBuilder<O, IS, RS2>
     where
-        RS2: Serdes<BatchSummary>,
+        RS2: Serdes<String>,
     {
         ParallelBuilder {
             ctx: self.ctx,
@@ -760,7 +774,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     pub async fn await_batch(self) -> Result<BatchResult<O>, OperationError>
     where
         IS: Serdes<O>,
-        RS: Serdes<BatchSummary>,
+        RS: Serdes<String>,
     {
         self.batch_future().await
     }
@@ -806,7 +820,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     pub fn spawn_batch(self) -> DurableFuture<BatchResult<O>>
     where
         IS: Serdes<O>,
-        RS: Serdes<BatchSummary>,
+        RS: Serdes<String>,
     {
         spawn_terminal!(self, batch_future)
     }
@@ -818,7 +832,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     fn batch_future(self) -> DurableFuture<BatchResult<O>>
     where
         IS: Serdes<O>,
-        RS: Serdes<BatchSummary>,
+        RS: Serdes<String>,
     {
         use crate::map_parallel::ParallelExecution;
 
@@ -853,7 +867,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     pub fn future(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
-        RS: Serdes<BatchSummary>,
+        RS: Serdes<String>,
     {
         self.into_future()
     }
@@ -876,7 +890,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     pub fn spawn(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
-        RS: Serdes<BatchSummary>,
+        RS: Serdes<String>,
     {
         spawn_terminal!(self)
     }
@@ -886,7 +900,7 @@ impl<O, IS, RS> IntoFuture for ParallelBuilder<O, IS, RS>
 where
     O: Send + 'static,
     IS: Serdes<O>,
-    RS: Serdes<BatchSummary>,
+    RS: Serdes<String>,
 {
     type Output = Result<Vec<O>, OperationError>;
     type IntoFuture = DurableFuture<Vec<O>>;
