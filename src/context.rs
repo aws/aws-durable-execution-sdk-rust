@@ -2926,27 +2926,40 @@ impl DurableContext {
         TryJoinAllBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
     }
 
-    /// Joins all futures, collecting every outcome as [`Settled`](crate::Settled).
+    /// Joins all futures, collecting every outcome as a `Result`.
     ///
     /// Never fails fast: all futures run to completion regardless of
-    /// individual errors.
+    /// individual errors. The output holds one `Result<O, OperationError>`
+    /// per input, in input order.
     ///
-    /// A rejected item is a
+    /// # Outer and inner errors
+    ///
+    /// Awaiting returns `Result<Vec<Result<O, OperationError>>, OperationError>`,
+    /// and the two levels report different failures:
+    ///
+    /// 1. The outer `Err` means the combinator itself failed, for example
+    ///    replay nondeterminism or a checkpoint write failure.
+    /// 2. An input that returns `Err` appears only as that input's inner
+    ///    `Err`. The outer result is then `Ok`.
+    /// 3. A panicking input ends the invocation, as a panic does everywhere
+    ///    else in the SDK. The SDK resumes the original panic payload. The
+    ///    combinator writes no record and returns no result.
+    /// 4. Nothing cancels an input that `join_all` awaits. A combinator stops
+    ///    an input only by dropping it, and `join_all` drops no input before
+    ///    it settles.
+    ///
+    /// An inner `Err` is a
     /// [`OperationErrorKind::ChildContext`](crate::OperationErrorKind::ChildContext)
     /// error of kind
     /// [`ChildContextErrorKind::ChildFailed`](crate::ChildContextErrorKind::ChildFailed),
     /// whose `wire()` carries the input's recorded failure (`error_type`,
     /// message, `error_data`), on the first run and on replay. Match on the
     /// `err.wire()` fields, not on the kind of the input that failed.
-    /// `join_all` cancels no input.
     ///
     /// # Empty input
     ///
     /// Called with no futures, resolves to `Ok` with an empty `Vec`,
     /// matching `futures::future::join_all`.
-    ///
-    /// A panic in an input propagates to the caller with its original
-    /// payload, and the SDK records nothing for it.
     ///
     /// # Examples
     ///
@@ -2959,9 +2972,12 @@ impl DurableContext {
     /// ) -> Result<(), durable::BoxError> {
     ///     let a = ctx.step(|_| async { Ok(1) }).future();
     ///     let b = ctx.step(|_| async { Ok(2) }).future();
-    ///     let _settled: Vec<durable::Settled<i32>> = ctx.join_all([a, b])
+    ///     let outcomes: Vec<Result<i32, durable::OperationError>> = ctx
+    ///         .join_all([a, b])
     ///         .name("collect")
     ///         .await?;
+    ///     let succeeded = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    ///     assert_eq!(succeeded, 2);
     ///     Ok(())
     /// }
     /// ```

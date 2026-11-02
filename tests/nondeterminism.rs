@@ -376,7 +376,7 @@ async fn removed_operation_detected() {
 
 /// Test: a mismatch inside `join_all` fails the execution.
 ///
-/// `join_all` stores every constituent failure as `Settled::Rejected` and
+/// `join_all` stores every constituent failure as that input's `Err` and
 /// checkpoints the combinator as successful, so without engine-level fatal
 /// tracking a replay identity mismatch inside it would produce a SUCCEEDED
 /// execution. Invocation 1 parks the combinator non-terminal (a retrying

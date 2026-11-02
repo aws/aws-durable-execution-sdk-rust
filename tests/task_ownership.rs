@@ -13,7 +13,7 @@
 
 use aws_durable_execution_sdk as durable;
 use durable::test_util::{LocalRunner, TestResult};
-use durable::{BoxError, Branch, DurableContext, OperationKind, OperationStatus, Settled};
+use durable::{BoxError, Branch, DurableContext, OperationKind, OperationStatus};
 
 /// Asserts that the execution succeeded and that every step succeeded.
 fn assert_all_steps_succeeded<O>(result: &TestResult<O>) {
@@ -111,11 +111,8 @@ async fn durable_operation_in_join_all_input() {
             |(), ctx: DurableContext| async move {
                 let a = ctx.step(|_| async { Ok(1_u32) }).name("a").future();
                 let b = ctx.step(|_| async { Ok(2_u32) }).name("b").future();
-                let settled = ctx.join_all([a, b]).await?;
-                let fulfilled = settled
-                    .iter()
-                    .filter(|slot| matches!(slot, Settled::Fulfilled(_)))
-                    .count();
+                let outcomes = ctx.join_all([a, b]).await?;
+                let fulfilled = outcomes.iter().filter(|slot| slot.is_ok()).count();
                 Ok::<_, BoxError>(fulfilled)
             },
             (),

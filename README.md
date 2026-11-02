@@ -292,7 +292,7 @@ durable::wrap(handler, options);
 | `ctx.map(items, f)` | Runs `f` per item, each in its own child context. |
 | `ctx.parallel(branches)` | Runs named branches concurrently. |
 | `ctx.try_join_all(futures)` | Collects every result, failing on the first error. |
-| `ctx.join_all(futures)` | Collects every outcome as `Settled<O>`, never failing fast. |
+| `ctx.join_all(futures)` | Collects every outcome as `Result<O, OperationError>`, never failing fast. |
 | `ctx.select_ok(futures)` | Returns the first success and cancels the inputs still running. |
 | `ctx.race(futures)` | Returns the first outcome to settle, success or failure. |
 
@@ -721,7 +721,7 @@ that waits stays pending. When every remaining input waits and nothing else
 runs, the invocation suspends.
 
 A combinator returns the value decoded from the payload it records, so the
-first run returns the value a replay returns. A `join_all` rejection is
+first run returns the value a replay returns. A `join_all` item's `Err` is
 therefore a child-context error whose `wire()` carries the input's recorded
 failure on both paths. When `try_join_all`, `select_ok` or `race` resolves,
 it cancels every input that is still running, and a cancelled input stops at
@@ -737,8 +737,8 @@ let c = ctx.step(|_| async { Ok(3u32) }).name("c").future();
 let results: Vec<u32> = ctx.try_join_all([a, b, c]).name("gather").await?;
 ```
 
-`join_all` returns `Vec<Settled<O>>` so you can inspect failures individually
-without failing fast:
+`join_all` returns one `Result<O, OperationError>` per input, in input order,
+so you can inspect failures individually without failing fast:
 
 ```rust ignore
 let good = ctx.step(|_| async { Ok(1u32) }).name("good").future();
@@ -748,15 +748,24 @@ let bad = ctx
     .retry_strategy(|_err, _attempt| durable::RetryDecision::Stop)
     .future();
 
-let settled: Vec<durable::Settled<u32>> = ctx.join_all([good, bad]).name("collect").await?;
-for outcome in &settled {
+let outcomes: Vec<Result<u32, durable::OperationError>> =
+    ctx.join_all([good, bad]).name("collect").await?;
+for outcome in &outcomes {
     match outcome {
-        durable::Settled::Fulfilled(value) => tracing::info!("ok: {value}"),
-        durable::Settled::Rejected(err) => tracing::info!("err: {err}"),
-        _ => {}
+        Ok(value) => tracing::info!("ok: {value}"),
+        Err(err) => tracing::info!("err: {err}"),
     }
 }
 ```
+
+The two levels of `Result` report different failures. The outer `Err`, which
+`?` propagates above, means the combinator itself failed, for example on
+replay nondeterminism or a failed checkpoint write. An input that returns
+`Err` appears only as that input's inner `Err`, and the outer result is then
+`Ok`. A panicking input ends the invocation, as a panic does everywhere else
+in the SDK: the SDK resumes the original panic payload, and `join_all` writes
+no record and returns no result. Nothing cancels an input that `join_all`
+awaits, because `join_all` drops no input before it settles.
 
 `select_ok` returns the first success, cancelling the inputs still running:
 

@@ -1,8 +1,7 @@
 //! Future types for durable operations.
 //!
 //! [`DurableFuture`] is the uniform handle for all durable operation
-//! results. [`Settled`] represents the outcome of a single future in
-//! `join_all`. [`Branch`] defines a named parallel branch. [`Callback`]
+//! results. [`Branch`] defines a named parallel branch. [`Callback`]
 //! holds a callback token and its result future.
 
 use std::future::Future;
@@ -152,33 +151,6 @@ impl<O: Send + 'static> Future for DurableFuture<O> {
 
 // DurableFuture<O> is automatically Send when O: Send, since it only
 // contains a pinned boxed future that is Send when O: Send.
-
-/// The outcome of a single future within [`DurableContext::join_all`].
-///
-/// Each item records either success or failure without short-circuiting
-/// the collection.
-///
-/// # Examples
-///
-/// ```
-/// use aws_durable_execution_sdk::{Settled, OperationError};
-///
-/// let ok: Settled<i32> = Settled::Fulfilled(42);
-/// let err: Settled<i32> = Settled::Rejected(OperationError::__test_error());
-/// match &ok {
-///     Settled::Fulfilled(v) => assert_eq!(*v, 42),
-///     _ => panic!("unexpected"),
-/// }
-/// # drop(err);
-/// ```
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum Settled<O> {
-    /// The operation completed successfully.
-    Fulfilled(O),
-    /// The operation failed with an error.
-    Rejected(OperationError),
-}
 
 /// A branch for [`DurableContext::parallel`].
 ///

@@ -8,7 +8,7 @@
 //!
 //! Semantics:
 //! - `try_join_all`: await all; fail fast on the first error.
-//! - `join_all`: await all; collect each outcome as `Settled` (never short-circuits).
+//! - `join_all`: await all; collect each outcome as a `Result` (never short-circuits).
 //! - `select_ok`: return the first success; fail only if all branches fail.
 //! - `race`: return the first settled outcome (success or failure). A
 //!   failure winner surfaces as `CombinatorErrorKind::FirstSettledFailed`.
@@ -49,7 +49,7 @@ use crate::error::{
     ChildContextError, ChildContextErrorKind, CombinatorError, CombinatorErrorKind, OperationError,
     OperationErrorKind,
 };
-use crate::future::{DurableFuture, Settled};
+use crate::future::DurableFuture;
 use crate::task::{NoRuntime, TrackedJoinSet};
 
 /// Wire sub-type for combinator operations (shared with child context
@@ -111,7 +111,7 @@ const ALL_FAILED_ERROR_TYPE: &str = "CombinatorError.AllFailed";
 /// Per-loser record persisted (as a JSON array) in an `AllFailed`
 /// aggregate record's `error_data`.
 ///
-/// Mirrors [`SerializedSettled::Rejected`]: the loser's complete wire
+/// Mirrors [`SerializedOutcome::Rejected`]: the loser's complete wire
 /// failure record (`error_type`, message, `error_data`, `stack_trace`),
 /// so each loser's identity survives the checkpoint round-trip rather
 /// than only the aggregate's flattened summary. Every field is optional
@@ -305,7 +305,7 @@ pub(crate) struct JoinAllExecution<O> {
     pub(crate) futures: Vec<DurableFuture<O>>,
 }
 
-/// Serializable representation of a settled result for checkpointing.
+/// Serializable representation of one `join_all` outcome for checkpointing.
 ///
 /// Error-aware serdes: rejected results are serialized as
 /// `{ status: "rejected", ... }` carrying the outcome's full wire error
@@ -317,7 +317,7 @@ pub(crate) struct JoinAllExecution<O> {
 /// existed still replay.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status")]
-enum SerializedSettled<O> {
+enum SerializedOutcome<O> {
     #[serde(rename = "fulfilled")]
     Fulfilled { value: O },
     #[serde(rename = "rejected")]
@@ -336,11 +336,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
     /// Executes the `join_all` combinator.
     ///
     /// Live path: awaits ALL futures (never short-circuits), collects each
-    /// as `Settled::Fulfilled(O)` or `Settled::Rejected(OperationError)`.
+    /// as `Ok(O)` or `Err(OperationError)`.
     /// Checkpoints with error-aware serdes so Err values survive round-trip.
-    /// Replay path: returns frozen `Vec<Settled<O>>`.
-    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
-    pub(crate) async fn execute(self) -> Result<Vec<Settled<O>>, OperationError> {
+    /// Replay path: returns frozen `Vec<Result<O, OperationError>>`.
+    pub(crate) async fn execute(self) -> Result<Vec<Result<O, OperationError>>, OperationError> {
         // Task-ownership check.
         self.ctx.enforce_task_ownership()?;
 
@@ -361,7 +360,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
                     // Decode FIRST, then emit `operation_replayed`: a corrupt
                     // payload surfaces as an error without the event.
                     let payload = self.ctx.checkpoint_result_payload(&positional_id);
-                    let value = replay_settled_success::<O>(payload.as_ref())?;
+                    let value = replay_outcomes_success::<O>(payload.as_ref())?;
                     self.ctx.emit_operation_replayed(
                         &wire_id,
                         self.name.as_deref(),
@@ -397,7 +396,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
 
         // Live path: run all futures, never short-circuit.
         let count = self.futures.len();
-        let mut settled: Vec<Option<Settled<O>>> = (0..count).map(|_| None).collect();
+        let mut outcomes: Vec<Option<Result<O, OperationError>>> =
+            (0..count).map(|_| None).collect();
         let mut join_set = constituent_set(&self.ctx);
 
         for (idx, future) in self.futures.into_iter().enumerate() {
@@ -406,27 +406,17 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
 
         while let Some((_, joined)) = join_set.join_next_with_id().await {
             // A panicked input resumes its panic here.
-            match joined.into_value() {
-                (idx, Ok(value)) => {
-                    if let Some(slot) = settled.get_mut(idx) {
-                        *slot = Some(Settled::Fulfilled(value));
-                    }
-                }
-                (idx, Err(op_err)) => {
-                    if let Some(slot) = settled.get_mut(idx) {
-                        *slot = Some(Settled::Rejected(op_err));
-                    }
-                }
+            let (idx, outcome) = joined.into_value();
+            if let Some(slot) = outcomes.get_mut(idx) {
+                *slot = Some(outcome);
             }
         }
 
         // Collect in order.
-        let collected: Vec<Settled<O>> = settled
+        let collected: Vec<Result<O, OperationError>> = outcomes
             .into_iter()
             .map(|opt| {
-                opt.unwrap_or_else(|| {
-                    Settled::Rejected(combinator_internal_error("future did not complete"))
-                })
+                opt.unwrap_or_else(|| Err(combinator_internal_error("future did not complete")))
             })
             .collect();
 
@@ -435,11 +425,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
         // `error_data` pass through), and replay rebuilds a synthetic
         // source carrying those fields (issue #41).
         let serialized = {
-            let serializable: Vec<SerializedSettled<&O>> = collected
+            let serializable: Vec<SerializedOutcome<&O>> = collected
                 .iter()
                 .map(|s| match s {
-                    Settled::Fulfilled(v) => SerializedSettled::Fulfilled { value: v },
-                    Settled::Rejected(err) => {
+                    Ok(v) => SerializedOutcome::Fulfilled { value: v },
+                    Err(err) => {
                         // Pass the outcome's own recorded wire record
                         // through verbatim when it carries one (the normal
                         // case: a failed constituent operation attaches its
@@ -448,7 +438,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
                         let wire = err.wire().cloned().unwrap_or_else(|| {
                             crate::error::wire_error_for(err, COMBINATOR_ERROR_TYPE)
                         });
-                        SerializedSettled::Rejected {
+                        SerializedOutcome::Rejected {
                             message: wire
                                 .error_message()
                                 .map_or_else(|| crate::error::chain_string(err), str::to_owned),
@@ -470,7 +460,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
         // first run returns what a replay of this record returns: every
         // rejected item is a `ChildContext(ChildFailed)` error whose
         // `wire()` carries the input's recorded failure, on both paths.
-        replay_settled_success::<O>(Some(&serialized))
+        replay_outcomes_success::<O>(Some(&serialized))
     }
 }
 
@@ -1042,24 +1032,25 @@ fn replay_single_success<O: DeserializeOwned>(
         .map_err(|e| combinator_internal_error(&format!("replay deserialization failed: {e}")))
 }
 
-/// Replays a successful `Vec<Settled<O>>` with error-aware deserialization.
-fn replay_settled_success<O: DeserializeOwned>(
+/// Replays a successful `join_all` record as `Vec<Result<O, OperationError>>`
+/// with error-aware deserialization.
+fn replay_outcomes_success<O: DeserializeOwned>(
     result: Option<&String>,
-) -> Result<Vec<Settled<O>>, OperationError> {
+) -> Result<Vec<Result<O, OperationError>>, OperationError> {
     let payload = result
         .ok_or_else(|| combinator_internal_error("replay: succeeded record has no payload"))?;
-    let serialized: Vec<SerializedSettled<O>> = serde_json::from_str(payload)
+    let serialized: Vec<SerializedOutcome<O>> = serde_json::from_str(payload)
         .map_err(|e| combinator_internal_error(&format!("replay deserialization failed: {e}")))?;
 
-    // Restore into Settled<O>: Rejected items become OperationErrors
+    // Restore each outcome: rejected items become `Err(OperationError)`s
     // whose synthetic sources carry the recorded wire fields
     // (`error_type`, message, `error_data`, `stack_trace`), not just the
     // flattened text (issue #41).
-    let settled = serialized
+    let outcomes = serialized
         .into_iter()
         .map(|s| match s {
-            SerializedSettled::Fulfilled { value } => Settled::Fulfilled(value),
-            SerializedSettled::Rejected {
+            SerializedOutcome::Fulfilled { value } => Ok(value),
+            SerializedOutcome::Rejected {
                 message,
                 error_type,
                 error_data,
@@ -1068,19 +1059,17 @@ fn replay_settled_success<O: DeserializeOwned>(
                 let wire = crate::error::WireError::new(error_type, Some(message))
                     .with_error_data(error_data)
                     .with_stack_trace(stack_trace);
-                Settled::Rejected(
-                    OperationError::from_kind(OperationErrorKind::ChildContext(
-                        ChildContextError::new(
-                            ChildContextErrorKind::ChildFailed,
-                            Some(crate::error::ReplayedFailure::source_from(wire.clone())),
-                        ),
-                    ))
-                    .with_wire(wire),
-                )
+                Err(OperationError::from_kind(OperationErrorKind::ChildContext(
+                    ChildContextError::new(
+                        ChildContextErrorKind::ChildFailed,
+                        Some(crate::error::ReplayedFailure::source_from(wire.clone())),
+                    ),
+                ))
+                .with_wire(wire))
             }
         })
         .collect();
-    Ok(settled)
+    Ok(outcomes)
 }
 
 /// Replays a failed combinator from a checkpoint record.
@@ -1577,8 +1566,8 @@ mod tests {
         };
         let result = exec.execute().await.unwrap();
         assert_eq!(result.len(), 2);
-        assert!(matches!(&result[0], Settled::Fulfilled(1)));
-        let Settled::Rejected(err) = &result[1] else {
+        assert!(matches!(&result[0], Ok(1)));
+        let Err(err) = &result[1] else {
             panic!("slot 1 must be rejected, got {:?}", result[1]);
         };
         let wire = err.wire().expect("the replayed slot carries its record");
@@ -1586,6 +1575,83 @@ mod tests {
         assert_eq!(
             wire.error_message(),
             Some(r#"task join failed: task 7 panicked with message "boom""#)
+        );
+    }
+
+    /// A `join_all` record written before item outcomes became `Result`
+    /// replays unchanged. The first two entries are the payload that a
+    /// `join_all` over one succeeding step and one failing step wrote
+    /// before the change. The third entry is the form an earlier release
+    /// wrote for a panicked input.
+    #[tokio::test]
+    async fn join_all_replays_pre_change_payload() {
+        let payload = r#"[{"status":"fulfilled","value":1},{"status":"rejected","message":"boom","error_type":"Error"},{"status":"rejected","message":"task join failed: task 7 panicked with message \"boom\"","error_type":"CombinatorError"}]"#;
+        let (wire_id, record) = succeeded_record("1", payload);
+        let ctx = test_ctx(CheckpointLog::from_records(vec![(wire_id, record)]));
+        let op_id = ctx.mint_id();
+        let result = JoinAllExecution::<u32> {
+            ctx,
+            op_id,
+            name: Some("collect".to_owned()),
+            futures: vec![],
+        }
+        .execute()
+        .await
+        .expect("the combinator itself succeeds");
+
+        assert_eq!(result.len(), 3);
+        assert!(matches!(&result[0], Ok(1)));
+        let expected = [
+            (1, "Error", "boom"),
+            (
+                2,
+                "CombinatorError",
+                r#"task join failed: task 7 panicked with message "boom""#,
+            ),
+        ];
+        for (idx, error_type, message) in expected {
+            let Err(err) = &result[idx] else {
+                panic!("slot {idx} must be Err, got {:?}", result[idx]);
+            };
+            let wire = err.wire().expect("the replayed slot carries its record");
+            assert_eq!(wire.error_type(), Some(error_type), "slot {idx}");
+            assert_eq!(wire.error_message(), Some(message), "slot {idx}");
+        }
+    }
+
+    /// The live path writes the same JSON shape it wrote before item
+    /// outcomes became `Result`: `"fulfilled"` with the value, and
+    /// `"rejected"` with the input's recorded error type and message.
+    #[tokio::test]
+    async fn join_all_live_payload_keeps_wire_format() {
+        let (ctx, client) = recording_ctx(CheckpointLog::empty());
+        let ok = DurableFuture::from_async(async { Ok(1_u32) });
+        let bad: DurableFuture<u32> = DurableFuture::from_async(async {
+            Err(
+                OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
+                    CombinatorErrorKind::Internal,
+                    vec!["boom".to_owned().into()],
+                )))
+                .with_wire(crate::error::WireError::new(
+                    Some("Error".to_owned()),
+                    Some("boom".to_owned()),
+                )),
+            )
+        });
+        let op_id = ctx.mint_id();
+        JoinAllExecution {
+            ctx,
+            op_id,
+            name: None,
+            futures: vec![ok, bad],
+        }
+        .execute()
+        .await
+        .expect("the combinator itself succeeds");
+
+        assert_eq!(
+            succeed_payload(&client),
+            r#"[{"status":"fulfilled","value":1},{"status":"rejected","message":"boom","error_type":"Error"}]"#
         );
     }
 
@@ -1770,14 +1836,14 @@ mod tests {
         };
         let result = exec.execute().await.unwrap();
         assert_eq!(result.len(), 3);
-        assert!(matches!(&result[0], Settled::Fulfilled(1)));
-        assert!(matches!(&result[1], Settled::Rejected(_)));
-        assert!(matches!(&result[2], Settled::Fulfilled(3)));
+        assert!(matches!(&result[0], Ok(1)));
+        assert!(result[1].is_err());
+        assert!(matches!(&result[2], Ok(3)));
     }
 
     #[tokio::test]
     async fn join_all_replay_with_error_aware_serdes() {
-        // Simulate replay with mixed settled results including rejections.
+        // Simulate replay with mixed outcomes including rejections.
         let payload = r#"[{"status":"fulfilled","value":42},{"status":"rejected","message":"oops"},{"status":"fulfilled","value":99}]"#;
         let (wire_id, record) = succeeded_record("1", payload);
         let log = CheckpointLog::from_records(vec![(wire_id, record)]);
@@ -1792,9 +1858,9 @@ mod tests {
         };
         let result = exec.execute().await.unwrap();
         assert_eq!(result.len(), 3);
-        assert!(matches!(&result[0], Settled::Fulfilled(42)));
-        assert!(matches!(&result[1], Settled::Rejected(e) if format!("{e:#}").contains("oops")));
-        assert!(matches!(&result[2], Settled::Fulfilled(99)));
+        assert!(matches!(&result[0], Ok(42)));
+        assert!(matches!(&result[1], Err(e) if format!("{e:#}").contains("oops")));
+        assert!(matches!(&result[2], Ok(99)));
     }
 
     // === select_ok tests ===
@@ -2434,7 +2500,7 @@ mod tests {
             let ctx = test_ctx_with_client(CheckpointLog::empty());
 
             // Each branch calls enforce_task_ownership: without blessing,
-            // every branch would be Rejected with an ownership error.
+            // every branch would be an Err with an ownership error.
             let ctx_a = ctx.clone();
             let a = DurableFuture::from_async(async move {
                 ctx_a.enforce_task_ownership()?;
@@ -2463,18 +2529,18 @@ mod tests {
         .await
         .unwrap();
 
-        // Must succeed with all branches fulfilled: none rejected due to ownership.
+        // Must succeed with every branch Ok: none is an Err due to ownership.
         let settled = result.unwrap();
         assert_eq!(settled.len(), 3);
         for (i, s) in settled.iter().enumerate() {
             assert!(
-                matches!(s, Settled::Fulfilled(_)),
-                "branch {i} must be Fulfilled, not Rejected with ownership error"
+                s.is_ok(),
+                "branch {i} must be Ok, not Err with an ownership error"
             );
         }
-        assert!(matches!(&settled[0], Settled::Fulfilled(10)));
-        assert!(matches!(&settled[1], Settled::Fulfilled(20)));
-        assert!(matches!(&settled[2], Settled::Fulfilled(30)));
+        assert!(matches!(&settled[0], Ok(10)));
+        assert!(matches!(&settled[1], Ok(20)));
+        assert!(matches!(&settled[2], Ok(30)));
     }
 
     #[tokio::test]
@@ -2632,12 +2698,12 @@ mod tests {
     }
 
     /// Renders a `join_all` result so a live and a replayed run compare.
-    fn render_settled(settled: &[Settled<Tagged>]) -> Vec<String> {
+    fn render_settled(settled: &[Result<Tagged, OperationError>]) -> Vec<String> {
         settled
             .iter()
             .map(|s| match s {
-                Settled::Fulfilled(t) => format!("ok:{}:{:?}", t.value, t.cached),
-                Settled::Rejected(err) => format!(
+                Ok(t) => format!("ok:{}:{:?}", t.value, t.cached),
+                Err(err) => format!(
                     "err:{:?}:{:?}:{:?}",
                     err.kind(),
                     err.wire().and_then(crate::error::WireError::error_type),
@@ -2649,7 +2715,7 @@ mod tests {
 
     /// Runs `join_all` live over one `Tagged` input and one failing input,
     /// and returns the result with the SUCCEED payload it wrote.
-    async fn join_all_live() -> (Vec<Settled<Tagged>>, String) {
+    async fn join_all_live() -> (Vec<Result<Tagged, OperationError>>, String) {
         let (ctx, client) = recording_ctx(CheckpointLog::empty());
         let op_id = ctx.mint_id();
         let live = JoinAllExecution {
@@ -2682,8 +2748,8 @@ mod tests {
 
         assert_eq!(render_settled(&live), render_settled(&replayed));
         assert!(live.iter().all(|s| match s {
-            Settled::Fulfilled(t) => t.cached.is_none(),
-            _ => true,
+            Ok(t) => t.cached.is_none(),
+            Err(_) => true,
         }));
     }
 
@@ -2691,7 +2757,7 @@ mod tests {
     async fn join_all_live_rejection_is_child_failed() {
         let (live, payload) = join_all_live().await;
 
-        let Some(Settled::Rejected(err)) = live.get(1) else {
+        let Some(Err(err)) = live.get(1) else {
             panic!("item 1 must be rejected: {live:?}");
         };
         let OperationErrorKind::ChildContext(child) = err.kind() else {

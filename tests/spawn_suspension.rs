@@ -232,11 +232,8 @@ async fn join_all_suspends_until_parked_input_resolves() {
                     })
                     .future();
 
-                let settled = ctx.join_all([waiting, fast]).await?;
-                let fulfilled = settled
-                    .iter()
-                    .filter(|s| matches!(s, durable::Settled::Fulfilled(())))
-                    .count();
+                let outcomes = ctx.join_all([waiting, fast]).await?;
+                let fulfilled = outcomes.iter().filter(|s| matches!(s, Ok(()))).count();
 
                 Ok::<_, durable::BoxError>(fulfilled)
             },

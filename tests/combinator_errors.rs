@@ -315,7 +315,7 @@ async fn select_ok_all_failed_kind_and_loser_count_survive_replay() {
 }
 
 /// A rejected `join_all` outcome's wire identity (`error_type`, message)
-/// survives the checkpoint round-trip: the replayed `Settled::Rejected`
+/// survives the checkpoint round-trip: the replayed `Err`
 /// carries the SAME recorded wire record the live outcome carried, not a
 /// synthetic untyped reconstruction (issue #41).
 #[tokio::test]
@@ -342,7 +342,7 @@ async fn join_all_rejected_wire_identity_survives_replay() {
                     let rejected_wires: Vec<String> = settled
                         .iter()
                         .filter_map(|outcome| match outcome {
-                            durable::Settled::Rejected(err) => Some(format!(
+                            Err(err) => Some(format!(
                                 "{}:{}",
                                 err.wire()
                                     .and_then(durable::WireError::error_type)
@@ -351,7 +351,7 @@ async fn join_all_rejected_wire_identity_survives_replay() {
                                     .and_then(durable::WireError::error_message)
                                     .unwrap_or("<none>"),
                             )),
-                            _ => None,
+                            Ok(_) => None,
                         })
                         .collect();
                     if let Ok(mut seen) = observed.lock() {
@@ -531,12 +531,12 @@ async fn join_all_rejection_kind_matches_live_and_replay() {
                     let family = settled
                         .iter()
                         .find_map(|outcome| match outcome {
-                            durable::Settled::Rejected(err) => Some(match err.kind() {
+                            Err(err) => Some(match err.kind() {
                                 OperationErrorKind::Step(_) => "Step",
                                 OperationErrorKind::ChildContext(_) => "ChildContext",
                                 _ => "other",
                             }),
-                            _ => None,
+                            Ok(_) => None,
                         })
                         .unwrap_or("none");
                     if let Ok(mut seen) = observed.lock() {
@@ -563,4 +563,62 @@ async fn join_all_rejection_kind_matches_live_and_replay() {
         seen.iter().all(|(_, family)| family == "ChildContext"),
         "the rejected item is a ChildContext error live and on replay: {seen:?}"
     );
+}
+
+/// A failing `join_all` input is reported as that input's inner `Err`,
+/// never as the combinator's outer `Err`: the outer result is `Ok`, with
+/// `Ok` at index 0 and `Err` at index 1 (issue #64).
+#[tokio::test]
+async fn join_all_input_failure_is_inner_err() {
+    let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_clone = Arc::clone(&observed);
+
+    let result = LocalRunner::new()
+        .run(
+            move |_event: (), ctx: durable::DurableContext| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let good = ctx.step(|_| async { Ok(1_u32) }).name("good").future();
+                    let bad = ctx
+                        .step(|_| async { Err::<u32, durable::BoxError>("boom".into()) })
+                        .name("bad")
+                        .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                        .future();
+
+                    let joined: Result<Vec<Result<u32, durable::OperationError>>, _> =
+                        ctx.join_all([good, bad]).name("collect").await;
+                    let rendered = match &joined {
+                        Err(err) => format!("outer-err:{err}"),
+                        Ok(items) => items
+                            .iter()
+                            .map(|item| match item {
+                                Ok(value) => format!("ok:{value}"),
+                                Err(err) => format!(
+                                    "err:{}",
+                                    err.wire()
+                                        .and_then(durable::WireError::error_message)
+                                        .unwrap_or("<none>")
+                                ),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    };
+                    if let Ok(mut seen) = observed.lock() {
+                        seen.push(rendered);
+                    }
+                    Ok::<_, durable::BoxError>(())
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+
+    assert!(
+        result.is_success(),
+        "handler should complete: {:?}",
+        result.error_message()
+    );
+    let seen = observed.lock().expect("observation lock").clone();
+    assert_eq!(seen, vec!["ok:1,err:boom".to_owned()]);
 }

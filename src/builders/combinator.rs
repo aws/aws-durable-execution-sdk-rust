@@ -15,7 +15,7 @@ use std::future::IntoFuture;
 use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
-use crate::future::{DurableFuture, Settled};
+use crate::future::DurableFuture;
 
 /// Builder for [`DurableContext::try_join_all`]: fail-fast join.
 ///
@@ -143,14 +143,29 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 
 /// Builder for [`DurableContext::join_all`]: collect all outcomes.
 ///
-/// Awaits all futures concurrently and returns `Vec<Settled<O>>`.
-/// Never short-circuits: every future runs to completion regardless
-/// of individual failures.
+/// Awaits all futures concurrently and returns one
+/// `Result<O, OperationError>` per input, in input order. Never
+/// short-circuits: every future runs to completion regardless of
+/// individual failures.
 ///
-/// A rejected item is a `ChildContext` error of kind `ChildFailed` whose
+/// Awaiting the builder returns
+/// `Result<Vec<Result<O, OperationError>>, OperationError>`. The two
+/// levels report different failures:
+///
+/// - The outer `Err` means the combinator itself failed, for example
+///   replay nondeterminism or a checkpoint write failure.
+/// - An input that returns `Err` appears only as that input's inner `Err`,
+///   and the outer result is `Ok`.
+/// - A panicking input ends the invocation, as a panic does everywhere else
+///   in the SDK. The SDK resumes the original panic payload, and the
+///   combinator writes no record and returns no result.
+/// - Nothing cancels an input that `join_all` awaits: `join_all` drops no
+///   input before it settles.
+///
+/// An inner `Err` is a `ChildContext` error of kind `ChildFailed` whose
 /// `wire()` carries the input's recorded failure, on the first run and on
 /// replay. Match on the `err.wire()` fields, not on the kind of the input
-/// that failed. `join_all` cancels no input.
+/// that failed.
 ///
 /// # Examples
 ///
@@ -163,8 +178,16 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// ) -> Result<(), durable::BoxError> {
 ///     let a = ctx.step(|_| async { Ok(1) }).future();
 ///     let b = ctx.step(|_| async { Ok(2) }).future();
-///     let settled: Vec<durable::Settled<i32>> = ctx.join_all([a, b]).await?;
-///     assert_eq!(settled.len(), 2);
+///     let outcomes: Vec<Result<i32, durable::OperationError>> =
+///         ctx.join_all([a, b]).await?;
+///     let rendered: Vec<String> = outcomes
+///         .iter()
+///         .map(|outcome| match outcome {
+///             Ok(value) => format!("ok:{value}"),
+///             Err(err) => format!("err:{err}"),
+///         })
+///         .collect();
+///     assert_eq!(rendered.len(), 2);
 ///     Ok(())
 /// }
 /// ```
@@ -217,7 +240,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     /// so `.future()` is how operations of different kinds join or race
     /// together. It does not start the operation: whatever awaits the
     /// returned future drives it, and a combinator drops the losers.
-    pub fn future(self) -> DurableFuture<Vec<Settled<O>>> {
+    pub fn future(self) -> DurableFuture<Vec<Result<O, OperationError>>> {
         self.into_future()
     }
 
@@ -236,7 +259,7 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
     /// error and the operation records nothing.
-    pub fn spawn(self) -> DurableFuture<Vec<Settled<O>>> {
+    pub fn spawn(self) -> DurableFuture<Vec<Result<O, OperationError>>> {
         spawn_terminal!(self)
     }
 }
@@ -244,8 +267,8 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
 impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFuture
     for JoinAllBuilder<O>
 {
-    type Output = Result<Vec<Settled<O>>, OperationError>;
-    type IntoFuture = DurableFuture<Vec<Settled<O>>>;
+    type Output = Result<Vec<Result<O, OperationError>>, OperationError>;
+    type IntoFuture = DurableFuture<Vec<Result<O, OperationError>>>;
 
     fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::JoinAllExecution;

@@ -1,14 +1,12 @@
 //! `join_all`: collect every outcome, successes and failures alike.
 //!
-//! [`join_all`] runs operations concurrently and returns a
-//! [`Settled`] per operation: [`Fulfilled`](aws_durable_execution_sdk::Settled::Fulfilled)
-//! with the value or [`Rejected`](aws_durable_execution_sdk::Settled::Rejected)
-//! with the error, never failing fast. It is the durable analogue of
-//! `Promise.allSettled`, for when you want every result regardless of
-//! individual failures. Errors inside the settled results are preserved through
+//! [`join_all`] runs operations concurrently and returns a `Result` per
+//! operation: `Ok` with the value or `Err` with the error, never failing
+//! fast. It is the durable analogue of `Promise.allSettled`, for when you
+//! want every result regardless of individual failures. Errors inside the item results are preserved through
 //! checkpointing, so replay reproduces the same successes and failures.
 //!
-//! A rejected item is a child-context error that carries the input's recorded
+//! An `Err` item is a child-context error that carries the input's recorded
 //! failure in its `wire()` record, on the first run and on replay alike. So
 //! match on the `wire()` fields rather than on the kind of the input that
 //! failed.
@@ -18,10 +16,8 @@
 //! failure. Its output is `ok:1,err:operation error: child_context`.
 //!
 //! [`join_all`]: aws_durable_execution_sdk::DurableContext::join_all
-//! [`Settled`]: aws_durable_execution_sdk::Settled
 
 use aws_durable_execution_sdk as durable;
-use durable::Settled;
 
 /// Joins a succeeding and a failing step, summarizing every outcome.
 async fn handler(
@@ -35,14 +31,12 @@ async fn handler(
         .retry_strategy(|_err, _attempt| durable::RetryDecision::Stop)
         .future();
 
-    let settled = ctx.join_all([good, bad]).name("collect").await?;
-    let summary: Vec<String> = settled
+    let outcomes = ctx.join_all([good, bad]).name("collect").await?;
+    let summary: Vec<String> = outcomes
         .into_iter()
         .map(|outcome| match outcome {
-            Settled::Fulfilled(value) => format!("ok:{value}"),
-            Settled::Rejected(err) => format!("err:{err}"),
-            // `Settled` is non_exhaustive; treat any future variant as unknown.
-            _ => "unknown".to_owned(),
+            Ok(value) => format!("ok:{value}"),
+            Err(err) => format!("err:{err}"),
         })
         .collect();
     Ok(summary.join(","))
