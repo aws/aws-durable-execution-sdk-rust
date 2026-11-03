@@ -235,6 +235,7 @@ where
             timeout: self.timeout,
             heartbeat: self.heartbeat,
             sub_type: self.sub_type.unwrap_or(OperationSubType::CALLBACK),
+            plugin_name: None,
             serdes: self.serdes,
             _marker: PhantomData,
         };

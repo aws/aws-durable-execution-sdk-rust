@@ -2057,3 +2057,352 @@ async fn invoke_failure_hooks() {
     assert_eq!(shape.5, FAILED);
     assert!(info.error().is_some(), "{info:?}");
 }
+
+// The operation hooks of callbacks and `wait_for_callback`.
+
+/// `(inv, hook, kind, name, is_replay, status)` of one operation or attempt
+/// hook call, with its sub-type and result.
+#[derive(Clone, Debug, PartialEq)]
+struct CbRec {
+    shape: OpShape,
+    sub_type: Option<String>,
+    result: Option<String>,
+    error_type: Option<String>,
+}
+
+/// Records every operation and attempt hook of a callback, a context and
+/// a step, for every invocation.
+#[derive(Clone, Default)]
+struct Callbacks {
+    recs: Arc<Mutex<Vec<CbRec>>>,
+    count: Arc<AtomicUsize>,
+}
+
+impl Callbacks {
+    fn recs(&self) -> Vec<CbRec> {
+        self.recs.lock().unwrap().clone()
+    }
+
+    /// The `(inv, hook, kind, name, is_replay, status)` of every record.
+    fn shapes(&self) -> Vec<OpShape> {
+        self.recs().into_iter().map(|r| r.shape).collect()
+    }
+
+    /// The records of the operation named `name`.
+    fn of(&self, name: &str) -> Vec<CbRec> {
+        self.recs()
+            .into_iter()
+            .filter(|r| r.shape.3.as_deref() == Some(name))
+            .collect()
+    }
+
+    fn runner(&self) -> LocalRunner {
+        LocalRunner::new().options(
+            Options::builder()
+                .plugin(self.clone())
+                .build()
+                .expect("valid options"),
+        )
+    }
+}
+
+struct CallbacksPlugin {
+    inv: usize,
+    callbacks: Callbacks,
+}
+
+impl CallbacksPlugin {
+    fn push(&self, hook: &'static str, info: &OperationInfo) {
+        if !matches!(
+            info.kind(),
+            Some(OperationKind::Callback | OperationKind::Context | OperationKind::Step)
+        ) {
+            return;
+        }
+        let rec = CbRec {
+            shape: (
+                self.inv,
+                hook,
+                info.kind(),
+                info.name().map(str::to_owned),
+                info.is_replay(),
+                info.status(),
+            ),
+            sub_type: info.sub_type().map(str::to_owned),
+            result: info.result().map(str::to_owned),
+            error_type: info
+                .error()
+                .and_then(WireError::error_type)
+                .map(str::to_owned),
+        };
+        self.callbacks.recs.lock().unwrap().push(rec);
+    }
+}
+
+impl Plugin for CallbacksPlugin {
+    fn on_operation_start(&self, info: &OperationInfo) -> HookWork {
+        self.push("start", info);
+        Ok(None)
+    }
+
+    fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
+        self.push("end", info);
+        Ok(None)
+    }
+
+    fn on_attempt_start(&self, info: &AttemptInfo) -> HookWork {
+        self.push("attempt_start", info.operation());
+        Ok(None)
+    }
+
+    fn on_attempt_end(&self, info: &AttemptEndInfo) -> HookWork {
+        self.push("attempt_end", info.operation());
+        Ok(None)
+    }
+}
+
+impl PluginFactory for Callbacks {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        let inv = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(Some(Box::new(CallbacksPlugin {
+            inv,
+            callbacks: self.clone(),
+        })))
+    }
+}
+
+const CALLBACK: Option<OperationKind> = Some(OperationKind::Callback);
+const CONTEXT: Option<OperationKind> = Some(OperationKind::Context);
+const STEP: Option<OperationKind> = Some(OperationKind::Step);
+
+#[tokio::test]
+async fn callback_hooks() {
+    let callbacks = Callbacks::default();
+    let result = callbacks
+        .runner()
+        .callback(durable::test_util::CallbackReply::success(&"ok").expect("encodes"))
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let cb = ctx.create_callback::<String>().name("cb").await?;
+                let value = cb.result().await?;
+                ctx.wait(Duration::from_secs(1)).await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output().map(String::as_str), Some("ok"));
+    assert_eq!(result.invocation_count(), 3);
+    let cb = Some("cb".to_owned());
+    let recs = callbacks.of("cb");
+    assert_eq!(
+        recs.iter().map(|r| r.shape.clone()).collect::<Vec<_>>(),
+        [
+            (1, "start", CALLBACK, cb.clone(), false, STARTED),
+            (2, "end", CALLBACK, cb.clone(), false, SUCCEEDED),
+            (3, "end", CALLBACK, cb, true, SUCCEEDED),
+        ]
+    );
+    assert_eq!(
+        recs.get(1).and_then(|r| r.result.as_deref()),
+        Some("\"ok\""),
+        "the end hook carries the raw reply"
+    );
+}
+
+#[tokio::test]
+async fn callback_timeout_hooks() {
+    let callbacks = Callbacks::default();
+    let result = callbacks
+        .runner()
+        .callback(durable::test_util::CallbackReply::timeout())
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let cb = ctx.create_callback::<String>().name("cb").await?;
+                Ok::<_, BoxError>(cb.result().await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_failure());
+    let ends: Vec<_> = callbacks
+        .of("cb")
+        .into_iter()
+        .filter(|r| r.shape.1 == "end")
+        .map(|r| r.shape.5)
+        .collect();
+    assert_eq!(ends, [Some(OperationStatus::TimedOut)]);
+}
+
+/// Runs a `wait_for_callback` named `name` (or unnamed), with the reply
+/// `reply` queued for it, then a 1 s wait.
+async fn run_wait_for_callback(
+    callbacks: &Callbacks,
+    name: Option<&'static str>,
+    reply: durable::test_util::CallbackReply,
+) -> durable::test_util::TestResult<String> {
+    let runner = match name {
+        Some(name) => callbacks.runner().callback_for(name, reply),
+        None => callbacks.runner().callback(reply),
+    };
+    runner
+        .run(
+            move |_e: (), ctx: DurableContext| async move {
+                let mut wfcb = ctx.wait_for_callback::<String, _, _>(|_step, _id| async { Ok(()) });
+                if let Some(name) = name {
+                    wfcb = wfcb.name(name);
+                }
+                let value = wfcb.await?;
+                ctx.wait(Duration::from_secs(1)).await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner")
+}
+
+#[tokio::test]
+async fn wait_for_callback_hooks() {
+    let callbacks = Callbacks::default();
+    let result = run_wait_for_callback(
+        &callbacks,
+        Some("approve"),
+        durable::test_util::CallbackReply::success(&"yes").expect("encodes"),
+    )
+    .await;
+    assert_eq!(result.output().map(String::as_str), Some("yes"));
+    assert_eq!(result.invocation_count(), 3);
+    let approve = Some("approve".to_owned());
+    let callback = Some("approve-callback".to_owned());
+    let submitter = Some("approve-submitter".to_owned());
+    assert_eq!(
+        callbacks.shapes(),
+        [
+            (1, "start", CONTEXT, approve.clone(), false, STARTED),
+            (1, "start", CALLBACK, callback.clone(), false, STARTED),
+            (1, "start", STEP, submitter.clone(), false, STARTED),
+            (1, "attempt_start", STEP, submitter.clone(), false, STARTED),
+            (1, "attempt_end", STEP, submitter.clone(), false, SUCCEEDED),
+            (1, "end", STEP, submitter, false, SUCCEEDED),
+            (2, "start", CONTEXT, approve.clone(), true, STARTED),
+            (2, "end", CALLBACK, callback, false, SUCCEEDED),
+            (2, "end", CONTEXT, approve, false, SUCCEEDED),
+        ]
+    );
+    let end = callbacks
+        .of("approve")
+        .into_iter()
+        .find(|r| r.shape.1 == "end")
+        .expect("the context ended");
+    assert_eq!(end.result.as_deref(), Some("\"yes\""));
+    assert_eq!(end.sub_type.as_deref(), Some("WaitForCallback"));
+}
+
+#[tokio::test]
+async fn wait_for_callback_failure_hooks() {
+    let callbacks = Callbacks::default();
+    let result = run_wait_for_callback(
+        &callbacks,
+        Some("approve"),
+        durable::test_util::CallbackReply::failure(durable::test_util::CallbackFailure::new(
+            "Declined", "no",
+        )),
+    )
+    .await;
+    assert!(result.is_failure());
+    let ends: Vec<_> = callbacks
+        .recs()
+        .into_iter()
+        .filter(|r| r.shape.0 == 2 && r.shape.1 == "end")
+        .map(|r| (r.shape.3, r.shape.5, r.error_type))
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            (
+                Some("approve-callback".to_owned()),
+                FAILED,
+                Some("Declined".to_owned())
+            ),
+            (
+                Some("approve".to_owned()),
+                FAILED,
+                Some("Declined".to_owned())
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn unnamed_wait_for_callback_has_unnamed_inner_ops() {
+    let callbacks = Callbacks::default();
+    let result = run_wait_for_callback(
+        &callbacks,
+        None,
+        durable::test_util::CallbackReply::success(&"yes").expect("encodes"),
+    )
+    .await;
+    assert_eq!(result.output().map(String::as_str), Some("yes"));
+    let inner: Vec<_> = callbacks
+        .recs()
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.shape.2,
+                Some(OperationKind::Callback | OperationKind::Step)
+            )
+        })
+        .collect();
+    assert_ne!(inner.len(), 0);
+    assert!(inner.iter().all(|r| r.shape.3.is_none()), "{inner:?}");
+}
+
+#[tokio::test]
+async fn callback_custom_sub_type_reaches_plugin() {
+    let callbacks = Callbacks::default();
+    let result = callbacks
+        .runner()
+        .callback(durable::test_util::CallbackReply::success(&"ok").expect("encodes"))
+        .callback_for(
+            "approve",
+            durable::test_util::CallbackReply::success(&"yes").expect("encodes"),
+        )
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let cb = ctx
+                    .create_callback::<String>()
+                    .name("cb")
+                    .sub_type(durable::OperationSubType::new("Approval")?)
+                    .await?;
+                let first = cb.result().await?;
+                let second = ctx
+                    .wait_for_callback::<String, _, _>(|_step, _id| async { Ok(()) })
+                    .name("approve")
+                    .await?;
+                Ok::<_, BoxError>(format!("{first}/{second}"))
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output().map(String::as_str), Some("ok/yes"));
+    let recorded = result
+        .operation("cb")
+        .and_then(durable::test_util::TestOperation::sub_type)
+        .map(str::to_owned);
+    assert_eq!(recorded.as_deref(), Some("Approval"));
+    let cb = callbacks.of("cb");
+    assert_ne!(cb.len(), 0);
+    assert!(cb.iter().all(|r| r.sub_type == recorded), "{cb:?}");
+    let inner = callbacks.of("approve-callback");
+    assert_ne!(inner.len(), 0);
+    assert!(
+        inner
+            .iter()
+            .all(|r| r.sub_type.as_deref() == Some("Callback")),
+        "{inner:?}"
+    );
+}

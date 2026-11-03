@@ -44,6 +44,10 @@ pub(crate) struct CreateCallbackExecution<O, S> {
     pub(crate) heartbeat: Option<Duration>,
     /// The resolved subtype: the builder's `sub_type`, or `Callback`.
     pub(crate) sub_type: crate::OperationSubType,
+    /// The name the plugin hooks report instead of `name`: the callback of
+    /// a named `wait_for_callback` reports `<name>-callback`. `None`
+    /// reports `name`.
+    pub(crate) plugin_name: Option<String>,
     pub(crate) serdes: S,
     pub(crate) _marker: std::marker::PhantomData<O>,
 }
@@ -89,7 +93,22 @@ where
             ) {
                 // Callback is in flight: return pending (`result()` waits
                 // for the record).
+                if let Some(plugins) = self.ctx.plugins() {
+                    let info = self.info(&wire_id).with_replay(true);
+                    crate::plugin::operation_started(plugins, &info);
+                }
                 return Ok(self.into_pending(callback_id));
+            }
+            // A terminal record fires the end hook when the callback is
+            // created, as JS does. It is live only in the first invocation
+            // after the service completed the callback.
+            if let Some(plugins) = self.ctx.plugins()
+                && is_terminal_callback_status(&view.status)
+            {
+                let info = self
+                    .info(&wire_id)
+                    .with_replay(!plugins.is_updated(&wire_id));
+                crate::plugin::operation_ended(plugins, &info);
             }
             let outcome = callback_outcome(
                 &self.ctx,
@@ -154,8 +173,27 @@ where
                 missing_callback_id_error(&wire_id, CheckpointStatus::Started.wire_str())
             })?;
 
+        if let Some(plugins) = self.ctx.plugins() {
+            let info = self
+                .info(&wire_id)
+                .with_status(crate::OperationStatus::Started)
+                .with_replay(false);
+            crate::plugin::operation_started(plugins, &info);
+        }
+
         // Return pending: `result()` waits for the record.
         Ok(self.into_pending(callback_id))
+    }
+
+    /// The plugin info of this callback, read from its current record.
+    fn info(&self, wire_id: &str) -> crate::plugin::OperationInfo {
+        callback_info(
+            &self.ctx,
+            wire_id,
+            self.sub_type.as_str(),
+            self.name.as_deref(),
+            self.plugin_name.as_deref(),
+        )
     }
 
     /// A pending callback whose `result()` waits for the record to settle,
@@ -166,9 +204,15 @@ where
             op_id,
             name,
             sub_type,
+            plugin_name,
             serdes,
             ..
         } = self;
+        let identity = crate::future::CallbackIdentity {
+            name: name.clone(),
+            plugin_name,
+            sub_type: sub_type.as_str().to_owned(),
+        };
         let wire_id = op_id.wire().to_owned();
         let positional_id = op_id.positional().to_owned();
         let resolver_ctx = ctx.clone();
@@ -194,7 +238,38 @@ where
                 .and_then(|outcome| outcome)
             })
         });
-        Callback::new_pending(callback_id, ctx, wire_id, resolver)
+        Callback::new_pending(callback_id, ctx, wire_id, identity, resolver)
+    }
+}
+
+/// Whether a callback record with `status` holds the callback's outcome:
+/// `SUCCEEDED`, `FAILED` or `TIMED_OUT`.
+pub(crate) fn is_terminal_callback_status(status: &CheckpointStatus) -> bool {
+    matches!(
+        status,
+        CheckpointStatus::Succeeded | CheckpointStatus::Failed | CheckpointStatus::TimedOut
+    )
+}
+
+/// The plugin info of the callback `wire_id`, created in `ctx`, read from
+/// its current record. A `plugin_name` replaces the name the info reports.
+pub(crate) fn callback_info(
+    ctx: &DurableContext,
+    wire_id: &str,
+    sub_type: &str,
+    name: Option<&str>,
+    plugin_name: Option<&str>,
+) -> crate::plugin::OperationInfo {
+    let info = crate::plugin::OperationInfo::for_operation(
+        ctx,
+        wire_id,
+        crate::OperationKind::Callback,
+        sub_type,
+        name,
+    );
+    match plugin_name {
+        Some(plugin_name) => info.with_name(Some(plugin_name.to_owned())),
+        None => info,
     }
 }
 
@@ -322,6 +397,8 @@ where
             serdes,
             ..
         } = self;
+        // The plugin names of the inner callback and submitter step.
+        let plugin_names = InnerPluginNames::of(name.as_deref());
         let core = WfcbCore {
             ctx,
             op_id,
@@ -338,6 +415,7 @@ where
                 let child_span = child_ctx.replay_span();
                 let body_result = run_wfcb_body::<O, _, _, _>(
                     child_ctx,
+                    plugin_names,
                     timeout,
                     heartbeat,
                     submitter,
@@ -355,6 +433,39 @@ where
             }
         }
     }
+}
+
+/// The names the plugin hooks report for the inner operations of a
+/// `wait_for_callback` named `n`: `n-callback` and `n-submitter`. An
+/// unnamed `wait_for_callback` reports unnamed inner operations.
+struct InnerPluginNames {
+    callback: Option<String>,
+    submitter: Option<String>,
+}
+
+impl InnerPluginNames {
+    fn of(name: Option<&str>) -> Self {
+        Self {
+            callback: name.map(|n| format!("{n}-callback")),
+            submitter: name.map(|n| format!("{n}-submitter")),
+        }
+    }
+}
+
+/// The plugin info of the `wait_for_callback` context `wire_id`, created
+/// in `ctx`, read from its current record.
+fn wfcb_info(
+    ctx: &DurableContext,
+    wire_id: &str,
+    name: Option<&str>,
+) -> crate::plugin::OperationInfo {
+    crate::plugin::OperationInfo::for_operation(
+        ctx,
+        wire_id,
+        crate::OperationKind::Context,
+        WFCB_SUB_TYPE,
+        name,
+    )
 }
 
 /// The pre-body half of `wait_for_callback`: task-ownership check, replay
@@ -454,7 +565,12 @@ where
                     ))));
                 }
                 // Started/Pending/Ready: fall through to execute/resume.
-                _ => {}
+                _ => {
+                    if let Some(plugins) = ctx.plugins() {
+                        let info = wfcb_info(&ctx, &wire_id, name.as_deref()).with_replay(true);
+                        crate::plugin::operation_started(plugins, &info);
+                    }
+                }
             }
         } else {
             // 3. First invocation: checkpoint ContextStarted.
@@ -466,6 +582,12 @@ where
                 return ctx
                     .checkpoint_failure_unrecoverable(&wire_id, err, None)
                     .await;
+            }
+            if let Some(plugins) = ctx.plugins() {
+                let info = wfcb_info(&ctx, &wire_id, name.as_deref())
+                    .with_status(crate::OperationStatus::Started)
+                    .with_replay(false);
+                crate::plugin::operation_started(plugins, &info);
             }
         }
 
@@ -528,6 +650,13 @@ where
                         .checkpoint_failure_unrecoverable(&wire_id, err, Some(terminal))
                         .await;
                 }
+                if let Some(plugins) = ctx.plugins() {
+                    let info = wfcb_info(&ctx, &wire_id, name.as_deref())
+                        .with_status(crate::OperationStatus::Succeeded)
+                        .with_result(Some(serialized.clone()))
+                        .with_replay(false);
+                    crate::plugin::operation_ended(plugins, &info);
+                }
 
                 // Round-trip deserialize for consistency.
                 let out: O = serde_json::from_str(&serialized)
@@ -570,6 +699,13 @@ where
                         .checkpoint_failure_unrecoverable(&wire_id, client_err, Some(terminal))
                         .await;
                 }
+                if let Some(plugins) = ctx.plugins() {
+                    let info = wfcb_info(&ctx, &wire_id, name.as_deref())
+                        .with_status(crate::OperationStatus::Failed)
+                        .with_error(Some(wire.clone()))
+                        .with_replay(false);
+                    crate::plugin::operation_ended(plugins, &info);
+                }
                 Err(err
                     .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
                     .with_wire(wire))
@@ -585,6 +721,7 @@ where
 /// `StepStarted`/`StepSucceeded`/`StepFailed` checkpoint events).
 async fn run_wfcb_body<O, F, Fut, S>(
     child_ctx: DurableContext,
+    plugin_names: InnerPluginNames,
     timeout: Option<Duration>,
     heartbeat: Option<Duration>,
     submitter: F,
@@ -607,6 +744,7 @@ where
         timeout,
         heartbeat,
         sub_type: crate::OperationSubType::CALLBACK,
+        plugin_name: plugin_names.callback,
         serdes,
         _marker: std::marker::PhantomData,
     };
@@ -625,6 +763,7 @@ where
         serdes: crate::serdes::JsonSerdes,
         semantics: crate::step::StepSemantics::default(),
         sub_type: crate::OperationSubType::STEP,
+        plugin_name: plugin_names.submitter,
         closure: move |step_ctx: StepContext| async move {
             (submitter)(step_ctx, callback_id).await?;
             Ok(())
@@ -968,6 +1107,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -999,6 +1139,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1037,6 +1178,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1070,6 +1212,7 @@ mod tests {
             timeout: Some(Duration::from_secs(5)),
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1101,6 +1244,7 @@ mod tests {
             timeout: None,
             heartbeat: Some(Duration::from_secs(10)),
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1132,6 +1276,7 @@ mod tests {
             timeout: None,
             heartbeat: Some(Duration::from_secs(10)),
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1163,6 +1308,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1194,12 +1340,182 @@ mod tests {
             timeout: Some(Duration::from_mins(1)),
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
         let cb = exec.execute().await.expect("should succeed");
         // The in-memory client assigns backend-style callback IDs.
         assert_eq!(cb.id(), "in-mem-cb-1");
+    }
+
+    /// A context on the records `records` whose one plugin is `hooks`.
+    fn ctx_with_hooks(
+        records: Vec<(String, CheckpointRecord)>,
+        hooks: &crate::plugin::test_support::OpHooks,
+    ) -> DurableContext {
+        DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:123:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(records)),
+            Arc::new(InMemoryExecutionClient::new(vec![])),
+            "token-1".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        )
+    }
+
+    /// Creates the callback `cb` in `ctx` and returns the outcome.
+    async fn create_cb(ctx: &DurableContext) -> Result<Callback<String>, OperationError> {
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id: ctx.mint_id(),
+            name: Some("cb".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
+            serdes: crate::serdes::JsonSerdes,
+            _marker: std::marker::PhantomData,
+        };
+        exec.execute().await
+    }
+
+    /// `(hook, is_replay, status)` of every hook call `hooks` recorded.
+    fn hook_shapes(
+        hooks: &crate::plugin::test_support::OpHooks,
+    ) -> Vec<(&'static str, bool, Option<crate::OperationStatus>)> {
+        hooks
+            .records()
+            .iter()
+            .map(|r| (r.hook, r.replay, r.status))
+            .collect()
+    }
+
+    /// A `STARTED` callback record without a callback ID returns the
+    /// missing-ID error and fires no hook.
+    #[tokio::test]
+    async fn callback_missing_id_fires_no_hook() {
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_hooks(
+            vec![callback_record(
+                &wire,
+                CheckpointStatus::Started,
+                None,
+                None,
+                None,
+                None,
+            )],
+            &hooks,
+        );
+        let err = create_cb(&ctx).await.expect_err("the ID is missing");
+        assert_missing_callback_id_error(&err, &wire);
+        assert!(hooks.records().is_empty(), "{:?}", hooks.records());
+    }
+
+    /// A live callback whose START response carries no callback ID returns
+    /// the missing-ID error and fires no hook.
+    #[tokio::test]
+    async fn live_callback_missing_id_fires_no_hook() {
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        client.enqueue_checkpoint_response(crate::client::TestResponse::Success(vec![]));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client,
+            "token-1".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let wire = crate::engine::compute_wire_id_public("1");
+        let err = create_cb(&ctx).await.expect_err("the ID is missing");
+        assert_missing_callback_id_error(&err, &wire);
+        assert!(hooks.records().is_empty(), "{:?}", hooks.records());
+    }
+
+    /// A replayed `STARTED` or `PENDING` callback with an ID fires
+    /// `on_operation_start` with `is_replay` `true`.
+    #[tokio::test]
+    async fn running_callback_record_starts_replayed() {
+        for status in [CheckpointStatus::Started, CheckpointStatus::Pending] {
+            let hooks = crate::plugin::test_support::OpHooks::default();
+            let wire = crate::engine::compute_wire_id_public("1");
+            let ctx = ctx_with_hooks(
+                vec![callback_record(
+                    &wire,
+                    status.clone(),
+                    None,
+                    None,
+                    None,
+                    Some("cb-1"),
+                )],
+                &hooks,
+            );
+            create_cb(&ctx).await.expect("the callback is running");
+            let records = hooks.of("cb");
+            assert_eq!(records.len(), 1, "{status:?}: {records:?}");
+            let record = records.first().expect("one record");
+            assert_eq!((record.hook, record.replay), ("start", true), "{status:?}");
+        }
+    }
+
+    /// A replayed `FAILED` or `TIMED_OUT` callback that the service did not
+    /// change since the previous invocation fires `on_operation_end` with
+    /// `is_replay` `true` when it is created.
+    #[tokio::test]
+    async fn failed_callback_record_ends_replayed() {
+        for (status, expected) in [
+            (CheckpointStatus::Failed, crate::OperationStatus::Failed),
+            (CheckpointStatus::TimedOut, crate::OperationStatus::TimedOut),
+        ] {
+            let hooks = crate::plugin::test_support::OpHooks::default();
+            let wire = crate::engine::compute_wire_id_public("1");
+            let ctx = ctx_with_hooks(
+                vec![callback_record(
+                    &wire,
+                    status.clone(),
+                    None,
+                    Some("Declined"),
+                    Some("no"),
+                    Some("cb-1"),
+                )],
+                &hooks,
+            );
+            let cb = create_cb(&ctx).await.expect("the record replays");
+            assert_eq!(
+                hook_shapes(&hooks),
+                [("end", true, Some(expected))],
+                "{status:?}"
+            );
+            cb.result().await.expect_err("the callback did not succeed");
+            assert_eq!(hooks.records().len(), 1, "result() fires no second hook");
+        }
+    }
+
+    /// A callback record with an ID and a status other than `STARTED`,
+    /// `PENDING`, `SUCCEEDED`, `FAILED` or `TIMED_OUT` fires no hook.
+    #[tokio::test]
+    async fn cancelled_callback_record_fires_no_hook() {
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_hooks(
+            vec![callback_record(
+                &wire,
+                CheckpointStatus::Cancelled,
+                None,
+                None,
+                None,
+                Some("cb-1"),
+            )],
+            &hooks,
+        );
+        create_cb(&ctx)
+            .await
+            .expect_err("a cancelled callback is unexpected");
+        assert!(hooks.records().is_empty(), "{:?}", hooks.records());
     }
 
     /// Asserts the error is the typed `CallbackError` for a missing
@@ -1243,6 +1559,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1272,6 +1589,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1301,6 +1619,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1332,6 +1651,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1524,6 +1844,7 @@ mod tests {
                     timeout: None,
                     heartbeat: None,
                     sub_type: crate::OperationSubType::CALLBACK,
+                    plugin_name: None,
                     serdes: crate::serdes::JsonSerdes,
                     _marker: std::marker::PhantomData,
                 };
@@ -1967,6 +2288,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: MarkerSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -2015,6 +2337,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: HexEnvelopeSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -2069,6 +2392,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: filesystem_serdes,
             _marker: std::marker::PhantomData,
         };
@@ -2116,6 +2440,7 @@ mod tests {
             timeout: None,
             heartbeat: None,
             sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -2533,5 +2858,150 @@ mod coordinator_tests {
         .expect("no panic");
         assert_eq!(outcome, InvocationOutcome::Complete("ok".to_owned()));
         assert_eq!(runs.load(Ordering::SeqCst), 2, "the submitter ran twice");
+    }
+
+    /// A refresh client that answers the callback `cb`'s START with its
+    /// ID, and answers the first refresh with `completed` for it.
+    fn refresh_completing(
+        completed: impl Fn(&OperationUpdate) -> Operation + Send + Sync + 'static,
+    ) -> crate::driver::test_support::RefreshClient {
+        crate::driver::test_support::RefreshClient::new(move |req| {
+            if let Some(start) = named(req.updates, "cb", &OperationAction::Start) {
+                return Ok(vec![started(start)]);
+            }
+            if req.empty_number == 1
+                && let Some(start) = named(req.history, "cb", &OperationAction::Start)
+            {
+                return Ok(vec![completed(start)]);
+            }
+            Ok(Vec::new())
+        })
+    }
+
+    /// Runs `create_callback` named `cb` with a recording plugin, and
+    /// joins `cb.result()` with a step that sleeps 3 s. Returns the
+    /// outcome, the callback's result, and the number of hook records of
+    /// `cb` when `result()` returned.
+    async fn join_result_with_sleeping_step(
+        client: crate::driver::test_support::RefreshClient,
+        hooks: &crate::plugin::test_support::OpHooks,
+    ) -> (
+        InvocationOutcome,
+        Option<(Result<String, crate::OperationError>, usize)>,
+    ) {
+        let ctx = crate::DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::engine::CheckpointLog::empty()),
+            Arc::new(client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let handler_seen = Arc::clone(&seen);
+        let handler_hooks = hooks.clone();
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            let step = ctx
+                .step(|_| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    Ok(1_u32)
+                })
+                .name("s")
+                .spawn();
+            let result = async {
+                let result = cb.result().await;
+                (result, handler_hooks.of("cb").len())
+            };
+            let (result, step) = tokio::join!(result, step);
+            step.map_err(wire_err)?;
+            *handler_seen.lock().expect("lock") = Some(result);
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        let result = seen.lock().expect("lock").take();
+        (outcome, result)
+    }
+
+    /// A callback that the first refresh completes while `result()` waits
+    /// fires its end hook live, before `result()` returns.
+    #[tokio::test(start_paused = true)]
+    async fn callback_resumed_in_invocation_ends_live() {
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let (outcome, result) =
+            join_result_with_sleeping_step(refresh_completing(succeeded), &hooks).await;
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let (value, hooks_at_return) = result.expect("the handler finished");
+        assert_eq!(value.expect("the callback succeeded"), "ok");
+        let shapes: Vec<_> = hooks
+            .of("cb")
+            .iter()
+            .map(|r| (r.hook, r.replay, r.status))
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                ("start", false, Some(crate::OperationStatus::Started)),
+                ("end", false, Some(crate::OperationStatus::Succeeded)),
+            ]
+        );
+        assert_eq!(
+            hooks_at_return, 2,
+            "the end hook ran before result() returned"
+        );
+    }
+
+    /// A callback that a refresh fails while `result()` waits fires its end
+    /// hook live with the status `Failed`.
+    #[tokio::test(start_paused = true)]
+    async fn callback_failed_in_invocation_ends_live() {
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let (outcome, result) =
+            join_result_with_sleeping_step(refresh_completing(declined), &hooks).await;
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let (value, _) = result.expect("the handler finished");
+        value.expect_err("the callback was declined");
+        let shapes: Vec<_> = hooks
+            .of("cb")
+            .iter()
+            .map(|r| (r.hook, r.replay, r.status))
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                ("start", false, Some(crate::OperationStatus::Started)),
+                ("end", false, Some(crate::OperationStatus::Failed)),
+            ]
+        );
+    }
+
+    /// A callback whose record a refresh changes to `CANCELLED` while
+    /// `result()` waits fires no end hook.
+    #[tokio::test(start_paused = true)]
+    async fn callback_cancelled_in_invocation_fires_no_end() {
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let cancelled = |start: &OperationUpdate| {
+            operation_like(start, OperationStatus::Cancelled)
+                .callback_details(CallbackDetails::builder().callback_id("cb-1").build())
+                .build()
+                .expect("all required fields set")
+        };
+        let (outcome, result) =
+            join_result_with_sleeping_step(refresh_completing(cancelled), &hooks).await;
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let (value, _) = result.expect("the handler finished");
+        let err = value.expect_err("a cancelled callback is unexpected");
+        assert!(
+            format!("{err:?}").contains("unexpected checkpointed status"),
+            "{err:?}"
+        );
+        let hooks_of_cb: Vec<_> = hooks.of("cb").iter().map(|r| r.hook).collect();
+        assert_eq!(hooks_of_cb, ["start"]);
     }
 }

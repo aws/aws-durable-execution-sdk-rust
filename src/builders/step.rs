@@ -369,6 +369,7 @@ where
             serdes: self.serdes,
             semantics: self.semantics,
             sub_type: self.sub_type.unwrap_or(OperationSubType::STEP),
+            plugin_name: None,
             closure: self.closure,
             _marker: PhantomData,
         };

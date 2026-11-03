@@ -442,6 +442,18 @@ pub struct Callback<O> {
 pub(crate) type CallbackResolver<O> =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<O, OperationError>> + Send>> + Send>;
 
+/// What a pending callback's `result()` needs, besides its context and
+/// wire ID, to build the plugin info of the callback.
+#[derive(Debug)]
+pub(crate) struct CallbackIdentity {
+    /// The callback's name.
+    pub(crate) name: Option<String>,
+    /// The name the plugin hooks report instead of `name`, if any.
+    pub(crate) plugin_name: Option<String>,
+    /// The callback's resolved subtype.
+    pub(crate) sub_type: String,
+}
+
 /// Internal state for a callback: either settled (replay) or pending (live).
 enum CallbackState<O> {
     /// The callback has a known outcome from the checkpoint log (replay).
@@ -452,6 +464,8 @@ enum CallbackState<O> {
         ctx: DurableContext,
         /// The callback operation's wire ID.
         wire_id: String,
+        /// The name, plugin name and subtype of the callback.
+        identity: CallbackIdentity,
         /// Builds the outcome from the terminal record.
         resolver: CallbackResolver<O>,
     },
@@ -461,10 +475,16 @@ impl<O: std::fmt::Debug> std::fmt::Debug for CallbackState<O> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Settled(outcome) => f.debug_tuple("Settled").field(outcome).finish(),
-            Self::Pending { ctx, wire_id, .. } => f
+            Self::Pending {
+                ctx,
+                wire_id,
+                identity,
+                ..
+            } => f
                 .debug_struct("Pending")
                 .field("ctx", ctx)
                 .field("wire_id", wire_id)
+                .field("identity", identity)
                 .finish_non_exhaustive(),
         }
     }
@@ -485,6 +505,7 @@ impl<O: Send + 'static> Callback<O> {
         id: String,
         ctx: DurableContext,
         wire_id: String,
+        identity: CallbackIdentity,
         resolver: CallbackResolver<O>,
     ) -> Self {
         Self {
@@ -492,6 +513,7 @@ impl<O: Send + 'static> Callback<O> {
             state: CallbackState::Pending {
                 ctx,
                 wire_id,
+                identity,
                 resolver,
             },
         }
@@ -583,8 +605,9 @@ impl<O: Send + 'static> Callback<O> {
             CallbackState::Pending {
                 ctx,
                 wire_id,
+                identity,
                 resolver,
-            } => Self::pending_result(ctx, wire_id, resolver),
+            } => Self::pending_result(ctx, wire_id, identity, resolver),
         }
     }
 
@@ -624,11 +647,12 @@ impl<O: Send + 'static> Callback<O> {
             CallbackState::Pending {
                 ctx,
                 wire_id,
+                identity,
                 resolver,
             } => {
                 let flag = Arc::new(AtomicBool::new(false));
                 let waiting = ctx.with_awaited(Arc::clone(&flag));
-                let future = Self::pending_result(waiting, wire_id, resolver);
+                let future = Self::pending_result(waiting, wire_id, identity, resolver);
                 DurableFuture::spawn_blessed(
                     future,
                     ctx.task_ownership(),
@@ -642,9 +666,15 @@ impl<O: Send + 'static> Callback<O> {
     /// The future of a pending callback's result: it waits until the record
     /// is terminal, then builds the outcome from it, as the create-time
     /// replay does.
+    ///
+    /// The callback was created in this invocation, so a `SUCCEEDED`,
+    /// `FAILED` or `TIMED_OUT` record it reads changed in this invocation.
+    /// So it fires `on_operation_end` with `is_replay` `false` before the
+    /// outcome is built, as JS does after its status wait.
     fn pending_result(
         ctx: DurableContext,
         wire_id: String,
+        identity: CallbackIdentity,
         resolver: CallbackResolver<O>,
     ) -> DurableFuture<O> {
         let gate = ctx.clone();
@@ -657,6 +687,24 @@ impl<O: Send + 'static> Callback<O> {
                 )
             })
             .await;
+            if let Some(plugins) = ctx.plugins() {
+                let terminal = ctx
+                    .with_checkpoint_record_by_wire(&wire_id, |record| {
+                        crate::callback::is_terminal_callback_status(&record.status)
+                    })
+                    .unwrap_or(false);
+                if terminal {
+                    let info = crate::callback::callback_info(
+                        &ctx,
+                        &wire_id,
+                        &identity.sub_type,
+                        identity.name.as_deref(),
+                        identity.plugin_name.as_deref(),
+                    )
+                    .with_replay(false);
+                    crate::plugin::operation_ended(plugins, &info);
+                }
+            }
             resolver().await
         })
     }

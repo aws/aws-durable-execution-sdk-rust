@@ -186,6 +186,10 @@ pub(crate) struct StepExecution<O, F, S> {
     pub(crate) semantics: StepSemantics,
     /// The resolved subtype: the builder's `sub_type`, or `Step`.
     pub(crate) sub_type: OperationSubType,
+    /// The name the plugin hooks report instead of `name`: the submitter
+    /// step of a named `wait_for_callback` reports `<name>-submitter`.
+    /// `None` reports `name`.
+    pub(crate) plugin_name: Option<String>,
     pub(crate) closure: F,
     pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
 }
@@ -217,6 +221,7 @@ where
             serdes,
             semantics,
             sub_type,
+            plugin_name,
             closure,
             _marker,
         } = self;
@@ -228,6 +233,7 @@ where
             serdes,
             semantics,
             sub_type,
+            plugin_name,
             _marker: std::marker::PhantomData,
         };
         // True once the step has waited for its record in this invocation.
@@ -299,6 +305,8 @@ struct StepCore<O, S> {
     serdes: S,
     semantics: StepSemantics,
     sub_type: OperationSubType,
+    /// The name the plugin hooks report instead of `name`, if any.
+    plugin_name: Option<String>,
     _marker: std::marker::PhantomData<fn() -> O>,
 }
 
@@ -430,6 +438,7 @@ where
                             wire_id,
                             self.name.as_deref(),
                             self.sub_type.as_str(),
+                            self.plugin_name.as_deref(),
                             self.retry_strategy.as_ref(),
                             StepErrorKind::Interrupted,
                             STEP_INTERRUPTED_MESSAGE.into(),
@@ -524,6 +533,7 @@ where
                     self.op_id.wire(),
                     self.sub_type.as_str(),
                     self.name.as_deref(),
+                    self.plugin_name.as_deref(),
                 ),
                 attempt,
                 is_replay,
@@ -563,6 +573,7 @@ where
                 wire_id,
                 self.name.as_deref(),
                 self.sub_type.as_str(),
+                self.plugin_name.as_deref(),
                 &self.serdes,
                 value,
                 attempt,
@@ -575,6 +586,7 @@ where
                     wire_id,
                     self.name.as_deref(),
                     self.sub_type.as_str(),
+                    self.plugin_name.as_deref(),
                     self.retry_strategy.as_ref(),
                     StepErrorKind::ExecutionFailed,
                     err,
@@ -589,20 +601,26 @@ where
 
 // Free functions for post-closure operations
 
-/// The plugin info of the step `wire_id`, created in `ctx`.
+/// The plugin info of the step `wire_id`, created in `ctx`. A
+/// `plugin_name` replaces the name the info reports.
 fn step_info(
     ctx: &DurableContext,
     wire_id: &str,
     sub_type: &str,
     name: Option<&str>,
+    plugin_name: Option<&str>,
 ) -> crate::plugin::OperationInfo {
-    crate::plugin::OperationInfo::for_operation(
+    let info = crate::plugin::OperationInfo::for_operation(
         ctx,
         wire_id,
         crate::OperationKind::Step,
         sub_type,
         name,
-    )
+    );
+    match plugin_name {
+        Some(plugin_name) => info.with_name(Some(plugin_name.to_owned())),
+        None => info,
+    }
 }
 
 /// Handles a successful step execution: serialize, checkpoint, return.
@@ -610,11 +628,13 @@ fn step_info(
 /// The value round-trips through the configured wire format: ownership
 /// transfers to `serialize`, and the returned value is what `deserialize`
 /// produced from the stored wire string (round-trip parity).
+#[expect(clippy::too_many_arguments)] // reason: the plugin name joins the inputs the end hooks need
 async fn handle_success<O, S: Serdes<O>>(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
     sub_type: &str,
+    plugin_name: Option<&str>,
     serdes: &S,
     value: O,
     attempt: u32,
@@ -677,7 +697,7 @@ async fn handle_success<O, S: Serdes<O>>(
     if let Some(plugins) = ctx.plugins() {
         crate::plugin::attempt_ended(
             plugins,
-            step_info(ctx, wire_id, sub_type, name)
+            step_info(ctx, wire_id, sub_type, name, plugin_name)
                 .with_status(crate::OperationStatus::Succeeded)
                 .with_result(Some(serialized.clone())),
             crate::plugin::AttemptEnd {
@@ -708,6 +728,7 @@ async fn handle_failure(
     wire_id: &str,
     name: Option<&str>,
     sub_type: &str,
+    plugin_name: Option<&str>,
     retry_strategy: Option<&RetryStrategy>,
     kind: StepErrorKind,
     err: BoxError,
@@ -735,7 +756,7 @@ async fn handle_failure(
         if let Some(plugins) = plugins {
             crate::plugin::attempt_ended(
                 plugins,
-                step_info(ctx, wire_id, sub_type, name)
+                step_info(ctx, wire_id, sub_type, name, plugin_name)
                     .with_status(status)
                     .with_error(Some(wire.clone())),
                 crate::plugin::AttemptEnd {
@@ -1284,6 +1305,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1343,6 +1365,7 @@ mod tests {
             serdes: Upper,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1423,6 +1446,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1489,6 +1513,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1538,6 +1563,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1784,6 +1810,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::new("Payment").expect("a valid subtype"),
+            plugin_name: None,
             closure: |step_ctx: StepContext| async move {
                 if step_ctx.attempt() == 1 {
                     Err::<i32, BoxError>("transient".into())
@@ -1861,6 +1888,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::new("Payment").expect("a valid subtype"),
+            plugin_name: None,
             closure: |_: StepContext| async { Ok::<i32, BoxError>(7) },
             _marker: std::marker::PhantomData,
         };
@@ -1914,6 +1942,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure: typed_failing_body,
             _marker: std::marker::PhantomData,
         };
@@ -1943,6 +1972,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure: typed_failing_body,
             _marker: std::marker::PhantomData,
         };
@@ -1979,6 +2009,7 @@ mod tests {
                 serdes: crate::serdes::JsonSerdes,
                 semantics: StepSemantics::default(),
                 sub_type: OperationSubType::STEP,
+                plugin_name: None,
                 closure: |_: StepContext| async { Err::<i32, BoxError>("boom".into()) },
                 _marker: std::marker::PhantomData,
             }
@@ -2082,6 +2113,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -2148,6 +2180,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -2198,6 +2231,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -2276,6 +2310,7 @@ mod tests {
                     serdes: crate::serdes::JsonSerdes,
                     semantics: StepSemantics::default(),
                     sub_type: OperationSubType::STEP,
+                    plugin_name: None,
                     closure,
                     _marker: std::marker::PhantomData,
                 };
@@ -2349,6 +2384,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtMostOncePerRetry,
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure: move |_: StepContext| {
                 executed.store(true, std::sync::atomic::Ordering::SeqCst);
                 std::future::ready(Ok::<i32, BoxError>(42))
@@ -2452,6 +2488,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtMostOncePerRetry,
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure: |_: StepContext| async { Err::<i32, BoxError>("boom".into()) },
             _marker: std::marker::PhantomData,
         };
@@ -2487,6 +2524,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtMostOncePerRetry,
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure: |_: StepContext| async { Ok::<i32, BoxError>(1) },
             _marker: std::marker::PhantomData,
         };
@@ -2572,6 +2610,7 @@ mod tests {
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtLeastOncePerRetry,
             sub_type: OperationSubType::STEP,
+            plugin_name: None,
             closure,
             _marker: std::marker::PhantomData,
         };

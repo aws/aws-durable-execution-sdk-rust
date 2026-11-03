@@ -297,22 +297,37 @@ pub trait Plugin: Send + Sync {
     /// - the attempt that ends the operation fires `on_attempt_end`, then
     ///   `on_operation_end`.
     ///
-    /// For a wait and a chained invoke:
+    /// For a wait, a chained invoke and a callback:
     ///
     /// - a new operation fires `on_operation_start` with `is_replay`
-    ///   `false` once its `START` is written;
+    ///   `false` once its `START` is written. A callback fires it once the
+    ///   service has also assigned its callback ID;
     /// - a replayed record that has not finished fires `on_operation_start`
-    ///   with `is_replay` `true`: a `STARTED` wait, or a `STARTED`,
-    ///   `PENDING` or `READY` invoke;
-    /// - a `SUCCEEDED` wait, or an invoke with status `SUCCEEDED`, `FAILED`,
-    ///   `TIMED_OUT`, `STOPPED` or `CANCELLED`, fires `on_operation_end` on
+    ///   with `is_replay` `true`: a `STARTED` wait, a `STARTED`, `PENDING`
+    ///   or `READY` invoke, or a `STARTED` or `PENDING` callback;
+    /// - a `SUCCEEDED` wait, an invoke with status `SUCCEEDED`, `FAILED`,
+    ///   `TIMED_OUT`, `STOPPED` or `CANCELLED`, or a callback with status
+    ///   `SUCCEEDED`, `FAILED` or `TIMED_OUT`, fires `on_operation_end` on
     ///   every replay. `is_replay` is `false` only in the first invocation
     ///   after the service completed it, the one whose
-    ///   [`InvocationInfo::updated_operations`] lists it;
-    /// - a wait that becomes `SUCCEEDED`, or an invoke that becomes one of
-    ///   those terminal statuses, while it waits in the invocation fires
-    ///   `on_operation_end` with `is_replay` `false`;
-    /// - a wait with any other status fires no hook.
+    ///   [`InvocationInfo::updated_operations`] lists it. A replayed
+    ///   callback fires it when it is created, before `result()` is
+    ///   awaited;
+    /// - a wait that becomes `SUCCEEDED`, an invoke that becomes one of
+    ///   its terminal statuses, or a callback that becomes `SUCCEEDED`,
+    ///   `FAILED` or `TIMED_OUT` while its `result()` waits in the
+    ///   invocation, fires `on_operation_end` with `is_replay` `false`. A
+    ///   callback fires it before `result()` returns;
+    /// - a wait or a callback with any other status, and a callback record
+    ///   without a callback ID, fire no hook.
+    ///
+    /// A `wait_for_callback` reports three operations. The operation itself
+    /// is a child context with sub-type `WaitForCallback`: it fires
+    /// `on_operation_start` before its body, with `is_replay` `true` when
+    /// its record exists, and `on_operation_end` after its outcome is
+    /// written. Inside it, a callback and a submitter step fire the hooks
+    /// above. When the `wait_for_callback` is named `n`, they report the
+    /// names `n-callback` and `n-submitter`; their records carry no name.
     ///
     /// A step or child context that is terminal on replay fires nothing.
     ///
@@ -343,22 +358,37 @@ pub trait Plugin: Send + Sync {
     /// - the attempt that ends the operation fires `on_attempt_end`, then
     ///   `on_operation_end`.
     ///
-    /// For a wait and a chained invoke:
+    /// For a wait, a chained invoke and a callback:
     ///
     /// - a new operation fires `on_operation_start` with `is_replay`
-    ///   `false` once its `START` is written;
+    ///   `false` once its `START` is written. A callback fires it once the
+    ///   service has also assigned its callback ID;
     /// - a replayed record that has not finished fires `on_operation_start`
-    ///   with `is_replay` `true`: a `STARTED` wait, or a `STARTED`,
-    ///   `PENDING` or `READY` invoke;
-    /// - a `SUCCEEDED` wait, or an invoke with status `SUCCEEDED`, `FAILED`,
-    ///   `TIMED_OUT`, `STOPPED` or `CANCELLED`, fires `on_operation_end` on
+    ///   with `is_replay` `true`: a `STARTED` wait, a `STARTED`, `PENDING`
+    ///   or `READY` invoke, or a `STARTED` or `PENDING` callback;
+    /// - a `SUCCEEDED` wait, an invoke with status `SUCCEEDED`, `FAILED`,
+    ///   `TIMED_OUT`, `STOPPED` or `CANCELLED`, or a callback with status
+    ///   `SUCCEEDED`, `FAILED` or `TIMED_OUT`, fires `on_operation_end` on
     ///   every replay. `is_replay` is `false` only in the first invocation
     ///   after the service completed it, the one whose
-    ///   [`InvocationInfo::updated_operations`] lists it;
-    /// - a wait that becomes `SUCCEEDED`, or an invoke that becomes one of
-    ///   those terminal statuses, while it waits in the invocation fires
-    ///   `on_operation_end` with `is_replay` `false`;
-    /// - a wait with any other status fires no hook.
+    ///   [`InvocationInfo::updated_operations`] lists it. A replayed
+    ///   callback fires it when it is created, before `result()` is
+    ///   awaited;
+    /// - a wait that becomes `SUCCEEDED`, an invoke that becomes one of
+    ///   its terminal statuses, or a callback that becomes `SUCCEEDED`,
+    ///   `FAILED` or `TIMED_OUT` while its `result()` waits in the
+    ///   invocation, fires `on_operation_end` with `is_replay` `false`. A
+    ///   callback fires it before `result()` returns;
+    /// - a wait or a callback with any other status, and a callback record
+    ///   without a callback ID, fire no hook.
+    ///
+    /// A `wait_for_callback` reports three operations. The operation itself
+    /// is a child context with sub-type `WaitForCallback`: it fires
+    /// `on_operation_start` before its body, with `is_replay` `true` when
+    /// its record exists, and `on_operation_end` after its outcome is
+    /// written. Inside it, a callback and a submitter step fire the hooks
+    /// above. When the `wait_for_callback` is named `n`, they report the
+    /// names `n-callback` and `n-submitter`; their records carry no name.
     ///
     /// A step or child context that is terminal on replay fires nothing.
     ///
@@ -1040,6 +1070,12 @@ impl OperationInfo {
     /// Replaces the error.
     pub(crate) fn with_error(mut self, error: Option<WireError>) -> Self {
         self.error = error;
+        self
+    }
+
+    /// Replaces the name.
+    pub(crate) fn with_name(mut self, name: Option<String>) -> Self {
+        self.name = name;
         self
     }
 
