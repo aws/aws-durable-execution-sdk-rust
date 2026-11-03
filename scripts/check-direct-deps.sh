@@ -36,11 +36,8 @@ ALWAYS_ON="aws-config aws-sdk-lambda lambda_runtime serde serde_json sha2 tokio 
 
 # Optional, feature-gated production dependencies. Each entry needs the same
 # policy approval as ALWAYS_ON (see CONTRIBUTING.md, "Dependency policy") and
-# a note here naming the feature that gates it:
-#   tracing-subscriber: gated by the `replay-filter` feature; provides the
-#     Filter/Layer traits ReplayFilterLayer implements. Absent from every
-#     default-feature build.
-OPTIONAL_ALLOWLIST="tracing-subscriber"
+# a note here naming the feature that gates it. There are none today.
+OPTIONAL_ALLOWLIST=""
 
 # check_graph <allowlist> <label> [extra cargo-tree args...]
 # Parses `cargo tree --workspace --depth 1 -e normal` for the given feature
@@ -133,7 +130,7 @@ check_graph() {
         done < "$VIOLATIONS_FILE"
         echo ""
         echo "Always-on allowlist: $ALWAYS_ON"
-        echo "Optional (feature-gated) allowlist: $OPTIONAL_ALLOWLIST"
+        echo "Optional (feature-gated) allowlist: ${OPTIONAL_ALLOWLIST:-none}"
         echo "To add a new production dependency, update the allowlists in scripts/check-direct-deps.sh"
         echo "and obtain design-spec approval. See CONTRIBUTING.md and deny.toml for policy."
         return 1
@@ -150,4 +147,4 @@ check_graph "$ALWAYS_ON" "default features" || exit 1
 check_graph "$ALWAYS_ON $OPTIONAL_ALLOWLIST" "--all-features" --all-features || exit 1
 
 echo "direct-dep-allowlist OK: default-feature graph limited to the always-on allowlist;"
-echo "all-features graph adds only approved optional crates ($OPTIONAL_ALLOWLIST)."
+echo "all-features graph adds only approved optional crates (${OPTIONAL_ALLOWLIST:-none})."

@@ -11,7 +11,7 @@ use aws_durable_execution_sdk as durable;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
-    lambda_runtime::tracing::init_default_subscriber();
+    durable::init_default_subscriber()?;
     durable::run(|name: String, ctx: durable::DurableContext| async move {
         let outcome: Result<String, _> = ctx
             .wait_for_callback::<String, _, _>(|_step_ctx, _cb_id| async { Ok(()) })

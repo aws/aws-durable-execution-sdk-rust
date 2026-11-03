@@ -5,8 +5,9 @@
 //! `tracing` events inside a step inherit those fields automatically, so
 //! ordinary `tracing::info!`/`warn!`/`error!` calls become correlated,
 //! structured log lines. Configure the format once in `main` with
-//! `lambda_runtime::tracing::init_default_subscriber()`, which honors
-//! `AWS_LAMBDA_LOG_FORMAT` and `AWS_LAMBDA_LOG_LEVEL`.
+//! `durable::init_default_subscriber()`, which honors
+//! `AWS_LAMBDA_LOG_FORMAT` and `AWS_LAMBDA_LOG_LEVEL` and writes each record
+//! between operations once per execution.
 
 use aws_durable_execution_sdk as durable;
 
@@ -31,6 +32,6 @@ async fn handler(
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
-    lambda_runtime::tracing::init_default_subscriber();
+    durable::init_default_subscriber()?;
     durable::run(handler).await
 }

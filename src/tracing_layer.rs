@@ -44,30 +44,21 @@
 //! replays recorded results. Handler code between operations executes again,
 //! so its log statements would re-emit on every resume. The `isReplay` flag
 //! on the handler span lets a per-layer filter suppress those events,
-//! avoiding duplicate `CloudWatch` log lines. The SDK does not install a
-//! subscriber automatically.
+//! avoiding duplicate `CloudWatch` log lines.
 //!
-//! Enable the **`replay-filter`** feature to get [`ReplayFilterLayer`], a
-//! ready-made per-layer filter that implements this suppression. Install it
-//! on a `tracing-subscriber` layer like any other filter:
-//!
-//! ```ignore
-//! use aws_durable_execution_sdk::ReplayFilterLayer;
-//! use tracing_subscriber::Layer as _;
-//! use tracing_subscriber::layer::SubscriberExt;
-//! use tracing_subscriber::util::SubscriberInitExt;
-//!
-//! tracing_subscriber::registry()
-//!     .with(tracing_subscriber::fmt::layer().with_filter(ReplayFilterLayer::new()))
-//!     .init();
-//! ```
-//!
-//! Without the feature, applications can build their own filter by walking
-//! the span scope and checking the `isReplay` field directly.
+//! [`ReplayFilterLayer`] is that filter. [`crate::init_default_subscriber`]
+//! installs `lambda_runtime`'s default subscriber settings with it. The SDK
+//! never installs a subscriber implicitly: only an explicit call to that
+//! helper, or the application's own subscriber, does.
 
-#[cfg(any(test, feature = "replay-filter"))]
+use std::str::FromStr as _;
+
+use lambda_runtime::tracing::subscriber;
+use subscriber::Layer as _;
+use subscriber::filter::{EnvFilter, LevelFilter};
+use subscriber::fmt::MakeWriter;
+use subscriber::layer::SubscriberExt as _;
 use tracing::Id;
-#[cfg(any(test, feature = "replay-filter"))]
 use tracing::span::Attributes;
 
 /// Field name constants for the structured-log contract.
@@ -457,12 +448,10 @@ pub(crate) fn execution_suspended_event(execution_arn: &str, request_id: &str) {
 /// Shared by [`is_replay_event`] (span attributes at creation),
 /// [`replay_flag_in_record`] (`span.record()` updates after creation), and
 /// [`ReplayFilterLayer`]'s `event_enabled` (an event's own fields).
-#[cfg(any(test, feature = "replay-filter"))]
 struct ReplayVisitor {
     is_replay: Option<bool>,
 }
 
-#[cfg(any(test, feature = "replay-filter"))]
 impl tracing::field::Visit for ReplayVisitor {
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
         if field.name() == fields::IS_REPLAY {
@@ -477,7 +466,6 @@ impl tracing::field::Visit for ReplayVisitor {
 ///
 /// Used by [`ReplayFilterLayer`] to detect replay spans at creation time and
 /// by the test-only [`ReplayTracker`] for verification.
-#[cfg(any(test, feature = "replay-filter"))]
 pub(crate) fn is_replay_event(attrs: &Attributes<'_>) -> bool {
     let mut visitor = ReplayVisitor { is_replay: None };
     attrs.record(&mut visitor);
@@ -488,7 +476,6 @@ pub(crate) fn is_replay_event(attrs: &Attributes<'_>) -> bool {
 ///
 /// Used by [`ReplayFilterLayer`] to track the handler span's dynamic replay
 /// flag, which the SDK re-records after every operation claim.
-#[cfg(any(test, feature = "replay-filter"))]
 fn replay_flag_in_record(values: &tracing::span::Record<'_>) -> Option<bool> {
     let mut visitor = ReplayVisitor { is_replay: None };
     values.record(&mut visitor);
@@ -498,7 +485,7 @@ fn replay_flag_in_record(values: &tracing::span::Record<'_>) -> Option<bool> {
 /// A subscriber wrapper that tracks which spans have `isReplay = true` and
 /// provides a method to check if events should be suppressed.
 ///
-/// This is used in the SDK's test infrastructure to verify replay-filter
+/// This is used in the SDK's test infrastructure to verify replay filter
 /// behavior. Production handlers use `tracing-subscriber` layers directly.
 #[cfg(test)]
 #[derive(Debug)]
@@ -544,41 +531,75 @@ impl ReplayTracker {
 /// a span already flipped to live. Inspecting the event's own field keeps
 /// suppression exact at that boundary.
 ///
+/// Suppression is global by design: the subscriber, not the handler, decides
+/// which records are written. [`crate::init_default_subscriber`] installs a
+/// subscriber with this filter. A custom subscriber adds the filter to its
+/// own layer to keep each record between operations written once per
+/// execution.
+///
 /// # Usage
 ///
-/// Enable the **`replay-filter`** feature:
-///
-/// ```toml
-/// [dependencies]
-/// aws-durable-execution-sdk = { git = "https://github.com/aws/aws-durable-execution-sdk-rust", features = ["replay-filter"] }
-/// tracing-subscriber = { version = "0.3", features = ["registry"] }
-/// ```
-///
-/// Then install the filter on a subscriber layer:
+/// The filter implements the `Filter` trait of `tracing-subscriber`, which
+/// `lambda_runtime` re-exports as `lambda_runtime::tracing::subscriber`, so
+/// no extra dependency is needed:
 ///
 /// ```
 /// use aws_durable_execution_sdk::ReplayFilterLayer;
-/// use tracing_subscriber::Layer as _;
-/// use tracing_subscriber::layer::SubscriberExt;
+/// use aws_durable_execution_sdk::lambda_runtime::tracing::subscriber;
+/// use subscriber::Layer as _;
+/// use subscriber::layer::SubscriberExt as _;
 ///
-/// let subscriber = tracing_subscriber::registry().with(
-///     tracing_subscriber::fmt::layer()
+/// let subscriber = subscriber::registry().with(
+///     subscriber::fmt::layer()
 ///         .json()
 ///         .with_filter(ReplayFilterLayer::new()),
 /// );
 ///
 /// // In a Lambda binary, install it globally instead:
-/// // `tracing_subscriber::util::SubscriberInitExt::init(subscriber)`.
+/// // `subscriber::util::SubscriberInitExt::init(subscriber)`.
 /// tracing::subscriber::with_default(subscriber, || {
 ///     tracing::info!("emitted normally, not inside a replay span");
 /// });
 /// ```
-#[cfg(any(test, feature = "replay-filter"))]
+///
+/// # Keeping one target during replay
+///
+/// A record of the target `audit` below is written on every invocation,
+/// replay included. Every other record is written once per execution. The
+/// first layer writes only `audit` records and has no replay filter. The
+/// second layer writes every other target through the replay filter.
+///
+/// ```
+/// use aws_durable_execution_sdk::ReplayFilterLayer;
+/// use aws_durable_execution_sdk::lambda_runtime::tracing::subscriber;
+/// use subscriber::Layer as _;
+/// use subscriber::filter::{FilterExt as _, LevelFilter, Targets};
+/// use subscriber::layer::SubscriberExt as _;
+///
+/// let subscriber = subscriber::registry()
+///     .with(
+///         subscriber::fmt::layer()
+///             .with_filter(Targets::new().with_target("audit", LevelFilter::TRACE)),
+///     )
+///     .with(
+///         subscriber::fmt::layer().with_filter(
+///             ReplayFilterLayer::new().and(
+///                 Targets::new()
+///                     .with_default(LevelFilter::TRACE)
+///                     .with_target("audit", LevelFilter::OFF),
+///             ),
+///         ),
+///     );
+///
+/// tracing::subscriber::with_default(subscriber, || {
+///     tracing::info!(target: "audit", "written on every invocation");
+///     tracing::info!("written once per execution");
+/// });
+/// ```
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ReplayFilterLayer;
 
-#[cfg(any(test, feature = "replay-filter"))]
 impl ReplayFilterLayer {
     /// Creates a replay filter.
     ///
@@ -591,15 +612,14 @@ impl ReplayFilterLayer {
     }
 }
 
-#[cfg(any(test, feature = "replay-filter"))]
-impl<S> tracing_subscriber::layer::Filter<S> for ReplayFilterLayer
+impl<S> subscriber::layer::Filter<S> for ReplayFilterLayer
 where
-    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    S: tracing::Subscriber + for<'lookup> subscriber::registry::LookupSpan<'lookup>,
 {
     fn enabled(
         &self,
         _meta: &tracing::Metadata<'_>,
-        _ctx: &tracing_subscriber::layer::Context<'_, S>,
+        _ctx: &subscriber::layer::Context<'_, S>,
     ) -> bool {
         // Always allow span creation: we only filter events.
         true
@@ -608,7 +628,7 @@ where
     fn event_enabled(
         &self,
         event: &tracing::Event<'_>,
-        ctx: &tracing_subscriber::layer::Context<'_, S>,
+        ctx: &subscriber::layer::Context<'_, S>,
     ) -> bool {
         // An event carrying its own `isReplay` field (every SDK lifecycle
         // event does: see `crate::observability`) is authoritative: the
@@ -638,12 +658,7 @@ where
         true
     }
 
-    fn on_new_span(
-        &self,
-        attrs: &Attributes<'_>,
-        id: &Id,
-        ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: subscriber::layer::Context<'_, S>) {
         // Record isReplay field when a new span is created.
         if let Some(span) = ctx.span(id)
             && is_replay_event(attrs)
@@ -657,7 +672,7 @@ where
         &self,
         id: &Id,
         values: &tracing::span::Record<'_>,
-        ctx: tracing_subscriber::layer::Context<'_, S>,
+        ctx: subscriber::layer::Context<'_, S>,
     ) {
         // The SDK re-records the handler span's isReplay flag after every
         // operation claim (see `execution_span`). Track those updates so
@@ -677,10 +692,206 @@ where
 }
 
 /// Storage for the replay flag in span extensions.
-#[cfg(any(test, feature = "replay-filter"))]
 #[derive(Debug)]
 struct ReplaySpanFields {
     is_replay: bool,
+}
+
+/// The level, the `EnvFilter` directives and the format that the default
+/// subscriber is built with.
+///
+/// [`LogSettings::from_lookup`] reads them from a lookup function, so tests
+/// can supply the variables without changing the process environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogSettings {
+    /// The default level: `AWS_LAMBDA_LOG_LEVEL`, else `RUST_LOG`, else
+    /// `INFO`.
+    pub(crate) level: String,
+    /// The `EnvFilter` directives: `RUST_LOG`, else empty.
+    pub(crate) directives: String,
+    /// The format: `AWS_LAMBDA_LOG_FORMAT`, else empty.
+    pub(crate) format: String,
+}
+
+impl LogSettings {
+    /// Reads the settings from the process environment.
+    pub(crate) fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Reads the settings with `lookup`, which returns the value of the
+    /// variable it is given, or `None` when the variable is unset.
+    ///
+    /// These are the rules of
+    /// `lambda_runtime::tracing::init_default_subscriber_with_writer`.
+    /// `RUST_LOG` serves twice: as the level when `AWS_LAMBDA_LOG_LEVEL` is
+    /// unset, and as the `EnvFilter` directives, which `from_env_lossy`
+    /// reads there.
+    pub(crate) fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let directives = lookup("RUST_LOG");
+        let level = lookup("AWS_LAMBDA_LOG_LEVEL")
+            .or_else(|| directives.clone())
+            .unwrap_or_else(|| "INFO".to_owned());
+        Self {
+            level,
+            directives: directives.unwrap_or_default(),
+            format: lookup("AWS_LAMBDA_LOG_FORMAT").unwrap_or_default(),
+        }
+    }
+}
+
+/// Whether `meta` describes an SDK span that carries the replay state.
+///
+/// [`ReplayFilterLayer`] reads the `isReplay` field of the SDK's
+/// `durable_execution` and `durable_operation` spans. Only these spans
+/// declare that field.
+fn is_replay_tracking_span(meta: &tracing::Metadata<'_>) -> bool {
+    meta.is_span() && meta.fields().field(fields::IS_REPLAY).is_some()
+}
+
+/// The filter of the default subscriber's `fmt` layer: the configured
+/// `EnvFilter`, then [`ReplayFilterLayer`].
+///
+/// The SDK creates its replay-tracking spans at `INFO`. An `EnvFilter` with a
+/// level above `INFO`, or a directive that turns the SDK's target off,
+/// disables those spans. A disabled span is never created, so
+/// [`ReplayFilterLayer`] cannot see its `isReplay` flag. A record that the
+/// `EnvFilter` allows would then be written again on every replay. So this
+/// filter enables the replay-tracking spans whatever the `EnvFilter` says,
+/// and applies the `EnvFilter` to everything else. It also raises the level
+/// hint to at least `INFO`, because `tracing` skips a span above the global
+/// maximum level before any filter sees it.
+///
+/// `F` is the `EnvFilter` in the subscriber. Tests use another filter, to
+/// observe the hooks this filter forwards.
+struct DefaultFilter<F> {
+    env: F,
+    replay: ReplayFilterLayer,
+}
+
+impl<S, F> subscriber::layer::Filter<S> for DefaultFilter<F>
+where
+    S: tracing::Subscriber + for<'lookup> subscriber::registry::LookupSpan<'lookup>,
+    F: subscriber::layer::Filter<S>,
+{
+    fn enabled(
+        &self,
+        meta: &tracing::Metadata<'_>,
+        cx: &subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        is_replay_tracking_span(meta) || self.env.enabled(meta, cx)
+    }
+
+    fn callsite_enabled(
+        &self,
+        meta: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        // `sometimes`, never `always`: `tracing` skips `enabled` for an
+        // `always` callsite, and `enabled` is what resets the per-layer
+        // filter state that `event_enabled` leaves behind when it drops a
+        // replayed record. `ReplayFilterLayer` alone returns `sometimes`
+        // for the same reason.
+        //
+        // The `EnvFilter` is asked for every callsite, replay-tracking spans
+        // included. Its `callsite_enabled` registers the matcher of a span
+        // directive such as `[durable_execution]=debug`, and `on_new_span`
+        // finds a span's matcher only when that registration happened. So
+        // skipping the call for the SDK's spans would disable those
+        // directives.
+        let env = self.env.callsite_enabled(meta);
+        if !is_replay_tracking_span(meta) && env.is_never() {
+            tracing::subscriber::Interest::never()
+        } else {
+            tracing::subscriber::Interest::sometimes()
+        }
+    }
+
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        cx: &subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        subscriber::layer::Filter::<S>::event_enabled(&self.replay, event, cx)
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        self.env
+            .max_level_hint()
+            .map(|hint| hint.max(LevelFilter::INFO))
+    }
+
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: subscriber::layer::Context<'_, S>) {
+        self.env.on_new_span(attrs, id, ctx.clone());
+        subscriber::layer::Filter::<S>::on_new_span(&self.replay, attrs, id, ctx);
+    }
+
+    fn on_record(
+        &self,
+        id: &Id,
+        values: &tracing::span::Record<'_>,
+        ctx: subscriber::layer::Context<'_, S>,
+    ) {
+        self.env.on_record(id, values, ctx.clone());
+        subscriber::layer::Filter::<S>::on_record(&self.replay, id, values, ctx);
+    }
+
+    fn on_enter(&self, id: &Id, ctx: subscriber::layer::Context<'_, S>) {
+        self.env.on_enter(id, ctx);
+    }
+
+    fn on_exit(&self, id: &Id, ctx: subscriber::layer::Context<'_, S>) {
+        self.env.on_exit(id, ctx);
+    }
+
+    fn on_close(&self, id: Id, ctx: subscriber::layer::Context<'_, S>) {
+        self.env.on_close(id, ctx);
+    }
+}
+
+/// Builds `lambda_runtime`'s default subscriber with replayed records
+/// suppressed.
+///
+/// The settings are those of
+/// `lambda_runtime::tracing::init_default_subscriber_with_writer`:
+///
+/// 1. An `EnvFilter` built from `directives`, ignoring invalid ones. When no
+///    directive is valid, the filter uses its default directive, `level`. A
+///    `level` that does not parse as a level filter falls back to `INFO`.
+///    The caller passes the value of `RUST_LOG`, which is what
+///    `from_env_lossy` would read.
+/// 2. An `fmt` layer without the target and the time, writing to `writer`.
+///    It writes JSON when `format` is `json` in any case, and text otherwise.
+///
+/// The `fmt` layer is filtered by [`DefaultFilter`]: the `EnvFilter`, then
+/// [`ReplayFilterLayer`], with the SDK's replay-tracking spans always
+/// enabled. The caller reads the environment, so tests pass every setting
+/// directly. The box lets the JSON and text branches return one type.
+pub(crate) fn default_subscriber<W>(
+    level: &str,
+    directives: &str,
+    format: &str,
+    writer: W,
+) -> Box<dyn tracing::Subscriber + Send + Sync>
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let level = LevelFilter::from_str(level).unwrap_or(LevelFilter::INFO);
+    let filter = DefaultFilter {
+        env: EnvFilter::builder()
+            .with_default_directive(level.into())
+            .parse_lossy(directives),
+        replay: ReplayFilterLayer::new(),
+    };
+    let layer = subscriber::fmt::layer()
+        .with_target(false)
+        .without_time()
+        .with_writer(writer);
+    let registry = subscriber::registry();
+    if format.eq_ignore_ascii_case("json") {
+        Box::new(registry.with(layer.json().with_filter(filter)))
+    } else {
+        Box::new(registry.with(layer.with_filter(filter)))
+    }
 }
 
 #[cfg(test)]
@@ -1099,7 +1310,7 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    impl<'a> MakeWriter<'a> for CaptureWriter {
         type Writer = CaptureWriter;
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
@@ -1239,5 +1450,551 @@ mod tests {
             output.contains("handler line after the wait"),
             "Handler-level events past the high-water mark must be emitted. Got: {output}"
         );
+    }
+
+    /// Reads the text a [`CaptureWriter`] captured, without the ANSI color
+    /// sequences the text format writes.
+    fn captured(buffer: &std::sync::Mutex<Vec<u8>>) -> String {
+        let raw = buffer.lock().map_or_else(
+            |_| String::new(),
+            |b| String::from_utf8_lossy(&b).to_string(),
+        );
+        let mut text = String::with_capacity(raw.len());
+        let mut chars = raw.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                // An SGR sequence is `ESC [ ... m`; skip through the `m`.
+                for skipped in chars.by_ref() {
+                    if skipped == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                text.push(c);
+            }
+        }
+        text
+    }
+
+    /// Counts the captured text lines whose message is exactly `message`.
+    /// The text format ends each line with the message, so the last word
+    /// is compared. A message that contains another one (`audit-before`
+    /// contains `before`) is not counted for both.
+    fn count_message(output: &str, message: &str) -> usize {
+        output
+            .lines()
+            .filter(|line| line.split_whitespace().last() == Some(message))
+            .count()
+    }
+
+    /// How the handler of [`run_logging_handler`] logs `before` and `after`.
+    #[derive(Clone, Copy)]
+    enum LogStyle {
+        /// `info!` with the default target.
+        Info,
+        /// `warn!` with the default target.
+        Warn,
+        /// `info!` with the target `app`.
+        AppTarget,
+    }
+
+    fn log_line(style: LogStyle, message: &str) {
+        match style {
+            LogStyle::Info => tracing::info!("{message}"),
+            LogStyle::Warn => tracing::warn!("{message}"),
+            LogStyle::AppTarget => tracing::info!(target: "app", "{message}"),
+        }
+    }
+
+    /// Runs a handler through `LocalRunner` under `subscriber`. The handler
+    /// logs `before`, waits one second, and logs `after`. With
+    /// `log_audit`, it also logs `audit-before` with the target `audit`
+    /// before the wait. The run uses a current-thread runtime, because
+    /// `with_default` scopes the subscriber to one thread.
+    fn run_logging_handler<S>(subscriber: S, log_audit: bool) -> usize
+    where
+        S: tracing::Subscriber + Send + Sync + 'static,
+    {
+        run_logging_handler_with(subscriber, log_audit, LogStyle::Info)
+    }
+
+    /// [`run_logging_handler`], with `before` and `after` logged in `style`.
+    fn run_logging_handler_with<S>(subscriber: S, log_audit: bool, style: LogStyle) -> usize
+    where
+        S: tracing::Subscriber + Send + Sync + 'static,
+    {
+        use std::time::Duration;
+
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                let result = crate::test_util::LocalRunner::new()
+                    .run(
+                        move |_event: serde_json::Value, ctx: crate::DurableContext| async move {
+                            if log_audit {
+                                tracing::info!(target: "audit", "audit-before");
+                            }
+                            log_line(style, "before");
+                            ctx.wait(Duration::from_secs(1)).name("pause").await?;
+                            log_line(style, "after");
+                            Ok::<_, crate::BoxError>(())
+                        },
+                        serde_json::Value::Null,
+                    )
+                    .await
+                    .expect("runner");
+                result.invocation_count()
+            })
+        })
+    }
+
+    #[test]
+    fn default_subscriber_writes_each_record_once_across_replay() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "INFO",
+            "",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+
+        let invocations = run_logging_handler(subscriber, false);
+
+        let output = captured(&buffer);
+        assert!(invocations >= 2, "the wait must suspend: {invocations}");
+        assert_eq!(count_message(&output, "before"), 1, "{output}");
+        assert_eq!(count_message(&output, "after"), 1, "{output}");
+    }
+
+    /// A `WARN` threshold disables `INFO` records, and the SDK creates its
+    /// replay-tracking spans at `INFO`. The default subscriber keeps those
+    /// spans enabled, so a warning before the wait is written once.
+    #[test]
+    fn default_subscriber_suppresses_replay_above_the_span_level() {
+        for level in ["WARN", "ERROR"] {
+            let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                default_subscriber(level, "", "", CaptureWriter(std::sync::Arc::clone(&buffer)));
+
+            let invocations = run_logging_handler_with(subscriber, false, LogStyle::Warn);
+
+            let output = captured(&buffer);
+            assert!(invocations >= 2, "the wait must suspend: {invocations}");
+            let expected = usize::from(level == "WARN");
+            assert_eq!(
+                count_message(&output, "before"),
+                expected,
+                "{level}: {output}"
+            );
+            assert_eq!(
+                count_message(&output, "after"),
+                expected,
+                "{level}: {output}"
+            );
+        }
+    }
+
+    /// A directive that turns the SDK's target off still leaves the
+    /// replay-tracking spans enabled, so an application record before the
+    /// wait is written once.
+    #[test]
+    fn default_subscriber_suppresses_replay_when_the_sdk_target_is_off() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "INFO",
+            "aws_durable_execution_sdk=off,app=info",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+
+        let invocations = run_logging_handler_with(subscriber, false, LogStyle::AppTarget);
+
+        let output = captured(&buffer);
+        assert!(invocations >= 2, "the wait must suspend: {invocations}");
+        assert_eq!(count_message(&output, "before"), 1, "{output}");
+        assert_eq!(count_message(&output, "after"), 1, "{output}");
+    }
+
+    /// Valid directives replace the default level: a target they enable is
+    /// written below the level, and a record they do not name is not.
+    #[test]
+    fn default_subscriber_applies_directives() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "WARN",
+            "app=debug,[=bogus",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "app", "app-line");
+            tracing::warn!("other-line");
+        });
+
+        let output = captured(&buffer);
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert_eq!(count_message(&output, "app-line"), 1, "{output}");
+    }
+
+    /// When no directive is valid, the default level applies.
+    #[test]
+    fn default_subscriber_ignores_invalid_directives() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "WARN",
+            "[=bogus",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("info-line");
+            tracing::warn!("warn-line");
+        });
+
+        let output = captured(&buffer);
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert_eq!(count_message(&output, "warn-line"), 1, "{output}");
+    }
+
+    /// A span directive enables records inside the span only. This needs
+    /// the `EnvFilter` to see the span's creation, entry and exit.
+    #[test]
+    fn default_subscriber_applies_span_directives() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "WARN",
+            "[outer]=debug",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("outer").in_scope(|| tracing::debug!("inside-line"));
+            tracing::debug!("outside-line");
+        });
+
+        let output = captured(&buffer);
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert_eq!(count_message(&output, "inside-line"), 1, "{output}");
+    }
+
+    /// A span field directive follows a value recorded after the span was
+    /// created, which needs the `EnvFilter` to see the record.
+    #[test]
+    fn default_subscriber_tracks_span_records() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "WARN",
+            "[outer{flag=true}]=debug",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("outer", flag = false);
+            span.in_scope(|| tracing::debug!("before-record"));
+            span.record("flag", true);
+            span.in_scope(|| tracing::debug!("after-record"));
+        });
+
+        let output = captured(&buffer);
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert_eq!(count_message(&output, "after-record"), 1, "{output}");
+    }
+
+    /// A span directive that names an SDK replay-tracking span enables the
+    /// records inside it. This needs the `EnvFilter` to register the
+    /// directive when `tracing` registers the span's callsite.
+    #[test]
+    fn default_subscriber_applies_span_directives_to_sdk_spans() {
+        for (directives, which) in [
+            ("[durable_execution]=debug", "execution"),
+            ("[durable_operation{attempt=1}]=debug", "operation"),
+        ] {
+            let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber = default_subscriber(
+                "WARN",
+                directives,
+                "",
+                CaptureWriter(std::sync::Arc::clone(&buffer)),
+            );
+
+            tracing::subscriber::with_default(subscriber, || {
+                let span = if which == "execution" {
+                    execution_span("arn", "request", false)
+                } else {
+                    operation_span("arn", "request", "op", 1, false)
+                };
+                span.in_scope(|| tracing::debug!("inside-line"));
+                tracing::debug!("outside-line");
+            });
+
+            let output = captured(&buffer);
+            assert_eq!(output.lines().count(), 1, "{directives}: {output}");
+            assert_eq!(
+                count_message(&output, "inside-line"),
+                1,
+                "{directives}: {output}"
+            );
+        }
+    }
+
+    /// A filter that enables everything and counts the span closes it sees.
+    struct CloseCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S> tracing_subscriber::layer::Filter<S> for CloseCounter {
+        fn enabled(
+            &self,
+            _meta: &tracing::Metadata<'_>,
+            _cx: &tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_close(&self, _id: Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// `DefaultFilter` forwards a span close to the `EnvFilter`, which
+    /// releases the state it keeps for the span.
+    #[test]
+    fn default_filter_forwards_span_close() {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let closes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let filter = DefaultFilter {
+            env: CloseCounter(std::sync::Arc::clone(&closes)),
+            replay: ReplayFilterLayer::new(),
+        };
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::sink)
+                .with_filter(filter),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            drop(tracing::info_span!("closed"));
+        });
+
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A lookup over a fixed list of variables, for `LogSettings::from_lookup`.
+    fn lookup_in(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(var, _)| var == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    fn settings(level: &str, directives: &str, format: &str) -> LogSettings {
+        LogSettings {
+            level: level.to_owned(),
+            directives: directives.to_owned(),
+            format: format.to_owned(),
+        }
+    }
+
+    #[test]
+    fn log_settings_default_to_info_text_and_no_directives() {
+        assert_eq!(
+            LogSettings::from_lookup(lookup_in(&[])),
+            settings("INFO", "", "")
+        );
+    }
+
+    #[test]
+    fn log_settings_take_the_level_from_aws_lambda_log_level_first() {
+        let lookup = lookup_in(&[("AWS_LAMBDA_LOG_LEVEL", "ERROR"), ("RUST_LOG", "debug")]);
+        assert_eq!(
+            LogSettings::from_lookup(lookup),
+            settings("ERROR", "debug", "")
+        );
+    }
+
+    #[test]
+    fn log_settings_fall_back_to_rust_log_for_the_level() {
+        let lookup = lookup_in(&[("RUST_LOG", "app=debug")]);
+        assert_eq!(
+            LogSettings::from_lookup(lookup),
+            settings("app=debug", "app=debug", "")
+        );
+    }
+
+    #[test]
+    fn log_settings_read_the_format() {
+        let lookup = lookup_in(&[("AWS_LAMBDA_LOG_FORMAT", "JSON")]);
+        assert_eq!(
+            LogSettings::from_lookup(lookup),
+            settings("INFO", "", "JSON")
+        );
+    }
+
+    /// The JSON branch of `default_subscriber` filters its layer through
+    /// `ReplayFilterLayer` too, so the pre-wait record is written once.
+    #[test]
+    fn default_subscriber_json_format_writes_each_record_once_across_replay() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "INFO",
+            "",
+            "json",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+
+        let invocations = run_logging_handler(subscriber, false);
+
+        let output = captured(&buffer);
+        assert!(invocations >= 2, "the wait must suspend: {invocations}");
+        let messages: Vec<String> = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|record| {
+                record
+                    .pointer("/fields/message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        let count = |message: &str| messages.iter().filter(|m| *m == message).count();
+        assert_eq!(count("before"), 1, "{output}");
+        assert_eq!(count("after"), 1, "{output}");
+    }
+
+    #[test]
+    fn default_subscriber_honors_level() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "WARN",
+            "",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("info-line");
+            tracing::warn!("warn-line");
+        });
+
+        let output = captured(&buffer);
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert_eq!(count_message(&output, "warn-line"), 1, "{output}");
+    }
+
+    #[test]
+    fn default_subscriber_unknown_level_falls_back_to_info() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "bogus",
+            "",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("debug-line");
+            tracing::info!("info-line");
+        });
+
+        let output = captured(&buffer);
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert_eq!(count_message(&output, "info-line"), 1, "{output}");
+    }
+
+    #[test]
+    fn default_subscriber_json_format() {
+        for format in ["JSON", "json"] {
+            let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber = default_subscriber(
+                "INFO",
+                "",
+                format,
+                CaptureWriter(std::sync::Arc::clone(&buffer)),
+            );
+
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!("json-line");
+            });
+
+            let output = captured(&buffer);
+            assert_eq!(output.lines().count(), 1, "{format}: {output}");
+            for line in output.lines() {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(line).expect("each line is JSON");
+                assert!(parsed.is_object(), "{format}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn default_subscriber_text_format() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = default_subscriber(
+            "INFO",
+            "",
+            "",
+            CaptureWriter(std::sync::Arc::clone(&buffer)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("text-line");
+        });
+
+        let output = captured(&buffer);
+        assert_eq!(output.lines().count(), 1, "{output}");
+        for line in output.lines() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_err(),
+                "a text line must not parse as JSON: {line}"
+            );
+        }
+    }
+
+    /// The two-layer subscriber of the `ReplayFilterLayer` rustdoc keeps
+    /// every `audit` record during replay and writes every other record
+    /// once per execution.
+    #[test]
+    fn kept_target_survives_replay() {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::filter::{FilterExt as _, LevelFilter, Targets};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(CaptureWriter(std::sync::Arc::clone(&buffer)))
+                    .with_filter(Targets::new().with_target("audit", LevelFilter::TRACE)),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(CaptureWriter(std::sync::Arc::clone(&buffer)))
+                    .with_filter(
+                        ReplayFilterLayer::new().and(
+                            Targets::new()
+                                .with_default(LevelFilter::TRACE)
+                                .with_target("audit", LevelFilter::OFF),
+                        ),
+                    ),
+            );
+
+        let invocations = run_logging_handler(subscriber, true);
+
+        let output = captured(&buffer);
+        assert!(invocations >= 2, "the wait must suspend: {invocations}");
+        assert_eq!(count_message(&output, "audit-before"), 2, "{output}");
+        assert_eq!(count_message(&output, "before"), 1, "{output}");
     }
 }

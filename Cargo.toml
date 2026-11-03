@@ -105,24 +105,21 @@ allowed_external_types = [
     # `test_util::TestRunnerError` (feature `test-util`) carries the
     # serde_json error of a failed event or output conversion.
     "serde_json::error::Error",
-    # The `replay-filter` feature exists to implement tracing-subscriber's
-    # `Filter` trait, which necessarily names these types in the impl.
+    # `ReplayFilterLayer` implements tracing-subscriber's `Filter` trait, and
+    # `init_default_subscriber_with_writer` takes a `MakeWriter`. The types
+    # come through `lambda_runtime`'s re-export of tracing-subscriber
+    # (`lambda_runtime::tracing::subscriber`), not a direct dependency.
     "tracing_subscriber::layer::Filter",
     "tracing_subscriber::registry::LookupSpan",
+    "tracing_subscriber::fmt::writer::MakeWriter",
     "tracing_core::subscriber::Subscriber",
 ]
 
 # Non-default feature gating the in-process local testing runner
 # (`test_util::LocalRunner`). Off by default so the always-on public API and
 # dependency graph are unchanged; enable with `--features test-util`.
-#
-# `replay-filter` exports `ReplayFilterLayer`, a ready-made
-# `tracing-subscriber` per-layer filter that suppresses replayed log events.
-# Off by default so the production dependency graph stays at the eight
-# allowlisted crates; enabling it pulls in `tracing-subscriber`.
 [features]
 test-util = []
-replay-filter = ["dep:tracing-subscriber"]
 
 # Workspace-level lints inherited by all members.
 # Style precedence: rustfmt (definitional) > Rust API Guidelines > clippy judgment.
@@ -187,7 +184,6 @@ aws-sdk-lambda = { version = "1", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", optional = true, features = ["registry"] }
 sha2 = "0.10"
 
 [dev-dependencies]
@@ -226,7 +222,15 @@ required-features = ["test-util"]
 
 [[test]]
 name = "replay_logging"
-required-features = ["test-util", "replay-filter"]
+required-features = ["test-util"]
+
+[[test]]
+name = "no_implicit_subscriber"
+required-features = ["test-util"]
+
+[[test]]
+name = "default_subscriber_writer"
+required-features = ["test-util"]
 
 [[test]]
 name = "lifecycle_events"

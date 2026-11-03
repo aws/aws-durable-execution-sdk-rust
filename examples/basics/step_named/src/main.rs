@@ -38,6 +38,6 @@ async fn handler(event: Input, ctx: durable::DurableContext) -> Result<String, d
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
-    lambda_runtime::tracing::init_default_subscriber();
+    durable::init_default_subscriber()?;
     durable::run(handler).await
 }

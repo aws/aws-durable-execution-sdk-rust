@@ -21,7 +21,7 @@ use durable::builders::wait_for_condition::WaitDecision;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
-    lambda_runtime::tracing::init_default_subscriber();
+    durable::init_default_subscriber()?;
     durable::run(|threshold: i32, ctx: durable::DurableContext| async move {
         let count = ctx
             .wait_for_condition(|_ctx, state: i32| async move { Ok(state + 1) }, 0)

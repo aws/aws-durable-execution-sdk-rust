@@ -15,7 +15,7 @@ use durable::RetryDecision;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
-    lambda_runtime::tracing::init_default_subscriber();
+    durable::init_default_subscriber()?;
     durable::run(|name: String, ctx: durable::DurableContext| async move {
         let result: String = ctx
             .wait_for_callback::<String, _, _>(|_step_ctx, cb_id| async move {

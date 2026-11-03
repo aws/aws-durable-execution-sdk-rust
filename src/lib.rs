@@ -110,14 +110,6 @@ pub(crate) mod wait;
 pub(crate) mod wait_for_condition;
 pub(crate) mod with_retry;
 
-#[cfg(feature = "replay-filter")]
-pub use self::tracing_layer::ReplayFilterLayer;
-
-// When users run `cargo test` without `--features replay-filter`, the type is
-// still compiled (via `#[cfg(any(test, ...))]`) inside the `pub(crate)` module.
-// Without this re-export the `unreachable_pub` lint fires. The guard ensures
-// only one `pub use` is active at a time.
-#[cfg(all(test, not(feature = "replay-filter")))]
 pub use self::tracing_layer::ReplayFilterLayer;
 
 pub use self::client::{
@@ -209,6 +201,86 @@ use tracing::Instrument as _;
 /// }
 /// ```
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Installs the default Lambda subscriber with replayed records suppressed.
+///
+/// The subscriber has the settings of
+/// `lambda_runtime::tracing::init_default_subscriber`, and its `fmt` layer is
+/// filtered by [`ReplayFilterLayer`]. So a record between operations is
+/// written once per execution, not again on every replay. The level and
+/// the `RUST_LOG` directives decide which records are written. The SDK's
+/// replay-tracking spans stay enabled whatever they say, so suppression
+/// also holds for a `WARN` or `ERROR` threshold.
+///
+/// The level comes from `AWS_LAMBDA_LOG_LEVEL`, else `RUST_LOG`, else
+/// `INFO`. A level that does not parse falls back to `INFO`. The subscriber
+/// writes JSON when `AWS_LAMBDA_LOG_FORMAT` is `json` in any case, and text
+/// otherwise. It writes to stdout: this function is
+/// [`init_default_subscriber_with_writer`]`(std::io::stdout)`.
+///
+/// The SDK never installs a subscriber implicitly. [`run`], [`wrap`] and
+/// `LocalRunner` install none; only a call to this function or to
+/// [`init_default_subscriber_with_writer`] does.
+///
+/// # Errors
+///
+/// Returns the `try_init` error when a global subscriber is already
+/// installed, for example by an earlier call.
+///
+/// # Example
+///
+/// ```no_run
+/// use aws_durable_execution_sdk as durable;
+///
+/// # async fn handler(
+/// #     _event: serde_json::Value,
+/// #     _ctx: durable::DurableContext,
+/// # ) -> Result<(), durable::BoxError> {
+/// #     Ok(())
+/// # }
+/// #[tokio::main]
+/// async fn main() -> Result<(), lambda_runtime::Error> {
+///     durable::init_default_subscriber()?;
+///     durable::run(handler).await
+/// }
+/// ```
+pub fn init_default_subscriber() -> Result<(), BoxError> {
+    init_default_subscriber_with_writer(std::io::stdout)
+}
+
+/// Installs the default Lambda subscriber with replayed records suppressed,
+/// writing to `writer`.
+///
+/// This mirrors `lambda_runtime::tracing::init_default_subscriber_with_writer`,
+/// whose documentation recommends a non-blocking writer for high-throughput
+/// functions, because a write to stdout can briefly block the runtime. It
+/// reads the level and the format exactly as [`init_default_subscriber`]
+/// does, and its `fmt` layer is filtered by [`ReplayFilterLayer`].
+///
+/// The SDK never installs a subscriber implicitly. [`run`], [`wrap`] and
+/// `LocalRunner` install none; only a call to this function or to
+/// [`init_default_subscriber`] does.
+///
+/// # Errors
+///
+/// Returns the `try_init` error when a global subscriber is already
+/// installed, for example by an earlier call.
+pub fn init_default_subscriber_with_writer<W>(writer: W) -> Result<(), BoxError>
+where
+    W: for<'w> lambda_runtime::tracing::subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use lambda_runtime::tracing::subscriber::util::SubscriberInitExt as _;
+
+    let settings = tracing_layer::LogSettings::from_env();
+    tracing_layer::default_subscriber(
+        &settings.level,
+        &settings.directives,
+        &settings.format,
+        writer,
+    )
+    .try_init()?;
+    Ok(())
+}
 
 /// Retry decision returned by a retry-strategy closure.
 ///

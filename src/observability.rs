@@ -28,8 +28,9 @@
 //! Both spans are created at the `INFO` level. The `isReplay` field on the
 //! `durable_execution` span is dynamic: the SDK re-records it after every
 //! operation claim, so it flips to `false` the moment the invocation crosses
-//! the replay high-water mark. The `replay-filter` feature's
-//! `ReplayFilterLayer` is built on exactly this contract.
+//! the replay high-water mark. [`crate::ReplayFilterLayer`] is built on
+//! exactly this contract, and [`crate::init_default_subscriber`] installs
+//! a subscriber with it.
 //!
 //! # Events
 //!
@@ -174,8 +175,8 @@
 //! ```
 //!
 //! Replay awareness carries over: an exporter that must not re-emit
-//! replayed work can drop events where `isReplay` is `true`. The
-//! `replay-filter` feature's `ReplayFilterLayer` implements exactly that
+//! replayed work can drop events where `isReplay` is `true`.
+//! [`crate::ReplayFilterLayer`] implements exactly that
 //! rule for events that carry the field (and additionally suppresses
 //! application log lines emitted inside spans marked `isReplay = true`,
 //! which carry no field of their own).

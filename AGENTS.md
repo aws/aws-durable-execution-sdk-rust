@@ -69,10 +69,11 @@ again on every replay. This implies four rules:
    values from steps instead.
 4. **Side effects outside steps repeat on every replay.** Put side effects
    in steps. Logging is a side effect too: a `tracing` event between
-   operations is emitted again on every replay. The SDK does not filter
-   these events by default. To suppress them, install `ReplayFilterLayer`
-   (feature `replay-filter`) as the filter of your `tracing-subscriber`
-   layer.
+   operations is emitted again on every replay, unless the subscriber
+   suppresses replayed records. Install the subscriber with
+   `durable::init_default_subscriber()`, and each record between
+   operations is written once per execution. A custom subscriber keeps
+   that by adding `ReplayFilterLayer` as the filter of its `fmt` layer.
 
 Three more rules are specific to Rust. The crate documentation lists them
 under "Determinism contract" in `src/lib.rs`.

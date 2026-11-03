@@ -56,7 +56,7 @@ async fn handler(
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
-    lambda_runtime::tracing::init_default_subscriber();
+    durable::init_default_subscriber()?;
     durable::run(handler).await
 }
 ```
@@ -244,6 +244,41 @@ outside a step body is such an await too: while an operation waits and no
 other SDK work runs, the invocation suspends at it. When an execution
 suspends, the SDK drops your handler future, so never make correctness
 between operations depend on `Drop` order.
+
+### Logging
+
+Handler code between operations runs again on every replay, so a `tracing`
+record it emits would be written again on every invocation. Install the
+subscriber with `durable::init_default_subscriber()`, as the quick start
+does, and each record between operations is written once per execution.
+The helper has the settings of `lambda_runtime`'s default subscriber: it
+reads the level from `AWS_LAMBDA_LOG_LEVEL`, else `RUST_LOG`, else `INFO`,
+and writes JSON when `AWS_LAMBDA_LOG_FORMAT` is `json`. It returns an error
+when a global subscriber is already installed.
+`durable::init_default_subscriber_with_writer(writer)` does the same with
+another writer, such as a non-blocking one.
+
+A custom subscriber keeps the suppression by adding `ReplayFilterLayer` as
+the filter of its `fmt` layer. The filter implements the `Filter` trait of
+`tracing-subscriber`, which `lambda_runtime` re-exports as
+`lambda_runtime::tracing::subscriber`, so no extra dependency is needed.
+The `ReplayFilterLayer` rustdoc shows how to keep the records of one target
+on every invocation.
+
+```rust ignore
+use durable::lambda_runtime::tracing::subscriber;
+use subscriber::Layer as _;
+use subscriber::layer::SubscriberExt as _;
+use subscriber::util::SubscriberInitExt as _;
+
+subscriber::registry()
+    .with(subscriber::fmt::layer().json().with_filter(durable::ReplayFilterLayer::new()))
+    .init();
+```
+
+The SDK never installs a subscriber implicitly. `run`, `wrap` and
+`LocalRunner` install none; only a call to `init_default_subscriber` or
+`init_default_subscriber_with_writer` does.
 
 ### Replacing the transport
 

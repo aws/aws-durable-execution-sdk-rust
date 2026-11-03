@@ -6,7 +6,7 @@
 //! execution: the resumed invocation replays the code before the wait
 //! without re-emitting its log line.
 
-#![cfg(all(feature = "test-util", feature = "replay-filter"))]
+#![cfg(feature = "test-util")]
 #![expect(clippy::expect_used)] // reason: test assertions
 
 use std::sync::{Arc, Mutex};

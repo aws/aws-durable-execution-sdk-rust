@@ -89,7 +89,7 @@ targets after a failure:
 | `cargo fmt --check` | any file whose formatting differs from rustfmt's default output |
 | `cargo clippy --all-targets --all-features -- -D warnings` | every clippy warning, including the `pedantic` and `cargo` groups, across the library and its tests |
 | `cargo test` | a failing unit test or doctest in the default feature set |
-| `cargo test --all-features` | a failing test behind a feature gate (`test-util`, `replay-filter`), including the integration tests those features unlock |
+| `cargo test --all-features` | a failing test behind a feature gate (`test-util`), including the integration tests those features unlock |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | a broken intra-doc link or malformed rustdoc markup anywhere in the documented surface, including feature-gated items |
 | `sh scripts/check-msrv-consistency.sh` | a `rust-version` declaration (in any manifest, the `msrv` CI job, or the README) that disagrees with the root `Cargo.toml`'s |
 | `cargo deny --all-features check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source, in the graph with every feature enabled |
@@ -156,11 +156,11 @@ teardown still runs after a hang. On macOS, install coreutils and put its
 
 Eight crates make up the always-on direct production dependency set:
 `aws-config`, `aws-sdk-lambda`, `lambda_runtime`, `serde`, `serde_json`,
-`sha2`, `tokio`, and `tracing`. One more is approved as an optional,
-feature-gated production dependency: `tracing-subscriber`, which only the
-`replay-filter` feature pulls in, because [`ReplayFilterLayer`] implements
-that crate's `Filter` trait and cannot exist without it. A default build
-never compiles or ships it.
+`sha2`, `tokio`, and `tracing`. No optional, feature-gated production
+dependency is approved today. [`ReplayFilterLayer`] implements the `Filter`
+trait of `tracing-subscriber` through `lambda_runtime`'s re-export of that
+crate (`lambda_runtime::tracing::subscriber`), so it needs no dependency of
+its own.
 
 `scripts/check-direct-deps.sh` reads `cargo tree` twice and fails if either
 graph steps outside its allowlist: the default-feature graph may contain only

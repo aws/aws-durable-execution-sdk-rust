@@ -48,7 +48,7 @@ wildcards = "allow"
 # contain only the spec-approved always-on crates (the ALWAYS_ON list in
 # that script is the source of truth for their count), and the
 # --all-features graph may add only the approved optional feature-gated
-# crates (currently tracing-subscriber, behind `replay-filter`).
+# crates (currently none).
 # This gives us the red gate the spec requires without needing to
 # enumerate every transitive crate.
 allow = []
