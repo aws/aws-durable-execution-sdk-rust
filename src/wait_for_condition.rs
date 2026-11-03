@@ -398,6 +398,19 @@ where
             start = Some(self.ctx.submit_checkpoint_updates(vec![start_update]));
         }
 
+        // A plugin sees the start of every check. It is a replay from the
+        // second check on, and on re-entry into a `STARTED` record. The
+        // hooks fire while the START write is in flight, as the check does
+        // not wait for it either.
+        if let Some(plugins) = self.ctx.plugins() {
+            crate::plugin::attempt_started(
+                plugins,
+                self.info(),
+                attempt,
+                already_started || attempt > 1,
+            );
+        }
+
         Ok(WfcPrelude::Run {
             attempt,
             state: current_state,
@@ -515,6 +528,12 @@ where
                             // terminal FAIL before the execution fails.
                             return self.checkpoint_unrecoverable(err).await;
                         }
+                        self.check_ended(
+                            attempt,
+                            crate::OperationStatus::Succeeded,
+                            Some(serialized),
+                            None,
+                        );
 
                         Ok(WfcSettled::Done(deserialized))
                     }
@@ -540,6 +559,12 @@ where
                             // fails.
                             return self.checkpoint_unrecoverable(err).await;
                         }
+                        self.check_ended(
+                            attempt,
+                            crate::OperationStatus::Pending,
+                            Some(serialized),
+                            None,
+                        );
 
                         Ok(WfcSettled::Retry)
                     }
@@ -567,6 +592,12 @@ where
                             // retry.
                             return self.checkpoint_unrecoverable(err).await;
                         }
+                        self.check_ended(
+                            attempt,
+                            crate::OperationStatus::Failed,
+                            None,
+                            Some(&wire),
+                        );
 
                         Err(wfc_op_error(WaitForConditionErrorKind::MaxChecksExceeded(
                             crate::error::MaxChecksExceeded::new(attempt),
@@ -595,6 +626,7 @@ where
                     // (the original carried the check error's payload).
                     return self.checkpoint_unrecoverable(err).await;
                 }
+                self.check_ended(attempt, crate::OperationStatus::Failed, None, Some(&wire));
 
                 Err(wfc_op_error_with_source(
                     WaitForConditionErrorKind::CheckFailed,
@@ -604,6 +636,52 @@ where
                 .with_wire(wire))
             }
         }
+    }
+
+    /// The plugin info of this operation.
+    fn info(&self) -> crate::plugin::OperationInfo {
+        crate::plugin::OperationInfo::for_operation(
+            &self.ctx,
+            self.op_id.wire(),
+            crate::OperationKind::Step,
+            WFC_SUB_TYPE,
+            self.name.as_deref(),
+        )
+    }
+
+    /// Fires the attempt-end hooks of check `attempt`, right after the
+    /// write of `status` returned `Ok`. The operation info carries what the
+    /// SDK wrote: the state `result`, or the error `error`. A
+    /// check that wrote `RETRY` (`Pending`) ended without an error, so its
+    /// attempt succeeded, as in JS, and the operation continues.
+    fn check_ended(
+        &self,
+        attempt: u32,
+        status: crate::OperationStatus,
+        result: Option<String>,
+        error: Option<&crate::error::WireError>,
+    ) {
+        let Some(plugins) = self.ctx.plugins() else {
+            return;
+        };
+        let outcome = if error.is_some() {
+            crate::plugin::AttemptOutcome::Failed
+        } else {
+            crate::plugin::AttemptOutcome::Succeeded
+        };
+        crate::plugin::attempt_ended(
+            plugins,
+            self.info()
+                .with_status(status)
+                .with_result(result)
+                .with_error(error.cloned()),
+            crate::plugin::AttemptEnd {
+                attempt,
+                outcome,
+                error: error.cloned(),
+                ends_operation: status != crate::OperationStatus::Pending,
+            },
+        );
     }
 
     /// Routes a rejected outcome write through the unrecoverable path
@@ -1316,6 +1394,54 @@ mod tests {
         }
     }
 
+    /// The in-memory client returns no record, so the end infos of a
+    /// failed check carry the error the SDK wrote.
+    #[tokio::test]
+    async fn failed_check_end_infos_carry_the_written_error() {
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::new(InMemoryExecutionClient::new(Vec::new())),
+            "token0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let err = ctx
+            .wait_for_condition(
+                |_ctx, _state: u32| async { Err::<u32, BoxError>("bad".into()) },
+                0_u32,
+            )
+            .name("cond")
+            .await
+            .unwrap_err();
+        assert!(err.wire().is_some());
+        let records = hooks.records();
+        let shapes: Vec<_> = records
+            .iter()
+            .map(crate::plugin::test_support::OpRecord::shape)
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                ("start", false, None, None),
+                ("attempt_start", false, Some(1), None),
+                (
+                    "attempt_end",
+                    false,
+                    Some(1),
+                    Some(crate::plugin::AttemptOutcome::Failed)
+                ),
+                ("end", false, None, None),
+            ]
+        );
+        let attempt_end = records.get(2).expect("an attempt end");
+        assert_eq!(attempt_end.error.as_deref(), Some("bad"));
+        assert_eq!(attempt_end.status, Some(crate::OperationStatus::Failed));
+        assert_eq!(attempt_end.result, None);
+    }
+
     /// Test: check function error immediately fails the operation.
     #[tokio::test]
     async fn check_function_error_fails_immediately() {
@@ -1549,6 +1675,108 @@ mod coordinator_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn wfc_resumed_in_invocation_fires_start() {
+        use crate::driver::test_support::{RefreshClient, poll_once};
+        use crate::plugin::AttemptOutcome::Succeeded;
+        // Answers the RETRY of `cond` with PENDING and the state it
+        // carries, and the first refresh with `cond` READY. The SUCCEED
+        // gets no record.
+        let client = Arc::new(RefreshClient::new(|req| {
+            let record =
+                |status: OperationStatus, update: &aws_sdk_lambda::types::OperationUpdate| {
+                    let mut details = StepDetails::builder().attempt(1);
+                    if let Some(payload) = update.payload() {
+                        details = details.result(payload);
+                    }
+                    operation_like(update, status)
+                        .step_details(details.build())
+                        .build()
+                        .expect("all required fields set")
+                };
+            let mut ops = Vec::new();
+            if let Some(retry) = named(req.updates, "cond", &OperationAction::Retry) {
+                ops.push(record(OperationStatus::Pending, retry));
+            }
+            if req.empty_number == 1
+                && let Some(retry) = named(req.history, "cond", &OperationAction::Retry)
+            {
+                ops.push(record(OperationStatus::Ready, retry));
+            }
+            Ok(ops)
+        }));
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let ctx = crate::DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::engine::CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let mut cond = std::pin::pin!(
+                ctx.wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0_u32)
+                    .wait_strategy_fn(|state: u32, _attempt| {
+                        if state >= 2 {
+                            WaitDecision::complete()
+                        } else {
+                            WaitDecision::continue_with(Duration::from_secs(1))
+                        }
+                    })
+                    .name("cond")
+                    .spawn()
+            );
+            poll_once(cond.as_mut()).await;
+            ctx.step(|_| async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok(1_u32)
+            })
+            .name("s")
+            .await
+            .map_err(wire_err)?;
+            let state = cond.await.map_err(wire_err)?;
+            Ok(state.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("2".to_owned()));
+        let records = hooks.of("cond");
+        let shapes: Vec<_> = records
+            .iter()
+            .map(crate::plugin::test_support::OpRecord::shape)
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                ("start", false, None, None),
+                ("attempt_start", false, Some(1), None),
+                ("attempt_end", false, Some(1), Some(Succeeded)),
+                ("start", true, None, None),
+                ("attempt_start", false, Some(2), None),
+                ("attempt_end", false, Some(2), Some(Succeeded)),
+                ("end", false, None, None),
+            ]
+        );
+        // The record carries the state 1; the SDK wrote 2.
+        let results: Vec<_> = records.iter().map(|r| r.result.as_deref()).collect();
+        assert_eq!(results.get(5..), Some(&[Some("2"), Some("2")][..]));
+        let statuses: Vec<_> = records.iter().map(|r| r.status).collect();
+        assert_eq!(
+            statuses,
+            [
+                Some(crate::OperationStatus::Started),
+                Some(crate::OperationStatus::Started),
+                Some(crate::OperationStatus::Pending),
+                Some(crate::OperationStatus::Started),
+                Some(crate::OperationStatus::Started),
+                Some(crate::OperationStatus::Succeeded),
+                Some(crate::OperationStatus::Succeeded),
+            ]
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn condition_check_resumes_on_sibling_response() {

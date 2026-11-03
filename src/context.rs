@@ -818,12 +818,14 @@ impl DurableContext {
             .collect()
     }
 
+    /// The checkpoint token mutex, which a checkpoint call holds.
+    #[cfg(test)]
+    pub(crate) fn checkpoint_token_mutex(&self) -> Arc<Mutex<String>> {
+        Arc::clone(&self.inner.checkpoint_token)
+    }
+
     /// The plugins of the invocation, shared by every context derived from
     /// the root. `None` without a registered plugin factory.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the operation hook issue")
-    )]
     pub(crate) fn plugins(&self) -> Option<&crate::plugin::InvocationPlugins> {
         self.inner.plugins.as_deref()
     }
@@ -993,6 +995,16 @@ impl DurableContext {
     ) -> Option<R> {
         let wire_id = crate::engine::compute_wire_id_public(positional_id);
         self.inner.engine.checkpoint_log.with_record(&wire_id, f)
+    }
+
+    /// [`Self::with_checkpoint_record`], for the record stored under the
+    /// wire ID `wire_id`.
+    pub(crate) fn with_checkpoint_record_by_wire<R>(
+        &self,
+        wire_id: &str,
+        f: impl FnOnce(&CheckpointRecord) -> R,
+    ) -> Option<R> {
+        self.inner.engine.checkpoint_log.with_record(wire_id, f)
     }
 
     /// Returns the compact view (status, attempt,

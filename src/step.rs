@@ -501,11 +501,34 @@ where
             is_replay,
         );
 
+        self.attempt_started(attempt, already_started || attempt > 1);
+
         Ok(StepPrelude::Run {
             attempt,
             span,
             start,
         })
+    }
+
+    /// Fires the start hooks of the live attempt `attempt`. It is a replay
+    /// from the second attempt on, and on re-entry into a `STARTED` record.
+    ///
+    /// An at-least-once attempt fires them while its START write is in
+    /// flight, as JS does: its body does not wait for the write either.
+    fn attempt_started(&self, attempt: u32, is_replay: bool) {
+        if let Some(plugins) = self.ctx.plugins() {
+            crate::plugin::attempt_started(
+                plugins,
+                step_info(
+                    &self.ctx,
+                    self.op_id.wire(),
+                    self.sub_type.as_str(),
+                    self.name.as_deref(),
+                ),
+                attempt,
+                is_replay,
+            );
+        }
     }
 
     /// Awaits the `START` write an at-least-once attempt submitted before
@@ -542,6 +565,7 @@ where
                 self.sub_type.as_str(),
                 &self.serdes,
                 value,
+                attempt,
             )
             .await
             .map(StepSettled::Done),
@@ -565,6 +589,22 @@ where
 
 // Free functions for post-closure operations
 
+/// The plugin info of the step `wire_id`, created in `ctx`.
+fn step_info(
+    ctx: &DurableContext,
+    wire_id: &str,
+    sub_type: &str,
+    name: Option<&str>,
+) -> crate::plugin::OperationInfo {
+    crate::plugin::OperationInfo::for_operation(
+        ctx,
+        wire_id,
+        crate::OperationKind::Step,
+        sub_type,
+        name,
+    )
+}
+
 /// Handles a successful step execution: serialize, checkpoint, return.
 ///
 /// The value round-trips through the configured wire format: ownership
@@ -577,6 +617,7 @@ async fn handle_success<O, S: Serdes<O>>(
     sub_type: &str,
     serdes: &S,
     value: O,
+    attempt: u32,
 ) -> Result<O, OperationError> {
     let serdes_ctx = SerdesContext::new(wire_id, ctx.execution_arn());
 
@@ -633,6 +674,21 @@ async fn handle_success<O, S: Serdes<O>>(
             .await;
     }
 
+    if let Some(plugins) = ctx.plugins() {
+        crate::plugin::attempt_ended(
+            plugins,
+            step_info(ctx, wire_id, sub_type, name)
+                .with_status(crate::OperationStatus::Succeeded)
+                .with_result(Some(serialized.clone())),
+            crate::plugin::AttemptEnd {
+                attempt,
+                outcome: crate::plugin::AttemptOutcome::Succeeded,
+                error: None,
+                ends_operation: true,
+            },
+        );
+    }
+
     // Return deserialized from the serialized form (round-trip parity).
     deserialize_result(ctx, name, serdes, serialized, serdes_ctx).await
 }
@@ -668,7 +724,29 @@ async fn handle_failure(
         STEP_FALLBACK_ERROR_TYPE
     };
     let wire = crate::error::wire_error_for(&*err, fallback);
+    // A plugin sees no hook for an interrupted attempt, as JS: no hook saw
+    // that attempt start in this invocation.
+    let plugins = ctx
+        .plugins()
+        .filter(|_| !matches!(kind, StepErrorKind::Interrupted));
     let step_err = StepError::new(kind, Some(err));
+    // Fires the attempt-end hooks once the outcome write returned `Ok`.
+    let attempt_ended = |status: crate::OperationStatus, ends_operation: bool| {
+        if let Some(plugins) = plugins {
+            crate::plugin::attempt_ended(
+                plugins,
+                step_info(ctx, wire_id, sub_type, name)
+                    .with_status(status)
+                    .with_error(Some(wire.clone())),
+                crate::plugin::AttemptEnd {
+                    attempt,
+                    outcome: crate::plugin::AttemptOutcome::Failed,
+                    error: Some(wire.clone()),
+                    ends_operation,
+                },
+            );
+        }
+    };
 
     // Consult the retry strategy. The strategy sees the live escaping
     // error through the step error's `source()`.
@@ -708,6 +786,7 @@ async fn handle_failure(
                     .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
                     .await;
             }
+            attempt_ended(crate::OperationStatus::Pending, false);
             Ok(())
         }
         RetryDecision::Stop => {
@@ -726,6 +805,7 @@ async fn handle_failure(
                     .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
                     .await;
             }
+            attempt_ended(crate::OperationStatus::Failed, true);
 
             // The step returns the error the strategy saw, as the JS SDK
             // does: the kind stays the one the strategy saw, and the
@@ -1469,6 +1549,145 @@ mod tests {
             err_msg.contains("retries exhausted") || err_msg.contains("always fails"),
             "got: {err_msg}"
         );
+    }
+
+    /// A root context on the in-memory client, with `hooks` as the
+    /// invocation's plugin, and the checkpoint buffer window `window`.
+    fn context_with_plugin(
+        hooks: &crate::plugin::test_support::OpHooks,
+        window: Option<Duration>,
+    ) -> (DurableContext, Arc<crate::client::InMemoryExecutionClient>) {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+            window,
+            Some(hooks.plugins()),
+        );
+        (ctx, client)
+    }
+
+    #[tokio::test]
+    async fn hooks_run_outside_the_token_lock() {
+        for window in [Some(Duration::ZERO), None] {
+            let lock: Arc<std::sync::OnceLock<Arc<tokio::sync::Mutex<String>>>> = Arc::default();
+            let probe_lock = Arc::clone(&lock);
+            let hooks = crate::plugin::test_support::OpHooks::probing(move || {
+                let free = probe_lock
+                    .get()
+                    .is_some_and(|mutex| mutex.try_lock().is_ok());
+                free.to_string()
+            });
+            let (ctx, _client) = context_with_plugin(&hooks, window);
+            lock.set(ctx.checkpoint_token_mutex()).expect("set once");
+            let value = ctx.step(|_| async { Ok(1_u32) }).name("a").await.unwrap();
+            assert_eq!(value, 1);
+            let probes: Vec<String> = hooks.records().into_iter().map(|r| r.probe).collect();
+            assert_eq!(probes, ["true"; 4], "window {window:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hooks_run_on_the_operation_task() {
+        let hooks = crate::plugin::test_support::OpHooks::probing(|| {
+            format!("{:?}", tokio::task::try_id())
+        });
+        let (ctx, _client) = context_with_plugin(&hooks, Some(Duration::ZERO));
+        let body_task = Arc::new(std::sync::Mutex::new(None));
+        let seen = Arc::clone(&body_task);
+        let value = ctx
+            .step(move |_| async move {
+                *seen.lock().unwrap() = tokio::task::try_id();
+                Ok(1_u32)
+            })
+            .name("a")
+            .spawn()
+            .await
+            .unwrap();
+        assert_eq!(value, 1);
+        let body = body_task.lock().unwrap().expect("the body ran on a task");
+        let records = hooks.records();
+        let probe_of = |hook: &str| {
+            records
+                .iter()
+                .find(|r| r.hook == hook)
+                .map(|r| r.probe.clone())
+                .expect("the hook ran")
+        };
+        let expected = format!("{:?}", Some(body));
+        assert_eq!(probe_of("attempt_end"), expected);
+        assert_eq!(probe_of("end"), expected);
+    }
+
+    #[tokio::test]
+    async fn no_plugins_keeps_checkpoint_updates() {
+        let (ctx, client) = context_over(Vec::new());
+        assert!(ctx.plugins().is_none());
+        let value = ctx.step(|_| async { Ok(1_u32) }).name("a").await.unwrap();
+        assert_eq!(value, 1);
+        let updates = client.recorded_updates();
+        let wire_id = crate::engine::compute_wire_id_public("1");
+        let fields: Vec<_> = updates
+            .iter()
+            .map(|u| {
+                (
+                    u.id().to_owned(),
+                    u.r#type().clone(),
+                    u.sub_type().map(str::to_owned),
+                    u.name().map(str::to_owned),
+                    u.action().clone(),
+                    u.payload().map(str::to_owned),
+                    u.parent_id().map(str::to_owned),
+                    u.error().is_some(),
+                )
+            })
+            .collect();
+        let step = |action, payload: Option<&str>| {
+            (
+                wire_id.clone(),
+                OperationType::Step,
+                Some(STEP_SUB_TYPE.to_owned()),
+                Some("a".to_owned()),
+                action,
+                payload.map(str::to_owned),
+                None,
+                false,
+            )
+        };
+        assert_eq!(
+            fields,
+            [
+                step(OperationAction::Start, None),
+                step(OperationAction::Succeed, Some("1")),
+            ]
+        );
+    }
+
+    /// The SDK's in-memory client returns no record, so the end infos of a
+    /// failed step carry the error the SDK wrote.
+    #[tokio::test]
+    async fn failed_step_end_infos_carry_the_written_error() {
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let (ctx, _client) = context_with_plugin(&hooks, None);
+        let err = ctx
+            .step(|_| async { Err::<u32, BoxError>("boom".into()) })
+            .name("a")
+            .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+            .await
+            .unwrap_err();
+        assert!(err.wire().is_some());
+        let records = hooks.records();
+        let ends: Vec<_> = records
+            .iter()
+            .filter(|r| r.hook == "attempt_end" || r.hook == "end")
+            .collect();
+        assert_eq!(ends.len(), 2);
+        let attempt_end = ends.first().expect("an attempt end");
+        assert_eq!(attempt_end.error.as_deref(), Some("boom"));
+        assert_eq!(attempt_end.status, Some(crate::OperationStatus::Failed));
     }
 
     /// Builds a step record for the first operation of a root context.
@@ -2659,6 +2878,78 @@ mod coordinator_tests {
         let numbers: Vec<u32> = attempts.iter().map(|(n, _)| *n).collect();
         assert_eq!(numbers, vec![1, 2]);
         assert_near(attempts.get(1).expect("attempt 2 ran").1, secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn step_retry_in_invocation_fires_start() {
+        use crate::plugin::AttemptOutcome::{Failed, Succeeded};
+        let client = Arc::new(retry_client("flaky"));
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let ctx = crate::DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::engine::CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let mut flaky = std::pin::pin!(
+                ctx.step(|step_ctx| async move {
+                    if step_ctx.attempt() < 2 {
+                        return Err::<u32, crate::BoxError>("transient".into());
+                    }
+                    Ok(7)
+                })
+                .name("flaky")
+                .retry_strategy(retry_once)
+                .spawn()
+            );
+            poll_once(flaky.as_mut()).await;
+            sleeping_step(&ctx).await?;
+            let value = flaky.await.map_err(wire_err)?;
+            Ok(value.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("7".to_owned()));
+        let records = hooks.of("flaky");
+        let shapes: Vec<_> = records
+            .iter()
+            .map(crate::plugin::test_support::OpRecord::shape)
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                ("start", false, None, None),
+                ("attempt_start", false, Some(1), None),
+                ("attempt_end", false, Some(1), Some(Failed)),
+                ("start", true, None, None),
+                ("attempt_start", false, Some(2), None),
+                ("attempt_end", false, Some(2), Some(Succeeded)),
+                ("end", false, None, None),
+            ]
+        );
+        let error = records.get(2).and_then(|r| r.error.as_deref());
+        assert_eq!(error, Some("transient"));
+        // The client returns no record for the SUCCEED, so the result is
+        // the one the SDK wrote.
+        let result = records.get(5).and_then(|r| r.result.as_deref());
+        assert_eq!(result, Some("7"));
+        let statuses: Vec<_> = records.iter().map(|r| r.status).collect();
+        assert_eq!(
+            statuses,
+            [
+                Some(crate::OperationStatus::Started),
+                Some(crate::OperationStatus::Started),
+                Some(crate::OperationStatus::Pending),
+                Some(crate::OperationStatus::Started),
+                Some(crate::OperationStatus::Started),
+                Some(crate::OperationStatus::Succeeded),
+                Some(crate::OperationStatus::Succeeded),
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]

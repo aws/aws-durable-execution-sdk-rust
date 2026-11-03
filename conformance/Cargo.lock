@@ -2744,7 +2744,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "plugin_attempt_hooks_retry"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_attempt_info_shape"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_error_isolation"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "plugin_external_update_on_invoke"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_faulty_and_healthy"
 version = "0.0.0"
 dependencies = [
  "aws-durable-execution-sdk",
@@ -2788,6 +2832,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin_operation_field_shape"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_operation_lifecycle"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_replay_flags"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_retry_exhaustion"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "plugin_suspension_invocation_end"
 version = "0.0.0"
 dependencies = [
@@ -2800,6 +2888,17 @@ dependencies = [
 
 [[package]]
 name = "plugin_terminal_failure"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_terminal_payloads"
 version = "0.0.0"
 dependencies = [
  "aws-durable-execution-sdk",

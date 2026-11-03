@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime};
 
 use aws_durable_execution_sdk as durable;
 use durable::plugin::{
-    HookFuture, InvocationEndInfo, InvocationInfo, OperationInfo, Plugin, PluginFactory,
+    AttemptEndInfo, AttemptInfo, AttemptOutcome, HookFuture, HookWork, InvocationEndInfo,
+    InvocationInfo, OperationInfo, Plugin, PluginFactory,
 };
 use durable::serdes::{RetryableSerdesError, SerdesContext};
 use durable::test_util::LocalRunner;
@@ -1082,4 +1083,733 @@ async fn custom_child_and_with_retry_subtypes_reach_plugin_operations() {
         assert_eq!(info.sub_type(), Some(sub_type), "{name}");
         assert_eq!(info.sub_type(), recorded.sub_type(), "{name}");
     }
+}
+
+// The operation and attempt hooks of steps and `wait_for_condition`.
+
+/// `(inv, hook, is_replay, status, attempt, outcome)` of one [`Rec`].
+type Shape = (
+    usize,
+    &'static str,
+    bool,
+    Option<OperationStatus>,
+    Option<u32>,
+    Option<AttemptOutcome>,
+);
+
+/// One operation or attempt hook call that [`Ops`] recorded.
+#[derive(Debug, Clone)]
+struct Rec {
+    /// The invocation, counted from 1.
+    inv: usize,
+    hook: &'static str,
+    /// For an attempt hook, the info of its operation.
+    info: OperationInfo,
+    /// For an attempt hook, its attempt number.
+    attempt: Option<u32>,
+    /// For an attempt-end hook, its outcome.
+    outcome: Option<AttemptOutcome>,
+    /// For an attempt-end hook, its error message.
+    attempt_error: Option<String>,
+}
+
+impl Rec {
+    /// `(inv, hook, is_replay, status, attempt, outcome)`.
+    fn shape(&self) -> Shape {
+        (
+            self.inv,
+            self.hook,
+            self.info.is_replay(),
+            self.info.status(),
+            self.attempt,
+            self.outcome,
+        )
+    }
+
+    fn error_message(&self) -> Option<&str> {
+        self.info.error().and_then(WireError::error_message)
+    }
+}
+
+/// Records every operation and attempt hook of a `Step`-kind operation,
+/// for every invocation. Its plugins are named `Ops`.
+#[derive(Clone, Default)]
+struct Ops {
+    recs: Arc<Mutex<Vec<Rec>>>,
+    count: Arc<AtomicUsize>,
+    /// Work `on_operation_end` returns, when set.
+    end_work: Option<Arc<AtomicBool>>,
+}
+
+impl Ops {
+    fn recs(&self) -> Vec<Rec> {
+        self.recs.lock().unwrap().clone()
+    }
+
+    fn shapes(&self) -> Vec<Shape> {
+        self.recs().iter().map(Rec::shape).collect()
+    }
+
+    fn find(&self, inv: usize, hook: &str, attempt: Option<u32>) -> Rec {
+        self.recs()
+            .into_iter()
+            .find(|r| r.inv == inv && r.hook == hook && (attempt.is_none() || r.attempt == attempt))
+            .unwrap_or_else(|| unreachable!("no {hook} in invocation {inv}"))
+    }
+}
+
+struct OpsPlugin {
+    inv: usize,
+    ops: Ops,
+}
+
+impl OpsPlugin {
+    fn push(
+        &self,
+        hook: &'static str,
+        info: &OperationInfo,
+        attempt: Option<u32>,
+        outcome: Option<AttemptOutcome>,
+        attempt_error: Option<&WireError>,
+    ) {
+        if info.kind() != Some(OperationKind::Step) {
+            return;
+        }
+        self.ops.recs.lock().unwrap().push(Rec {
+            inv: self.inv,
+            hook,
+            info: info.clone(),
+            attempt,
+            outcome,
+            attempt_error: attempt_error
+                .and_then(WireError::error_message)
+                .map(str::to_owned),
+        });
+    }
+}
+
+impl Plugin for OpsPlugin {
+    fn name(&self) -> &'static str {
+        "Ops"
+    }
+
+    fn on_operation_start(&self, info: &OperationInfo) -> HookWork {
+        self.push("start", info, None, None, None);
+        Ok(None)
+    }
+
+    fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
+        self.push("end", info, None, None, None);
+        let Some(flag) = self.ops.end_work.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(Box::pin(async move {
+            tokio::task::yield_now().await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        })))
+    }
+
+    fn on_attempt_start(&self, info: &AttemptInfo) -> HookWork {
+        self.push(
+            "attempt_start",
+            info.operation(),
+            Some(info.attempt()),
+            None,
+            None,
+        );
+        Ok(None)
+    }
+
+    fn on_attempt_end(&self, info: &AttemptEndInfo) -> HookWork {
+        self.push(
+            "attempt_end",
+            info.operation(),
+            Some(info.attempt()),
+            Some(info.outcome()),
+            info.error(),
+        );
+        Ok(None)
+    }
+}
+
+impl PluginFactory for Ops {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        let inv = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(Some(Box::new(OpsPlugin {
+            inv,
+            ops: self.clone(),
+        })))
+    }
+}
+
+fn ops_runner(ops: &Ops) -> LocalRunner {
+    LocalRunner::new().options(
+        Options::builder()
+            .plugin(ops.clone())
+            .build()
+            .expect("valid options"),
+    )
+}
+
+/// Retries attempts below `stop_at` after 1 s, and stops at `stop_at`.
+fn retry_below(
+    stop_at: u32,
+) -> impl Fn(&durable::StepError, u32) -> RetryDecision + Send + Sync + 'static {
+    move |_err, attempt| {
+        if attempt < stop_at {
+            RetryDecision::Retry {
+                delay: Duration::from_secs(1),
+            }
+        } else {
+            RetryDecision::Stop
+        }
+    }
+}
+
+async fn step_a(_e: (), ctx: DurableContext) -> Result<String, BoxError> {
+    Ok(ctx
+        .step(|_| async { Ok("task-a".to_owned()) })
+        .name("a")
+        .await?)
+}
+
+/// A step that fails its first attempt and succeeds its second.
+async fn flaky_step(_e: (), ctx: DurableContext) -> Result<String, BoxError> {
+    Ok(ctx
+        .step(|step_ctx| async move {
+            if step_ctx.attempt() == 1 {
+                return Err::<String, BoxError>("attempt 1 failed".into());
+            }
+            Ok("ok".to_owned())
+        })
+        .name("flaky")
+        .retry_strategy(retry_below(3))
+        .await?)
+}
+
+const STARTED: Option<OperationStatus> = Some(OperationStatus::Started);
+const SUCCEEDED: Option<OperationStatus> = Some(OperationStatus::Succeeded);
+const FAILED: Option<OperationStatus> = Some(OperationStatus::Failed);
+const PENDING: Option<OperationStatus> = Some(OperationStatus::Pending);
+const OK: Option<AttemptOutcome> = Some(AttemptOutcome::Succeeded);
+const KO: Option<AttemptOutcome> = Some(AttemptOutcome::Failed);
+
+#[tokio::test]
+async fn step_first_attempt_success() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops).run(step_a, ()).await.expect("runner");
+    assert_eq!(result.output().map(String::as_str), Some("task-a"));
+    assert_eq!(
+        ops.shapes(),
+        [
+            (1, "start", false, STARTED, None, None),
+            (1, "attempt_start", false, STARTED, Some(1), None),
+            (1, "attempt_end", false, SUCCEEDED, Some(1), OK),
+            (1, "end", false, SUCCEEDED, None, None),
+        ]
+    );
+    let end = ops.find(1, "end", None);
+    assert_eq!(end.info.result(), Some("\"task-a\""));
+    assert!(end.info.error().is_none());
+    assert!(ops.find(1, "attempt_end", Some(1)).attempt_error.is_none());
+}
+
+#[tokio::test]
+async fn step_retry_then_success() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops).run(flaky_step, ()).await.expect("runner");
+    assert_eq!(result.output().map(String::as_str), Some("ok"));
+    assert_eq!(
+        ops.shapes(),
+        [
+            (1, "start", false, STARTED, None, None),
+            (1, "attempt_start", false, STARTED, Some(1), None),
+            (1, "attempt_end", false, PENDING, Some(1), KO),
+            (2, "start", true, STARTED, None, None),
+            (2, "attempt_start", false, STARTED, Some(2), None),
+            (2, "attempt_end", false, SUCCEEDED, Some(2), OK),
+            (2, "end", false, SUCCEEDED, None, None),
+        ]
+    );
+    let first = ops.find(1, "attempt_end", Some(1));
+    assert_eq!(first.attempt_error.as_deref(), Some("attempt 1 failed"));
+    assert_eq!(first.error_message(), Some("attempt 1 failed"));
+}
+
+#[tokio::test]
+async fn step_retry_exhaustion() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok::<u32, BoxError>(
+                    ctx.step(|_| async { Err::<u32, BoxError>("boom".into()) })
+                        .name("a")
+                        .retry_strategy(retry_below(2))
+                        .await?,
+                )
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(!result.is_success());
+    assert_eq!(
+        ops.shapes(),
+        [
+            (1, "start", false, STARTED, None, None),
+            (1, "attempt_start", false, STARTED, Some(1), None),
+            (1, "attempt_end", false, PENDING, Some(1), KO),
+            (2, "start", true, STARTED, None, None),
+            (2, "attempt_start", false, STARTED, Some(2), None),
+            (2, "attempt_end", false, FAILED, Some(2), KO),
+            (2, "end", false, FAILED, None, None),
+        ]
+    );
+    let last = ops.find(2, "attempt_end", Some(2));
+    assert_eq!(last.attempt_error.as_deref(), Some("boom"));
+    let end = ops.find(2, "end", None);
+    assert_eq!(end.error_message(), Some("boom"));
+    assert_eq!(end.info.result(), None);
+}
+
+#[tokio::test]
+async fn step_terminal_replay_fires_nothing() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .run(
+            |e: (), ctx: DurableContext| async move {
+                let value = step_a(e, ctx.clone()).await?;
+                ctx.wait(Duration::from_secs(1)).await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success());
+    assert_eq!(result.invocation_count(), 2);
+    assert!(ops.recs().iter().all(|r| r.inv == 1), "{:?}", ops.shapes());
+    assert_eq!(ops.recs().len(), 4);
+}
+
+#[tokio::test]
+async fn step_reentry_after_interruption() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .fail_checkpoints_after_retryable(1, 1)
+        .run(step_a, ())
+        .await
+        .expect("runner");
+    assert!(result.is_success());
+    let second: Vec<_> = ops.shapes().into_iter().filter(|s| s.0 == 2).collect();
+    assert_eq!(
+        second.get(..2),
+        Some(
+            &[
+                (2, "start", true, STARTED, None, None),
+                (2, "attempt_start", false, STARTED, Some(1), None),
+            ][..]
+        ),
+        "{:?}",
+        ops.shapes()
+    );
+}
+
+#[tokio::test]
+async fn step_at_most_once_interruption_fires_nothing() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .fail_checkpoints_after_retryable(1, 1)
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok::<_, BoxError>(
+                    ctx.step(|_| async { Ok("task-a".to_owned()) })
+                        .name("a")
+                        .semantics(durable::StepSemantics::AtMostOncePerRetry)
+                        .retry_strategy(retry_below(3))
+                        .await?,
+                )
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.invocation_count(), 3, "{:?}", ops.shapes());
+    let shapes = ops.shapes();
+    assert!(shapes.iter().all(|s| s.0 != 2), "{shapes:?}");
+    let third: Vec<_> = shapes.into_iter().filter(|s| s.0 == 3).collect();
+    assert_eq!(
+        third.get(..2),
+        Some(
+            &[
+                (3, "start", true, STARTED, None, None),
+                (3, "attempt_start", false, STARTED, Some(2), None),
+            ][..]
+        )
+    );
+}
+
+#[tokio::test]
+async fn step_ids_match_history() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .run(
+            |e: (), ctx: DurableContext| async move {
+                Ok::<_, BoxError>(
+                    ctx.run_in_child_context(move |child| async move { step_a(e, child).await })
+                        .name("child")
+                        .await?,
+                )
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    let step = result.operation("a").expect("the step is recorded");
+    let child = result.operation("child").expect("the child is recorded");
+    let recs = ops.recs();
+    assert_eq!(recs.len(), 4);
+    for rec in recs {
+        assert_eq!(rec.info.id(), step.id(), "{}", rec.hook);
+        assert_eq!(rec.info.parent_id(), Some(child.id()), "{}", rec.hook);
+    }
+}
+
+/// A condition whose state counts the checks, and which completes at 2.
+async fn counting_condition(_e: (), ctx: DurableContext) -> Result<u32, BoxError> {
+    Ok(ctx
+        .wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0_u32)
+        .wait_strategy_fn(|state: u32, _attempt| {
+            if state >= 2 {
+                durable::builders::wait_for_condition::WaitDecision::complete()
+            } else {
+                durable::builders::wait_for_condition::WaitDecision::continue_with(
+                    Duration::from_secs(1),
+                )
+            }
+        })
+        .name("cond")
+        .await?)
+}
+
+#[tokio::test]
+async fn wfc_continue_then_complete() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .run(counting_condition, ())
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&2));
+    assert_eq!(
+        ops.shapes(),
+        [
+            (1, "start", false, STARTED, None, None),
+            (1, "attempt_start", false, STARTED, Some(1), None),
+            (1, "attempt_end", false, PENDING, Some(1), OK),
+            (2, "start", true, STARTED, None, None),
+            (2, "attempt_start", false, STARTED, Some(2), None),
+            (2, "attempt_end", false, SUCCEEDED, Some(2), OK),
+            (2, "end", false, SUCCEEDED, None, None),
+        ]
+    );
+    assert_eq!(ops.find(1, "attempt_end", Some(1)).info.result(), Some("1"));
+    assert_eq!(ops.find(2, "attempt_end", Some(2)).info.result(), Some("2"));
+    assert_eq!(ops.find(2, "end", None).info.result(), Some("2"));
+    for n in [1, 2] {
+        let start = ops.find(n as usize, "attempt_start", Some(n));
+        assert!(start.info.start_timestamp().is_some(), "attempt {n}");
+    }
+    let cond = result.operation("cond").expect("the condition is recorded");
+    let first_end = ops.find(1, "attempt_end", Some(1)).info;
+    assert_eq!(first_end.start_timestamp(), cond.start_time());
+    assert_ne!(first_end.start_timestamp(), first_end.end_timestamp());
+}
+
+#[tokio::test]
+async fn wfc_check_error() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok::<u32, BoxError>(
+                    ctx.wait_for_condition(
+                        |_ctx, _state: u32| async move { Err::<u32, BoxError>("bad".into()) },
+                        0_u32,
+                    )
+                    .name("cond")
+                    .await?,
+                )
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(!result.is_success());
+    assert_eq!(
+        ops.shapes(),
+        [
+            (1, "start", false, STARTED, None, None),
+            (1, "attempt_start", false, STARTED, Some(1), None),
+            (1, "attempt_end", false, FAILED, Some(1), KO),
+            (1, "end", false, FAILED, None, None),
+        ]
+    );
+    assert_eq!(
+        ops.find(1, "attempt_end", Some(1)).attempt_error.as_deref(),
+        Some("bad")
+    );
+    assert_eq!(ops.find(1, "end", None).error_message(), Some("bad"));
+}
+
+#[tokio::test]
+async fn wfc_exhaustion() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok::<u32, BoxError>(
+                    ctx.wait_for_condition(|_ctx, state: u32| async move { Ok(state) }, 0_u32)
+                        .wait_strategy(
+                            durable::builders::wait_for_condition::WaitStrategy::builder(
+                                |_state: &u32| false,
+                            )
+                            .max_attempts(1)
+                            .build(),
+                        )
+                        .name("cond")
+                        .await?,
+                )
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(!result.is_success());
+    let ends: Vec<_> = ops
+        .recs()
+        .into_iter()
+        .filter(|r| r.hook == "attempt_end" || r.hook == "end")
+        .collect();
+    assert_eq!(
+        ends.iter().map(Rec::shape).collect::<Vec<_>>(),
+        [
+            (1, "attempt_end", false, FAILED, Some(1), KO),
+            (1, "end", false, FAILED, None, None),
+        ]
+    );
+    for rec in &ends {
+        assert_eq!(
+            rec.info.error().and_then(WireError::error_type),
+            Some("WaitForCondition.MaxChecksExceeded"),
+            "{}",
+            rec.hook
+        );
+    }
+}
+
+#[tokio::test]
+async fn wfc_reentry_after_interruption() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .fail_checkpoints_after_retryable(1, 1)
+        .run(counting_condition, ())
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&2));
+    let second: Vec<_> = ops.shapes().into_iter().filter(|s| s.0 == 2).collect();
+    assert_eq!(
+        second.get(..2),
+        Some(
+            &[
+                (2, "start", true, STARTED, None, None),
+                (2, "attempt_start", false, STARTED, Some(1), None),
+            ][..]
+        ),
+        "{:?}",
+        ops.shapes()
+    );
+}
+
+#[tokio::test]
+async fn attempt_end_carries_end_timestamp() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops).run(flaky_step, ()).await.expect("runner");
+    let step = result.operation("flaky").expect("the step is recorded");
+    let first = ops.find(1, "attempt_end", Some(1)).info;
+    let day = SystemTime::UNIX_EPOCH + Duration::from_hours(24);
+    assert!(first.end_timestamp().expect("an end timestamp") > day);
+    assert_eq!(
+        ops.find(2, "attempt_end", Some(2)).info.end_timestamp(),
+        step.end_time()
+    );
+    assert_eq!(
+        ops.find(2, "end", None).info.end_timestamp(),
+        step.end_time()
+    );
+    assert!(step.end_time().is_some());
+}
+
+/// Panics in every operation and attempt hook. Named `Faulty`.
+#[derive(Clone)]
+struct OpFaulty;
+
+#[expect(clippy::panic)] // reason: the hook panics under test
+impl Plugin for OpFaulty {
+    fn name(&self) -> &'static str {
+        "Faulty"
+    }
+
+    fn on_operation_start(&self, _info: &OperationInfo) -> HookWork {
+        panic!("start boom")
+    }
+
+    fn on_operation_end(&self, _info: &OperationInfo) -> HookWork {
+        panic!("end boom")
+    }
+
+    fn on_attempt_start(&self, _info: &AttemptInfo) -> HookWork {
+        panic!("attempt start boom")
+    }
+
+    fn on_attempt_end(&self, _info: &AttemptEndInfo) -> HookWork {
+        panic!("attempt end boom")
+    }
+}
+
+impl PluginFactory for OpFaulty {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        Ok(Some(Box::new(self.clone())))
+    }
+}
+
+/// Returns `Err("x")` from every operation and attempt hook.
+#[derive(Clone)]
+struct OpFailing;
+
+impl Plugin for OpFailing {
+    fn on_operation_start(&self, _info: &OperationInfo) -> HookWork {
+        Err("x".into())
+    }
+
+    fn on_operation_end(&self, _info: &OperationInfo) -> HookWork {
+        Err("x".into())
+    }
+
+    fn on_attempt_start(&self, _info: &AttemptInfo) -> HookWork {
+        Err("x".into())
+    }
+
+    fn on_attempt_end(&self, _info: &AttemptEndInfo) -> HookWork {
+        Err("x".into())
+    }
+}
+
+impl PluginFactory for OpFailing {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        Ok(Some(Box::new(self.clone())))
+    }
+}
+
+#[tokio::test]
+#[expect(clippy::panic)] // reason: reports that no attempt captured the warnings
+async fn panicking_operation_hook_is_isolated() {
+    const HOOKS: [&str; 4] = [
+        "on_operation_start",
+        "on_attempt_start",
+        "on_attempt_end",
+        "on_operation_end",
+    ];
+    let alone = LocalRunner::new().run(step_a, ()).await.expect("runner");
+    for _attempt in 0..5 {
+        let (buffer, _guard) = capture();
+        let healthy = Ops::default();
+        let result = LocalRunner::new()
+            .options(
+                Options::builder()
+                    .plugin(OpFaulty)
+                    .plugin(healthy.clone())
+                    .plugin(OpFailing)
+                    .build()
+                    .expect("valid options"),
+            )
+            .run(step_a, ())
+            .await
+            .expect("runner");
+        assert!(result.is_success());
+        assert_eq!(result.output(), alone.output());
+        assert_eq!(
+            healthy.shapes(),
+            [
+                (1, "start", false, STARTED, None, None),
+                (1, "attempt_start", false, STARTED, Some(1), None),
+                (1, "attempt_end", false, SUCCEEDED, Some(1), OK),
+                (1, "end", false, SUCCEEDED, None, None),
+            ]
+        );
+        let warnings = plugin_warnings(&buffer);
+        let hooks_of = |message: &str| {
+            warnings
+                .iter()
+                .filter(|(_, _, m)| m == message)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let panics = hooks_of("plugin hook panicked; the panic is ignored");
+        let failures = hooks_of("plugin hook failed; the error is ignored");
+        if panics.len() != HOOKS.len() || failures.len() != HOOKS.len() {
+            continue;
+        }
+        for ((plugin, hook, _), expected) in panics.iter().zip(HOOKS) {
+            assert!(plugin.ends_with("Faulty (plugins[0])"), "{plugin}");
+            assert_eq!(hook, expected);
+        }
+        for ((plugin, hook, _), expected) in failures.iter().zip(HOOKS) {
+            assert!(plugin.ends_with("(plugins[2])"), "{plugin}");
+            assert_eq!(hook, expected);
+        }
+        return;
+    }
+    panic!("no attempt captured the eight warnings");
+}
+
+#[tokio::test]
+async fn step_custom_sub_type_reaches_plugin() {
+    let ops = Ops::default();
+    let result = ops_runner(&ops)
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok::<_, BoxError>(
+                    ctx.step(|_| async { Ok("ok".to_owned()) })
+                        .name("pay")
+                        .sub_type(durable::OperationSubType::new("Payment")?)
+                        .await?,
+                )
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    let pay = result.operation("pay").expect("the step is recorded");
+    let recs = ops.recs();
+    assert_eq!(recs.len(), 4);
+    for rec in recs {
+        assert_eq!(rec.info.sub_type(), Some("Payment"), "{}", rec.hook);
+        assert_eq!(rec.info.sub_type(), pay.sub_type(), "{}", rec.hook);
+    }
+}
+
+#[tokio::test]
+async fn operation_hook_work_runs() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let ops = Ops {
+        end_work: Some(Arc::clone(&flag)),
+        ..Ops::default()
+    };
+    let alone = LocalRunner::new().run(step_a, ()).await.expect("runner");
+    let result = ops_runner(&ops).run(step_a, ()).await.expect("runner");
+    assert!(flag.load(Ordering::SeqCst));
+    assert_eq!(result.output(), alone.output());
 }

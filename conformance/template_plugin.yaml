@@ -104,3 +104,138 @@ Resources:
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
+
+  PluginOperationLifecycle:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-2"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_operation_lifecycle/
+      Handler: bootstrap
+      Description: 'Conformance 10-2: Plugin operation start and end hooks fire once for a step'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginAttemptHooksRetry:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-3"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_attempt_hooks_retry/
+      Handler: bootstrap
+      Description: 'Conformance 10-3: Plugin attempt hooks fire per step attempt with attempt number and outcome'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginErrorIsolation:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-4"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_error_isolation/
+      Handler: bootstrap
+      Description: 'Conformance 10-4: Plugin hook errors never affect the execution outcome'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginReplayFlags:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-13"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_replay_flags/
+      Handler: bootstrap
+      Description: 'Conformance 10-13: Plugin sees no hook for a terminal replayed step and a replay flag on a retried start'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginTerminalPayloads:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-14"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_terminal_payloads/
+      Handler: bootstrap
+      Description: 'Conformance 10-14: Plugin operation-end hook carries the result or the error of a terminal step'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginRetryExhaustion:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-15"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_retry_exhaustion/
+      Handler: bootstrap
+      Description: 'Conformance 10-15: Plugin attempt and end hooks follow a step to retry exhaustion'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginFaultyAndHealthy:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-17"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_faulty_and_healthy/
+      Handler: bootstrap
+      Description: 'Conformance 10-17: A healthy plugin receives every hook beside a faulty one'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginOperationFieldShape:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-20"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_operation_field_shape/
+      Handler: bootstrap
+      Description: 'Conformance 10-20: Plugin operation infos carry every field in the canonical dump'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginAttemptInfoShape:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-21"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_attempt_info_shape/
+      Handler: bootstrap
+      Description: 'Conformance 10-21: Plugin attempt infos carry every field in the canonical dump'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

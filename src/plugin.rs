@@ -285,38 +285,112 @@ pub trait Plugin: Send + Sync {
         Box::pin(std::future::ready(Ok(())))
     }
 
-    /// Runs when an operation starts or replays.
+    /// Runs when a live attempt of an operation starts.
+    ///
+    /// For a step and a `wait_for_condition`:
+    ///
+    /// - an operation replayed from a terminal record fires no hook;
+    /// - every live attempt fires `on_operation_start`, then
+    ///   `on_attempt_start`. `is_replay` is `true` from the second attempt
+    ///   on, and when the attempt re-enters a `STARTED` record;
+    /// - an attempt that schedules a retry fires only `on_attempt_end`;
+    /// - the attempt that ends the operation fires `on_attempt_end`, then
+    ///   `on_operation_end`.
+    ///
+    /// The hook runs synchronously, on the task that runs the operation.
+    /// It can return work: the SDK
+    /// runs that future on its own task, and waits for it before
+    /// `on_invocation_end` until 500 ms before the invocation deadline.
     ///
     /// # Errors
     ///
-    /// An error is logged and does not change the execution.
+    /// An error or a panic is logged at WARN with the plugin's name and
+    /// registration index, and does not change the execution.
     fn on_operation_start(&self, _info: &OperationInfo) -> HookWork {
         Ok(None)
     }
 
-    /// Runs when an operation ends or replays its recorded outcome.
+    /// Runs when an operation ends, after the checkpoint that records its
+    /// outcome. The info carries the same end timestamp as the
+    /// `on_attempt_end` before it.
+    ///
+    /// For a step and a `wait_for_condition`:
+    ///
+    /// - an operation replayed from a terminal record fires no hook;
+    /// - every live attempt fires `on_operation_start`, then
+    ///   `on_attempt_start`. `is_replay` is `true` from the second attempt
+    ///   on, and when the attempt re-enters a `STARTED` record;
+    /// - an attempt that schedules a retry fires only `on_attempt_end`;
+    /// - the attempt that ends the operation fires `on_attempt_end`, then
+    ///   `on_operation_end`.
+    ///
+    /// The hook runs synchronously, on the task that runs the operation.
+    /// It can return work: the SDK
+    /// runs that future on its own task, and waits for it before
+    /// `on_invocation_end` until 500 ms before the invocation deadline.
     ///
     /// # Errors
     ///
-    /// An error is logged and does not change the execution.
+    /// An error or a panic is logged at WARN with the plugin's name and
+    /// registration index, and does not change the execution.
     fn on_operation_end(&self, _info: &OperationInfo) -> HookWork {
         Ok(None)
     }
 
-    /// Runs when a step attempt or a condition check starts.
+    /// Runs when a step attempt or a condition check starts, right after
+    /// `on_operation_start`. The operation's start timestamp is the time
+    /// the attempt started.
+    ///
+    /// For a step and a `wait_for_condition`:
+    ///
+    /// - an operation replayed from a terminal record fires no hook;
+    /// - every live attempt fires `on_operation_start`, then
+    ///   `on_attempt_start`. `is_replay` is `true` from the second attempt
+    ///   on, and when the attempt re-enters a `STARTED` record;
+    /// - an attempt that schedules a retry fires only `on_attempt_end`;
+    /// - the attempt that ends the operation fires `on_attempt_end`, then
+    ///   `on_operation_end`.
+    ///
+    /// The hook runs synchronously, on the task that runs the operation.
+    /// It can return work: the SDK
+    /// runs that future on its own task, and waits for it before
+    /// `on_invocation_end` until 500 ms before the invocation deadline.
     ///
     /// # Errors
     ///
-    /// An error is logged and does not change the execution.
+    /// An error or a panic is logged at WARN with the plugin's name and
+    /// registration index, and does not change the execution.
     fn on_attempt_start(&self, _info: &AttemptInfo) -> HookWork {
         Ok(None)
     }
 
-    /// Runs when a step attempt or a condition check ends.
+    /// Runs when a step attempt or a condition check ends, after the
+    /// checkpoint that records its outcome.
+    ///
+    /// The operation's end timestamp is the recorded end time when the
+    /// checkpoint response carries one. Otherwise it is the local time the
+    /// SDK observed right after the checkpoint call returned. A condition
+    /// check that continues ends its attempt `Succeeded`.
+    ///
+    /// For a step and a `wait_for_condition`:
+    ///
+    /// - an operation replayed from a terminal record fires no hook;
+    /// - every live attempt fires `on_operation_start`, then
+    ///   `on_attempt_start`. `is_replay` is `true` from the second attempt
+    ///   on, and when the attempt re-enters a `STARTED` record;
+    /// - an attempt that schedules a retry fires only `on_attempt_end`;
+    /// - the attempt that ends the operation fires `on_attempt_end`, then
+    ///   `on_operation_end`.
+    ///
+    /// The hook runs synchronously, on the task that runs the operation.
+    /// It can return work: the SDK
+    /// runs that future on its own task, and waits for it before
+    /// `on_invocation_end` until 500 ms before the invocation deadline.
     ///
     /// # Errors
     ///
-    /// An error is logged and does not change the execution.
+    /// An error or a panic is logged at WARN with the plugin's name and
+    /// registration index, and does not change the execution.
     fn on_attempt_end(&self, _info: &AttemptEndInfo) -> HookWork {
         Ok(None)
     }
@@ -861,6 +935,190 @@ impl AttemptEndInfo {
     }
 }
 
+// The builders the operation hook sites use.
+
+impl OperationInfo {
+    /// The info of the operation `wire_id`, created in `ctx`.
+    ///
+    /// It starts from the operation's record when the log holds one. Each
+    /// identity field the record leaves absent is then set from the
+    /// arguments: the kind, the sub-type, the name, and the parent, which
+    /// is `ctx.parent_wire_id()`. A field the record populates keeps the
+    /// record's value. Without a record the info holds only the ID and
+    /// those fields. The service's type and status tokens come only from a
+    /// record, so this sets neither.
+    pub(crate) fn for_operation(
+        ctx: &crate::DurableContext,
+        wire_id: &str,
+        kind: OperationKind,
+        sub_type: &str,
+        name: Option<&str>,
+    ) -> Self {
+        let mut info = ctx
+            .with_checkpoint_record_by_wire(wire_id, |record| Self::from_record(wire_id, record))
+            .unwrap_or_else(|| Self {
+                id: wire_id.to_owned(),
+                name: None,
+                kind: None,
+                type_str: None,
+                sub_type: None,
+                parent_id: None,
+                status: None,
+                status_str: None,
+                start_timestamp: None,
+                end_timestamp: None,
+                result: None,
+                error: None,
+                attempt: None,
+                is_replay: false,
+                is_virtual: false,
+            });
+        info.kind = info.kind.or(Some(kind));
+        if info.sub_type.is_none() {
+            info.sub_type = Some(sub_type.to_owned());
+        }
+        if info.name.is_none() {
+            info.name = name.map(str::to_owned);
+        }
+        if info.parent_id.is_none() {
+            info.parent_id = ctx.parent_wire_id().map(str::to_owned);
+        }
+        info
+    }
+
+    /// Replaces the status. The service's status token is left as the
+    /// record set it.
+    pub(crate) fn with_status(mut self, status: OperationStatus) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    /// Replaces the result.
+    pub(crate) fn with_result(mut self, result: Option<String>) -> Self {
+        self.result = result;
+        self
+    }
+
+    /// Replaces the error.
+    pub(crate) fn with_error(mut self, error: Option<WireError>) -> Self {
+        self.error = error;
+        self
+    }
+
+    /// Replaces the replay flag.
+    pub(crate) fn with_replay(mut self, is_replay: bool) -> Self {
+        self.is_replay = is_replay;
+        self
+    }
+
+    /// Replaces the start timestamp.
+    pub(crate) fn with_start_timestamp(mut self, at: SystemTime) -> Self {
+        self.start_timestamp = Some(at);
+        self
+    }
+
+    /// Replaces the end timestamp.
+    pub(crate) fn with_end_timestamp(mut self, at: SystemTime) -> Self {
+        self.end_timestamp = Some(at);
+        self
+    }
+}
+
+impl AttemptInfo {
+    pub(crate) fn new(operation: OperationInfo, attempt: u32) -> Self {
+        Self { operation, attempt }
+    }
+}
+
+impl AttemptEndInfo {
+    pub(crate) fn new(
+        operation: OperationInfo,
+        attempt: u32,
+        outcome: AttemptOutcome,
+        error: Option<WireError>,
+    ) -> Self {
+        Self {
+            operation,
+            attempt,
+            outcome,
+            error,
+        }
+    }
+}
+
+/// Gives `info` the end timestamp an attempt-end hook reports.
+///
+/// 1. The record's end timestamp, which the checkpoint response sets when
+///    it returns the operation, is kept.
+/// 2. Without one, as on a `RETRY` record, the end timestamp is the local
+///    time now. Every hook site calls this right after its checkpoint call
+///    returned, so it is the time the SDK observed then.
+///
+/// The clock read feeds only the plugin info, so it does not affect
+/// replay.
+pub(crate) fn with_observed_end(info: OperationInfo) -> OperationInfo {
+    if info.end_timestamp.is_some() {
+        return info;
+    }
+    info.with_end_timestamp(SystemTime::now())
+}
+
+/// Fires the hooks of a live attempt that starts: `on_operation_start`
+/// with `is_replay`, then `on_attempt_start` with the attempt's start time.
+///
+/// `operation` is the info [`OperationInfo::for_operation`] built; both
+/// hooks see it with the status `Started`.
+pub(crate) fn attempt_started(
+    plugins: &InvocationPlugins,
+    operation: OperationInfo,
+    attempt: u32,
+    is_replay: bool,
+) {
+    let started = operation.with_status(OperationStatus::Started);
+    let start = started.clone().with_replay(is_replay);
+    plugins.dispatch_work("on_operation_start", |plugin| {
+        plugin.on_operation_start(&start)
+    });
+    let info = AttemptInfo::new(started.with_start_timestamp(SystemTime::now()), attempt);
+    plugins.dispatch_work("on_attempt_start", |plugin| plugin.on_attempt_start(&info));
+}
+
+/// Fires the hooks of an attempt that ended, right after the checkpoint
+/// call that recorded its outcome returned: `on_attempt_end`, then, when
+/// the attempt ended the operation, `on_operation_end` with the same
+/// operation info.
+///
+/// `operation` carries the status, result and error the SDK wrote. Its end
+/// timestamp is set by [`with_observed_end`].
+pub(crate) fn attempt_ended(
+    plugins: &InvocationPlugins,
+    operation: OperationInfo,
+    end: AttemptEnd,
+) {
+    let operation = with_observed_end(operation);
+    let ends_operation = end.ends_operation;
+    let info = AttemptEndInfo::new(operation, end.attempt, end.outcome, end.error);
+    plugins.dispatch_work("on_attempt_end", |plugin| plugin.on_attempt_end(&info));
+    if ends_operation {
+        let operation = info.operation;
+        plugins.dispatch_work("on_operation_end", |plugin| {
+            plugin.on_operation_end(&operation)
+        });
+    }
+}
+
+/// How an attempt ended, for [`attempt_ended`].
+pub(crate) struct AttemptEnd {
+    /// The 1-based attempt number.
+    pub(crate) attempt: u32,
+    pub(crate) outcome: AttemptOutcome,
+    /// The attempt's error, when it failed.
+    pub(crate) error: Option<WireError>,
+    /// Whether the attempt ended the operation: the SDK wrote `SUCCEED` or
+    /// `FAIL`, not `RETRY`.
+    pub(crate) ends_operation: bool,
+}
+
 /// What a plugin knows when a checkpoint response reports operations the
 /// service changed.
 #[derive(Debug, Clone)]
@@ -1375,6 +1633,31 @@ impl InvocationPlugins {
         }
     }
 
+    /// Calls the synchronous operation hook `hook` on every plugin, in
+    /// registration order, through `call`.
+    ///
+    /// Each call runs inside its own catch, and the remaining plugins run
+    /// whatever one call did:
+    ///
+    /// 1. `Ok(None)` does nothing.
+    /// 2. `Ok(Some(work))` hands `work` to [`Self::start_work`].
+    /// 3. `Err(error)` is logged at WARN by [`report_hook_error`].
+    /// 4. A panic is logged at WARN, and its payload is dropped through
+    ///    [`crate::task::discard_panic`]: a plugin panic does not fail the
+    ///    invocation.
+    pub(crate) fn dispatch_work(&self, hook: &'static str, call: impl Fn(&dyn Plugin) -> HookWork) {
+        for (index, slot) in self.plugins.iter().enumerate() {
+            match catch_unwind(AssertUnwindSafe(|| call(slot.plugin.as_ref()))) {
+                Ok(Ok(None)) => {}
+                Ok(Ok(Some(work))) => self.start_work(index, hook, work),
+                Ok(Err(error)) => {
+                    report_hook_error(&slot.identity, hook, &self.undelivered, error);
+                }
+                Err(payload) => log_hook_panic(&slot.identity, hook, payload),
+            }
+        }
+    }
+
     /// Runs `work`, which the operation hook `hook` of the plugin at index
     /// `slot` returned, on its own task.
     ///
@@ -1382,10 +1665,6 @@ impl InvocationPlugins {
     /// suspension permit. Before the drain closes, the task is spawned
     /// under the lock and its handle is kept for the drain. After it
     /// closed, `work` is dropped unspawned and a warning is logged.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by the operation hook issue")
-    )]
     pub(crate) fn start_work(&self, slot: usize, hook: &'static str, work: HookFuture<'static>) {
         #[expect(clippy::expect_used)]
         // reason: every caller passes the index of a plugin of this
@@ -1550,37 +1829,41 @@ struct HookRun<'a> {
     undelivered: Arc<Mutex<Undelivered>>,
 }
 
-impl HookRun<'_> {
-    /// Logs the hook's error, and drops it.
-    ///
-    /// The error's `Display` is plugin code. So it runs inside a catch that
-    /// only borrows the error, and a panic there is logged and dropped.
-    /// The SDK delivers the error to nobody, so it then drops the error
-    /// inside a second catch. A panic from its destructor fails the
-    /// invocation, so it is recorded on the coordinator.
-    fn report_error(&self, error: BoxError) {
-        match catch_unwind(AssertUnwindSafe(|| error.to_string())) {
-            Ok(message) => tracing::warn!(
+/// Logs the error the hook `hook` of the plugin `identity` returned, and
+/// drops it.
+///
+/// The error's `Display` is plugin code. So it runs inside a catch that
+/// only borrows the error, and a panic there is logged and dropped. The
+/// SDK delivers the error to nobody, so it then drops the error inside a
+/// second catch. A panic from its destructor fails the invocation, so it is
+/// recorded on the coordinator through `undelivered`.
+fn report_hook_error(
+    identity: &str,
+    hook: &'static str,
+    undelivered: &Mutex<Undelivered>,
+    error: BoxError,
+) {
+    match catch_unwind(AssertUnwindSafe(|| error.to_string())) {
+        Ok(message) => tracing::warn!(
+            target: TARGET,
+            plugin = %identity,
+            hook,
+            error = %message,
+            "plugin hook failed; the error is ignored"
+        ),
+        Err(payload) => {
+            tracing::warn!(
                 target: TARGET,
-                plugin = %self.identity,
-                hook = self.hook,
-                error = %message,
-                "plugin hook failed; the error is ignored"
-            ),
-            Err(payload) => {
-                tracing::warn!(
-                    target: TARGET,
-                    plugin = %self.identity,
-                    hook = self.hook,
-                    "plugin hook failed, and its error panicked while it was formatted; \
-                     the error is ignored"
-                );
-                crate::task::discard_panic(payload);
-            }
+                plugin = %identity,
+                hook,
+                "plugin hook failed, and its error panicked while it was formatted; \
+                 the error is ignored"
+            );
+            crate::task::discard_panic(payload);
         }
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(error))) {
-            Undelivered::record(&self.undelivered, payload);
-        }
+    }
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(error))) {
+        Undelivered::record(undelivered, payload);
     }
 }
 
@@ -1600,7 +1883,9 @@ impl Future for HookRun<'_> {
             drop_hook_future(&this.identity, this.hook, future);
         }
         match polled {
-            Ok(Poll::Ready(Err(error))) => this.report_error(error),
+            Ok(Poll::Ready(Err(error))) => {
+                report_hook_error(&this.identity, this.hook, &this.undelivered, error);
+            }
             Err(payload) => log_hook_panic(&this.identity, this.hook, payload),
             Ok(_) => {}
         }
@@ -1896,24 +2181,162 @@ pub(crate) mod test_support {
         }
     }
 
+    /// One operation or attempt hook call that [`OpHooks`] recorded.
+    #[derive(Clone, Debug)]
+    pub(crate) struct OpRecord {
+        pub(crate) hook: &'static str,
+        /// The operation's name.
+        pub(crate) name: Option<String>,
+        pub(crate) replay: bool,
+        pub(crate) status: Option<crate::OperationStatus>,
+        /// For an attempt hook, its attempt number.
+        pub(crate) attempt: Option<u32>,
+        /// For an attempt-end hook, its outcome.
+        pub(crate) outcome: Option<super::AttemptOutcome>,
+        pub(crate) result: Option<String>,
+        /// For an attempt-end hook, its error message.
+        pub(crate) error: Option<String>,
+        /// What the probe returned when the hook ran.
+        pub(crate) probe: String,
+    }
+
+    impl OpRecord {
+        /// `(hook, replay, attempt, outcome)`.
+        pub(crate) fn shape(
+            &self,
+        ) -> (
+            &'static str,
+            bool,
+            Option<u32>,
+            Option<super::AttemptOutcome>,
+        ) {
+            (self.hook, self.replay, self.attempt, self.outcome)
+        }
+    }
+
+    type Probe = dyn Fn() -> String + Send + Sync;
+
+    /// A plugin that records every operation and attempt hook call, with
+    /// what its probe returns at the call.
+    #[derive(Clone, Default)]
+    pub(crate) struct OpHooks {
+        pub(crate) records: Arc<Mutex<Vec<OpRecord>>>,
+        pub(crate) probe: Option<Arc<Probe>>,
+    }
+
+    impl OpHooks {
+        pub(crate) fn probing(probe: impl Fn() -> String + Send + Sync + 'static) -> Self {
+            Self {
+                probe: Some(Arc::new(probe)),
+                ..Self::default()
+            }
+        }
+
+        pub(crate) fn records(&self) -> Vec<OpRecord> {
+            self.records.lock().unwrap().clone()
+        }
+
+        /// The records of the operation named `name`.
+        pub(crate) fn of(&self, name: &str) -> Vec<OpRecord> {
+            self.records()
+                .into_iter()
+                .filter(|r| r.name.as_deref() == Some(name))
+                .collect()
+        }
+
+        fn push(
+            &self,
+            hook: &'static str,
+            info: &super::OperationInfo,
+            attempt: Option<u32>,
+            end: Option<&super::AttemptEndInfo>,
+        ) {
+            let probe = self.probe.as_ref().map(|probe| probe()).unwrap_or_default();
+            self.records.lock().unwrap().push(OpRecord {
+                hook,
+                name: info.name().map(str::to_owned),
+                replay: info.is_replay(),
+                status: info.status(),
+                attempt,
+                outcome: end.map(super::AttemptEndInfo::outcome),
+                result: info.result().map(str::to_owned),
+                error: end
+                    .and_then(super::AttemptEndInfo::error)
+                    .and_then(crate::WireError::error_message)
+                    .map(str::to_owned),
+                probe,
+            });
+        }
+
+        /// The plugins of an invocation whose one plugin is this recorder.
+        pub(crate) fn plugins(&self) -> Arc<super::InvocationPlugins> {
+            let factories: Vec<(&'static str, Arc<dyn PluginFactory>)> =
+                vec![("test::OpHooks", Arc::new(self.clone()))];
+            super::create_plugins(&factories, None, empty_info).expect("one factory is registered")
+        }
+    }
+
+    impl Plugin for OpHooks {
+        fn on_operation_start(&self, info: &super::OperationInfo) -> super::HookWork {
+            self.push("start", info, None, None);
+            Ok(None)
+        }
+
+        fn on_operation_end(&self, info: &super::OperationInfo) -> super::HookWork {
+            self.push("end", info, None, None);
+            Ok(None)
+        }
+
+        fn on_attempt_start(&self, info: &super::AttemptInfo) -> super::HookWork {
+            self.push(
+                "attempt_start",
+                info.operation(),
+                Some(info.attempt()),
+                None,
+            );
+            Ok(None)
+        }
+
+        fn on_attempt_end(&self, info: &super::AttemptEndInfo) -> super::HookWork {
+            self.push(
+                "attempt_end",
+                info.operation(),
+                Some(info.attempt()),
+                Some(info),
+            );
+            Ok(None)
+        }
+    }
+
+    impl PluginFactory for OpHooks {
+        fn create_plugin(
+            &self,
+            _info: &InvocationInfo,
+        ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// The info of a first invocation with no operations.
+    fn empty_info() -> InvocationInfo {
+        InvocationInfo::new(
+            "r".to_owned(),
+            "arn".to_owned(),
+            "{}".to_owned(),
+            std::collections::BTreeMap::new(),
+            Vec::new(),
+            None,
+            true,
+            None,
+        )
+    }
+
     /// The plugins of an invocation with one [`Hooks`] plugin, as
     /// `create_plugins` returns them.
     pub(crate) fn invocation_plugins() -> Arc<super::InvocationPlugins> {
         let factories: Vec<(&'static str, Arc<dyn PluginFactory>)> =
             vec![("test::Hooks", Arc::new(Hooks::default()))];
-        super::create_plugins(&factories, None, || {
-            InvocationInfo::new(
-                "r".to_owned(),
-                "arn".to_owned(),
-                "{}".to_owned(),
-                std::collections::BTreeMap::new(),
-                Vec::new(),
-                None,
-                true,
-                None,
-            )
-        })
-        .expect("one factory is registered")
+        super::create_plugins(&factories, None, empty_info).expect("one factory is registered")
     }
 
     /// The deadline `millis` from now, in epoch milliseconds, as a Lambda
@@ -2048,6 +2471,109 @@ mod tests {
         let mut record = CheckpointRecord::with_status("id", status);
         record.op_type = Some(op_type.to_owned());
         record
+    }
+
+    /// The info of a started step record with no timestamps.
+    fn bare_info() -> OperationInfo {
+        OperationInfo::from_record("a", &record("STEP", CheckpointStatus::Started))
+    }
+
+    #[test]
+    fn for_operation_without_record_holds_the_identity() {
+        let ctx = DurableContext::test_context();
+        let info = OperationInfo::for_operation(&ctx, "w", OperationKind::Step, "Pay", Some("a"))
+            .with_status(OperationStatus::Started);
+        assert_eq!(info.id(), "w");
+        assert_eq!(info.kind(), Some(OperationKind::Step));
+        assert_eq!(info.type_str(), None);
+        assert_eq!(info.sub_type(), Some("Pay"));
+        assert_eq!(info.name(), Some("a"));
+        assert_eq!(info.parent_id(), None);
+        assert_eq!(info.status(), Some(OperationStatus::Started));
+        assert_eq!(info.status_str(), None);
+        assert_eq!(info.start_timestamp(), None);
+        assert_eq!(info.attempt(), None);
+    }
+
+    /// Without a record, the parent comes from the context the operation
+    /// was created in.
+    #[test]
+    fn for_operation_without_record_takes_the_context_parent() {
+        let ctx = DurableContext::test_context().new_child("1", None);
+        let parent = ctx
+            .parent_wire_id()
+            .expect("a child has a parent")
+            .to_owned();
+        let info = OperationInfo::for_operation(&ctx, "w", OperationKind::Step, "Step", None);
+        assert_eq!(info.parent_id(), Some(parent.as_str()));
+        assert_eq!(info.name(), None);
+    }
+
+    /// A field the record populates keeps the record's value, and only the
+    /// absent identity fields come from the arguments.
+    #[test]
+    fn for_operation_keeps_populated_record_fields() {
+        let mut rec = record("STEP", CheckpointStatus::Started);
+        rec.op_name = Some("recorded".to_owned());
+        rec.sub_type = Some("Recorded".to_owned());
+        rec.parent_id = Some("p".to_owned());
+        let ctx = DurableContext::new_root(
+            String::from("arn"),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(vec![("w".to_owned(), rec)])),
+        );
+        let info = OperationInfo::for_operation(
+            &ctx.new_child("1", None),
+            "w",
+            OperationKind::Wait,
+            "Pay",
+            Some("a"),
+        )
+        .with_status(OperationStatus::Succeeded);
+        assert_eq!(info.kind(), Some(OperationKind::Step));
+        assert_eq!(info.type_str(), Some("STEP"));
+        assert_eq!(info.sub_type(), Some("Recorded"));
+        assert_eq!(info.name(), Some("recorded"));
+        assert_eq!(info.parent_id(), Some("p"));
+        assert_eq!(info.status(), Some(OperationStatus::Succeeded));
+        assert_eq!(info.status_str(), Some("STARTED"));
+    }
+
+    /// A record without a type, sub-type or name gets them from the
+    /// arguments.
+    #[test]
+    fn for_operation_fills_absent_record_fields() {
+        let rec = CheckpointRecord::with_status("w", CheckpointStatus::Started);
+        let ctx = DurableContext::new_root(
+            String::from("arn"),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(vec![("w".to_owned(), rec)])),
+        );
+        let info = OperationInfo::for_operation(&ctx, "w", OperationKind::Step, "Pay", Some("a"));
+        assert_eq!(info.kind(), Some(OperationKind::Step));
+        assert_eq!(info.type_str(), None);
+        assert_eq!(info.sub_type(), Some("Pay"));
+        assert_eq!(info.name(), Some("a"));
+        assert_eq!(info.parent_id(), None);
+        assert_eq!(info.status_str(), Some("STARTED"));
+    }
+
+    #[test]
+    fn observed_end_keeps_the_recorded_timestamp() {
+        let recorded = UNIX_EPOCH + Duration::from_secs(5);
+        let info = with_observed_end(bare_info().with_end_timestamp(recorded));
+        assert_eq!(info.end_timestamp(), Some(recorded));
+    }
+
+    #[test]
+    fn observed_end_uses_local_time_without_record() {
+        let info = bare_info();
+        assert_eq!(info.end_timestamp(), None);
+        let before = SystemTime::now();
+        let info = with_observed_end(info);
+        let after = SystemTime::now();
+        let end = info.end_timestamp().expect("an end timestamp");
+        assert!(before <= end && end <= after, "{end:?}");
     }
 
     #[test]
