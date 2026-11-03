@@ -37,7 +37,6 @@ impl OperationKind {
 
     /// Converts a service model operation type, or returns `None` for a type
     /// this enum does not list.
-    #[cfg(feature = "test-util")]
     pub(crate) fn from_wire(t: &aws_sdk_lambda::types::OperationType) -> Option<Self> {
         use aws_sdk_lambda::types::OperationType;
         match t {
@@ -123,9 +122,65 @@ impl fmt::Display for OperationStatus {
     }
 }
 
+/// How one invocation of a durable function ended, as a plugin sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum InvocationStatus {
+    /// The execution completed successfully in this invocation.
+    Succeeded,
+    /// The execution failed in this invocation.
+    Failed,
+    /// The invocation suspended, and the service invokes the function
+    /// again when an operation it waits for is due.
+    Pending,
+    /// The invocation failed, and the service invokes the function again.
+    Retrying,
+}
+
+impl InvocationStatus {
+    /// Returns the token JS plugins use for this status, such as
+    /// `SUCCEEDED` or `RETRYING`.
+    #[must_use]
+    pub fn wire_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+            Self::Pending => "PENDING",
+            Self::Retrying => "RETRYING",
+        }
+    }
+}
+
+impl fmt::Display for InvocationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+            Self::Pending => "Pending",
+            Self::Retrying => "Retrying",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OperationKind, OperationStatus};
+    use super::{InvocationStatus, OperationKind, OperationStatus};
+
+    /// Each invocation status displays its variant name and returns the
+    /// token JS plugins use.
+    #[test]
+    fn invocation_status_displays_variant_names() {
+        let all = [
+            InvocationStatus::Succeeded,
+            InvocationStatus::Failed,
+            InvocationStatus::Pending,
+            InvocationStatus::Retrying,
+        ];
+        let shown: Vec<String> = all.iter().map(ToString::to_string).collect();
+        assert_eq!(shown, ["Succeeded", "Failed", "Pending", "Retrying"]);
+        let wire: Vec<&str> = all.iter().map(|s| s.wire_str()).collect();
+        assert_eq!(wire, ["SUCCEEDED", "FAILED", "PENDING", "RETRYING"]);
+    }
 
     const KINDS: [OperationKind; 6] = [
         OperationKind::Step,

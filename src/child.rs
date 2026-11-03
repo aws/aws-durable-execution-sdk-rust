@@ -856,6 +856,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )
     }
@@ -889,6 +892,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )
     }

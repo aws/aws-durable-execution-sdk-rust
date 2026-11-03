@@ -1464,6 +1464,9 @@ pub(crate) mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire_key, record)]));
         let ctx = crate::DurableContext::new_root(

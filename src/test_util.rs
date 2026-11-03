@@ -7384,13 +7384,16 @@ mod tests {
             client.as_ref(),
             "arn:test",
             "token",
-            operations_to_checkpoint_log(&first_page),
-            crate::client::PageInput::Execution(Some("{}".to_owned())),
+            crate::client::BootstrapState {
+                log: operations_to_checkpoint_log(&first_page),
+                input_payload: Some("{}".to_owned()),
+                execution: None,
+            },
             Some("marker-1"),
         )
         .await
         .unwrap()
-        .0;
+        .log;
 
         assert!(
             log.get("step-1").is_some(),
@@ -7422,13 +7425,16 @@ mod tests {
             client.as_ref(),
             "arn:test",
             "token",
-            operations_to_checkpoint_log(&first_page),
-            crate::client::PageInput::Execution(Some("{}".to_owned())),
+            crate::client::BootstrapState {
+                log: operations_to_checkpoint_log(&first_page),
+                input_payload: Some("{}".to_owned()),
+                execution: None,
+            },
             None,
         )
         .await
         .unwrap()
-        .0;
+        .log;
 
         assert!(log.get("step-1").is_some());
         assert!(

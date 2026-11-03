@@ -1014,6 +1014,9 @@ fn operation_to_record(op: &Operation) -> (String, CheckpointRecord) {
         sub_type: op.sub_type.clone(),
         op_name: op.name.clone(),
         due_at: operation_due_at(op),
+        parent_id: op.parent_id().map(str::to_owned),
+        start_timestamp: crate::to_system_time(*op.start_timestamp()),
+        end_timestamp: op.end_timestamp().and_then(|t| crate::to_system_time(*t)),
     };
     (op.id().to_owned(), record)
 }
@@ -1036,18 +1039,25 @@ fn operation_due_at(op: &Operation) -> Option<std::time::SystemTime> {
     crate::to_system_time(timestamp)
 }
 
-/// Converts an `OperationType` enum to a string for identity comparison.
+/// Returns the wire token of an `OperationType`, such as `CONTEXT`, for
+/// every variant, including one this SDK version does not know.
 fn operation_type_to_string(op_type: &OperationType) -> String {
-    match op_type {
-        OperationType::Callback => "Callback".to_owned(),
-        OperationType::ChainedInvoke => "ChainedInvoke".to_owned(),
-        OperationType::Context => "Context".to_owned(),
-        OperationType::Execution => "Execution".to_owned(),
-        OperationType::Step => "Step".to_owned(),
-        OperationType::Wait => "Wait".to_owned(),
-        // Future-proof: unknown variants use a placeholder.
-        _ => "Unknown".to_owned(),
-    }
+    op_type.as_str().to_owned()
+}
+
+/// Builds the plugin info of a fetched `EXECUTION` operation, or returns
+/// `None` for an operation of any other type.
+pub(crate) fn execution_info_from_operation(
+    op: &Operation,
+) -> Option<crate::plugin::OperationInfo> {
+    crate::plugin::OperationInfo::execution(
+        op.id(),
+        op.r#type().as_str(),
+        &sdk_status_to_checkpoint_status(op.status()),
+        op.parent_id().map(str::to_owned),
+        crate::to_system_time(*op.start_timestamp()),
+        op.end_timestamp().and_then(|t| crate::to_system_time(*t)),
+    )
 }
 
 /// Converts SDK `Operation` records into a `CheckpointLog`.
@@ -1079,55 +1089,67 @@ pub(crate) fn merge_operations_into_log(log: &CheckpointLog, operations: &[Opera
     }
 }
 
-/// Resolves the bootstrap checkpoint log and the execution input, following
-/// the pagination marker.
+/// The execution state the bootstrap reads: the checkpoint log, the
+/// execution input and the `EXECUTION` operation.
+#[derive(Debug)]
+pub(crate) struct BootstrapState {
+    /// The checkpoint log, without the `EXECUTION` operation.
+    pub(crate) log: CheckpointLog,
+    /// The `InputPayload` of the `EXECUTION` operation, or `None` when it
+    /// is absent or no page holds the operation.
+    pub(crate) input_payload: Option<String>,
+    /// The plugin info of the `EXECUTION` operation, or `None` when no page
+    /// read so far holds it.
+    pub(crate) execution: Option<crate::plugin::OperationInfo>,
+}
+
+/// Resolves the bootstrap state, following the pagination marker.
 ///
 /// This is the single production decision point for bootstrap pagination.
-/// `first_page` is the log parsed from the inline
+/// `first_page` is the state parsed from the inline
 /// `InitialExecutionState`, and `next_marker` is its `NextMarker`.
-/// `first_page_input` says whether the inline page holds the EXECUTION
-/// operation, and if so carries that operation's `InputPayload`.
+/// `first_page.execution.is_some()` says that the inline page holds the
+/// `EXECUTION` operation, so its input is `first_page.input_payload`.
 ///
 /// - Without a marker the inline page is the whole state. The function
-///   returns `first_page` and the inline input unchanged, and calls nothing.
+///   returns `first_page` unchanged, and calls nothing.
 /// - With a marker the function keeps `first_page`. It calls
 ///   [`ExecutionClient::get_state`] with the inline marker, merges each
 ///   returned page into the log, and calls again with each returned marker
 ///   until a page has none. It never reads the first page again.
 ///
-/// The returned input is the inline input when the inline page holds the
-/// EXECUTION operation. Otherwise it is the `InputPayload` of the first
-/// EXECUTION operation of the fetched pages, in page order, or `None`
-/// when no page holds one. The caller parses it after this function
-/// returns, so an input on a later page reaches the handler.
+/// When the inline page lacks the `EXECUTION` operation, the function takes
+/// the operation and its `InputPayload` from the first `EXECUTION`
+/// operation of the fetched pages, in page order. The caller parses the
+/// input after this function returns, so an input on a later page reaches
+/// the handler.
 pub(crate) async fn resolve_bootstrap_log(
     client: &dyn ExecutionClient,
     execution_arn: &str,
     checkpoint_token: &str,
-    first_page: CheckpointLog,
-    first_page_input: PageInput,
+    first_page: BootstrapState,
     next_marker: Option<&str>,
-) -> Result<(CheckpointLog, Option<String>), ExecutionClientError> {
-    let mut input = first_page_input;
+) -> Result<BootstrapState, ExecutionClientError> {
+    let mut state = first_page;
     let mut marker = next_marker.map(str::to_owned);
     while let Some(current) = marker {
         let page = client
             .get_state(execution_arn, checkpoint_token, Some(&current))
             .await?;
         marker = page.next_marker().map(str::to_owned);
-        // The checkpoint log skips EXECUTION operations, so the input is
-        // read from the raw page before the page is merged.
-        if input == PageInput::NoExecutionOperation
+        // The checkpoint log skips EXECUTION operations, so the input and
+        // the operation are read from the raw page before it is merged.
+        if state.execution.is_none()
             && let Some(op) = page
                 .operations
                 .iter()
                 .find(|op| op.r#type == OperationType::Execution)
         {
-            input = PageInput::Execution(
-                op.execution_details
-                    .as_ref()
-                    .and_then(|d| d.input_payload.clone()),
-            );
+            state.input_payload = op
+                .execution_details
+                .as_ref()
+                .and_then(|d| d.input_payload.clone());
+            state.execution = execution_info_from_operation(op);
         }
         for op in page
             .operations
@@ -1135,10 +1157,10 @@ pub(crate) async fn resolve_bootstrap_log(
             .filter(|op| op.r#type != OperationType::Execution)
         {
             let (wire_id, record) = operation_to_record(op);
-            first_page.insert(wire_id, record);
+            state.log.insert(wire_id, record);
         }
     }
-    Ok((first_page, input.into_payload()))
+    Ok(state)
 }
 
 /// What one page of the execution state holds of the execution input.
@@ -1285,6 +1307,114 @@ fn extract_wire_error_field<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `get_state` path reads `ParentId` and both timestamps.
+    #[test]
+    fn sdk_operation_parent_and_timestamps() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let with_all = Operation::builder()
+            .id("s")
+            .r#type(OperationType::Step)
+            .status(aws_sdk_lambda::types::OperationStatus::Succeeded)
+            .parent_id("p")
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(10))
+            .end_timestamp(aws_smithy_types::DateTime::from_secs(12))
+            .build()
+            .expect("all required fields set");
+        let (_, record) = operation_to_record(&with_all);
+        assert_eq!(record.parent_id.as_deref(), Some("p"));
+        assert_eq!(
+            record.start_timestamp,
+            Some(UNIX_EPOCH + Duration::from_secs(10))
+        );
+        assert_eq!(
+            record.end_timestamp,
+            Some(UNIX_EPOCH + Duration::from_secs(12))
+        );
+
+        let bare = Operation::builder()
+            .id("s")
+            .r#type(OperationType::Step)
+            .status(aws_sdk_lambda::types::OperationStatus::Started)
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(10))
+            .build()
+            .expect("all required fields set");
+        let (_, record) = operation_to_record(&bare);
+        assert_eq!(record.parent_id, None);
+        assert_eq!(record.end_timestamp, None);
+    }
+
+    /// The `get_state` path keeps the wire tokens of a type and a status
+    /// this SDK version does not know.
+    #[test]
+    fn unknown_type_and_status_keep_wire_tokens_on_get_state_path() {
+        let op = Operation::builder()
+            .id("f")
+            .r#type(OperationType::from("FUTURE_OP"))
+            .status(aws_sdk_lambda::types::OperationStatus::from(
+                "FUTURE_STATUS",
+            ))
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+            .build()
+            .expect("all required fields set");
+        let (id, record) = operation_to_record(&op);
+        let info = crate::plugin::OperationInfo::from_record(&id, &record);
+        assert_eq!(info.kind(), None);
+        assert_eq!(info.status(), None);
+        assert_eq!(info.type_str(), Some("FUTURE_OP"));
+        assert_eq!(info.status_str(), Some("FUTURE_STATUS"));
+    }
+
+    /// Every known operation type is stored as its wire token.
+    #[test]
+    fn operation_type_to_string_returns_wire_tokens() {
+        for (op_type, token) in [
+            (OperationType::Callback, "CALLBACK"),
+            (OperationType::ChainedInvoke, "CHAINED_INVOKE"),
+            (OperationType::Context, "CONTEXT"),
+            (OperationType::Execution, "EXECUTION"),
+            (OperationType::Step, "STEP"),
+            (OperationType::Wait, "WAIT"),
+        ] {
+            assert_eq!(operation_type_to_string(&op_type), token);
+        }
+    }
+
+    /// A fetched `EXECUTION` operation converts with its wire fields; any
+    /// other type gives `None`.
+    #[test]
+    fn execution_info_from_operation_reads_execution_only() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let execution = Operation::builder()
+            .id("exec")
+            .r#type(OperationType::Execution)
+            .status(aws_sdk_lambda::types::OperationStatus::Started)
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(3))
+            .end_timestamp(aws_smithy_types::DateTime::from_secs(4))
+            .build()
+            .expect("all required fields set");
+        let info = execution_info_from_operation(&execution).expect("an EXECUTION operation");
+        assert_eq!(info.id(), "exec");
+        assert_eq!(info.type_str(), Some("EXECUTION"));
+        assert_eq!(info.status_str(), Some("STARTED"));
+        assert_eq!(info.parent_id(), None);
+        assert_eq!(
+            info.start_timestamp(),
+            Some(UNIX_EPOCH + Duration::from_secs(3))
+        );
+        assert_eq!(
+            info.end_timestamp(),
+            Some(UNIX_EPOCH + Duration::from_secs(4))
+        );
+        let step = Operation::builder()
+            .id("s")
+            .r#type(OperationType::Step)
+            .status(aws_sdk_lambda::types::OperationStatus::Started)
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(3))
+            .build()
+            .expect("all required fields set");
+        assert!(execution_info_from_operation(&step).is_none());
+    }
 
     #[test]
     fn due_at_from_wait_and_step_details() {
@@ -1810,18 +1940,20 @@ mod tests {
             )
             .build()
             .expect("id, type, status and start timestamp are set");
-        let first_page = operations_to_checkpoint_log(&[execution, make_step_op("s1", "1")]);
+        let execution_info = execution_info_from_operation(&execution);
+        let first_page = BootstrapState {
+            log: operations_to_checkpoint_log(&[execution, make_step_op("s1", "1")]),
+            input_payload: Some("{}".to_owned()),
+            execution: execution_info,
+        };
 
-        let (log, input) = resolve_bootstrap_log(
-            &client,
-            "arn:test",
-            "tok",
-            first_page,
-            PageInput::Execution(Some("{}".to_owned())),
-            Some("m-1"),
-        )
-        .await
-        .expect("bootstrap succeeds");
+        let BootstrapState {
+            log,
+            input_payload: input,
+            ..
+        } = resolve_bootstrap_log(&client, "arn:test", "tok", first_page, Some("m-1"))
+            .await
+            .expect("bootstrap succeeds");
 
         let markers = client
             .markers
@@ -1908,12 +2040,18 @@ mod tests {
             pages,
             markers: Mutex::new(Vec::new()),
         };
-        let (_, input) = resolve_bootstrap_log(
+        let BootstrapState {
+            input_payload: input,
+            ..
+        } = resolve_bootstrap_log(
             &client,
             "arn:test",
             "tok",
-            operations_to_checkpoint_log(&[]),
-            PageInput::NoExecutionOperation,
+            BootstrapState {
+                log: operations_to_checkpoint_log(&[]),
+                input_payload: None,
+                execution: None,
+            },
             Some("m-1"),
         )
         .await
@@ -2502,6 +2640,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )]);
 
@@ -2901,8 +3042,7 @@ mod tests {
                     "Unknown",
                     "Wait",
                 ],
-                wildcard_sites: "operation_type_to_string (src/client.rs); \
-                                 operation_type_str (src/tracing_layer.rs); \
+                wildcard_sites: "operation_type_str (src/tracing_layer.rs); \
                                  operation_type_str (src/test_util.rs)",
             },
             Pin {

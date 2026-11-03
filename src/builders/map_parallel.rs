@@ -2030,6 +2030,9 @@ mod tests {
             sub_type: Some("Step".to_owned()),
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
         DurableContext::new_root(
             "arn:test".to_owned(),

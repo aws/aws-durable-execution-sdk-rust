@@ -4,6 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client::ExecutionClient;
+use crate::plugin::PluginFactory;
+
+/// The registered plugin factories, in registration order, each with the
+/// type name it was registered under.
+pub(crate) type PluginFactories = Vec<(&'static str, Arc<dyn PluginFactory>)>;
 
 /// Error returned when [`OptionsBuilder::build()`] detects an invalid
 /// configuration combination.
@@ -93,6 +98,9 @@ pub struct Options {
     /// a zero window. `false` without a delay writes each checkpoint
     /// immediately.
     pub(crate) checkpoint_batching: bool,
+    /// The plugin factories, in registration order, each with the type
+    /// name it was registered under. Empty by default.
+    pub(crate) plugins: PluginFactories,
 }
 
 impl Default for Options {
@@ -113,6 +121,7 @@ impl Default for Options {
             execution_client: None,
             checkpoint_delay: None,
             checkpoint_batching: true,
+            plugins: Vec::new(),
         }
     }
 }
@@ -130,7 +139,8 @@ impl std::fmt::Debug for ExecutionClientDebug<'_> {
     }
 }
 
-// Written by hand: `Arc<dyn ExecutionClient>` does not implement `Debug`.
+// Written by hand: `Arc<dyn ExecutionClient>` and `Arc<dyn PluginFactory>`
+// do not implement `Debug`.
 impl std::fmt::Debug for Options {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Options")
@@ -142,6 +152,7 @@ impl std::fmt::Debug for Options {
             )
             .field("checkpoint_delay", &self.checkpoint_delay)
             .field("checkpoint_batching", &self.checkpoint_batching)
+            .field("plugins", &self.plugins.len())
             .finish()
     }
 }
@@ -187,9 +198,11 @@ pub struct OptionsBuilder {
     execution_client: Option<Arc<dyn ExecutionClient>>,
     checkpoint_delay: Option<Duration>,
     checkpoint_batching: Option<bool>,
+    plugins: PluginFactories,
 }
 
-// Written by hand: `Arc<dyn ExecutionClient>` does not implement `Debug`.
+// Written by hand: `Arc<dyn ExecutionClient>` and `Arc<dyn PluginFactory>`
+// do not implement `Debug`.
 impl std::fmt::Debug for OptionsBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OptionsBuilder")
@@ -201,6 +214,7 @@ impl std::fmt::Debug for OptionsBuilder {
             )
             .field("checkpoint_delay", &self.checkpoint_delay)
             .field("checkpoint_batching", &self.checkpoint_batching)
+            .field("plugins", &self.plugins.len())
             .finish()
     }
 }
@@ -435,6 +449,47 @@ impl OptionsBuilder {
         self
     }
 
+    /// Registers a plugin factory.
+    ///
+    /// Each invocation calls every registered factory once, in
+    /// registration order, and the plugin a factory returns observes that
+    /// one invocation. The [`plugin`](crate::plugin) module describes the
+    /// factory, the plugin and its hooks.
+    ///
+    /// [`build`](Self::build) rejects two factories whose
+    /// [`exclusive_group`](PluginFactory::exclusive_group) returns the same
+    /// non-empty group.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::plugin::{InvocationInfo, Plugin, PluginFactory};
+    /// use aws_durable_execution_sdk::{BoxError, Options};
+    ///
+    /// struct Quiet;
+    /// impl Plugin for Quiet {}
+    ///
+    /// struct QuietFactory;
+    /// impl PluginFactory for QuietFactory {
+    ///     fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+    ///         Ok(Some(Box::new(Quiet)))
+    ///     }
+    /// }
+    ///
+    /// let opts = Options::builder()
+    ///     .plugin(QuietFactory)
+    ///     .build()
+    ///     .expect("valid config");
+    /// # drop(opts);
+    /// ```
+    pub fn plugin<F: PluginFactory>(mut self, factory: F) -> Self {
+        self.plugins.push((
+            std::any::type_name::<F>(),
+            Arc::new(factory) as Arc<dyn PluginFactory>,
+        ));
+        self
+    }
+
     /// Builds the [`Options`] from the configured values.
     ///
     /// # Errors
@@ -445,6 +500,11 @@ impl OptionsBuilder {
     ///   transport: provide one or the other). This check runs first.
     /// - Setting both `sdk_config` and `lambda_client` is invalid (the
     ///   client supersedes the config: provide one or the other).
+    /// - Registering two plugin factories whose
+    ///   [`exclusive_group`](PluginFactory::exclusive_group) returns the
+    ///   same non-empty group is invalid. The message names both factory
+    ///   types, the earlier registration first, and the group. `None` and
+    ///   `Some("")` are no group.
     ///
     /// # Examples
     ///
@@ -476,14 +536,41 @@ impl OptionsBuilder {
             });
         }
 
+        check_exclusive_groups(&self.plugins)?;
+
         Ok(Options {
             sdk_config: self.sdk_config,
             lambda_client: self.lambda_client,
             execution_client: self.execution_client,
             checkpoint_delay: self.checkpoint_delay,
             checkpoint_batching: self.checkpoint_batching.unwrap_or(true),
+            plugins: self.plugins,
         })
     }
+}
+
+/// Rejects two factories in the same non-empty exclusive group.
+///
+/// Each factory's group is read once, in registration order. A group seen
+/// a second time names the factory that claimed it first, so the message
+/// lists the earlier registration first.
+fn check_exclusive_groups(plugins: &PluginFactories) -> Result<(), OptionsValidationError> {
+    let mut claimed: Vec<(&str, &'static str)> = Vec::new();
+    for (type_name, factory) in plugins {
+        let Some(group) = factory.exclusive_group().filter(|g| !g.is_empty()) else {
+            continue;
+        };
+        if let Some((_, first)) = claimed.iter().find(|(g, _)| *g == group) {
+            return Err(OptionsValidationError {
+                message: format!(
+                    "plugin factories '{first}' and '{type_name}' are mutually exclusive in \
+                     group '{group}'; register only one"
+                ),
+            });
+        }
+        claimed.push((group, type_name));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -744,5 +831,101 @@ mod tests {
             unset_opts.contains("execution_client: None"),
             "{unset_opts}"
         );
+    }
+
+    /// A test factory that implements neither `Debug` nor `Clone`, and
+    /// returns a fixed exclusive group.
+    struct GroupFactory(Option<&'static str>);
+
+    impl PluginFactory for GroupFactory {
+        fn create_plugin(
+            &self,
+            _info: &crate::plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn crate::plugin::Plugin>>, crate::BoxError> {
+            Ok(None)
+        }
+
+        fn exclusive_group(&self) -> Option<&str> {
+            self.0
+        }
+    }
+
+    /// A second factory type, so two registrations have distinct names.
+    struct OtherFactory(Option<&'static str>);
+
+    impl PluginFactory for OtherFactory {
+        fn create_plugin(
+            &self,
+            _info: &crate::plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn crate::plugin::Plugin>>, crate::BoxError> {
+            Ok(None)
+        }
+
+        fn exclusive_group(&self) -> Option<&str> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn plugin_registers_factories_in_order() {
+        let builder = Options::builder()
+            .plugin(GroupFactory(None))
+            .plugin(OtherFactory(None));
+        let builder_debug = format!("{builder:?}");
+        assert!(builder_debug.contains("plugins: 2"), "{builder_debug}");
+        let opts = builder.build().expect("valid");
+        let names: Vec<&str> = opts.plugins.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            [
+                std::any::type_name::<GroupFactory>(),
+                std::any::type_name::<OtherFactory>()
+            ]
+        );
+        let opts_debug = format!("{opts:?}");
+        assert!(opts_debug.contains("plugins: 2"), "{opts_debug}");
+        assert!(
+            format!("{:?}", Options::default()).contains("plugins: 0"),
+            "the default registers no factory"
+        );
+    }
+
+    #[test]
+    fn conflicting_exclusive_groups_fail_build() {
+        let err = Options::builder()
+            .plugin(GroupFactory(Some("view")))
+            .plugin(OtherFactory(Some("view")))
+            .build()
+            .expect_err("same group");
+        assert_eq!(
+            err.message,
+            format!(
+                "plugin factories '{}' and '{}' are mutually exclusive in group 'view'; \
+                 register only one",
+                std::any::type_name::<GroupFactory>(),
+                std::any::type_name::<OtherFactory>()
+            )
+        );
+    }
+
+    #[test]
+    fn distinct_groups_and_none_build() {
+        let opts = Options::builder()
+            .plugin(GroupFactory(Some("a")))
+            .plugin(OtherFactory(Some("b")))
+            .plugin(GroupFactory(None))
+            .build()
+            .expect("distinct groups");
+        assert_eq!(opts.plugins.len(), 3);
+    }
+
+    #[test]
+    fn empty_exclusive_group_is_no_group() {
+        let opts = Options::builder()
+            .plugin(GroupFactory(Some("")))
+            .plugin(OtherFactory(Some("")))
+            .build()
+            .expect("an empty group is no group");
+        assert_eq!(opts.plugins.len(), 2);
     }
 }

@@ -398,6 +398,16 @@ where
     coordinator.start_deadline(remaining);
     // Boxed, so the cleanup below can drop it before it waits for the tasks.
     let mut scheduler = Box::pin(scheduler);
+    // A panic can be recorded before the drive starts, for example from the
+    // destructor of a plugin factory's error. Keeping it ends the drive, so
+    // the handler must never run. The check in the poll
+    // below comes too late: on a multi-thread runtime another worker can
+    // poll the root task before the driver polls at all. So the phase ends
+    // here, before the root is spawned. The root then starts idle, it can
+    // take no permit, and the gateway never polls the handler.
+    if coordinator.has_panic() {
+        coordinator.finish();
+    }
     // The handler runs as an operation task, so every SDK poll of user code
     // runs on a Tokio worker with the gateway wrapper.
     #[expect(clippy::expect_used)]
@@ -1534,6 +1544,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )]));
 
@@ -1751,6 +1764,9 @@ mod suspension_containment_and_task_ownership {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         }
     }
 
@@ -6185,5 +6201,76 @@ mod panic_owner {
         );
         assert_eq!(returned_tag(&driven), Some(17));
         assert_eq!(live, 0);
+    }
+
+    /// A test scheduler that stays pending. When the cleanup drops it, it
+    /// waits until a probe task, spawned after the root task, has run.
+    struct ProbeOnDrop(Arc<AtomicBool>);
+
+    impl Future for ProbeOnDrop {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for ProbeOnDrop {
+        // The probe is spawned outside the SDK's gateway, so it queues
+        // behind the root task on the runtime's inject queue.
+        fn drop(&mut self) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            drop(tokio::runtime::Handle::current().spawn(async move {
+                tx.send(()).ok();
+            }));
+            // A timeout would leave the flag unset, which fails the test.
+            if rx.recv_timeout(Duration::from_secs(10)).is_ok() {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A panic recorded before the drive starts ends it before the handler
+    /// runs. The runtime has one worker, and the driver runs on the
+    /// `block_on` thread. So the root task and the probe both go to the
+    /// runtime's inject queue, in that order, and the worker takes them in
+    /// that order. The cleanup drops the scheduler before it aborts the
+    /// root, and the scheduler's drop waits for the probe. So the worker
+    /// has started the root task before the abort, and the handler stays
+    /// unpolled only because the root cannot take a permit.
+    #[test]
+    fn panic_recorded_before_the_drive_leaves_the_handler_unpolled() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let drops = counter();
+        let polled = Arc::new(AtomicBool::new(false));
+        let probe_ran = Arc::new(AtomicBool::new(false));
+        let handler_polled = Arc::clone(&polled);
+        let scheduler = ProbeOnDrop(Arc::clone(&probe_ran));
+        let driven = runtime.block_on(async {
+            let ctx = live_ctx();
+            let ownership = Arc::clone(ctx.task_ownership());
+            let coordinator = Arc::clone(ctx.coordinator());
+            assert!(
+                coordinator
+                    .record_panic(Box::new(Tagged(119, Arc::clone(&drops))))
+                    .is_none(),
+                "the coordinator keeps the panic"
+            );
+            let handler = async move {
+                handler_polled.store(true, Ordering::SeqCst);
+                std::future::pending::<Result<String, crate::error::WireError>>().await
+            };
+            drive_with_scheduler(handler, ownership, coordinator, scheduler, None).await
+        });
+        assert!(probe_ran.load(Ordering::SeqCst), "the probe ran");
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "the handler is never polled"
+        );
+        assert_eq!(returned_tag(&driven), Some(119));
     }
 }

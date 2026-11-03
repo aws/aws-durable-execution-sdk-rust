@@ -4562,6 +4562,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )
     }
@@ -4590,6 +4593,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )
     }
@@ -4621,6 +4627,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )
     }
@@ -5201,6 +5210,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             )
         }]);
@@ -7326,6 +7338,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             )
         }]);
@@ -8615,6 +8630,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             ),
             (
@@ -8639,6 +8657,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             ),
         ]);
@@ -8693,6 +8714,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )]);
         let ctx = test_ctx(log);
@@ -8951,6 +8975,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )
     }
@@ -9031,6 +9058,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             )
         };
@@ -9110,6 +9140,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             )
         };
@@ -9184,6 +9217,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             ),
             succeeded_record("2", "\"hello\""),
@@ -9518,6 +9554,9 @@ mod tests {
                     sub_type: Some("ParallelBranch".to_owned()),
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             )
         };

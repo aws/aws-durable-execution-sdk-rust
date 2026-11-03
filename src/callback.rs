@@ -940,6 +940,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )
     }
@@ -1639,6 +1642,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             ),
             // Callback: Started (pending: will suspend on .result()).
@@ -1664,6 +1670,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             ),
             // Submitter step: Succeeded (replay: should not re-invoke).
@@ -1689,6 +1698,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             ),
         ]);

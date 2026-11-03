@@ -907,6 +907,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         // The START checkpoint response echoes the operation as a fresh
@@ -1035,6 +1038,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
@@ -1151,6 +1157,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id(); // mints "1"
@@ -1262,6 +1271,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
@@ -1352,6 +1364,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
@@ -1400,6 +1415,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();
@@ -1458,6 +1476,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
         let ctx = make_ctx_with_log(vec![(wire_key, record)]);
         let op_id = ctx.mint_id();

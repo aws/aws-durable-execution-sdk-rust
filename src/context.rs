@@ -3303,15 +3303,14 @@ impl StepContext {
 /// Canonicalizes an operation type string to the service wire format via
 /// [`aws_sdk_lambda::types::OperationType`].
 ///
-/// Operation types reach the SDK in two spellings: the typed SDK path
-/// stores `PascalCase` (`ChainedInvoke`, from `operation_type_to_string`),
-/// while the inline JSON envelope path stores the raw wire value
-/// (`CHAINED_INVOKE`, the `OperationType::as_str()` form). A plain
-/// case-insensitive comparison misses the underscore, so both spellings
-/// are converted to `SCREAMING_SNAKE` and round-tripped through
-/// `OperationType` before comparison. Unknown types canonicalize to their
-/// `SCREAMING_SNAKE` form, which keeps genuine mismatches detectable.
-fn canonical_op_type(raw: &str) -> String {
+/// Both envelope parsers store the wire token (`CHAINED_INVOKE`, the
+/// `OperationType::as_str()` form). The SDK's own claimed types and older
+/// fixtures use `PascalCase` (`ChainedInvoke`). A plain case-insensitive
+/// comparison misses the underscore, so both spellings are converted to
+/// `SCREAMING_SNAKE` and round-tripped through `OperationType` before
+/// comparison. Unknown types canonicalize to their `SCREAMING_SNAKE` form,
+/// which keeps genuine mismatches detectable.
+pub(crate) fn canonical_op_type(raw: &str) -> String {
     // PascalCase → SCREAMING_SNAKE: insert `_` at lower→upper boundaries,
     // then uppercase. Already-wire values (all caps + underscores) pass
     // through unchanged because they contain no lower→upper boundary.
@@ -3360,10 +3359,10 @@ fn replay_identity_mismatch(
         ))
     };
 
-    // Compare canonicalized types: the checkpoint log stores PascalCase
-    // on the typed SDK path but the raw wire form (e.g.
-    // `CHAINED_INVOKE`) on the inline JSON envelope path, so both sides
-    // canonicalize through `OperationType` before comparison.
+    // Compare canonicalized types: the checkpoint log stores the wire
+    // token (e.g. `CHAINED_INVOKE`), while the claimed type can be
+    // PascalCase, so both sides canonicalize through `OperationType`
+    // before comparison.
     if canonical_op_type(expected_type) != canonical_op_type(claimed_type) {
         return mismatch();
     }
@@ -3874,6 +3873,9 @@ mod tests {
             sub_type: Some("Step".to_owned()),
             due_at: None,
             op_name: Some("my-step".to_owned()),
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         let result =
@@ -3917,6 +3919,9 @@ mod tests {
             sub_type: Some("Step".to_owned()),
             due_at: None,
             op_name: Some("my-step".to_owned()),
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         });
 
         let result =
@@ -3956,6 +3961,9 @@ mod tests {
             sub_type: Some("Step".to_owned()),
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         });
 
         // Claimed as Wait but checkpointed as Step → the same
@@ -4000,6 +4008,9 @@ mod tests {
             sub_type: Some("Step".to_owned()),
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         });
 
         assert!(
@@ -4063,6 +4074,9 @@ mod tests {
             sub_type: Some("Step".to_owned()),
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         });
 
         let result = ctx.checkpoint_view_validated("1", "wire-1", "Step", Some("Step"), None);
@@ -4092,6 +4106,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         });
 
         assert!(ctx.has_checkpoint_record("1"));
@@ -4140,6 +4157,9 @@ mod tests {
             sub_type: Some("Map".to_owned()),
             due_at: None,
             op_name: Some("batch".to_owned()),
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         });
 
         let snapshot = ctx.checkpoint_terminal_replay("1");
@@ -4188,6 +4208,9 @@ mod tests {
             sub_type: Some("Step".to_owned()),
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         // Claimed as Wait but checkpointed as Step → error
@@ -4237,6 +4260,9 @@ mod tests {
             sub_type: Some("Step".to_owned()),
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         // Same op_type but different sub_type → error
@@ -4278,6 +4304,9 @@ mod tests {
             sub_type: Some("Step".to_owned()),
             due_at: None,
             op_name: Some("fetch-user".to_owned()),
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         // Same type but different name → error
@@ -4330,6 +4359,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         // Even though claimed type differs, validation passes because the
@@ -4366,6 +4398,9 @@ mod tests {
             sub_type: Some("STEP".to_owned()),
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         // Wire format uses UPPER_CASE: validation is case-insensitive.
@@ -4408,6 +4443,9 @@ mod tests {
             sub_type: Some("ChainedInvoke".to_owned()),
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         let result = ctx.validate_replay_identity(
@@ -4453,6 +4491,9 @@ mod tests {
             sub_type: Some("ChainedInvoke".to_owned()),
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
 
         let result =
@@ -4515,6 +4556,9 @@ mod tests {
             sub_type: sub_type.map(ToOwned::to_owned),
             due_at: None,
             op_name: op_name.map(ToOwned::to_owned),
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         }
     }
 
@@ -5995,6 +6039,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
         let log = CheckpointLog::from_records(vec![(wire, record)]);
         let root = DurableContext::new_root_with_client_and_defaults(
@@ -6049,6 +6096,9 @@ mod tests {
                 sub_type: Some("Wait".to_owned()),
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             };
             (wire, record)
         };
@@ -6130,6 +6180,9 @@ mod tests {
             sub_type: None,
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
         let log = Arc::new(CheckpointLog::from_records(vec![(wire, record)]));
         let root = DurableContext::new_root_with_client_and_defaults(
@@ -6257,6 +6310,9 @@ mod tests {
             sub_type: Some(crate::child::CHILD_SUB_TYPE.to_owned()),
             due_at: None,
             op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
         let ctx = DurableContext::new_root_with_client_and_defaults(
             "arn:test".to_owned(),

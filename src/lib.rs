@@ -101,6 +101,7 @@ pub(crate) mod map_parallel; // public types re-exported from crate::builders::m
 pub mod observability;
 mod operation;
 mod options;
+pub mod plugin;
 pub mod serdes;
 pub(crate) mod step;
 mod task;
@@ -127,7 +128,7 @@ pub use self::error::{
     WaitForConditionErrorKind, WireError,
 };
 pub use self::future::{Branch, BranchHandle, BranchSet, DurableFuture};
-pub use self::operation::{OperationKind, OperationStatus};
+pub use self::operation::{InvocationStatus, OperationKind, OperationStatus};
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
 pub use self::serdes::{JsonSerdes, PassthroughSerdes, Serdes};
 pub use self::step::StepSemantics;
@@ -460,6 +461,10 @@ where
 struct InvocationEnvelope {
     execution_arn: String,
     checkpoint_token: String,
+    /// The top-level `UpdatedOperationIds`: the operations the service
+    /// changed since the previous invocation. Non-string entries are
+    /// skipped; an absent field or a value that is not an array is empty.
+    updated_operation_ids: Vec<String>,
 }
 
 /// Returns `true` when the payload looks like a durable invocation envelope
@@ -528,9 +533,21 @@ fn parse_envelope(
         }
     };
 
+    let updated_operation_ids = payload
+        .get("UpdatedOperationIds")
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(Some(InvocationEnvelope {
         execution_arn,
         checkpoint_token,
+        updated_operation_ids,
     }))
 }
 
@@ -718,6 +735,80 @@ pub(crate) fn to_system_time<T: TryInto<std::time::SystemTime>>(
     timestamp.try_into().ok()
 }
 
+/// Maps an inline `Status` string to a checkpoint status, ignoring case.
+/// A status this SDK does not know keeps its raw value.
+fn parse_inline_status(status_str: &str) -> engine::CheckpointStatus {
+    match status_str.to_ascii_uppercase().as_str() {
+        "STARTED" => engine::CheckpointStatus::Started,
+        "SUCCEEDED" => engine::CheckpointStatus::Succeeded,
+        "FAILED" => engine::CheckpointStatus::Failed,
+        "PENDING" => engine::CheckpointStatus::Pending,
+        "READY" => engine::CheckpointStatus::Ready,
+        "CANCELLED" => engine::CheckpointStatus::Cancelled,
+        "TIMED_OUT" => engine::CheckpointStatus::TimedOut,
+        "STOPPED" => engine::CheckpointStatus::Stopped,
+        _ => engine::CheckpointStatus::Unknown(status_str.to_owned()),
+    }
+}
+
+/// Builds the plugin info of an inline `EXECUTION` operation, or returns
+/// `None` when `op` has no string `Id` or `Type`, or is of another type.
+///
+/// The status, `ParentId` and timestamps are read as
+/// `parse_single_operation` reads them.
+fn execution_info_from_json(op: &serde_json::Value) -> Option<plugin::OperationInfo> {
+    let id = op.get("Id").and_then(serde_json::Value::as_str)?;
+    let op_type = op.get("Type").and_then(serde_json::Value::as_str)?;
+    let status = parse_inline_status(
+        op.get("Status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("STARTED"),
+    );
+    plugin::OperationInfo::execution(
+        id,
+        op_type,
+        &status,
+        op.get("ParentId")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        op.get("StartTimestamp").and_then(parse_envelope_timestamp),
+        op.get("EndTimestamp").and_then(parse_envelope_timestamp),
+    )
+}
+
+/// Reads the inline page of the bootstrap state and its `NextMarker`.
+///
+/// A non-string `InputPayload` fails, as [`inline_input_payload`] says.
+fn inline_bootstrap_state(
+    payload: &serde_json::Value,
+) -> Result<(client::BootstrapState, Option<String>), lambda_runtime::Error> {
+    let input_payload = inline_input_payload(payload)?.into_payload();
+    let (log, next_marker) = parse_inline_operations(payload);
+    let state = client::BootstrapState {
+        log,
+        input_payload,
+        execution: inline_execution_info(payload),
+    };
+    Ok((state, next_marker))
+}
+
+/// The plugin info of the first inline operation of type `EXECUTION`, the
+/// operation [`inline_input_payload`] reads the input from.
+fn inline_execution_info(payload: &serde_json::Value) -> Option<plugin::OperationInfo> {
+    payload
+        .get("InitialExecutionState")
+        .and_then(|s| s.get("Operations"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|ops| {
+            ops.iter().find(|op| {
+                op.get("Type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("EXECUTION"))
+            })
+        })
+        .and_then(execution_info_from_json)
+}
+
 /// Parses a single operation JSON object into a checkpoint record.
 #[expect(clippy::too_many_lines)] // reason: sequential detail extraction reads better as one flow
 fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::CheckpointRecord)> {
@@ -736,17 +827,7 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
     // Python and JS SDKs; a `TIMEDOUT` value therefore falls to `Unknown`
     // like any other unrecognized status (issue #45), carrying the raw
     // value as received so replay can name it when it fails the execution.
-    let status = match status_str.to_ascii_uppercase().as_str() {
-        "STARTED" => engine::CheckpointStatus::Started,
-        "SUCCEEDED" => engine::CheckpointStatus::Succeeded,
-        "FAILED" => engine::CheckpointStatus::Failed,
-        "PENDING" => engine::CheckpointStatus::Pending,
-        "READY" => engine::CheckpointStatus::Ready,
-        "CANCELLED" => engine::CheckpointStatus::Cancelled,
-        "TIMED_OUT" => engine::CheckpointStatus::TimedOut,
-        "STOPPED" => engine::CheckpointStatus::Stopped,
-        _ => engine::CheckpointStatus::Unknown(status_str.to_owned()),
-    };
+    let status = parse_inline_status(status_str);
 
     // Extract step details.
     let step_details = op.get("StepDetails");
@@ -905,6 +986,12 @@ fn parse_single_operation(op: &serde_json::Value) -> Option<(String, engine::Che
                 .and_then(serde_json::Value::as_str)
                 .map(String::from),
             due_at,
+            parent_id: op
+                .get("ParentId")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from),
+            start_timestamp: op.get("StartTimestamp").and_then(parse_envelope_timestamp),
+            end_timestamp: op.get("EndTimestamp").and_then(parse_envelope_timestamp),
         },
     ))
 }
@@ -1002,6 +1089,7 @@ where
         execution_client,
         checkpoint_delay,
         checkpoint_batching,
+        plugins,
     } = options;
     // The checkpoint buffer window: a configured delay is the coalescing
     // window; batching without a delay buffers with a zero window (writes
@@ -1022,6 +1110,7 @@ where
         handler,
         ClientProvider::new(preset_client),
         checkpoint_buffer_window,
+        plugins.into(),
     )
 }
 
@@ -1030,10 +1119,12 @@ where
 /// calls [`wrap`] with its
 /// in-memory backend as the execution client, so it runs the same envelope
 /// parsing, pagination, driver, and error-mapping code as production.
+#[expect(clippy::too_many_lines)] // reason: the invocation's steps read in order as one flow
 fn wrap_with_provider<F, E, Fut, O>(
     handler: F,
     provider: ClientProvider,
     checkpoint_buffer_window: Option<Duration>,
+    plugin_factories: std::sync::Arc<plugin::Factories>,
 ) -> impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture + Send + Sync
 where
     F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
@@ -1051,6 +1142,7 @@ where
     > {
         let handler = StdArc::clone(&handler);
         let provider = StdArc::clone(&provider);
+        let plugin_factories = StdArc::clone(&plugin_factories);
         Box::pin(async move {
             let (InvocationPayload(raw_payload), lambda_ctx) = event.into_parts();
 
@@ -1065,11 +1157,11 @@ where
             })?;
             let execution_arn = envelope.execution_arn;
             let checkpoint_token = envelope.checkpoint_token;
+            let updated_operation_ids = envelope.updated_operation_ids;
 
             // Read the inline input and the inline page. A non-string
             // `InputPayload` fails here, before pagination or the handler.
-            let first_page_input = inline_input_payload(&raw_payload)?;
-            let (checkpoint_log, initial_marker) = parse_inline_operations(&raw_payload);
+            let (first_page, initial_marker) = inline_bootstrap_state(&raw_payload)?;
 
             // Reuse the execution client resolved once at wrap time (built
             // from the ambient default at most once when no client was
@@ -1081,17 +1173,16 @@ where
             // re-invokes. A non-retryable error (a KMS misconfiguration)
             // fails the same way on every invocation, so it fails the
             // execution before the handler runs, as in JS.
-            let (checkpoint_log, input_payload) = match client::resolve_bootstrap_log(
+            let (checkpoint_log, input_payload, execution) = match client::resolve_bootstrap_log(
                 exec_client.as_ref(),
                 &execution_arn,
                 &checkpoint_token,
-                checkpoint_log,
-                first_page_input,
+                first_page,
                 initial_marker.as_deref(),
             )
             .await
             {
-                Ok((log, input_payload)) => (StdArc::new(log), input_payload),
+                Ok(state) => (StdArc::new(state.log), state.input_payload, state.execution),
                 Err(e) if e.is_retryable() => {
                     return Err(lambda_runtime::Error::from(format!(
                         "failed to paginate initial state: {e}"
@@ -1109,6 +1200,21 @@ where
             // later page. An absent payload parses as `{}`.
             let customer_input: E = extract_customer_input(input_payload.as_deref())?;
 
+            // The plugins of this invocation. The local holds them until the
+            // invocation future returns, so every plugin instance is dropped
+            // when its invocation returns. Nothing is built without a
+            // registered factory. Their `Drop` catches a plugin destructor
+            // panic, so dropping them never changes the outcome.
+            let plugins = create_invocation_plugins(
+                &plugin_factories,
+                &lambda_ctx,
+                &execution_arn,
+                input_payload.as_deref(),
+                &checkpoint_log,
+                execution.as_ref(),
+                updated_operation_ids,
+            );
+
             let ctx = DurableContext::new_root_with_client_and_defaults(
                 execution_arn,
                 lambda_ctx,
@@ -1122,6 +1228,14 @@ where
             // drain the checkpoint coalescing buffer (a cheap Arc clone).
             let flush_ctx = ctx.clone();
             let coordinator = StdArc::clone(ctx.coordinator());
+            // A factory error whose destructor panicked fails the invocation.
+            // The plugins were created before the coordinator existed, so the
+            // panic is recorded here, which ends the drive.
+            if let Some(plugins) = &plugins {
+                for payload in plugins.take_error_drop_panics() {
+                    task::record_or_discard(&coordinator, payload);
+                }
+            }
             let remaining = ctx.remaining_time();
             let replay_span = ctx.replay_span();
 
@@ -1179,7 +1293,12 @@ where
             .await
             {
                 Ok(outcome) => outcome,
-                Err(payload) => std::panic::resume_unwind(payload),
+                Err(payload) => {
+                    // The plugins are dropped before the panic resumes, so
+                    // no plugin destructor runs while it unwinds.
+                    drop(plugins);
+                    std::panic::resume_unwind(payload)
+                }
             };
 
             // Unconditional flush point of the checkpoint buffering
@@ -1249,6 +1368,35 @@ where
             outcome_envelope(outcome, &flush_ctx)
         })
     }
+}
+
+/// Creates the plugins of one invocation from the bootstrap state.
+///
+/// The invocation info is built only when a factory is registered. Its
+/// input is `{}` when the execution has none, its operations map holds the
+/// `EXECUTION` operation, and its X-Ray trace header comes from the Lambda
+/// context, never from the process environment.
+fn create_invocation_plugins(
+    factories: &plugin::Factories,
+    lambda_ctx: &lambda_runtime::Context,
+    execution_arn: &str,
+    input_payload: Option<&str>,
+    checkpoint_log: &engine::CheckpointLog,
+    execution: Option<&plugin::OperationInfo>,
+    updated_operation_ids: Vec<String>,
+) -> Option<std::sync::Arc<plugin::InvocationPlugins>> {
+    plugin::create_plugins(factories, execution.cloned(), || {
+        plugin::InvocationInfo::new(
+            lambda_ctx.request_id.clone(),
+            execution_arn.to_owned(),
+            input_payload.unwrap_or("{}").to_owned(),
+            plugin::operations_map(checkpoint_log, execution),
+            updated_operation_ids,
+            execution.and_then(plugin::OperationInfo::start_timestamp),
+            !checkpoint_log.has_records(),
+            lambda_ctx.xray_trace_id.clone(),
+        )
+    })
 }
 
 /// Applies the issue #43 checkpoint-failure classification to a failed
@@ -1739,6 +1887,7 @@ mod tests {
             |_event: serde_json::Value, _ctx: DurableContext| async move { boom() },
             ClientProvider::new(Some(client)),
             None,
+            std::sync::Arc::from(Vec::new()),
         );
         let payload = serde_json::json!({
             "DurableExecutionArn": "arn:aws:lambda:us-east-1:1:function:test",
@@ -2286,14 +2435,30 @@ mod tests {
             &client,
             "arn:test",
             "token",
-            inline_log,
-            client::PageInput::NoExecutionOperation,
+            client::BootstrapState {
+                log: inline_log,
+                input_payload: None,
+                execution: None,
+            },
             Some("page-2-marker"),
         )
         .await;
 
         assert!(result.is_ok());
-        let (log, input) = result.unwrap();
+        let client::BootstrapState {
+            log,
+            input_payload: input,
+            execution,
+        } = result.unwrap();
+        let execution = execution.expect("the fetched Execution operation");
+        assert_eq!(execution.id(), "execution");
+        assert_eq!(execution.kind(), Some(OperationKind::Execution));
+        assert_eq!(execution.status(), Some(OperationStatus::Started));
+        assert_eq!(
+            execution.start_timestamp(),
+            Some(std::time::UNIX_EPOCH),
+            "the fetched start timestamp"
+        );
         assert_eq!(
             input.as_deref(),
             Some("{\"fetched\":true}"),
@@ -2348,21 +2513,45 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         );
 
+        let inline_execution = execution_info_from_json(&serde_json::json!({
+            "Id": "inline-exec",
+            "Type": "EXECUTION",
+            "Status": "STARTED",
+            "StartTimestamp": 4000
+        }));
+        assert!(inline_execution.is_some());
         let result = client::resolve_bootstrap_log(
             &client,
             "arn:test",
             "token",
-            inline_log,
-            client::PageInput::Execution(Some("\"inline-input\"".to_owned())),
+            client::BootstrapState {
+                log: inline_log,
+                input_payload: Some("\"inline-input\"".to_owned()),
+                execution: inline_execution,
+            },
             None,
         )
         .await;
 
         assert!(result.is_ok());
-        let (log, input) = result.unwrap();
+        let client::BootstrapState {
+            log,
+            input_payload: input,
+            execution,
+        } = result.unwrap();
+        // The inline execution is returned unchanged.
+        let execution = execution.expect("the inline Execution operation");
+        assert_eq!(execution.id(), "inline-exec");
+        assert_eq!(
+            execution.start_timestamp(),
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(4))
+        );
         // The inline input is returned unchanged.
         assert_eq!(input.as_deref(), Some("\"inline-input\""));
         // The inline log is returned as-is.
@@ -2522,6 +2711,449 @@ mod tests {
             msg.contains("CheckpointToken") && msg.contains("not a string"),
             "error should note the type mismatch, got: {msg}"
         );
+    }
+
+    #[test]
+    fn envelope_updated_operation_ids_are_read() {
+        let ids = |extra: serde_json::Value| {
+            let mut payload = serde_json::json!({
+                "DurableExecutionArn": "arn:test",
+                "CheckpointToken": "tok",
+            });
+            if let (Some(map), serde_json::Value::Object(extra)) = (payload.as_object_mut(), extra)
+            {
+                map.extend(extra);
+            }
+            parse_envelope(&payload)
+                .unwrap()
+                .unwrap()
+                .updated_operation_ids
+        };
+        assert_eq!(
+            ids(serde_json::json!({ "UpdatedOperationIds": ["a", 7, "b"] })),
+            ["a", "b"]
+        );
+        assert_eq!(ids(serde_json::json!({})), Vec::<String>::new());
+        assert_eq!(
+            ids(serde_json::json!({ "UpdatedOperationIds": "a" })),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn inline_operation_parent_and_timestamps() {
+        let op = serde_json::json!({
+            "Id": "s",
+            "Type": "STEP",
+            "Status": "STARTED",
+            "ParentId": "p",
+            "StartTimestamp": 1500,
+            "EndTimestamp": "later"
+        });
+        let (_, record) = parse_single_operation(&op).unwrap();
+        assert_eq!(record.parent_id.as_deref(), Some("p"));
+        assert_eq!(
+            record.start_timestamp,
+            Some(std::time::UNIX_EPOCH + Duration::from_millis(1500))
+        );
+        assert_eq!(record.end_timestamp, None);
+    }
+
+    /// The inline path keeps the wire tokens of a type and a status this
+    /// SDK version does not know.
+    #[test]
+    fn unknown_type_and_status_keep_wire_tokens() {
+        let op = serde_json::json!({
+            "Id": "f",
+            "Type": "FUTURE_OP",
+            "Status": "FUTURE_STATUS"
+        });
+        let (id, record) = parse_single_operation(&op).unwrap();
+        let info = plugin::OperationInfo::from_record(&id, &record);
+        assert_eq!(info.kind(), None);
+        assert_eq!(info.status(), None);
+        assert_eq!(info.type_str(), Some("FUTURE_OP"));
+        assert_eq!(info.status_str(), Some("FUTURE_STATUS"));
+    }
+
+    /// `execution_info_from_json` reads an inline `EXECUTION` operation, and
+    /// pagination takes the operation from the first fetched page when the
+    /// inline page lacks it.
+    #[tokio::test]
+    async fn bootstrap_state_reads_execution() {
+        let inline = execution_info_from_json(&serde_json::json!({
+            "Id": "exec",
+            "Type": "EXECUTION",
+            "Status": "STARTED",
+            "StartTimestamp": 2000
+        }))
+        .expect("an inline EXECUTION operation");
+        assert_eq!(
+            inline.start_timestamp(),
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(2))
+        );
+
+        let fetched_execution = aws_sdk_lambda::types::Operation::builder()
+            .id("exec")
+            .r#type(aws_sdk_lambda::types::OperationType::Execution)
+            .status(aws_sdk_lambda::types::OperationStatus::Started)
+            .start_timestamp(aws_sdk_lambda::primitives::DateTime::from_secs(3))
+            .build()
+            .unwrap();
+        let client = client::InMemoryExecutionClient::new(vec![
+            fetched_execution,
+            make_test_step_op("s1", "\"r\""),
+        ]);
+        let state = client::resolve_bootstrap_log(
+            &client,
+            "arn:test",
+            "token",
+            client::BootstrapState {
+                log: engine::CheckpointLog::empty(),
+                input_payload: None,
+                execution: None,
+            },
+            Some("m"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.execution.and_then(|e| e.start_timestamp()),
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(3))
+        );
+    }
+
+    /// An inline operation of another type, or without an `Id` or a
+    /// `Type`, is no `EXECUTION` operation. A missing `Status` reads as
+    /// `STARTED`.
+    #[test]
+    fn execution_info_from_json_rejects_other_operations() {
+        assert!(
+            execution_info_from_json(&serde_json::json!({ "Id": "s", "Type": "STEP" })).is_none()
+        );
+        assert!(execution_info_from_json(&serde_json::json!({ "Type": "EXECUTION" })).is_none());
+        assert!(execution_info_from_json(&serde_json::json!({ "Id": "e" })).is_none());
+        let info = execution_info_from_json(&serde_json::json!({
+            "Id": "e",
+            "Type": "Execution",
+            "ParentId": "p",
+            "EndTimestamp": 5000
+        }))
+        .expect("the PascalCase spelling is an EXECUTION operation");
+        assert_eq!(info.status(), Some(OperationStatus::Started));
+        assert_eq!(info.parent_id(), Some("p"));
+        assert_eq!(
+            info.end_timestamp(),
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(5))
+        );
+    }
+
+    /// A factory that records every `InvocationInfo` it receives and
+    /// returns no plugin.
+    #[derive(Clone, Default)]
+    struct RecordingFactory(std::sync::Arc<std::sync::Mutex<Vec<plugin::InvocationInfo>>>);
+
+    impl plugin::PluginFactory for RecordingFactory {
+        fn create_plugin(
+            &self,
+            info: &plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn plugin::Plugin>>, BoxError> {
+            self.0.lock().unwrap().push(info.clone());
+            Ok(None)
+        }
+    }
+
+    /// Invokes a `wrap` service with the in-memory transport and `factory`,
+    /// and returns the infos the factory received.
+    async fn infos_for(
+        payload: serde_json::Value,
+        lambda_ctx: lambda_runtime::Context,
+    ) -> Vec<plugin::InvocationInfo> {
+        let factory = RecordingFactory::default();
+        let options = Options::builder()
+            .execution_client(std::sync::Arc::new(client::InMemoryExecutionClient::new(
+                Vec::new(),
+            )))
+            .plugin(factory.clone())
+            .build()
+            .unwrap();
+        let service = wrap(
+            |_event: serde_json::Value, _ctx: DurableContext| async move {
+                Ok::<serde_json::Value, BoxError>(serde_json::Value::Null)
+            },
+            options,
+        );
+        service(lambda_runtime::LambdaEvent::new(
+            InvocationPayload(payload),
+            lambda_ctx,
+        ))
+        .await
+        .unwrap();
+        factory.0.lock().unwrap().clone()
+    }
+
+    fn envelope_with(operations: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "DurableExecutionArn": "arn:test",
+            "CheckpointToken": "tok",
+            "InitialExecutionState": { "Operations": operations }
+        })
+    }
+
+    #[tokio::test]
+    async fn operations_map_contains_execution() {
+        let payload = envelope_with(&serde_json::json!([
+            {
+                "Id": "exec-1",
+                "Type": "EXECUTION",
+                "Status": "STARTED",
+                "StartTimestamp": 7000,
+                "ExecutionDetails": { "InputPayload": "{}" }
+            },
+            { "Id": "s1", "Type": "STEP", "Status": "SUCCEEDED", "ParentId": "exec-1" },
+            { "Id": "c1", "Type": "CONTEXT", "Status": "STARTED" }
+        ]));
+        let infos = infos_for(payload, lambda_runtime::Context::default()).await;
+        assert_eq!(infos.len(), 1);
+        let operations = infos.first().unwrap().operations();
+        let exec = operations.get("exec-1").expect("the EXECUTION operation");
+        assert_eq!(exec.kind(), Some(OperationKind::Execution));
+        assert_eq!(exec.status(), Some(OperationStatus::Started));
+        assert_eq!(exec.status_str(), Some("STARTED"));
+        assert_eq!(
+            exec.start_timestamp(),
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(7))
+        );
+        assert_eq!(
+            operations
+                .get("s1")
+                .and_then(plugin::OperationInfo::parent_id),
+            Some("exec-1")
+        );
+        assert_eq!(
+            operations.get("c1").map(plugin::OperationInfo::parent_id),
+            Some(None)
+        );
+        assert_eq!(
+            infos.first().unwrap().execution_start_timestamp(),
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(7))
+        );
+        assert!(!infos.first().unwrap().is_first_invocation());
+    }
+
+    #[tokio::test]
+    async fn invocation_info_reads_lambda_context() {
+        let payload = || {
+            envelope_with(&serde_json::json!([{
+                "Id": "exec-1",
+                "Type": "EXECUTION",
+                "Status": "STARTED",
+                "ExecutionDetails": { "InputPayload": "{\"k\":1}" }
+            }]))
+        };
+        let mut lambda_ctx = lambda_runtime::Context::default();
+        lambda_ctx.request_id = "r-1".to_owned();
+        lambda_ctx.xray_trace_id = Some("Root=1-abc".to_owned());
+        let infos = infos_for(payload(), lambda_ctx).await;
+        let info = infos.first().unwrap();
+        assert_eq!(info.request_id(), "r-1");
+        assert_eq!(info.x_ray_trace_id(), Some("Root=1-abc"));
+        assert_eq!(info.execution_arn(), "arn:test");
+        assert_eq!(info.execution_input(), "{\"k\":1}");
+        assert!(info.is_first_invocation());
+
+        let mut lambda_ctx = lambda_runtime::Context::default();
+        lambda_ctx.xray_trace_id = None;
+        let infos = infos_for(payload(), lambda_ctx).await;
+        assert_eq!(infos.first().unwrap().x_ray_trace_id(), None);
+    }
+
+    #[tokio::test]
+    async fn invocation_info_defaults_input() {
+        let payload = envelope_with(&serde_json::json!([{
+            "Id": "exec-1",
+            "Type": "EXECUTION",
+            "Status": "STARTED"
+        }]));
+        let infos = infos_for(payload, lambda_runtime::Context::default()).await;
+        assert_eq!(infos.first().unwrap().execution_input(), "{}");
+    }
+
+    /// A plugin whose destructor panics with `plugin drop`.
+    struct PanickingDropPlugin;
+
+    impl plugin::Plugin for PanickingDropPlugin {}
+
+    impl Drop for PanickingDropPlugin {
+        #[expect(clippy::panic)] // reason: the destructor panic under test
+        fn drop(&mut self) {
+            panic!("plugin drop");
+        }
+    }
+
+    /// An error whose destructor panics with `error drop`.
+    #[derive(Debug)]
+    struct PanickingDropError;
+
+    impl std::fmt::Display for PanickingDropError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("drop err")
+        }
+    }
+
+    impl std::error::Error for PanickingDropError {}
+
+    impl Drop for PanickingDropError {
+        #[expect(clippy::panic)] // reason: the destructor panic under test
+        fn drop(&mut self) {
+            panic!("error drop");
+        }
+    }
+
+    /// A factory that returns a plugin whose destructor panics, or, with
+    /// `failing`, an error whose destructor panics.
+    struct PanickingDropFactory {
+        failing: bool,
+    }
+
+    impl plugin::PluginFactory for PanickingDropFactory {
+        fn create_plugin(
+            &self,
+            _info: &plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn plugin::Plugin>>, BoxError> {
+            if self.failing {
+                Err(Box::new(PanickingDropError))
+            } else {
+                Ok(Some(Box::new(PanickingDropPlugin)))
+            }
+        }
+    }
+
+    /// A `wrap` service with the in-memory transport, `factory` and
+    /// `handler`, and an envelope for it.
+    fn service_with_factory<F, Fut>(
+        factory: PanickingDropFactory,
+        handler: F,
+    ) -> (
+        impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture,
+        lambda_runtime::LambdaEvent<InvocationPayload>,
+    )
+    where
+        F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, BoxError>> + Send,
+    {
+        let options = Options::builder()
+            .execution_client(std::sync::Arc::new(client::InMemoryExecutionClient::new(
+                Vec::new(),
+            )))
+            .plugin(factory)
+            .build()
+            .unwrap();
+        let payload = envelope_with(&serde_json::json!([{
+            "Id": "exec-1",
+            "Type": "EXECUTION",
+            "Status": "STARTED",
+            "ExecutionDetails": { "InputPayload": "{}" }
+        }]));
+        let event = lambda_runtime::LambdaEvent::new(
+            InvocationPayload(payload),
+            lambda_runtime::Context::default(),
+        );
+        (wrap(handler, options), event)
+    }
+
+    /// A plugin destructor that panics after a successful handler is
+    /// logged and discarded, and the invocation still reports success.
+    #[tokio::test]
+    async fn plugin_drop_panic_keeps_successful_outcome() {
+        let (service, event) = service_with_factory(
+            PanickingDropFactory { failing: false },
+            |_event, _ctx| async move { Ok(serde_json::json!("done")) },
+        );
+        let json = service(event).await.unwrap().0;
+        assert_eq!(
+            json.get("Status"),
+            Some(&serde_json::json!("SUCCEEDED")),
+            "{json}"
+        );
+        assert_eq!(
+            json.get("Result"),
+            Some(&serde_json::json!("\"done\"")),
+            "{json}"
+        );
+    }
+
+    /// A plugin destructor that panics while the handler's panic is about
+    /// to resume does not abort, and the handler's own payload leaves the
+    /// SDK.
+    #[tokio::test]
+    // reason: the test calls the service on its own task so the panic is
+    // observable as that task's `JoinError`.
+    #[expect(clippy::disallowed_methods)]
+    async fn plugin_drop_panic_while_handler_panics_resumes_handler_panic() {
+        #[expect(clippy::panic)] // reason: the handler panic under test
+        fn boom() -> Result<serde_json::Value, BoxError> {
+            panic!("root boom")
+        }
+        let (service, event) = service_with_factory(
+            PanickingDropFactory { failing: false },
+            |_event, _ctx| async move { boom() },
+        );
+        let join_err = tokio::spawn(service(event))
+            .await
+            .expect_err("the handler panic leaves the service");
+        assert!(join_err.is_panic(), "a panic, not a cancellation");
+        let payload = join_err.into_panic();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"root boom"));
+    }
+
+    /// A factory error whose destructor panics fails the invocation with
+    /// that panic, which the invocation coordinator recorded.
+    #[tokio::test]
+    // reason: the test calls the service on its own task so the panic is
+    // observable as that task's `JoinError`.
+    #[expect(clippy::disallowed_methods)]
+    async fn factory_error_destructor_panic_fails_the_invocation() {
+        let (service, event) = service_with_factory(
+            PanickingDropFactory { failing: true },
+            |_event, _ctx| async move { Ok(serde_json::Value::Null) },
+        );
+        let join_err = tokio::spawn(service(event))
+            .await
+            .expect_err("the destructor panic leaves the service");
+        assert!(join_err.is_panic(), "a panic, not a cancellation");
+        let payload = join_err.into_panic();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"error drop"));
+    }
+
+    /// An invocation that fails before the plugins are created calls no
+    /// factory.
+    #[tokio::test]
+    async fn failed_input_calls_no_factory() {
+        let factory = RecordingFactory::default();
+        let options = Options::builder()
+            .execution_client(std::sync::Arc::new(client::InMemoryExecutionClient::new(
+                Vec::new(),
+            )))
+            .plugin(factory.clone())
+            .build()
+            .unwrap();
+        let service = wrap(
+            |_event: u32, _ctx: DurableContext| async move { Ok::<u32, BoxError>(0) },
+            options,
+        );
+        let payload = envelope_with(&serde_json::json!([{
+            "Id": "exec-1",
+            "Type": "EXECUTION",
+            "ExecutionDetails": { "InputPayload": "\"not a number\"" }
+        }]));
+        let result = service(lambda_runtime::LambdaEvent::new(
+            InvocationPayload(payload),
+            lambda_runtime::Context::default(),
+        ))
+        .await;
+        assert!(result.is_err());
+        assert!(factory.0.lock().unwrap().is_empty());
     }
 
     #[test]

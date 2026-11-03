@@ -293,6 +293,17 @@ pub(crate) struct CheckpointRecord {
     /// ([`crate::coordinator`]) arms a waiting operation's first refresh
     /// at this time.
     pub(crate) due_at: Option<std::time::SystemTime>,
+    /// The wire `ParentId` of the operation, as the service reports it.
+    /// No replay path reads it; plugins see it in their operation infos.
+    pub(crate) parent_id: Option<String>,
+    /// When the operation started, from the wire `StartTimestamp`. `None`
+    /// when the service sent none, or sent a value that does not convert.
+    /// No replay path reads it.
+    pub(crate) start_timestamp: Option<std::time::SystemTime>,
+    /// When the operation ended, from the wire `EndTimestamp`. `None` when
+    /// the service sent none, or sent a value that does not convert. No
+    /// replay path reads it.
+    pub(crate) end_timestamp: Option<std::time::SystemTime>,
 }
 
 #[cfg(test)]
@@ -319,6 +330,9 @@ impl CheckpointRecord {
             sub_type: None,
             op_name: None,
             due_at: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         }
     }
 }
@@ -493,6 +507,27 @@ impl CheckpointLog {
         guard.insert(wire_id, record);
     }
 
+    /// Applies `f` to every record under one read guard and returns the
+    /// results, in no particular order.
+    ///
+    /// `f` borrows each record, so no record is cloned. Plugin hooks build
+    /// their operations maps with this one call per hook event, which keeps
+    /// full-record clones off every path that builds such a map. `f` must
+    /// not touch the checkpoint log, because the read guard is held while
+    /// it runs.
+    pub(crate) fn project_records<R>(
+        &self,
+        mut f: impl FnMut(&str, &CheckpointRecord) -> R,
+    ) -> Vec<R> {
+        #[cfg(test)]
+        PROJECTIONS.with(|count| count.set(count.get() + 1));
+        let guard = self
+            .records
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.iter().map(|(id, record)| f(id, record)).collect()
+    }
+
     /// Returns true if the log has any records at all.
     pub(crate) fn has_records(&self) -> bool {
         let guard = self
@@ -501,6 +536,21 @@ impl CheckpointLog {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         !guard.is_empty()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`CheckpointLog::project_records`] ran on this
+    /// thread. A `#[tokio::test]` runs every SDK task on the test's own
+    /// thread, so a test reads how many operations maps its invocations
+    /// built, and tests on other threads do not change the count.
+    static PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of [`CheckpointLog::project_records`] calls on this thread.
+#[cfg(test)]
+pub(crate) fn projections() -> usize {
+    PROJECTIONS.with(std::cell::Cell::get)
 }
 
 /// The shared engine state carried by every `DurableContext` clone.
@@ -798,6 +848,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )]);
 
@@ -832,6 +885,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )]);
 
@@ -872,6 +928,9 @@ mod tests {
             sub_type: Some("Step".to_owned()),
             due_at: None,
             op_name: Some("my-step".to_owned()),
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         }
     }
 
@@ -960,6 +1019,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             ),
             (
@@ -984,6 +1046,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             ),
         ]));
@@ -1050,6 +1115,9 @@ mod tests {
                 sub_type: None,
                 due_at: None,
                 op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
             },
         )]));
 
@@ -1092,6 +1160,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             ),
             (
@@ -1116,6 +1187,9 @@ mod tests {
                     sub_type: None,
                     due_at: None,
                     op_name: None,
+                    parent_id: None,
+                    start_timestamp: None,
+                    end_timestamp: None,
                 },
             ),
         ]));
