@@ -1341,8 +1341,12 @@ where
     let writer = req.ctx.with_owner(req.child_op_id.positional());
 
     // FLAT nesting emits no child-context events: only the value transform
-    // (round-trip for live == replay consistency) happens here.
-    if req.nesting == NestingMode::Flat {
+    // (round-trip for live == replay consistency) happens here. A terminal
+    // item re-runs only to rebuild a `ReplayChildren` result (see
+    // `item_before`). Its record is already closed, and a checkpoint backend
+    // rejects a second close of a CONTEXT. So it takes the same path and
+    // writes nothing.
+    if req.nesting == NestingMode::Flat || req.is_terminal {
         return match outcome {
             Ok(value) => {
                 // A result serialization failure is LOCAL and

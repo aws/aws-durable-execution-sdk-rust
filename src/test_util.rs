@@ -73,9 +73,41 @@
 //!   as the service does, unless the context recorded `ReplayChildren`.
 //!   Checkpoint responses and [`TestResult::operations`] keep every record.
 //! - The backend rejects a checkpoint that exceeds a service size limit or
-//!   a delay range, with the service's message. It does not check the rest
-//!   of the service's update model: ID and name patterns, parent existence
-//!   and action order.
+//!   a delay range, with the service's message.
+//! - The backend rejects a chained-invoke `START` whose function name has
+//!   no target registered on the runner, and an update whose operation
+//!   type it does not know. Neither rejection changes any state.
+//! - The backend also checks a checkpoint against the history rules of the
+//!   JS SDK's test backend, and rejects it with that backend's message. It
+//!   checks the whole request against the operations stored before it, and
+//!   a rejected request changes no operation, no token and no history
+//!   event. The rules are:
+//!   - An update must not change the `Type`, `SubType`, `Name` or
+//!     `ParentId` of a stored operation. A field the update omits passes.
+//!   - The action must fit the type. `STEP` allows `START`, `FAIL`, `RETRY`
+//!     and `SUCCEED`; `CONTEXT` allows `START`, `FAIL` and `SUCCEED`; `WAIT`
+//!     allows `START` and `CANCEL`; `CALLBACK` and `CHAINED_INVOKE` allow only
+//!     `START`; `EXECUTION` allows `SUCCEED` and `FAIL`.
+//!   - The action must fit the stored status. A stored `STEP` may `START`
+//!     only when `READY`, and may `FAIL`, `SUCCEED` or `RETRY` only when
+//!     `STARTED` or `READY`. A stored `CONTEXT` cannot `START` again, and may
+//!     close only when `STARTED`. A `WAIT` may `START` only when it is not
+//!     stored, and `CANCEL` only when it is `STARTED`. A `CALLBACK` or
+//!     `CHAINED_INVOKE` may `START` only when it is not stored.
+//!   - A `ParentId` must name a stored `CONTEXT`, or a `CONTEXT` that an
+//!     earlier update of the same request starts.
+//!   - An ID may appear twice in one request only when the earlier update
+//!     is a `STEP` or `CONTEXT` `START` and the later one is not a `START`.
+//!
+//!   It does not check the rest of the service's update model: the request
+//!   model, the ID and name patterns, the options and payloads each action
+//!   requires or forbids, and the count and position of `EXECUTION`
+//!   updates.
+//!
+//!   The SDK treats a rejection as any other non-retryable checkpoint
+//!   failure. So the execution fails with the error type
+//!   `CheckpointUnrecoverableExecutionError`, and a test fails where the SDK
+//!   would write a history that the JS SDK's test backend rejects.
 //! - Each invocation input carries `UpdatedOperationIds`: the operations
 //!   the backend changed between invocations, such as a fired wait, a
 //!   retry that became ready, or a callback that received a reply.
@@ -4263,6 +4295,30 @@ impl BackendState {
         Some(event)
     }
 
+    /// Checks a checkpoint request against the history rules (see
+    /// [`validate_history_rules`]), then applies its updates in order and
+    /// returns the records the response carries.
+    ///
+    /// The rules read the state stored before the request. So a rejected
+    /// request changes no operation, no token and no history event.
+    fn apply_request(
+        &mut self,
+        updates: &[OperationUpdate],
+        kinds: Vec<OperationKind>,
+    ) -> Result<Vec<Operation>, String> {
+        validate_history_rules(&self.ops, updates, &kinds)?;
+        self.token_counter += 1;
+        let mut out = Vec::with_capacity(updates.len());
+        for (update, kind) in updates.iter().zip(kinds) {
+            if let Some(stored) = self.apply_update(kind, update)
+                && let Some(op) = build_operation(&stored, self.base)
+            {
+                out.push(op);
+            }
+        }
+        Ok(out)
+    }
+
     /// Finds a stored op by wire ID.
     fn find_mut(&mut self, id: &str) -> Option<&mut StoredOp> {
         self.ops.iter_mut().find(|op| op.id == id)
@@ -4504,18 +4560,13 @@ impl Backend {
                 ))
             });
         };
-        let updated_ops: Vec<Operation> = {
-            let mut state = self.lock();
-            state.token_counter += 1;
-            let mut out = Vec::with_capacity(updates.len());
-            for (update, kind) in updates.iter().zip(kinds) {
-                if let Some(stored) = state.apply_update(kind, update)
-                    && let Some(op) = build_operation(&stored, state.base)
-                {
-                    out.push(op);
-                }
+        let updated_ops = match self.lock().apply_request(updates, kinds) {
+            Ok(ops) => ops,
+            Err(message) => {
+                return Box::pin(
+                    async move { Err(ExecutionClientError::new_non_retryable(&message)) },
+                );
             }
-            out
         };
         let token = self.current_token();
 
@@ -4593,6 +4644,175 @@ fn update_kinds(updates: &[OperationUpdate]) -> Option<Vec<OperationKind>> {
         .iter()
         .map(|update| OperationKind::from_wire(update.r#type()))
         .collect()
+}
+
+/// Checks a checkpoint request against the history rules of JS's checkpoint
+/// server, and returns JS's message for the first rule it breaks.
+///
+/// `ops` is the state stored before the request, and `kinds` holds the kind
+/// of each update. The checks run in JS's order:
+///
+/// 1. One pass over the request checks repeated IDs and parents (see
+///    [`validate_parents_and_repeats`]).
+/// 2. Then each update in turn is checked against the operation stored
+///    before the request: first its identity, then its action against its
+///    type, then its action against the stored status.
+///
+/// Every check compares with the stored state, never with an earlier
+/// update of the same request.
+fn validate_history_rules(
+    ops: &[StoredOp],
+    updates: &[OperationUpdate],
+    kinds: &[OperationKind],
+) -> Result<(), String> {
+    validate_parents_and_repeats(ops, updates, kinds)?;
+    for (update, kind) in updates.iter().zip(kinds) {
+        let stored = ops.iter().find(|op| op.id == update.id());
+        if let Some(stored) = stored {
+            validate_identity(update, *kind, stored)?;
+        }
+        validate_action_for_type(*kind, update.action())?;
+        validate_status_transition(*kind, update.action(), stored)?;
+    }
+    Ok(())
+}
+
+/// Checks the repeated IDs and the parents of a request, in request order.
+///
+/// 1. An ID may repeat only when the latest earlier update of that ID is a
+///    STEP or CONTEXT `START` and the repeat is not a `START`.
+/// 2. A supplied `ParentId` must name a CONTEXT that an earlier update of
+///    the request starts, or a stored CONTEXT. An earlier `START` of the ID
+///    takes precedence over the stored record, as in JS.
+///
+/// The repeat check of an update runs before its parent check.
+fn validate_parents_and_repeats(
+    ops: &[StoredOp],
+    updates: &[OperationUpdate],
+    kinds: &[OperationKind],
+) -> Result<(), String> {
+    let mut started: BTreeMap<&str, OperationKind> = BTreeMap::new();
+    let mut last_seen: BTreeMap<&str, (OperationKind, &OperationAction)> = BTreeMap::new();
+    for (update, kind) in updates.iter().zip(kinds) {
+        let id = update.id();
+        let action = update.action();
+        if let Some((last_kind, last_action)) = last_seen.get(id) {
+            let allowed = matches!(last_kind, OperationKind::Step | OperationKind::Context)
+                && **last_action == OperationAction::Start
+                && *action != OperationAction::Start;
+            if !allowed {
+                return Err("Cannot update the same operation twice in a single request.".into());
+            }
+        }
+        if let Some(parent_id) = update.parent_id() {
+            let parent_kind = started
+                .get(parent_id)
+                .copied()
+                .or_else(|| ops.iter().find(|op| op.id == parent_id).map(|op| op.kind));
+            if parent_kind != Some(OperationKind::Context) {
+                return Err("Invalid parent operation id.".into());
+            }
+        }
+        if *action == OperationAction::Start {
+            started.insert(id, *kind);
+        }
+        last_seen.insert(id, (*kind, action));
+    }
+    Ok(())
+}
+
+/// Checks that an update keeps the `Type`, `SubType`, `Name` and
+/// `ParentId` of the stored operation. A field the update omits passes.
+fn validate_identity(
+    update: &OperationUpdate,
+    kind: OperationKind,
+    stored: &StoredOp,
+) -> Result<(), String> {
+    let inconsistent = |field: &str| {
+        Err(format!(
+            "{field} value in OperationUpdate is inconsistent with existing operation. \
+             Check for non-determinism."
+        ))
+    };
+    let differs = |supplied: Option<&str>, stored: Option<&String>| {
+        supplied.is_some_and(|value| Some(value) != stored.map(String::as_str))
+    };
+    if kind != stored.kind {
+        return inconsistent("Type");
+    }
+    if differs(update.sub_type(), stored.sub_type.as_ref()) {
+        return inconsistent("SubType");
+    }
+    if differs(update.name(), stored.name.as_ref()) {
+        return inconsistent("Name");
+    }
+    if differs(update.parent_id(), stored.parent_id.as_ref()) {
+        return inconsistent("ParentId");
+    }
+    Ok(())
+}
+
+/// Checks that `action` is one of the actions JS allows for `kind`.
+fn validate_action_for_type(kind: OperationKind, action: &OperationAction) -> Result<(), String> {
+    use OperationAction as A;
+    let allowed = match kind {
+        OperationKind::Step => matches!(action, A::Start | A::Fail | A::Retry | A::Succeed),
+        OperationKind::Context => matches!(action, A::Start | A::Fail | A::Succeed),
+        OperationKind::Wait => matches!(action, A::Start | A::Cancel),
+        OperationKind::Callback | OperationKind::ChainedInvoke => matches!(action, A::Start),
+        OperationKind::Execution => matches!(action, A::Succeed | A::Fail),
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err("Invalid action for the given operation type.".into())
+    }
+}
+
+/// Checks that `action` is valid for the status of the stored operation,
+/// with the message of JS's validator for `kind`. `stored` is `None` when
+/// no operation has the update's ID.
+///
+/// [`validate_action_for_type`] has already accepted the action, so only
+/// the actions of `kind` reach this function.
+fn validate_status_transition(
+    kind: OperationKind,
+    action: &OperationAction,
+    stored: Option<&StoredOp>,
+) -> Result<(), String> {
+    use OperationStatus as S;
+    let status = stored.map(|op| op.status);
+    let message = match (kind, action) {
+        (OperationKind::Step, OperationAction::Start) => status
+            .is_some_and(|s| s != S::Ready)
+            .then_some("Invalid current STEP state to start."),
+        (OperationKind::Step, OperationAction::Retry) => status
+            .is_some_and(|s| !matches!(s, S::Started | S::Ready))
+            .then_some("Invalid current STEP state to retry."),
+        (OperationKind::Step, _) => status
+            .is_some_and(|s| !matches!(s, S::Started | S::Ready))
+            .then_some("Invalid current STEP state to close."),
+        (OperationKind::Context, OperationAction::Start) => status
+            .is_some()
+            .then_some("Cannot start a CONTEXT operation that already exists."),
+        (OperationKind::Context, _) => status
+            .is_some_and(|s| s != S::Started)
+            .then_some("Invalid current CONTEXT state to close."),
+        (OperationKind::Wait, OperationAction::Start) => status
+            .is_some()
+            .then_some("Cannot start a WAIT operation that already exists."),
+        (OperationKind::Wait, _) => (status != Some(S::Started)).then_some(
+            "Cannot cancel a WAIT operation that does not exist or has already completed.",
+        ),
+        (OperationKind::Callback, _) => status
+            .is_some()
+            .then_some("Cannot start a CALLBACK operation that already exists."),
+        (OperationKind::ChainedInvoke, _) => status
+            .is_some()
+            .then_some("Cannot start a CHAINED_INVOKE operation that already exists."),
+        (OperationKind::Execution, _) => None,
+    };
+    message.map_or(Ok(()), |message| Err(message.to_owned()))
 }
 
 /// Whether `stored` carries any error field. A callback failure may set
@@ -8946,6 +9166,7 @@ mod tests {
                 "arn:test",
                 "token-0",
                 vec![
+                    ctx_op("C", OperationAction::Start, None, None),
                     step_op("S", OperationAction::Succeed, Some("C")),
                     ctx_op("C", OperationAction::Succeed, None, None),
                 ],
@@ -8957,22 +9178,25 @@ mod tests {
             .iter()
             .map(Operation::id)
             .collect();
-        assert_eq!(ids, ["S", "C"]);
+        assert_eq!(ids, ["C", "S", "C"]);
     }
 
     /// A paginated checkpoint response returns the first page of the full
-    /// state. That page is not pruned either. So with a page size of 1 the
-    /// page holds the child `S`, which was stored first, and not `C`.
+    /// state. That page is not pruned either. So with a page size of 2 the
+    /// page holds `C` and its child `S`, which were stored first, and not
+    /// the top-level step `T`.
     #[tokio::test]
     async fn paginated_checkpoint_response_is_not_pruned() {
-        let backend = Backend::new(QueuedReplies::default(), Some(1));
+        let backend = Backend::new(QueuedReplies::default(), Some(2));
         let output = backend
             .checkpoint(
                 "arn:test",
                 "token-0",
                 vec![
+                    ctx_op("C", OperationAction::Start, None, None),
                     step_op("S", OperationAction::Succeed, Some("C")),
                     ctx_op("C", OperationAction::Succeed, None, None),
+                    step_op("T", OperationAction::Succeed, None),
                 ],
             )
             .await
@@ -8983,7 +9207,7 @@ mod tests {
             .iter()
             .map(Operation::id)
             .collect();
-        assert_eq!(ids, ["S"]);
+        assert_eq!(ids, ["C", "S"]);
     }
 
     /// A context closed with `FAIL` and `ReplayChildren: true` records the
@@ -9531,6 +9755,638 @@ mod tests {
                 "CallbackOptions": {}, "ChainedInvokeOptions": { "FunctionName": "fn" }
             })
         );
+    }
+
+    // History rules: identity, actions, statuses, parents and repeated IDs.
+
+    /// A builder for an update of `op_type` and `action` with id `id`
+    /// (history-rule tests).
+    fn rule_update(
+        id: &str,
+        op_type: OperationType,
+        action: OperationAction,
+    ) -> aws_sdk_lambda::types::builders::OperationUpdateBuilder {
+        OperationUpdate::builder()
+            .id(id)
+            .r#type(op_type)
+            .action(action)
+    }
+
+    /// Builds the update of `builder`.
+    fn built(builder: aws_sdk_lambda::types::builders::OperationUpdateBuilder) -> OperationUpdate {
+        builder.build().expect("valid update")
+    }
+
+    /// The text that follows the field name in every identity message.
+    const INCONSISTENT: &str = " value in OperationUpdate is inconsistent with existing operation. Check for non-determinism.";
+
+    /// Seeds a backend with `seed`, sets each `(id, status)` of `statuses`
+    /// on the stored op, and sends `updates` in one checkpoint call.
+    ///
+    /// With `expected` set, asserts the call fails with a non-retryable
+    /// error carrying that message, and that the stored operations, the
+    /// token and the history did not change. Without it, asserts the call
+    /// succeeded.
+    async fn check_rule_row(
+        row: &str,
+        seed: &[OperationUpdate],
+        statuses: &[(&str, OperationStatus)],
+        updates: Vec<OperationUpdate>,
+        expected: Option<&str>,
+    ) {
+        let backend = seeded_backend(Vec::new(), 0, seed);
+        {
+            let mut state = backend.lock();
+            for (id, status) in statuses {
+                let op = state.find_mut(id).expect("the op is seeded");
+                op.status = *status;
+            }
+        }
+        let token = backend.current_token();
+        let ops_before = format!("{:?}", backend.lock().ops);
+        let events_before = format!("{:?}", backend.events());
+        let result =
+            ExecutionClient::checkpoint(&backend, LOCAL_EXECUTION_ARN, &token, updates).await;
+        match expected {
+            Some(expected) => {
+                assert!(result.is_err(), "row {row}: accepted");
+                let err = result.expect_err("the call is rejected");
+                assert_eq!(
+                    err.to_string(),
+                    format!("durable: client: {expected}"),
+                    "row {row}"
+                );
+                assert!(!err.is_retryable(), "row {row}");
+                assert_eq!(format!("{:?}", backend.lock().ops), ops_before, "row {row}");
+                assert_eq!(backend.current_token(), token, "row {row}");
+                assert_eq!(
+                    format!("{:?}", backend.events()),
+                    events_before,
+                    "row {row}"
+                );
+            }
+            None => {
+                assert_eq!(result.err().map(|e| e.to_string()), None, "row {row}");
+            }
+        }
+    }
+
+    /// The case of #147: a STEP update reaches the ID of a map item's
+    /// CONTEXT record. The backend rejects it, and keeps the record.
+    #[tokio::test]
+    async fn step_update_at_a_context_id_is_rejected() {
+        let seed = [
+            built(
+                rule_update("map", OperationType::Context, OperationAction::Start).sub_type("Map"),
+            ),
+            built(
+                rule_update("item", OperationType::Context, OperationAction::Start)
+                    .sub_type("MapIteration")
+                    .name("map-item-0")
+                    .parent_id("map"),
+            ),
+        ];
+        let update = built(
+            rule_update("item", OperationType::Step, OperationAction::Succeed)
+                .sub_type("Step")
+                .name("second")
+                .payload("2"),
+        );
+        check_rule_row(
+            "step at context",
+            &seed,
+            &[],
+            vec![update],
+            Some(&format!("Type{INCONSISTENT}")),
+        )
+        .await;
+    }
+
+    /// JS's message for an action outside the type's set.
+    const INVALID_ACTION: &str = "Invalid action for the given operation type.";
+    /// JS's message for a bad parent.
+    const INVALID_PARENT: &str = "Invalid parent operation id.";
+    /// JS's message for a forbidden repeated ID.
+    const REPEATED_ID: &str = "Cannot update the same operation twice in a single request.";
+    /// JS's message for a WAIT `CANCEL` that finds no started WAIT.
+    const CANCEL_WAIT: &str =
+        "Cannot cancel a WAIT operation that does not exist or has already completed.";
+
+    /// Runs each `(row, updates, expected)` of `rows` on its own backend
+    /// seeded with `seed` (see [`check_rule_row`]).
+    async fn check_rule_rows(
+        seed: &[OperationUpdate],
+        rows: Vec<(&str, Vec<OperationUpdate>, Option<String>)>,
+    ) {
+        for (row, updates, expected) in rows {
+            check_rule_row(row, seed, &[], updates, expected.as_deref()).await;
+        }
+    }
+
+    /// The identity message for `field`.
+    fn inconsistent(field: &str) -> String {
+        format!("{field}{INCONSISTENT}")
+    }
+
+    /// Test 1.1: each identity field equal, changed, and omitted, and the
+    /// order in which the fields are checked.
+    #[tokio::test]
+    async fn identity_rules() {
+        use OperationAction as A;
+        use OperationType as T;
+        let seed = [
+            built(rule_update("p", T::Context, A::Start)),
+            built(rule_update("q", T::Context, A::Start)),
+            built(
+                rule_update("c", T::Context, A::Start)
+                    .sub_type("Child")
+                    .name("n")
+                    .parent_id("p"),
+            ),
+            built(rule_update("bare", T::Context, A::Start)),
+        ];
+        let close = |id: &str| rule_update(id, T::Context, A::Succeed);
+        let rows = vec![
+            (
+                "all equal",
+                vec![built(close("c").sub_type("Child").name("n").parent_id("p"))],
+                None,
+            ),
+            ("all omitted", vec![built(close("c"))], None),
+            (
+                "type changed",
+                vec![built(rule_update("c", T::Step, A::Succeed))],
+                Some(inconsistent("Type")),
+            ),
+            (
+                "subtype changed",
+                vec![built(close("c").sub_type("Other"))],
+                Some(inconsistent("SubType")),
+            ),
+            (
+                "subtype set on a record without one",
+                vec![built(close("bare").sub_type("Child"))],
+                Some(inconsistent("SubType")),
+            ),
+            (
+                "name changed",
+                vec![built(close("c").name("m"))],
+                Some(inconsistent("Name")),
+            ),
+            (
+                "name set on a record without one",
+                vec![built(close("bare").name("n"))],
+                Some(inconsistent("Name")),
+            ),
+            (
+                "parent changed",
+                vec![built(close("c").parent_id("q"))],
+                Some(inconsistent("ParentId")),
+            ),
+            (
+                "parent set on a record without one",
+                vec![built(close("bare").parent_id("p"))],
+                Some(inconsistent("ParentId")),
+            ),
+            (
+                "type before name",
+                vec![built(rule_update("c", T::Step, A::Succeed).name("m"))],
+                Some(inconsistent("Type")),
+            ),
+            (
+                "subtype before name",
+                vec![built(close("c").sub_type("Other").name("m"))],
+                Some(inconsistent("SubType")),
+            ),
+            (
+                "name before parent",
+                vec![built(close("c").name("m").parent_id("q"))],
+                Some(inconsistent("Name")),
+            ),
+            (
+                "identity before action",
+                vec![built(rule_update("c", T::Context, A::Retry).name("m"))],
+                Some(inconsistent("Name")),
+            ),
+            (
+                "an earlier update of the request is not a stored record",
+                vec![
+                    built(rule_update("new", T::Step, A::Start).name("a")),
+                    built(rule_update("new", T::Step, A::Succeed).name("b")),
+                ],
+                None,
+            ),
+        ];
+        check_rule_rows(&seed, rows).await;
+    }
+
+    /// Test 1.2: every action of every type, with no stored operation.
+    #[tokio::test]
+    async fn action_sets() {
+        use OperationAction as A;
+        use OperationType as T;
+        // For each type: the actions it allows, and the message of an
+        // allowed action that needs a stored operation.
+        type Row<'a> = (T, &'a [A], Option<(A, &'a str)>);
+        let actions = [A::Start, A::Succeed, A::Fail, A::Retry, A::Cancel];
+        let table: [Row<'_>; 6] = [
+            (T::Step, &[A::Start, A::Succeed, A::Fail, A::Retry], None),
+            (T::Context, &[A::Start, A::Succeed, A::Fail], None),
+            (
+                T::Wait,
+                &[A::Start, A::Cancel],
+                Some((A::Cancel, CANCEL_WAIT)),
+            ),
+            (T::Callback, &[A::Start], None),
+            (T::ChainedInvoke, &[A::Start], None),
+            (T::Execution, &[A::Succeed, A::Fail], None),
+        ];
+        for (op_type, allowed, needs_record) in table {
+            for action in &actions {
+                let expected = if allowed.contains(action) {
+                    needs_record
+                        .as_ref()
+                        .filter(|(a, _)| a == action)
+                        .map(|(_, message)| (*message).to_owned())
+                } else {
+                    Some(INVALID_ACTION.to_owned())
+                };
+                let row = format!("{op_type:?} {action:?}");
+                let update = built(rule_update("o", op_type.clone(), action.clone()));
+                check_rule_row(&row, &[], &[], vec![update], expected.as_deref()).await;
+            }
+        }
+    }
+
+    /// The action is checked before the status: a forbidden action on a
+    /// stored operation gets the action message, not the status message.
+    #[tokio::test]
+    async fn action_is_checked_before_status() {
+        let seed = [built(rule_update(
+            "s",
+            OperationType::Step,
+            OperationAction::Succeed,
+        ))];
+        let update = built(rule_update(
+            "s",
+            OperationType::Step,
+            OperationAction::Cancel,
+        ));
+        check_rule_row(
+            "cancel a step",
+            &seed,
+            &[],
+            vec![update],
+            Some(INVALID_ACTION),
+        )
+        .await;
+    }
+
+    /// Test 1.3: every allowed action of every type against every status
+    /// of a stored operation.
+    #[tokio::test]
+    async fn status_transitions() {
+        use OperationAction as A;
+        use OperationStatus as S;
+        use OperationType as T;
+        let statuses = [
+            S::Started,
+            S::Pending,
+            S::Ready,
+            S::Succeeded,
+            S::Failed,
+            S::Cancelled,
+            S::TimedOut,
+            S::Stopped,
+        ];
+        // For each type and action: the statuses that allow it, and JS's
+        // message for every other status.
+        let table: [(T, A, &[S], Option<&str>); 12] = [
+            (
+                T::Step,
+                A::Start,
+                &[S::Ready],
+                Some("Invalid current STEP state to start."),
+            ),
+            (
+                T::Step,
+                A::Succeed,
+                &[S::Started, S::Ready],
+                Some("Invalid current STEP state to close."),
+            ),
+            (
+                T::Step,
+                A::Fail,
+                &[S::Started, S::Ready],
+                Some("Invalid current STEP state to close."),
+            ),
+            (
+                T::Step,
+                A::Retry,
+                &[S::Started, S::Ready],
+                Some("Invalid current STEP state to retry."),
+            ),
+            (
+                T::Context,
+                A::Start,
+                &[],
+                Some("Cannot start a CONTEXT operation that already exists."),
+            ),
+            (
+                T::Context,
+                A::Succeed,
+                &[S::Started],
+                Some("Invalid current CONTEXT state to close."),
+            ),
+            (
+                T::Context,
+                A::Fail,
+                &[S::Started],
+                Some("Invalid current CONTEXT state to close."),
+            ),
+            (
+                T::Wait,
+                A::Start,
+                &[],
+                Some("Cannot start a WAIT operation that already exists."),
+            ),
+            (T::Wait, A::Cancel, &[S::Started], Some(CANCEL_WAIT)),
+            (
+                T::Callback,
+                A::Start,
+                &[],
+                Some("Cannot start a CALLBACK operation that already exists."),
+            ),
+            (
+                T::ChainedInvoke,
+                A::Start,
+                &[],
+                Some("Cannot start a CHAINED_INVOKE operation that already exists."),
+            ),
+            (T::Execution, A::Succeed, &statuses, None),
+        ];
+        for (op_type, action, allowed, message) in table {
+            // The seed creates the record. Its status is then set directly.
+            let seed_action = if op_type == T::Execution {
+                A::Succeed
+            } else {
+                A::Start
+            };
+            let seed = [built(rule_update("o", op_type.clone(), seed_action))];
+            for status in statuses {
+                let expected = (!allowed.contains(&status)).then_some(message).flatten();
+                let row = format!("{op_type:?} {action:?} at {status:?}");
+                let update = built(rule_update("o", op_type.clone(), action.clone()));
+                check_rule_row(&row, &seed, &[("o", status)], vec![update], expected).await;
+            }
+        }
+        // EXECUTION FAIL is allowed at any status too.
+        let seed = [built(rule_update("o", T::Execution, A::Succeed))];
+        let update = built(rule_update("o", T::Execution, A::Fail));
+        check_rule_row("Execution Fail", &seed, &[], vec![update], None).await;
+    }
+
+    /// Test 1.4: the parent rules.
+    #[tokio::test]
+    async fn parent_rules() {
+        use OperationAction as A;
+        use OperationType as T;
+        let seed = [
+            built(rule_update("ctx", T::Context, A::Start)),
+            built(rule_update("step", T::Step, A::Start)),
+        ];
+        let child = |parent: &str| built(rule_update("a", T::Step, A::Start).parent_id(parent));
+        let parent_error = Some(INVALID_PARENT.to_owned());
+        let rows = vec![
+            (
+                "omitted",
+                vec![built(rule_update("a", T::Step, A::Start))],
+                None,
+            ),
+            ("stored CONTEXT", vec![child("ctx")], None),
+            (
+                "CONTEXT started earlier in the request",
+                vec![built(rule_update("n", T::Context, A::Start)), child("n")],
+                None,
+            ),
+            ("missing", vec![child("nope")], parent_error.clone()),
+            ("stored STEP", vec![child("step")], parent_error.clone()),
+            (
+                "STEP started earlier in the request",
+                vec![built(rule_update("n", T::Step, A::Start)), child("n")],
+                parent_error.clone(),
+            ),
+            (
+                "CONTEXT closed, not started, earlier in the request",
+                vec![built(rule_update("n", T::Context, A::Succeed)), child("n")],
+                parent_error.clone(),
+            ),
+            (
+                "the operation itself",
+                vec![built(rule_update("a", T::Context, A::Start).parent_id("a"))],
+                parent_error.clone(),
+            ),
+            (
+                "CONTEXT started later in the request",
+                vec![child("n"), built(rule_update("n", T::Context, A::Start))],
+                parent_error.clone(),
+            ),
+            (
+                "an earlier START in the request wins over the stored record",
+                vec![built(rule_update("ctx", T::Step, A::Start)), child("ctx")],
+                parent_error,
+            ),
+        ];
+        check_rule_rows(&seed, rows).await;
+    }
+
+    /// Test 1.5: every allowed and forbidden form of a repeated ID.
+    #[tokio::test]
+    async fn repeated_id_rules() {
+        use OperationAction as A;
+        use OperationType as T;
+        let u = |op_type: T, action: A| built(rule_update("r", op_type, action));
+        let repeated = Some(REPEATED_ID.to_owned());
+        let rows = vec![
+            (
+                "STEP START then SUCCEED",
+                vec![u(T::Step, A::Start), u(T::Step, A::Succeed)],
+                None,
+            ),
+            (
+                "STEP START then FAIL",
+                vec![u(T::Step, A::Start), u(T::Step, A::Fail)],
+                None,
+            ),
+            (
+                "STEP START then RETRY",
+                vec![u(T::Step, A::Start), u(T::Step, A::Retry)],
+                None,
+            ),
+            (
+                "CONTEXT START then SUCCEED",
+                vec![u(T::Context, A::Start), u(T::Context, A::Succeed)],
+                None,
+            ),
+            (
+                "CONTEXT START then FAIL",
+                vec![u(T::Context, A::Start), u(T::Context, A::Fail)],
+                None,
+            ),
+            (
+                "STEP START then START",
+                vec![u(T::Step, A::Start), u(T::Step, A::Start)],
+                repeated.clone(),
+            ),
+            (
+                "CONTEXT START then START",
+                vec![u(T::Context, A::Start), u(T::Context, A::Start)],
+                repeated.clone(),
+            ),
+            (
+                "STEP SUCCEED then FAIL",
+                vec![u(T::Step, A::Succeed), u(T::Step, A::Fail)],
+                repeated.clone(),
+            ),
+            (
+                "STEP START, SUCCEED, then FAIL",
+                vec![
+                    u(T::Step, A::Start),
+                    u(T::Step, A::Succeed),
+                    u(T::Step, A::Fail),
+                ],
+                repeated.clone(),
+            ),
+            (
+                "WAIT START then CANCEL",
+                vec![u(T::Wait, A::Start), u(T::Wait, A::Cancel)],
+                repeated.clone(),
+            ),
+            (
+                "CALLBACK START twice",
+                vec![u(T::Callback, A::Start), u(T::Callback, A::Start)],
+                repeated.clone(),
+            ),
+            (
+                "CHAINED_INVOKE START twice",
+                vec![u(T::ChainedInvoke, A::Start), u(T::ChainedInvoke, A::Start)],
+                repeated.clone(),
+            ),
+            (
+                "EXECUTION SUCCEED then FAIL",
+                vec![u(T::Execution, A::Succeed), u(T::Execution, A::Fail)],
+                repeated.clone(),
+            ),
+            (
+                "the repeat is checked before the parent",
+                vec![
+                    u(T::Step, A::Start),
+                    built(rule_update("r", T::Step, A::Start).parent_id("nope")),
+                ],
+                repeated,
+            ),
+        ];
+        check_rule_rows(&[], rows).await;
+    }
+
+    /// The repeated-ID and parent pass covers the whole request before any
+    /// update is checked on its own. So a repeat later in the request wins
+    /// over a status error of an earlier update.
+    #[tokio::test]
+    async fn request_pass_runs_before_update_checks() {
+        use OperationAction as A;
+        use OperationType as T;
+        let seed = [built(rule_update("s", T::Step, A::Succeed))];
+        let updates = vec![
+            built(rule_update("s", T::Step, A::Succeed)),
+            built(rule_update("w", T::Wait, A::Start)),
+            built(rule_update("w", T::Wait, A::Start)),
+        ];
+        check_rule_row(
+            "repeat after a status error",
+            &seed,
+            &[],
+            updates,
+            Some(REPEATED_ID),
+        )
+        .await;
+    }
+
+    /// Test 2: a request whose first update is valid and whose second is
+    /// rejected stores neither, keeps the token and records no event.
+    #[tokio::test]
+    async fn rejected_request_applies_no_update() {
+        use OperationAction as A;
+        use OperationType as T;
+        let seed = [built(rule_update("ctx", T::Context, A::Start))];
+        let updates = vec![
+            built(rule_update("a", T::Step, A::Start)),
+            built(rule_update("ctx", T::Context, A::Start)),
+        ];
+        check_rule_row(
+            "second update rejected",
+            &seed,
+            &[],
+            updates,
+            Some("Cannot start a CONTEXT operation that already exists."),
+        )
+        .await;
+        // `check_rule_row` compared the whole store, so `a` is not stored.
+    }
+
+    /// Test 3: the SDK sends a STEP update to an ID that holds a pruned
+    /// WAIT record. The backend rejects it with a non-retryable error, and
+    /// the run ends with `CheckpointUnrecoverableExecutionError`.
+    ///
+    /// A correct handler builds no forbidden update, and the SDK checks the
+    /// identity of every record it can see. So the test hides the WAIT
+    /// from the SDK: it stores the WAIT as the child of a closed CONTEXT
+    /// without `ReplayChildren`, which the invocation input omits.
+    #[tokio::test]
+    async fn run_with_a_rejected_update_ends_unrecoverable() {
+        use OperationAction as A;
+        use OperationType as T;
+        let handler = |(), ctx: DurableContext| async move {
+            let value = ctx.step(|_| async { Ok(1_u32) }).name("s").await?;
+            Ok::<_, BoxError>(value)
+        };
+        // The ID the handler's step uses.
+        let probe = LocalRunner::new().run(handler, ()).await.expect("runner");
+        let step_id = probe.operations()[0].id().to_owned();
+
+        let backend = Arc::new(seeded_backend(
+            Vec::new(),
+            0,
+            &[
+                built(rule_update("hidden", T::Context, A::Start)),
+                built(rule_update(&step_id, T::Wait, A::Start).parent_id("hidden")),
+                built(rule_update("hidden", T::Context, A::Succeed)),
+            ],
+        ));
+        let result = LocalRunner::new()
+            .run_on_backend(Arc::clone(&backend), handler, "null".to_owned())
+            .await
+            .expect("runner");
+        assert!(result.is_failure(), "{result}");
+        assert_eq!(
+            result.error_type(),
+            Some("CheckpointUnrecoverableExecutionError")
+        );
+        assert_eq!(
+            result.error_message(),
+            Some(
+                format!("[Unrecoverable Execution] Checkpoint failed: Type{INCONSISTENT}").as_str()
+            )
+        );
+        // The WAIT record is unchanged.
+        let state = backend.lock();
+        let hidden = state
+            .ops
+            .iter()
+            .find(|op| op.id == step_id)
+            .expect("the WAIT is stored");
+        assert_eq!(hidden.kind, OperationKind::Wait);
+        assert_eq!(hidden.status, OperationStatus::Started);
     }
 
     /// Sends `updates` in one checkpoint call, which must succeed.
