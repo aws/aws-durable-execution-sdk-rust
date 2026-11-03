@@ -339,7 +339,10 @@ A reviewer reads for the things no automated check can see. Documentation on a n
 item should explain when to use it rather than restate its signature. A change
 must preserve determinism, since the SDK claims operation IDs at the call site,
 so any control flow deciding which operations to create may depend only on the
-event and on results the service already recorded. A new error path returns an
+event and on results the service already recorded. A combinator is the
+exception: it claims its ID when it is first awaited or polled, or when it is
+spawned, and an outer combinator rejects an inner combinator that has not
+claimed yet. A new error path returns an
 error rather than panicking, and a new operation follows the builder shape the
 existing operations use so the API stays predictable. The reviewer also asks
 whether the change belongs in the SDK at all, or whether an example teaches it

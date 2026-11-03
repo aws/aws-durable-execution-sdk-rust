@@ -21,9 +21,17 @@ use crate::error::{ChildFnError, OperationError};
 /// The uniform future handle for all durable operations.
 ///
 /// Every builder's [`IntoFuture`](std::future::IntoFuture) target is
-/// `DurableFuture<O>`. The operation ID is already claimed at builder
-/// creation; the body runs when polled (lazy) unless the builder was
-/// terminated with `.spawn()` (eager).
+/// `DurableFuture<O>`. Every operation except a combinator has already
+/// claimed its operation ID when its builder was created. A combinator
+/// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
+/// [`DurableContext::select_ok`] and [`DurableContext::race`]) claims its ID
+/// on the first poll of this future, or at `.spawn()`. A combinator future
+/// that is dropped before its first poll claims no ID and records nothing.
+/// A combinator future passed to another combinator must already have
+/// claimed its ID: start it with `.spawn()` and pass the returned handle. A
+/// still-unclaimed one fails the execution with a context usage error. The
+/// body runs when polled (lazy) unless the builder was terminated with
+/// `.spawn()` (eager).
 ///
 /// When produced by `.spawn()` the operation runs eagerly on an owned tokio
 /// task. Dropping the `DurableFuture` before it resolves aborts that task,
@@ -60,6 +68,41 @@ pub struct DurableFuture<O> {
     /// the coordinator to notify when the handle is first polled. `None`
     /// for every other handle, and after the first poll.
     awaited: Option<(Arc<AtomicBool>, Arc<InvocationCoordinator>)>,
+    /// The pending claim of a combinator that has not claimed its operation
+    /// ID yet. `None` for every other future, and once the claim ran. While
+    /// it is `Some`, `inner` is a placeholder that is never polled.
+    claim: Option<PendingClaim<O>>,
+}
+
+/// The claim a combinator future runs on its first poll or at `.spawn()`.
+///
+/// `run` claims the combinator's operation ID on the context the
+/// combinator was created on, checks the claimed ID against the recorded
+/// history, and returns the future that runs the combinator.
+pub(crate) struct PendingClaim<O> {
+    /// The combinator's public method, such as `"race"`.
+    method: &'static str,
+    /// The display name of the context the combinator was created on:
+    /// `"root"` or the positional ID of the operation that created it.
+    context: String,
+    /// Claims the ID and builds the combinator's future.
+    run: Box<dyn FnOnce() -> DurableFuture<O> + Send>,
+}
+
+impl<O> PendingClaim<O> {
+    /// Creates the pending claim of combinator `method` created on the
+    /// context whose display name is `context`.
+    pub(crate) fn new(
+        method: &'static str,
+        context: String,
+        run: impl FnOnce() -> DurableFuture<O> + Send + 'static,
+    ) -> Self {
+        Self {
+            method,
+            context,
+            run: Box::new(run),
+        }
+    }
 }
 
 impl<O> std::fmt::Debug for DurableFuture<O> {
@@ -77,7 +120,56 @@ impl<O: Send + 'static> DurableFuture<O> {
         Self {
             inner: Box::pin(fut),
             awaited: None,
+            claim: None,
         }
+    }
+
+    /// Creates the future of a combinator that claims its operation ID on
+    /// its first poll or at `.spawn()`, through [`Self::claim_now`].
+    pub(crate) fn deferred(claim: PendingClaim<O>) -> Self {
+        Self {
+            // A placeholder: `claim_now` replaces it before the first poll.
+            inner: Box::pin(std::future::pending()),
+            awaited: None,
+            claim: Some(claim),
+        }
+    }
+
+    /// Runs the pending claim of a combinator future: claims its operation
+    /// ID and checks it against the recorded history.
+    ///
+    /// The first poll and `.spawn()` call this. It runs the claim once. It
+    /// does nothing for a future that is not a combinator, and for a
+    /// combinator that already claimed.
+    pub(crate) fn claim_now(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            let claimed = (claim.run)();
+            self.inner = claimed.inner;
+        }
+    }
+
+    /// Reports whether this future is a combinator that has not claimed its
+    /// operation ID yet.
+    pub(crate) fn is_unclaimed_combinator(&self) -> bool {
+        self.claim.is_some()
+    }
+
+    /// The message of the context usage error an outer combinator records
+    /// when it would start this still-unclaimed combinator as an input.
+    /// `None` when this future is not an unclaimed combinator.
+    ///
+    /// `outer` is the positional ID of the outer combinator.
+    pub(crate) fn unclaimed_input_message(&self, outer: &str) -> Option<String> {
+        self.claim.as_ref().map(|claim| {
+            format!(
+                "context usage error in \"{method}\": the combinator was created on context \
+                 \"{context}\", but combinator \"{outer}\" started it as an input. Start the \
+                 inner combinator with .spawn() and pass the returned handle to the outer \
+                 combinator.",
+                method = claim.method,
+                context = claim.context,
+            )
+        })
     }
 
     /// Creates the future of one operation created on `ctx`.
@@ -141,6 +233,8 @@ impl<O: Send + 'static> Future for DurableFuture<O> {
     type Output = Result<O, OperationError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // The first poll of a combinator claims its operation ID.
+        self.claim_now();
         // The first poll of the handle of an operation started on its own
         // task: from now on the scheduler refreshes its registrations.
         if let Some((flag, coordinator)) = self.awaited.take() {
@@ -958,6 +1052,39 @@ mod tests {
             client,
             "token0".to_owned(),
         )
+    }
+
+    /// Test 16: a combinator future claims one ID however often
+    /// `claim_now` runs, and its first poll after a claim claims nothing.
+    #[tokio::test]
+    async fn claim_now_claims_once() {
+        let ctx = test_ctx_with_client();
+        let mut all = ctx.try_join_all(Vec::<DurableFuture<i32>>::new()).future();
+        assert!(all.is_unclaimed_combinator());
+        all.claim_now();
+        assert!(!all.is_unclaimed_combinator());
+        all.claim_now();
+        assert_eq!(
+            all.await.expect("an empty join succeeds"),
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            ctx.mint_id().positional(),
+            "2",
+            "the combinator claimed 1 only"
+        );
+    }
+
+    /// Test 17: a step's future carries no pending claim.
+    #[tokio::test]
+    async fn claim_now_is_noop_for_non_combinator() {
+        let ctx = test_ctx_with_client();
+        let mut step = ctx.step(|_| async { Ok(1_i32) }).future();
+        assert!(!step.is_unclaimed_combinator());
+        assert_eq!(step.unclaimed_input_message("9"), None);
+        step.claim_now();
+        assert_eq!(ctx.mint_id().positional(), "2", "only the step claimed");
+        assert_eq!(step.await.expect("the step succeeds"), 1);
     }
 
     /// A panic inside a `.spawn()`ed operation body must surface to the

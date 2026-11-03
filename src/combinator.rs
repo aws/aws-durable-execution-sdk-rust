@@ -252,6 +252,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
             false
         };
 
+        reject_unclaimed_inputs(&self.ctx, &positional_id, &self.futures)?;
+
         // Live path: run all futures concurrently, fail-fast on first error.
         let count = self.futures.len();
         let mut results: Vec<Option<O>> = (0..count).map(|_| None).collect();
@@ -442,6 +444,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             false
         };
 
+        reject_unclaimed_inputs(&self.ctx, &positional_id, &self.futures)?;
+
         // Live path: run all futures, never short-circuit.
         let count = self.futures.len();
         let mut outcomes: Vec<Option<Result<O, OperationError>>> =
@@ -607,6 +611,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                 .with_wire(wire));
         }
 
+        reject_unclaimed_inputs(&self.ctx, &positional_id, &self.futures)?;
+
         // Live path: race all futures, keep going until one succeeds or all
         // fail.
         let mut join_set = constituent_set(&self.ctx);
@@ -718,6 +724,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
     /// cancelled input stops at its next `.await`.
     /// Replay path: returns the frozen result, or, for a record with
     /// `ReplayChildren`, drives only the recorded winner again.
+    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         self.ctx.enforce_task_ownership()?;
 
@@ -791,6 +798,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                 .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
                 .with_wire(wire));
         }
+
+        reject_unclaimed_inputs(&self.ctx, &positional_id, &self.futures)?;
 
         // Live path: race all futures, first settled wins. A losing input
         // that waits stays pending and never suspends the invocation once
@@ -877,6 +886,36 @@ fn spawn_constituent<O: Send + 'static>(
         .map_err(NoRuntime::operation_error)
 }
 
+/// Fails a combinator that would start a still-unclaimed combinator input.
+///
+/// A combinator claims its operation ID on its first poll or at `.spawn()`.
+/// An outer combinator polls its inputs on tasks it spawns, so two
+/// unclaimed inner combinators would claim their IDs in scheduler order,
+/// and the IDs would differ between runs. JS rejects the same handler with
+/// its context usage error. So every path that would start inputs calls
+/// this first, after any START write the path needs and before it starts
+/// any input. For the first unclaimed combinator input, it records an
+/// execution-fatal context usage error and returns it. No input runs, and
+/// the outer combinator writes neither `SUCCEED` nor `FAIL`.
+///
+/// `outer` is the positional ID of the outer combinator.
+fn reject_unclaimed_inputs<O: Send + 'static>(
+    ctx: &DurableContext,
+    outer: &str,
+    futures: &[DurableFuture<O>],
+) -> Result<(), OperationError> {
+    let message = futures
+        .iter()
+        .find(|future| future.is_unclaimed_combinator())
+        .and_then(|future| future.unclaimed_input_message(outer));
+    if let Some(message) = message {
+        ctx.coordinator()
+            .record_fatal("Error".to_owned(), message.clone());
+        return Err(combinator_internal_error(&message));
+    }
+    Ok(())
+}
+
 /// Creates the join set of one combinator's inputs, counted on the
 /// invocation's task tracker.
 fn constituent_set<O: Send + 'static>(
@@ -891,7 +930,8 @@ fn constituent_set<O: Send + 'static>(
 /// Called at the top of [`checkpoint_succeed`] and [`checkpoint_fail`], which
 /// every combinator's live path funnels through. A replay identity mismatch
 /// is recorded on the shared fatal slot eagerly: when the mismatching
-/// constituent [`DurableFuture`] was finalized (see `preflight_identity!` in
+/// constituent [`DurableFuture`] was finalized, or, for a combinator
+/// constituent, when it claimed its ID (see `preflight_identity!` in
 /// `builders`), so by the time a short-circuiting combinator (`select_ok`,
 /// `race`, `try_join_all`) is ready to record a winner, the slot already
 /// says the recorded history contradicts the handler. Writing a SUCCEED (or
@@ -1003,13 +1043,15 @@ async fn checkpoint_winner_succeed(
 /// Rebuilds the value of a `race` or `select_ok` whose SUCCEEDED record
 /// carries `ReplayChildren` and a [`RecordedWinner`] payload.
 ///
-/// 1. The payload names the winner's input index. A missing payload, or one
+/// 1. A still-unclaimed combinator input fails the execution (see
+///    [`reject_unclaimed_inputs`]), before any input is driven.
+/// 2. The payload names the winner's input index. A missing payload, or one
 ///    that does not decode, is an internal error.
-/// 2. An index past the inputs is an internal error.
-/// 3. Every other input is dropped without being polled: a lazy input never
+/// 3. An index past the inputs is an internal error.
+/// 4. Every other input is dropped without being polled: a lazy input never
 ///    runs, and a spawned one is aborted. The winner is awaited directly, so
 ///    its error, or its wait for the service, is the combinator's.
-/// 4. The value is serialized and decoded, as the live path does, so both
+/// 5. The value is serialized and decoded, as the live path does, so both
 ///    paths return the same value.
 ///
 /// It writes no checkpoint and emits no `operation_replayed` event, as
@@ -1019,6 +1061,7 @@ async fn replay_recorded_winner<O: Serialize + DeserializeOwned + Send + 'static
     positional_id: &str,
     futures: Vec<DurableFuture<O>>,
 ) -> Result<O, OperationError> {
+    reject_unclaimed_inputs(ctx, positional_id, &futures)?;
     let RecordedWinner { winner } = ctx
         .checkpoint_result_payload(positional_id)
         .and_then(|payload| serde_json::from_str(&payload).ok())
@@ -3444,6 +3487,111 @@ mod tests {
         .unwrap();
         assert_eq!(value, vec![1, 2]);
         assert_eq!(client.recorded_updates().len(), 0, "no update");
+    }
+
+    // === unclaimed combinator inputs (issue #149) ===
+
+    /// The outer combinator of a test-20 case.
+    #[derive(Clone, Copy, Debug)]
+    enum Outer {
+        TryJoinAll,
+        JoinAll,
+        SelectOk,
+        Race,
+    }
+
+    /// The record the outer combinator finds at positional ID "1".
+    #[derive(Clone, Copy, Debug)]
+    enum Recorded {
+        Nothing,
+        Started,
+        Pending,
+        ReplayChildren,
+    }
+
+    /// Test 20: on every path that would start its inputs, an outer
+    /// combinator fails on a still-unclaimed combinator input before it
+    /// polls any input, and it writes START only when no record exists.
+    #[tokio::test]
+    async fn unclaimed_input_check_covers_every_spawn_path() {
+        let outers = [
+            Outer::TryJoinAll,
+            Outer::JoinAll,
+            Outer::SelectOk,
+            Outer::Race,
+        ];
+        let records = [
+            Recorded::Nothing,
+            Recorded::Started,
+            Recorded::Pending,
+            Recorded::ReplayChildren,
+        ];
+        for outer in outers {
+            for recorded in records {
+                let log = match recorded {
+                    Recorded::Nothing => CheckpointLog::empty(),
+                    Recorded::Started | Recorded::Pending => {
+                        let (wire_id, mut record) = succeeded_record("1", "");
+                        record.result = None;
+                        record.status = if matches!(recorded, Recorded::Started) {
+                            CheckpointStatus::Started
+                        } else {
+                            CheckpointStatus::Pending
+                        };
+                        CheckpointLog::from_records(vec![(wire_id, record)])
+                    }
+                    Recorded::ReplayChildren => {
+                        let payload = match outer {
+                            Outer::TryJoinAll | Outer::JoinAll => "",
+                            Outer::SelectOk | Outer::Race => r#"{"winner":0}"#,
+                        };
+                        let (wire_id, mut record) = succeeded_record("1", payload);
+                        record.replay_children = true;
+                        CheckpointLog::from_records(vec![(wire_id, record)])
+                    }
+                };
+                let (ctx, client) = recording_ctx(log);
+                let polled = Arc::new(AtomicBool::new(false));
+                let inner = ctx.race(vec![flagging(&polled, 1)]).name("inner").future();
+                // The claimed input comes first, so the check must skip it.
+                let inputs = vec![flagging(&polled, 2), inner];
+                let failed = match outer {
+                    Outer::TryJoinAll => ctx.try_join_all(inputs).await.is_err(),
+                    Outer::JoinAll => ctx.join_all(inputs).await.is_err(),
+                    Outer::SelectOk => ctx.select_ok(inputs).await.is_err(),
+                    Outer::Race => ctx.race(inputs).await.is_err(),
+                };
+                let case = format!("{outer:?} with {recorded:?}");
+                assert!(failed, "{case}: the outer combinator fails");
+                let fatal = ctx.coordinator().fatal_error().expect("a fatal error");
+                assert_eq!(fatal.error_type, "Error", "{case}");
+                assert_eq!(
+                    fatal.error_message,
+                    "context usage error in \"race\": the combinator was created on context \
+                     \"root\", but combinator \"1\" started it as an input. Start the inner \
+                     combinator with .spawn() and pass the returned handle to the outer \
+                     combinator.",
+                    "{case}"
+                );
+                assert!(!polled.load(Ordering::SeqCst), "{case}: no input is polled");
+                assert_eq!(
+                    ctx.mint_id().positional(),
+                    "2",
+                    "{case}: the inner combinator claims nothing"
+                );
+                let actions: Vec<_> = client
+                    .recorded_updates()
+                    .iter()
+                    .map(|u| u.action().clone())
+                    .collect();
+                let expected = if matches!(recorded, Recorded::Nothing) {
+                    vec![aws_sdk_lambda::types::OperationAction::Start]
+                } else {
+                    vec![]
+                };
+                assert_eq!(actions, expected, "{case}: START only without a record");
+            }
+        }
     }
 }
 

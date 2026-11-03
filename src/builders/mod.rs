@@ -32,17 +32,26 @@
 
 use std::time::Duration;
 
-/// Eagerly validates the builder's claimed replay identity when the builder
-/// is finalized into a [`DurableFuture`](crate::DurableFuture).
+/// Eagerly validates the builder's claimed replay identity right after the
+/// builder claims its operation ID.
 ///
-/// Every `into_future` runs this FIRST, and `.future()`, `.spawn()`, and
-/// `.await` all funnel through `into_future`, so a replay identity mismatch
-/// is recorded on the execution-fatal slot synchronously at finalization,
-/// before the operation future is ever polled. This is what makes fatal
-/// propagation scheduler-independent: a short-circuiting combinator
-/// (`select_ok`, `race`, `try_join_all`) aborts losers the moment a winner
-/// settles, so a mismatching constituent might never be polled, but by then
-/// its identity was already validated here.
+/// Every builder except a combinator claims its ID when it is created, and
+/// its `into_future` runs this FIRST. `.future()`, `.spawn()`, and `.await`
+/// all funnel through `into_future`, so a replay identity mismatch is
+/// recorded on the execution-fatal slot synchronously at finalization,
+/// before the operation future is ever polled.
+///
+/// A combinator claims its ID on the first poll of its future, or at
+/// `.spawn()`, and runs this right after that claim, before its body runs.
+///
+/// This is what makes fatal propagation scheduler-independent. A
+/// short-circuiting combinator (`select_ok`, `race`, `try_join_all`) aborts
+/// losers the moment a winner settles, so a mismatching constituent might
+/// never be polled. An input that is not a combinator was validated when it
+/// was finalized. A combinator input either claimed and was validated at its
+/// first poll or `.spawn()`, or it is still unclaimed, and then the outer
+/// combinator fails the execution with a context usage error before it
+/// starts any input.
 ///
 /// On mismatch the returned future resolves immediately with the dedicated
 /// error and never runs the operation (no START is checkpointed for an
@@ -64,7 +73,10 @@ macro_rules! preflight_identity {
 ///
 /// Builds the operation future with the builder's lazy terminal
 /// (`into_future`, which runs the identity preflight and the admission
-/// check), then starts it on its own task through
+/// check). For a combinator it then runs the pending claim
+/// ([`DurableFuture::claim_now`](crate::future::DurableFuture)), so the
+/// combinator claims its ID and runs the identity preflight at the
+/// `.spawn()` call. Then it starts the future on its own task through
 /// [`DurableFuture::spawn_blessed`](crate::future::DurableFuture), which
 /// blesses the task with the builder context's ownership handle.
 ///
@@ -87,7 +99,8 @@ macro_rules! spawn_terminal {
         let builder = $builder;
         let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
         let coordinator = ::std::sync::Arc::clone(builder.ctx.coordinator());
-        let future = ::std::future::IntoFuture::into_future(builder);
+        let mut future = ::std::future::IntoFuture::into_future(builder);
+        future.claim_now();
         $crate::future::DurableFuture::spawn_blessed(future, &task_ownership, &coordinator, None)
     }};
     ($builder:expr, batch_future) => {{

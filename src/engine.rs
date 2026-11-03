@@ -88,8 +88,10 @@ mod hex {
 /// `SeqCst` is deliberate: the spec's defining invariant is that ID
 /// assignment follows program order. `SeqCst` is the only ordering that
 /// prevents the compiler and CPU from reordering atomic operations with
-/// respect to other memory accesses on the same thread, guaranteeing the
-/// "minted at the call site" contract.
+/// respect to other memory accesses on the same thread, guaranteeing that
+/// an ID is minted where the handler's control flow claims it: at the call
+/// site for every operation except a combinator, and at a combinator's
+/// first poll or `.spawn()`.
 #[derive(Debug)]
 pub(crate) struct IdCounter {
     prefix: String,
@@ -108,7 +110,9 @@ impl IdCounter {
 
     /// Mints the next operation ID. Synchronous, lock-free.
     ///
-    /// This is the call-site claim: every invocation advances the counter by
+    /// Every operation claims its ID through this. Every operation except a
+    /// combinator calls it at its call site; a combinator calls it on its
+    /// first poll or at `.spawn()`. Every invocation advances the counter by
     /// exactly one position and returns the operation identity.
     pub(crate) fn mint(&self) -> OperationId {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;

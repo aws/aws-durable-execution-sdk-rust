@@ -39,7 +39,18 @@
 //! Each durable operation has an **operation ID**: the identity that ties a
 //! call site to its recorded result. The SDK mints IDs synchronously at the
 //! call site, in the order the handler creates operations, and replay hands
-//! each recorded result to the operation that claims the same ID. A `map`,
+//! each recorded result to the operation that claims the same ID. A
+//! combinator ([`DurableContext::try_join_all`],
+//! [`DurableContext::join_all`], [`DurableContext::select_ok`],
+//! [`DurableContext::race`]) is the exception: it claims its ID when it is
+//! first awaited or polled, or when it is spawned. That point is in the
+//! handler's own control flow, so it is deterministic as long as the handler
+//! awaits the combinator where it awaited it on the first run. A combinator
+//! that is dropped before that point claims no ID and records nothing. A
+//! combinator passed to another combinator must already have claimed its ID:
+//! start the inner combinator with `.spawn()` and pass the returned handle.
+//! A still-unclaimed one fails the execution with a context usage error. A
+//! `map`,
 //! `parallel` or `parallel_mixed` claims one ID from its caller, its own,
 //! and numbers its items inside the batch: item `i` gets the ID of item `i`
 //! in the batch's namespace, however the items are scheduled. Replay is

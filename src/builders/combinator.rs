@@ -5,6 +5,12 @@
 //! [`DurableContext::select_ok`](crate::DurableContext::select_ok), and
 //! [`DurableContext::race`](crate::DurableContext::race).
 //!
+//! A combinator claims its operation ID when it is first awaited or
+//! polled, or when it is spawned, not when the context method is called.
+//! Every other operation claims its ID when its builder is created. A
+//! combinator builder or future that is dropped before that point claims no
+//! ID and records nothing.
+//!
 //! The combinators are this SDK's composition surface over
 //! [`DurableFuture`] values; the
 //! [operations section of the SDK reference](https://docs.aws.amazon.com/durable-execution/sdk-reference/)
@@ -15,7 +21,15 @@ use std::future::IntoFuture;
 use crate::context::DurableContext;
 use crate::engine::OperationId;
 use crate::error::OperationError;
-use crate::future::DurableFuture;
+use crate::future::{DurableFuture, PendingClaim};
+
+/// The operation ID a combinator claimed on its first poll or at
+/// `.spawn()`, with the context and name it was claimed with.
+struct Claimed {
+    ctx: DurableContext,
+    op_id: OperationId,
+    name: Option<String>,
+}
 
 /// Builder for [`DurableContext::try_join_all`]: fail-fast join.
 ///
@@ -48,7 +62,6 @@ use crate::future::DurableFuture;
 #[non_exhaustive]
 pub struct TryJoinAllBuilder<O> {
     ctx: DurableContext,
-    op_id: OperationId,
     name: Option<String>,
     futures: Vec<DurableFuture<O>>,
 }
@@ -63,14 +76,9 @@ impl<O> std::fmt::Debug for TryJoinAllBuilder<O> {
 
 impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoinAllBuilder<O> {
     /// Creates a new builder (internal).
-    pub(crate) fn new_internal(
-        ctx: DurableContext,
-        op_id: OperationId,
-        futures: Vec<DurableFuture<O>>,
-    ) -> Self {
+    pub(crate) fn new_internal(ctx: DurableContext, futures: Vec<DurableFuture<O>>) -> Self {
         Self {
             ctx,
-            op_id,
             name: None,
             futures,
         }
@@ -93,6 +101,13 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
     /// so `.future()` is how operations of different kinds join or race
     /// together. It does not start the operation: whatever awaits the
     /// returned future drives it, and a combinator drops the losers.
+    ///
+    /// The returned future claims the combinator's operation ID on its
+    /// first poll, not here. Dropped before its first poll, it claims no ID
+    /// and records nothing. Do not pass it to another combinator: an outer
+    /// combinator that would start a still-unclaimed combinator fails the
+    /// execution with a context usage error. Pass the handle that
+    /// [`.spawn()`](Self::spawn) returns instead.
     pub fn future(self) -> DurableFuture<Vec<O>> {
         self.into_future()
     }
@@ -102,6 +117,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
     /// The returned [`DurableFuture`] is already running; this is the
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
+    ///
+    /// The combinator claims its operation ID at this call, and checks it
+    /// against the recorded history before the task starts. The returned
+    /// handle has claimed, so it is a valid input to another combinator.
     ///
     /// Dropping the returned future cancels the operation. When the handler
     /// returns while a cancelled operation still waits, the execution ends
@@ -126,18 +145,24 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::TryJoinAllExecution;
 
-        preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
-
-        let gate = self.ctx.clone();
-
-        let execution = TryJoinAllExecution {
-            ctx: self.ctx,
-            op_id: self.op_id,
-            name: self.name,
-            futures: self.futures,
-        };
-
-        DurableFuture::for_operation(&gate, execution.execute())
+        let Self { ctx, name, futures } = self;
+        let context = crate::context::display_prefix(ctx.prefix()).to_owned();
+        DurableFuture::deferred(PendingClaim::new("try_join_all", context, move || {
+            let claimed = Claimed {
+                op_id: ctx.claim_operation_id("try_join_all"),
+                ctx,
+                name,
+            };
+            preflight_identity!(claimed, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+            let gate = claimed.ctx.clone();
+            let execution = TryJoinAllExecution {
+                ctx: claimed.ctx,
+                op_id: claimed.op_id,
+                name: claimed.name,
+                futures,
+            };
+            DurableFuture::for_operation(&gate, execution.execute())
+        }))
     }
 }
 
@@ -195,7 +220,6 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 #[non_exhaustive]
 pub struct JoinAllBuilder<O> {
     ctx: DurableContext,
-    op_id: OperationId,
     name: Option<String>,
     futures: Vec<DurableFuture<O>>,
 }
@@ -210,14 +234,9 @@ impl<O> std::fmt::Debug for JoinAllBuilder<O> {
 
 impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAllBuilder<O> {
     /// Creates a new builder (internal).
-    pub(crate) fn new_internal(
-        ctx: DurableContext,
-        op_id: OperationId,
-        futures: Vec<DurableFuture<O>>,
-    ) -> Self {
+    pub(crate) fn new_internal(ctx: DurableContext, futures: Vec<DurableFuture<O>>) -> Self {
         Self {
             ctx,
-            op_id,
             name: None,
             futures,
         }
@@ -240,6 +259,13 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     /// so `.future()` is how operations of different kinds join or race
     /// together. It does not start the operation: whatever awaits the
     /// returned future drives it, and a combinator drops the losers.
+    ///
+    /// The returned future claims the combinator's operation ID on its
+    /// first poll, not here. Dropped before its first poll, it claims no ID
+    /// and records nothing. Do not pass it to another combinator: an outer
+    /// combinator that would start a still-unclaimed combinator fails the
+    /// execution with a context usage error. Pass the handle that
+    /// [`.spawn()`](Self::spawn) returns instead.
     pub fn future(self) -> DurableFuture<Vec<Result<O, OperationError>>> {
         self.into_future()
     }
@@ -249,6 +275,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     /// The returned [`DurableFuture`] is already running; this is the
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
+    ///
+    /// The combinator claims its operation ID at this call, and checks it
+    /// against the recorded history before the task starts. The returned
+    /// handle has claimed, so it is a valid input to another combinator.
     ///
     /// Dropping the returned future cancels the operation. When the handler
     /// returns while a cancelled operation still waits, the execution ends
@@ -273,18 +303,24 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::JoinAllExecution;
 
-        preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
-
-        let gate = self.ctx.clone();
-
-        let execution = JoinAllExecution {
-            ctx: self.ctx,
-            op_id: self.op_id,
-            name: self.name,
-            futures: self.futures,
-        };
-
-        DurableFuture::for_operation(&gate, execution.execute())
+        let Self { ctx, name, futures } = self;
+        let context = crate::context::display_prefix(ctx.prefix()).to_owned();
+        DurableFuture::deferred(PendingClaim::new("join_all", context, move || {
+            let claimed = Claimed {
+                op_id: ctx.claim_operation_id("join_all"),
+                ctx,
+                name,
+            };
+            preflight_identity!(claimed, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+            let gate = claimed.ctx.clone();
+            let execution = JoinAllExecution {
+                ctx: claimed.ctx,
+                op_id: claimed.op_id,
+                name: claimed.name,
+                futures,
+            };
+            DurableFuture::for_operation(&gate, execution.execute())
+        }))
     }
 }
 
@@ -317,7 +353,6 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 #[non_exhaustive]
 pub struct SelectOkBuilder<O> {
     ctx: DurableContext,
-    op_id: OperationId,
     name: Option<String>,
     futures: Vec<DurableFuture<O>>,
 }
@@ -332,14 +367,9 @@ impl<O> std::fmt::Debug for SelectOkBuilder<O> {
 
 impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectOkBuilder<O> {
     /// Creates a new builder (internal).
-    pub(crate) fn new_internal(
-        ctx: DurableContext,
-        op_id: OperationId,
-        futures: Vec<DurableFuture<O>>,
-    ) -> Self {
+    pub(crate) fn new_internal(ctx: DurableContext, futures: Vec<DurableFuture<O>>) -> Self {
         Self {
             ctx,
-            op_id,
             name: None,
             futures,
         }
@@ -362,6 +392,13 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
     /// so `.future()` is how operations of different kinds join or race
     /// together. It does not start the operation: whatever awaits the
     /// returned future drives it, and a combinator drops the losers.
+    ///
+    /// The returned future claims the combinator's operation ID on its
+    /// first poll, not here. Dropped before its first poll, it claims no ID
+    /// and records nothing. Do not pass it to another combinator: an outer
+    /// combinator that would start a still-unclaimed combinator fails the
+    /// execution with a context usage error. Pass the handle that
+    /// [`.spawn()`](Self::spawn) returns instead.
     pub fn future(self) -> DurableFuture<O> {
         self.into_future()
     }
@@ -371,6 +408,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
     /// The returned [`DurableFuture`] is already running; this is the
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
+    ///
+    /// The combinator claims its operation ID at this call, and checks it
+    /// against the recorded history before the task starts. The returned
+    /// handle has claimed, so it is a valid input to another combinator.
     ///
     /// Dropping the returned future cancels the operation. When the handler
     /// returns while a cancelled operation still waits, the execution ends
@@ -395,18 +436,24 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::SelectOkExecution;
 
-        preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
-
-        let gate = self.ctx.clone();
-
-        let execution = SelectOkExecution {
-            ctx: self.ctx,
-            op_id: self.op_id,
-            name: self.name,
-            futures: self.futures,
-        };
-
-        DurableFuture::for_operation(&gate, execution.execute())
+        let Self { ctx, name, futures } = self;
+        let context = crate::context::display_prefix(ctx.prefix()).to_owned();
+        DurableFuture::deferred(PendingClaim::new("select_ok", context, move || {
+            let claimed = Claimed {
+                op_id: ctx.claim_operation_id("select_ok"),
+                ctx,
+                name,
+            };
+            preflight_identity!(claimed, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+            let gate = claimed.ctx.clone();
+            let execution = SelectOkExecution {
+                ctx: claimed.ctx,
+                op_id: claimed.op_id,
+                name: claimed.name,
+                futures,
+            };
+            DurableFuture::for_operation(&gate, execution.execute())
+        }))
     }
 }
 
@@ -439,7 +486,6 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 #[non_exhaustive]
 pub struct RaceBuilder<O> {
     ctx: DurableContext,
-    op_id: OperationId,
     name: Option<String>,
     futures: Vec<DurableFuture<O>>,
 }
@@ -454,14 +500,9 @@ impl<O> std::fmt::Debug for RaceBuilder<O> {
 
 impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBuilder<O> {
     /// Creates a new builder (internal).
-    pub(crate) fn new_internal(
-        ctx: DurableContext,
-        op_id: OperationId,
-        futures: Vec<DurableFuture<O>>,
-    ) -> Self {
+    pub(crate) fn new_internal(ctx: DurableContext, futures: Vec<DurableFuture<O>>) -> Self {
         Self {
             ctx,
-            op_id,
             name: None,
             futures,
         }
@@ -484,6 +525,13 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
     /// so `.future()` is how operations of different kinds join or race
     /// together. It does not start the operation: whatever awaits the
     /// returned future drives it, and a combinator drops the losers.
+    ///
+    /// The returned future claims the combinator's operation ID on its
+    /// first poll, not here. Dropped before its first poll, it claims no ID
+    /// and records nothing. Do not pass it to another combinator: an outer
+    /// combinator that would start a still-unclaimed combinator fails the
+    /// execution with a context usage error. Pass the handle that
+    /// [`.spawn()`](Self::spawn) returns instead.
     pub fn future(self) -> DurableFuture<O> {
         self.into_future()
     }
@@ -493,6 +541,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
     /// The returned [`DurableFuture`] is already running; this is the
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
+    ///
+    /// The combinator claims its operation ID at this call, and checks it
+    /// against the recorded history before the task starts. The returned
+    /// handle has claimed, so it is a valid input to another combinator.
     ///
     /// Dropping the returned future cancels the operation. When the handler
     /// returns while a cancelled operation still waits, the execution ends
@@ -517,17 +569,118 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
     fn into_future(self) -> Self::IntoFuture {
         use crate::combinator::RaceExecution;
 
-        preflight_identity!(self, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+        let Self { ctx, name, futures } = self;
+        let context = crate::context::display_prefix(ctx.prefix()).to_owned();
+        DurableFuture::deferred(PendingClaim::new("race", context, move || {
+            let claimed = Claimed {
+                op_id: ctx.claim_operation_id("race"),
+                ctx,
+                name,
+            };
+            preflight_identity!(claimed, "Context", crate::combinator::COMBINATOR_SUB_TYPE);
+            let gate = claimed.ctx.clone();
+            let execution = RaceExecution {
+                ctx: claimed.ctx,
+                op_id: claimed.op_id,
+                name: claimed.name,
+                futures,
+            };
+            DurableFuture::for_operation(&gate, execution.execute())
+        }))
+    }
+}
 
-        let gate = self.ctx.clone();
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-        let execution = RaceExecution {
-            ctx: self.ctx,
-            op_id: self.op_id,
-            name: self.name,
-            futures: self.futures,
+    use crate::DurableFuture;
+    use crate::context::DurableContext;
+    use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
+
+    /// Test 18: a builder and a `.future()` dropped before their first poll
+    /// claim no ID.
+    #[test]
+    fn dropped_combinator_builder_claims_nothing() {
+        let ctx = DurableContext::new_root(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+        );
+        drop(ctx.try_join_all(Vec::<DurableFuture<i32>>::new()));
+        drop(ctx.join_all(Vec::<DurableFuture<i32>>::new()).future());
+        drop(
+            ctx.select_ok(Vec::<DurableFuture<i32>>::new())
+                .name("s")
+                .future(),
+        );
+        drop(ctx.race(Vec::<DurableFuture<i32>>::new()));
+        assert_eq!(ctx.mint_id().positional(), "1", "the counter is unchanged");
+    }
+
+    /// A context whose log records a succeeded step at positional ID "1".
+    fn ctx_with_step_at_1() -> DurableContext {
+        let wire_id = crate::engine::compute_wire_id_public("1");
+        let record = CheckpointRecord {
+            id: wire_id.clone(),
+            status: CheckpointStatus::Succeeded,
+            result: Some("1".to_owned()),
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Step".to_owned()),
+            sub_type: Some("Step".to_owned()),
+            due_at: None,
+            op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
         };
+        DurableContext::new_root(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(vec![(wire_id, record)])),
+        )
+    }
 
-        DurableFuture::for_operation(&gate, execution.execute())
+    /// Asserts that `claim` recorded a replay identity mismatch on `ctx`.
+    fn assert_mismatch_recorded(method: &str, ctx: &DurableContext) {
+        assert!(
+            ctx.coordinator().fatal_error().is_some(),
+            "{method}: the claim records the mismatch before any poll"
+        );
+    }
+
+    /// The claim of each combinator checks its ID against the recorded
+    /// history at once, before the future is polled. A step recorded at
+    /// the claimed ID is a replay identity mismatch.
+    #[test]
+    fn claim_checks_identity_before_poll() {
+        let empty = Vec::<DurableFuture<i32>>::new;
+
+        let ctx = ctx_with_step_at_1();
+        ctx.try_join_all(empty()).future().claim_now();
+        assert_mismatch_recorded("try_join_all", &ctx);
+
+        let ctx = ctx_with_step_at_1();
+        ctx.join_all(empty()).future().claim_now();
+        assert_mismatch_recorded("join_all", &ctx);
+
+        let ctx = ctx_with_step_at_1();
+        ctx.select_ok(empty()).future().claim_now();
+        assert_mismatch_recorded("select_ok", &ctx);
+
+        let ctx = ctx_with_step_at_1();
+        ctx.race(empty()).future().claim_now();
+        assert_mismatch_recorded("race", &ctx);
     }
 }

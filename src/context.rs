@@ -160,7 +160,7 @@ fn remaining_until(deadline_ms: u64, now: std::time::SystemTime) -> Option<Durat
 }
 
 /// Shows a context prefix in a context usage error: `root` for the root.
-fn display_prefix(prefix: &str) -> &str {
+pub(crate) fn display_prefix(prefix: &str) -> &str {
     if prefix.is_empty() { "root" } else { prefix }
 }
 
@@ -270,8 +270,16 @@ impl std::fmt::Debug for Inner {
 ///
 /// `DurableContext` is `Clone + Send + Sync` (backed by an `Arc`). Clone it
 /// freely to share across async boundaries. Every durable operation method
-/// claims its operation ID synchronously at the call site: polling order
-/// never affects identity.
+/// except the four combinators claims its operation ID synchronously at the
+/// call site: polling order never affects identity. A combinator
+/// ([`try_join_all`](Self::try_join_all), [`join_all`](Self::join_all),
+/// [`select_ok`](Self::select_ok) and [`race`](Self::race)) claims its ID
+/// when it is first awaited or polled, or when it is spawned. A combinator
+/// that is dropped before that claims no ID and records nothing. A
+/// combinator passed to another combinator must already have claimed its
+/// ID: start it with `.spawn()` and pass the returned handle. A
+/// still-unclaimed combinator input fails the execution with a context
+/// usage error.
 ///
 /// # Examples
 ///
@@ -3004,6 +3012,21 @@ impl DurableContext {
     /// A panic in an input propagates to the caller with its original
     /// payload, and the SDK records nothing for it.
     ///
+    /// # Operation ID
+    ///
+    /// This method collects `futures` and claims no operation ID. An
+    /// operation that the iterator creates claims its ID during this
+    /// collection, so the inputs take their IDs before the combinator. The
+    /// combinator claims its own ID when it is first awaited or polled, or
+    /// when it is spawned, on this context. A combinator that is dropped
+    /// before that claims no ID and records nothing. An input that is itself
+    /// a combinator must already have claimed its ID: start it with
+    /// `.spawn()` and pass the returned handle. A still-unclaimed combinator
+    /// input fails the execution with a context usage error. Starting the
+    /// combinator inside the body of another context (a child context, a
+    /// `with_retry` attempt, a map item or a parallel branch) fails the
+    /// execution with a context usage error too.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -3028,8 +3051,7 @@ impl DurableContext {
     where
         O: Serialize + DeserializeOwned + Send + 'static,
     {
-        let op_id = self.claim_operation_id("try_join_all");
-        TryJoinAllBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
+        TryJoinAllBuilder::new_internal(self.clone(), futures.into_iter().collect())
     }
 
     /// Joins all futures, collecting every outcome as a `Result`.
@@ -3075,6 +3097,21 @@ impl DurableContext {
     /// Called with no futures, resolves to `Ok` with an empty `Vec`,
     /// matching `futures::future::join_all`.
     ///
+    /// # Operation ID
+    ///
+    /// This method collects `futures` and claims no operation ID. An
+    /// operation that the iterator creates claims its ID during this
+    /// collection, so the inputs take their IDs before the combinator. The
+    /// combinator claims its own ID when it is first awaited or polled, or
+    /// when it is spawned, on this context. A combinator that is dropped
+    /// before that claims no ID and records nothing. An input that is itself
+    /// a combinator must already have claimed its ID: start it with
+    /// `.spawn()` and pass the returned handle. A still-unclaimed combinator
+    /// input fails the execution with a context usage error. Starting the
+    /// combinator inside the body of another context (a child context, a
+    /// `with_retry` attempt, a map item or a parallel branch) fails the
+    /// execution with a context usage error too.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -3102,8 +3139,7 @@ impl DurableContext {
     where
         O: Serialize + DeserializeOwned + Send + 'static,
     {
-        let op_id = self.claim_operation_id("join_all");
-        JoinAllBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
+        JoinAllBuilder::new_internal(self.clone(), futures.into_iter().collect())
     }
 
     /// Returns the first successful result.
@@ -3140,6 +3176,21 @@ impl DurableContext {
     /// A panic in an input propagates to the caller with its original
     /// payload, and the SDK records nothing for it.
     ///
+    /// # Operation ID
+    ///
+    /// This method collects `futures` and claims no operation ID. An
+    /// operation that the iterator creates claims its ID during this
+    /// collection, so the inputs take their IDs before the combinator. The
+    /// combinator claims its own ID when it is first awaited or polled, or
+    /// when it is spawned, on this context. A combinator that is dropped
+    /// before that claims no ID and records nothing. An input that is itself
+    /// a combinator must already have claimed its ID: start it with
+    /// `.spawn()` and pass the returned handle. A still-unclaimed combinator
+    /// input fails the execution with a context usage error. Starting the
+    /// combinator inside the body of another context (a child context, a
+    /// `with_retry` attempt, a map item or a parallel branch) fails the
+    /// execution with a context usage error too.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -3164,8 +3215,7 @@ impl DurableContext {
     where
         O: Serialize + DeserializeOwned + Send + 'static,
     {
-        let op_id = self.claim_operation_id("select_ok");
-        SelectOkBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
+        SelectOkBuilder::new_internal(self.clone(), futures.into_iter().collect())
     }
 
     /// Returns the first settled result, whether success or failure.
@@ -3204,6 +3254,21 @@ impl DurableContext {
     /// A panic in an input propagates to the caller with its original
     /// payload, and the SDK records nothing for it.
     ///
+    /// # Operation ID
+    ///
+    /// This method collects `futures` and claims no operation ID. An
+    /// operation that the iterator creates claims its ID during this
+    /// collection, so the inputs take their IDs before the combinator. The
+    /// combinator claims its own ID when it is first awaited or polled, or
+    /// when it is spawned, on this context. A combinator that is dropped
+    /// before that claims no ID and records nothing. An input that is itself
+    /// a combinator must already have claimed its ID: start it with
+    /// `.spawn()` and pass the returned handle. A still-unclaimed combinator
+    /// input fails the execution with a context usage error. Starting the
+    /// combinator inside the body of another context (a child context, a
+    /// `with_retry` attempt, a map item or a parallel branch) fails the
+    /// execution with a context usage error too.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -3225,8 +3290,7 @@ impl DurableContext {
     where
         O: Serialize + DeserializeOwned + Send + 'static,
     {
-        let op_id = self.claim_operation_id("race");
-        RaceBuilder::new_internal(self.clone(), op_id, futures.into_iter().collect())
+        RaceBuilder::new_internal(self.clone(), futures.into_iter().collect())
     }
 }
 
@@ -3434,6 +3498,33 @@ mod tests {
     use crate::engine::{CheckpointLog, CheckpointStatus};
     use aws_sdk_lambda::types::Operation;
     use std::sync::Arc;
+
+    /// Test 19: each combinator method collects the operations its
+    /// iterator creates, which claim their IDs, and claims no ID itself.
+    #[test]
+    fn combinator_methods_collect_without_claiming() {
+        let ctx = DurableContext::new_root(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+        );
+        // A lazy iterator: each step claims its ID when the combinator
+        // method collects it.
+        let inputs = || {
+            let ctx = &ctx;
+            (0..2).map(move |n| ctx.step(move |_| async move { Ok(n) }).future())
+        };
+        let try_join_all = ctx.try_join_all(inputs());
+        let join_all = ctx.join_all(inputs());
+        let select_ok = ctx.select_ok(inputs());
+        let race = ctx.race(inputs());
+        assert_eq!(
+            ctx.mint_id().positional(),
+            "9",
+            "the eight steps claimed 1 to 8, the combinators nothing"
+        );
+        drop((try_join_all, join_all, select_ok, race));
+    }
 
     /// Panics with "value drop" when dropped.
     struct DropPanics;

@@ -226,6 +226,28 @@ function of the event and of results the SDK already recorded. Iterating a
 `HashMap` or `HashSet` to create operations breaks that, because the iteration
 order changes between runs; sort into a `Vec` first.
 
+A combinator (`try_join_all`, `join_all`, `select_ok` or `race`) is the one
+exception to the call-site rule. The context method only collects the
+inputs, so inputs that an iterator creates take their IDs first. The
+combinator claims its own ID when it is first awaited or polled, or when it
+is spawned, as a JS combinator claims its ID when it is first awaited. That
+point is in the handler's own control flow, so it is deterministic as long
+as the handler awaits the combinator where it awaited it on the first run.
+A combinator that is dropped before that point claims no ID and records
+nothing. A combinator passed to another combinator must already have
+claimed its ID: start the inner combinator with `.spawn()` and pass the
+returned handle. A still-unclaimed one fails the execution with a context
+usage error.
+
+```rust ignore
+let a = ctx.step(|_| async { Ok(1u32) }).name("a").future();
+let b = ctx.step(|_| async { Ok(2u32) }).name("b").future();
+let inner = ctx.race([a, b]).name("inner").spawn(); // claims its ID here
+let c = ctx.step(|_| async { Ok(3u32) }).name("c").future();
+let all = ctx.try_join_all([inner, c]).name("all"); // claims nothing yet
+let values = all.await?; // claims its ID here
+```
+
 A `map`, `parallel` or `parallel_mixed` takes one ID from its caller, its
 own. Its items are numbered inside the batch: item `i` of the batch has the
 ID of item `i` in the batch's own namespace, whatever the item count, the
