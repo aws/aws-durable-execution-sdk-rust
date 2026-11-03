@@ -84,6 +84,9 @@
 //!   each invocation, and for the start and the end of the execution (see
 //!   [`TestResult::history_events`]). Invocation `n` has the request ID
 //!   `local-invocation-{n}`.
+//! - The backend reports operation start and end times as the run's start
+//!   time plus virtual seconds. The invocation envelope carries them as
+//!   epoch milliseconds, as the service does.
 //!
 //! # Runner divergences
 //!
@@ -2534,6 +2537,7 @@ fn build_envelope(
         "Id": EXECUTION_OPERATION_ID,
         "Type": "EXECUTION",
         "Status": "STARTED",
+        "StartTimestamp": virtual_epoch_millis(backend.base(), 0),
         "ExecutionDetails": { "InputPayload": event_json }
     }));
     operations.extend(page);
@@ -3685,7 +3689,11 @@ impl Backend {
     /// per-invocation checkpoint log).
     fn build_operations(&self) -> Vec<Operation> {
         let state = self.lock();
-        state.ops.iter().filter_map(build_operation).collect()
+        state
+            .ops
+            .iter()
+            .filter_map(|op| build_operation(op, state.base))
+            .collect()
     }
 
     /// Renders the recorded history as envelope-wire JSON operation
@@ -3698,7 +3706,7 @@ impl Backend {
         let state = self.lock();
         prune_replay_children(&state.ops)
             .into_iter()
-            .map(stored_op_envelope_json)
+            .map(|op| stored_op_envelope_json(op, state.base))
             .collect()
     }
 
@@ -3709,13 +3717,18 @@ impl Backend {
         let state = self.lock();
         prune_replay_children(&state.ops)
             .into_iter()
-            .filter_map(build_operation)
+            .filter_map(|op| build_operation(op, state.base))
             .collect()
     }
 
     /// The virtual time.
     fn now(&self) -> u64 {
         self.lock().now
+    }
+
+    /// The wall-clock time the run started.
+    fn base(&self) -> std::time::SystemTime {
+        self.lock().base
     }
 
     /// The recorded history events.
@@ -4115,11 +4128,7 @@ impl BackendState {
     /// `DateTime` counts seconds in an `i64`, so the sum cannot leave its
     /// range: `t` is a sum of `i32` wait and retry durations.
     fn event_time(&self, t: u64) -> DateTime {
-        let base = DateTime::from(self.base);
-        DateTime::from_secs_and_nanos(
-            base.secs().saturating_add(t.cast_signed()),
-            base.subsec_nanos(),
-        )
+        virtual_date_time(self.base, t)
     }
 
     /// Appends the event `builder` describes, with the next event ID
@@ -4501,7 +4510,7 @@ impl Backend {
             let mut out = Vec::with_capacity(updates.len());
             for (update, kind) in updates.iter().zip(kinds) {
                 if let Some(stored) = state.apply_update(kind, update)
-                    && let Some(op) = build_operation(&stored)
+                    && let Some(op) = build_operation(&stored, state.base)
                 {
                     out.push(op);
                 }
@@ -4714,16 +4723,46 @@ fn settled_event(op: &StoredOp) -> Option<EventBuilder> {
     Some(event)
 }
 
+/// The `DateTime` of the virtual time `t`: the run's start time `base`
+/// plus `t` seconds, the time [`TestOperation::start_time`] and
+/// [`TestOperation::end_time`] report.
+///
+/// `DateTime` counts seconds in an `i64`, so the sum cannot leave its
+/// range: `t` is a sum of `i32` wait and retry durations. The sum
+/// saturates, so no conversion panics.
+fn virtual_date_time(base: std::time::SystemTime, t: u64) -> DateTime {
+    let base = DateTime::from(base);
+    DateTime::from_secs_and_nanos(
+        base.secs().saturating_add(t.cast_signed()),
+        base.subsec_nanos(),
+    )
+}
+
+/// The epoch milliseconds of the virtual time `t`: the run's start time
+/// `base` in epoch milliseconds plus `t` seconds. The envelope carries
+/// operation times in this unit, as the service does. The arithmetic
+/// saturates, so no conversion panics.
+fn virtual_epoch_millis(base: std::time::SystemTime, t: u64) -> u64 {
+    let base_ms = base
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    base_ms.saturating_add(t.saturating_mul(1000))
+}
+
 /// Builds an SDK `Operation` from a stored op, placing result/error in the
-/// details bucket the SDK reads for that operation type.
-fn build_operation(stored: &StoredOp) -> Option<Operation> {
+/// details bucket the SDK reads for that operation type. The start and end
+/// times are the run's start time `base` plus the record's virtual times.
+fn build_operation(stored: &StoredOp, base: std::time::SystemTime) -> Option<Operation> {
     let error_obj = stored_wire_error(stored).map(|wire| error_object(&wire));
 
     let mut builder = Operation::builder()
         .id(&stored.id)
         .r#type(OperationType::from(stored.kind.wire_str()))
         .status(WireOperationStatus::from(stored.status.wire_str()))
-        .start_timestamp(DateTime::from_secs(0));
+        .start_timestamp(virtual_date_time(base, stored.start_at));
+    if let Some(end_at) = stored.end_at {
+        builder = builder.end_timestamp(virtual_date_time(base, end_at));
+    }
 
     if let Some(ref st) = stored.sub_type {
         builder = builder.sub_type(st);
@@ -4792,8 +4831,9 @@ fn build_operation(stored: &StoredOp) -> Option<Operation> {
 /// result/error in the details bucket `parse_single_operation` reads for
 /// that operation type. Mirrors [`build_operation`] field-for-field so the
 /// inline envelope page and the `get_state` fetch describe identical
-/// records.
-fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
+/// records. The start and end times are epoch milliseconds: the run's start
+/// time `base` plus the record's virtual times.
+fn stored_op_envelope_json(stored: &StoredOp, base: std::time::SystemTime) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("Id".to_owned(), serde_json::json!(stored.id));
     obj.insert("Type".to_owned(), serde_json::json!(stored.kind.wire_str()));
@@ -4801,6 +4841,16 @@ fn stored_op_envelope_json(stored: &StoredOp) -> serde_json::Value {
         "Status".to_owned(),
         serde_json::json!(stored.status.wire_str()),
     );
+    obj.insert(
+        "StartTimestamp".to_owned(),
+        serde_json::json!(virtual_epoch_millis(base, stored.start_at)),
+    );
+    if let Some(end_at) = stored.end_at {
+        obj.insert(
+            "EndTimestamp".to_owned(),
+            serde_json::json!(virtual_epoch_millis(base, end_at)),
+        );
+    }
     if let Some(st) = &stored.sub_type {
         obj.insert("SubType".to_owned(), serde_json::json!(st));
     }
@@ -9526,6 +9576,83 @@ mod tests {
         assert_eq!(envelope_updated_ids(&backend), serde_json::json!(["c"]));
         assert!(backend.advance(), "fires the retry");
         assert_eq!(envelope_updated_ids(&backend), serde_json::json!(["s"]));
+    }
+
+    /// Epoch milliseconds count 0 for a start time before the epoch,
+    /// saturate a start time past `u64::MAX` milliseconds, and saturate the
+    /// sum with the virtual seconds.
+    #[test]
+    fn virtual_epoch_millis_saturates() {
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(virtual_epoch_millis(epoch + second, 2), 3_000);
+        let before_epoch = epoch
+            .checked_sub(second)
+            .expect("in range on this platform");
+        assert_eq!(virtual_epoch_millis(before_epoch, 0), 0);
+        let far = epoch
+            .checked_add(std::time::Duration::from_secs(u64::MAX / 1000 + 1))
+            .expect("in range on this platform");
+        assert_eq!(virtual_epoch_millis(far, 0), u64::MAX);
+        assert_eq!(virtual_epoch_millis(epoch + second, u64::MAX), u64::MAX);
+    }
+
+    /// The envelope and `get_state` render each record's start and end
+    /// times as the run's start time plus the record's virtual seconds.
+    #[tokio::test]
+    async fn envelope_renders_virtual_timestamps() {
+        let before = std::time::SystemTime::now();
+        let backend = seeded_backend(Vec::new(), 0, &[]);
+        checkpoint_ok(&backend, vec![step_op("s", OperationAction::Start, None)]).await;
+        checkpoint_ok(&backend, vec![step_op("s", OperationAction::Succeed, None)]).await;
+        checkpoint_ok(&backend, vec![wait_start("w", 10)]).await;
+        assert!(backend.advance(), "fires the wait");
+
+        let envelope = build_envelope(&backend, "{}", None);
+        let ops = envelope["InitialExecutionState"]["Operations"]
+            .as_array()
+            .expect("Operations is an array");
+        let millis = |id: &str, field: &str| {
+            ops.iter()
+                .find(|op| op["Id"] == id)
+                .and_then(|op| op[field].as_u64())
+                .expect("the record has an integer timestamp field")
+        };
+        let e = millis(EXECUTION_OPERATION_ID, "StartTimestamp");
+        let before_ms = u64::try_from(
+            before
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_millis(),
+        )
+        .expect("fits in u64");
+        assert!(e >= before_ms, "execution start {e} before {before_ms}");
+        assert_eq!(
+            (millis("s", "StartTimestamp"), millis("s", "EndTimestamp")),
+            (e, e)
+        );
+        assert_eq!(
+            (millis("w", "StartTimestamp"), millis("w", "EndTimestamp")),
+            (e, e + 10_000)
+        );
+
+        let state = get_state_ops(&backend).await;
+        let times = |id: &str| {
+            let op = state
+                .iter()
+                .find(|op| op.id() == id)
+                .expect("get_state holds the record");
+            (
+                *op.start_timestamp(),
+                *op.end_timestamp().expect("an end timestamp"),
+            )
+        };
+        let (step_start, step_end) = times("s");
+        assert_eq!(step_start, step_end);
+        assert!(step_start >= DateTime::from(before));
+        let (wait_start_time, wait_end_time) = times("w");
+        assert_eq!(wait_end_time.secs() - wait_start_time.secs(), 10);
+        assert_eq!(wait_end_time.subsec_nanos(), wait_start_time.subsec_nanos());
     }
 
     #[tokio::test]
