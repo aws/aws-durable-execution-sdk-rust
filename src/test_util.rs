@@ -320,6 +320,10 @@ impl TestOperation {
 
     /// The operation sub-type, e.g. `"Step"`, `"Wait"`, `"Map"`,
     /// `"WaitForCondition"`, or `None` if the operation carried none.
+    ///
+    /// The constants of [`OperationSubType`](crate::OperationSubType) hold
+    /// the built-in values. A step or a callback built with a `sub_type`
+    /// setter records the custom value instead.
     pub fn sub_type(&self) -> Option<&str> {
         self.sub_type.as_deref()
     }
@@ -6492,6 +6496,96 @@ mod tests {
 
         assert!(result.is_success(), "{:?}", result.error_message());
         assert_eq!(result.output().map(String::as_str), Some("a=A b=B"));
+    }
+
+    /// The recorded subtypes of rows 10 to 14: a step and a callback without
+    /// a setter keep the built-in subtype, a custom subtype is recorded on
+    /// the operation and on each of its events, and `wait_for_callback`
+    /// keeps its three built-in subtypes.
+    #[tokio::test]
+    async fn step_and_callback_record_custom_sub_type() {
+        use crate::{OperationSubType, StepContext};
+
+        let result = LocalRunner::new()
+            .callback_for("plain-cb", success(&1_u32))
+            .callback_for("approval", success(&2_u32))
+            .callback_for("wfcb", success(&3_u32))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let plain = ctx.step(|_| async { Ok(1_u32) }).name("plain").await?;
+                    let paid = ctx
+                        .step(|step_ctx: StepContext| async move {
+                            if step_ctx.attempt() == 1 {
+                                Err::<u32, BoxError>("transient".into())
+                            } else {
+                                Ok(2)
+                            }
+                        })
+                        .name("pay")
+                        .sub_type(OperationSubType::new("Payment")?)
+                        .retry_strategy(|_err, attempt| {
+                            if attempt >= 2 {
+                                RetryDecision::Stop
+                            } else {
+                                RetryDecision::Retry {
+                                    delay: std::time::Duration::from_secs(1),
+                                }
+                            }
+                        })
+                        .await?;
+                    let cb = ctx.create_callback::<u32>().name("plain-cb").await?;
+                    let a = cb.result().await?;
+                    let cb = ctx
+                        .create_callback::<u32>()
+                        .name("approval")
+                        .sub_type(OperationSubType::new("Approval")?)
+                        .await?;
+                    let b = cb.result().await?;
+                    let c = ctx
+                        .wait_for_callback::<u32, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+                        .name("wfcb")
+                        .await?;
+                    Ok::<_, BoxError>(plain + paid + a + b + c)
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&9));
+
+        let op = |name: &str| result.operation(name).expect("the operation is recorded");
+        // Row 10.
+        assert_eq!(op("plain").sub_type(), Some("Step"));
+        // Row 11: the step retried once, and the operation and every event
+        // of it carry the custom subtype.
+        let pay = op("pay");
+        assert_eq!(pay.sub_type(), Some("Payment"));
+        assert_eq!(step_attempt(pay), Some(1));
+        assert!(pay.events().len() >= 3, "{:?}", pay.events());
+        for event in pay.events() {
+            assert_eq!(event.sub_type(), Some("Payment"), "{event:?}");
+        }
+        // Rows 12 and 13.
+        assert_eq!(op("plain-cb").sub_type(), Some("Callback"));
+        assert_eq!(op("approval").sub_type(), Some("Approval"));
+        // Row 14.
+        let wfcb = op("wfcb");
+        assert_eq!(wfcb.sub_type(), Some("WaitForCallback"));
+        let mut children: Vec<(OperationKind, Option<&str>)> = result
+            .operations()
+            .iter()
+            .filter(|child| child.parent_id() == Some(wfcb.id()))
+            .map(|child| (child.kind(), child.sub_type()))
+            .collect();
+        children.sort_by_key(|(kind, _)| kind.wire_str());
+        assert_eq!(
+            children,
+            [
+                (OperationKind::Callback, Some("Callback")),
+                (OperationKind::Step, Some("Step"))
+            ]
+        );
     }
 
     #[tokio::test]

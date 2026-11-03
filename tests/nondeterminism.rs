@@ -1046,3 +1046,84 @@ async fn changed_map_item_name_fails_replay() {
         "the wait must end invocation 1 before the batch is terminal"
     );
 }
+
+/// Runs `body(ctx, call)` under `LocalRunner`, where `call` counts the
+/// invocations from 0.
+async fn run_per_invocation<F, Fut>(body: F) -> durable::test_util::TestResult<String>
+where
+    F: Fn(durable::DurableContext, u32) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, durable::BoxError>> + Send + 'static,
+{
+    let invocation = Arc::new(AtomicU32::new(0));
+    LocalRunner::new()
+        .run(
+            move |_event: (), ctx: durable::DurableContext| {
+                let call = invocation.fetch_add(1, Ordering::SeqCst);
+                body(ctx, call)
+            },
+            (),
+        )
+        .await
+        .expect("runner")
+}
+
+/// A changed subtype fails replay as a changed name does. Invocation 1
+/// records the operation with one subtype and suspends on a wait;
+/// invocation 2 creates the same operation with another subtype.
+#[tokio::test]
+async fn sub_type_change_detected() {
+    fn sub_type(call: u32, first: &str, later: &str) -> durable::OperationSubType {
+        durable::OperationSubType::new(if call == 0 { first } else { later })
+            .expect("a valid subtype")
+    }
+
+    // A step.
+    let result = run_per_invocation(|ctx, call| async move {
+        ctx.step(|_| async { Ok(1_u32) })
+            .name("pay")
+            .sub_type(sub_type(call, "Payment", "Refund"))
+            .await?;
+        ctx.wait(Duration::from_secs(1)).name("pause").await?;
+        Ok("done".to_owned())
+    })
+    .await;
+    assert!(result.is_failure(), "{:?}", result.error_message());
+    assert_eq!(result.error_type(), Some("NonDeterministicExecutionError"));
+
+    // A create_callback.
+    let result = run_per_invocation(|ctx, call| async move {
+        let _cb = ctx
+            .create_callback::<u32>()
+            .name("approve")
+            .sub_type(sub_type(call, "Approval", "Rejection"))
+            .await?;
+        ctx.wait(Duration::from_secs(1)).name("pause").await?;
+        Ok("done".to_owned())
+    })
+    .await;
+    assert!(result.is_failure(), "{:?}", result.error_message());
+    assert_eq!(result.error_type(), Some("NonDeterministicExecutionError"));
+}
+
+/// The same handler with an unchanged subtype replays and succeeds.
+#[tokio::test]
+async fn same_sub_type_replays_successfully() {
+    let result = run_per_invocation(|ctx, _call| async move {
+        let value = ctx
+            .step(|_| async { Ok("paid".to_owned()) })
+            .name("pay")
+            .sub_type(durable::OperationSubType::new("Payment")?)
+            .await?;
+        let _cb = ctx
+            .create_callback::<u32>()
+            .name("approve")
+            .sub_type(durable::OperationSubType::new("Approval")?)
+            .await?;
+        ctx.wait(Duration::from_secs(1)).name("pause").await?;
+        Ok(value)
+    })
+    .await;
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.output().map(String::as_str), Some("paid"));
+    assert!(result.invocation_count() >= 2);
+}

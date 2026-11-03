@@ -576,6 +576,64 @@ async fn replayed_events_cover_child_condition_and_callback() {
     }
 }
 
+/// `operation_replayed` carries a custom subtype: a step that succeeded,
+/// a step that failed, and a callback each report the subtype their
+/// builder set when a resumed invocation returns their recorded outcome.
+#[tokio::test]
+#[expect(clippy::expect_used)] // reason: the queued reply encodes a bool, which cannot fail
+async fn replayed_events_carry_custom_sub_type() {
+    let (buffer, _guard) = capture_subscriber();
+
+    let result = LocalRunner::new()
+        .callback(CallbackReply::success(&true).expect("encodes"))
+        .run(
+            |_event: serde_json::Value, ctx: durable::DurableContext| async move {
+                ctx.step(|_| async { Ok(1_u32) })
+                    .name("pay")
+                    .sub_type(durable::OperationSubType::new("Payment")?)
+                    .await?;
+                let refused = ctx
+                    .step(|_| async { Err::<u32, durable::BoxError>("no".into()) })
+                    .name("refuse")
+                    .sub_type(durable::OperationSubType::new("Refusal")?)
+                    .retry_strategy(|_err, _attempt| durable::RetryDecision::Stop)
+                    .await;
+                let cb = ctx
+                    .create_callback::<bool>()
+                    .name("approve")
+                    .sub_type(durable::OperationSubType::new("Approval")?)
+                    .await?;
+                let approved = cb.result().await?;
+                // A final suspension forces one more resume, on which every
+                // operation above replays from its terminal record.
+                ctx.wait(Duration::from_secs(1)).name("final-pause").await?;
+                Ok::<_, durable::BoxError>(refused.is_err() && approved)
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&true));
+
+    let output = captured(&buffer);
+    let replayed = lifecycle_events(&output, event_names::OPERATION_REPLAYED);
+    for (sub_type, name) in [
+        ("Payment", "pay"),
+        ("Refusal", "refuse"),
+        ("Approval", "approve"),
+    ] {
+        let matching = events_with_field(&replayed, field_names::OPERATION_SUB_TYPE, sub_type);
+        assert!(
+            matching.iter().any(|v| {
+                v.get(field_names::OPERATION_NAME)
+                    .and_then(serde_json::Value::as_str)
+                    == Some(name)
+            }),
+            "operation_replayed must carry {sub_type} for '{name}'. Got: {output}"
+        );
+    }
+}
+
 /// A rejected checkpoint emits no record-transition lifecycle event: the
 /// events claim a transition was recorded, so they fire only after the
 /// checkpoint that persists it succeeds. The step whose START write is

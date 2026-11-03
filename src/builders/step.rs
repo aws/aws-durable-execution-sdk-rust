@@ -7,6 +7,7 @@
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
 
+use crate::OperationSubType;
 use crate::RetryStrategy;
 use crate::Serdes;
 use crate::context::DurableContext;
@@ -62,6 +63,7 @@ pub struct StepBuilder<O, F, Fut, S = JsonSerdes> {
     retry_strategy: Option<RetryStrategy>,
     serdes: S,
     semantics: crate::step::StepSemantics,
+    sub_type: Option<OperationSubType>,
     closure: F,
     _marker: PhantomData<fn() -> (O, Fut)>,
 }
@@ -90,6 +92,7 @@ where
             retry_strategy: None,
             serdes: JsonSerdes,
             semantics: crate::step::StepSemantics::default(),
+            sub_type: None,
             closure,
             _marker: PhantomData,
         }
@@ -202,6 +205,7 @@ where
             retry_strategy: self.retry_strategy,
             serdes,
             semantics: self.semantics,
+            sub_type: self.sub_type,
             closure: self.closure,
             _marker: PhantomData,
         }
@@ -243,6 +247,42 @@ where
     /// ```
     pub fn semantics(mut self, semantics: crate::step::StepSemantics) -> Self {
         self.semantics = semantics;
+        self
+    }
+
+    /// Records `sub_type` instead of the default subtype.
+    ///
+    /// The subtype labels this step in its checkpoint, in place of `Step`.
+    /// So the steps of an operation composed from several durable
+    /// operations can be told apart. Execution history and plugins read
+    /// it. Without this call the step records [`OperationSubType::STEP`].
+    /// A second call replaces the first.
+    ///
+    /// Replay compares the recorded subtype with this one, as it compares
+    /// the name. So changing the subtype of an existing step breaks the
+    /// executions in flight: their replay fails with
+    /// `NonDeterministicExecutionError`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::OperationSubType;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, durable::BoxError> {
+    ///     let receipt = ctx
+    ///         .step(|_| async { Ok("receipt-1".to_owned()) })
+    ///         .name("charge")
+    ///         .sub_type(OperationSubType::new("Payment")?)
+    ///         .await?;
+    ///     Ok(receipt)
+    /// }
+    /// ```
+    pub fn sub_type(mut self, sub_type: OperationSubType) -> Self {
+        self.sub_type = Some(sub_type);
         self
     }
 }
@@ -311,7 +351,13 @@ where
     fn into_future(self) -> Self::IntoFuture {
         use crate::step::StepExecution;
 
-        preflight_identity!(self, "Step", crate::step::STEP_SUB_TYPE);
+        preflight_identity!(
+            self,
+            "Step",
+            self.sub_type
+                .as_ref()
+                .map_or(crate::step::STEP_SUB_TYPE, OperationSubType::as_str)
+        );
 
         let gate = self.ctx.clone();
 
@@ -322,6 +368,7 @@ where
             retry_strategy: self.retry_strategy,
             serdes: self.serdes,
             semantics: self.semantics,
+            sub_type: self.sub_type.unwrap_or(OperationSubType::STEP),
             closure: self.closure,
             _marker: PhantomData,
         };
@@ -335,6 +382,22 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// A second `sub_type` call replaces the first, and `serdes` keeps
+    /// the subtype.
+    #[test]
+    fn sub_type_setter_replaces_and_survives_serdes() {
+        let ctx = DurableContext::test_context();
+        let builder = ctx
+            .step(|_| async { Ok("a".to_owned()) })
+            .sub_type(OperationSubType::new("First").unwrap())
+            .sub_type(OperationSubType::new("Second").unwrap())
+            .serdes(crate::PassthroughSerdes);
+        assert_eq!(
+            builder.sub_type.as_ref().map(OperationSubType::as_str),
+            Some("Second")
+        );
+    }
 
     /// The closure setters accept a bare (unboxed) closure and box it
     /// internally: a plain `|err, attempt| ...` compiles and the installed

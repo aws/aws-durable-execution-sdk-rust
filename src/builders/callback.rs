@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 use std::time::Duration;
 
 use crate::BoxError;
+use crate::OperationSubType;
 use crate::RetryStrategy;
 use crate::Serdes;
 use crate::context::DurableContext;
@@ -60,6 +61,7 @@ pub struct CreateCallbackBuilder<O, S = JsonSerdes> {
     name: Option<String>,
     timeout: Option<Duration>,
     heartbeat: Option<Duration>,
+    sub_type: Option<OperationSubType>,
     serdes: S,
     _marker: PhantomData<O>,
 }
@@ -81,6 +83,7 @@ impl<O: Send + 'static> CreateCallbackBuilder<O> {
             name: None,
             timeout: None,
             heartbeat: None,
+            sub_type: None,
             serdes: JsonSerdes,
             _marker: PhantomData,
         }
@@ -106,6 +109,42 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
         self
     }
 
+    /// Records `sub_type` instead of the default subtype.
+    ///
+    /// The subtype labels this callback in its checkpoint, in place of
+    /// `Callback`. So the callbacks of an operation composed from several
+    /// durable operations can be told apart. Execution history and
+    /// plugins read it. Without this call the callback records
+    /// [`OperationSubType::CALLBACK`]. A second call replaces the first.
+    ///
+    /// Replay compares the recorded subtype with this one, as it compares
+    /// the name. So changing the subtype of an existing callback breaks the
+    /// executions in flight: their replay fails with
+    /// `NonDeterministicExecutionError`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::OperationSubType;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<bool, durable::BoxError> {
+    ///     let cb = ctx
+    ///         .create_callback::<bool>()
+    ///         .name("approval")
+    ///         .sub_type(OperationSubType::new("Approval")?)
+    ///         .await?;
+    ///     Ok(cb.result().await?)
+    /// }
+    /// ```
+    pub fn sub_type(mut self, sub_type: OperationSubType) -> Self {
+        self.sub_type = Some(sub_type);
+        self
+    }
+
     /// Sets a custom deserializer for the callback payload.
     ///
     /// The callback payload is produced by an external caller through the
@@ -125,6 +164,7 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
             name: self.name,
             timeout: self.timeout,
             heartbeat: self.heartbeat,
+            sub_type: self.sub_type,
             serdes,
             _marker: PhantomData,
         }
@@ -179,7 +219,13 @@ where
     fn into_future(self) -> Self::IntoFuture {
         use crate::callback::CreateCallbackExecution;
 
-        preflight_identity!(self, "Callback", crate::callback::CALLBACK_SUB_TYPE);
+        preflight_identity!(
+            self,
+            "Callback",
+            self.sub_type
+                .as_ref()
+                .map_or(crate::callback::CALLBACK_SUB_TYPE, OperationSubType::as_str)
+        );
 
         let gate = self.ctx.clone();
         let execution = CreateCallbackExecution {
@@ -188,6 +234,7 @@ where
             name: self.name,
             timeout: self.timeout,
             heartbeat: self.heartbeat,
+            sub_type: self.sub_type.unwrap_or(OperationSubType::CALLBACK),
             serdes: self.serdes,
             _marker: PhantomData,
         };
@@ -481,6 +528,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second `sub_type` call replaces the first, and `serdes` keeps
+    /// the subtype.
+    #[test]
+    fn sub_type_setter_replaces_and_survives_serdes() {
+        let ctx = DurableContext::test_context();
+        let builder = ctx
+            .create_callback::<String>()
+            .sub_type(OperationSubType::new("First").unwrap())
+            .sub_type(OperationSubType::new("Second").unwrap())
+            .serdes(crate::PassthroughSerdes);
+        assert_eq!(
+            builder.sub_type.as_ref().map(OperationSubType::as_str),
+            Some("Second")
+        );
+    }
 
     /// The callback submitter retry setter likewise takes a bare closure.
     #[test]

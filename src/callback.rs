@@ -42,6 +42,8 @@ pub(crate) struct CreateCallbackExecution<O, S> {
     pub(crate) name: Option<String>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) heartbeat: Option<Duration>,
+    /// The resolved subtype: the builder's `sub_type`, or `Callback`.
+    pub(crate) sub_type: crate::OperationSubType,
     pub(crate) serdes: S,
     pub(crate) _marker: std::marker::PhantomData<O>,
 }
@@ -66,7 +68,7 @@ where
             &positional_id,
             &wire_id,
             "Callback",
-            Some(CALLBACK_SUB_TYPE),
+            Some(self.sub_type.as_str()),
             self.name.as_deref(),
         )? {
             // The backend assigns the callback ID in the START response, so
@@ -93,6 +95,7 @@ where
                 &self.ctx,
                 &positional_id,
                 self.name.as_deref(),
+                self.sub_type.as_str(),
                 &self.serdes,
                 &view,
                 true,
@@ -105,7 +108,7 @@ where
         let mut builder = OperationUpdate::builder()
             .id(wire_id.clone())
             .r#type(OperationType::Callback)
-            .sub_type(CALLBACK_SUB_TYPE.to_owned())
+            .sub_type(self.sub_type.as_str())
             .action(OperationAction::Start);
 
         if let Some(n) = &self.name {
@@ -162,6 +165,7 @@ where
             ctx,
             op_id,
             name,
+            sub_type,
             serdes,
             ..
         } = self;
@@ -181,6 +185,7 @@ where
                     &resolver_ctx,
                     &positional_id,
                     name.as_deref(),
+                    sub_type.as_str(),
                     &serdes,
                     &view,
                     false,
@@ -204,6 +209,7 @@ async fn callback_outcome<O, S: Serdes<O>>(
     ctx: &DurableContext,
     positional_id: &str,
     name: Option<&str>,
+    sub_type: &str,
     serdes: &S,
     view: &crate::engine::CheckpointStatusView,
     emit_replayed: bool,
@@ -214,13 +220,7 @@ where
     let wire_id = crate::engine::compute_wire_id_public(positional_id);
     let emit = || {
         if emit_replayed {
-            ctx.emit_operation_replayed(
-                &wire_id,
-                name,
-                "Callback",
-                Some(CALLBACK_SUB_TYPE),
-                view.attempt,
-            );
+            ctx.emit_operation_replayed(&wire_id, name, "Callback", Some(sub_type), view.attempt);
         }
     };
     match view.status {
@@ -606,6 +606,7 @@ where
         name: None,
         timeout,
         heartbeat,
+        sub_type: crate::OperationSubType::CALLBACK,
         serdes,
         _marker: std::marker::PhantomData,
     };
@@ -623,6 +624,7 @@ where
         retry_strategy: submitter_retry,
         serdes: crate::serdes::JsonSerdes,
         semantics: crate::step::StepSemantics::default(),
+        sub_type: crate::OperationSubType::STEP,
         closure: move |step_ctx: StepContext| async move {
             (submitter)(step_ctx, callback_id).await?;
             Ok(())
@@ -965,6 +967,7 @@ mod tests {
             name: Some("test".to_owned()),
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -995,6 +998,7 @@ mod tests {
             name: Some("racer".to_owned()),
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1032,6 +1036,7 @@ mod tests {
             name: Some("joiner".to_owned()),
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1064,6 +1069,7 @@ mod tests {
             name: None,
             timeout: Some(Duration::from_secs(5)),
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1094,6 +1100,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: Some(Duration::from_secs(10)),
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1124,6 +1131,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: Some(Duration::from_secs(10)),
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1154,6 +1162,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1184,6 +1193,7 @@ mod tests {
             name: Some("my-cb".to_owned()),
             timeout: Some(Duration::from_mins(1)),
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1232,6 +1242,7 @@ mod tests {
             name: Some("no-id".to_owned()),
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1260,6 +1271,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1288,6 +1300,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1318,6 +1331,7 @@ mod tests {
             name: Some("no-id-live".to_owned()),
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1509,6 +1523,7 @@ mod tests {
                     name: None,
                     timeout: None,
                     heartbeat: None,
+                    sub_type: crate::OperationSubType::CALLBACK,
                     serdes: crate::serdes::JsonSerdes,
                     _marker: std::marker::PhantomData,
                 };
@@ -1951,6 +1966,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: MarkerSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -1998,6 +2014,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: HexEnvelopeSerdes,
             _marker: std::marker::PhantomData,
         };
@@ -2051,6 +2068,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: filesystem_serdes,
             _marker: std::marker::PhantomData,
         };
@@ -2097,6 +2115,7 @@ mod tests {
             name: None,
             timeout: None,
             heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
             serdes: crate::serdes::JsonSerdes,
             _marker: std::marker::PhantomData,
         };

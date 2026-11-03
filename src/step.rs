@@ -23,7 +23,7 @@ use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
 use crate::serdes::SerdesContext;
 use crate::tracing_layer;
-use crate::{BoxError, RetryDecision, RetryStrategy, Serdes};
+use crate::{BoxError, OperationSubType, RetryDecision, RetryStrategy, Serdes};
 
 /// The default retry strategy: 6 total attempts, 5s initial delay, 60s max
 /// delay, 2x backoff rate, FULL jitter.
@@ -184,6 +184,8 @@ pub(crate) struct StepExecution<O, F, S> {
     pub(crate) retry_strategy: Option<RetryStrategy>,
     pub(crate) serdes: S,
     pub(crate) semantics: StepSemantics,
+    /// The resolved subtype: the builder's `sub_type`, or `Step`.
+    pub(crate) sub_type: OperationSubType,
     pub(crate) closure: F,
     pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
 }
@@ -214,6 +216,7 @@ where
             retry_strategy,
             serdes,
             semantics,
+            sub_type,
             closure,
             _marker,
         } = self;
@@ -224,6 +227,7 @@ where
             retry_strategy,
             serdes,
             semantics,
+            sub_type,
             _marker: std::marker::PhantomData,
         };
         // True once the step has waited for its record in this invocation.
@@ -294,6 +298,7 @@ struct StepCore<O, S> {
     retry_strategy: Option<RetryStrategy>,
     serdes: S,
     semantics: StepSemantics,
+    sub_type: OperationSubType,
     _marker: std::marker::PhantomData<fn() -> O>,
 }
 
@@ -340,10 +345,20 @@ where
                 self.op_id.wire(),
                 self.name.as_deref(),
                 "Step",
-                Some(STEP_SUB_TYPE),
+                Some(self.sub_type.as_str()),
                 attempt,
             );
         }
+    }
+
+    /// The START update of this step.
+    fn start_update(&self) -> OperationUpdate {
+        build_start_update(
+            self.op_id.wire(),
+            self.name.as_deref(),
+            self.sub_type.as_str(),
+            self.ctx.parent_wire_id(),
+        )
     }
 
     /// Runs everything that precedes the user closure in one cycle: replay
@@ -368,7 +383,7 @@ where
             positional_id,
             wire_id,
             "Step",
-            Some(STEP_SUB_TYPE),
+            Some(self.sub_type.as_str()),
             self.name.as_deref(),
         )? {
             match view.status {
@@ -414,6 +429,7 @@ where
                             &self.ctx,
                             wire_id,
                             self.name.as_deref(),
+                            self.sub_type.as_str(),
                             self.retry_strategy.as_ref(),
                             StepErrorKind::Interrupted,
                             STEP_INTERRUPTED_MESSAGE.into(),
@@ -454,9 +470,9 @@ where
         // that attempt awaits START here.
         let mut start = None;
         if !already_started {
-            let start_update =
-                build_start_update(wire_id, self.name.as_deref(), self.ctx.parent_wire_id());
-            let submitted = self.ctx.submit_checkpoint_updates(vec![start_update]);
+            let submitted = self
+                .ctx
+                .submit_checkpoint_updates(vec![self.start_update()]);
             if self.semantics == StepSemantics::AtLeastOncePerRetry {
                 start = Some(submitted);
             } else if let Err(err) = submitted.await {
@@ -523,6 +539,7 @@ where
                 &self.ctx,
                 wire_id,
                 self.name.as_deref(),
+                self.sub_type.as_str(),
                 &self.serdes,
                 value,
             )
@@ -533,6 +550,7 @@ where
                     &self.ctx,
                     wire_id,
                     self.name.as_deref(),
+                    self.sub_type.as_str(),
                     self.retry_strategy.as_ref(),
                     StepErrorKind::ExecutionFailed,
                     err,
@@ -556,6 +574,7 @@ async fn handle_success<O, S: Serdes<O>>(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
+    sub_type: &str,
     serdes: &S,
     value: O,
 ) -> Result<O, OperationError> {
@@ -577,7 +596,7 @@ async fn handle_success<O, S: Serdes<O>>(
             // `StepErrorKind::SerializationFailed`, so a handler that
             // branches on the kind takes the same path live and replayed.
             let wire = crate::error::serialization_failure_wire(&op_err);
-            let update = build_fail_update(wire_id, name, ctx.parent_wire_id(), &wire);
+            let update = build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &wire);
             if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
                 // Audit (#43): step FAIL (serialization): the body ran,
                 // so the failed FAIL write routes unrecoverable with a
@@ -585,7 +604,8 @@ async fn handle_success<O, S: Serdes<O>>(
                 // small, but a checkpoint-failure-derived one is the
                 // uniform terminal shape.
                 let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                let terminal = build_fail_update(wire_id, name, ctx.parent_wire_id(), &cwire);
+                let terminal =
+                    build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &cwire);
                 return ctx
                     .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
                     .await;
@@ -597,7 +617,7 @@ async fn handle_success<O, S: Serdes<O>>(
     };
 
     // Checkpoint SUCCEED with payload.
-    let update = build_succeed_update(wire_id, name, ctx.parent_wire_id(), &serialized);
+    let update = build_succeed_update(wire_id, name, sub_type, ctx.parent_wire_id(), &serialized);
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
         // Audit (#43): step SUCCEED: the body ran and its side effects
         // need a recorded outcome, so a permanent rejection persists a
@@ -607,7 +627,7 @@ async fn handle_success<O, S: Serdes<O>>(
         // checkpoint records, and re-invoking without a terminal record
         // would re-run the body once per lap until the execution timeout.
         let cwire = crate::error::checkpoint_failure_wire(&err);
-        let terminal = build_fail_update(wire_id, name, ctx.parent_wire_id(), &cwire);
+        let terminal = build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &cwire);
         return ctx
             .checkpoint_failure_unrecoverable(wire_id, err, Some(terminal))
             .await;
@@ -626,10 +646,12 @@ async fn handle_success<O, S: Serdes<O>>(
 ///
 /// Returns `Ok(())` once a `RETRY` is recorded: the caller then waits for
 /// the retry timer. Returns the step error once a `FAIL` is recorded.
+#[expect(clippy::too_many_arguments)] // reason: the subtype joins the inputs every outcome update needs
 async fn handle_failure(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
+    sub_type: &str,
     retry_strategy: Option<&RetryStrategy>,
     kind: StepErrorKind,
     err: BoxError,
@@ -665,7 +687,14 @@ async fn handle_failure(
                 .as_secs()
                 .saturating_add(u64::from(delay.subsec_nanos() > 0));
             let delay_secs = i32::try_from(whole_secs.max(1)).unwrap_or(i32::MAX);
-            let update = build_retry_update(wire_id, name, ctx.parent_wire_id(), &wire, delay_secs);
+            let update = build_retry_update(
+                wire_id,
+                name,
+                sub_type,
+                ctx.parent_wire_id(),
+                &wire,
+                delay_secs,
+            );
             if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
                 // Audit (#43): step RETRY: the body ran (and failed), so
                 // its side effects need a recorded outcome. A permanent
@@ -673,7 +702,8 @@ async fn handle_failure(
                 // execution fails; recorded retries replay, but a retry
                 // the service never recorded would not.
                 let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                let terminal = build_fail_update(wire_id, name, ctx.parent_wire_id(), &cwire);
+                let terminal =
+                    build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &cwire);
                 return ctx
                     .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
                     .await;
@@ -682,7 +712,7 @@ async fn handle_failure(
         }
         RetryDecision::Stop => {
             // Checkpoint FAIL (permanent).
-            let update = build_fail_update(wire_id, name, ctx.parent_wire_id(), &wire);
+            let update = build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &wire);
             if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
                 // Audit (#43): step FAIL: the body ran, so the failed
                 // FAIL write routes unrecoverable with a minimal terminal
@@ -690,7 +720,8 @@ async fn handle_failure(
                 // error payload's size; the checkpoint-failure-derived
                 // record is a few hundred bytes).
                 let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                let terminal = build_fail_update(wire_id, name, ctx.parent_wire_id(), &cwire);
+                let terminal =
+                    build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &cwire);
                 return ctx
                     .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
                     .await;
@@ -713,12 +744,13 @@ async fn handle_failure(
 fn build_start_update(
     wire_id: &str,
     name: Option<&str>,
+    sub_type: &str,
     parent_wire_id: Option<&str>,
 ) -> OperationUpdate {
     let mut builder = OperationUpdate::builder()
         .id(wire_id)
         .r#type(OperationType::Step)
-        .sub_type(STEP_SUB_TYPE)
+        .sub_type(sub_type)
         .action(OperationAction::Start);
 
     if let Some(n) = name {
@@ -739,13 +771,14 @@ fn build_start_update(
 fn build_succeed_update(
     wire_id: &str,
     name: Option<&str>,
+    sub_type: &str,
     parent_wire_id: Option<&str>,
     payload: &str,
 ) -> OperationUpdate {
     let mut builder = OperationUpdate::builder()
         .id(wire_id)
         .r#type(OperationType::Step)
-        .sub_type(STEP_SUB_TYPE)
+        .sub_type(sub_type)
         .action(OperationAction::Succeed)
         .payload(payload);
 
@@ -766,6 +799,7 @@ fn build_succeed_update(
 fn build_retry_update(
     wire_id: &str,
     name: Option<&str>,
+    sub_type: &str,
     parent_wire_id: Option<&str>,
     error: &crate::error::WireError,
     delay_secs: i32,
@@ -773,7 +807,7 @@ fn build_retry_update(
     let mut builder = OperationUpdate::builder()
         .id(wire_id)
         .r#type(OperationType::Step)
-        .sub_type(STEP_SUB_TYPE)
+        .sub_type(sub_type)
         .action(OperationAction::Retry)
         .error(error.to_error_object())
         .step_options(
@@ -799,13 +833,14 @@ fn build_retry_update(
 fn build_fail_update(
     wire_id: &str,
     name: Option<&str>,
+    sub_type: &str,
     parent_wire_id: Option<&str>,
     error: &crate::error::WireError,
 ) -> OperationUpdate {
     let mut builder = OperationUpdate::builder()
         .id(wire_id)
         .r#type(OperationType::Step)
-        .sub_type(STEP_SUB_TYPE)
+        .sub_type(sub_type)
         .action(OperationAction::Fail)
         .error(error.to_error_object());
 
@@ -1168,6 +1203,7 @@ mod tests {
             retry_strategy: None,
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
+            sub_type: OperationSubType::STEP,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1226,6 +1262,7 @@ mod tests {
             retry_strategy: None,
             serdes: Upper,
             semantics: StepSemantics::default(),
+            sub_type: OperationSubType::STEP,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1305,6 +1342,7 @@ mod tests {
             retry_strategy: None,
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
+            sub_type: OperationSubType::STEP,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1370,6 +1408,7 @@ mod tests {
             retry_strategy: None,
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
+            sub_type: OperationSubType::STEP,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1418,6 +1457,7 @@ mod tests {
             retry_strategy: Some(no_retry),
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
+            sub_type: OperationSubType::STEP,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1505,6 +1545,133 @@ mod tests {
             .with_error_data(error.error_data())
     }
 
+    /// A step with subtype `Payment` that fails attempt 1 with a 1 s retry
+    /// and succeeds attempt 2.
+    fn payment_step(ctx: DurableContext) -> impl Future<Output = Result<i32, OperationError>> {
+        let op_id = ctx.mint_id();
+        StepExecution {
+            ctx,
+            op_id,
+            name: Some("pay".to_owned()),
+            retry_strategy: Some(Box::new(|_err: &StepError, attempt: u32| {
+                if attempt >= 2 {
+                    RetryDecision::Stop
+                } else {
+                    RetryDecision::Retry {
+                        delay: Duration::from_secs(1),
+                    }
+                }
+            })),
+            serdes: crate::serdes::JsonSerdes,
+            semantics: StepSemantics::default(),
+            sub_type: OperationSubType::new("Payment").expect("a valid subtype"),
+            closure: |step_ctx: StepContext| async move {
+                if step_ctx.attempt() == 1 {
+                    Err::<i32, BoxError>("transient".into())
+                } else {
+                    Ok(7)
+                }
+            },
+            _marker: std::marker::PhantomData,
+        }
+        .execute()
+    }
+
+    /// A custom subtype is the `SubType` of every update the step writes:
+    /// START and RETRY on attempt 1, START and SUCCEED on attempt 2. The
+    /// in-memory client never moves the record to `READY`, so attempt 2
+    /// runs in a second invocation over a `READY` record.
+    #[tokio::test]
+    async fn custom_sub_type_on_every_step_update() {
+        // Attempt 1: the body fails, the strategy retries, and the step
+        // suspends.
+        let (ctx, first) = context_over(Vec::new());
+        let signal = Arc::clone(ctx.coordinator());
+        let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            payment_step(ctx),
+        )
+        .await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+
+        // Attempt 2 over the READY record: the body succeeds.
+        let (id, mut record) = step_record(CheckpointStatus::Ready, 1, None);
+        record.sub_type = Some("Payment".to_owned());
+        let (ctx, second) = context_over(vec![(id, record)]);
+        assert_eq!(payment_step(ctx).await.expect("attempt 2 succeeds"), 7);
+
+        let updates: Vec<OperationUpdate> = first
+            .recorded_updates()
+            .into_iter()
+            .chain(second.recorded_updates())
+            .collect();
+        let actions: Vec<OperationAction> = updates.iter().map(|u| u.action().clone()).collect();
+        assert_eq!(
+            actions,
+            [
+                OperationAction::Start,
+                OperationAction::Retry,
+                OperationAction::Start,
+                OperationAction::Succeed
+            ]
+        );
+        for update in &updates {
+            assert_eq!(update.sub_type(), Some("Payment"), "{update:?}");
+        }
+    }
+
+    /// The terminal FAIL the SDK writes after the service rejects the
+    /// SUCCEED write carries the custom subtype.
+    #[tokio::test]
+    async fn custom_sub_type_on_terminal_fail_after_rejected_write() {
+        use crate::client::TestResponse;
+
+        let (ctx, client) = context_over(Vec::new());
+        client.enqueue_checkpoint_response(TestResponse::Success(vec![]));
+        client.enqueue_checkpoint_response(TestResponse::NonRetryableError(
+            "payload rejected".to_owned(),
+        ));
+        let op_id = ctx.mint_id();
+        let exec = StepExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("pay".to_owned()),
+            retry_strategy: None,
+            serdes: crate::serdes::JsonSerdes,
+            semantics: StepSemantics::default(),
+            sub_type: OperationSubType::new("Payment").expect("a valid subtype"),
+            closure: |_: StepContext| async { Ok::<i32, BoxError>(7) },
+            _marker: std::marker::PhantomData,
+        };
+        let signal = Arc::clone(ctx.coordinator());
+        let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, crate::driver::InvocationOutcome::Failed { .. }),
+            "a rejected SUCCEED fails the execution: {outcome:?}"
+        );
+
+        let updates = client.recorded_updates();
+        let actions: Vec<OperationAction> = updates.iter().map(|u| u.action().clone()).collect();
+        assert_eq!(
+            actions,
+            [
+                OperationAction::Start,
+                OperationAction::Succeed,
+                OperationAction::Fail
+            ]
+        );
+        let terminal = updates.last().expect("the terminal FAIL is recorded");
+        assert_eq!(terminal.sub_type(), Some("Payment"));
+    }
+
     /// A step body that fails with a typed error carrying error data.
     async fn typed_failing_body(_: StepContext) -> Result<i32, BoxError> {
         Err(Box::new(
@@ -1527,6 +1694,7 @@ mod tests {
             })),
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
+            sub_type: OperationSubType::STEP,
             closure: typed_failing_body,
             _marker: std::marker::PhantomData,
         };
@@ -1555,6 +1723,7 @@ mod tests {
             retry_strategy: None,
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
+            sub_type: OperationSubType::STEP,
             closure: typed_failing_body,
             _marker: std::marker::PhantomData,
         };
@@ -1590,6 +1759,7 @@ mod tests {
                 retry_strategy: Some(retry_once()),
                 serdes: crate::serdes::JsonSerdes,
                 semantics: StepSemantics::default(),
+                sub_type: OperationSubType::STEP,
                 closure: |_: StepContext| async { Err::<i32, BoxError>("boom".into()) },
                 _marker: std::marker::PhantomData,
             }
@@ -1692,6 +1862,7 @@ mod tests {
             retry_strategy: Some(no_retry),
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
+            sub_type: OperationSubType::STEP,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1757,6 +1928,7 @@ mod tests {
             retry_strategy: Some(always_retry),
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
+            sub_type: OperationSubType::STEP,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1806,6 +1978,7 @@ mod tests {
             retry_strategy: Some(fractional_retry),
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::default(),
+            sub_type: OperationSubType::STEP,
             closure,
             _marker: std::marker::PhantomData,
         };
@@ -1883,6 +2056,7 @@ mod tests {
                     retry_strategy: None,
                     serdes: crate::serdes::JsonSerdes,
                     semantics: StepSemantics::default(),
+                    sub_type: OperationSubType::STEP,
                     closure,
                     _marker: std::marker::PhantomData,
                 };
@@ -1955,6 +2129,7 @@ mod tests {
             retry_strategy,
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtMostOncePerRetry,
+            sub_type: OperationSubType::STEP,
             closure: move |_: StepContext| {
                 executed.store(true, std::sync::atomic::Ordering::SeqCst);
                 std::future::ready(Ok::<i32, BoxError>(42))
@@ -2057,6 +2232,7 @@ mod tests {
             retry_strategy: Some(strategy),
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtMostOncePerRetry,
+            sub_type: OperationSubType::STEP,
             closure: |_: StepContext| async { Err::<i32, BoxError>("boom".into()) },
             _marker: std::marker::PhantomData,
         };
@@ -2091,6 +2267,7 @@ mod tests {
             retry_strategy: None,
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtMostOncePerRetry,
+            sub_type: OperationSubType::STEP,
             closure: |_: StepContext| async { Ok::<i32, BoxError>(1) },
             _marker: std::marker::PhantomData,
         };
@@ -2175,6 +2352,7 @@ mod tests {
             retry_strategy: None,
             serdes: crate::serdes::JsonSerdes,
             semantics: StepSemantics::AtLeastOncePerRetry,
+            sub_type: OperationSubType::STEP,
             closure,
             _marker: std::marker::PhantomData,
         };

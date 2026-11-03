@@ -44,11 +44,11 @@ use serde_json::value::RawValue;
 /// Wire sub-type for map operations.
 pub(crate) const MAP_SUB_TYPE: &str = "Map";
 /// Wire sub-type for map iteration children.
-const MAP_ITERATION_SUB_TYPE: &str = "MapIteration";
+pub(crate) const MAP_ITERATION_SUB_TYPE: &str = "MapIteration";
 /// Wire sub-type for parallel operations.
 pub(crate) const PARALLEL_SUB_TYPE: &str = "Parallel";
 /// Wire sub-type for parallel branch children.
-const PARALLEL_BRANCH_SUB_TYPE: &str = "ParallelBranch";
+pub(crate) const PARALLEL_BRANCH_SUB_TYPE: &str = "ParallelBranch";
 
 /// Sentinel error message returned by `replay_terminal_batch` when the
 /// batch has `replay_children` set, signalling the caller should fall

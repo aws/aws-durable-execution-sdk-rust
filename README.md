@@ -472,6 +472,21 @@ if let Err(err) = result {
 }
 ```
 
+A step records the subtype `Step`, and `.sub_type(...)` records an
+`OperationSubType` of your choice instead, so history and plugins can tell
+the steps of a composed operation apart. `OperationSubType::new` accepts 1
+to 32 characters from `A-Z`, `a-z`, `0-9`, `-` and `_`, and rejects an
+empty string. Replay compares the subtype, so changing it on an existing
+step fails the executions in flight with `NonDeterministicExecutionError`.
+
+```rust ignore
+let receipt = ctx
+    .step(|_| async { Ok(charge_card().await?) })
+    .name("charge")
+    .sub_type(durable::OperationSubType::new("Payment")?)
+    .await?;
+```
+
 ### wait
 
 ```rust ignore
@@ -565,6 +580,8 @@ let approval: String = ctx
 Both builders take `.timeout(...)` and `.heartbeat(...)`.
 `wait_for_callback` also takes `.submitter_retry(...)`, which retries the
 submitter with the same retry strategy shape a step uses.
+`create_callback` also takes `.sub_type(...)`, which records an
+`OperationSubType` instead of `Callback`, as on a step.
 
 A callback that an external system completes while other work runs
 continues in the same invocation. `cb.spawn_result()` waits for the result

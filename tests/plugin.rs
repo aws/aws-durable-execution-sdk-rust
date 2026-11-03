@@ -967,3 +967,44 @@ async fn end_hook_retrying_after_retryable_orphaned_write_failure() {
         Some("CheckpointUnrecoverableInvocationError")
     );
 }
+
+/// A custom step and callback subtype reach the operations map of the last
+/// invocation's end info, with the value the runner records.
+#[tokio::test]
+async fn custom_step_and_callback_subtypes_reach_plugin_operations() {
+    let plugin = Lifecycle::default();
+    let result = lifecycle_runner(&plugin)
+        .callback_for(
+            "cb",
+            durable::test_util::CallbackReply::success(&true).expect("encodes"),
+        )
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                ctx.step(|_| async { Ok(1_u32) })
+                    .name("pay")
+                    .sub_type(durable::OperationSubType::new("Payment")?)
+                    .await?;
+                let cb = ctx
+                    .create_callback::<bool>()
+                    .name("cb")
+                    .sub_type(durable::OperationSubType::new("Approval")?)
+                    .await?;
+                Ok::<_, BoxError>(cb.result().await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+
+    let ends = plugin.ends();
+    let operations = ends.last().expect("an end info").operations();
+    for (name, sub_type) in [("pay", "Payment"), ("cb", "Approval")] {
+        let recorded = result.operation(name).expect("the runner records it");
+        let info = operations
+            .get(recorded.id())
+            .expect("the operation is in the operations map");
+        assert_eq!(info.sub_type(), Some(sub_type));
+        assert_eq!(info.sub_type(), recorded.sub_type());
+    }
+}

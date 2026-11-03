@@ -114,6 +114,7 @@ pub(crate) mod invoke;
 pub(crate) mod map_parallel; // public types re-exported from crate::builders::map_parallel
 pub mod observability;
 mod operation;
+mod operation_sub_type;
 mod options;
 pub mod plugin;
 pub mod serdes;
@@ -143,6 +144,7 @@ pub use self::error::{
 };
 pub use self::future::{Branch, BranchHandle, BranchSet, DurableFuture};
 pub use self::operation::{InvocationStatus, OperationKind, OperationStatus};
+pub use self::operation_sub_type::{InvalidOperationSubType, OperationSubType};
 pub use self::options::{Options, OptionsBuilder, OptionsValidationError};
 pub use self::serdes::{JsonSerdes, PassthroughSerdes, Serdes};
 pub use self::step::StepSemantics;
