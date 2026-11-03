@@ -39,7 +39,10 @@
 //! Each durable operation has an **operation ID**: the identity that ties a
 //! call site to its recorded result. The SDK mints IDs synchronously at the
 //! call site, in the order the handler creates operations, and replay hands
-//! each recorded result to the operation that claims the same ID. Replay is
+//! each recorded result to the operation that claims the same ID. A `map`,
+//! `parallel` or `parallel_mixed` claims one ID from its caller, its own,
+//! and numbers its items inside the batch: item `i` gets the ID of item `i`
+//! in the batch's namespace, however the items are scheduled. Replay is
 //! therefore correct only if the handler creates the same operations in the
 //! same order on every invocation:
 //!

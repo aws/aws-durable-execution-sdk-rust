@@ -834,12 +834,13 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
         IS: Serdes<O>,
         RS: Serdes<String>,
     {
-        use crate::map_parallel::ParallelExecution;
+        use crate::map_parallel::{ItemIds, ParallelExecution};
 
         preflight_identity!(self, "Context", crate::map_parallel::PARALLEL_SUB_TYPE);
 
         let gate = self.ctx.clone();
 
+        let item_ids = ItemIds::new(&self.op_id, self.branches.len());
         let execution = ParallelExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -851,7 +852,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
-            child_ids: None,
+            item_ids,
         };
 
         DurableFuture::for_operation(&gate, execution.execute_batch_result())
@@ -907,12 +908,13 @@ where
     type IntoFuture = DurableFuture<Vec<O>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        use crate::map_parallel::ParallelExecution;
+        use crate::map_parallel::{ItemIds, ParallelExecution};
 
         preflight_identity!(self, "Context", crate::map_parallel::PARALLEL_SUB_TYPE);
 
         let gate = self.ctx.clone();
 
+        let item_ids = ItemIds::new(&self.op_id, self.branches.len());
         let execution = ParallelExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -924,7 +926,7 @@ where
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
-            child_ids: None,
+            item_ids,
         };
 
         DurableFuture::for_operation(&gate, execution.execute())
@@ -1138,13 +1140,15 @@ impl<RS> ParallelMixedBuilder<RS> {
     where
         RS: Serdes<String>,
     {
-        use crate::map_parallel::{MixedItemSerdes, PARALLEL_SUB_TYPE, ParallelExecution};
+        use crate::map_parallel::{ItemIds, MixedItemSerdes, PARALLEL_SUB_TYPE, ParallelExecution};
 
         preflight_identity!(self, "Context", PARALLEL_SUB_TYPE);
 
         let gate = self.ctx.clone();
-        let serdes = MixedItemSerdes::new(self.op_id.wire(), self.decoders);
-        let child_ids = Some(serdes.child_ids());
+        // One table of branch IDs, read by the batch engine and by the item
+        // serdes, which finds each branch's serdes from it.
+        let item_ids = ItemIds::new(&self.op_id, self.branches.len());
+        let serdes = MixedItemSerdes::new(&self.op_id, &item_ids, self.decoders);
         let execution = ParallelExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -1156,7 +1160,7 @@ impl<RS> ParallelMixedBuilder<RS> {
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
-            child_ids,
+            item_ids,
         };
 
         DurableFuture::for_operation(&gate, execution.execute_batch_result())

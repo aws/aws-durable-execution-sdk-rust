@@ -2175,6 +2175,8 @@ pub(crate) mod tests {
             .children(batch)
             .find(|op| op.kind() == crate::OperationKind::Context)
             .expect("item child");
+        // The map is "1", and its items are numbered inside it.
+        assert_eq!(item.id(), crate::engine::compute_wire_id_public("1-1"));
         let spans = spans_of(&records, "in-item");
         assert!(
             has_field(&spans, fields::OPERATION_ID, &json_str(item.id())),
@@ -2184,7 +2186,7 @@ pub(crate) mod tests {
 
     /// A flat map item has no child record of its own, but its span still
     /// carries the virtual child's wire ID and the item's recorded name.
-    /// The virtual child claims the same ID a normal item claims, so the
+    /// The virtual child has the same ID a normal item has, `1-1`, so the
     /// expected ID comes from a normal run of the same handler.
     #[test]
     fn flat_map_item_record_has_operation_id_and_name() {
@@ -2216,6 +2218,7 @@ pub(crate) mod tests {
             .children(batch)
             .find(|op| op.kind() == crate::OperationKind::Context)
             .expect("item child");
+        assert_eq!(item.id(), crate::engine::compute_wire_id_public("1-1"));
 
         let (records, _flat) = run_capturing(
             crate::test_util::LocalRunner::new(),
@@ -2247,6 +2250,8 @@ pub(crate) mod tests {
             },
         );
         let branch = result.operation("left").expect("branch operation");
+        // The parallel is "1", and its branches are numbered inside it.
+        assert_eq!(branch.id(), crate::engine::compute_wire_id_public("1-1"));
         let spans = spans_of(&records, "in-branch");
         assert!(
             has_field(&spans, fields::OPERATION_ID, &json_str(branch.id())),

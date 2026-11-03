@@ -232,9 +232,9 @@ async fn parent_step_inside_map_item_fails() {
         )
         .await
         .expect("runner");
-    // The map is "1". Its items nest flat in the parent's namespace, so the
-    // first item's context has the prefix "2".
-    assert_context_usage_failure(&result, &message_a("step", "root", "2"));
+    // The map is "1". Its items are numbered inside the batch, so the
+    // first item's context has the prefix "1-1".
+    assert_context_usage_failure(&result, &message_a("step", "root", "1-1"));
 }
 
 /// Not in the issue's table: it covers the `run_body` wrapper of a parallel
@@ -258,8 +258,8 @@ async fn parent_step_inside_parallel_branch_fails() {
         )
         .await
         .expect("runner");
-    // The parallel is "1"; its branch nests flat, like a map item.
-    assert_context_usage_failure(&result, &message_a("step", "root", "2"));
+    // The parallel is "1"; its branch is "1-1", like a map item.
+    assert_context_usage_failure(&result, &message_a("step", "root", "1-1"));
 }
 
 #[tokio::test]

@@ -22,6 +22,13 @@ pub(crate) struct OperationId {
 }
 
 impl OperationId {
+    /// Builds the identity of the positional ID `positional`, with its
+    /// wire ID.
+    pub(crate) fn new(positional: String) -> Self {
+        let wire = compute_wire_id(&positional);
+        Self { positional, wire }
+    }
+
     /// Returns the positional string.
     pub(crate) fn positional(&self) -> &str {
         &self.positional
@@ -105,9 +112,7 @@ impl IdCounter {
     /// exactly one position and returns the operation identity.
     pub(crate) fn mint(&self) -> OperationId {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let positional = self.format(n);
-        let wire = compute_wire_id(&positional);
-        OperationId { positional, wire }
+        OperationId::new(self.format(n))
     }
 
     /// Creates a child counter whose prefix is the given positional ID.
@@ -129,35 +134,11 @@ impl IdCounter {
         &self.prefix
     }
 
-    /// Advances the counter by `n` positions without minting IDs.
-    ///
-    /// Used when replaying a terminal batch: the child IDs that were minted
-    /// during the original execution must be skipped so subsequent operations
-    /// receive the correct positional ID.
-    pub(crate) fn advance(&self, n: usize) {
-        self.counter.fetch_add(n as u64, Ordering::SeqCst);
-    }
-
     /// Peeks at the positional ID that the next `mint()` will produce,
     /// without advancing the counter.
     pub(crate) fn peek_next(&self) -> String {
         let next_n = self.counter.load(Ordering::SeqCst) + 1;
         self.format(next_n)
-    }
-
-    /// Peeks at the operation identity `offset` positions ahead of the next
-    /// `mint()`, without advancing the counter.
-    ///
-    /// `peek_at(0)` names the same position as [`Self::peek_next`]. Used by
-    /// terminal-batch replay to derive the child IDs a prior live run minted
-    /// without consuming counter positions, so a replay attempt that must
-    /// fall back to re-execution leaves the counter exactly where the
-    /// re-execution path expects it.
-    pub(crate) fn peek_at(&self, offset: u64) -> OperationId {
-        let n = self.counter.load(Ordering::SeqCst) + 1 + offset;
-        let positional = self.format(n);
-        let wire = compute_wire_id(&positional);
-        OperationId { positional, wire }
     }
 }
 
@@ -682,19 +663,6 @@ mod tests {
         let id2 = counter.mint();
         assert_eq!(id1.positional(), "2-1");
         assert_eq!(id2.positional(), "2-2");
-    }
-
-    #[test]
-    fn counter_advance_skips_positions() {
-        // Simulates batch replay: map consumes positions 2,3 during original
-        // execution; on replay, advance(2) skips them so the next operation
-        // gets position 4.
-        let counter = IdCounter::new(String::new());
-        let map_id = counter.mint(); // position 1 (the map parent)
-        assert_eq!(map_id.positional(), "1");
-        counter.advance(2); // skip 2 child positions
-        let wait_id = counter.mint(); // should be position 4
-        assert_eq!(wait_id.positional(), "4");
     }
 
     // Child prefix chaining produces full positional paths

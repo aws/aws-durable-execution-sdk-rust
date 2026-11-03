@@ -226,6 +226,13 @@ function of the event and of results the SDK already recorded. Iterating a
 `HashMap` or `HashSet` to create operations breaks that, because the iteration
 order changes between runs; sort into a `Vec` first.
 
+A `map`, `parallel` or `parallel_mixed` takes one ID from its caller, its
+own. Its items are numbered inside the batch: item `i` of the batch has the
+ID of item `i` in the batch's own namespace, whatever the item count, the
+concurrency or the order in which items finish. So an operation the handler
+starts beside a batch, for example with `.spawn()` and `tokio::join!`, gets
+the same ID on every run.
+
 Put nondeterminism inside a step body instead of between operations. A step
 body may read the clock, generate a random ID, or call a service, because only
 its recorded result takes part in replay. `StepContext`, the argument a step

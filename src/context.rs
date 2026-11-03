@@ -630,9 +630,9 @@ impl DurableContext {
     /// claimed in every case, so the caller builds its builder as usual.
     ///
     /// Only the public operation methods call this. The SDK's own internal
-    /// claims (inside `wait_for_callback`, `map` and `parallel`) call
-    /// [`Self::mint_id`], because they run on the composite's context
-    /// while a child body may be active.
+    /// claims (inside `wait_for_callback`) call [`Self::mint_id`], because
+    /// they run on the composite's context while a child body may be
+    /// active.
     pub(crate) fn claim_operation_id(&self, method: &'static str) -> OperationId {
         let message = ACTIVE_BODY
             .try_with(|active| match active {
@@ -762,38 +762,6 @@ impl DurableContext {
             }),
             awaited: None,
         }
-    }
-
-    /// Advances the ID counter by `n` positions without minting.
-    ///
-    /// Used after replaying a terminal batch: the child IDs consumed during
-    /// the original execution must be skipped so the next operation gets
-    /// the correct positional ID.
-    ///
-    /// Like [`Self::mint_id`], re-records this namespace's span `isReplay`
-    /// flag afterwards. The skipped positions are a flat batch's synthetic
-    /// child IDs, which intentionally have no checkpoint records, so
-    /// minting the terminal batch parent set the flag to `false`; only
-    /// after the skip does the next positional ID name the caller's next
-    /// logical operation, whose record (or absence) decides whether the
-    /// namespace is still replaying.
-    pub(crate) fn advance_counter(&self, n: usize) {
-        self.inner.engine.id_counter.advance(n);
-        self.inner.replay_span.record(
-            crate::tracing_layer::fields::IS_REPLAY,
-            self.inner.engine.is_replaying(),
-        );
-    }
-
-    /// Peeks at the operation identity `offset` positions ahead of the next
-    /// mint in this namespace, without advancing the counter or touching
-    /// the replay span.
-    ///
-    /// Terminal-batch replay uses this to derive the child IDs a prior live
-    /// run minted: reading them non-destructively lets a failed replay
-    /// attempt fall back to re-execution with the counter untouched.
-    pub(crate) fn peek_id_at(&self, offset: usize) -> OperationId {
-        self.inner.engine.id_counter.peek_at(offset as u64)
     }
 
     /// The abandoned owners of this invocation (see [`Admission`]).
@@ -2776,6 +2744,12 @@ impl DurableContext {
     /// Each item gets its own child context with an independent operation
     /// namespace.
     ///
+    /// The map claims one operation ID from this context when this method
+    /// is called. Its items are numbered inside the map: item `i` has the
+    /// ID of item `i` in the map's own namespace, whatever the item count,
+    /// the concurrency or the order in which items finish. So this
+    /// context's next operation gets this context's next ID.
+    ///
     /// A panic in an item propagates to the caller with its original
     /// payload, and the SDK records nothing for it.
     ///
@@ -2862,6 +2836,11 @@ impl DurableContext {
     /// Creates a parallel operation that executes named branches
     /// concurrently.
     ///
+    /// The parallel claims one operation ID from this context when this
+    /// method is called. Its branches are numbered inside the parallel:
+    /// branch `i` has the ID of item `i` in the parallel's own namespace,
+    /// as a [`map`](Self::map) item does.
+    ///
     /// A panic in a branch propagates to the caller with its original
     /// payload, and the SDK records nothing for it.
     ///
@@ -2922,7 +2901,8 @@ impl DurableContext {
     /// are filled when the returned future is awaited.
     ///
     /// The operation ID is claimed when this method is called, as
-    /// [`parallel`](Self::parallel) claims it.
+    /// [`parallel`](Self::parallel) claims it, and branch `i` has the ID of
+    /// item `i` in the batch's own namespace, as in `parallel`.
     ///
     /// # Which form to use
     ///

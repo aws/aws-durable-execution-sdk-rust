@@ -791,6 +791,12 @@ impl<O> BatchResult<O> {
 /// each item are checkpointed directly under the parent batch context, with
 /// no per-item context events.
 ///
+/// In both modes, item `i` of the batch with ID `b` has the ID `b-{i+1}`,
+/// in the batch's own namespace, and the operations inside it have the IDs
+/// `b-{i+1}-{n}`. A Normal item records a child context at its ID, with the
+/// batch as its parent. A Flat item records nothing at its ID, and its
+/// operations name the batch as their parent.
+///
 /// # Examples
 ///
 /// ```
@@ -878,6 +884,7 @@ where
         let items = into_item_slots(self.items);
         let closure = self.closure;
         let items_ref = Arc::clone(&items);
+        let item_ids = ItemIds::new(&self.op_id, total_items);
 
         let dispatch = MapDispatch {
             run_item: Arc::new(move |child_ctx: DurableContext, index: usize| {
@@ -906,7 +913,7 @@ where
             MAP_SUB_TYPE,
             MAP_ITERATION_SUB_TYPE,
             &dispatch,
-            None,
+            &item_ids,
         )
         .await
     }
@@ -924,10 +931,9 @@ pub(crate) struct ParallelExecution<O, IS, RS> {
     pub(crate) result_serdes: RS,
     pub(crate) nesting: NestingMode,
     pub(crate) branches: Vec<(Option<String>, crate::future::BranchBody<O>)>,
-    /// Where the batch engine registers the child ID of each branch:
-    /// `Some` for `parallel_mixed`, whose item serdes finds a branch by its
-    /// child ID, and `None` for `parallel`.
-    pub(crate) child_ids: Option<ChildIds>,
+    /// The IDs of the branches (see [`ItemIds`]). `parallel_mixed` builds
+    /// its item serdes from the same table.
+    pub(crate) item_ids: ItemIds,
 }
 
 impl<O, IS, RS> ParallelExecution<O, IS, RS>
@@ -987,7 +993,7 @@ where
             PARALLEL_SUB_TYPE,
             PARALLEL_BRANCH_SUB_TYPE,
             &dispatch,
-            self.child_ids.as_ref(),
+            &self.item_ids,
         )
         .await
     }
@@ -1067,74 +1073,70 @@ fn await_error<O>(batch: &BatchResult<O>) -> Option<OperationError> {
     })
 }
 
-/// The child IDs of a `parallel_mixed` batch, mapped to the indexes of
-/// their branches.
+/// The operation IDs of a batch's items, in the batch's own namespace.
 ///
-/// The batch engine takes each child ID from the next ID of the caller's
-/// context when it starts the item, after the batch parent's START. An
-/// operation that runs beside the batch on the same context can take IDs
-/// in between. So the IDs are not known before the batch runs, and the
-/// engine registers each child ID here when it assigns the ID to an item.
-#[derive(Clone, Default)]
-pub(crate) struct ChildIds(Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>);
+/// Item `i` of the batch at the positional ID `b` has the positional ID
+/// `b-{i+1}`, as in JS. The table is built from the batch's ID and the item
+/// count before anything runs. So an item's ID depends only on its index,
+/// not on the polling order, the concurrency, the admission order, an early
+/// completion or a replay. The live run, sequential admission, every replay
+/// path and the `parallel_mixed` item serdes read item IDs from it.
+#[derive(Clone)]
+pub(crate) struct ItemIds(Arc<[OperationId]>);
 
-impl ChildIds {
-    fn insert(&self, wire: String, index: usize) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(wire, index);
+impl ItemIds {
+    /// Builds the table of the `count` items of the batch `batch`.
+    pub(crate) fn new(batch: &OperationId, count: usize) -> Self {
+        Self(
+            (1..=count)
+                .map(|n| OperationId::new(format!("{}-{n}", batch.positional())))
+                .collect(),
+        )
     }
 
-    fn get(&self, wire: &str) -> Option<usize> {
+    /// The ID of item `index`.
+    ///
+    /// Every caller passes an index below the item count: the batch engine
+    /// iterates `0..total_items`, and the table has `total_items` entries,
+    /// and the record readers check each index against `total_items`
+    /// before they look it up. So the lookup cannot miss.
+    #[expect(clippy::expect_used)]
+    // reason: every caller passes an index below the item count the table was built with
+    fn id(&self, index: usize) -> &OperationId {
         self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(wire)
-            .copied()
-    }
-}
-
-/// Registers `op_id` as the child ID of item `index`, when the batch has a
-/// [`ChildIds`] map.
-fn register_child_id(child_ids: Option<&ChildIds>, index: usize, op_id: &OperationId) {
-    if let Some(child_ids) = child_ids {
-        child_ids.insert(op_id.wire().to_owned(), index);
+            .get(index)
+            .expect("every caller passes an index below the item count")
     }
 }
 
 /// The item serdes of `parallel_mixed`: each branch's serdes, found from
-/// the operation ID of the child that is being encoded or decoded.
+/// the operation ID of the item that is being encoded or decoded.
 ///
 /// `Serdes::deserialize` receives no item index, but its `SerdesContext`
-/// names the child. So `by_op_id` maps each child wire ID to the branch
-/// index: the batch engine registers each child ID when it assigns it (see
-/// [`ChildIds`]). `by_op_id` also maps the `{parent_wire}/item-{index}`
-/// context a preview batch record replays with. A value encodes itself: it
-/// carries its own branch's serdes.
+/// names the item. So `by_op_id` maps the wire ID of each item of the
+/// batch's [`ItemIds`] table to the branch index. It is built before the
+/// batch runs and never changes. `by_op_id` also maps the
+/// `{parent_wire}/item-{index}` context a preview batch record replays
+/// with. A value encodes itself: it carries its own branch's serdes.
 pub(crate) struct MixedItemSerdes {
-    by_op_id: ChildIds,
+    by_op_id: std::collections::HashMap<String, usize>,
     decoders: Arc<Vec<Arc<dyn crate::future::BranchDecoder>>>,
 }
 
 impl MixedItemSerdes {
-    /// Builds the item serdes of a batch whose parent has the wire ID
-    /// `parent_wire`, with the preview contexts of its branches mapped. The
-    /// batch registers the child IDs into [`Self::child_ids`].
+    /// Builds the item serdes of the batch whose items have the IDs
+    /// `item_ids`, one per decoder.
     pub(crate) fn new(
-        parent_wire: &str,
+        batch: &OperationId,
+        item_ids: &ItemIds,
         decoders: Arc<Vec<Arc<dyn crate::future::BranchDecoder>>>,
     ) -> Self {
-        let by_op_id = ChildIds::default();
+        let mut by_op_id = std::collections::HashMap::new();
         for index in 0..decoders.len() {
-            by_op_id.insert(format!("{parent_wire}/item-{index}"), index);
+            by_op_id.insert(item_ids.id(index).wire().to_owned(), index);
+            by_op_id.insert(format!("{}/item-{index}", batch.wire()), index);
         }
         Self { by_op_id, decoders }
-    }
-
-    /// The map the batch engine registers the child IDs into.
-    pub(crate) fn child_ids(&self) -> ChildIds {
-        self.by_op_id.clone()
     }
 }
 
@@ -1155,7 +1157,7 @@ impl Serdes<crate::future::MixedValue> for MixedItemSerdes {
         let decoder = self
             .by_op_id
             .get(context.operation_id())
-            .and_then(|index| self.decoders.get(index))
+            .and_then(|index| self.decoders.get(*index))
             .ok_or_else(|| {
                 format!(
                     "parallel_mixed: no branch has operation ID \"{}\"",
@@ -1931,7 +1933,7 @@ async fn execute_batch<O, IS, RS>(
     parent_sub_type: &str,
     child_sub_type: &str,
     dispatch: &dyn ItemDispatch<O, IS>,
-    child_ids: Option<&ChildIds>,
+    item_ids: &ItemIds,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -1977,6 +1979,13 @@ where
     let parent_positional = parent_op_id.positional().to_owned();
     let parent_wire = parent_op_id.wire().to_owned();
 
+    // The batch's own namespace. The batch's START, SUCCEED and FAIL writes
+    // and the whole-batch serdes stay on the caller's context `ctx`,
+    // because they name the caller's parent. Item replay, item serdes
+    // faults and the item contexts use `batch_ctx`, and item IDs come from
+    // `item_ids`, so the batch never claims an ID from the caller.
+    let batch_ctx = ctx.new_child(&parent_positional, parent_name.as_deref());
+
     // 2. Check if the parent batch is already terminal in the checkpoint log.
     // Identity validation and the status read happen in one read-guard pass;
     // the terminal payload/error projection is cloned only when the batch is
@@ -2017,7 +2026,6 @@ where
 
             if let Some(record) = decision {
                 let plan = ReplayPlan::from_record(&record, total_items)?;
-                let concurrency = max_concurrency.unwrap_or(total_items).max(1);
                 // Fast path (Normal nesting): decode every completed item
                 // straight from its child record (after validating each
                 // child's replay identity), report items in the started
@@ -2028,12 +2036,12 @@ where
                 // plan-constrained re-execution below.
                 if nesting != NestingMode::Flat {
                     match replay_batch_from_record(
-                        &ctx,
+                        &batch_ctx,
                         &plan,
                         &record_names,
                         &serdes,
                         child_sub_type,
-                        child_ids,
+                        item_ids,
                     )
                     .await
                     {
@@ -2047,15 +2055,6 @@ where
                                 Some(parent_sub_type),
                                 view.attempt,
                             );
-                            // Counter parity with the live run: concurrent
-                            // pre-claims an ID per input item; sequential
-                            // minted one per ADMITTED item, and ordered
-                            // admission makes that exactly `totalCount`.
-                            if concurrency == 1 {
-                                ctx.advance_counter(plan.total_count);
-                            } else {
-                                ctx.advance_counter(total_items);
-                            }
                             return Ok(result);
                         }
                         Err(e) => {
@@ -2082,7 +2081,7 @@ where
                     total_items,
                     &result_serdes,
                     &serdes_ctx,
-                    child_ids,
+                    item_ids,
                 )
                 .await
                 {
@@ -2096,16 +2095,6 @@ where
                             Some(parent_sub_type),
                             view.attempt,
                         );
-                        // Advance the parent counter past the iteration IDs
-                        // that were consumed during the original execution.
-                        // Sequential (concurrency=1) only claims started
-                        // items; concurrent claims all items upfront.
-                        let concurrency = max_concurrency.unwrap_or(total_items).max(1);
-                        if concurrency == 1 {
-                            ctx.advance_counter(result.items.len());
-                        } else {
-                            ctx.advance_counter(total_items);
-                        }
                         return Ok(result);
                     }
                     Err(e) => {
@@ -2193,7 +2182,7 @@ where
         return Ok(result);
     }
 
-    // 5. Determine effective concurrency (needed before pre-claiming).
+    // 5. Determine effective concurrency.
     let concurrency = max_concurrency.unwrap_or(total_items).max(1);
 
     // Validate completion config.
@@ -2201,22 +2190,17 @@ where
         return Err(batch_error(&msg));
     }
 
-    // 6. Pre-claim child IDs.
-    // For concurrency > 1 (concurrent path): claim ALL child IDs upfront
-    // on the owning task (determinism rule 4: deterministic ID ordering
-    // regardless of completion order). Claiming is LOCAL, no `Start` is
-    // checkpointed here; the coordinator writes each child's `Start` at
-    // dispatch, so a child is admitted (and recorded) only when a
-    // concurrency slot is actually free for it.
-    // For concurrency == 1 (sequential path): mint IDs lazily, one at a
-    // time inside the loop, so only STARTED items consume IDs
-    // and the service doesn't see dangling operations for never-started
-    // items on early termination.
+    // 6. Read every item's record up front (concurrent path). Each item's
+    // ID comes from `item_ids`, so it depends on its index alone. Reading
+    // is LOCAL, no `Start` is checkpointed here; the coordinator writes
+    // each child's `Start` at dispatch, so a child is admitted (and
+    // recorded) only when a concurrency slot is actually free for it.
+    // The sequential path (`concurrency == 1`) reads each item's record at
+    // the dispatch cursor instead.
     let mut pre_claimed: Vec<PreClaimed> = Vec::with_capacity(total_items);
     if concurrency > 1 {
         for i in 0..total_items {
-            let child_op_id = ctx.mint_id();
-            register_child_id(child_ids, i, &child_op_id);
+            let child_op_id = item_ids.id(i).clone();
             // Under a replay plan, only indexes the record admits as
             // COMPLETED have their child checkpoints consulted. Started-set
             // entries are reconstructed from the record alone and
@@ -2224,8 +2208,6 @@ where
             // identity-validating) their views here would violate the
             // record's contract and could raise a spurious
             // non-determinism error for a record replay never touches.
-            // The ID is still minted above for counter parity with the
-            // live run, which claims one per input item.
             let consult_checkpoint = replay_plan.as_ref().is_none_or(|plan| plan.admits(i));
             let (has_record, is_terminal) = if consult_checkpoint {
                 let child_positional = child_op_id.positional().to_owned();
@@ -2304,7 +2286,7 @@ where
     }
 
     let env = BatchEnv {
-        ctx: &ctx,
+        ctx: &batch_ctx,
         dispatch,
         completion_cfg: &completion_cfg,
         total_items,
@@ -2374,9 +2356,7 @@ where
             // or beyond `totalCount` never started and is omitted; an
             // index in the started set was non-terminal when the batch
             // completed and is reported as STARTED: with no result and no
-            // error, its child checkpoints never consulted. A started-set
-            // item still consumed an ID on the live sequential path, so
-            // its counter position is skipped rather than reused.
+            // error, its child checkpoints never consulted.
             if let Some(plan) = &replay_plan
                 && !plan.admits(i)
             {
@@ -2394,9 +2374,6 @@ where
                             stack_trace: Vec::new(),
                         });
                     }
-                    if concurrency == 1 {
-                        ctx.advance_counter(1);
-                    }
                 }
                 continue;
             }
@@ -2409,10 +2386,9 @@ where
 
             // Determine the PreClaimed item: for concurrent mode use the
             // pre-claimed vector, which holds only non-terminal items here;
-            // for sequential mode, read the record of the ID the item WOULD
-            // get, without minting it yet. The sequential path mints lazily
-            // (only started items consume IDs), so it must know whether the
-            // item is recorded-terminal before the dispatch gate runs.
+            // for sequential mode, read the record of the item's ID now, so
+            // the cursor knows whether the item is recorded-terminal before
+            // the dispatch gate runs.
             let pc = if concurrency > 1 {
                 let pre = pre_claimed
                     .get(i)
@@ -2424,8 +2400,7 @@ where
                     has_record: pre.has_record,
                 }
             } else {
-                let child_op_id = ctx.peek_id_at(0);
-                register_child_id(child_ids, i, &child_op_id);
+                let child_op_id = item_ids.id(i).clone();
                 // Non-determinism detection on child items happens inside
                 // the validated view fetch; only the status is consumed.
                 let view = ctx.checkpoint_view_validated(
@@ -2451,10 +2426,8 @@ where
             // dispatch cursor, in input order. This is the replay pass of
             // the sequential path, not a live dispatch, so the dispatch
             // gate does not run for it; its settle evaluates the
-            // completion rule, except under a replay plan. The item consumed an ID on the run that
-            // recorded it, so the ID is minted for counter parity.
+            // completion rule, except under a replay plan.
             if pc.is_terminal {
-                ctx.mint_id();
                 // The item enters the "ever started" prefix the batch
                 // decision record reports. It settles at once, with no
                 // evaluation in between, so the predicate never sees its
@@ -2476,17 +2449,10 @@ where
             // completion predicate on the current view. A `Complete`
             // decision sets the reason and stops dispatch; when nothing
             // runs, the loop below ends the batch at once, and otherwise
-            // the next settle ends it through early completion. The gate
-            // runs before the sequential path mints this item's ID, so an
-            // item the gate stops consumes no ID, live or on replay. Under
-            // a replay plan the recorded reason is reproduced instead.
+            // the next settle ends it through early completion. Under a
+            // replay plan the recorded reason is reproduced instead.
             if replay_plan.is_none() && progress.tracker.dispatch_gate(&completion_cfg) {
                 break;
-            }
-
-            // The sequential path claims the ID it peeked above.
-            if concurrency == 1 {
-                ctx.mint_id();
             }
 
             // The item is admitted: it enters the "ever started" prefix the
@@ -2529,7 +2495,7 @@ where
             }
 
             let req = ItemRequest {
-                ctx: ctx.clone(),
+                ctx: batch_ctx.clone(),
                 child_op_id: pc.op_id,
                 index: branch_index,
                 is_terminal: pc.is_terminal,
@@ -2692,7 +2658,7 @@ async fn replay_terminal_batch<O, IS, RS>(
     total_items: usize,
     result_serdes: &RS,
     serdes_ctx: &SerdesContext,
-    child_ids: Option<&ChildIds>,
+    item_ids: &ItemIds,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -2729,7 +2695,7 @@ where
                 total_items,
                 serdes_ctx.operation_id(),
                 serdes_ctx.durable_execution_arn(),
-                child_ids,
+                item_ids,
             )
             .await
         }
@@ -3032,11 +2998,10 @@ impl ReplayPlan {
 /// batch result directly from the decision record and the child checkpoint
 /// records, without re-running any item body.
 ///
-/// Child IDs are PEEKED, never minted, so a fall-back to re-execution, an
-/// admitted child whose own result was too large to checkpoint inline
-/// surfaces as the `ReplayChildren` sentinel, leaves the parent counter
-/// untouched for the re-execution path; the caller advances the counter
-/// only after a successful reconstruction. Items in the started set are
+/// Each child's ID comes from the batch's [`ItemIds`] table. An admitted
+/// child whose own result was too large to checkpoint inline surfaces as
+/// the `ReplayChildren` sentinel, and the caller falls back to
+/// re-execution, which reads the same table. Items in the started set are
 /// reported as [`BatchItemStatus::Started`] without consulting their child
 /// checkpoints, and indexes at or beyond `totalCount` are omitted entirely.
 ///
@@ -3052,7 +3017,7 @@ async fn replay_batch_from_record<O, IS>(
     record_names: &[String],
     serdes: &Arc<IS>,
     child_sub_type: &str,
-    child_ids: Option<&ChildIds>,
+    item_ids: &ItemIds,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -3085,8 +3050,7 @@ where
             });
             continue;
         }
-        let op_id = ctx.peek_id_at(i);
-        register_child_id(child_ids, i, &op_id);
+        let op_id = item_ids.id(i);
         // Non-determinism detection: validate the claimed child identity
         // against the record before decoding its terminal payload.
         ctx.checkpoint_view_validated(
@@ -4017,7 +3981,7 @@ fn oversized_batch_summary<O>(result: &BatchResult<O>, parent_sub_type: &str) ->
 /// child's serdes context. A record from an earlier release decodes it with
 /// the context that release used (see [`preview_item_serdes_ctx`]).
 /// `total_items` is the length of the current input.
-#[expect(clippy::too_many_arguments)] // reason: the record decode needs the child-ID map beside the serdes inputs
+#[expect(clippy::too_many_arguments)] // reason: the record decode needs the item ID table beside the serdes inputs
 async fn to_batch_result<O, IS>(
     ctx: &DurableContext,
     record_text: &str,
@@ -4026,7 +3990,7 @@ async fn to_batch_result<O, IS>(
     total_items: usize,
     parent_wire: &str,
     execution_arn: &str,
-    child_ids: Option<&ChildIds>,
+    item_ids: &ItemIds,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -4041,7 +4005,7 @@ where
                 encoding,
                 total_items,
                 execution_arn,
-                child_ids,
+                item_ids,
             )
             .await
         }
@@ -4053,9 +4017,8 @@ where
 
 /// Converts a JS-form batch record back into a `BatchResult`.
 ///
-/// The child of item `i` holds the `i`-th ID after the batch parent's (see
-/// [`replay_batch_from_record`]), so its serdes context is derived from
-/// that ID. A failed item's type, message and data come from `Cause` when
+/// The child of item `i` has the ID of item `i` in the batch's
+/// [`ItemIds`] table, so its serdes context is derived from that ID. A failed item's type, message and data come from `Cause` when
 /// it has them, else from the top level; its frames come from `Cause` when
 /// it is present.
 ///
@@ -4065,8 +4028,8 @@ where
 /// that form, but a custom `result_serdes` or a corrupt checkpoint can
 /// produce another one. A sparse, duplicate or reordered index would
 /// derive a child serdes context that is not the child's own ID, and an
-/// index past the input would name an ID beyond the counter's range. So
-/// such a record fails the replay with an error.
+/// index past the input would name no item of the table. So such a record
+/// fails the replay with an error.
 async fn js_to_batch_result<O, IS>(
     ctx: &DurableContext,
     record: JsBatchRecord,
@@ -4074,7 +4037,7 @@ async fn js_to_batch_result<O, IS>(
     encoding: ItemEncoding,
     total_items: usize,
     execution_arn: &str,
-    child_ids: Option<&ChildIds>,
+    item_ids: &ItemIds,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -4114,8 +4077,7 @@ where
                         ))
                     })?
                 };
-                let child_op_id = ctx.peek_id_at(index);
-                register_child_id(child_ids, index, &child_op_id);
+                let child_op_id = item_ids.id(index);
                 let item_ctx = SerdesContext::new(child_op_id.wire().to_owned(), execution_arn);
                 Some(
                     deserialize_value::<O, _>(
@@ -4745,11 +4707,11 @@ mod tests {
         use crate::future::Branch;
 
         // Second-invocation state: the batch parent (positional "1") is not
-        // yet terminal, child 0 (positional "2") failed, and child 1
-        // (positional "3") succeeded with 7.
+        // yet terminal, child 0 (positional "1-1") failed, and child 1
+        // (positional "1-2") succeeded with 7.
         let log = CheckpointLog::from_records(vec![
-            failed_record("2", "recorded failure"),
-            succeeded_record("3", "7"),
+            failed_record("1-1", "recorded failure"),
+            succeeded_record("1-2", "7"),
         ]);
         let (ctx, _client) = test_ctx_with_client(log);
 
@@ -6191,9 +6153,9 @@ mod tests {
     #[tokio::test]
     async fn resumed_batch_keeps_recorded_outcomes() {
         let log = CheckpointLog::from_records(vec![
-            succeeded_record("2", "1"),
-            succeeded_record("3", "2"),
-            failed_record("4", "recorded failure"),
+            succeeded_record("1-1", "1"),
+            succeeded_record("1-2", "2"),
+            failed_record("1-3", "recorded failure"),
         ]);
         let (ctx, _client) = test_ctx_with_client(log);
         let ran = Arc::new(AtomicUsize::new(0));
@@ -6725,7 +6687,7 @@ mod tests {
     /// the live items still get the IDs the first run would give them.
     #[tokio::test]
     async fn sequential_replay_asks_no_gate_for_a_recorded_item() {
-        let log = CheckpointLog::from_records(vec![succeeded_record("2", "1")]);
+        let log = CheckpointLog::from_records(vec![succeeded_record("1-1", "1")]);
         let (ctx, client) = test_ctx_with_client(log);
         let views: ViewLog = Arc::default();
         let writer = Arc::clone(&views);
@@ -6766,8 +6728,8 @@ mod tests {
         assert_eq!(
             started,
             [
-                crate::engine::compute_wire_id_public("3"),
-                crate::engine::compute_wire_id_public("4")
+                crate::engine::compute_wire_id_public("1-2"),
+                crate::engine::compute_wire_id_public("1-3")
             ],
             "the live items keep the IDs the first run gives them"
         );
@@ -7194,7 +7156,7 @@ mod tests {
             2,
             "parent-wire",
             "arn:test",
-            None,
+            &ItemIds::new(&OperationId::new("1".to_owned()), 2),
         )
         .await
         .expect("deserializing the payload must succeed");
@@ -7288,7 +7250,7 @@ mod tests {
             2,
             "parent-wire",
             "arn:test",
-            None,
+            &ItemIds::new(&OperationId::new("1".to_owned()), 2),
         )
         .await
         .expect("deserializing the payload must succeed");
@@ -7494,7 +7456,9 @@ mod tests {
         let mut set = crate::BranchSet::new();
         let handle = set.add("only", |_ctx| async { Ok(1_u32) });
         let (_bodies, decoders, _json) = set.into_parts();
-        (MixedItemSerdes::new("parent-wire", decoders), handle)
+        let batch = OperationId::new("1".to_owned());
+        let item_ids = ItemIds::new(&batch, decoders.len());
+        (MixedItemSerdes::new(&batch, &item_ids, decoders), handle)
     }
 
     #[tokio::test]
@@ -7512,32 +7476,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_item_serdes_finds_child_and_preview_ids() {
+    async fn mixed_item_serdes_uses_item_id_table() {
         let mut set = crate::BranchSet::new();
         let _first = set.add("first", |_ctx| async { Ok(1_u32) });
         let second = set.add("second", |_ctx| async { Ok(2_u32) });
         let (_bodies, decoders, _json) = set.into_parts();
-        let ctx = test_ctx(CheckpointLog::empty());
-        let parent = "parent-wire";
-        let serdes = MixedItemSerdes::new(parent, decoders);
-        // The batch engine registers the child ID it gives branch 1.
-        let child_op_id = ctx.peek_id_at(5);
-        register_child_id(Some(&serdes.child_ids()), 1, &child_op_id);
-        // The registered child ID of branch 1 and the preview context of
-        // branch 1 both reach branch 1's decoder: publishing the decoded
-        // value fills branch 1's handle.
-        let child = SerdesContext::new(child_op_id.wire().to_owned(), "arn:test");
+        let batch = OperationId::new("1".to_owned());
+        let item_ids = ItemIds::new(&batch, decoders.len());
+        let serdes = MixedItemSerdes::new(&batch, &item_ids, decoders);
+        // With no registration, the wire ID of `1-2` names branch 1: the
+        // serdes reads it from the table, and publishing the decoded value
+        // fills branch 1's handle.
+        let child = SerdesContext::new(crate::engine::compute_wire_id_public("1-2"), "arn:test");
         let value = serdes
             .deserialize("7".to_owned(), child)
             .await
-            .expect("the child ID names branch 1");
+            .expect("the ID 1-2 names branch 1");
         value.0.publish();
-        let preview = SerdesContext::new(format!("{parent}/item-1"), "arn:test");
+        assert_eq!(second.into_result().expect("branch 1 holds a value"), 7);
+    }
+
+    #[tokio::test]
+    async fn mixed_item_serdes_finds_preview_ids() {
+        let mut set = crate::BranchSet::new();
+        let _first = set.add("first", |_ctx| async { Ok(1_u32) });
+        let second = set.add("second", |_ctx| async { Ok(2_u32) });
+        let (_bodies, decoders, _json) = set.into_parts();
+        let batch = OperationId::new("1".to_owned());
+        let item_ids = ItemIds::new(&batch, decoders.len());
+        let serdes = MixedItemSerdes::new(&batch, &item_ids, decoders);
+        // The preview context of branch 1 reaches branch 1's decoder.
+        let preview = SerdesContext::new(format!("{}/item-1", batch.wire()), "arn:test");
         let value = serdes
             .deserialize("8".to_owned(), preview)
             .await
             .expect("the preview context names branch 1");
-        // The later publish replaces the earlier value in the slot.
         value.0.publish();
         assert_eq!(second.into_result().expect("branch 1 holds a value"), 8);
     }
@@ -8070,8 +8043,8 @@ mod tests {
             parent.result = None;
             CheckpointLog::from_records(vec![
                 (parent_wire, parent),
-                succeeded_record("2", "1"),
-                panic_record("3"),
+                succeeded_record("1-1", "1"),
+                panic_record("1-2"),
             ])
         };
         let ran = Arc::new(AtomicBool::new(false));
@@ -8603,10 +8576,10 @@ mod tests {
         let doc = probe_doc();
         let wire = hex_envelope(&serde_json::to_string(&doc).expect("doc is JSON-able"));
 
-        // Batch parent "1" started; its single child "1.1" already succeeded
+        // Batch parent "1" started; its single child "1-1" already succeeded
         // with the custom wire form in the log.
         let parent_wire_id = crate::engine::compute_wire_id_public("1");
-        let child_wire_id = crate::engine::compute_wire_id_public("2");
+        let child_wire_id = crate::engine::compute_wire_id_public("1-1");
         let log = CheckpointLog::from_records(vec![
             (
                 parent_wire_id.clone(),
@@ -8992,13 +8965,13 @@ mod tests {
         // Live history: 6 input items, min_successful stopped the batch
         // after items 0 and 1 completed; items 2..5 never started. The
         // parent's payload was too large to store, so the decision record
-        // was written in its place. Children claimed IDs "2" and "3".
+        // was written in its place. Children have the IDs "1-1" and "1-2".
         let decision =
             r#"{"totalCount":2,"completionReason":"MIN_SUCCESSFUL_REACHED","startedIndexes":[]}"#;
         let log = CheckpointLog::from_records(vec![
             decision_record_parent("1", decision),
-            succeeded_record("2", "\"hello\""),
-            succeeded_record("3", "\"world\""),
+            succeeded_record("1-1", "\"hello\""),
+            succeeded_record("1-2", "\"world\""),
         ]);
         let ctx = test_ctx(log);
 
@@ -9070,9 +9043,9 @@ mod tests {
             r#"{"totalCount":3,"completionReason":"MIN_SUCCESSFUL_REACHED","startedIndexes":[1]}"#;
         let log = CheckpointLog::from_records(vec![
             decision_record_parent("1", decision),
-            succeeded_record("2", "\"a\""),
-            started_record("3"),
-            succeeded_record("4", "\"c\""),
+            succeeded_record("1-1", "\"a\""),
+            started_record("1-2"),
+            succeeded_record("1-3", "\"c\""),
         ]);
         let ctx = test_ctx(log);
 
@@ -9154,10 +9127,10 @@ mod tests {
             r#"{"totalCount":3,"completionReason":"MIN_SUCCESSFUL_REACHED","startedIndexes":[1]}"#;
         let log = CheckpointLog::from_records(vec![
             decision_record_parent("1", decision),
-            replay_children_success_record("2"),
-            poisoned_record("3"),
-            succeeded_record("4", "\"c\""),
-            poisoned_record("5"),
+            replay_children_success_record("1-1"),
+            poisoned_record("1-2"),
+            succeeded_record("1-3", "\"c\""),
+            poisoned_record("1-4"),
         ]);
         // The fallback re-executes item 0's body to reconstruct its
         // oversized result, so a live client is needed.
@@ -9222,8 +9195,8 @@ mod tests {
                     end_timestamp: None,
                 },
             ),
-            succeeded_record("2", "\"hello\""),
-            succeeded_record("3", "\"world\""),
+            succeeded_record("1-1", "\"hello\""),
+            succeeded_record("1-2", "\"world\""),
         ]);
         // Re-execution re-checkpoints the parent, so a live client is
         // needed, exactly as before decision records existed.
@@ -9528,10 +9501,10 @@ mod tests {
     /// of replaying the stale record successfully.
     #[tokio::test]
     async fn fast_replay_validates_completed_child_identity() {
-        // Child "2" (item 0) carries a recorded identity that does NOT
+        // Child "1-1" (item 0) carries a recorded identity that does NOT
         // match a map iteration: same type but a different sub-type.
         let mismatched_child = {
-            let wire_id = crate::engine::compute_wire_id_public("2");
+            let wire_id = crate::engine::compute_wire_id_public("1-1");
             (
                 wire_id.clone(),
                 CheckpointRecord {
@@ -9564,7 +9537,7 @@ mod tests {
         let log = CheckpointLog::from_records(vec![
             decision_record_parent("1", decision),
             mismatched_child,
-            succeeded_record("3", "\"b\""),
+            succeeded_record("1-2", "\"b\""),
         ]);
         let ctx = test_ctx(log);
 
@@ -9590,11 +9563,11 @@ mod tests {
     const EARLY_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// The wire IDs of the two items of a root map at position 1: the
-    /// batch claims its items' IDs next, in the root namespace.
+    /// items are numbered inside the batch.
     fn item_wires() -> [String; 2] {
         [
-            crate::engine::compute_wire_id_public("2"),
-            crate::engine::compute_wire_id_public("3"),
+            crate::engine::compute_wire_id_public("1-1"),
+            crate::engine::compute_wire_id_public("1-2"),
         ]
     }
 
@@ -10551,7 +10524,7 @@ mod tests {
             2,
             "parent-wire",
             "arn:test",
-            None,
+            &ItemIds::new(&OperationId::new("1".to_owned()), 2),
         )
         .await
         .expect("a preview summary replays");
@@ -10962,7 +10935,7 @@ mod tests {
             wires.len(),
             "parent-wire",
             "arn:test",
-            None,
+            &ItemIds::new(&OperationId::new("1".to_owned()), wires.len()),
         )
         .await
         .expect("the record replays");
@@ -11005,7 +10978,7 @@ mod tests {
             wires.len(),
             "parent-wire",
             "arn:test",
-            None,
+            &ItemIds::new(&OperationId::new("1".to_owned()), wires.len()),
         )
         .await
         .expect("the record replays");
@@ -11032,7 +11005,7 @@ mod tests {
             3,
             "parent-wire",
             "arn:test",
-            None,
+            &ItemIds::new(&OperationId::new("1".to_owned()), 3),
         )
         .await
         .expect("the earlier record replays");
@@ -11683,8 +11656,8 @@ mod tests {
     fn started_middle_log(payload: &str) -> CheckpointLog {
         CheckpointLog::from_records(vec![
             decision_record_parent("1", payload),
-            succeeded_record("2", "\"a\""),
-            succeeded_record("4", "\"c\""),
+            succeeded_record("1-1", "\"a\""),
+            succeeded_record("1-3", "\"c\""),
         ])
     }
 
@@ -11822,7 +11795,7 @@ mod tests {
             .await
             .expect("map succeeds");
         assert_eq!(out, vec![10, 20]);
-        let (c0, c1) = (wire_of("2"), wire_of("3"));
+        let (c0, c1) = (wire_of("1-1"), wire_of("1-2"));
         let mut live = vec![
             ("deserialize", c0.clone()),
             ("deserialize", c1.clone()),
@@ -11926,7 +11899,7 @@ mod tests {
                     ..succeeded_record("1", "").1
                 },
             ),
-            succeeded_record("2", "\"hello\""),
+            succeeded_record("1-1", "\"hello\""),
         ]);
         let (ctx, client) = test_ctx_with_client(log);
         let out: Vec<String> = ctx
