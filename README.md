@@ -291,6 +291,7 @@ durable::wrap(handler, options);
 | `ctx.wait_for_callback(submitter)` | Mints the ID, hands it to `submitter`, and waits for the payload. |
 | `ctx.map(items, f)` | Runs `f` per item, each in its own child context. |
 | `ctx.parallel(branches)` | Runs named branches concurrently. |
+| `ctx.parallel_mixed(branches)` | Runs named branches that each return their own type; each branch handle returns its result after the parallel completes. |
 | `ctx.try_join_all(futures)` | Collects every result, failing on the first error. |
 | `ctx.join_all(futures)` | Collects every outcome as `Result<O, OperationError>`, never failing fast. |
 | `ctx.select_ok(futures)` | Returns the first success and cancels the inputs still running. |
@@ -713,6 +714,57 @@ When the completion rule ends the batch early, items that are still running
 are cancelled at their next `.await` and reported as `Started`. A cancelled
 item writes no further checkpoint.
 
+### parallel_mixed
+
+`parallel_mixed` runs branches of different result types in one parallel
+operation. Add each branch to a `BranchSet`. `add` returns a
+`BranchHandle<T>` typed with that branch's result, and `add_with_serdes`
+does the same with a serdes of your choice for that branch. After the
+`.await` of `parallel_mixed`, each handle's `into_result()` returns its own
+type.
+
+```rust ignore
+let mut branches = BranchSet::new();
+let reservation = branches.add("inventory", |child| async move {
+    Ok(child
+        .step(|_| async { Ok(Reservation { sku: "sku-1".to_owned() }) })
+        .name("reserve")
+        .await?)
+});
+let auth = branches.add_with_serdes("payment", PaymentSerdes, |_child| async {
+    Ok(PaymentAuth { code: 7 })
+});
+
+ctx.parallel_mixed(branches).name("process-order").await?;
+
+let reservation: Reservation = reservation.into_result()?;
+let auth: PaymentAuth = auth.into_result()?;
+```
+
+The operation records the same history as `parallel` over branches with
+the same names and outcomes: one parallel parent and one child context per
+branch. `ParallelMixedBuilder` takes `.max_concurrency(...)`,
+`.completion(...)`, `.nesting(...)`, `.result_serdes(...)` and `.spawn()`,
+as `ParallelBuilder` does. `.await` returns the batch's
+`CompletionReason`. A handle whose branch settled holds the branch's value
+or error, whatever the parallel's own outcome. A handle whose branch never
+started, or still ran when the batch completed, returns a `NotCompleted`
+error. With `.spawn()`, the handles receive their results when the
+returned future is awaited.
+
+The result serdes works as on `ParallelBuilder`: it is a `Serdes<String>`
+over the batch record's JSON text, and it defaults to `PassthroughSerdes`.
+`JsonSerdes` stores the record as a quoted JSON string.
+
+Pick the parallel form by the branch result types:
+
+- `parallel`, when every branch returns the same type.
+- `parallel` over an enum, when the results are cases of one type that the
+  handler processes together. Use serde's default (externally tagged) enum
+  representation. `#[serde(untagged)]` can decode a result into the wrong
+  variant when two variants accept the same JSON.
+- `parallel_mixed`, when each branch returns its own type.
+
 ### combinators
 
 The four combinators take `DurableFuture` values, which `.future()` and
@@ -867,23 +919,27 @@ operation that produces another type fails to compile.
 Serdes are configured **per operation**, with `.serdes(...)` on
 `StepBuilder`, `InvokeBuilder`, `ChildBuilder`, `WithRetryBuilder`,
 `WaitForConditionBuilder`, `CreateCallbackBuilder`,
-`WaitForCallbackBuilder`, `MapBuilder`, or `ParallelBuilder`. Each builder
+`WaitForCallbackBuilder`, `MapBuilder`, or `ParallelBuilder`. A
+`parallel_mixed` branch takes its serdes from `BranchSet::add_with_serdes`
+instead. Each builder
 carries its serdes as a generic type parameter defaulting to `JsonSerdes`,
 and `.serdes(...)` swaps that parameter; `.await` still produces a
 `DurableFuture<O>` regardless of the serdes type, so futures configured
 with different serdes implementations coexist in one combinator input
 collection. `WaitBuilder` and the combinator builders carry no serdes
 method because their payloads are structural, not user-typed.
-`MapBuilder` and `ParallelBuilder` also carry a result serdes, set with
-`.result_serdes(...)`, which defaults to `PassthroughSerdes`, not
-`JsonSerdes`.
+`MapBuilder`, `ParallelBuilder` and `ParallelMixedBuilder` also carry a
+result serdes, set with `.result_serdes(...)`, which defaults to
+`PassthroughSerdes`, not `JsonSerdes`.
 
-On `MapBuilder` and `ParallelBuilder` the two serdes do different jobs.
+On `MapBuilder`, `ParallelBuilder` and `ParallelMixedBuilder` the two
+serdes do different jobs.
 The item `.serdes(...)` is a `Serdes<O>` for each item's value, as on any
-other operation. `.result_serdes(...)` is a `Serdes<String>` over the
-batch record's JSON text, in the shape of the JS SDK's batch result. It
-must be lossless: its deserializer must return the exact record text its
-serializer received, though the stored payload may use any format.
+other operation, or for each branch's value on `ParallelMixedBuilder`.
+`.result_serdes(...)` is a `Serdes<String>` over the batch record's JSON
+text, in the shape of the JS SDK's batch result. It must be lossless: its
+deserializer must reconstruct the exact record text its serializer
+received, though the stored payload may use any format.
 `PassthroughSerdes` stores the record text unchanged, and `JsonSerdes`
 stores it as a quoted JSON string.
 

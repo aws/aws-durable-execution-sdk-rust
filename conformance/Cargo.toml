@@ -20,6 +20,7 @@ members = [
     "history/*",
     "nondeterminism/*",
     "combinator/*",
+    "static_typing/*",
 ]
 resolver = "2"
 

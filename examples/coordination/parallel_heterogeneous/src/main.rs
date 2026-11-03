@@ -1,39 +1,57 @@
-//! Heterogeneous fan-out: differently-typed operations in parallel.
+//! Heterogeneous fan-out: branches of different result types in one
+//! parallel operation.
 //!
-//! [`parallel`](aws_durable_execution_sdk::DurableContext::parallel)
-//! requires a single branch result type. When you want to run operations that
-//! return *different* types concurrently, the idiom is to hold the operation
-//! builders and drive them with `tokio::join!`. Each builder claims its
-//! operation identity at creation, so joining them is replay-safe: polling
-//! order cannot change which operation is which.
+//! [`parallel_mixed`](aws_durable_execution_sdk::DurableContext::parallel_mixed)
+//! runs branches of different result types in one parallel operation. Each
+//! branch is added to a [`BranchSet`](aws_durable_execution_sdk::BranchSet),
+//! which returns a [`BranchHandle`](aws_durable_execution_sdk::BranchHandle)
+//! typed with that branch's result. After the `.await` of `parallel_mixed`,
+//! each handle returns its own type.
 //!
-//! This is the Rust analogue of a variadic, mixed-type `Promise.all`. The
-//! variadic-tuple sugar is not expressible in Rust's type system, but the
-//! capability, concurrent, heterogeneous durable operations, is fully
-//! preserved through `tokio::join!` over held builders.
-//!
-//! This example joins a numeric step and a string step, then combines them.
+//! This example runs a numeric branch and a string branch, then combines
+//! their results.
 
 use aws_durable_execution_sdk as durable;
 
-/// Joins two differently-typed steps concurrently and combines their results.
+/// Runs two differently-typed branches in one parallel operation and
+/// combines their results.
 async fn handler(
     _event: serde_json::Value,
     ctx: durable::DurableContext,
 ) -> Result<String, durable::BoxError> {
-    // Builders are lazy handles with already-claimed identities; tokio::join!
-    // polls them concurrently and returns both results.
-    let count = ctx.step(|_| async { Ok(7u32) }).name("count");
-    let status = ctx
-        .step(|_| async { Ok("ready".to_owned()) })
-        .name("status");
+    let mut branches = durable::BranchSet::new();
+    let count = branches.add("count", |child| async move {
+        Ok(child.step(|_| async { Ok(7u32) }).name("count").await?)
+    });
+    let status = branches.add("status", |child| async move {
+        Ok(child
+            .step(|_| async { Ok("ready".to_owned()) })
+            .name("status")
+            .await?)
+    });
 
-    let (count, status) = tokio::join!(count, status);
-    Ok(format!("{}: {}", count?, status?))
+    ctx.parallel_mixed(branches).name("fan-out").await?;
+    Ok(format!("{}: {}", count.into_result()?, status.into_result()?))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
     lambda_runtime::tracing::init_default_subscriber();
     durable::run(handler).await
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_durable_execution_sdk::test_util::LocalRunner;
+
+    /// The handler returns the count branch's value and the status
+    /// branch's value, each read through its own typed handle.
+    #[tokio::test]
+    async fn outputs_count_and_status() -> Result<(), aws_durable_execution_sdk::BoxError> {
+        let result = LocalRunner::new()
+            .run(super::handler, serde_json::Value::Null)
+            .await?;
+        assert_eq!(result.output().map(String::as_str), Some("7: ready"));
+        Ok(())
+    }
 }

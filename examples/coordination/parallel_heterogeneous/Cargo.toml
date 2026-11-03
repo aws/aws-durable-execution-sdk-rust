@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.94.1"
 publish = false
-description = "Example: heterogeneous fan-out via held builders + tokio::join!"
+description = "Example: heterogeneous fan-out with parallel_mixed"
 
 [[bin]]
 name = "parallel_heterogeneous"
@@ -19,3 +19,6 @@ lambda_runtime = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+aws-durable-execution-sdk = { path = "../../..", features = ["test-util"] }

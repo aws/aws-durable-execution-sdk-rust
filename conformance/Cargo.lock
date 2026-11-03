@@ -3044,6 +3044,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "static_typing_typed_branches"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "step_and_wait_replay"
 version = "0.0.0"
 dependencies = [

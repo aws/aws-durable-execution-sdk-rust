@@ -253,7 +253,7 @@ Resources:
     Properties:
       CodeUri: publish/parallel_heterogeneous/
       Handler: bootstrap
-      Description: 'Example: heterogeneous fan-out via held builders + tokio::join!'
+      Description: 'Example: heterogeneous fan-out with parallel_mixed'
       Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7

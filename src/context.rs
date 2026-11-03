@@ -2911,9 +2911,9 @@ impl DurableContext {
     ///   type.
     /// - [`parallel`](Self::parallel) over an enum, when the results are
     ///   cases of one type that the handler processes together. Use serde's
-    ///   default enum representation: with `#[serde(untagged)]`, a result
-    ///   can decode into the wrong variant when two variants accept the
-    ///   same JSON.
+    ///   default (externally tagged) enum representation.
+    ///   `#[serde(untagged)]` can decode a result into the wrong variant
+    ///   when two variants accept the same JSON.
     /// - `parallel_mixed`, when each branch returns its own type.
     ///
     /// A panic in a branch propagates to the caller with its original

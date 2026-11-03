@@ -1,0 +1,31 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (Static Typing)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  StaticTypingTypedBranches:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["12-1"]
+      NotImplemented:
+        - id: "12-2"
+          reason: "branches start only when `parallel_mixed` runs the set"
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/static_typing_typed_branches/
+      Handler: bootstrap
+      Description: 'Conformance 12-1: parallel_mixed typed branch handles'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
