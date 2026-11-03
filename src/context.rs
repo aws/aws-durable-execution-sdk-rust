@@ -605,6 +605,18 @@ impl DurableContext {
         }
     }
 
+    /// Whether a context for the child namespace `child_positional_id`
+    /// would replay before its first claim: the first operation of that
+    /// namespace has a checkpoint record. It is the
+    /// [`Self::is_replaying`] a child context created now starts with.
+    pub(crate) fn namespace_is_replaying(&self, child_positional_id: &str) -> bool {
+        EngineState::new_child(
+            child_positional_id,
+            Arc::clone(&self.inner.engine.checkpoint_log),
+        )
+        .is_replaying()
+    }
+
     /// Mints the next operation ID (internal engine concern).
     ///
     /// Also re-records THIS namespace's span `isReplay` flag: after each

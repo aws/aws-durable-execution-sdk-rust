@@ -269,3 +269,18 @@ Resources:
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
+
+  PluginNestedParentLinkage:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-11"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_nested_parent_linkage/
+      Handler: bootstrap
+      Description: 'Conformance 10-11: Plugin operation end hook reports the parent ID of a step nested in a child context'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

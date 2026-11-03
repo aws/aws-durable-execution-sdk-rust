@@ -244,7 +244,11 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
                         self.futures.len(),
                     ));
                 }
-                _ => false, // Started/Pending: fall through to re-execute
+                _ => {
+                    // Started/Pending: fall through to re-execute.
+                    combinator_resumed(&self.ctx, &wire_id, self.name.as_deref());
+                    false
+                }
             }
         } else {
             // First invocation: checkpoint START.
@@ -380,6 +384,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
     /// Replay path: returns frozen `Vec<Result<O, OperationError>>`, or,
     /// for a record with `ReplayChildren`, drives the inputs again without
     /// writing.
+    #[expect(clippy::too_many_lines)] // reason: the replay, live and record paths read better in one flow
     pub(crate) async fn execute(self) -> Result<Vec<Result<O, OperationError>>, OperationError> {
         // Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -437,7 +442,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
                         self.futures.len(),
                     ));
                 }
-                _ => false,
+                _ => {
+                    combinator_resumed(&self.ctx, &wire_id, self.name.as_deref());
+                    false
+                }
             }
         } else {
             checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
@@ -589,7 +597,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                         self.futures.len(),
                     ));
                 }
-                _ => {}
+                _ => combinator_resumed(&self.ctx, &wire_id, self.name.as_deref()),
             }
         } else {
             checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
@@ -778,7 +786,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                         self.futures.len(),
                     ));
                 }
-                _ => {}
+                _ => combinator_resumed(&self.ctx, &wire_id, self.name.as_deref()),
             }
         } else {
             checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
@@ -980,7 +988,37 @@ async fn checkpoint_start(
             .checkpoint_failure_unrecoverable(wire_id, err, None)
             .await;
     }
+    if let Some(plugins) = ctx.plugins() {
+        let info = combinator_info(ctx, wire_id, name)
+            .with_status(crate::OperationStatus::Started)
+            .with_replay(false);
+        crate::plugin::operation_started(plugins, &info);
+    }
     Ok(())
+}
+
+/// The plugin info of the combinator `wire_id`, created in `ctx`.
+fn combinator_info(
+    ctx: &DurableContext,
+    wire_id: &str,
+    name: Option<&str>,
+) -> crate::plugin::OperationInfo {
+    crate::plugin::OperationInfo::for_operation(
+        ctx,
+        wire_id,
+        crate::OperationKind::Context,
+        COMBINATOR_SUB_TYPE,
+        name,
+    )
+}
+
+/// Fires `on_operation_start` with `is_replay` `true` for a combinator
+/// whose record exists and is not terminal.
+fn combinator_resumed(ctx: &DurableContext, wire_id: &str, name: Option<&str>) {
+    if let Some(plugins) = ctx.plugins() {
+        let info = combinator_info(ctx, wire_id, name).with_replay(true);
+        crate::plugin::operation_started(plugins, &info);
+    }
 }
 
 /// Serializes a combinator result to its JSON string.
@@ -1136,6 +1174,13 @@ async fn checkpoint_succeed(
             .checkpoint_failure_unrecoverable(wire_id, err, Some(terminal))
             .await;
     }
+    if let Some(plugins) = ctx.plugins() {
+        let info = combinator_info(ctx, wire_id, name)
+            .with_status(crate::OperationStatus::Succeeded)
+            .with_result(Some(payload.to_owned()))
+            .with_replay(false);
+        crate::plugin::operation_ended(plugins, &info);
+    }
     Ok(())
 }
 
@@ -1182,6 +1227,13 @@ async fn checkpoint_fail(
         return ctx
             .checkpoint_failure_unrecoverable(wire_id, err, Some(terminal))
             .await;
+    }
+    if let Some(plugins) = ctx.plugins() {
+        let info = combinator_info(ctx, wire_id, name)
+            .with_status(crate::OperationStatus::Failed)
+            .with_error(Some(error.clone()))
+            .with_replay(false);
+        crate::plugin::operation_ended(plugins, &info);
     }
     Ok(())
 }

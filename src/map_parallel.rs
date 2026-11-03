@@ -1327,6 +1327,7 @@ where
 async fn item_after<O, IS>(
     req: &ItemRequest<IS>,
     outcome: Result<O, ChildFnError>,
+    replaying: bool,
 ) -> Result<ItemOutcome<O>, OperationError>
 where
     O: Send + 'static,
@@ -1347,7 +1348,7 @@ where
     // rejects a second close of a CONTEXT. So it takes the same path and
     // writes nothing.
     if req.nesting == NestingMode::Flat || req.is_terminal {
-        return match outcome {
+        let settled = match outcome {
             Ok(value) => {
                 // A result serialization failure is LOCAL and
                 // deterministic: the item closure already ran, so the item
@@ -1400,6 +1401,32 @@ where
                 ))
             }
         };
+        // A flat item reports its end as a virtual child. A terminal
+        // Normal item that re-ran to rebuild its result fires nothing.
+        if req.nesting == NestingMode::Flat
+            && let Ok((item, _)) = &settled
+        {
+            // A settled flat item either succeeded or failed.
+            if matches!(item.status, BatchItemStatus::Succeeded) {
+                item_ended(
+                    req,
+                    crate::OperationStatus::Succeeded,
+                    None,
+                    None,
+                    replaying,
+                );
+            } else {
+                let wire = item.failure_wire();
+                item_ended(
+                    req,
+                    crate::OperationStatus::Failed,
+                    None,
+                    Some(&wire),
+                    replaying,
+                );
+            }
+        }
+        return settled;
     }
 
     match outcome {
@@ -1453,6 +1480,13 @@ where
                             )
                             .await;
                     }
+                    item_ended(
+                        req,
+                        crate::OperationStatus::Failed,
+                        None,
+                        Some(&wire),
+                        replaying,
+                    );
                     return Ok((
                         BatchItem::failed_from_wire(req.index, req.item_name.clone(), &wire),
                         None,
@@ -1481,6 +1515,9 @@ where
             let update = builder
                 .build()
                 .expect("all required OperationUpdate fields set");
+            // The end hook reports the payload the update carries: none for
+            // a `ReplayChildren` result.
+            let result = update.payload().map(str::to_owned);
 
             if let Err(err) = writer.checkpoint_updates(vec![update]).await {
                 // Audit (#43): batch child SUCCEED: the item closure
@@ -1501,6 +1538,13 @@ where
                     .checkpoint_failure_unrecoverable(&child_wire, err, Some(terminal))
                     .await;
             }
+            item_ended(
+                req,
+                crate::OperationStatus::Succeeded,
+                result,
+                None,
+                replaying,
+            );
 
             // Round-trip deserialize for live == replay consistency.
             let deserialized: O = deserialize_value(
@@ -1565,6 +1609,13 @@ where
                     .checkpoint_failure_unrecoverable(&child_wire, client_err, Some(terminal))
                     .await;
             }
+            item_ended(
+                req,
+                crate::OperationStatus::Failed,
+                None,
+                Some(&wire),
+                replaying,
+            );
 
             Ok((
                 BatchItem::failed_from_wire(req.index, req.item_name.clone(), &wire),
@@ -1601,10 +1652,11 @@ where
             // closure runs before it returns its future is checked too. A
             // wait inside the body keeps this task pending in the join set.
             let body = ActiveBody::Context(child_ctx.prefix().to_owned());
+            let item_ctx = child_ctx.clone();
             let outcome = run_body(body, async move { run_item(child_ctx, index).await })
                 .instrument(span)
                 .await;
-            item_after(&req, outcome).await
+            item_after(&req, outcome, item_ctx.is_replaying()).await
         }
     }
 }
@@ -1624,6 +1676,7 @@ where
         ItemPrelude::Done(item) => Ok(item),
         ItemPrelude::Run { child_ctx } => {
             let span = child_ctx.replay_span();
+            let item_ctx = child_ctx.clone();
             let outcome = match take_branch_body(&slots, req.index) {
                 Ok(body) => {
                     // `start` injects the child context and returns the
@@ -1638,7 +1691,7 @@ where
                 }
                 Err(err) => Err(err),
             };
-            item_after(&req, outcome).await
+            item_after(&req, outcome, item_ctx.is_replaying()).await
         }
     }
 }
@@ -2132,6 +2185,11 @@ where
             }
         }
         // Non-terminal (Started/Pending): continue from where we left off.
+        else if let Some(plugins) = ctx.plugins() {
+            let info = container_info(&ctx, &parent_wire, parent_sub_type, parent_name.as_deref())
+                .with_replay(true);
+            crate::plugin::operation_started(plugins, &info);
+        }
     } else {
         // 3. First invocation: checkpoint the parent START.
         let update = build_parent_update(
@@ -2148,6 +2206,12 @@ where
             return ctx
                 .checkpoint_failure_unrecoverable(&parent_wire, err, None)
                 .await;
+        }
+        if let Some(plugins) = ctx.plugins() {
+            let info = container_info(&ctx, &parent_wire, parent_sub_type, parent_name.as_deref())
+                .with_status(crate::OperationStatus::Started)
+                .with_replay(false);
+            crate::plugin::operation_started(plugins, &info);
         }
     }
 
@@ -2496,6 +2560,22 @@ where
                         .checkpoint_failure_unrecoverable(&branch_wire, err, None)
                         .await;
                 }
+            }
+            if let Some(plugins) = ctx.plugins() {
+                let info = item_info(&batch_ctx, &branch_wire, &child_sub_type_owned, &item_name);
+                let info = if nesting == NestingMode::Flat {
+                    // A flat item writes no record: it reports as a virtual
+                    // child, with the replay state its context will start
+                    // with.
+                    info.with_virtual(true)
+                        .with_replay(batch_ctx.namespace_is_replaying(pc.op_id.positional()))
+                } else if pc.has_record {
+                    info.with_replay(true)
+                } else {
+                    info.with_status(crate::OperationStatus::Started)
+                        .with_replay(false)
+                };
+                crate::plugin::operation_started(plugins, &info);
             }
 
             let req = ItemRequest {
@@ -3135,6 +3215,8 @@ async fn checkpoint_batch_success_serialized(
     let update = builder
         .build()
         .expect("all required OperationUpdate fields set");
+    // The end hook reports the payload the update carries.
+    let result = update.payload().map(str::to_owned);
 
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
         // Audit (#43): batch parent SUCCEED: the batch's items ran, so
@@ -3148,8 +3230,79 @@ async fn checkpoint_batch_success_serialized(
             .checkpoint_failure_unrecoverable(parent_wire, err, Some(terminal))
             .await;
     }
+    if let Some(plugins) = ctx.plugins() {
+        let info = container_info(ctx, parent_wire, parent_sub_type, parent_name)
+            .with_status(crate::OperationStatus::Succeeded)
+            .with_result(result)
+            .with_replay(false);
+        crate::plugin::operation_ended(plugins, &info);
+    }
 
     Ok(())
+}
+
+/// The plugin info of the `map` or `parallel` container `wire_id`, created
+/// in the caller's context `ctx`.
+fn container_info(
+    ctx: &DurableContext,
+    wire_id: &str,
+    sub_type: &str,
+    name: Option<&str>,
+) -> crate::plugin::OperationInfo {
+    crate::plugin::OperationInfo::for_operation(
+        ctx,
+        wire_id,
+        crate::OperationKind::Context,
+        sub_type,
+        name,
+    )
+}
+
+/// The plugin info of the map item or parallel branch `wire_id`, created
+/// in the batch's own context `batch_ctx`. That context's parent is the
+/// container, so the info names the container as its parent.
+fn item_info(
+    batch_ctx: &DurableContext,
+    wire_id: &str,
+    sub_type: &str,
+    name: &str,
+) -> crate::plugin::OperationInfo {
+    crate::plugin::OperationInfo::for_operation(
+        batch_ctx,
+        wire_id,
+        crate::OperationKind::Context,
+        sub_type,
+        Some(name),
+    )
+}
+
+/// Fires `on_operation_end` for the item of `req` once its outcome is
+/// known: `status` with `result` and `error`. A flat item reports as a
+/// virtual child with the replay state `replaying` of its context.
+fn item_ended(
+    req: &ItemRequest<impl Sized>,
+    status: crate::OperationStatus,
+    result: Option<String>,
+    error: Option<&crate::error::WireError>,
+    replaying: bool,
+) {
+    if let Some(plugins) = req.ctx.plugins() {
+        let info = item_info(
+            &req.ctx,
+            req.child_op_id.wire(),
+            &req.child_sub_type,
+            &req.item_name,
+        )
+        .with_status(status)
+        .with_result(result)
+        .with_error(error.cloned());
+        let info = if req.nesting == NestingMode::Flat {
+            info.with_virtual(true).with_replay(replaying)
+        } else {
+            info.with_replay(false)
+        };
+        crate::plugin::operation_ended(plugins, &info);
+    }
 }
 
 /// Builds a parent-level operation update.
@@ -4350,6 +4503,120 @@ mod tests {
             "token0".to_owned(),
         );
         (ctx, client)
+    }
+
+    /// The in-memory client's checkpoint responses return no operations, so
+    /// no item record exists when the item hooks fire. The item's infos
+    /// still name the map as their parent, because the item is created in
+    /// the batch's own context.
+    #[tokio::test]
+    async fn item_hooks_report_container_without_record() {
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let values = ctx
+            .map(vec![1_u32], |_child, item, _idx| async move { Ok(item) })
+            .name("m")
+            .await
+            .expect("the map succeeds");
+        assert_eq!(values, [1]);
+        let map_wire = crate::engine::compute_wire_id_public("1");
+        let item = hooks.of("map-item-0");
+        let shape: Vec<_> = item
+            .iter()
+            .map(|r| (r.hook, r.parent_id.as_deref()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("start", Some(map_wire.as_str())),
+                ("end", Some(map_wire.as_str()))
+            ]
+        );
+    }
+
+    /// Builds the request of item 0 of a map named `m` on a root context
+    /// that carries the plugin `hooks`, without running the map.
+    fn item_request(
+        hooks: &crate::plugin::test_support::OpHooks,
+        nesting: NestingMode,
+    ) -> ItemRequest<crate::serdes::JsonSerdes> {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        ItemRequest {
+            ctx,
+            child_op_id: OperationId::new("1-1".to_owned()),
+            index: 0,
+            is_terminal: false,
+            parent_wire: crate::engine::compute_wire_id_public("1"),
+            child_sub_type: "MapIteration".to_owned(),
+            item_name: "map-item-0".to_owned(),
+            nesting,
+            serdes: Arc::new(crate::serdes::JsonSerdes),
+        }
+    }
+
+    /// The end hook of a flat item reports the `is_replaying()` value that
+    /// the caller read from the item's own context, for a success and for
+    /// a failure. The test passes both values directly, so it needs no
+    /// history that the item body does not follow. A Normal item writes
+    /// its own record and ends live, so it reports `false` either way.
+    #[tokio::test]
+    async fn flat_item_end_reports_item_context_replay_state() {
+        for replaying in [true, false] {
+            let hooks = crate::plugin::test_support::OpHooks::default();
+            let req = item_request(&hooks, NestingMode::Flat);
+            item_after(&req, Ok(1_u32), replaying)
+                .await
+                .expect("a flat success settles");
+            let failed: Result<u32, ChildFnError> = Err(ChildFnError::from(BoxError::from("bad")));
+            item_after(&req, failed, replaying)
+                .await
+                .expect("a flat failure settles");
+            let ends: Vec<_> = hooks
+                .of("map-item-0")
+                .iter()
+                .map(|r| (r.hook, r.replay, r.is_virtual, r.status))
+                .collect();
+            assert_eq!(
+                ends,
+                [
+                    (
+                        "end",
+                        replaying,
+                        true,
+                        Some(crate::OperationStatus::Succeeded)
+                    ),
+                    ("end", replaying, true, Some(crate::OperationStatus::Failed)),
+                ],
+                "replaying = {replaying}"
+            );
+        }
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let req = item_request(&hooks, NestingMode::Normal);
+        item_ended(&req, crate::OperationStatus::Succeeded, None, None, true);
+        let normal: Vec<_> = hooks
+            .of("map-item-0")
+            .iter()
+            .map(|r| (r.hook, r.replay, r.is_virtual))
+            .collect();
+        assert_eq!(normal, [("end", false, false)]);
     }
 
     /// Map items must be MOVED into the closure, not re-created through a

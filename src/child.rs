@@ -225,7 +225,18 @@ where
                     )));
                 }
                 // Started/Pending/Ready: re-enter child body (resume path).
-                _ => {}
+                _ => {
+                    if let Some(plugins) = self.ctx.plugins() {
+                        let info = child_info(
+                            &self.ctx,
+                            &wire_id,
+                            self.sub_type.as_str(),
+                            self.name.as_deref(),
+                        )
+                        .with_replay(true);
+                        crate::plugin::operation_started(plugins, &info);
+                    }
+                }
             }
         } else {
             // 3. No checkpoint record: first invocation: checkpoint START.
@@ -244,6 +255,17 @@ where
                     .ctx
                     .checkpoint_failure_unrecoverable(&wire_id, err, None)
                     .await;
+            }
+            if let Some(plugins) = self.ctx.plugins() {
+                let info = child_info(
+                    &self.ctx,
+                    &wire_id,
+                    self.sub_type.as_str(),
+                    self.name.as_deref(),
+                )
+                .with_status(crate::OperationStatus::Started)
+                .with_replay(false);
+                crate::plugin::operation_started(plugins, &info);
             }
         }
 
@@ -425,6 +447,7 @@ where
                                 )
                                 .await;
                         }
+                        child_failed(&ctx, &wire_id, sub_type, name.as_deref(), &wire);
                         return Err(op_err
                             .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
                             .with_wire(wire));
@@ -432,6 +455,9 @@ where
                 };
                 let update =
                     build_succeed_update(&wire_id, name.as_deref(), sub_type, &ctx, &serialized);
+                // The end hook reports the payload the update carries: none
+                // for a `ReplayChildren` result.
+                let result = update.payload().map(str::to_owned);
                 if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
                     // Audit (#43): child-context SUCCEED: the closure
                     // ran, so its side effects need a recorded outcome. A
@@ -443,6 +469,13 @@ where
                     return ctx
                         .checkpoint_failure_unrecoverable(&wire_id, err, Some(terminal))
                         .await;
+                }
+                if let Some(plugins) = ctx.plugins() {
+                    let info = child_info(&ctx, &wire_id, sub_type, name.as_deref())
+                        .with_status(crate::OperationStatus::Succeeded)
+                        .with_result(result)
+                        .with_replay(false);
+                    crate::plugin::operation_ended(plugins, &info);
                 }
 
                 // Round-trip deserialize for consistency (first-run == replay).
@@ -456,6 +489,40 @@ where
                 )
             }
         }
+    }
+}
+
+/// The plugin info of the child context `wire_id`, created in `ctx`.
+fn child_info(
+    ctx: &DurableContext,
+    wire_id: &str,
+    sub_type: &str,
+    name: Option<&str>,
+) -> crate::plugin::OperationInfo {
+    crate::plugin::OperationInfo::for_operation(
+        ctx,
+        wire_id,
+        crate::OperationKind::Context,
+        sub_type,
+        name,
+    )
+}
+
+/// Fires `on_operation_end` for a child context whose `FAIL` with `wire`
+/// was written.
+fn child_failed(
+    ctx: &DurableContext,
+    wire_id: &str,
+    sub_type: &str,
+    name: Option<&str>,
+    wire: &crate::error::WireError,
+) {
+    if let Some(plugins) = ctx.plugins() {
+        let info = child_info(ctx, wire_id, sub_type, name)
+            .with_status(crate::OperationStatus::Failed)
+            .with_error(Some(wire.clone()))
+            .with_replay(false);
+        crate::plugin::operation_ended(plugins, &info);
     }
 }
 
@@ -559,6 +626,7 @@ async fn checkpoint_live_failure(
             .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
             .await;
     }
+    child_failed(ctx, wire_id, sub_type, name, &wire);
 
     OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
         ChildContextErrorKind::ChildFailed,

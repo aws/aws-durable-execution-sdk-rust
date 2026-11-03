@@ -329,7 +329,66 @@ pub trait Plugin: Send + Sync {
     /// above. When the `wait_for_callback` is named `n`, they report the
     /// names `n-callback` and `n-submitter`; their records carry no name.
     ///
-    /// A step or child context that is terminal on replay fires nothing.
+    /// A child context (and so `with_retry` and each of its `attempt-N`
+    /// child contexts), a `map` or `parallel` container, each map item and
+    /// parallel branch, and the combinators `try_join_all`, `join_all`,
+    /// `select_ok` and `race` report kind `Context`. The rules below apply
+    /// to each of them that writes a record, which includes a map item or
+    /// parallel branch with `NestingMode::Normal`. A map item or parallel
+    /// branch with `NestingMode::Flat` writes no `START`, `SUCCEED` or
+    /// `FAIL` record, so these rules do not apply to it; its own rules
+    /// follow the list.
+    ///
+    /// - an operation without a record fires `on_operation_start` with
+    ///   status `Started` and `is_replay` `false` once its `START` is
+    ///   written, before its body or its first item runs;
+    /// - a record that is not terminal (`STARTED`, `PENDING` or `READY`)
+    ///   fires `on_operation_start` with `is_replay` `true`, before the
+    ///   body or the first item runs;
+    /// - a body or batch that succeeds fires `on_operation_end` with status
+    ///   `Succeeded`, `is_replay` `false` and the payload the `SUCCEED`
+    ///   carries as `result()`, once the `SUCCEED` is written. A result
+    ///   too large for the record is written with `ReplayChildren`, and
+    ///   `result()` is the payload that update carries instead: `None` for
+    ///   a child context and a map item or parallel branch, which write no
+    ///   payload; the JSON summary of the batch for a `map` or `parallel`
+    ///   container; `""` for `try_join_all` and `join_all`; and the JSON
+    ///   object `{"winner":<index>}` for `select_ok` and `race`;
+    /// - a body that fails fires `on_operation_end` with status `Failed`,
+    ///   `is_replay` `false` and the error, once the `FAIL` is written;
+    /// - a `SUCCEEDED` or `FAILED` record fires nothing, also when the SDK
+    ///   runs the body again to rebuild a result that `ReplayChildren`
+    ///   kept out of the record;
+    /// - after a failed outcome write, or a serdes failure that ends the
+    ///   invocation, no hook fires.
+    ///
+    /// A map item or parallel branch names the container as its parent.
+    /// Its start hook fires when the item is dispatched, and its end hook
+    /// on the item's task. When the batch completes early, an item that is
+    /// still running is abandoned: it and the unfinished operations inside
+    /// it fire no `on_operation_end`. An item that was never dispatched
+    /// fires no hook.
+    ///
+    /// A map item or parallel branch with `NestingMode::Flat` writes no
+    /// record. It fires `on_operation_start` and `on_operation_end` with
+    /// kind `Context`, sub-type `MapIteration` or `ParallelBranch`, its
+    /// stable ID, the container as its parent and `is_virtual()` `true`.
+    /// Its start hook fires when the item is dispatched and carries no
+    /// status: `status()` is `None`, because no `START` is written, also
+    /// when the item ran in an earlier invocation. Its `is_replay` is the `is_replaying()` value of that item's own
+    /// context when the hook fires, so two flat items of one batch can
+    /// report different values in the same invocation. The end hook carries
+    /// status `Succeeded` and no `result()`, or status `Failed` and the
+    /// error the batch records for the item. An abandoned flat item fires
+    /// no end hook.
+    ///
+    /// A panic in a body, an item or a combinator input ends the
+    /// invocation. No operation hook fires after it: no `on_operation_end`
+    /// for the operation that panicked, nor for any operation around it.
+    /// The invocation still ends with one `on_invocation_end` with status
+    /// `Retrying`.
+    ///
+    /// A step that is terminal on replay fires nothing.
     ///
     /// The hook runs synchronously, on the task that runs the operation.
     /// It can return work: the SDK
@@ -390,7 +449,66 @@ pub trait Plugin: Send + Sync {
     /// above. When the `wait_for_callback` is named `n`, they report the
     /// names `n-callback` and `n-submitter`; their records carry no name.
     ///
-    /// A step or child context that is terminal on replay fires nothing.
+    /// A child context (and so `with_retry` and each of its `attempt-N`
+    /// child contexts), a `map` or `parallel` container, each map item and
+    /// parallel branch, and the combinators `try_join_all`, `join_all`,
+    /// `select_ok` and `race` report kind `Context`. The rules below apply
+    /// to each of them that writes a record, which includes a map item or
+    /// parallel branch with `NestingMode::Normal`. A map item or parallel
+    /// branch with `NestingMode::Flat` writes no `START`, `SUCCEED` or
+    /// `FAIL` record, so these rules do not apply to it; its own rules
+    /// follow the list.
+    ///
+    /// - an operation without a record fires `on_operation_start` with
+    ///   status `Started` and `is_replay` `false` once its `START` is
+    ///   written, before its body or its first item runs;
+    /// - a record that is not terminal (`STARTED`, `PENDING` or `READY`)
+    ///   fires `on_operation_start` with `is_replay` `true`, before the
+    ///   body or the first item runs;
+    /// - a body or batch that succeeds fires `on_operation_end` with status
+    ///   `Succeeded`, `is_replay` `false` and the payload the `SUCCEED`
+    ///   carries as `result()`, once the `SUCCEED` is written. A result
+    ///   too large for the record is written with `ReplayChildren`, and
+    ///   `result()` is the payload that update carries instead: `None` for
+    ///   a child context and a map item or parallel branch, which write no
+    ///   payload; the JSON summary of the batch for a `map` or `parallel`
+    ///   container; `""` for `try_join_all` and `join_all`; and the JSON
+    ///   object `{"winner":<index>}` for `select_ok` and `race`;
+    /// - a body that fails fires `on_operation_end` with status `Failed`,
+    ///   `is_replay` `false` and the error, once the `FAIL` is written;
+    /// - a `SUCCEEDED` or `FAILED` record fires nothing, also when the SDK
+    ///   runs the body again to rebuild a result that `ReplayChildren`
+    ///   kept out of the record;
+    /// - after a failed outcome write, or a serdes failure that ends the
+    ///   invocation, no hook fires.
+    ///
+    /// A map item or parallel branch names the container as its parent.
+    /// Its start hook fires when the item is dispatched, and its end hook
+    /// on the item's task. When the batch completes early, an item that is
+    /// still running is abandoned: it and the unfinished operations inside
+    /// it fire no `on_operation_end`. An item that was never dispatched
+    /// fires no hook.
+    ///
+    /// A map item or parallel branch with `NestingMode::Flat` writes no
+    /// record. It fires `on_operation_start` and `on_operation_end` with
+    /// kind `Context`, sub-type `MapIteration` or `ParallelBranch`, its
+    /// stable ID, the container as its parent and `is_virtual()` `true`.
+    /// Its start hook fires when the item is dispatched and carries no
+    /// status: `status()` is `None`, because no `START` is written, also
+    /// when the item ran in an earlier invocation. Its `is_replay` is the `is_replaying()` value of that item's own
+    /// context when the hook fires, so two flat items of one batch can
+    /// report different values in the same invocation. The end hook carries
+    /// status `Succeeded` and no `result()`, or status `Failed` and the
+    /// error the batch records for the item. An abandoned flat item fires
+    /// no end hook.
+    ///
+    /// A panic in a body, an item or a combinator input ends the
+    /// invocation. No operation hook fires after it: no `on_operation_end`
+    /// for the operation that panicked, nor for any operation around it.
+    /// The invocation still ends with one `on_invocation_end` with status
+    /// `Retrying`.
+    ///
+    /// A step that is terminal on replay fires nothing.
     ///
     /// The hook runs synchronously, on the task that runs the operation.
     /// It can return work: the SDK
@@ -1082,6 +1200,13 @@ impl OperationInfo {
     /// Replaces the replay flag.
     pub(crate) fn with_replay(mut self, is_replay: bool) -> Self {
         self.is_replay = is_replay;
+        self
+    }
+
+    /// Replaces the virtual flag. A flat map item or parallel branch, which
+    /// writes no record, reports with `true`.
+    pub(crate) fn with_virtual(mut self, is_virtual: bool) -> Self {
+        self.is_virtual = is_virtual;
         self
     }
 
@@ -2283,7 +2408,11 @@ pub(crate) mod test_support {
         pub(crate) hook: &'static str,
         /// The operation's name.
         pub(crate) name: Option<String>,
+        /// The operation's parent ID.
+        pub(crate) parent_id: Option<String>,
         pub(crate) replay: bool,
+        /// The info's `is_virtual()`.
+        pub(crate) is_virtual: bool,
         pub(crate) status: Option<crate::OperationStatus>,
         /// For an attempt hook, its attempt number.
         pub(crate) attempt: Option<u32>,
@@ -2351,7 +2480,9 @@ pub(crate) mod test_support {
             self.records.lock().unwrap().push(OpRecord {
                 hook,
                 name: info.name().map(str::to_owned),
+                parent_id: info.parent_id().map(str::to_owned),
                 replay: info.is_replay(),
+                is_virtual: info.is_virtual(),
                 status: info.status(),
                 attempt,
                 outcome: end.map(super::AttemptEndInfo::outcome),
@@ -2589,6 +2720,16 @@ mod tests {
         assert_eq!(info.status_str(), None);
         assert_eq!(info.start_timestamp(), None);
         assert_eq!(info.attempt(), None);
+    }
+
+    #[test]
+    fn with_virtual_sets_the_flag() {
+        let ctx = DurableContext::test_context();
+        let info = OperationInfo::for_operation(&ctx, "w", OperationKind::Context, "Map", None);
+        assert!(!info.is_virtual());
+        let info = info.with_virtual(true);
+        assert!(info.is_virtual());
+        assert!(!info.with_virtual(false).is_virtual());
     }
 
     /// Without a record, the parent comes from the context the operation
