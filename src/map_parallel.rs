@@ -1303,7 +1303,9 @@ where
     // parent. Operations inside the flat branch checkpoint with ParentId
     // pointing to the batch parent (not the virtual child).
     if req.nesting == NestingMode::Flat {
-        let child_ctx = req.ctx.new_flat_child(&child_positional, &req.parent_wire);
+        let child_ctx =
+            req.ctx
+                .new_flat_child(&child_positional, &req.parent_wire, Some(&req.item_name));
         return Ok(ItemPrelude::Run { child_ctx });
     }
 
@@ -1312,7 +1314,7 @@ where
     // sole writer of child starts; see `execute_batch`), or exists from a
     // prior invocation.
     Ok(ItemPrelude::Run {
-        child_ctx: req.ctx.new_child(&child_positional),
+        child_ctx: req.ctx.new_child(&child_positional, Some(&req.item_name)),
     })
 }
 
@@ -7441,7 +7443,7 @@ mod tests {
         let child_op = ctx.mint_id();
         let child_positional = child_op.positional().to_owned();
         // Create a flat child context with the batch parent's wire ID.
-        let flat_child = ctx.new_flat_child(&child_positional, &batch_wire);
+        let flat_child = ctx.new_flat_child(&child_positional, &batch_wire, None);
         // Operations inside the flat child should report the batch parent
         // as their parent wire ID.
         assert_eq!(
@@ -10176,7 +10178,7 @@ mod tests {
                 }
             };
             // The control: an owner that is not abandoned replays the batch.
-            let control = root.new_child("1");
+            let control = root.new_child("1", None);
             let replayed = tokio::time::timeout(bound, replay(control))
                 .await
                 .expect("the recorded batch replays")
@@ -10186,7 +10188,7 @@ mod tests {
                 [&"hello".to_owned(), &"world".to_owned()]
             );
 
-            let item = root.new_child("1");
+            let item = root.new_child("1", None);
             root.admission()
                 .abandon(item.owners().iter().map(String::as_str));
             let replayed = tokio::time::timeout(bound, replay(item)).await;

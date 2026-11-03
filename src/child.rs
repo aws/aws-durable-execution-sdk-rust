@@ -244,7 +244,7 @@ where
         let Self {
             ctx, name, serdes, ..
         } = self;
-        let child_ctx = ctx.new_child(&positional_id);
+        let child_ctx = ctx.new_child(&positional_id, name.as_deref());
 
         Ok(ChildPrelude::Run {
             child_ctx,

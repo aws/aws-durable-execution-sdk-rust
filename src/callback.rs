@@ -470,7 +470,7 @@ where
         }
 
         // 4. Create child context with chained prefix.
-        let child_ctx = ctx.new_child(&positional_id);
+        let child_ctx = ctx.new_child(&positional_id, name.as_deref());
 
         Ok(WfcbPrelude::Run {
             child_ctx,

@@ -258,6 +258,17 @@ when a global subscriber is already installed.
 `durable::init_default_subscriber_with_writer(writer)` does the same with
 another writer, such as a non-blocking one.
 
+Each record carries correlation fields from the SDK's spans. Every record
+has `executionArn`, `requestId`, `isReplay` and, when the invocation has
+one, `tenantId`. A record inside a child context body, a map item or a
+parallel branch also has the child operation's `operationId` and, when the
+operation has a recorded name, `operationName`. A map item or parallel
+branch without a caller-given name has its generated name, such as
+`map-item-0`. A record inside a step body or a
+`wait_for_condition` check has those two fields for the step or the
+condition operation, plus `attempt`. The `observability` module lists
+which span carries which field.
+
 A custom subscriber keeps the suppression by adding `ReplayFilterLayer` as
 the filter of its `fmt` layer. The filter implements the `Filter` trait of
 `tracing-subscriber`, which `lambda_runtime` re-exports as

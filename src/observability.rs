@@ -22,8 +22,16 @@
 //!
 //! | Span name | Wraps | Fields |
 //! |-----------|-------|--------|
-//! | [`span_names::EXECUTION`] (`durable_execution`) | one invocation of the handler; each child namespace (a `run_in_child_context` body, a map/parallel branch, a `wait_for_callback` submitter) gets its own detached span | `executionArn`, `requestId`, `isReplay` |
-//! | [`span_names::OPERATION`] (`durable_operation`) | each live step body | `executionArn`, `requestId`, `operationId`, `attempt`, `isReplay` |
+//! | [`span_names::EXECUTION`] (`durable_execution`), root | one invocation of the handler | `executionArn`, `requestId`, `isReplay`, `tenantId` |
+//! | [`span_names::EXECUTION`] (`durable_execution`), child | each child namespace (a `run_in_child_context` body, a map item, a parallel branch, a `wait_for_callback` body), in its own detached span | the root's fields, plus `operationId` and `operationName` of the child operation |
+//! | [`span_names::OPERATION`] (`durable_operation`) | each live step body and each `wait_for_condition` check | `executionArn`, `requestId`, `isReplay`, `tenantId`, `operationId`, `operationName`, `attempt` |
+//!
+//! A child span is detached from its parent, so a record inside a child
+//! body sees only the child span's fields. So the child span repeats the
+//! root's fields. `tenantId` is omitted when the invocation has no tenant
+//! ID, and `operationName` is omitted when the operation has no recorded
+//! name. A map item or parallel branch always has one: the SDK records
+//! `map-item-{index}` or `parallel-branch-{index}` when the caller gave none.
 //!
 //! Both spans are created at the `INFO` level. The `isReplay` field on the
 //! `durable_execution` span is dynamic: the SDK re-records it after every
@@ -98,7 +106,8 @@
 //! | [`field_names::EXECUTION_ARN`] (`executionArn`) | string | durable execution ARN |
 //! | [`field_names::REQUEST_ID`] (`requestId`) | string | Lambda invocation request ID |
 //! | [`field_names::OPERATION_ID`] (`operationId`) | string | wire operation ID (SHA-256 hex digest of the positional ID) |
-//! | [`field_names::OPERATION_NAME`] (`operationName`) | string, omitted when the operation is unnamed | the `.name("...")` label |
+//! | [`field_names::OPERATION_NAME`] (`operationName`) | string, omitted when the operation has no recorded name | the name recorded for the operation in the execution history: its `.name("...")`, or a map item's or parallel branch's generated name such as `map-item-0` |
+//! | [`field_names::TENANT_ID`] (`tenantId`) | string, omitted when the invocation has none | Lambda tenant ID (spans only) |
 //! | [`field_names::OPERATION_TYPE`] (`operationType`) | string | one of `Step`, `Wait`, `Context`, `Callback`, `ChainedInvoke` |
 //! | [`field_names::OPERATION_SUB_TYPE`] (`operationSubType`) | string, omitted when absent | wire sub-type (e.g. `Step`, `Wait`, `Map`, `Parallel`, `RunInChildContext`, `WaitForCondition`, `WaitForCallback`) |
 //! | [`field_names::ATTEMPT`] (`attempt`) | integer | 1-based attempt number the event describes |
@@ -189,12 +198,21 @@ pub const TARGET: &str = "aws_durable_execution_sdk::lifecycle";
 
 /// Names of the spans the SDK creates.
 pub mod span_names {
-    /// Wraps one invocation of the handler (and, detached, each child
-    /// namespace's body). Fields: `executionArn`, `requestId`, `isReplay`.
+    /// Wraps one invocation of the handler, and, detached, each child
+    /// namespace's body: a `run_in_child_context` body, a map item, a
+    /// parallel branch and a `wait_for_callback` body.
+    ///
+    /// The root span has `executionArn`, `requestId`, `isReplay` and
+    /// `tenantId`. A child span adds the child operation's `operationId`
+    /// and `operationName`. `tenantId` is omitted when the invocation has
+    /// none, and `operationName` when the operation has no recorded name.
     pub const EXECUTION: &str = "durable_execution";
 
-    /// Wraps each live step body. Fields: `executionArn`, `requestId`,
-    /// `operationId`, `attempt`, `isReplay`.
+    /// Wraps each live step body and each `wait_for_condition` check.
+    ///
+    /// Fields: `executionArn`, `requestId`, `isReplay`, `tenantId`,
+    /// `operationId`, `operationName` and `attempt`. `tenantId` and
+    /// `operationName` are omitted as on [`EXECUTION`].
     pub const OPERATION: &str = "durable_operation";
 }
 
@@ -244,8 +262,13 @@ pub mod field_names {
     /// Wire operation ID (SHA-256 hex digest of the positional ID).
     pub const OPERATION_ID: &str = "operationId";
 
-    /// User-supplied operation name (`.name("...")`); omitted when unnamed.
+    /// The name recorded for the operation in the execution history: its
+    /// `.name("...")`, or a map item's or parallel branch's generated name
+    /// such as `map-item-0`. Omitted when the operation has no recorded name.
     pub const OPERATION_NAME: &str = "operationName";
+
+    /// Lambda tenant ID; omitted when the invocation has none.
+    pub const TENANT_ID: &str = "tenantId";
 
     /// Operation type: `Step`, `Wait`, `Context`, `Callback`, or
     /// `ChainedInvoke`.
@@ -294,6 +317,7 @@ mod tests {
         assert_eq!(field_names::REQUEST_ID, "requestId");
         assert_eq!(field_names::OPERATION_ID, "operationId");
         assert_eq!(field_names::OPERATION_NAME, "operationName");
+        assert_eq!(field_names::TENANT_ID, "tenantId");
         assert_eq!(field_names::OPERATION_TYPE, "operationType");
         assert_eq!(field_names::OPERATION_SUB_TYPE, "operationSubType");
         assert_eq!(field_names::ATTEMPT, "attempt");

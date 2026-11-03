@@ -20,6 +20,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
+use tracing::Instrument as _;
 
 use crate::context::{ActiveBody, DurableContext, StepContext, SubmittedWrite, run_body};
 use crate::engine::CheckpointStatus;
@@ -168,9 +169,23 @@ where
                     // activity permit while it runs.
                     let body = ActiveBody::Step(core.op_id.positional().to_owned());
                     let step_ctx = StepContext::new(attempt);
+                    // The check runs inside a `durable_operation` span, as a
+                    // live step body does. A live check is never replay.
+                    let span = crate::tracing_layer::operation_span(
+                        core.ctx.execution_arn(),
+                        &core.ctx.lambda_context().request_id,
+                        core.ctx.lambda_context().tenant_id.as_deref(),
+                        core.op_id.wire(),
+                        core.name.as_deref(),
+                        attempt,
+                        false,
+                    );
                     let check_result = core
                         .ctx
-                        .hold_activity(run_body(body, async { (check)(step_ctx, state).await }))
+                        .hold_activity(
+                            run_body(body, async { (check)(step_ctx, state).await })
+                                .instrument(span),
+                        )
                         .await;
                     core.await_start(start).await?;
                     match core.settle(attempt, check_result).await? {

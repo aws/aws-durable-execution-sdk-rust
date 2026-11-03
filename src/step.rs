@@ -478,7 +478,9 @@ where
         let span = tracing_layer::operation_span(
             self.ctx.execution_arn(),
             &self.ctx.lambda_context().request_id,
+            self.ctx.lambda_context().tenant_id.as_deref(),
             wire_id,
+            self.name.as_deref(),
             attempt,
             is_replay,
         );

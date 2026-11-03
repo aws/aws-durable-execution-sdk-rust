@@ -64,7 +64,8 @@
 //! # Observability
 //!
 //! The SDK instruments the operation lifecycle through the [`tracing`]
-//! facade: spans around the handler and each live step body, and `DEBUG`
+//! facade: spans around the handler, each child body, each live step body
+//! and each `wait_for_condition` check, and `DEBUG`
 //! events at operation start/finish/replay/retry and execution
 //! start/resume/suspend. The span names, event names, and field names are a
 //! documented, stable contract, including how to bridge it to

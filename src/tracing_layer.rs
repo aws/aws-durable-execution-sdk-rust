@@ -11,13 +11,16 @@
 //!   each invocation of the user's handler; each child namespace (a
 //!   `run_in_child_context` body, a map/parallel branch, a
 //!   `wait_for_callback` body) gets its own detached span wrapping its body.
-//!   Every one carries the execution ARN, the request ID, and an `isReplay`
-//!   flag that the SDK keeps current as that namespace crosses its own
+//!   Every one carries the execution ARN, the request ID, the tenant ID
+//!   when the invocation has one, and an `isReplay` flag that the SDK keeps current as that namespace crosses its own
 //!   replay high-water mark: the flag starts as the namespace's initial
 //!   replay status and is re-recorded after every operation claim minted
-//!   through it.
-//! - A per-operation `durable_operation` span wrapping each live step body,
-//!   carrying the full structured-log field contract below.
+//!   through it. A child span also carries the child operation's
+//!   `operationId` and, when the operation has a recorded name, its
+//!   `operationName`.
+//! - A per-operation `durable_operation` span wrapping each live step body
+//!   and each `wait_for_condition` check, carrying the full structured-log
+//!   field contract below.
 //!
 //! When these spans are rendered by a JSON subscriber (e.g.,
 //! `lambda_runtime`'s `init_default_subscriber()` with
@@ -30,13 +33,15 @@
 //!
 //! # Structured-log field contract
 //!
-//! | Field | Description |
-//! |-------|-------------|
-//! | `executionArn` | Durable execution ARN |
-//! | `requestId` | Lambda invocation request ID |
-//! | `operationId` | Wire operation ID (SHA-256 hex) |
-//! | `attempt` | Current attempt number (1-based) |
-//! | `isReplay` | Whether the span covers replayed work |
+//! | Field | Description | Root `durable_execution` | Child `durable_execution` | `durable_operation` |
+//! |-------|-------------|------|-------|-----------|
+//! | `executionArn` | Durable execution ARN | yes | yes | yes |
+//! | `requestId` | Lambda invocation request ID | yes | yes | yes |
+//! | `tenantId` | Lambda tenant ID; omitted when the invocation has none | yes | yes | yes |
+//! | `isReplay` | Whether the span covers replayed work | yes | yes | yes |
+//! | `operationId` | Wire operation ID (SHA-256 hex) | no | yes | yes |
+//! | `operationName` | The operation's recorded name: its `.name(...)`, or a generated batch item name such as `map-item-0`; omitted when it has none | no | yes | yes |
+//! | `attempt` | Current attempt number (1-based) | no | no | yes |
 //!
 //! # Replay filter
 //!
@@ -68,34 +73,55 @@ use tracing::span::Attributes;
 /// spelling short.
 pub(crate) use crate::observability::field_names as fields;
 
+/// Records the optional correlation fields on `span`.
+///
+/// `tracing` writes a field declared as `Empty` only after it is recorded.
+/// So a `None` value leaves its field out of the span.
+fn record_optional(span: &tracing::Span, tenant_id: Option<&str>, operation_name: Option<&str>) {
+    if let Some(tenant_id) = tenant_id {
+        span.record(fields::TENANT_ID, tenant_id);
+    }
+    if let Some(operation_name) = operation_name {
+        span.record(fields::OPERATION_NAME, operation_name);
+    }
+}
+
 /// Creates a `tracing::Span` for a durable operation with the structured-log
 /// field contract.
 ///
 /// The span carries:
 /// - `executionArn`: the durable execution ARN
 /// - `requestId`: the Lambda request ID
+/// - `tenantId`: the Lambda tenant ID, when the invocation has one
 /// - `operationId`: the wire operation ID (SHA-256 hex)
+/// - `operationName`: the operation's recorded name, when it has one
 /// - `attempt`: the current attempt (1-based)
 /// - `isReplay`: whether this operation is replayed
 ///
-/// User `tracing::info!` calls inside step bodies inherit these fields
-/// automatically through span nesting.
+/// User `tracing::info!` calls inside step bodies and `wait_for_condition`
+/// checks inherit these fields automatically through span nesting.
 #[must_use]
 pub(crate) fn operation_span(
     execution_arn: &str,
     request_id: &str,
+    tenant_id: Option<&str>,
     operation_id: &str,
+    operation_name: Option<&str>,
     attempt: u32,
     is_replay: bool,
 ) -> tracing::Span {
-    tracing::info_span!(
+    let span = tracing::info_span!(
         "durable_operation",
         { fields::EXECUTION_ARN } = execution_arn,
         { fields::REQUEST_ID } = request_id,
+        { fields::TENANT_ID } = tracing::field::Empty,
         { fields::OPERATION_ID } = operation_id,
+        { fields::OPERATION_NAME } = tracing::field::Empty,
         { fields::ATTEMPT } = attempt,
         { fields::IS_REPLAY } = is_replay,
-    )
+    );
+    record_optional(&span, tenant_id, operation_name);
+    span
 }
 
 /// Creates the handler-level `tracing::Span` wrapping one invocation of the
@@ -104,6 +130,7 @@ pub(crate) fn operation_span(
 /// The span carries:
 /// - `executionArn`: the durable execution ARN
 /// - `requestId`: the Lambda request ID
+/// - `tenantId`: the Lambda tenant ID, when the invocation has one
 /// - `isReplay`: whether the execution is currently replaying
 ///
 /// Handler-level `tracing::info!` calls (user code between operations)
@@ -118,14 +145,18 @@ pub(crate) fn operation_span(
 pub(crate) fn execution_span(
     execution_arn: &str,
     request_id: &str,
+    tenant_id: Option<&str>,
     is_replay: bool,
 ) -> tracing::Span {
-    tracing::info_span!(
+    let span = tracing::info_span!(
         "durable_execution",
         { fields::EXECUTION_ARN } = execution_arn,
         { fields::REQUEST_ID } = request_id,
+        { fields::TENANT_ID } = tracing::field::Empty,
         { fields::IS_REPLAY } = is_replay,
-    )
+    );
+    record_optional(&span, tenant_id, None);
+    span
 }
 
 /// Creates a DETACHED `durable_execution` span for a child namespace: a
@@ -145,19 +176,32 @@ pub(crate) fn execution_span(
 /// parent span that is still replaying must not suppress a branch that has
 /// gone live, and a live parent must not un-suppress a branch that is still
 /// replaying.
+///
+/// The span is detached, so a record inside the child body does not see
+/// the root span's fields. So the span carries the root's fields itself
+/// (`executionArn`, `requestId`, `tenantId`, `isReplay`), and adds the
+/// child operation's `operationId` and, when it has one, `operationName`.
 #[must_use]
 pub(crate) fn scoped_execution_span(
     execution_arn: &str,
     request_id: &str,
+    tenant_id: Option<&str>,
+    operation_id: &str,
+    operation_name: Option<&str>,
     is_replay: bool,
 ) -> tracing::Span {
-    tracing::info_span!(
+    let span = tracing::info_span!(
         parent: None,
         "durable_execution",
         { fields::EXECUTION_ARN } = execution_arn,
         { fields::REQUEST_ID } = request_id,
+        { fields::TENANT_ID } = tracing::field::Empty,
+        { fields::OPERATION_ID } = operation_id,
+        { fields::OPERATION_NAME } = tracing::field::Empty,
         { fields::IS_REPLAY } = is_replay,
-    )
+    );
+    record_optional(&span, tenant_id, operation_name);
+    span
 }
 
 use crate::observability::{TARGET, event_names};
@@ -895,7 +939,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -907,7 +951,9 @@ mod tests {
         let span = operation_span(
             "arn:aws:lambda:us-east-1:123:function:test:durable:abc",
             "req-123",
+            None,
             "deadbeef01234567890abcdef0123456789abcdef0123456789abcdef012345",
+            None,
             1,
             false,
         );
@@ -980,7 +1026,7 @@ mod tests {
         let test_request_id = "req-abc-def-456";
         let test_op_id = "aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb";
 
-        let span = operation_span(test_arn, test_request_id, test_op_id, 2, false);
+        let span = operation_span(test_arn, test_request_id, None, test_op_id, None, 2, false);
         let _entered = span.enter();
         tracing::info!("Greeting step started for: TestUser");
 
@@ -1059,7 +1105,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         // Create a replay span (isReplay = true).
-        let span = operation_span("arn:test", "req-1", "op-1", 1, true);
+        let span = operation_span("arn:test", "req-1", None, "op-1", None, 1, true);
         let _entered = span.enter();
         tracing::info!("this event is inside a replay span");
 
@@ -1122,14 +1168,14 @@ mod tests {
 
         // Event in a live span: should pass through.
         {
-            let span = operation_span("arn:test", "req-1", "op-1", 1, false);
+            let span = operation_span("arn:test", "req-1", None, "op-1", None, 1, false);
             let _entered = span.enter();
             tracing::info!("live event");
         }
 
         // Event in a replay span: should be suppressed.
         {
-            let span = operation_span("arn:test", "req-1", "op-2", 1, true);
+            let span = operation_span("arn:test", "req-1", None, "op-2", None, 1, true);
             let _entered = span.enter();
             tracing::info!("replay event");
         }
@@ -1204,7 +1250,7 @@ mod tests {
         // it to live, and only afterwards does the final replay hit emit its
         // event (carrying isReplay = true).
         {
-            let span = execution_span("arn:test", "req-1", true);
+            let span = execution_span("arn:test", "req-1", None, true);
             span.record(fields::IS_REPLAY, false); // mint_id: next op is live
             let _entered = span.enter();
             tracing::info!({ fields::IS_REPLAY } = true, "boundary replay hit");
@@ -1213,7 +1259,7 @@ mod tests {
         // The converse: a live-work event under a span still marked as
         // replaying must pass: its own field is authoritative.
         {
-            let span = execution_span("arn:test", "req-1", true);
+            let span = execution_span("arn:test", "req-1", None, true);
             let _entered = span.enter();
             tracing::info!({ fields::IS_REPLAY } = false, "live work under replay span");
         }
@@ -1340,7 +1386,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let span = execution_span("arn:test", "req-1", true);
+        let span = execution_span("arn:test", "req-1", None, true);
         {
             let _entered = span.enter();
             tracing::info!("suppressed while replaying");
@@ -1726,9 +1772,9 @@ mod tests {
 
             tracing::subscriber::with_default(subscriber, || {
                 let span = if which == "execution" {
-                    execution_span("arn", "request", false)
+                    execution_span("arn", "request", None, false)
                 } else {
-                    operation_span("arn", "request", "op", 1, false)
+                    operation_span("arn", "request", None, "op", None, 1, false)
                 };
                 span.in_scope(|| tracing::debug!("inside-line"));
                 tracing::debug!("outside-line");
@@ -1996,5 +2042,318 @@ mod tests {
         assert!(invocations >= 2, "the wait must suspend: {invocations}");
         assert_eq!(count_message(&output, "audit-before"), 2, "{output}");
         assert_eq!(count_message(&output, "before"), 1, "{output}");
+    }
+
+    // Correlation fields on the spans of user-code bodies.
+
+    /// Builds a JSON `fmt` subscriber that writes each record's current
+    /// span and span list into `buffer`.
+    pub(crate) fn json_span_subscriber(
+        buffer: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_writer(CaptureWriter(std::sync::Arc::clone(buffer)))
+            .finish()
+    }
+
+    /// Parses the JSON records in `buffer`, one per line.
+    pub(crate) fn json_records(buffer: &std::sync::Mutex<Vec<u8>>) -> Vec<serde_json::Value> {
+        captured(buffer)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// The span list of the first record whose message is `message`.
+    pub(crate) fn spans_of(records: &[serde_json::Value], message: &str) -> Vec<serde_json::Value> {
+        let record = records
+            .iter()
+            .find(|r| r.get("message").and_then(serde_json::Value::as_str) == Some(message))
+            .expect("the record is in the captured output");
+        record
+            .get("spans")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether one span of `spans` carries `field` with the value `value`.
+    pub(crate) fn has_field(
+        spans: &[serde_json::Value],
+        field: &str,
+        value: &serde_json::Value,
+    ) -> bool {
+        spans.iter().any(|span| span.get(field) == Some(value))
+    }
+
+    /// Whether any span of `spans` carries `field`.
+    pub(crate) fn any_field(spans: &[serde_json::Value], field: &str) -> bool {
+        spans.iter().any(|span| span.get(field).is_some())
+    }
+
+    /// Runs `handler` through `LocalRunner` under a JSON span subscriber,
+    /// on a current-thread runtime, and returns the records and the result.
+    fn run_capturing<F, Fut>(
+        runner: crate::test_util::LocalRunner,
+        handler: F,
+    ) -> (Vec<serde_json::Value>, crate::test_util::TestResult<()>)
+    where
+        F: Fn(serde_json::Value, crate::DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), crate::BoxError>> + Send,
+    {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = json_span_subscriber(&buffer);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                runner
+                    .run(handler, serde_json::Value::Null)
+                    .await
+                    .expect("runner")
+            })
+        });
+        assert!(result.is_success(), "{:?}", result.error());
+        (json_records(&buffer), result)
+    }
+
+    fn json_str(value: &str) -> serde_json::Value {
+        serde_json::Value::String(value.to_owned())
+    }
+
+    #[test]
+    fn child_body_record_has_operation_id_and_name() {
+        let (records, result) = run_capturing(
+            crate::test_util::LocalRunner::new(),
+            |_event, ctx| async move {
+                ctx.run_in_child_context(|_child| async move {
+                    tracing::info!("in-child");
+                    Ok(())
+                })
+                .name("enrich")
+                .await?;
+                Ok(())
+            },
+        );
+        let child = result.operation("enrich").expect("child operation");
+        let spans = spans_of(&records, "in-child");
+        assert!(
+            has_field(&spans, fields::OPERATION_ID, &json_str(child.id())),
+            "{spans:?}"
+        );
+        assert!(
+            has_field(&spans, fields::OPERATION_NAME, &json_str("enrich")),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn map_item_record_has_operation_id() {
+        let (records, result) = run_capturing(
+            crate::test_util::LocalRunner::new(),
+            |_event, ctx| async move {
+                ctx.map(vec![7_u32], |_child, _item, _idx| async move {
+                    tracing::info!("in-item");
+                    Ok(())
+                })
+                .name("items")
+                .await?;
+                Ok(())
+            },
+        );
+        let batch = result.operation("items").expect("map operation");
+        let item = result
+            .children(batch)
+            .find(|op| op.kind() == crate::OperationKind::Context)
+            .expect("item child");
+        let spans = spans_of(&records, "in-item");
+        assert!(
+            has_field(&spans, fields::OPERATION_ID, &json_str(item.id())),
+            "{spans:?}"
+        );
+    }
+
+    /// A flat map item has no child record of its own, but its span still
+    /// carries the virtual child's wire ID and the item's recorded name.
+    /// The virtual child claims the same ID a normal item claims, so the
+    /// expected ID comes from a normal run of the same handler.
+    #[test]
+    fn flat_map_item_record_has_operation_id_and_name() {
+        type Boxed = std::pin::Pin<Box<dyn Future<Output = Result<(), crate::BoxError>> + Send>>;
+
+        fn handler(
+            nesting: crate::map_parallel::NestingMode,
+        ) -> impl Fn(serde_json::Value, crate::DurableContext) -> Boxed + Send + Sync + 'static
+        {
+            move |_event, ctx| {
+                Box::pin(async move {
+                    ctx.map(vec![7_u32], |_child, _item, _idx| async move {
+                        tracing::info!("in-item");
+                        Ok(())
+                    })
+                    .name("items")
+                    .nesting(nesting)
+                    .await?;
+                    Ok(())
+                })
+            }
+        }
+        let (_records, normal) = run_capturing(
+            crate::test_util::LocalRunner::new(),
+            handler(crate::map_parallel::NestingMode::Normal),
+        );
+        let batch = normal.operation("items").expect("map operation");
+        let item = normal
+            .children(batch)
+            .find(|op| op.kind() == crate::OperationKind::Context)
+            .expect("item child");
+
+        let (records, _flat) = run_capturing(
+            crate::test_util::LocalRunner::new(),
+            handler(crate::map_parallel::NestingMode::Flat),
+        );
+        let spans = spans_of(&records, "in-item");
+        assert!(
+            has_field(&spans, fields::OPERATION_ID, &json_str(item.id())),
+            "{spans:?}"
+        );
+        assert!(
+            has_field(&spans, fields::OPERATION_NAME, &json_str("map-item-0")),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_branch_record_has_operation_id_and_name() {
+        let (records, result) = run_capturing(
+            crate::test_util::LocalRunner::new(),
+            |_event, ctx| async move {
+                let branches: Vec<crate::Branch<()>> =
+                    vec![crate::Branch::new("left", |_child| async move {
+                        tracing::info!("in-branch");
+                        Ok(())
+                    })];
+                ctx.parallel(branches).name("fan-out").await?;
+                Ok(())
+            },
+        );
+        let branch = result.operation("left").expect("branch operation");
+        let spans = spans_of(&records, "in-branch");
+        assert!(
+            has_field(&spans, fields::OPERATION_ID, &json_str(branch.id())),
+            "{spans:?}"
+        );
+        assert!(
+            has_field(&spans, fields::OPERATION_NAME, &json_str("left")),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn condition_check_record_has_operation_id_and_attempt() {
+        let (records, result) = run_capturing(
+            crate::test_util::LocalRunner::new(),
+            |_event, ctx| async move {
+                ctx.wait_for_condition(
+                    |_step, state: u32| async move {
+                        tracing::info!("in-check");
+                        Ok(state + 1)
+                    },
+                    0,
+                )
+                .name("poll")
+                .await?;
+                Ok(())
+            },
+        );
+        let poll = result.operation("poll").expect("condition operation");
+        let spans = spans_of(&records, "in-check");
+        assert!(
+            has_field(&spans, fields::OPERATION_ID, &json_str(poll.id())),
+            "{spans:?}"
+        );
+        assert!(
+            has_field(&spans, fields::OPERATION_NAME, &json_str("poll")),
+            "{spans:?}"
+        );
+        assert!(
+            has_field(&spans, fields::ATTEMPT, &serde_json::json!(1)),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn submitter_record_has_operation_id() {
+        let reply = crate::test_util::CallbackReply::success(&"approved").expect("reply");
+        let (records, result) = run_capturing(
+            crate::test_util::LocalRunner::new().callback_for("approve", reply),
+            |_event, ctx| async move {
+                let _value: String = ctx
+                    .wait_for_callback(|_step, _callback_id| async move {
+                        tracing::info!("in-submitter");
+                        Ok(())
+                    })
+                    .name("approve")
+                    .await?;
+                Ok(())
+            },
+        );
+        let wfcb = result
+            .operation("approve")
+            .expect("wait_for_callback operation");
+        let submitter = result
+            .children(wfcb)
+            .find(|op| op.kind() == crate::OperationKind::Step)
+            .expect("submitter step");
+        let spans = spans_of(&records, "in-submitter");
+        assert!(
+            has_field(&spans, fields::OPERATION_ID, &json_str(submitter.id())),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn named_step_record_has_operation_name() {
+        let (records, _result) = run_capturing(
+            crate::test_util::LocalRunner::new(),
+            |_event, ctx| async move {
+                ctx.step(|_| async {
+                    tracing::info!("in-step");
+                    Ok(())
+                })
+                .name("fetch")
+                .await?;
+                Ok(())
+            },
+        );
+        let spans = spans_of(&records, "in-step");
+        assert!(
+            has_field(&spans, fields::OPERATION_NAME, &json_str("fetch")),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn unnamed_step_record_has_no_operation_name() {
+        let (records, _result) = run_capturing(
+            crate::test_util::LocalRunner::new(),
+            |_event, ctx| async move {
+                ctx.step(|_| async {
+                    tracing::info!("in-step");
+                    Ok(())
+                })
+                .await?;
+                Ok(())
+            },
+        );
+        let spans = spans_of(&records, "in-step");
+        assert!(any_field(&spans, fields::OPERATION_ID), "{spans:?}");
+        assert!(!any_field(&spans, fields::OPERATION_NAME), "{spans:?}");
     }
 }

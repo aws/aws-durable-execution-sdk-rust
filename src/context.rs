@@ -371,6 +371,7 @@ impl DurableContext {
         let replay_span = crate::tracing_layer::execution_span(
             &execution_arn,
             &lambda_context.request_id,
+            lambda_context.tenant_id.as_deref(),
             engine.is_replaying(),
         );
         Self {
@@ -406,6 +407,7 @@ impl DurableContext {
         let replay_span = crate::tracing_layer::execution_span(
             &execution_arn,
             &lambda_context.request_id,
+            lambda_context.tenant_id.as_deref(),
             engine.is_replaying(),
         );
         Self {
@@ -441,6 +443,7 @@ impl DurableContext {
         let replay_span = crate::tracing_layer::execution_span(
             &execution_arn,
             &lambda_context.request_id,
+            lambda_context.tenant_id.as_deref(),
             engine.is_replaying(),
         );
         Self {
@@ -482,6 +485,7 @@ impl DurableContext {
         let replay_span = crate::tracing_layer::execution_span(
             &execution_arn,
             &lambda_context.request_id,
+            lambda_context.tenant_id.as_deref(),
             engine.is_replaying(),
         );
         Self {
@@ -519,6 +523,7 @@ impl DurableContext {
         let replay_span = crate::tracing_layer::execution_span(
             &execution_arn,
             &lambda_context.request_id,
+            lambda_context.tenant_id.as_deref(),
             engine.is_replaying(),
         );
         Self {
@@ -539,7 +544,12 @@ impl DurableContext {
             awaited: None,
         }
     }
-    pub(crate) fn new_child(&self, parent_positional_id: &str) -> Self {
+    /// Creates the child context of the child operation at
+    /// `parent_positional_id`. `name` is that operation's name; the child's
+    /// span carries it as `operationName`, with the operation's wire ID as
+    /// `operationId`.
+    pub(crate) fn new_child(&self, parent_positional_id: &str, name: Option<&str>) -> Self {
+        let wire_id = crate::engine::compute_wire_id_public(parent_positional_id);
         let engine = Arc::new(EngineState::new_child(
             parent_positional_id,
             Arc::clone(&self.inner.engine.checkpoint_log),
@@ -552,6 +562,9 @@ impl DurableContext {
         let replay_span = crate::tracing_layer::scoped_execution_span(
             &self.inner.execution_arn,
             &self.inner.lambda_context.request_id,
+            self.inner.lambda_context.tenant_id.as_deref(),
+            &wire_id,
+            name,
             engine.is_replaying(),
         );
         Self {
@@ -564,7 +577,7 @@ impl DurableContext {
                 execution_client: self.inner.execution_client.clone(),
                 checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
                 coalescer: self.inner.coalescer.clone(),
-                parent_wire_id: Some(crate::engine::compute_wire_id_public(parent_positional_id)),
+                parent_wire_id: Some(wire_id),
                 admission: Arc::clone(&self.inner.admission),
                 owners: self.owners_with(parent_positional_id),
                 replay_span,
@@ -683,11 +696,14 @@ impl DurableContext {
 
     /// FLAT-nesting counterpart of [`Self::new_child`]: a child that
     /// reports `parent_wire_id_override` as its operations' parent (the
-    /// batch parent, not the virtual child).
+    /// batch parent, not the virtual child). The child's span carries the
+    /// virtual child's wire ID as `operationId` and `name` as
+    /// `operationName`.
     pub(crate) fn new_flat_child(
         &self,
         child_positional_id: &str,
         parent_wire_id_override: &str,
+        name: Option<&str>,
     ) -> Self {
         let engine = Arc::new(EngineState::new_child(
             child_positional_id,
@@ -698,6 +714,9 @@ impl DurableContext {
         let replay_span = crate::tracing_layer::scoped_execution_span(
             &self.inner.execution_arn,
             &self.inner.lambda_context.request_id,
+            self.inner.lambda_context.tenant_id.as_deref(),
+            &crate::engine::compute_wire_id_public(child_positional_id),
+            name,
             engine.is_replaying(),
         );
         Self {
@@ -5707,7 +5726,7 @@ mod tests {
     async fn assert_abandoned_write_not_sent(window: Option<Duration>) {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, window);
-        let item = root.new_child("1");
+        let item = root.new_child("1", None);
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
         let written = tokio::time::timeout(
@@ -5735,7 +5754,7 @@ mod tests {
         // So this rejection comes from the check under the token lock.
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, Some(Duration::ZERO));
-        let item = root.new_child("1");
+        let item = root.new_child("1", None);
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
         let written = tokio::time::timeout(
@@ -5751,8 +5770,8 @@ mod tests {
     async fn nested_owner_follows_its_outer_item() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, Some(Duration::ZERO));
-        let item = root.new_child("1");
-        let inner = item.new_child("1-1");
+        let item = root.new_child("1", None);
+        let inner = item.new_child("1-1", None);
         assert_eq!(
             inner.owners(),
             [
@@ -5776,7 +5795,7 @@ mod tests {
     async fn admitted_update_precedes_parent_final_update() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, Some(Duration::from_millis(50)));
-        let item = root.new_child("1");
+        let item = root.new_child("1", None);
         let writer = tokio::spawn({
             let item = item.clone();
             async move { item.checkpoint_updates(vec![make_update("a")]).await }
@@ -5886,7 +5905,7 @@ mod tests {
             "token-0".to_owned(),
             None,
         );
-        let item = root.new_child("1");
+        let item = root.new_child("1", None);
         let entered = client.entered.notified();
         let writer = tokio::spawn({
             let item = item.clone();
@@ -5925,7 +5944,7 @@ mod tests {
     async fn abandoned_owner_starts_no_operation() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, Some(Duration::ZERO));
-        let item = root.new_child("1");
+        let item = root.new_child("1", None);
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5986,7 +6005,7 @@ mod tests {
             "token-0".to_owned(),
             Some(Duration::ZERO),
         );
-        let item = root.new_child("1");
+        let item = root.new_child("1", None);
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
         let stepped = tokio::time::timeout(
@@ -6049,7 +6068,7 @@ mod tests {
 
         // Control: an owner that is not abandoned records the mismatch.
         let (_, control_root) = build_root();
-        let control_item = control_root.new_child("1");
+        let control_item = control_root.new_child("1", None);
         let control = tokio::time::timeout(
             ADMISSION_BOUND,
             control_item.step(|_| async { Ok(0_u32) }).into_future(),
@@ -6064,7 +6083,7 @@ mod tests {
 
         // The builder exists before the abandonment and is finalized after it.
         let (client, root) = build_root();
-        let item = root.new_child("1");
+        let item = root.new_child("1", None);
         let builder = item.step(|_| async { Ok(0_u32) });
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
@@ -6122,7 +6141,7 @@ mod tests {
             Some(Duration::ZERO),
         );
         // The control: an owner that is not abandoned replays the callback.
-        let control = root.new_child("1");
+        let control = root.new_child("1", None);
         let replayed = tokio::time::timeout(
             ADMISSION_BOUND,
             control.create_callback::<String>().into_future(),
@@ -6132,7 +6151,7 @@ mod tests {
         .expect("the replay succeeds");
         assert_eq!(replayed.id(), "cb-1");
 
-        let item = root.new_child("1");
+        let item = root.new_child("1", None);
         root.admission()
             .abandon(item.owners().iter().map(String::as_str));
         let created = tokio::time::timeout(
@@ -6152,7 +6171,7 @@ mod tests {
         for window in [Some(Duration::ZERO), None] {
             let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
             let root = admission_root(&client, window);
-            let item = root.new_child("1");
+            let item = root.new_child("1", None);
             tokio::time::timeout(
                 ADMISSION_BOUND,
                 item.checkpoint_updates(vec![make_update("u")]),
@@ -6519,7 +6538,7 @@ mod tests {
     async fn child_context_owner_covers_its_descendants() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let root = admission_root(&client, Some(Duration::ZERO));
-        let child = root.new_child("1");
+        let child = root.new_child("1", None);
         root.admission()
             .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
         let written = tokio::time::timeout(
@@ -6609,6 +6628,73 @@ mod tests {
         assert!(
             !has(&step_wire, OperationAction::Succeed),
             "s SUCCEED is never sent after the child returned"
+        );
+    }
+
+    // Tenant ID on the root and child spans.
+
+    /// Emits one record under the root span of a context built from a
+    /// Lambda context with `tenant_id`, and one under a child body's span,
+    /// and returns the span lists of the two records.
+    fn tenant_span_lists(
+        tenant_id: Option<&str>,
+    ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        use crate::tracing_layer::tests::{json_records, json_span_subscriber, spans_of};
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = json_span_subscriber(&buffer);
+        tracing::subscriber::with_default(subscriber, || {
+            let mut lambda_context = lambda_runtime::Context::default();
+            lambda_context.tenant_id = tenant_id.map(str::to_owned);
+            let root = DurableContext::new_root(
+                "arn:test".to_owned(),
+                lambda_context,
+                Arc::new(CheckpointLog::empty()),
+            );
+            root.replay_span().in_scope(|| tracing::info!("in-root"));
+            let child = root.new_child("1", Some("child"));
+            child.replay_span().in_scope(|| tracing::info!("in-child"));
+        });
+        let records = json_records(&buffer);
+        (
+            spans_of(&records, "in-root"),
+            spans_of(&records, "in-child"),
+        )
+    }
+
+    #[test]
+    fn tenant_id_on_root_and_child_spans() {
+        use crate::tracing_layer::tests::has_field;
+
+        let tenant = serde_json::Value::String("t-1".to_owned());
+        let (root, child) = tenant_span_lists(Some("t-1"));
+        assert!(
+            has_field(&root, crate::tracing_layer::fields::TENANT_ID, &tenant),
+            "{root:?}"
+        );
+        assert!(
+            has_field(&child, crate::tracing_layer::fields::TENANT_ID, &tenant),
+            "{child:?}"
+        );
+    }
+
+    #[test]
+    fn no_tenant_id_without_tenant() {
+        use crate::tracing_layer::tests::any_field;
+
+        let (root, child) = tenant_span_lists(None);
+        assert!(
+            !any_field(&root, crate::tracing_layer::fields::TENANT_ID),
+            "{root:?}"
+        );
+        assert!(
+            !any_field(&child, crate::tracing_layer::fields::TENANT_ID),
+            "{child:?}"
+        );
+        // The record is still under the SDK's spans.
+        assert!(
+            any_field(&child, crate::tracing_layer::fields::OPERATION_ID),
+            "{child:?}"
         );
     }
 }
