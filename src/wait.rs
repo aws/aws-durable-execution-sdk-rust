@@ -53,11 +53,15 @@ impl WaitExecution {
                         Some(WAIT_SUB_TYPE),
                         view.attempt,
                     );
+                    // A replayed completion is live only in the first
+                    // invocation after the service completed the wait.
+                    self.ended(&wire_id, |plugins| !plugins.is_updated(&wire_id));
                     return Ok(());
                 }
                 CheckpointStatus::Started => {
                     // Timer started but not yet completed: wait for the
                     // record to change.
+                    self.started(&wire_id, |info| info.with_replay(true));
                     return self.resume(&positional_id, &wire_id).await;
                 }
                 status => return recorded_outcome(&self.ctx, &wire_id, &status),
@@ -83,8 +87,49 @@ impl WaitExecution {
                 .await;
         }
 
+        self.started(&wire_id, |info| {
+            info.with_status(crate::OperationStatus::Started)
+                .with_replay(false)
+        });
+
         // The backend owns the timer: wait for the record to change.
         self.resume(&positional_id, &wire_id).await
+    }
+
+    /// The plugin info of this wait, read from its current record.
+    fn info(&self, wire_id: &str) -> crate::plugin::OperationInfo {
+        crate::plugin::OperationInfo::for_operation(
+            &self.ctx,
+            wire_id,
+            crate::OperationKind::Wait,
+            WAIT_SUB_TYPE,
+            self.name.as_deref(),
+        )
+    }
+
+    /// Fires `on_operation_start` with the info `shape` makes of the
+    /// current record's info.
+    fn started(
+        &self,
+        wire_id: &str,
+        shape: impl FnOnce(crate::plugin::OperationInfo) -> crate::plugin::OperationInfo,
+    ) {
+        if let Some(plugins) = self.ctx.plugins() {
+            crate::plugin::operation_started(plugins, &shape(self.info(wire_id)));
+        }
+    }
+
+    /// Fires `on_operation_end` with the current record's info, and the
+    /// replay flag `is_replay` returns.
+    fn ended(
+        &self,
+        wire_id: &str,
+        is_replay: impl FnOnce(&crate::plugin::InvocationPlugins) -> bool,
+    ) {
+        if let Some(plugins) = self.ctx.plugins() {
+            let info = self.info(wire_id).with_replay(is_replay(plugins));
+            crate::plugin::operation_ended(plugins, &info);
+        }
     }
 
     /// Waits until the wait's record is no longer `STARTED`, then returns
@@ -98,6 +143,10 @@ impl WaitExecution {
             .ctx
             .wait_for_record_view(positional_id, |status| *status != CheckpointStatus::Started)
             .await;
+        // The wait waited in this invocation, so its completion is live.
+        if view.status == CheckpointStatus::Succeeded {
+            self.ended(wire_id, |_| false);
+        }
         recorded_outcome(&self.ctx, wire_id, &view.status)
     }
 }
@@ -525,6 +574,165 @@ mod tests {
             .expect("the START update carries WaitSeconds")
     }
 
+    /// A wait record with `status` for the first operation of a root
+    /// context.
+    fn wait_record_with(status: CheckpointStatus) -> (String, CheckpointRecord) {
+        let wire_key = crate::engine::compute_wire_id_public("1");
+        let record = CheckpointRecord {
+            id: wire_key.clone(),
+            status,
+            result: None,
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            due_at: None,
+            op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
+        };
+        (wire_key, record)
+    }
+
+    /// A `FAILED` wait record returns its error and fires no hook.
+    #[tokio::test]
+    async fn failed_wait_record_fires_no_hook() {
+        use crate::client::InMemoryExecutionClient;
+
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let log = Arc::new(CheckpointLog::from_records(vec![wait_record_with(
+            CheckpointStatus::Failed,
+        )]));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+            Arc::new(InMemoryExecutionClient::new(Vec::new())),
+            "token0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let err = ctx.wait(Duration::from_secs(5)).await.unwrap_err();
+        assert!(
+            matches!(err.kind(), OperationErrorKind::Wait(_)),
+            "{:?}",
+            err.kind()
+        );
+        assert!(hooks.records().is_empty(), "{:?}", hooks.records());
+    }
+
+    /// A wait that waited in the invocation and whose record became
+    /// `FAILED` returns its error and fires no end hook.
+    #[tokio::test(start_paused = true)]
+    async fn wait_failed_in_invocation_fires_no_end() {
+        use crate::driver::test_support::{RefreshClient, drive_handler, named, operation_like};
+        use aws_sdk_lambda::types::OperationStatus;
+
+        let client = Arc::new(RefreshClient::new(|req| {
+            if req.empty_number == 1
+                && let Some(start) = named(req.history, "w", &OperationAction::Start)
+            {
+                let record = operation_like(start, OperationStatus::Failed)
+                    .build()
+                    .expect("all required fields set");
+                return Ok(vec![record]);
+            }
+            Ok(Vec::new())
+        }));
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let wait = ctx.wait(Duration::from_secs(1)).name("w").spawn();
+            let step = ctx
+                .step(|_| async {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Ok(1_u32)
+                })
+                .name("s")
+                .spawn();
+            let (wait, _step) = tokio::join!(wait, step);
+            Ok(format!("{}", wait.is_err()))
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(
+            outcome,
+            crate::driver::InvocationOutcome::Complete("true".to_owned())
+        );
+        let hooks_of_w: Vec<_> = hooks.of("w").iter().map(|r| r.hook).collect();
+        assert_eq!(hooks_of_w, ["start"]);
+    }
+
+    /// A new wait fires a live start hook with status `Started` once its
+    /// START is written, even when the response carries no record.
+    #[tokio::test]
+    async fn live_wait_start_reports_started() {
+        use crate::client::InMemoryExecutionClient;
+
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::new(InMemoryExecutionClient::new(Vec::new())),
+            "token0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let signal = Arc::clone(ctx.coordinator());
+        let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            ctx.wait(Duration::from_secs(5)).name("w"),
+        )
+        .await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+        let shapes: Vec<_> = hooks
+            .records()
+            .iter()
+            .map(|r| (r.hook, r.replay, r.status))
+            .collect();
+        assert_eq!(
+            shapes,
+            [("start", false, Some(crate::OperationStatus::Started))]
+        );
+    }
+
+    /// Without plugins, a replayed `SUCCEEDED` wait returns.
+    #[tokio::test]
+    async fn succeeded_wait_without_plugins_returns() {
+        let log = Arc::new(CheckpointLog::from_records(vec![wait_record_with(
+            CheckpointStatus::Succeeded,
+        )]));
+        let ctx = DurableContext::new_root(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+        );
+        assert!(ctx.plugins().is_none());
+        ctx.wait(Duration::from_secs(5)).await.unwrap();
+    }
+
     /// The service rejects `WaitSeconds: 0`, so a zero wait records one
     /// second.
     #[tokio::test]
@@ -547,5 +755,87 @@ mod tests {
                 "{duration:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{
+        RefreshClient, drive_handler, named, operation_like, wire_err,
+    };
+    use aws_sdk_lambda::types::{OperationAction, OperationStatus, WaitDetails};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    /// A wait that the first refresh completes, while a step sleeps 3 s
+    /// beside it, fires its end hook live in the same invocation.
+    #[tokio::test(start_paused = true)]
+    async fn wait_resumed_in_invocation_ends_live() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            if let Some(start) = named(req.updates, "w", &OperationAction::Start) {
+                let record = operation_like(start, OperationStatus::Started)
+                    .wait_details(
+                        WaitDetails::builder()
+                            .scheduled_end_timestamp(req.timestamp_in(secs(1)))
+                            .build(),
+                    )
+                    .build()
+                    .expect("all required fields set");
+                return Ok(vec![record]);
+            }
+            if req.empty_number == 1
+                && let Some(start) = named(req.history, "w", &OperationAction::Start)
+            {
+                let record = operation_like(start, OperationStatus::Succeeded)
+                    .build()
+                    .expect("all required fields set");
+                return Ok(vec![record]);
+            }
+            Ok(Vec::new())
+        }));
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let ctx = crate::DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::engine::CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let wait = ctx.wait(secs(1)).name("w").spawn();
+            let step = ctx
+                .step(|_| async {
+                    tokio::time::sleep(secs(3)).await;
+                    Ok(1_u32)
+                })
+                .name("s")
+                .spawn();
+            let (wait, step) = tokio::join!(wait, step);
+            wait.map_err(wire_err)?;
+            step.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        let shapes: Vec<_> = hooks
+            .of("w")
+            .iter()
+            .map(|r| (r.hook, r.replay, r.status))
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                ("start", false, Some(crate::OperationStatus::Started)),
+                ("end", false, Some(crate::OperationStatus::Succeeded)),
+            ]
+        );
     }
 }

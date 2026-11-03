@@ -2909,6 +2909,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin_wait_operation_hooks"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_wait_replay_flag"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

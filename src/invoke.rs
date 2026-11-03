@@ -108,6 +108,13 @@ where
                 .await;
         }
 
+        if let Some(plugins) = self.ctx.plugins() {
+            let info = invoke_info(&self.ctx, &wire_id, self.name.as_deref())
+                .with_status(crate::OperationStatus::Started)
+                .with_replay(false);
+            crate::plugin::operation_started(plugins, &info);
+        }
+
         // The backend owns the child invocation: wait for its record.
         resume(
             &self.ctx,
@@ -182,8 +189,20 @@ async fn recorded_outcome<O, RS: Serdes<O>>(
             );
         }
     };
+    // Fires the end hook of a terminal record before its outcome is
+    // decoded, as JS does. On the replay path the completion is live only
+    // in the first invocation after the service completed the invoke; an
+    // invoke that waited in this invocation saw it complete live.
+    let ended = || {
+        if let Some(plugins) = ctx.plugins() {
+            let is_replay = emit_replayed && !plugins.is_updated(&wire_id);
+            let info = invoke_info(ctx, &wire_id, name).with_replay(is_replay);
+            crate::plugin::operation_ended(plugins, &info);
+        }
+    };
     match &view.status {
         CheckpointStatus::Succeeded => {
+            ended();
             // Invoke succeeded: deserialize the result from invoke details
             // FIRST, then emit `operation_replayed`: a corrupt payload or
             // failing serdes surfaces as an error without claiming a
@@ -203,6 +222,7 @@ async fn recorded_outcome<O, RS: Serdes<O>>(
             Ok(value)
         }
         CheckpointStatus::Failed | CheckpointStatus::TimedOut | CheckpointStatus::Stopped => {
+            ended();
             // Invoke failed: reconstruct InvokeError from details.
             emit();
             let (error_type, error_message, error_data, stack_trace) = ctx
@@ -226,7 +246,13 @@ async fn recorded_outcome<O, RS: Serdes<O>>(
             ))
         }
         CheckpointStatus::Started | CheckpointStatus::Pending | CheckpointStatus::Ready => {
-            // Invoke has not settled yet: wait for its record.
+            // Invoke has not settled yet: wait for its record. Only the
+            // replay path reads such a record, because `resume` waits until
+            // the record leaves these statuses.
+            if let Some(plugins) = ctx.plugins() {
+                let info = invoke_info(ctx, &wire_id, name).with_replay(true);
+                crate::plugin::operation_started(plugins, &info);
+            }
             Box::pin(resume(
                 ctx,
                 name,
@@ -238,6 +264,7 @@ async fn recorded_outcome<O, RS: Serdes<O>>(
             .await
         }
         CheckpointStatus::Cancelled => {
+            ended();
             emit();
             Err(
                 OperationError::from_kind(OperationErrorKind::Invoke(InvokeError::new(
@@ -255,6 +282,21 @@ async fn recorded_outcome<O, RS: Serdes<O>>(
             Err(ctx.unrecognized_status_error(&wire_id, raw))
         }
     }
+}
+
+/// The plugin info of the invoke `wire_id`, read from its current record.
+fn invoke_info(
+    ctx: &DurableContext,
+    wire_id: &str,
+    name: Option<&str>,
+) -> crate::plugin::OperationInfo {
+    crate::plugin::OperationInfo::for_operation(
+        ctx,
+        wire_id,
+        crate::OperationKind::ChainedInvoke,
+        CHAINED_INVOKE_SUB_TYPE,
+        name,
+    )
 }
 
 // Serialization helpers
@@ -420,6 +462,128 @@ mod tests {
     use std::sync::Arc;
 
     // Replay tests
+
+    /// An invoke record that has not finished fires a replayed start hook,
+    /// and the invoke waits.
+    #[tokio::test]
+    async fn started_invoke_record_fires_replayed_start() {
+        for (status, expected) in [
+            (CheckpointStatus::Started, crate::OperationStatus::Started),
+            (CheckpointStatus::Pending, crate::OperationStatus::Pending),
+            (CheckpointStatus::Ready, crate::OperationStatus::Ready),
+        ] {
+            let wire_key = crate::engine::compute_wire_id_public("1");
+            let record = CheckpointRecord {
+                id: wire_key.clone(),
+                status: status.clone(),
+                result: None,
+                error_type: None,
+                error_message: None,
+                error_data: None,
+                stack_trace: None,
+                attempt: 0,
+                invoke_result: None,
+                invoke_error_type: None,
+                invoke_error_message: None,
+                invoke_error_data: None,
+                invoke_stack_trace: None,
+                replay_children: false,
+                callback_id: None,
+                op_type: None,
+                sub_type: None,
+                due_at: None,
+                op_name: None,
+                parent_id: None,
+                start_timestamp: None,
+                end_timestamp: None,
+            };
+            let hooks = crate::plugin::test_support::OpHooks::default();
+            let ctx = DurableContext::new_root_with_client_and_defaults(
+                "arn:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(CheckpointLog::from_records(vec![(wire_key, record)])),
+                Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new())),
+                "token0".to_owned(),
+                None,
+                Some(hooks.plugins()),
+            );
+            let signal = Arc::clone(ctx.coordinator());
+            let outcome = crate::driver::test_support::outcome_of(
+                ctx.clone(),
+                Arc::clone(ctx.task_ownership()),
+                signal,
+                ctx.invoke::<u32, _>("target", 1_u32).name("call"),
+            )
+            .await;
+            assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+            let shapes: Vec<_> = hooks
+                .records()
+                .iter()
+                .map(|r| (r.hook, r.replay, r.status))
+                .collect();
+            assert_eq!(shapes, [("start", true, Some(expected))], "{status:?}");
+        }
+    }
+
+    /// A `CANCELLED` invoke record returns its error and fires one end
+    /// hook, with status `Cancelled` and `is_replay` true.
+    #[tokio::test]
+    async fn cancelled_invoke_record_fires_end() {
+        let wire_key = crate::engine::compute_wire_id_public("1");
+        let record = CheckpointRecord {
+            id: wire_key.clone(),
+            status: CheckpointStatus::Cancelled,
+            result: None,
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            due_at: None,
+            op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
+        };
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(vec![(wire_key, record)])),
+            Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new())),
+            "token0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let err = ctx
+            .invoke::<u32, _>("target", 1_u32)
+            .name("call")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.kind(), OperationErrorKind::Invoke(_)),
+            "{:?}",
+            err.kind()
+        );
+        let shapes: Vec<_> = hooks
+            .records()
+            .iter()
+            .map(|r| (r.hook, r.replay, r.status))
+            .collect();
+        assert_eq!(
+            shapes,
+            [("end", true, Some(crate::OperationStatus::Cancelled))]
+        );
+    }
 
     #[tokio::test]
     async fn invoke_replay_success_deserializes_result() {
@@ -1352,6 +1516,74 @@ mod coordinator_tests {
             events.replayed(),
             0,
             "a resumed operation emits no replay event"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use crate::driver::InvocationOutcome;
+    use crate::driver::test_support::{
+        RefreshClient, drive_handler, named, operation_like, wire_err,
+    };
+    use aws_sdk_lambda::types::{ChainedInvokeDetails, OperationAction, OperationStatus};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// An invoke that the first refresh completes, while a step sleeps 3 s
+    /// beside it, returns the result and fires its end hook live in the
+    /// same invocation.
+    #[tokio::test(start_paused = true)]
+    async fn invoke_resumed_in_invocation_ends_live() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            if req.empty_number == 1
+                && let Some(start) = named(req.history, "inv", &OperationAction::Start)
+            {
+                let record = operation_like(start, OperationStatus::Succeeded)
+                    .chained_invoke_details(ChainedInvokeDetails::builder().result("7").build())
+                    .build()
+                    .expect("all required fields set");
+                return Ok(vec![record]);
+            }
+            Ok(Vec::new())
+        }));
+        let hooks = crate::plugin::test_support::OpHooks::default();
+        let ctx = crate::DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::engine::CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let invoke = ctx.invoke::<u32, _>("target", 1_u32).name("inv").spawn();
+            let step = ctx
+                .step(|_| async {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Ok(1_u32)
+                })
+                .name("s")
+                .spawn();
+            let (invoke, step) = tokio::join!(invoke, step);
+            step.map_err(wire_err)?;
+            Ok(invoke.map_err(wire_err)?.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("7".to_owned()));
+        let shapes: Vec<_> = hooks
+            .of("inv")
+            .iter()
+            .map(|r| (r.hook, r.replay, r.status))
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                ("start", false, Some(crate::OperationStatus::Started)),
+                ("end", false, Some(crate::OperationStatus::Succeeded)),
+            ]
         );
     }
 }

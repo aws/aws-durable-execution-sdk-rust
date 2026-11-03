@@ -297,6 +297,25 @@ pub trait Plugin: Send + Sync {
     /// - the attempt that ends the operation fires `on_attempt_end`, then
     ///   `on_operation_end`.
     ///
+    /// For a wait and a chained invoke:
+    ///
+    /// - a new operation fires `on_operation_start` with `is_replay`
+    ///   `false` once its `START` is written;
+    /// - a replayed record that has not finished fires `on_operation_start`
+    ///   with `is_replay` `true`: a `STARTED` wait, or a `STARTED`,
+    ///   `PENDING` or `READY` invoke;
+    /// - a `SUCCEEDED` wait, or an invoke with status `SUCCEEDED`, `FAILED`,
+    ///   `TIMED_OUT`, `STOPPED` or `CANCELLED`, fires `on_operation_end` on
+    ///   every replay. `is_replay` is `false` only in the first invocation
+    ///   after the service completed it, the one whose
+    ///   [`InvocationInfo::updated_operations`] lists it;
+    /// - a wait that becomes `SUCCEEDED`, or an invoke that becomes one of
+    ///   those terminal statuses, while it waits in the invocation fires
+    ///   `on_operation_end` with `is_replay` `false`;
+    /// - a wait with any other status fires no hook.
+    ///
+    /// A step or child context that is terminal on replay fires nothing.
+    ///
     /// The hook runs synchronously, on the task that runs the operation.
     /// It can return work: the SDK
     /// runs that future on its own task, and waits for it before
@@ -323,6 +342,25 @@ pub trait Plugin: Send + Sync {
     /// - an attempt that schedules a retry fires only `on_attempt_end`;
     /// - the attempt that ends the operation fires `on_attempt_end`, then
     ///   `on_operation_end`.
+    ///
+    /// For a wait and a chained invoke:
+    ///
+    /// - a new operation fires `on_operation_start` with `is_replay`
+    ///   `false` once its `START` is written;
+    /// - a replayed record that has not finished fires `on_operation_start`
+    ///   with `is_replay` `true`: a `STARTED` wait, or a `STARTED`,
+    ///   `PENDING` or `READY` invoke;
+    /// - a `SUCCEEDED` wait, or an invoke with status `SUCCEEDED`, `FAILED`,
+    ///   `TIMED_OUT`, `STOPPED` or `CANCELLED`, fires `on_operation_end` on
+    ///   every replay. `is_replay` is `false` only in the first invocation
+    ///   after the service completed it, the one whose
+    ///   [`InvocationInfo::updated_operations`] lists it;
+    /// - a wait that becomes `SUCCEEDED`, or an invoke that becomes one of
+    ///   those terminal statuses, while it waits in the invocation fires
+    ///   `on_operation_end` with `is_replay` `false`;
+    /// - a wait with any other status fires no hook.
+    ///
+    /// A step or child context that is terminal on replay fires nothing.
     ///
     /// The hook runs synchronously, on the task that runs the operation.
     /// It can return work: the SDK
@@ -1107,6 +1145,18 @@ pub(crate) fn attempt_ended(
     }
 }
 
+/// Fires `on_operation_start` with `info`.
+pub(crate) fn operation_started(plugins: &InvocationPlugins, info: &OperationInfo) {
+    plugins.dispatch_work("on_operation_start", |plugin| {
+        plugin.on_operation_start(info)
+    });
+}
+
+/// Fires `on_operation_end` with `info`.
+pub(crate) fn operation_ended(plugins: &InvocationPlugins, info: &OperationInfo) {
+    plugins.dispatch_work("on_operation_end", |plugin| plugin.on_operation_end(info));
+}
+
 /// How an attempt ended, for [`attempt_ended`].
 pub(crate) struct AttemptEnd {
     /// The 1-based attempt number.
@@ -1422,6 +1472,16 @@ impl InvocationPlugins {
     /// The info every plugin of this invocation was created with.
     pub(crate) fn info(&self) -> &InvocationInfo {
         &self.info
+    }
+
+    /// Whether the service changed the operation `id` (its wire ID) since
+    /// the previous invocation: [`InvocationInfo::updated_operations`]
+    /// holds an operation with that ID.
+    pub(crate) fn is_updated(&self, id: &str) -> bool {
+        self.info
+            .updated_operations()
+            .iter()
+            .any(|operation| operation.id() == id)
     }
 
     /// Returns the kept destructor panics, and leaves none behind.

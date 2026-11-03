@@ -239,3 +239,33 @@ Resources:
       DurableConfig:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
+
+  PluginWaitOperationHooks:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-10"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_wait_operation_hooks/
+      Handler: bootstrap
+      Description: 'Conformance 10-10: Plugin operation-start and operation-end hooks fire for wait-type operations'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginWaitReplayFlag:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-18"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_wait_replay_flag/
+      Handler: bootstrap
+      Description: 'Conformance 10-18: A wait still pending during a replay re-fires operation-start with replay=true'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

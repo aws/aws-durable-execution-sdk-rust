@@ -1813,3 +1813,247 @@ async fn operation_hook_work_runs() {
     assert!(flag.load(Ordering::SeqCst));
     assert_eq!(result.output(), alone.output());
 }
+
+// The operation hooks of waits and chained invokes.
+
+/// `(inv, hook, kind, name, is_replay, status)` of one operation hook call.
+type OpShape = (
+    usize,
+    &'static str,
+    Option<OperationKind>,
+    Option<String>,
+    bool,
+    Option<OperationStatus>,
+);
+
+/// Records every operation hook of a wait or a chained invoke, for every
+/// invocation.
+#[derive(Clone, Default)]
+struct Timers {
+    recs: Arc<Mutex<Vec<(OpShape, OperationInfo)>>>,
+    count: Arc<AtomicUsize>,
+}
+
+impl Timers {
+    fn shapes(&self) -> Vec<OpShape> {
+        self.recs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(shape, _)| shape.clone())
+            .collect()
+    }
+
+    /// The `(inv, hook, is_replay, status)` of the operation named `name`.
+    fn of(&self, name: &str) -> Vec<(usize, &'static str, bool, Option<OperationStatus>)> {
+        self.shapes()
+            .into_iter()
+            .filter(|s| s.3.as_deref() == Some(name))
+            .map(|(inv, hook, _, _, replay, status)| (inv, hook, replay, status))
+            .collect()
+    }
+
+    fn runner(&self) -> LocalRunner {
+        LocalRunner::new().options(
+            Options::builder()
+                .plugin(self.clone())
+                .build()
+                .expect("valid options"),
+        )
+    }
+}
+
+struct TimersPlugin {
+    inv: usize,
+    timers: Timers,
+}
+
+impl TimersPlugin {
+    fn push(&self, hook: &'static str, info: &OperationInfo) {
+        if !matches!(
+            info.kind(),
+            Some(OperationKind::Wait | OperationKind::ChainedInvoke)
+        ) {
+            return;
+        }
+        let shape = (
+            self.inv,
+            hook,
+            info.kind(),
+            info.name().map(str::to_owned),
+            info.is_replay(),
+            info.status(),
+        );
+        self.timers.recs.lock().unwrap().push((shape, info.clone()));
+    }
+}
+
+impl Plugin for TimersPlugin {
+    fn on_operation_start(&self, info: &OperationInfo) -> HookWork {
+        self.push("start", info);
+        Ok(None)
+    }
+
+    fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
+        self.push("end", info);
+        Ok(None)
+    }
+}
+
+impl PluginFactory for Timers {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        let inv = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(Some(Box::new(TimersPlugin {
+            inv,
+            timers: self.clone(),
+        })))
+    }
+}
+
+#[tokio::test]
+async fn wait_hooks_across_three_invocations() {
+    let timers = Timers::default();
+    let result = timers
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                ctx.wait(Duration::from_secs(1)).name("w").await?;
+                ctx.wait(Duration::from_secs(1)).name("x").await?;
+                Ok::<_, BoxError>(())
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success());
+    assert_eq!(result.invocation_count(), 3);
+    let wait = Some(OperationKind::Wait);
+    let w = Some("w".to_owned());
+    let x = Some("x".to_owned());
+    assert_eq!(
+        timers.shapes(),
+        [
+            (1, "start", wait, w.clone(), false, STARTED),
+            (2, "end", wait, w.clone(), false, SUCCEEDED),
+            (2, "start", wait, x.clone(), false, STARTED),
+            (3, "end", wait, w, true, SUCCEEDED),
+            (3, "end", wait, x, false, SUCCEEDED),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn pending_wait_restarts_with_replay() {
+    let timers = Timers::default();
+    let result = timers
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let branches: Vec<durable::Branch<String>> = vec![
+                    durable::Branch::new("0", |child: DurableContext| async move {
+                        child.wait(Duration::from_secs(2)).name("short").await?;
+                        Ok("short-done".to_owned())
+                    }),
+                    durable::Branch::new("1", |child: DurableContext| async move {
+                        child.wait(Duration::from_secs(8)).name("long").await?;
+                        Ok("long-done".to_owned())
+                    }),
+                ];
+                Ok::<_, BoxError>(ctx.parallel(branches).name("waits").await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(
+        result.output().map(Vec::as_slice),
+        Some(["short-done".to_owned(), "long-done".to_owned()].as_slice())
+    );
+    let short = timers.of("short");
+    let long = timers.of("long");
+    assert_eq!(
+        short.iter().filter(|r| r.1 == "start").collect::<Vec<_>>(),
+        [&(1, "start", false, STARTED)],
+        "{short:?}"
+    );
+    let short_ends: Vec<_> = short.iter().filter(|r| r.1 == "end").collect();
+    assert_eq!(short_ends.len(), 1, "{short:?}");
+    let short_end_inv = short_ends.first().unwrap().0;
+    assert_eq!(
+        short_ends.first().map(|r| (r.2, r.3)),
+        Some((false, SUCCEEDED))
+    );
+    assert_eq!(
+        long,
+        [
+            (1, "start", false, STARTED),
+            (short_end_inv, "start", true, STARTED),
+            (short_end_inv + 1, "end", false, SUCCEEDED),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn invoke_hooks() {
+    let timers = Timers::default();
+    let result = timers
+        .runner()
+        .register_function("double", |x: u32| async move { Ok(x * 2) })
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let value = ctx.invoke::<u32, _>("double", 21_u32).name("call").await?;
+                ctx.wait(Duration::from_secs(1)).await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&42));
+    assert_eq!(result.invocation_count(), 3);
+    assert_eq!(
+        timers.of("call"),
+        [
+            (1, "start", false, STARTED),
+            (2, "end", false, SUCCEEDED),
+            (3, "end", true, SUCCEEDED),
+        ]
+    );
+    let kinds: Vec<_> = timers
+        .shapes()
+        .into_iter()
+        .filter(|s| s.3.as_deref() == Some("call"))
+        .map(|s| s.2)
+        .collect();
+    assert!(
+        kinds
+            .iter()
+            .all(|k| *k == Some(OperationKind::ChainedInvoke))
+    );
+}
+
+#[tokio::test]
+async fn invoke_failure_hooks() {
+    let timers = Timers::default();
+    let result = timers
+        .runner()
+        .register_function("fails", |(): ()| async move {
+            Err::<(), BoxError>("declined".into())
+        })
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                ctx.invoke::<(), _>("fails", ()).name("call").await?;
+                Ok::<_, BoxError>(())
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(!result.is_success());
+    let recs = timers.recs.lock().unwrap().clone();
+    let ends: Vec<_> = recs.iter().filter(|(shape, _)| shape.1 == "end").collect();
+    assert_eq!(ends.len(), 1, "{:?}", timers.shapes());
+    let (shape, info) = ends.first().unwrap();
+    assert_eq!(shape.5, FAILED);
+    assert!(info.error().is_some(), "{info:?}");
+}
