@@ -8354,6 +8354,87 @@ mod tests {
         );
     }
 
+    /// An invocation fault, with a retained non-retryable failure of a
+    /// detached batch flush, fails the execution through the flush
+    /// failure. The plugins' end hook runs once, with `Failed`.
+    ///
+    /// The handler records the fault itself, after the rejection was
+    /// retained and before any later write, so no contributor republishes
+    /// the retained rejection first.
+    #[tokio::test]
+    async fn end_hook_failed_after_a_fault_with_a_retained_failure() {
+        let plugin = crate::plugin::test_support::Hooks::default();
+        let runner = LocalRunner::new().options(
+            crate::Options::builder()
+                .checkpoint_batching(true)
+                .plugin(plugin.clone())
+                .build()
+                .expect("valid options"),
+        );
+        let backend = Arc::new(Backend::new(
+            QueuedReplies::default(),
+            runner.checkpoint_page_size,
+        ));
+        // 1. the orphan's START passes. 2. its SUCCEED is held at the gate,
+        // then rejected non-retryably after the contributor was dropped.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        backend.plan_checkpoint_calls(vec![
+            PlannedCheckpoint::Pass,
+            PlannedCheckpoint::FailNonRetryable {
+                gate: Some(Arc::clone(&gate)),
+            },
+        ]);
+        let backend_h = Arc::clone(&backend);
+        let gate_h = Arc::clone(&gate);
+        let result = runner
+            .run_on_backend(
+                Arc::clone(&backend),
+                move |(), ctx: DurableContext| {
+                    let backend = Arc::clone(&backend_h);
+                    let gate = Arc::clone(&gate_h);
+                    async move {
+                        let orphan = ctx
+                            .step(|_| async { Ok("orphaned-outcome".to_owned()) })
+                            .name("orphan")
+                            .spawn();
+                        while backend.checkpoint_call_count() < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                        drop(orphan);
+                        gate.add_permits(1);
+                        // Let the detached flush receive the rejection and
+                        // retain it.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        ctx.coordinator().record_invocation_fault(
+                            crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE,
+                            "injected invocation fault".to_owned(),
+                        );
+                        std::future::pending::<()>().await;
+                        Ok::<_, BoxError>(())
+                    }
+                },
+                "null".to_owned(),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_failure(), "{:?}", result.error_message());
+        assert_eq!(result.invocation_count(), 1);
+        assert_eq!(
+            result.error_type(),
+            Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+        let ends = plugin.ends();
+        let [end] = ends.as_slice() else {
+            unreachable!("one end info, got {}", ends.len());
+        };
+        assert_eq!(end.status(), crate::InvocationStatus::Failed);
+        assert_eq!(end.execution_result(), None);
+        assert_eq!(
+            end.execution_error().and_then(crate::WireError::error_type),
+            Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+    }
+
     // Harness fidelity: production wire-error mapping
 
     /// The runner reports the SAME wire error message production reports.

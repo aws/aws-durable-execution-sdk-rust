@@ -645,9 +645,9 @@ impl InvocationCoordinator {
     /// function again, and the execution stays alive. Used by the retryable
     /// checkpoint-failure path and by the serdes fault path
     /// ([`crate::context::DurableContext::serdes_fault`]).
-    pub(crate) fn record_invocation_fault(&self, error_message: String) {
+    pub(crate) fn record_invocation_fault(&self, error_type: &'static str, error_message: String) {
         self.record(FatalError {
-            error_type: crate::error::CHECKPOINT_FAILED_ERROR_TYPE.to_owned(),
+            error_type: error_type.to_owned(),
             error_message,
             severity: FatalSeverity::FailInvocation,
         });
@@ -1229,7 +1229,7 @@ mod tests {
     #[test]
     fn invocation_fault_is_recorded_once() {
         let coordinator = InvocationCoordinator::new();
-        coordinator.record_invocation_fault("first".to_owned());
+        coordinator.record_invocation_fault("FirstError", "first".to_owned());
         coordinator.record_fatal("Error".to_owned(), "second".to_owned());
         let fatal = coordinator.fatal_error().expect("recorded");
         assert_eq!(fatal.error_message, "first");

@@ -75,8 +75,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use tokio::task::JoinHandle;
+
+use crate::coordinator::InvocationCoordinator;
 use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
 use crate::{BoxError, InvocationStatus, OperationKind, OperationStatus, WireError};
 
@@ -126,8 +129,10 @@ pub trait PluginFactory: Send + Sync + 'static {
 
 /// The hooks of one invocation's plugin.
 ///
-/// One instance serves exactly one invocation and is dropped when the
-/// invocation returns. Every method has a no-op default, so a later SDK
+/// One instance serves exactly one invocation. The SDK releases the
+/// instance when the invocation returns. A `DurableContext` clone that
+/// outlives the invocation keeps it alive until that clone drops. Every
+/// method has a no-op default, so a later SDK
 /// version can add a hook without breaking implementors.
 ///
 /// # Operation, attempt and change hooks
@@ -153,6 +158,13 @@ pub trait PluginFactory: Send + Sync + 'static {
 /// An `Err` or a panic from any hook, factory or hook future is logged and
 /// never changes the execution. Catching a panic relies on unwinding, so a
 /// binary built with `panic = "abort"` aborts instead.
+///
+/// The SDK drops each error it logs. A panic in that error's destructor
+/// fails the invocation, as a panic in the SDK's own code does, and the
+/// service invokes the function again. When the panic happens after the
+/// handler returned, the SDK resumes it after the end hooks, instead of
+/// returning the response. Such a panic during the drain gives the end
+/// hooks `Retrying` with its message.
 ///
 /// Every such warning is logged on the target
 /// `aws_durable_execution_sdk::plugin`, with the field
@@ -231,14 +243,44 @@ pub trait Plugin: Send + Sync {
         std::any::type_name::<Self>()
     }
 
-    /// Runs when the invocation starts, before the handler. The SDK awaits
-    /// the returned future.
+    /// Runs when the invocation starts. The SDK awaits the returned future
+    /// of every plugin, concurrently, before the handler runs.
+    ///
+    /// An `Err` or a panic is logged at WARN with the plugin's name and
+    /// registration index, and changes nothing else.
     fn on_invocation_start<'a>(&'a self, _info: &'a InvocationInfo) -> HookFuture<'a> {
         Box::pin(std::future::ready(Ok(())))
     }
 
-    /// Runs when the invocation ends, after its last checkpoint. The SDK
-    /// awaits the returned future.
+    /// Runs when the invocation ends. The SDK awaits the returned future of
+    /// every plugin, concurrently.
+    ///
+    /// 1. It runs exactly once per invocation that created the plugin,
+    ///    after every checkpoint of the invocation is written. The status
+    ///    of [`InvocationEndInfo::status`] is:
+    ///
+    ///    | The invocation | `status` | `execution_result` | `execution_error` |
+    ///    | --- | --- | --- | --- |
+    ///    | completed the execution | `Succeeded` | the serialized result | `None` |
+    ///    | failed the execution | `Failed` | `None` | the recorded error |
+    ///    | suspended | `Pending` | `None` | `None` |
+    ///    | failed itself after a retryable checkpoint or serdes failure | `Retrying` | `None` | the fault's type (`CheckpointUnrecoverableInvocationError` or `SerdesFailedError`) and message |
+    ///    | panicked | `Retrying` | `None` | no type, and the panic's message |
+    ///
+    /// 2. Before this hook, the SDK waits for the work the operation hooks
+    ///    returned until 500 ms before the Lambda deadline. Work still
+    ///    running then is aborted, and the SDK waits for each aborted task
+    ///    to end. So no hook work runs after `on_invocation_end` starts.
+    /// 3. When a panic ends the invocation, this hook runs with `Retrying`
+    ///    after the SDK has stopped every task it started, and the panic
+    ///    then continues. No operation end hook runs for an operation the
+    ///    panic interrupted. With `panic = "abort"` the process exits at the
+    ///    panic, and no hook runs.
+    /// 4. The SDK cuts this hook off 50 ms before the Lambda deadline. When
+    ///    the context has no deadline, as under `LocalRunner`, it runs to
+    ///    completion.
+    /// 5. An `Err` or a panic is logged at WARN with the plugin's name and
+    ///    registration index, and changes nothing else.
     fn on_invocation_end<'a>(&'a self, _info: &'a InvocationEndInfo) -> HookFuture<'a> {
         Box::pin(std::future::ready(Ok(())))
     }
@@ -967,40 +1009,646 @@ pub(crate) struct PluginSlot {
     pub(crate) identity: String,
 }
 
+/// The time the invocation-end drain leaves before the Lambda deadline:
+/// hook work still running then is aborted. Named after JS
+/// `PLUGIN_DRAIN_RESERVE_MS`.
+pub(crate) const PLUGIN_DRAIN_RESERVE: Duration = Duration::from_millis(500);
+
+/// The time the end hooks leave before the Lambda deadline: the response
+/// returns without them then. Named after JS `PLUGIN_END_RESERVE_MS`.
+pub(crate) const PLUGIN_END_RESERVE: Duration = Duration::from_millis(50);
+
+/// The hook work of one invocation.
+///
+/// `start_work` spawns while it holds the lock, and the drain closes the
+/// state and takes the list in one critical section. So a `start_work`
+/// call either lands in a list the drain takes, or sees `Closed`.
+enum WorkState {
+    /// The drain has not closed: the handles of the work started so far.
+    Open(Vec<JoinHandle<()>>),
+    /// The drain closed: work started from now on is dropped unspawned.
+    Closed,
+}
+
+/// Where a panic goes that the destructor of an undelivered plugin value
+/// raised: a hook error, or a factory error.
+///
+/// Such a panic fails the invocation, so it goes to the invocation
+/// coordinator. The plugins are created and their start hooks run before
+/// the coordinator exists, so the panics of that time are kept until the
+/// invocation attaches its coordinator.
+///
+/// The drive closes the coordinator's panic ownership before the drain
+/// and the end hooks run, so the coordinator returns a panic recorded
+/// after that. Such a panic is kept as a late panic, and the invocation
+/// end decides what it does (see [`LatePanics`]). The coordinator also
+/// returns a second panic while ownership is open. Then the drive already
+/// ended with the first panic or with a fatal error, and the invocation
+/// end discards every late panic.
+///
+/// The plugins shut down when they are dropped, or when the invocation
+/// future is dropped before it returned. Nobody then delivers a panic, so
+/// every kept or late panic is dropped through
+/// [`crate::task::discard_panic`], and so is every panic recorded after
+/// that: an aborted hook task can still be polled on another thread.
+enum Undelivered {
+    /// No coordinator yet: the panics so far.
+    Kept(Vec<Payload>),
+    /// The invocation's coordinator, and the panics it returned.
+    Attached {
+        coordinator: Arc<InvocationCoordinator>,
+        late: Vec<Payload>,
+    },
+    /// The plugins shut down: every panic is dropped at once.
+    Discarding,
+}
+
+impl Undelivered {
+    /// Records `payload` on the coordinator, or keeps it until one is
+    /// attached, or keeps it as a late panic when the coordinator returns
+    /// it, or drops it once the plugins shut down.
+    fn record(this: &Mutex<Self>, payload: Payload) {
+        let coordinator = {
+            let mut state = this
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &mut *state {
+                Self::Kept(kept) => {
+                    kept.push(payload);
+                    return;
+                }
+                Self::Attached { coordinator, .. } => Arc::clone(coordinator),
+                Self::Discarding => {
+                    drop(state);
+                    crate::task::discard_panic(payload);
+                    return;
+                }
+            }
+        };
+        let Some(rejected) = coordinator.record_panic(payload) else {
+            return;
+        };
+        Self::keep_late(this, rejected);
+    }
+
+    /// Keeps `payload`, which the coordinator returned, as a late panic.
+    /// The plugins may have shut down since the coordinator was read; the
+    /// payload is then dropped.
+    ///
+    /// The payload is dropped after the lock is released. A payload can
+    /// hold the last context that keeps the plugins alive. Dropping it
+    /// then drops the plugins, and their shutdown locks this state again.
+    /// So a drop under the lock would deadlock.
+    fn keep_late(this: &Mutex<Self>, payload: Payload) {
+        let rejected = {
+            let mut state = this
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Self::Attached { late, .. } = &mut *state {
+                late.push(payload);
+                return;
+            }
+            // `Kept` never follows `Attached`, so this is `Discarding`.
+            payload
+        };
+        crate::task::discard_panic(rejected);
+    }
+
+    /// Enters `Discarding`, and drops every panic kept so far.
+    fn discard_all(this: &Mutex<Self>) {
+        let state = std::mem::replace(
+            &mut *this
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Self::Discarding,
+        );
+        if let Self::Kept(left) | Self::Attached { late: left, .. } = state {
+            for payload in left {
+                crate::task::discard_panic(payload);
+            }
+        }
+    }
+}
+
+/// What a late panic does: a panic of an undelivered plugin value's
+/// destructor that the coordinator returned (see [`Undelivered`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LatePanics {
+    /// The invocation was to return a response: the first late panic
+    /// fails the invocation instead, as it would have during the drive.
+    Fail,
+    /// The invocation already fails: with a panic, with a fatal error, or
+    /// with a Lambda error. The drive keeps a fatal error over a panic and
+    /// the first panic over a later one, so every late panic is dropped.
+    Discard,
+}
+
 /// The plugins of one invocation and what they share.
 ///
-/// The invocation future holds the value in a local until it returns, so
-/// every plugin instance is dropped when its invocation returns. Its
+/// The root context and every context derived from it hold an `Arc` of
+/// the value, and so does the invocation future until it returns. Its
 /// `Drop` drops each plugin inside its own catch, so a plugin destructor
 /// that panics never changes the invocation's outcome.
 pub(crate) struct InvocationPlugins {
-    #[expect(dead_code, reason = "read by the invocation hook issue")]
     info: InvocationInfo,
     plugins: Vec<PluginSlot>,
-    #[expect(dead_code, reason = "read by the invocation hook issue")]
     execution: Mutex<Option<OperationInfo>>,
-    /// The panics of factory error destructors, which fail the invocation.
-    /// The plugins are created before the invocation coordinator exists, so
-    /// the invocation records them on the coordinator once it does.
-    error_drop_panics: Mutex<Vec<Payload>>,
+    /// The panics of undelivered plugin values' destructors, which fail
+    /// the invocation.
+    undelivered: Arc<Mutex<Undelivered>>,
+    /// The work the operation hooks returned.
+    work: Mutex<WorkState>,
 }
 
 impl InvocationPlugins {
-    /// Returns the panics that factory error destructors raised, and
-    /// leaves none behind.
+    /// The info every plugin of this invocation was created with.
+    pub(crate) fn info(&self) -> &InvocationInfo {
+        &self.info
+    }
+
+    /// Returns the kept destructor panics, and leaves none behind.
+    #[cfg(test)]
     pub(crate) fn take_error_drop_panics(&self) -> Vec<Payload> {
-        std::mem::take(
+        match &mut *self
+            .undelivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Undelivered::Kept(kept) => std::mem::take(kept),
+            Undelivered::Attached { .. } | Undelivered::Discarding => Vec::new(),
+        }
+    }
+
+    /// Hands the invocation's coordinator to the plugins. The destructor
+    /// panics kept so far are recorded on it, which ends the drive, and
+    /// every later one is recorded on it at once.
+    pub(crate) fn attach(&self, coordinator: &Arc<InvocationCoordinator>) {
+        let kept = std::mem::replace(
             &mut *self
-                .error_drop_panics
+                .undelivered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+            Undelivered::Attached {
+                coordinator: Arc::clone(coordinator),
+                late: Vec::new(),
+            },
+        );
+        if let Undelivered::Kept(kept) = kept {
+            for payload in kept {
+                crate::task::record_or_discard(coordinator, payload);
+            }
+        }
+    }
+
+    /// Shuts the plugins down: they are dropped, or the invocation future
+    /// was dropped before it returned, so nobody runs the invocation end.
+    ///
+    /// It closes the work state and aborts every hook task. It cannot wait
+    /// for them, so an aborted task drops its work on its runtime, inside
+    /// the catch of its run. Every panic kept so far, and every panic
+    /// recorded from now on, is dropped through
+    /// [`crate::task::discard_panic`]. After the invocation end, the drain
+    /// has joined every task and the late panics were taken, so this
+    /// aborts nothing and drops nothing then.
+    pub(crate) fn shut_down(&self) {
+        if let WorkState::Open(list) = std::mem::replace(&mut *self.lock_work(), WorkState::Closed)
+        {
+            for handle in list {
+                handle.abort();
+            }
+        }
+        Undelivered::discard_all(&self.undelivered);
+    }
+
+    /// Runs `on_invocation_start` on every plugin concurrently, and waits
+    /// for all of them.
+    pub(crate) async fn invocation_start(&self) {
+        let info = self.info();
+        JoinHooks::new(self.runs("on_invocation_start", |plugin| {
+            plugin.on_invocation_start(info)
+        }))
+        .await;
+    }
+
+    /// Drains the hook work, then runs `on_invocation_end` on every plugin
+    /// concurrently, with the end info built from `log` and `end`.
+    ///
+    /// `remaining` is the time left until the Lambda deadline, or `None`
+    /// without a usable deadline. `late` says what a late panic does (see
+    /// [`Undelivered`]).
+    ///
+    /// 1. The drain waits for the hook work until
+    ///    [`PLUGIN_DRAIN_RESERVE`] before the deadline. Work that settled
+    ///    work started is waited for in the next round.
+    /// 2. When that time passes, the drain closes, aborts the work still
+    ///    running, and waits for every task to end. So no hook work runs
+    ///    once the end hooks start.
+    /// 3. The end hooks run until [`PLUGIN_END_RESERVE`] before the
+    ///    deadline. When that time passes, the SDK logs a warning and
+    ///    returns without them.
+    ///
+    /// Without a deadline both waits last until everything settles.
+    ///
+    /// Every hook task has ended when the drain returns. So with
+    /// [`LatePanics::Fail`], a late panic recorded so far makes the end
+    /// `Retrying`, with the panic's message, as a panic during the drive
+    /// does. The first late panic, from the drain or from the end hooks,
+    /// is returned, and the caller resumes it. With
+    /// [`LatePanics::Discard`], every late panic is dropped and this
+    /// returns `None`.
+    pub(crate) async fn invocation_end(
+        &self,
+        log: &CheckpointLog,
+        end: crate::InvocationEnd,
+        remaining: Option<Duration>,
+        late: LatePanics,
+    ) -> Option<Payload> {
+        let now = tokio::time::Instant::now();
+        let by = |reserve: Duration| remaining.map(|left| now + left.saturating_sub(reserve));
+        self.drain(by(PLUGIN_DRAIN_RESERVE)).await;
+        let drained = self.take_late_panic(late);
+        let end = match &drained {
+            Some(payload) => crate::InvocationEnd::panicked(&**payload),
+            None => end,
+        };
+        let info = self.end_info(log, end);
+        let hooks = JoinHooks::new(self.runs("on_invocation_end", |plugin| {
+            plugin.on_invocation_end(&info)
+        }));
+        if !wait_until(by(PLUGIN_END_RESERVE), hooks).await {
+            tracing::warn!(
+                target: TARGET,
+                "plugin on_invocation_end hooks did not finish before the invocation deadline; \
+                 the response returns without them"
+            );
+        }
+        let ended = self.take_late_panic(late);
+        match (drained, ended) {
+            (Some(first), later) => {
+                if let Some(later) = later {
+                    crate::task::discard_panic(later);
+                }
+                Some(first)
+            }
+            (None, ended) => ended,
+        }
+    }
+
+    /// Takes the late panics. With [`LatePanics::Fail`] it returns the
+    /// first one and drops the others; with [`LatePanics::Discard`] it
+    /// drops all of them.
+    fn take_late_panic(&self, policy: LatePanics) -> Option<Payload> {
+        let late = match &mut *self
+            .undelivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Undelivered::Attached { late, .. } => std::mem::take(late),
+            Undelivered::Kept(_) | Undelivered::Discarding => Vec::new(),
+        };
+        let mut late = late.into_iter();
+        let first = match policy {
+            LatePanics::Fail => late.next(),
+            LatePanics::Discard => None,
+        };
+        for payload in late {
+            crate::task::discard_panic(payload);
+        }
+        first
+    }
+
+    /// Steps 1 and 2 of [`Self::invocation_end`]. Closes the work state.
+    async fn drain(&self, drain_by: Option<tokio::time::Instant>) {
+        loop {
+            let mut joining = AbortOnDrop({
+                let mut state = self.lock_work();
+                match std::mem::replace(&mut *state, WorkState::Closed) {
+                    WorkState::Open(list) if !list.is_empty() => {
+                        *state = WorkState::Open(Vec::new());
+                        list
+                    }
+                    _ => return,
+                }
+            });
+            let joined = wait_until(
+                drain_by,
+                std::future::poll_fn(|cx| {
+                    joining
+                        .0
+                        .retain_mut(|handle| Pin::new(handle).poll(cx).is_pending());
+                    if joining.0.is_empty() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await;
+            if !joined {
+                if let WorkState::Open(rest) =
+                    std::mem::replace(&mut *self.lock_work(), WorkState::Closed)
+                {
+                    joining.0.extend(rest);
+                }
+                let abandoned = joining
+                    .0
+                    .iter()
+                    .filter(|handle| !handle.is_finished())
+                    .count();
+                for handle in &joining.0 {
+                    handle.abort();
+                }
+                for handle in &mut joining.0 {
+                    // The work catches its own panics, so a join error
+                    // only reports the abort.
+                    let _ = handle.await;
+                }
+                if abandoned > 0 {
+                    tracing::warn!(
+                        target: TARGET,
+                        abandoned,
+                        "plugin hook work did not finish before the drain deadline; it is aborted"
+                    );
+                }
+                return;
+            }
+        }
+    }
+
+    /// Runs `work`, which the operation hook `hook` of the plugin at index
+    /// `slot` returned, on its own task.
+    ///
+    /// The task is not counted by the SDK's task cleanup and holds no
+    /// suspension permit. Before the drain closes, the task is spawned
+    /// under the lock and its handle is kept for the drain. After it
+    /// closed, `work` is dropped unspawned and a warning is logged.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "called by the operation hook issue")
+    )]
+    pub(crate) fn start_work(&self, slot: usize, hook: &'static str, work: HookFuture<'static>) {
+        #[expect(clippy::expect_used)]
+        // reason: every caller passes the index of a plugin of this
+        // invocation, which it read from `self.plugins`.
+        let identity = &self
+            .plugins
+            .get(slot)
+            .expect("the slot names a plugin of this invocation")
+            .identity;
+        let mut state = self.lock_work();
+        let WorkState::Open(list) = &mut *state else {
+            drop(state);
+            drop_hook_future(identity, hook, work);
+            tracing::warn!(
+                target: TARGET,
+                plugin = %identity,
+                hook,
+                "plugin hook work started after the drain closed; it is dropped"
+            );
+            return;
+        };
+        list.retain(|handle| !handle.is_finished());
+        let run = HookRun {
+            identity: identity.clone().into(),
+            hook,
+            future: Some(work),
+            undelivered: Arc::clone(&self.undelivered),
+        };
+        if let Ok(handle) = crate::task::spawn_plugin_work(run) {
+            list.push(handle);
+        } else {
+            drop(state);
+            tracing::warn!(
+                target: TARGET,
+                plugin = %identity,
+                hook,
+                "plugin hook work could not be spawned; it is dropped"
+            );
+        }
+    }
+
+    /// Builds the end info of this invocation: the start info's request
+    /// ID, execution ARN, input and start time, the operations of `log`
+    /// with the `EXECUTION` operation, and `end`. It projects the log
+    /// once, whatever the number of plugins.
+    fn end_info(&self, log: &CheckpointLog, end: crate::InvocationEnd) -> InvocationEndInfo {
+        let execution = self
+            .execution
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        InvocationEndInfo {
+            request_id: self.info.request_id.clone(),
+            execution_arn: self.info.execution_arn.clone(),
+            execution_input: self.info.execution_input.clone(),
+            operations: operations_map(log, execution.as_ref()),
+            execution_start_timestamp: self.info.execution_start_timestamp,
+            status: end.status,
+            execution_result: end.result,
+            execution_error: end.error,
+        }
+    }
+
+    /// One hook run per plugin, each with the future `call` returned.
+    fn runs<'a>(
+        &'a self,
+        hook: &'static str,
+        call: impl Fn(&'a dyn Plugin) -> HookFuture<'a>,
+    ) -> Vec<HookRun<'a>> {
+        self.plugins
+            .iter()
+            .map(|slot| {
+                let future = match catch_unwind(AssertUnwindSafe(|| call(slot.plugin.as_ref()))) {
+                    Ok(future) => Some(future),
+                    Err(payload) => {
+                        log_hook_panic(&slot.identity, hook, payload);
+                        None
+                    }
+                };
+                HookRun {
+                    identity: slot.identity.as_str().into(),
+                    hook,
+                    future,
+                    undelivered: Arc::clone(&self.undelivered),
+                }
+            })
+            .collect()
+    }
+
+    fn lock_work(&self) -> std::sync::MutexGuard<'_, WorkState> {
+        self.work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The hook tasks the drain took out of the work state. Dropping it
+/// aborts every task still in it.
+///
+/// The drain future can be dropped while it waits, when the invocation
+/// future is dropped. The handles are then no longer in the work state, so
+/// [`InvocationPlugins::shut_down`] cannot abort them. A dropped
+/// `JoinHandle` detaches its task, and the task would keep running the
+/// hook work after the invocation. So the drain keeps the handles in this
+/// guard while it waits.
+struct AbortOnDrop(Vec<JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+/// Awaits `future` until `deadline`, or until it finishes without a
+/// deadline. Returns whether it finished.
+///
+/// `tokio::time::timeout_at` polls `future` once before it checks the
+/// deadline, so a future that finishes on its first poll finishes even
+/// when the deadline already passed.
+async fn wait_until(
+    deadline: Option<tokio::time::Instant>,
+    future: impl Future<Output = ()>,
+) -> bool {
+    if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, future).await.is_ok()
+    } else {
+        future.await;
+        true
+    }
+}
+
+/// Logs a caught hook panic, and drops its payload.
+fn log_hook_panic(identity: &str, hook: &'static str, payload: Payload) {
+    tracing::warn!(
+        target: TARGET,
+        plugin = %identity,
+        hook,
+        "plugin hook panicked; the panic is ignored"
+    );
+    crate::task::discard_panic(payload);
+}
+
+/// Drops a hook future inside a catch. Its destructor is plugin code, so a
+/// panic there is logged as the hook's panic.
+fn drop_hook_future(identity: &str, hook: &'static str, future: HookFuture<'_>) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(future))) {
+        log_hook_panic(identity, hook, payload);
+    }
+}
+
+/// One hook future of one plugin, polled inside a catch.
+///
+/// It finishes when the future returns, returns `Err` or panics. An `Err`
+/// and a panic are logged. The future is dropped once it finished, or
+/// with the run, each time inside a catch.
+struct HookRun<'a> {
+    identity: std::borrow::Cow<'a, str>,
+    hook: &'static str,
+    /// `None` once the hook finished.
+    future: Option<HookFuture<'a>>,
+    undelivered: Arc<Mutex<Undelivered>>,
+}
+
+impl HookRun<'_> {
+    /// Logs the hook's error, and drops it.
+    ///
+    /// The error's `Display` is plugin code. So it runs inside a catch that
+    /// only borrows the error, and a panic there is logged and dropped.
+    /// The SDK delivers the error to nobody, so it then drops the error
+    /// inside a second catch. A panic from its destructor fails the
+    /// invocation, so it is recorded on the coordinator.
+    fn report_error(&self, error: BoxError) {
+        match catch_unwind(AssertUnwindSafe(|| error.to_string())) {
+            Ok(message) => tracing::warn!(
+                target: TARGET,
+                plugin = %self.identity,
+                hook = self.hook,
+                error = %message,
+                "plugin hook failed; the error is ignored"
+            ),
+            Err(payload) => {
+                tracing::warn!(
+                    target: TARGET,
+                    plugin = %self.identity,
+                    hook = self.hook,
+                    "plugin hook failed, and its error panicked while it was formatted; \
+                     the error is ignored"
+                );
+                crate::task::discard_panic(payload);
+            }
+        }
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(error))) {
+            Undelivered::record(&self.undelivered, payload);
+        }
+    }
+}
+
+impl Future for HookRun<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let Some(future) = this.future.as_mut() else {
+            return Poll::Ready(());
+        };
+        let polled = catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)));
+        if matches!(polled, Ok(Poll::Pending)) {
+            return Poll::Pending;
+        }
+        if let Some(future) = this.future.take() {
+            drop_hook_future(&this.identity, this.hook, future);
+        }
+        match polled {
+            Ok(Poll::Ready(Err(error))) => this.report_error(error),
+            Err(payload) => log_hook_panic(&this.identity, this.hook, payload),
+            Ok(_) => {}
+        }
+        Poll::Ready(())
+    }
+}
+
+impl Drop for HookRun<'_> {
+    /// A run dropped before its hook finished: the drain aborted it, or
+    /// the end hooks were cut off at the deadline.
+    fn drop(&mut self) {
+        if let Some(future) = self.future.take() {
+            drop_hook_future(&self.identity, self.hook, future);
+        }
+    }
+}
+
+/// Polls one hook run per plugin concurrently. Ready when every run
+/// finished.
+struct JoinHooks<'a> {
+    runs: Vec<HookRun<'a>>,
+}
+
+impl<'a> JoinHooks<'a> {
+    fn new(runs: Vec<HookRun<'a>>) -> Self {
+        Self { runs }
+    }
+}
+
+impl Future for JoinHooks<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut finished = true;
+        for run in &mut self.get_mut().runs {
+            finished &= Pin::new(run).poll(cx).is_ready();
+        }
+        if finished {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 }
 
 impl Drop for InvocationPlugins {
-    /// Drops every plugin, in registration order, each inside its own
-    /// catch.
+    /// Shuts the plugins down (see [`Self::shut_down`]), then drops every
+    /// plugin, in registration order, each inside its own catch.
     ///
     /// A plugin's destructor is plugin code, and a plugin panic never
     /// changes the execution. So a destructor panic is logged and its
@@ -1008,6 +1656,7 @@ impl Drop for InvocationPlugins {
     /// plugin has its own catch, because a second panic while the first
     /// one unwinds a shared drop would abort the process.
     fn drop(&mut self) {
+        self.shut_down();
         for PluginSlot { plugin, identity } in std::mem::take(&mut self.plugins) {
             if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(plugin))) {
                 tracing::warn!(
@@ -1019,9 +1668,29 @@ impl Drop for InvocationPlugins {
                 crate::task::discard_panic(payload);
             }
         }
-        // A panic nobody took is dropped without escaping.
-        for payload in self.take_error_drop_panics() {
-            crate::task::discard_panic(payload);
+    }
+}
+
+/// Shuts the plugins down when it is dropped (see
+/// [`InvocationPlugins::shut_down`]).
+///
+/// The invocation future holds one. A context clone can outlive the
+/// invocation and keep the plugins alive, so their own `Drop` may run
+/// late. This guard runs when the invocation future returns or is dropped
+/// before it returned, so the hook tasks are aborted then. It holds a weak
+/// reference, so it never keeps the plugins alive itself.
+pub(crate) struct ShutDownOnDrop(Weak<InvocationPlugins>);
+
+impl ShutDownOnDrop {
+    pub(crate) fn new(plugins: &Arc<InvocationPlugins>) -> Self {
+        Self(Arc::downgrade(plugins))
+    }
+}
+
+impl Drop for ShutDownOnDrop {
+    fn drop(&mut self) {
+        if let Some(plugins) = self.0.upgrade() {
+            plugins.shut_down();
         }
     }
 }
@@ -1052,7 +1721,8 @@ pub(crate) fn create_plugins(
         info,
         plugins,
         execution: Mutex::new(execution),
-        error_drop_panics: Mutex::new(error_drop_panics),
+        undelivered: Arc::new(Mutex::new(Undelivered::Kept(error_drop_panics))),
+        work: Mutex::new(WorkState::Open(Vec::new())),
     }))
 }
 
@@ -1141,6 +1811,230 @@ fn log_factory_error(
     }
     if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(error))) {
         error_drop_panics.push(payload);
+    }
+}
+
+/// Plugins built from closures, and a `wrap` service that runs them, for
+/// the hook tests of this module and of `lib.rs`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+
+    use super::{HookFuture, InvocationEndInfo, InvocationInfo, Plugin, PluginFactory, TARGET};
+    use crate::{BoxError, DurableContext, InvocationPayload, Options};
+
+    type StartFn = dyn Fn(&InvocationInfo) -> HookFuture<'static> + Send + Sync;
+    type EndFn = dyn Fn(&InvocationEndInfo) -> HookFuture<'static> + Send + Sync;
+
+    /// A plugin whose hooks are closures. A hook without a closure does
+    /// nothing. Every info it receives is recorded.
+    #[derive(Clone, Default)]
+    pub(crate) struct Hooks {
+        pub(crate) name: Option<&'static str>,
+        pub(crate) start: Option<Arc<StartFn>>,
+        pub(crate) end: Option<Arc<EndFn>>,
+        pub(crate) starts: Arc<Mutex<Vec<InvocationInfo>>>,
+        pub(crate) ends: Arc<Mutex<Vec<InvocationEndInfo>>>,
+    }
+
+    impl Hooks {
+        pub(crate) fn on_start(
+            mut self,
+            hook: impl Fn(&InvocationInfo) -> HookFuture<'static> + Send + Sync + 'static,
+        ) -> Self {
+            self.start = Some(Arc::new(hook));
+            self
+        }
+
+        pub(crate) fn on_end(
+            mut self,
+            hook: impl Fn(&InvocationEndInfo) -> HookFuture<'static> + Send + Sync + 'static,
+        ) -> Self {
+            self.end = Some(Arc::new(hook));
+            self
+        }
+
+        pub(crate) fn named(mut self, name: &'static str) -> Self {
+            self.name = Some(name);
+            self
+        }
+
+        pub(crate) fn ends(&self) -> Vec<InvocationEndInfo> {
+            self.ends.lock().unwrap().clone()
+        }
+    }
+
+    impl Plugin for Hooks {
+        fn name(&self) -> &'static str {
+            self.name.unwrap_or("Hooks")
+        }
+
+        fn on_invocation_start<'a>(&'a self, info: &'a InvocationInfo) -> HookFuture<'a> {
+            self.starts.lock().unwrap().push(info.clone());
+            match &self.start {
+                Some(hook) => hook(info),
+                None => Box::pin(std::future::ready(Ok(()))),
+            }
+        }
+
+        fn on_invocation_end<'a>(&'a self, info: &'a InvocationEndInfo) -> HookFuture<'a> {
+            self.ends.lock().unwrap().push(info.clone());
+            match &self.end {
+                Some(hook) => hook(info),
+                None => Box::pin(std::future::ready(Ok(()))),
+            }
+        }
+    }
+
+    impl PluginFactory for Hooks {
+        fn create_plugin(
+            &self,
+            _info: &InvocationInfo,
+        ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// The plugins of an invocation with one [`Hooks`] plugin, as
+    /// `create_plugins` returns them.
+    pub(crate) fn invocation_plugins() -> Arc<super::InvocationPlugins> {
+        let factories: Vec<(&'static str, Arc<dyn PluginFactory>)> =
+            vec![("test::Hooks", Arc::new(Hooks::default()))];
+        super::create_plugins(&factories, None, || {
+            InvocationInfo::new(
+                "r".to_owned(),
+                "arn".to_owned(),
+                "{}".to_owned(),
+                std::collections::BTreeMap::new(),
+                Vec::new(),
+                None,
+                true,
+                None,
+            )
+        })
+        .expect("one factory is registered")
+    }
+
+    /// The deadline `millis` from now, in epoch milliseconds, as a Lambda
+    /// context carries it.
+    pub(crate) fn deadline_in(millis: u64) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        u64::try_from(now.as_millis()).unwrap() + millis
+    }
+
+    /// A `wrap` service with the in-memory transport and `plugins`, and the
+    /// event of a first invocation whose Lambda deadline is `deadline`
+    /// (epoch milliseconds, 0 for none).
+    pub(crate) fn service<F, Fut>(
+        plugins: Vec<Hooks>,
+        deadline: u64,
+        handler: F,
+    ) -> (
+        impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> crate::BoxedInvocationFuture,
+        lambda_runtime::LambdaEvent<InvocationPayload>,
+    )
+    where
+        F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, BoxError>> + Send,
+    {
+        service_with(plugins, deadline, Vec::new(), handler)
+    }
+
+    /// [`service`], with `recorded` added to the invocation's operations
+    /// after the `EXECUTION` operation.
+    pub(crate) fn service_with<F, Fut>(
+        plugins: Vec<Hooks>,
+        deadline: u64,
+        recorded: Vec<serde_json::Value>,
+        handler: F,
+    ) -> (
+        impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> crate::BoxedInvocationFuture,
+        lambda_runtime::LambdaEvent<InvocationPayload>,
+    )
+    where
+        F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, BoxError>> + Send,
+    {
+        let mut builder = Options::builder().execution_client(Arc::new(
+            crate::client::InMemoryExecutionClient::new(Vec::new()),
+        ));
+        for plugin in plugins {
+            builder = builder.plugin(plugin);
+        }
+        let mut operations = vec![serde_json::json!({
+            "Id": "exec-1",
+            "Type": "EXECUTION",
+            "Status": "STARTED",
+            "ExecutionDetails": { "InputPayload": "{}" }
+        })];
+        operations.extend(recorded);
+        let payload = serde_json::json!({
+            "DurableExecutionArn": "arn:test",
+            "CheckpointToken": "tok",
+            "InitialExecutionState": { "Operations": operations }
+        });
+        let mut lambda_ctx = lambda_runtime::Context::default();
+        lambda_ctx.deadline = deadline;
+        let event = lambda_runtime::LambdaEvent::new(InvocationPayload(payload), lambda_ctx);
+        (crate::wrap(handler, builder.build().unwrap()), event)
+    }
+
+    /// Captures the events of this thread as JSON lines.
+    pub(crate) fn capture() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = Writer(Arc::clone(&buffer));
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_writer(move || writer.clone());
+        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        (buffer, guard)
+    }
+
+    /// The warnings on the plugin target that `buffer` captured.
+    pub(crate) fn warnings(buffer: &Arc<Mutex<Vec<u8>>>) -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(&buffer.lock().unwrap())
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| {
+                v.get("target").and_then(serde_json::Value::as_str) == Some(TARGET)
+                    && v.get("level").and_then(serde_json::Value::as_str) == Some("WARN")
+            })
+            .collect()
+    }
+
+    /// The string field `name` of `event`, or `""`.
+    pub(crate) fn field<'a>(event: &'a serde_json::Value, name: &str) -> &'a str {
+        event
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    }
+
+    /// The warnings whose message is `message`.
+    pub(crate) fn with_message<'a>(
+        warnings: &'a [serde_json::Value],
+        message: &str,
+    ) -> Vec<&'a serde_json::Value> {
+        warnings
+            .iter()
+            .filter(|w| field(w, "message") == message)
+            .collect()
     }
 }
 
@@ -1606,47 +2500,7 @@ mod tests {
         assert!(result.is_none());
     }
 
-    /// Captures the warnings on the plugin target as JSON lines.
-    fn capture() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
-        use tracing_subscriber::layer::SubscriberExt as _;
-        #[derive(Clone)]
-        struct Writer(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Writer {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let writer = Writer(Arc::clone(&buffer));
-        let layer = tracing_subscriber::fmt::layer()
-            .json()
-            .flatten_event(true)
-            .with_writer(move || writer.clone());
-        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
-        (buffer, guard)
-    }
-
-    fn warnings(buffer: &Arc<Mutex<Vec<u8>>>) -> Vec<serde_json::Value> {
-        String::from_utf8_lossy(&buffer.lock().unwrap())
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|v| {
-                v.get("target").and_then(serde_json::Value::as_str) == Some(TARGET)
-                    && v.get("level").and_then(serde_json::Value::as_str) == Some("WARN")
-            })
-            .collect()
-    }
-
-    fn field<'a>(event: &'a serde_json::Value, name: &str) -> &'a str {
-        event
-            .get(name)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-    }
+    use super::test_support::{capture, field, warnings};
 
     /// The skipped factories are logged with their identities.
     ///
@@ -2053,5 +2907,1176 @@ mod tests {
             link: 0,
         };
         assert_eq!(format!("{next:?}"), "Next");
+    }
+
+    // Hook work. The operation hooks that return work are called by later
+    // issues, so each handler starts its work directly through
+    // `ctx.plugins()`, as a hook call site does.
+
+    use super::test_support::{Hooks, deadline_in, service, with_message};
+    use crate::DurableContext;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Starts `work` as the `on_operation_end` work of plugin 0.
+    fn start(
+        ctx: &DurableContext,
+        work: impl Future<Output = Result<(), BoxError>> + Send + 'static,
+    ) {
+        ctx.plugins()
+            .expect("the invocation has plugins")
+            .start_work(0, "on_operation_end", Box::pin(work));
+    }
+
+    /// Runs its closure when dropped.
+    struct OnDrop(Option<Box<dyn FnOnce() + Send>>);
+
+    impl OnDrop {
+        fn new(f: impl FnOnce() + Send + 'static) -> Self {
+            Self(Some(Box::new(f)))
+        }
+    }
+
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            if let Some(f) = self.0.take() {
+                f();
+            }
+        }
+    }
+
+    /// The time since `start`, in whole milliseconds.
+    fn millis_since(start: tokio::time::Instant) -> u128 {
+        start.elapsed().as_millis()
+    }
+
+    /// How many times a deadline test runs its scenario at most.
+    const DEADLINE_ATTEMPTS: usize = 5;
+
+    /// The real time a run may take for its result to be checked exactly.
+    const EXACT_SLACK_MS: u128 = 50;
+
+    /// The slack of a deadline test's run that started at `real`.
+    ///
+    /// Tokio's time is paused, so a run's tokio time moves only through
+    /// its timers. The Lambda deadline is an epoch time, so the real time
+    /// that passes before the SDK reads it, and the millisecond truncation
+    /// of the deadline and of the readings, shorten the budget. So an event
+    /// that the SDK places `x` ms before the deadline is seen at most
+    /// `slack` ms before its exact time, and never after it.
+    fn slack(real: std::time::Instant) -> u128 {
+        real.elapsed().as_millis() + 2
+    }
+
+    /// Whether a deadline test should run its scenario again: the run took
+    /// too much real time for an exact check, and attempts remain.
+    fn retry(slack: u128, attempt: usize) -> bool {
+        slack >= EXACT_SLACK_MS && attempt + 1 < DEADLINE_ATTEMPTS
+    }
+
+    /// Asserts that `what` happened at `actual` ms: at most `exact` ms,
+    /// and at least `exact` ms less `slack`. With the slack under
+    /// [`EXACT_SLACK_MS`], a reserve 50 ms off fails the check.
+    fn assert_at(what: &str, actual: u128, exact: u128, slack: u128) {
+        assert!(
+            actual <= exact && actual + slack >= exact,
+            "{what} at {actual} ms; expected {exact} ms, less at most {slack} ms"
+        );
+    }
+
+    type Shared<T> = Arc<Mutex<T>>;
+
+    fn shared<T: Default>() -> Shared<T> {
+        Arc::new(Mutex::new(T::default()))
+    }
+
+    /// A plugin whose end hook records the milliseconds since `start` at
+    /// its start, then awaits `then`.
+    fn end_at<F>(start: tokio::time::Instant, at: &Shared<Option<u128>>, then: F) -> Hooks
+    where
+        F: Fn() -> HookFuture<'static> + Send + Sync + 'static,
+    {
+        let at = Arc::clone(at);
+        Hooks::default().on_end(move |_| {
+            *at.lock().unwrap() = Some(millis_since(start));
+            then()
+        })
+    }
+
+    fn ready() -> HookFuture<'static> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hook_work_runs_during_the_invocation() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let seen = shared::<Option<bool>>();
+        let plugin = {
+            let flag = Arc::clone(&flag);
+            let seen = Arc::clone(&seen);
+            Hooks::default().on_end(move |_| {
+                *seen.lock().unwrap() = Some(flag.load(Ordering::SeqCst));
+                ready()
+            })
+        };
+        let (service, event) = service(vec![plugin], 0, move |_e, ctx| {
+            let flag = Arc::clone(&flag);
+            async move {
+                ctx.step(|_| async { Ok(1_u32) }).await?;
+                start(&ctx, async move {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                });
+                Ok(serde_json::Value::Null)
+            }
+        });
+        service(event).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), Some(true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hook_work_does_not_delay_task_cleanup() {
+        for attempt in 0..DEADLINE_ATTEMPTS {
+            if hook_work_does_not_delay_task_cleanup_once(attempt).await {
+                return;
+            }
+        }
+    }
+
+    /// One run of `hook_work_does_not_delay_task_cleanup`. Returns whether
+    /// the run was checked.
+    async fn hook_work_does_not_delay_task_cleanup_once(attempt: usize) -> bool {
+        let real = std::time::Instant::now();
+        let begin = tokio::time::Instant::now();
+        let observed = shared::<Option<u128>>();
+        let ended = shared::<Option<u128>>();
+        let end_started = shared::<Option<u128>>();
+        let plugin = end_at(begin, &end_started, ready);
+        let (service, event) = service(vec![plugin], deadline_in(2_000), {
+            let observed = Arc::clone(&observed);
+            let ended = Arc::clone(&ended);
+            move |_e, ctx| {
+                let observed = Arc::clone(&observed);
+                let ended = Arc::clone(&ended);
+                async move {
+                    ctx.step(|_| async { Ok(1_u32) }).await?;
+                    let probe = ctx.clone();
+                    start(&ctx, async move {
+                        let _guard = OnDrop::new(move || {
+                            *ended.lock().unwrap() = Some(millis_since(begin));
+                        });
+                        // The drive returns while the work runs: the task
+                        // count reaches zero at once.
+                        while probe.coordinator().tasks().live() > 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        *observed.lock().unwrap() = Some(millis_since(begin));
+                        drop(probe);
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        Ok(())
+                    });
+                    Ok(serde_json::Value::Null)
+                }
+            }
+        });
+        service(event).await.unwrap();
+        let slack = slack(real);
+        if retry(slack, attempt) {
+            return false;
+        }
+        assert_eq!(*observed.lock().unwrap(), Some(0));
+        let aborted = ended
+            .lock()
+            .unwrap()
+            .expect("the work ended when the service returned");
+        assert_at("the drain aborted the work", aborted, 1_500, slack);
+        let end = end_started.lock().unwrap().expect("the end hook ran");
+        assert!(
+            end >= aborted,
+            "the end hook started at {end} ms, before the abort"
+        );
+        true
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_waits_for_work_started_while_draining() {
+        let second_done = Arc::new(AtomicBool::new(false));
+        let seen = shared::<Option<bool>>();
+        let plugin = {
+            let second_done = Arc::clone(&second_done);
+            let seen = Arc::clone(&seen);
+            Hooks::default().on_end(move |_| {
+                *seen.lock().unwrap() = Some(second_done.load(Ordering::SeqCst));
+                ready()
+            })
+        };
+        let (service, event) = service(vec![plugin], 0, move |_e, ctx| {
+            let second_done = Arc::clone(&second_done);
+            async move {
+                let starter = ctx.clone();
+                start(&ctx, async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    start(&starter, async move {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        second_done.store(true, Ordering::SeqCst);
+                        Ok(())
+                    });
+                    Ok(())
+                });
+                Ok(serde_json::Value::Null)
+            }
+        });
+        service(event).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), Some(true));
+    }
+
+    /// The drain aborts work that was started while it waited and that it
+    /// had not taken yet: the drain waits for the first list, which holds
+    /// 20 s of work, while the second work is started.
+    #[tokio::test(start_paused = true)]
+    async fn drain_aborts_work_started_while_waiting() {
+        for attempt in 0..DEADLINE_ATTEMPTS {
+            if drain_aborts_work_started_while_waiting_once(attempt).await {
+                return;
+            }
+        }
+    }
+
+    /// One run of `drain_aborts_work_started_while_waiting`. Returns
+    /// whether the run was checked.
+    async fn drain_aborts_work_started_while_waiting_once(attempt: usize) -> bool {
+        let real = std::time::Instant::now();
+        let begin = tokio::time::Instant::now();
+        let ended = shared::<Option<u128>>();
+        let end_started = shared::<Option<u128>>();
+        let plugin = end_at(begin, &end_started, ready);
+        let (service, event) = service(vec![plugin], deadline_in(2_000), {
+            let ended = Arc::clone(&ended);
+            move |_e, ctx| {
+                let ended = Arc::clone(&ended);
+                async move {
+                    let starter = ctx.clone();
+                    start(&ctx, async move {
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        Ok(())
+                    });
+                    start(&ctx, async move {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        start(&starter, async move {
+                            let _guard = OnDrop::new(move || {
+                                *ended.lock().unwrap() = Some(millis_since(begin));
+                            });
+                            tokio::time::sleep(Duration::from_secs(20)).await;
+                            Ok(())
+                        });
+                        Ok(())
+                    });
+                    Ok(serde_json::Value::Null)
+                }
+            }
+        });
+        service(event).await.unwrap();
+        let slack = slack(real);
+        if retry(slack, attempt) {
+            return false;
+        }
+        let aborted = ended.lock().unwrap().expect("the second work ended");
+        assert_at("the drain aborted the second work", aborted, 1_500, slack);
+        let end = end_started.lock().unwrap().expect("the end hook ran");
+        assert!(end >= aborted, "the end hook started at {end} ms");
+        true
+    }
+
+    /// A handler that starts 20 s of work whose drop is recorded in
+    /// `ended`, and returns.
+    fn twenty_seconds_of_work(
+        begin: tokio::time::Instant,
+        ended: &Shared<Option<u128>>,
+    ) -> impl Fn(
+        serde_json::Value,
+        DurableContext,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, BoxError>> + Send>>
+    + Send
+    + Sync
+    + 'static {
+        let ended = Arc::clone(ended);
+        move |_e, ctx| {
+            let ended = Arc::clone(&ended);
+            Box::pin(async move {
+                start(&ctx, async move {
+                    let _guard = OnDrop::new(move || {
+                        *ended.lock().unwrap() = Some(millis_since(begin));
+                    });
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    Ok(())
+                });
+                Ok(serde_json::Value::Null)
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[expect(clippy::panic)] // reason: reports that no attempt captured both warnings
+    async fn drain_stops_500ms_and_end_50ms_before_deadline() {
+        for attempt in 0..DEADLINE_ATTEMPTS {
+            let (buffer, _guard) = capture();
+            let real = std::time::Instant::now();
+            let begin = tokio::time::Instant::now();
+            let ended = shared::<Option<u128>>();
+            let end_dropped = Arc::new(AtomicBool::new(false));
+            let plugin = {
+                let end_dropped = Arc::clone(&end_dropped);
+                Hooks::default().on_end(move |_| {
+                    let guard = OnDrop::new({
+                        let end_dropped = Arc::clone(&end_dropped);
+                        move || end_dropped.store(true, Ordering::SeqCst)
+                    });
+                    Box::pin(async move {
+                        let _guard = guard;
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    })
+                })
+            };
+            let (service, event) = service(
+                vec![plugin],
+                deadline_in(2_000),
+                twenty_seconds_of_work(begin, &ended),
+            );
+            service(event).await.unwrap();
+            let returned = millis_since(begin);
+            let slack = slack(real);
+            if retry(slack, attempt) {
+                continue;
+            }
+            assert_at("the service returned", returned, 1_950, slack);
+            let aborted = ended.lock().unwrap().expect("the work was aborted");
+            assert_at("the drain aborted the work", aborted, 1_500, slack);
+            assert!(
+                end_dropped.load(Ordering::SeqCst),
+                "the cut-off end hook was dropped"
+            );
+            let warnings = warnings(&buffer);
+            let drained = with_message(
+                &warnings,
+                "plugin hook work did not finish before the drain deadline; it is aborted",
+            );
+            let cut = with_message(
+                &warnings,
+                "plugin on_invocation_end hooks did not finish before the invocation deadline; \
+                 the response returns without them",
+            );
+            let ([drained], [_]) = (drained.as_slice(), cut.as_slice()) else {
+                continue;
+            };
+            assert_eq!(drained.get("abandoned"), Some(&serde_json::json!(1)));
+            return;
+        }
+        panic!("no attempt captured both warnings");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn end_hook_keeps_its_time() {
+        for attempt in 0..DEADLINE_ATTEMPTS {
+            if end_hook_keeps_its_time_once(attempt).await {
+                return;
+            }
+        }
+    }
+
+    /// One run of `end_hook_keeps_its_time`. Returns whether the run was
+    /// checked.
+    async fn end_hook_keeps_its_time_once(attempt: usize) -> bool {
+        let real = std::time::Instant::now();
+        let begin = tokio::time::Instant::now();
+        let ended = shared::<Option<u128>>();
+        let finished = shared::<Option<u128>>();
+        let plugin = {
+            let finished = Arc::clone(&finished);
+            Hooks::default().on_end(move |_| {
+                let finished = Arc::clone(&finished);
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    *finished.lock().unwrap() = Some(millis_since(begin));
+                    Ok(())
+                })
+            })
+        };
+        let (service, event) = service(
+            vec![plugin],
+            deadline_in(2_000),
+            twenty_seconds_of_work(begin, &ended),
+        );
+        service(event).await.unwrap();
+        let slack = slack(real);
+        if retry(slack, attempt) {
+            return false;
+        }
+        let at = finished.lock().unwrap().expect("the end hook finished");
+        assert_at("the end hook finished", at, 1_800, slack);
+        true
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_unbounded_without_deadline() {
+        let begin = tokio::time::Instant::now();
+        let ended = shared::<Option<u128>>();
+        let end_started = shared::<Option<u128>>();
+        let plugin = end_at(begin, &end_started, ready);
+        let (service, event) = service(vec![plugin], 0, twenty_seconds_of_work(begin, &ended));
+        service(event).await.unwrap();
+        assert_eq!(*ended.lock().unwrap(), Some(20_000));
+        assert_eq!(*end_started.lock().unwrap(), Some(20_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_skipped_inside_the_reserve() {
+        let begin = tokio::time::Instant::now();
+        let ended = shared::<Option<u128>>();
+        let end_started = shared::<Option<u128>>();
+        let plugin = end_at(begin, &end_started, ready);
+        let (service, event) = service(
+            vec![plugin],
+            deadline_in(400),
+            twenty_seconds_of_work(begin, &ended),
+        );
+        service(event).await.unwrap();
+        assert_eq!(*ended.lock().unwrap(), Some(0));
+        assert_eq!(*end_started.lock().unwrap(), Some(0));
+    }
+
+    /// An error whose `Display` panics with `display boom`.
+    #[derive(Debug)]
+    struct PanickingDisplayError;
+
+    impl fmt::Display for PanickingDisplayError {
+        #[expect(clippy::panic)] // reason: the formatting panic under test
+        fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("display boom")
+        }
+    }
+
+    impl std::error::Error for PanickingDisplayError {}
+
+    #[tokio::test(start_paused = true)]
+    #[expect(clippy::panic)] // reason: the hook panic under test, and the report of no capture
+    async fn hook_work_errors_and_panics_are_logged() {
+        for _attempt in 0..5 {
+            let (buffer, _guard) = capture();
+            let (service, event) = service(
+                vec![Hooks::default().named("Worker")],
+                0,
+                |_e, ctx| async move {
+                    start(&ctx, async { Err("x".into()) });
+                    start(&ctx, async { panic!("work boom") });
+                    start(&ctx, async {
+                        Err(Box::new(PanickingDisplayError) as BoxError)
+                    });
+                    Ok(serde_json::json!("out"))
+                },
+            );
+            let json = service(event).await.unwrap().0;
+            assert_eq!(json.get("Status"), Some(&serde_json::json!("SUCCEEDED")));
+            assert_eq!(json.get("Result"), Some(&serde_json::json!("\"out\"")));
+            let warnings = warnings(&buffer);
+            let failed = with_message(&warnings, "plugin hook failed; the error is ignored");
+            let panicked = with_message(&warnings, "plugin hook panicked; the panic is ignored");
+            let unformatted = with_message(
+                &warnings,
+                "plugin hook failed, and its error panicked while it was formatted; \
+                 the error is ignored",
+            );
+            let ([failed], [panicked], [unformatted]) = (
+                failed.as_slice(),
+                panicked.as_slice(),
+                unformatted.as_slice(),
+            ) else {
+                continue;
+            };
+            for warning in [failed, panicked, unformatted] {
+                assert_eq!(field(warning, "plugin"), "Worker (plugins[0])", "{warning}");
+                assert_eq!(field(warning, "hook"), "on_operation_end", "{warning}");
+            }
+            assert_eq!(field(failed, "error"), "x");
+            return;
+        }
+        panic!("no attempt captured the three warnings");
+    }
+
+    /// The SDK drops a hook future inside a catch: a panic from the
+    /// destructor of a finished future is logged as the hook's panic.
+    #[tokio::test(start_paused = true)]
+    #[expect(clippy::panic)] // reason: the destructor panic under test, and the report of no capture
+    async fn hook_future_drop_panic_is_logged() {
+        for _attempt in 0..5 {
+            let (buffer, _guard) = capture();
+            let plugin = Hooks::default().on_end(|_| {
+                let guard = OnDrop::new(|| panic!("future drop"));
+                Box::pin(async move {
+                    let _guard = guard;
+                    Ok(())
+                })
+            });
+            let (service, event) = service(vec![plugin], 0, |_e, _ctx| async move {
+                Ok(serde_json::Value::Null)
+            });
+            service(event).await.unwrap();
+            let warnings = warnings(&buffer);
+            let [warning] =
+                with_message(&warnings, "plugin hook panicked; the panic is ignored")[..]
+            else {
+                continue;
+            };
+            assert_eq!(field(warning, "hook"), "on_invocation_end");
+            return;
+        }
+        panic!("no attempt captured the warning");
+    }
+
+    /// Work started after the drain closed is dropped unpolled, with a
+    /// warning.
+    #[tokio::test(start_paused = true)]
+    #[expect(clippy::panic)] // reason: reports that no attempt captured the warning
+    async fn work_started_after_the_drain_closed_is_dropped() {
+        for _attempt in 0..5 {
+            let (buffer, _guard) = capture();
+            let escaped = shared::<Option<DurableContext>>();
+            let (service, event) = service(vec![Hooks::default()], 0, {
+                let escaped = Arc::clone(&escaped);
+                move |_e, ctx| {
+                    let escaped = Arc::clone(&escaped);
+                    async move {
+                        *escaped.lock().unwrap() = Some(ctx);
+                        Ok(serde_json::Value::Null)
+                    }
+                }
+            });
+            service(event).await.unwrap();
+            let ctx = escaped.lock().unwrap().take().unwrap();
+            let polled = Arc::new(AtomicBool::new(false));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let guard = OnDrop::new({
+                let dropped = Arc::clone(&dropped);
+                move || dropped.store(true, Ordering::SeqCst)
+            });
+            start(&ctx, {
+                let polled = Arc::clone(&polled);
+                async move {
+                    let _guard = guard;
+                    polled.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            });
+            tokio::task::yield_now().await;
+            assert!(!polled.load(Ordering::SeqCst));
+            assert!(dropped.load(Ordering::SeqCst));
+            let warnings = warnings(&buffer);
+            let [warning] = with_message(
+                &warnings,
+                "plugin hook work started after the drain closed; it is dropped",
+            )[..] else {
+                continue;
+            };
+            assert_eq!(field(warning, "hook"), "on_operation_end");
+            assert!(field(warning, "plugin").ends_with("(plugins[0])"));
+            return;
+        }
+        panic!("no attempt captured the warning");
+    }
+
+    /// Without a Tokio runtime the work cannot be spawned: it is dropped,
+    /// with a warning.
+    #[test]
+    #[expect(clippy::panic)] // reason: reports that no attempt captured the warning
+    fn work_without_a_runtime_is_dropped() {
+        for _attempt in 0..5 {
+            let (buffer, _guard) = capture();
+            let factories: Vec<(&'static str, Arc<dyn PluginFactory>)> =
+                vec![("Hooks", Arc::new(Hooks::default()))];
+            let plugins = create_plugins(&factories, None, empty_info).unwrap();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let guard = OnDrop::new({
+                let dropped = Arc::clone(&dropped);
+                move || dropped.store(true, Ordering::SeqCst)
+            });
+            plugins.start_work(
+                0,
+                "on_operation_end",
+                Box::pin(async move {
+                    let _guard = guard;
+                    Ok(())
+                }),
+            );
+            assert!(dropped.load(Ordering::SeqCst));
+            let warnings = warnings(&buffer);
+            let [warning] = with_message(
+                &warnings,
+                "plugin hook work could not be spawned; it is dropped",
+            )[..] else {
+                continue;
+            };
+            assert_eq!(field(warning, "hook"), "on_operation_end");
+            return;
+        }
+        panic!("no attempt captured the warning");
+    }
+
+    /// `start_work` removes the handles of finished work before it adds
+    /// one.
+    #[tokio::test(start_paused = true)]
+    async fn start_work_removes_finished_handles() {
+        let factories: Vec<(&'static str, Arc<dyn PluginFactory>)> =
+            vec![("Hooks", Arc::new(Hooks::default()))];
+        let plugins = create_plugins(&factories, None, empty_info).unwrap();
+        plugins.start_work(0, "on_operation_end", Box::pin(async { Ok(()) }));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        plugins.start_work(0, "on_operation_end", Box::pin(std::future::pending()));
+        let WorkState::Open(list) = &*plugins.lock_work() else {
+            unreachable!("the drain has not closed");
+        };
+        assert_eq!(list.len(), 1);
+    }
+
+    /// An error whose destructor panics with `error drop`.
+    #[derive(Debug)]
+    struct DropPanicError;
+
+    impl fmt::Display for DropPanicError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("drop err")
+        }
+    }
+
+    impl std::error::Error for DropPanicError {}
+
+    impl Drop for DropPanicError {
+        #[expect(clippy::panic)] // reason: the destructor panic under test
+        fn drop(&mut self) {
+            panic!("error drop");
+        }
+    }
+
+    /// An error whose destructor panics with its text.
+    #[derive(Debug)]
+    struct DropPanicDisplayError(&'static str);
+
+    impl fmt::Display for DropPanicDisplayError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for DropPanicDisplayError {}
+
+    impl Drop for DropPanicDisplayError {
+        #[expect(clippy::panic)] // reason: the destructor panic under test
+        fn drop(&mut self) {
+            std::panic::panic_any(self.0);
+        }
+    }
+
+    /// Runs `service` on its own task and returns its panic payload.
+    #[expect(clippy::disallowed_methods)]
+    // reason: the test calls the service on its own task so the panic is
+    // observable as that task's `JoinError`.
+    async fn panic_of<Fut>(future: Fut) -> Payload
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send,
+    {
+        match tokio::spawn(future).await {
+            Ok(_) => unreachable!("the service panicked"),
+            Err(join_err) => join_err.into_panic(),
+        }
+    }
+
+    /// A start hook error whose destructor panics fails the invocation:
+    /// the panic is kept until the coordinator exists, and resumes.
+    #[tokio::test(start_paused = true)]
+    async fn start_hook_error_destructor_panic_fails_the_invocation() {
+        let plugin = Hooks::default()
+            .on_start(|_| Box::pin(async { Err(Box::new(DropPanicError) as BoxError) }));
+        let (service, event) = service(vec![plugin.clone()], 0, |_e, _ctx| async move {
+            Ok(serde_json::Value::Null)
+        });
+        let payload = panic_of(service(event)).await;
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"error drop"));
+        let ends = plugin.ends();
+        let [end] = ends.as_slice() else {
+            unreachable!("one end info, got {}", ends.len());
+        };
+        assert_eq!(end.status(), InvocationStatus::Retrying);
+    }
+
+    /// A hook work error whose destructor panics while the handler runs
+    /// fails the invocation: the panic is recorded on the coordinator.
+    #[tokio::test(start_paused = true)]
+    async fn hook_work_error_destructor_panic_fails_the_invocation() {
+        let (service, event) = service(vec![Hooks::default()], 0, |_e, ctx| async move {
+            start(&ctx, async { Err(Box::new(DropPanicError) as BoxError) });
+            std::future::pending::<()>().await;
+            Ok(serde_json::Value::Null)
+        });
+        let payload = panic_of(service(event)).await;
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"error drop"));
+    }
+
+    /// A hook work error whose destructor panics while the drain waits
+    /// fails the invocation, as it does while the handler runs. The drive
+    /// already returned, so the end hooks see `Retrying` with the panic's
+    /// message, and the panic resumes after them.
+    #[tokio::test(start_paused = true)]
+    async fn hook_work_error_destructor_panic_during_the_drain_fails_the_invocation() {
+        let plugin = Hooks::default();
+        let (service, event) = service(vec![plugin.clone()], 0, |_e, ctx| async move {
+            start(&ctx, async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(Box::new(DropPanicError) as BoxError)
+            });
+            Ok(serde_json::Value::Null)
+        });
+        let payload = panic_of(service(event)).await;
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"error drop"));
+        let ends = plugin.ends();
+        let [end] = ends.as_slice() else {
+            unreachable!("one end info, got {}", ends.len());
+        };
+        assert_eq!(end.status(), InvocationStatus::Retrying);
+        assert_eq!(end.execution_result(), None);
+        let error = end.execution_error().expect("the panic's error");
+        assert_eq!(error.error_type(), None);
+        assert_eq!(error.error_message(), Some("error drop"));
+    }
+
+    /// An end hook error whose destructor panics fails the invocation. The
+    /// end hooks already saw the response's status, so the panic resumes
+    /// after them, instead of the response.
+    #[tokio::test(start_paused = true)]
+    async fn end_hook_error_destructor_panic_fails_the_invocation() {
+        let failing = Hooks::default()
+            .on_end(|_| Box::pin(async { Err(Box::new(DropPanicError) as BoxError) }));
+        let healthy = Hooks::default();
+        let (service, event) = service(vec![failing, healthy.clone()], 0, |_e, _ctx| async move {
+            Ok(serde_json::json!("ok"))
+        });
+        let payload = panic_of(service(event)).await;
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"error drop"));
+        let ends = healthy.ends();
+        let [end] = ends.as_slice() else {
+            unreachable!("one end info, got {}", ends.len());
+        };
+        assert_eq!(end.status(), InvocationStatus::Succeeded);
+    }
+
+    /// When a late panic comes from the drain, the end hooks' late panic
+    /// is dropped, and the drain's resumes.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_late_panic_resumes() {
+        let failing = Hooks::default().on_end(|_| {
+            Box::pin(async { Err(Box::new(DropPanicDisplayError("end drop")) as BoxError) })
+        });
+        let (service, event) = service(vec![failing], 0, |_e, ctx| async move {
+            start(&ctx, async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(Box::new(DropPanicDisplayError("work drop")) as BoxError)
+            });
+            Ok(serde_json::Value::Null)
+        });
+        let payload = panic_of(service(event)).await;
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"work drop"));
+    }
+
+    /// A late panic, from the drain or from an end hook, never replaces a
+    /// panic that ended the drive: the end hooks see the drive's panic,
+    /// and it resumes.
+    #[tokio::test(start_paused = true)]
+    #[expect(clippy::panic)] // reason: the handler panic under test
+    async fn late_panic_after_a_drive_panic_is_dropped() {
+        let failing = Hooks::default()
+            .on_end(|_| Box::pin(async { Err(Box::new(DropPanicError) as BoxError) }));
+        let (service, event) = service(vec![failing.clone()], 0, |_e, ctx| async move {
+            start(&ctx, async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(Box::new(DropPanicDisplayError("work drop")) as BoxError)
+            });
+            if ctx.is_replaying() {
+                return Ok(serde_json::Value::Null);
+            }
+            panic!("boom");
+        });
+        let payload = panic_of(service(event)).await;
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+        let ends = failing.ends();
+        let [end] = ends.as_slice() else {
+            unreachable!("one end info, got {}", ends.len());
+        };
+        assert_eq!(
+            end.execution_error().and_then(WireError::error_message),
+            Some("boom")
+        );
+    }
+
+    /// A late panic never replaces a fatal error, as the drive keeps a
+    /// fatal error over a panic: the `FAILED` envelope returns.
+    #[tokio::test(start_paused = true)]
+    async fn late_panic_after_a_fatal_error_is_dropped() {
+        let failing = Hooks::default()
+            .on_end(|_| Box::pin(async { Err(Box::new(DropPanicError) as BoxError) }));
+        let (service, event) = service(vec![failing.clone()], 0, |_e, ctx| async move {
+            ctx.coordinator()
+                .record_fatal("Error".to_owned(), "fatal".to_owned());
+            std::future::pending::<()>().await;
+            Ok(serde_json::Value::Null)
+        });
+        let response = service(event).await.expect("the FAILED envelope");
+        assert_eq!(
+            response.0.get("Status"),
+            Some(&serde_json::json!("FAILED")),
+            "{:?}",
+            response.0
+        );
+        let ends = failing.ends();
+        let [end] = ends.as_slice() else {
+            unreachable!("one end info, got {}", ends.len());
+        };
+        assert_eq!(end.status(), InvocationStatus::Failed);
+    }
+
+    /// Counts a poll after the end hook started as a violation.
+    struct Checked<F> {
+        inner: Pin<Box<F>>,
+        ended: Arc<AtomicBool>,
+        violations: Arc<AtomicUsize>,
+        _live: OnDrop,
+    }
+    impl<F: Future<Output = Result<(), BoxError>>> Future for Checked<F> {
+        type Output = Result<(), BoxError>;
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.ended.load(Ordering::SeqCst) {
+                self.violations.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.as_mut().poll(cx)
+        }
+    }
+    #[derive(Clone)]
+    struct Round {
+        ended: Arc<AtomicBool>,
+        violations: Arc<AtomicUsize>,
+        live: Arc<AtomicUsize>,
+    }
+    impl Round {
+        /// Work that sleeps 1 ms, then, while `depth` is above 0, starts
+        /// more work.
+        fn work(&self, ctx: DurableContext, depth: u32) -> HookFuture<'static> {
+            self.live.fetch_add(1, Ordering::SeqCst);
+            let live = Arc::clone(&self.live);
+            let round = self.clone();
+            Box::pin(Checked {
+                inner: Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    if depth > 0 {
+                        let next = round.work(ctx.clone(), depth - 1);
+                        ctx.plugins()
+                            .unwrap()
+                            .start_work(0, "on_operation_end", next);
+                    }
+                    Ok(())
+                }),
+                ended: Arc::clone(&self.ended),
+                violations: Arc::clone(&self.violations),
+                _live: OnDrop::new(move || {
+                    live.fetch_sub(1, Ordering::SeqCst);
+                }),
+            })
+        }
+    }
+
+    /// A `start_work` call racing the drain either lands in a list the
+    /// drain takes, or sees the drain closed. So no work runs once the end
+    /// hook started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[expect(clippy::disallowed_methods)]
+    // reason: the starters run on their own tasks, outside the SDK, to
+    // race the drain from other threads.
+    async fn late_start_racing_the_drain_never_runs_after_end_starts() {
+        for round_index in 0..20 {
+            let round = Round {
+                ended: Arc::new(AtomicBool::new(false)),
+                violations: Arc::new(AtomicUsize::new(0)),
+                live: Arc::new(AtomicUsize::new(0)),
+            };
+            let plugin = {
+                let ended = Arc::clone(&round.ended);
+                Hooks::default().on_end(move |_| {
+                    ended.store(true, Ordering::SeqCst);
+                    ready()
+                })
+            };
+            let starters = shared::<Vec<JoinHandle<()>>>();
+            // The starters keep the work list from emptying, so only the
+            // drain deadline, 200 ms in, closes the drain.
+            let (service, event) = service(vec![plugin], deadline_in(700), {
+                let round = round.clone();
+                let starters = Arc::clone(&starters);
+                move |_e, ctx| {
+                    let round = round.clone();
+                    let starters = Arc::clone(&starters);
+                    async move {
+                        for _ in 0..4 {
+                            ctx.plugins().unwrap().start_work(
+                                0,
+                                "on_operation_end",
+                                round.work(ctx.clone(), 5),
+                            );
+                        }
+                        for _ in 0..3 {
+                            let ctx = ctx.clone();
+                            let round = round.clone();
+                            starters.lock().unwrap().push(tokio::spawn(async move {
+                                let mut after_end: Option<std::time::Instant> = None;
+                                loop {
+                                    let work = round.work(ctx.clone(), 1);
+                                    ctx.plugins()
+                                        .unwrap()
+                                        .start_work(0, "on_operation_end", work);
+                                    if round.ended.load(Ordering::SeqCst) {
+                                        let since =
+                                            *after_end.get_or_insert_with(std::time::Instant::now);
+                                        if since.elapsed() > Duration::from_millis(20) {
+                                            break;
+                                        }
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            }));
+                        }
+                        Ok(serde_json::Value::Null)
+                    }
+                }
+            });
+            service(event).await.unwrap();
+            let handles = std::mem::take(&mut *starters.lock().unwrap());
+            for handle in handles {
+                handle.await.unwrap();
+            }
+            assert_eq!(
+                round.violations.load(Ordering::SeqCst),
+                0,
+                "round {round_index}"
+            );
+            assert_eq!(round.live.load(Ordering::SeqCst), 0, "round {round_index}");
+        }
+    }
+
+    // Shutdown: the plugins are dropped, or the invocation future is
+    // dropped before it returned.
+
+    /// Sets its flag when dropped.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Plugins with one plugin, outside an invocation.
+    fn one_plugin() -> Arc<InvocationPlugins> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        create_plugins(
+            &factories(vec![("A", Behavior::Some)], &log),
+            None,
+            empty_info,
+        )
+        .unwrap()
+    }
+
+    /// Work that sets `flag` when it is dropped, then panics with a
+    /// payload whose destructor panics too. It never finishes.
+    #[expect(clippy::panic)] // reason: the destructor panic under test
+    fn pending_work_dropping(
+        flag: Arc<AtomicBool>,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send + 'static {
+        let guard = OnDrop::new({
+            move || {
+                flag.store(true, Ordering::SeqCst);
+                std::panic::panic_any(PanickingPayload);
+            }
+        });
+        async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), BoxError>>().await
+        }
+    }
+
+    /// Lets the runtime run the tasks an abort cancelled.
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Dropping the plugins aborts their hook work. A detached task would
+    /// keep running the work after its invocation.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_plugins_aborts_hook_work() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let plugins = one_plugin();
+        plugins.start_work(
+            0,
+            "on_operation_end",
+            Box::pin(pending_work_dropping(Arc::clone(&dropped))),
+        );
+        settle().await;
+        assert!(!dropped.load(Ordering::SeqCst), "the work runs");
+        drop(plugins);
+        settle().await;
+        assert!(dropped.load(Ordering::SeqCst), "the work was aborted");
+    }
+
+    /// Dropping the invocation future before it returned aborts the hook
+    /// work, even while a context clone that escaped the handler keeps the
+    /// plugins alive.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_invocation_aborts_hook_work() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let escaped = shared::<Option<DurableContext>>();
+        let (service, event) = service(vec![Hooks::default()], 0, {
+            let dropped = Arc::clone(&dropped);
+            let escaped = Arc::clone(&escaped);
+            move |_e, ctx| {
+                let dropped = Arc::clone(&dropped);
+                let escaped = Arc::clone(&escaped);
+                async move {
+                    start(&ctx, pending_work_dropping(dropped));
+                    *escaped.lock().unwrap() = Some(ctx);
+                    std::future::pending::<()>().await;
+                    Ok(serde_json::Value::Null)
+                }
+            }
+        });
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), service(event)).await;
+        assert!(cancelled.is_err(), "the invocation was cancelled");
+        settle().await;
+        let ctx = escaped.lock().unwrap().take().expect("the handler ran");
+        assert!(
+            ctx.plugins().is_some(),
+            "the escaped context keeps the plugins"
+        );
+        assert!(dropped.load(Ordering::SeqCst), "the work was aborted");
+    }
+
+    /// Dropping the invocation future while the drain waits for the hook
+    /// work aborts that work. The drain has taken the handles out of the
+    /// work state then, so the shutdown alone would find none to abort.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_drain_aborts_hook_work() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let escaped = shared::<Option<DurableContext>>();
+        let (service, event) = service(vec![Hooks::default()], 0, {
+            let dropped = Arc::clone(&dropped);
+            let escaped = Arc::clone(&escaped);
+            move |_e, ctx| {
+                let dropped = Arc::clone(&dropped);
+                let escaped = Arc::clone(&escaped);
+                async move {
+                    start(&ctx, pending_work_dropping(dropped));
+                    *escaped.lock().unwrap() = Some(ctx);
+                    Ok(serde_json::Value::Null)
+                }
+            }
+        });
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), service(event)).await;
+        assert!(cancelled.is_err(), "the drain waited until the cancel");
+        settle().await;
+        let ctx = escaped.lock().unwrap().take().expect("the handler ran");
+        assert!(
+            ctx.plugins().is_some(),
+            "the escaped context keeps the plugins"
+        );
+        assert!(dropped.load(Ordering::SeqCst), "the work was aborted");
+    }
+
+    /// After the plugins shut down, a recorded panic is dropped at once,
+    /// through `discard_panic`: an aborted hook task can still report an
+    /// error destructor panic on another thread.
+    #[test]
+    fn panic_recorded_after_shut_down_is_dropped() {
+        let plugins = one_plugin();
+        plugins.shut_down();
+        let dropped = Arc::new(AtomicBool::new(false));
+        Undelivered::record(
+            &plugins.undelivered,
+            Box::new(DropFlag(Arc::clone(&dropped))),
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the payload was dropped at once"
+        );
+        let nested = catch_unwind(AssertUnwindSafe(|| {
+            Undelivered::record(&plugins.undelivered, Box::new(PanickingPayload));
+        }));
+        assert!(
+            nested.is_ok(),
+            "a nested payload's destructor panic escaped"
+        );
+        assert!(plugins.take_error_drop_panics().is_empty());
+    }
+
+    /// A panic the coordinator returned after the plugins shut down is
+    /// dropped through `discard_panic`, not kept.
+    #[test]
+    fn late_panic_after_shut_down_is_dropped() {
+        let state = Mutex::new(Undelivered::Discarding);
+        let dropped = Arc::new(AtomicBool::new(false));
+        Undelivered::keep_late(&state, Box::new(DropFlag(Arc::clone(&dropped))));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the payload was dropped at once"
+        );
+        let nested = catch_unwind(AssertUnwindSafe(|| {
+            Undelivered::keep_late(&state, Box::new(PanickingPayload));
+        }));
+        assert!(
+            nested.is_ok(),
+            "a nested payload's destructor panic escaped"
+        );
+    }
+
+    /// A payload that holds the plugins.
+    struct HoldsPlugins(
+        #[expect(dead_code, reason = "held only to be dropped")] Arc<InvocationPlugins>,
+    );
+
+    /// A late panic is dropped after the state's lock is released. The
+    /// payload here holds the last reference to the plugins, so dropping
+    /// it drops the plugins, and their shutdown locks the state again.
+    /// Under the lock, that would deadlock. The test runs on its own
+    /// thread, so a deadlock fails it instead of hanging the suite.
+    #[test]
+    fn late_panic_holding_the_plugins_is_dropped_after_the_lock() {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let plugins = one_plugin();
+            let undelivered = Arc::clone(&plugins.undelivered);
+            plugins.shut_down();
+            Undelivered::keep_late(&undelivered, Box::new(HoldsPlugins(plugins)));
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "dropping the payload deadlocked on the state's lock"
+        );
+    }
+
+    /// A panic kept before the shutdown is dropped by it, through
+    /// `discard_panic`.
+    #[test]
+    fn shut_down_drops_kept_panics() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let factories = factories(vec![("bad", Behavior::ErrorPanickingNestedDrop)], &log);
+        let plugins = create_plugins(&factories, None, empty_info).unwrap();
+        let shut = catch_unwind(AssertUnwindSafe(|| plugins.shut_down()));
+        assert!(shut.is_ok(), "a nested payload's destructor panic escaped");
+        assert!(plugins.take_error_drop_panics().is_empty());
     }
 }

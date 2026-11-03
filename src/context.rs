@@ -249,6 +249,10 @@ struct Inner {
     /// concurrent branches, each with its own replay high-water mark, from
     /// clobbering each other's flag.
     replay_span: tracing::Span,
+    /// The plugins of the invocation. The root context of a wrapped
+    /// invocation holds them, and every context derived from it shares
+    /// the same `Arc`. `None` without a registered plugin factory.
+    plugins: Option<Arc<crate::plugin::InvocationPlugins>>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -396,6 +400,7 @@ impl DurableContext {
                 admission: Arc::new(Admission::new()),
                 owners: Arc::from(Vec::new()),
                 replay_span,
+                plugins: None,
             }),
             awaited: None,
         }
@@ -432,6 +437,7 @@ impl DurableContext {
                 admission: Arc::new(Admission::new()),
                 owners: Arc::from(Vec::new()),
                 replay_span,
+                plugins: None,
             }),
             awaited: None,
         }
@@ -468,6 +474,7 @@ impl DurableContext {
                 admission: Arc::new(Admission::new()),
                 owners: Arc::from(Vec::new()),
                 replay_span,
+                plugins: None,
             }),
             awaited: None,
         }
@@ -488,6 +495,7 @@ impl DurableContext {
         client: Arc<dyn ExecutionClient>,
         checkpoint_token: String,
         checkpoint_buffer_window: Option<Duration>,
+        plugins: Option<Arc<crate::plugin::InvocationPlugins>>,
     ) -> Self {
         let engine = Arc::new(EngineState::new_root(checkpoint_log));
         let replay_span = crate::tracing_layer::execution_span(
@@ -510,6 +518,7 @@ impl DurableContext {
                 admission: Arc::new(Admission::new()),
                 owners: Arc::from(Vec::new()),
                 replay_span,
+                plugins,
             }),
             awaited: None,
         }
@@ -548,6 +557,7 @@ impl DurableContext {
                 admission: Arc::new(Admission::new()),
                 owners: Arc::from(Vec::new()),
                 replay_span,
+                plugins: None,
             }),
             awaited: None,
         }
@@ -589,6 +599,7 @@ impl DurableContext {
                 admission: Arc::clone(&self.inner.admission),
                 owners: self.owners_with(parent_positional_id),
                 replay_span,
+                plugins: self.inner.plugins.clone(),
             }),
             awaited: None,
         }
@@ -741,6 +752,7 @@ impl DurableContext {
                 admission: Arc::clone(&self.inner.admission),
                 owners: self.owners_with(child_positional_id),
                 replay_span,
+                plugins: self.inner.plugins.clone(),
             }),
             awaited: None,
         }
@@ -767,6 +779,7 @@ impl DurableContext {
                 admission: Arc::clone(&self.inner.admission),
                 owners: self.owners_with(positional_id),
                 replay_span: self.inner.replay_span.clone(),
+                plugins: self.inner.plugins.clone(),
             }),
             awaited: None,
         }
@@ -803,6 +816,16 @@ impl DurableContext {
                 positional_id,
             )))
             .collect()
+    }
+
+    /// The plugins of the invocation, shared by every context derived from
+    /// the root. `None` without a registered plugin factory.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the operation hook issue")
+    )]
+    pub(crate) fn plugins(&self) -> Option<&crate::plugin::InvocationPlugins> {
+        self.inner.plugins.as_deref()
     }
 
     /// Returns the invocation coordinator, shared by every context of the
@@ -1328,7 +1351,10 @@ impl DurableContext {
                 "retryable checkpoint failure exhausted retries; failing the invocation \
                  so the service re-invokes"
             );
-            self.inner.coordinator.record_invocation_fault(message);
+            self.inner.coordinator.record_invocation_fault(
+                crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE,
+                message,
+            );
         } else {
             tracing::error!(
                 operation_id = %op_wire_id,
@@ -1374,7 +1400,9 @@ impl DurableContext {
             "serdes {call} failed with a retryable error; failing the invocation so the \
              service re-invokes"
         );
-        self.inner.coordinator.record_invocation_fault(message);
+        self.inner
+            .coordinator
+            .record_invocation_fault(crate::error::SERDES_FAILED_ERROR_TYPE, message);
         std::future::pending::<T>().await
     }
 
@@ -4851,6 +4879,43 @@ mod tests {
         );
     }
 
+    /// Every context derived from the root shares the root's plugins: the
+    /// child of `new_child`, the flat child of `new_flat_child`, and the
+    /// clone of `with_owner`. The test compares the `Arc`s by address.
+    #[test]
+    fn derived_contexts_share_the_root_plugins() {
+        let plugins = crate::plugin::test_support::invocation_plugins();
+        let root = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::new(InMemoryExecutionClient::new(Vec::new())),
+            "token-0".to_owned(),
+            None,
+            Some(Arc::clone(&plugins)),
+        );
+        let same = |ctx: &DurableContext| {
+            ctx.plugins()
+                .is_some_and(|shared| std::ptr::eq(shared, Arc::as_ptr(&plugins)))
+        };
+        assert!(same(&root), "the root holds the plugins");
+        let child = root.new_child("1", None);
+        assert!(same(&child), "new_child copies the plugins");
+        assert!(
+            same(&child.new_child("1-1", None)),
+            "a grandchild shares them"
+        );
+        assert!(
+            same(&root.new_flat_child("2", "parent", None)),
+            "new_flat_child copies the plugins"
+        );
+        assert!(same(&root.with_owner("3")), "with_owner copies the plugins");
+        assert!(
+            DurableContext::test_context().plugins().is_none(),
+            "a root constructor without the parameter sets none"
+        );
+    }
+
     // Checkpoint coalescing tests
 
     /// Builds a root context with a checkpoint-coalescing delay, backed by
@@ -4863,6 +4928,7 @@ mod tests {
             client,
             "token-0".to_owned(),
             Some(delay),
+            None,
         )
     }
 
@@ -5824,6 +5890,7 @@ mod tests {
             Arc::clone(client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             window,
+            None,
         )
     }
 
@@ -6019,6 +6086,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             None,
+            None,
         );
         let item = root.new_child("1", None);
         let entered = client.entered.notified();
@@ -6122,6 +6190,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             Some(Duration::ZERO),
+            None,
         );
         let item = root.new_child("1", None);
         root.admission()
@@ -6183,6 +6252,7 @@ mod tests {
                 Arc::clone(&client) as Arc<dyn ExecutionClient>,
                 "token-0".to_owned(),
                 Some(Duration::ZERO),
+                None,
             );
             (client, root)
         };
@@ -6263,6 +6333,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             Some(Duration::ZERO),
+            None,
         );
         // The control: an owner that is not abandoned replays the callback.
         let control = root.new_child("1", None);
@@ -6392,6 +6463,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             None,
+            None,
         );
         let signal = Arc::clone(ctx.coordinator());
         let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
@@ -6454,6 +6526,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             client,
             "token-0".to_owned(),
+            None,
             None,
         );
         let coordinator = Arc::clone(root.coordinator());
@@ -6557,6 +6630,7 @@ mod tests {
             Arc::new(CheckpointLog::empty()),
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
+            None,
             None,
         );
         let coordinator = Arc::clone(root.coordinator());

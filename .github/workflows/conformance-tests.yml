@@ -100,9 +100,9 @@ jobs:
 
       # tar, not a bare artifact upload: actions/upload-artifact does not
       # preserve the executable bit, and a non-executable bootstrap cannot be
-      # started by the runtime. The 152 handlers are ~2.1 GiB raw / ~800 MiB
+      # started by the runtime. The handlers are ~2.1 GiB raw / ~800 MiB
       # gzipped; one upload plus one download per suite is still far cheaper
-      # than rebuilding the whole workspace in each of the 10 suite jobs.
+      # than rebuilding the whole workspace in each suite job.
       - name: Package handlers
         working-directory: conformance
         run: tar -czf handlers.tar.gz publish

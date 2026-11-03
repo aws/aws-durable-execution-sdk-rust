@@ -1135,6 +1135,20 @@ where
     Ok(())
 }
 
+/// Runs plugin hook work on its own task: a raw `tokio::spawn`.
+///
+/// The task is not counted, takes no permit, is not polled by the
+/// permit-aware wrapper, blesses nothing and runs no `wrap_task` hook. So
+/// it holds neither the task cleanup nor the suspension decision. The
+/// plugins' invocation-end drain joins it, and aborts it at the drain
+/// deadline. `future` catches its own panics.
+pub(crate) fn spawn_plugin_work(
+    future: impl Future<Output = ()> + Send + 'static,
+) -> Result<tokio::task::JoinHandle<()>, NoRuntime> {
+    ensure_runtime()?;
+    Ok(raw::spawn(future))
+}
+
 /// A set of operation tasks whose outcomes are joined in completion order.
 ///
 /// The outcomes of finished tasks wait in a queue it shares with its tasks;

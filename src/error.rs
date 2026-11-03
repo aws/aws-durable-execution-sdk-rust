@@ -530,6 +530,16 @@ pub(crate) fn wire_error_with_type(err: &(dyn Error + 'static), error_type: &str
 /// handler through the unrecoverable path (issue #43).
 pub(crate) const CHECKPOINT_FAILED_ERROR_TYPE: &str = "CheckpointFailedError";
 
+/// The error type of the fault that a retryable checkpoint failure records.
+/// It ends the invocation, and the next invocation can recover. JS throws an
+/// error of this class in the same case.
+pub(crate) const CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE: &str =
+    "CheckpointUnrecoverableInvocationError";
+
+/// The error type of the fault that a retryable serdes failure records. JS
+/// throws an error of this class in the same case.
+pub(crate) const SERDES_FAILED_ERROR_TYPE: &str = "SerdesFailedError";
+
 /// The wire `ErrorType` recorded on the `FAILED` envelope when the
 /// execution client fails permanently before the handler runs: a
 /// non-retryable error of the bootstrap state read. It is the type JS

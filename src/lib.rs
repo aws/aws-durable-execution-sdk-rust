@@ -1038,7 +1038,7 @@ pub struct InvocationResponse(pub(crate) serde_json::Value);
 ///
 /// Crate-internal: rustdoc renders the alias transparently, and callers
 /// only ever name the `impl Fn` the wrappers return.
-type BoxedInvocationFuture = std::pin::Pin<
+pub(crate) type BoxedInvocationFuture = std::pin::Pin<
     Box<dyn Future<Output = Result<InvocationResponse, lambda_runtime::Error>> + Send>,
 >;
 
@@ -1228,6 +1228,17 @@ where
                 execution.as_ref(),
                 updated_operation_ids,
             );
+            // When this future is dropped before it returns, the hook
+            // tasks are aborted and no panic of theirs escapes.
+            let _shut_down = plugins.as_ref().map(plugin::ShutDownOnDrop::new);
+
+            // The start hooks run before the handler, and every one of
+            // them finishes first.
+            if let Some(plugins) = &plugins {
+                plugins.invocation_start().await;
+            }
+            // The end info reads the log as it is at the end.
+            let end_log = StdArc::clone(&checkpoint_log);
 
             let ctx = DurableContext::new_root_with_client_and_defaults(
                 execution_arn,
@@ -1236,19 +1247,19 @@ where
                 exec_client,
                 checkpoint_token,
                 checkpoint_buffer_window,
+                plugins.clone(),
             );
 
             // Retained past the handler move so the post-outcome flush can
             // drain the checkpoint coalescing buffer (a cheap Arc clone).
             let flush_ctx = ctx.clone();
             let coordinator = StdArc::clone(ctx.coordinator());
-            // A factory error whose destructor panicked fails the invocation.
-            // The plugins were created before the coordinator existed, so the
-            // panic is recorded here, which ends the drive.
+            // A factory error or a start hook error whose destructor
+            // panicked fails the invocation. The plugins were created before
+            // the coordinator existed, so such a panic is recorded here,
+            // which ends the drive. Every later one is recorded at once.
             if let Some(plugins) = &plugins {
-                for payload in plugins.take_error_drop_panics() {
-                    task::record_or_discard(&coordinator, payload);
-                }
+                plugins.attach(&coordinator);
             }
             let remaining = ctx.remaining_time();
             let replay_span = ctx.replay_span();
@@ -1295,8 +1306,8 @@ where
             // the SDK with its original payload. When several panic, the
             // first one recorded is resumed. A recorded fatal error takes
             // precedence over a panic, so the driver then returns the fatal
-            // outcome instead. Nothing runs between the cleanup and the
-            // resume.
+            // outcome instead. Between the cleanup and the resume, only the
+            // plugins' drain and end hooks run, with `Retrying`.
             let outcome = match driver::drive_invocation(
                 root,
                 task_ownership,
@@ -1308,8 +1319,18 @@ where
             {
                 Ok(outcome) => outcome,
                 Err(payload) => {
+                    let end = InvocationEnd::panicked(&*payload);
+                    // A late panic never replaces this one: without a
+                    // response, `end_invocation` discards every late panic
+                    // and returns none.
+                    end_invocation(plugins.as_deref(), &end_log, &flush_ctx, end, None)
+                        .await
+                        .into_iter()
+                        .for_each(task::discard_panic);
                     // The plugins are dropped before the panic resumes, so
-                    // no plugin destructor runs while it unwinds.
+                    // no plugin destructor runs while it unwinds. The
+                    // contexts hold them too.
+                    drop(flush_ctx);
                     drop(plugins);
                     std::panic::resume_unwind(payload)
                 }
@@ -1350,10 +1371,29 @@ where
                 if let Some(retained) = flush_ctx.take_retained_flush_failures().await
                     && retained.any_non_retryable()
                 {
-                    return flush_failure_response(&retained, outcome, &flush_ctx).await;
+                    let (response, end) =
+                        flush_failure_response(&retained, outcome, &flush_ctx).await;
+                    let late = end_invocation(
+                        plugins.as_deref(),
+                        &end_log,
+                        &flush_ctx,
+                        end,
+                        Some(&response),
+                    )
+                    .await;
+                    return respond(response, late, flush_ctx, plugins);
                 }
             } else if let Err(flush) = flush_ctx.flush_pending_checkpoints().await {
-                return flush_failure_response(&flush, outcome, &flush_ctx).await;
+                let (response, end) = flush_failure_response(&flush, outcome, &flush_ctx).await;
+                let late = end_invocation(
+                    plugins.as_deref(),
+                    &end_log,
+                    &flush_ctx,
+                    end,
+                    Some(&response),
+                )
+                .await;
+                return respond(response, late, flush_ctx, plugins);
             }
 
             // Convert outcome to the durable response envelope.
@@ -1379,8 +1419,116 @@ where
             // execution status (`GetDurableExecution` /
             // `ListDurableExecutionsByFunction`) instead. See the rustdoc on
             // [`run`] and [`wrap`].
-            outcome_envelope(outcome, &flush_ctx)
+            let (response, end) = outcome_envelope(outcome, &flush_ctx);
+            let late = end_invocation(
+                plugins.as_deref(),
+                &end_log,
+                &flush_ctx,
+                end,
+                Some(&response),
+            )
+            .await;
+            respond(response, late, flush_ctx, plugins)
         })
+    }
+}
+
+/// Returns `response`, unless a late panic fails the invocation: then the
+/// panic resumes instead. The plugins are dropped before it resumes, so no
+/// plugin destructor runs while it unwinds. The contexts hold them too, so
+/// `ctx` is dropped as well.
+fn respond(
+    response: Result<InvocationResponse, lambda_runtime::Error>,
+    late: Option<Box<dyn std::any::Any + Send + 'static>>,
+    ctx: DurableContext,
+    plugins: Option<std::sync::Arc<plugin::InvocationPlugins>>,
+) -> Result<InvocationResponse, lambda_runtime::Error> {
+    if let Some(payload) = late {
+        drop(response);
+        drop(ctx);
+        drop(plugins);
+        std::panic::resume_unwind(payload);
+    }
+    response
+}
+
+/// How an invocation ended, for the plugins' end hooks. It is set where
+/// the response is built.
+pub(crate) struct InvocationEnd {
+    pub(crate) status: InvocationStatus,
+    pub(crate) result: Option<String>,
+    pub(crate) error: Option<WireError>,
+}
+
+impl InvocationEnd {
+    /// The end of an invocation that `payload`, an invocation-failing
+    /// panic, ended: `Retrying`, with an error that has no type and the
+    /// panic's message.
+    pub(crate) fn panicked(payload: &(dyn std::any::Any + Send)) -> Self {
+        Self {
+            status: InvocationStatus::Retrying,
+            result: None,
+            error: Some(WireError::new(
+                None::<String>,
+                Some(panic_payload_text(payload)),
+            )),
+        }
+    }
+
+    /// The end of an invocation that failed with the Lambda error
+    /// `message`: `Retrying`, with the fault's type.
+    fn retrying(error_type: impl Into<String>, message: String) -> Self {
+        Self {
+            status: InvocationStatus::Retrying,
+            result: None,
+            error: Some(WireError::new(Some(error_type.into()), Some(message))),
+        }
+    }
+}
+
+/// The text of a panic payload: the payload itself when it is a
+/// `&'static str` or a `String`, and a fixed text otherwise. It does not
+/// consume the payload.
+pub(crate) fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "the invocation panicked with a payload that is not a string".to_owned()
+    }
+}
+
+/// Drains the plugins' hook work and runs their end hooks once, when the
+/// invocation has plugins. The end info reads `log` as it is now.
+///
+/// Returns the late panic that fails the invocation instead of `response`
+/// (see [`plugin::LatePanics`]). `response` is `None` when a panic already
+/// ends the invocation. A late panic is discarded when the invocation
+/// already fails: with that panic, with a Lambda error, or with a fatal
+/// error, which the drive keeps over a panic too.
+async fn end_invocation(
+    plugins: Option<&plugin::InvocationPlugins>,
+    log: &engine::CheckpointLog,
+    ctx: &DurableContext,
+    end: InvocationEnd,
+    response: Option<&Result<InvocationResponse, lambda_runtime::Error>>,
+) -> Option<Box<dyn std::any::Any + Send + 'static>> {
+    let plugins = plugins?;
+    plugins
+        .invocation_end(log, end, ctx.remaining_time(), late_panics(response, ctx))
+        .await
+}
+
+/// What a late panic does at the end of an invocation that returns
+/// `response` (see [`end_invocation`]).
+fn late_panics(
+    response: Option<&Result<InvocationResponse, lambda_runtime::Error>>,
+    ctx: &DurableContext,
+) -> plugin::LatePanics {
+    match response {
+        Some(Ok(_)) if ctx.coordinator().fatal_error().is_none() => plugin::LatePanics::Fail,
+        _ => plugin::LatePanics::Discard,
     }
 }
 
@@ -1442,12 +1590,17 @@ async fn flush_failure_response(
     flush: &context::FlushFailure,
     outcome: driver::InvocationOutcome,
     ctx: &DurableContext,
-) -> Result<InvocationResponse, lambda_runtime::Error> {
+) -> (
+    Result<InvocationResponse, lambda_runtime::Error>,
+    InvocationEnd,
+) {
     let error = flush.primary_error();
     if !flush.any_non_retryable() {
-        return Err(lambda_runtime::Error::from(format!(
-            "failed to flush coalesced checkpoints at invocation end: {error}"
-        )));
+        let message = format!("failed to flush coalesced checkpoints at invocation end: {error}");
+        return (
+            Err(lambda_runtime::Error::from(message.clone())),
+            InvocationEnd::retrying(error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE, message),
+        );
     }
 
     tracing::error!(
@@ -1475,17 +1628,27 @@ async fn flush_failure_response(
 /// `Fault` outcome is the deliberate inverse: a retryable checkpoint
 /// failure returns `Err`, failing the Lambda invocation itself so the
 /// durable service re-invokes (issue #43).
+///
+/// It also returns how the invocation ended, for the plugins' end hooks.
 fn outcome_envelope(
     outcome: driver::InvocationOutcome,
     ctx: &DurableContext,
-) -> Result<InvocationResponse, lambda_runtime::Error> {
+) -> (
+    Result<InvocationResponse, lambda_runtime::Error>,
+    InvocationEnd,
+) {
     match outcome {
-        driver::InvocationOutcome::Complete(serialized) => {
+        driver::InvocationOutcome::Complete(serialized) => (
             Ok(InvocationResponse(serde_json::json!({
                 "Status": "SUCCEEDED",
                 "Result": serialized
-            })))
-        }
+            }))),
+            InvocationEnd {
+                status: InvocationStatus::Succeeded,
+                result: Some(serialized),
+                error: None,
+            },
+        ),
         driver::InvocationOutcome::Pending => {
             // Emitted while the handler's `durable_execution` span is
             // entered, the instrumented handler future has already been
@@ -1499,17 +1662,38 @@ fn outcome_envelope(
                 ctx.execution_arn(),
                 &ctx.lambda_context().request_id,
             );
-            Ok(InvocationResponse(serde_json::json!({
-                "Status": "PENDING"
-            })))
+            (
+                Ok(InvocationResponse(serde_json::json!({
+                    "Status": "PENDING"
+                }))),
+                InvocationEnd {
+                    status: InvocationStatus::Pending,
+                    result: None,
+                    error: None,
+                },
+            )
         }
-        driver::InvocationOutcome::Fault { message } => {
-            // A retryable checkpoint failure: fail the invocation itself
-            // (no envelope, no further writes). The service re-invokes,
-            // which is the same recovery as an interruption.
-            Err(lambda_runtime::Error::from(message))
+        driver::InvocationOutcome::Fault {
+            error_type,
+            message,
+        } => {
+            // A retryable checkpoint or serdes failure: fail the invocation
+            // itself (no envelope, no further writes). The service
+            // re-invokes, which is the same recovery as an interruption.
+            // The type reaches only the end hooks.
+            (
+                Err(lambda_runtime::Error::from(message.clone())),
+                InvocationEnd::retrying(error_type, message),
+            )
         }
-        driver::InvocationOutcome::Failed { error } => Ok(failed_envelope(&error)),
+        driver::InvocationOutcome::Failed { error } => (
+            Ok(failed_envelope(&error)),
+            InvocationEnd {
+                status: InvocationStatus::Failed,
+                result: None,
+                error: Some(error),
+            },
+        ),
     }
 }
 
@@ -3138,6 +3322,348 @@ mod tests {
         assert!(join_err.is_panic(), "a panic, not a cancellation");
         let payload = join_err.into_panic();
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"error drop"));
+    }
+
+    // The invocation end hooks, through the `wrap` service.
+
+    use plugin::test_support::{self as hooks, Hooks};
+
+    /// The service returns the `SUCCEEDED` envelope at the deadline cut-off
+    /// even though the end hook never finishes.
+    #[tokio::test(start_paused = true)]
+    #[expect(clippy::panic)] // reason: reports that no attempt captured the warning
+    async fn end_hook_cut_off_before_deadline() {
+        for _attempt in 0..5 {
+            let (buffer, _guard) = hooks::capture();
+            let plugin = Hooks::default().on_end(|_| Box::pin(std::future::pending()));
+            let (service, event) = hooks::service(
+                vec![plugin],
+                hooks::deadline_in(1_000),
+                |_e, _ctx| async move { Ok(serde_json::json!("ok")) },
+            );
+            let json = service(event).await.unwrap().0;
+            assert_eq!(json.get("Status"), Some(&serde_json::json!("SUCCEEDED")));
+            let warnings = hooks::warnings(&buffer);
+            let [_] = hooks::with_message(
+                &warnings,
+                "plugin on_invocation_end hooks did not finish before the invocation deadline; \
+                 the response returns without them",
+            )[..] else {
+                continue;
+            };
+            return;
+        }
+        panic!("no attempt captured the warning");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn end_hook_unbounded_without_deadline() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let plugin = {
+            let flag = std::sync::Arc::clone(&flag);
+            Hooks::default().on_end(move |_| {
+                let flag = std::sync::Arc::clone(&flag);
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        let (service, event) = hooks::service(vec![plugin], 0, |_e, _ctx| async move {
+            Ok(serde_json::Value::Null)
+        });
+        service(event).await.unwrap();
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The end info is built once per end, whatever the number of plugins:
+    /// the log is projected the same number of times with one plugin as
+    /// with three.
+    #[tokio::test]
+    async fn end_info_projects_operations_once() {
+        async fn thousand_steps(
+            _event: serde_json::Value,
+            ctx: DurableContext,
+        ) -> Result<serde_json::Value, BoxError> {
+            for i in 1..=1_000_u32 {
+                ctx.step(move |_| async move { Ok(i) }).await?;
+            }
+            Ok(serde_json::Value::Null)
+        }
+        // The steps are recorded, so the log holds them at the end: the
+        // in-memory transport returns no operation state.
+        let recorded = || {
+            (1..=1_000_u32)
+                .map(|i| {
+                    serde_json::json!({
+                        "Id": engine::compute_wire_id_public(&i.to_string()),
+                        "Type": "STEP",
+                        "SubType": "Step",
+                        "Status": "SUCCEEDED",
+                        "StepDetails": { "Result": i.to_string() }
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut growths = Vec::new();
+        for count in [1, 3] {
+            let plugins: Vec<Hooks> = (0..count).map(|_| Hooks::default()).collect();
+            let (service, event) =
+                hooks::service_with(plugins.clone(), 0, recorded(), thousand_steps);
+            let before = engine::projections();
+            service(event).await.unwrap();
+            growths.push(engine::projections() - before);
+            for plugin in &plugins {
+                let ends = plugin.ends();
+                let [end] = ends.as_slice() else {
+                    unreachable!("one end info per plugin, got {}", ends.len());
+                };
+                assert_eq!(end.operations().len(), 1_001);
+            }
+        }
+        let [one, three] = growths.as_slice() else {
+            unreachable!("two runs");
+        };
+        assert_eq!(one, three);
+    }
+
+    fn flush_failure(scope: ExecutionClientErrorScope) -> context::FlushFailure {
+        context::FlushFailure {
+            failures: vec![checkpoint_coalescer::FailedFlush {
+                error: ExecutionClientError::new(scope, "flush down"),
+                unwritten: Vec::new(),
+            }],
+        }
+    }
+
+    /// A late panic fails only an invocation that returns a response and
+    /// has no fatal error. A Lambda error, a fatal error and a panic each
+    /// already fail the invocation.
+    #[test]
+    fn late_panics_fail_only_a_response_without_a_fatal_error() {
+        use crate::plugin::LatePanics;
+        let ctx = DurableContext::test_context();
+        let ok = Ok(InvocationResponse(serde_json::Value::Null));
+        let err = Err(lambda_runtime::Error::from("fault"));
+        assert_eq!(late_panics(Some(&ok), &ctx), LatePanics::Fail);
+        assert_eq!(late_panics(Some(&err), &ctx), LatePanics::Discard);
+        assert_eq!(late_panics(None, &ctx), LatePanics::Discard);
+        ctx.coordinator()
+            .record_fatal("Error".to_owned(), "fatal".to_owned());
+        assert_eq!(late_panics(Some(&ok), &ctx), LatePanics::Discard);
+    }
+
+    #[tokio::test]
+    async fn flush_failure_response_reports_retrying() {
+        let ctx = DurableContext::test_context();
+        let (response, end) = flush_failure_response(
+            &flush_failure(ExecutionClientErrorScope::Invocation),
+            driver::InvocationOutcome::Pending,
+            &ctx,
+        )
+        .await;
+        let text = response
+            .expect_err("a retryable flush failure fails the invocation")
+            .to_string();
+        assert_eq!(end.status, InvocationStatus::Retrying);
+        assert_eq!(end.result, None);
+        let error = end.error.expect("a Retrying end carries the fault");
+        assert_eq!(
+            error.error_type(),
+            Some(error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE)
+        );
+        assert_eq!(error.error_message(), Some(text.as_str()));
+        assert!(text.contains("flush down"), "{text}");
+
+        let (response, end) = flush_failure_response(
+            &flush_failure(ExecutionClientErrorScope::Execution),
+            driver::InvocationOutcome::Pending,
+            &ctx,
+        )
+        .await;
+        assert!(response.is_ok());
+        assert_eq!(end.status, InvocationStatus::Failed);
+        assert!(end.error.is_some());
+    }
+
+    /// Runs `future` on its own task and returns its panic payload.
+    #[expect(clippy::disallowed_methods)]
+    // reason: the test calls the service on its own task so the panic is
+    // observable as that task's `JoinError`.
+    async fn panic_payload_of<Fut>(future: Fut) -> Box<dyn std::any::Any + Send>
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send,
+    {
+        match tokio::spawn(future).await {
+            Ok(_) => unreachable!("the service must panic"),
+            Err(join_err) => join_err.into_panic(),
+        }
+    }
+
+    #[tokio::test]
+    #[expect(clippy::panic)] // reason: the handler panics under test
+    async fn end_hook_retrying_after_panic() {
+        let messages = [
+            "boom",
+            "boom",
+            "the invocation panicked with a payload that is not a string",
+        ];
+        for (case, message) in messages.into_iter().enumerate() {
+            let plugin = Hooks::default();
+            let (service, event) =
+                hooks::service(vec![plugin.clone()], 0, move |_e, _ctx| async move {
+                    match case {
+                        0 => panic!("boom"),
+                        1 => panic!("{}", String::from("boom")),
+                        _ => std::panic::panic_any(42_u32),
+                    }
+                });
+            let resumed = panic_payload_of(service(event)).await;
+            let original = match case {
+                0 => resumed.downcast_ref::<&str>() == Some(&"boom"),
+                1 => resumed.downcast_ref::<String>().map(String::as_str) == Some("boom"),
+                _ => resumed.downcast_ref::<u32>() == Some(&42),
+            };
+            assert!(original, "case {case}: the original payload leaves the SDK");
+            let ends = plugin.ends();
+            let [end] = ends.as_slice() else {
+                unreachable!("one end info, got {}", ends.len());
+            };
+            assert_eq!(end.status(), InvocationStatus::Retrying);
+            assert_eq!(end.execution_result(), None);
+            let error = end.execution_error().expect("a panic end has an error");
+            assert_eq!(error.error_type(), None);
+            assert_eq!(error.error_message(), Some(message));
+        }
+    }
+
+    #[tokio::test]
+    #[expect(clippy::panic)] // reason: the handler panic under test
+    async fn end_hook_after_panic_runs_after_cleanup() {
+        struct Guard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let plugin = {
+            let dropped = std::sync::Arc::clone(&dropped);
+            let seen = std::sync::Arc::clone(&seen);
+            Hooks::default().on_end(move |_| {
+                *seen.lock().unwrap() = Some(dropped.load(std::sync::atomic::Ordering::SeqCst));
+                Box::pin(std::future::ready(Ok(())))
+            })
+        };
+        let (service, event) = hooks::service(vec![plugin], 0, move |_e, ctx| {
+            let dropped = std::sync::Arc::clone(&dropped);
+            async move {
+                let _held = ctx
+                    .step(move |_| {
+                        let guard = Guard(std::sync::Arc::clone(&dropped));
+                        async move {
+                            let _guard = guard;
+                            std::future::pending::<()>().await;
+                            Ok(0_u32)
+                        }
+                    })
+                    .spawn();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                panic!("boom")
+            }
+        });
+        let payload = panic_payload_of(service(event)).await;
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+        assert_eq!(*seen.lock().unwrap(), Some(true));
+    }
+
+    /// The plugins are dropped before the panic resumes, so no plugin
+    /// destructor runs while it unwinds: every context, which holds them,
+    /// is dropped first.
+    #[tokio::test]
+    #[expect(clippy::panic)] // reason: the handler panic under test
+    async fn plugins_drop_before_the_panic_resumes() {
+        struct Probe(std::sync::Arc<std::sync::Mutex<Option<bool>>>);
+        impl plugin::Plugin for Probe {}
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = Some(std::thread::panicking());
+            }
+        }
+        struct ProbeFactory(std::sync::Arc<std::sync::Mutex<Option<bool>>>);
+        impl plugin::PluginFactory for ProbeFactory {
+            fn create_plugin(
+                &self,
+                _info: &plugin::InvocationInfo,
+            ) -> Result<Option<Box<dyn plugin::Plugin>>, BoxError> {
+                Ok(Some(Box::new(Probe(std::sync::Arc::clone(&self.0)))))
+            }
+        }
+        let unwinding = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let options = Options::builder()
+            .execution_client(std::sync::Arc::new(client::InMemoryExecutionClient::new(
+                Vec::new(),
+            )))
+            .plugin(ProbeFactory(std::sync::Arc::clone(&unwinding)))
+            .build()
+            .unwrap();
+        let service = wrap(
+            |_e: serde_json::Value, _ctx: DurableContext| async move {
+                panic!("boom");
+                #[expect(unreachable_code)] // reason: names the handler's output type
+                Ok::<serde_json::Value, BoxError>(serde_json::Value::Null)
+            },
+            options,
+        );
+        let event = lambda_runtime::LambdaEvent::new(
+            InvocationPayload(envelope_with(&serde_json::json!([{
+                "Id": "exec-1",
+                "Type": "EXECUTION",
+                "Status": "STARTED",
+                "ExecutionDetails": { "InputPayload": "{}" }
+            }]))),
+            lambda_runtime::Context::default(),
+        );
+        let payload = panic_payload_of(service(event)).await;
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+        assert_eq!(*unwinding.lock().unwrap(), Some(false));
+    }
+
+    #[tokio::test]
+    #[expect(clippy::panic)] // reason: the hook and handler panics under test, and the report of no capture
+    async fn panicking_end_hook_keeps_the_original_panic() {
+        for _attempt in 0..5 {
+            let (buffer, _guard) = hooks::capture();
+            let faulty = Hooks::default().named("Faulty").on_end(|_| panic!("hook"));
+            let healthy = Hooks::default();
+            let (service, event) =
+                hooks::service(vec![faulty, healthy.clone()], 0, |_e, _ctx| async move {
+                    panic!("boom")
+                });
+            let payload = panic_payload_of(service(event)).await;
+            assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+            let ends = healthy.ends();
+            let [end] = ends.as_slice() else {
+                unreachable!("one end info, got {}", ends.len());
+            };
+            assert_eq!(end.status(), InvocationStatus::Retrying);
+            let warnings = hooks::warnings(&buffer);
+            let [warning] =
+                hooks::with_message(&warnings, "plugin hook panicked; the panic is ignored")[..]
+            else {
+                continue;
+            };
+            assert!(
+                hooks::field(warning, "plugin").ends_with("Faulty (plugins[0])"),
+                "{warning}"
+            );
+            assert_eq!(hooks::field(warning, "hook"), "on_invocation_end");
+            return;
+        }
+        panic!("no attempt captured the warning");
     }
 
     /// An invocation that fails before the plugins are created calls no

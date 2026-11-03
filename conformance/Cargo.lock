@@ -1116,6 +1116,7 @@ dependencies = [
  "aws-config",
  "aws-durable-execution-sdk",
  "aws-sdk-dynamodb",
+ "serde_json",
 ]
 
 [[package]]
@@ -2741,6 +2742,72 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "plugin_external_update_on_invoke"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_first_invocation_flag"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_invocation_lifecycle"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_multiple_plugins"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_suspension_invocation_end"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_terminal_failure"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "potential_utf"

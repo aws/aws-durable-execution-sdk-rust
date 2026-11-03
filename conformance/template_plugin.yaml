@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Durable Execution Conformance Test Examples - Rust (Plugin)
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: IAM role the deployed functions assume
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Timeout: 60
+    MemorySize: 128
+
+Resources:
+  PluginInvocationLifecycle:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-1"]
+      NotImplemented:
+        - id: "10-19"
+          reason: "InvocationEndInfo carries no first-invocation flag, as in the JS reference"
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_invocation_lifecycle/
+      Handler: bootstrap
+      Description: 'Conformance 10-1: Plugin invocation lifecycle hooks (start and end on a single invocation)'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginMultiplePlugins:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-5"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_multiple_plugins/
+      Handler: bootstrap
+      Description: 'Conformance 10-5: Multiple registered plugins all receive lifecycle hooks'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginFirstInvocationFlag:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-6"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_first_invocation_flag/
+      Handler: bootstrap
+      Description: 'Conformance 10-6: Plugin sees is-first-invocation true once, then false on replay'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginTerminalFailure:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-7"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_terminal_failure/
+      Handler: bootstrap
+      Description: 'Conformance 10-7: Plugin invocation-end hook receives FAILED status when execution fails'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginExternalUpdateOnInvoke:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-9"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_external_update_on_invoke/
+      Handler: bootstrap
+      Description: 'Conformance 10-9: Plugin sees a wait completed externally between invocations as an updated operation'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginSuspensionInvocationEnd:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-16"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_suspension_invocation_end/
+      Handler: bootstrap
+      Description: 'Conformance 10-16: Invocation-end fires for every invocation, non-terminal on suspension and terminal at completion'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300

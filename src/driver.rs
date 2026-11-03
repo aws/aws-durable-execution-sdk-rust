@@ -73,6 +73,9 @@ pub(crate) enum InvocationOutcome {
     /// the write channel is down, so nothing more is written and the
     /// execution stays alive for the retry.
     Fault {
+        /// The type of the fault, which the invocation end hook receives.
+        /// It does not reach Lambda.
+        error_type: String,
         /// The message reported as the Lambda invocation error.
         message: String,
     },
@@ -135,6 +138,7 @@ impl FatalError {
                 ),
             },
             FatalSeverity::FailInvocation => InvocationOutcome::Fault {
+                error_type: self.error_type,
                 message: self.error_message,
             },
         }
@@ -649,7 +653,7 @@ pub(crate) mod test_support {
         )
         .await
         .expect("the operation must reach an invocation outcome within 5 s");
-        let InvocationOutcome::Fault { message } = outcome else {
+        let InvocationOutcome::Fault { message, .. } = outcome else {
             panic!("expected an invocation fault, got {outcome:?}");
         };
         assert!(
@@ -1333,6 +1337,7 @@ pub(crate) mod test_support {
             Arc::clone(client) as Arc<dyn ExecutionClient>,
             "t0".to_owned(),
             buffer_window,
+            None,
         )
     }
 }
@@ -2084,7 +2089,7 @@ mod suspension_containment_and_task_ownership {
             "a checkpoint API failure must not be observable by a catch"
         );
         match outcome {
-            InvocationOutcome::Fault { message } => {
+            InvocationOutcome::Fault { message, .. } => {
                 assert!(
                     message.contains("throttled"),
                     "the exhausted failure's reason is preserved: {message}"
@@ -4556,7 +4561,7 @@ mod refresh_scheduler {
             Ok(callback_starts(req.updates))
         }));
         let outcome = callback_beside_step(&client, None, secs(3)).await;
-        let InvocationOutcome::Fault { message } = &outcome else {
+        let InvocationOutcome::Fault { message, .. } = &outcome else {
             panic!("expected a fault, got {outcome:?}");
         };
         assert!(message.contains("throttled refresh"), "got {message}");
@@ -4624,7 +4629,7 @@ mod refresh_scheduler {
             Ok(callback_starts(req.updates))
         }));
         let outcome = callback_beside_activity(batched_ctx(&client)).await;
-        let InvocationOutcome::Fault { message } = &outcome else {
+        let InvocationOutcome::Fault { message, .. } = &outcome else {
             panic!("expected a fault, got {outcome:?}");
         };
         assert!(message.contains("throttled refresh"), "got {message}");
@@ -4750,7 +4755,7 @@ mod refresh_scheduler {
         let coordinator = Arc::clone(ctx.coordinator());
         let ended = drive_handler(ctx, None, |ctx| async move {
             ctx.coordinator()
-                .record_invocation_fault("fatal first".to_owned());
+                .record_invocation_fault("FatalFirst", "fatal first".to_owned());
             assert!(
                 ctx.coordinator()
                     .record_panic(Box::new(PanicsOnDrop))
@@ -4759,7 +4764,7 @@ mod refresh_scheduler {
             Ok("done".to_owned())
         })
         .await;
-        let Ok(InvocationOutcome::Fault { message }) = &ended else {
+        let Ok(InvocationOutcome::Fault { message, .. }) = &ended else {
             panic!("expected the fatal outcome, got {ended:?}");
         };
         assert!(message.contains("fatal first"), "{message}");
@@ -4776,7 +4781,7 @@ mod refresh_scheduler {
         let coordinator = Arc::clone(ctx.coordinator());
         let ended = drive_handler(ctx, None, |ctx| async move {
             ctx.coordinator()
-                .record_invocation_fault("fatal first".to_owned());
+                .record_invocation_fault("FatalFirst", "fatal first".to_owned());
             assert!(
                 ctx.coordinator()
                     .record_panic(Box::new(super::task_gateway::NestedPanicPayload))
@@ -4785,7 +4790,7 @@ mod refresh_scheduler {
             Ok("done".to_owned())
         })
         .await;
-        let Ok(InvocationOutcome::Fault { message }) = &ended else {
+        let Ok(InvocationOutcome::Fault { message, .. }) = &ended else {
             panic!("expected the fatal outcome, got {ended:?}");
         };
         assert!(message.contains("fatal first"), "{message}");
@@ -4832,7 +4837,7 @@ mod refresh_scheduler {
             "throttled refresh".to_owned(),
         ))
         .await;
-        let InvocationOutcome::Fault { message } = &outcome else {
+        let InvocationOutcome::Fault { message, .. } = &outcome else {
             panic!("expected a fault, got {outcome:?}");
         };
         assert!(message.contains("throttled refresh"), "got {message}");
@@ -4884,7 +4889,7 @@ mod refresh_scheduler {
             ctx.hold_activity(tokio::time::sleep(millis(1200))).await;
             if fatal {
                 ctx.coordinator()
-                    .record_invocation_fault("fatal first".to_owned());
+                    .record_invocation_fault("FatalFirst", "fatal first".to_owned());
             }
             Ok("done".to_owned())
         })
@@ -4912,7 +4917,7 @@ mod refresh_scheduler {
     #[tokio::test(start_paused = true)]
     async fn fatal_wins_over_unbatched_refresh_panic_after_handler_returns() {
         let (outcome, coordinator) = drive_unbatched_refresh_panic_after_return(true).await;
-        let Ok(InvocationOutcome::Fault { message }) = &outcome else {
+        let Ok(InvocationOutcome::Fault { message, .. }) = &outcome else {
             panic!("expected the fatal outcome, got {outcome:?}");
         };
         assert!(message.contains("fatal first"), "{message}");
@@ -4968,7 +4973,7 @@ mod refresh_scheduler {
             "throttled refresh".to_owned(),
         ))
         .await;
-        let InvocationOutcome::Fault { message } = &outcome else {
+        let InvocationOutcome::Fault { message, .. } = &outcome else {
             panic!("expected a fault, got {outcome:?}");
         };
         assert!(message.contains("throttled refresh"), "got {message}");

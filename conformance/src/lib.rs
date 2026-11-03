@@ -46,3 +46,20 @@ pub async fn increment_attempt(
         _ => Err("attemptCount is not a number".into()),
     }
 }
+
+/// Prints one JSON object on one stdout line: the given fields, then
+/// `durableExecutionArn`.
+///
+/// The plugin requirements read their records from the function's log
+/// group, and Lambda writes a function's stdout there.
+pub fn emit_record(execution_arn: &str, fields: &[(&str, serde_json::Value)]) {
+    let mut record = serde_json::Map::new();
+    for (key, value) in fields {
+        record.insert((*key).to_owned(), value.clone());
+    }
+    record.insert(
+        "durableExecutionArn".to_owned(),
+        serde_json::Value::String(execution_arn.to_owned()),
+    );
+    println!("{}", serde_json::Value::Object(record));
+}
