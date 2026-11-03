@@ -7,9 +7,11 @@
 //! are introduced:
 //!
 //! - The `with_retry` operation itself is a child context
-//!   (`OperationType::Context`, sub-type `RunInChildContext`) whose body is
-//!   the retry loop.
-//! - Each ATTEMPT is a nested child context under it (named `attempt-N`),
+//!   (`OperationType::Context`) whose body is the retry loop. Its sub-type
+//!   is the one the caller sets with `WithRetryBuilder::sub_type`, and
+//!   `RunInChildContext` when the caller sets none.
+//! - Each ATTEMPT is a nested child context under it (named `attempt-N`,
+//!   sub-type `RunInChildContext` whatever the outer sub-type is),
 //!   which is what gives every attempt a fresh operation namespace: attempt
 //!   1's operations live under `<id>-1-*`, attempt 2's under `<id>-3-*`,
 //!   and so on. A failed attempt's recorded operations can therefore never

@@ -341,3 +341,79 @@ async fn retry_strategy_config_shapes_block_retries() {
     assert_eq!(result.output(), Some(&20));
     assert_eq!(closure_runs.load(Ordering::SeqCst), 2);
 }
+
+/// A custom subtype labels the block in the history: the block operation
+/// and every event of it record `Checkout`, while the attempt contexts
+/// keep `RunInChildContext`, the delay keeps `Wait` and the steps keep
+/// `Step`, on the operations and on their events.
+#[tokio::test]
+async fn custom_sub_type_labels_only_the_block_in_history() {
+    let work_runs = Arc::new(AtomicU32::new(0));
+    let result = LocalRunner::new()
+        .run(
+            move |_: serde_json::Value, ctx: DurableContext| {
+                let work_runs = Arc::clone(&work_runs);
+                async move {
+                    let out = ctx
+                        .with_retry(move |child| {
+                            let work_runs = Arc::clone(&work_runs);
+                            async move {
+                                let v = child
+                                    .step(move |_| async move {
+                                        if work_runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                                            Err::<u32, durable::BoxError>("transient".into())
+                                        } else {
+                                            Ok(7)
+                                        }
+                                    })
+                                    .name("work")
+                                    .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                                    .await?;
+                                Ok(v)
+                            }
+                        })
+                        .name("block")
+                        .sub_type(durable::OperationSubType::new("Checkout")?)
+                        .retry_strategy(|_err, attempt| {
+                            if attempt >= 2 {
+                                RetryDecision::Stop
+                            } else {
+                                RetryDecision::Retry {
+                                    delay: Duration::from_secs(1),
+                                }
+                            }
+                        })
+                        .await?;
+                    Ok::<_, durable::BoxError>(out)
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.output(), Some(&7));
+
+    let mut shape: Vec<(&str, Option<&str>)> = result
+        .operations()
+        .iter()
+        .map(|op| {
+            for event in op.events() {
+                assert_eq!(event.sub_type(), op.sub_type(), "{event:?}");
+            }
+            (op.name().unwrap_or(""), op.sub_type())
+        })
+        .collect();
+    shape.sort_unstable();
+    assert_eq!(
+        shape,
+        [
+            ("attempt-1", Some("RunInChildContext")),
+            ("attempt-2", Some("RunInChildContext")),
+            ("block", Some("Checkout")),
+            ("retry-delay-1", Some("Wait")),
+            ("work", Some("Step")),
+            ("work", Some("Step")),
+        ]
+    );
+}

@@ -608,6 +608,22 @@ let greeting = ctx
 When a child context's body returns, an operation it started and did not
 await writes no further checkpoint, and awaiting it never resolves.
 
+A child context records the subtype `RunInChildContext`, and
+`.sub_type(...)` records an `OperationSubType` of your choice instead, as
+on a step. Replay compares the subtype, so changing it on an existing
+child context fails the executions in flight with
+`NonDeterministicExecutionError`.
+
+```rust ignore
+let order = ctx
+    .run_in_child_context(|child| async move {
+        Ok(child.step(|_| async { Ok(reserve().await?) }).name("reserve").await?)
+    })
+    .name("checkout")
+    .sub_type(durable::OperationSubType::new("Checkout")?)
+    .await?;
+```
+
 ### with_retry
 
 `with_retry` runs a closure against a child context and applies a retry
@@ -648,6 +664,10 @@ let receipt = ctx
 closure, and without either the step default applies (6 total attempts with
 exponential backoff). When retries exhaust, the operation fails with the
 attempt count and the last attempt's error.
+
+`.sub_type(...)` on `with_retry` labels the block's own child context; each
+`attempt-N` child context keeps `RunInChildContext`, and each
+`retry-delay-N` wait keeps `Wait`.
 
 ### map and parallel
 

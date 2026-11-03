@@ -6,7 +6,7 @@
 //!
 //! Wire shape:
 //! - `OperationType`: `Context`
-//! - `OperationSubType`: `RunInChildContext`
+//! - `OperationSubType`: the caller's subtype, or `RunInChildContext`
 //! - Actions: Start → (Succeed | Fail)
 //! - Payload on Succeed: serialized child result
 //! - Error on Fail: `{ Type, Message }` from the child function error
@@ -46,6 +46,8 @@ pub(crate) struct ChildExecution<O, F, S> {
     pub(crate) ctx: DurableContext,
     pub(crate) op_id: OperationId,
     pub(crate) name: Option<String>,
+    /// The resolved subtype: the caller's, or `RunInChildContext`.
+    pub(crate) sub_type: crate::OperationSubType,
     pub(crate) serdes: S,
     pub(crate) closure: F,
     pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
@@ -72,6 +74,7 @@ where
             ctx,
             op_id,
             name,
+            sub_type,
             serdes,
             closure,
             _marker,
@@ -80,6 +83,7 @@ where
             ctx,
             op_id,
             name,
+            sub_type,
             serdes,
             _marker: std::marker::PhantomData,
         };
@@ -126,6 +130,7 @@ struct ChildCore<O, S> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
+    sub_type: crate::OperationSubType,
     serdes: S,
     _marker: std::marker::PhantomData<fn() -> O>,
 }
@@ -164,6 +169,7 @@ struct ChildAfter<O, S> {
     ctx: DurableContext,
     wire_id: String,
     name: Option<String>,
+    sub_type: crate::OperationSubType,
     serdes: S,
     _marker: std::marker::PhantomData<fn() -> O>,
 }
@@ -196,7 +202,7 @@ where
             &positional_id,
             &wire_id,
             "Context",
-            Some(CHILD_SUB_TYPE),
+            Some(self.sub_type.as_str()),
             self.name.as_deref(),
         )? {
             match view.status {
@@ -226,6 +232,7 @@ where
             let update = build_update(
                 &wire_id,
                 self.name.as_deref(),
+                self.sub_type.as_str(),
                 OperationAction::Start,
                 &self.ctx,
             );
@@ -242,7 +249,11 @@ where
 
         // 4. Create child context with chained prefix.
         let Self {
-            ctx, name, serdes, ..
+            ctx,
+            name,
+            sub_type,
+            serdes,
+            ..
         } = self;
         let child_ctx = ctx.new_child(&positional_id, name.as_deref());
 
@@ -253,6 +264,7 @@ where
                 ctx,
                 wire_id,
                 name,
+                sub_type,
                 serdes,
                 _marker: std::marker::PhantomData,
             },
@@ -285,7 +297,7 @@ where
             wire_id,
             self.name.as_deref(),
             "Context",
-            Some(CHILD_SUB_TYPE),
+            Some(self.sub_type.as_str()),
             attempt,
         );
         Ok(value)
@@ -303,7 +315,7 @@ where
             wire_id,
             self.name.as_deref(),
             "Context",
-            Some(CHILD_SUB_TYPE),
+            Some(self.sub_type.as_str()),
             attempt,
         );
         let wire = self
@@ -342,9 +354,11 @@ where
             ctx,
             wire_id,
             name,
+            sub_type,
             serdes,
             ..
         } = self;
+        let sub_type = sub_type.as_str();
         let serdes_ctx = SerdesContext::new(&wire_id, ctx.execution_arn());
 
         match (mode, result) {
@@ -383,16 +397,26 @@ where
                     Ok(serialized) => serialized,
                     Err(op_err) => {
                         let wire = crate::error::serialization_failure_wire(&op_err);
-                        let update =
-                            build_child_fail_update(&wire_id, name.as_deref(), &ctx, &wire);
+                        let update = build_child_fail_update(
+                            &wire_id,
+                            name.as_deref(),
+                            sub_type,
+                            &ctx,
+                            &wire,
+                        );
                         if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
                             // Audit (#43): child FAIL (serialization): the
                             // closure ran, so the failed FAIL write routes
                             // unrecoverable with a minimal terminal FAIL
                             // retry.
                             let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                            let terminal =
-                                build_child_fail_update(&wire_id, name.as_deref(), &ctx, &cwire);
+                            let terminal = build_child_fail_update(
+                                &wire_id,
+                                name.as_deref(),
+                                sub_type,
+                                &ctx,
+                                &cwire,
+                            );
                             return ctx
                                 .checkpoint_failure_unrecoverable(
                                     &wire_id,
@@ -406,14 +430,16 @@ where
                             .with_wire(wire));
                     }
                 };
-                let update = build_succeed_update(&wire_id, name.as_deref(), &ctx, &serialized);
+                let update =
+                    build_succeed_update(&wire_id, name.as_deref(), sub_type, &ctx, &serialized);
                 if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
                     // Audit (#43): child-context SUCCEED: the closure
                     // ran, so its side effects need a recorded outcome. A
                     // permanent rejection persists a small terminal FAIL
                     // before the execution fails.
                     let cwire = crate::error::checkpoint_failure_wire(&err);
-                    let terminal = build_child_fail_update(&wire_id, name.as_deref(), &ctx, &cwire);
+                    let terminal =
+                        build_child_fail_update(&wire_id, name.as_deref(), sub_type, &ctx, &cwire);
                     return ctx
                         .checkpoint_failure_unrecoverable(&wire_id, err, Some(terminal))
                         .await;
@@ -424,7 +450,10 @@ where
             }
             (ChildRunMode::Live, Err(child_err)) => {
                 // Failure: checkpoint FAIL with error details.
-                Err(checkpoint_live_failure(&ctx, name.as_deref(), &wire_id, child_err).await)
+                Err(
+                    checkpoint_live_failure(&ctx, name.as_deref(), sub_type, &wire_id, child_err)
+                        .await,
+                )
             }
         }
     }
@@ -434,13 +463,14 @@ where
 fn build_update(
     wire_id: &str,
     name: Option<&str>,
+    sub_type: &str,
     action: OperationAction,
     ctx: &DurableContext,
 ) -> OperationUpdate {
     let mut builder = OperationUpdate::builder()
         .id(wire_id.to_owned())
         .r#type(OperationType::Context)
-        .sub_type(CHILD_SUB_TYPE.to_owned())
+        .sub_type(sub_type.to_owned())
         .action(action);
 
     if let Some(n) = name {
@@ -467,13 +497,14 @@ fn build_update(
 fn build_succeed_update(
     wire_id: &str,
     name: Option<&str>,
+    sub_type: &str,
     ctx: &DurableContext,
     serialized: &str,
 ) -> OperationUpdate {
     let mut succeed_builder = OperationUpdate::builder()
         .id(wire_id.to_owned())
         .r#type(OperationType::Context)
-        .sub_type(CHILD_SUB_TYPE.to_owned())
+        .sub_type(sub_type.to_owned())
         .action(OperationAction::Succeed);
     if let Some(n) = name {
         succeed_builder = succeed_builder.name(n);
@@ -504,6 +535,7 @@ fn build_succeed_update(
 async fn checkpoint_live_failure(
     ctx: &DurableContext,
     name: Option<&str>,
+    sub_type: &str,
     wire_id: &str,
     child_err: ChildFnError,
 ) -> OperationError {
@@ -512,7 +544,7 @@ async fn checkpoint_live_failure(
     // chain, and `error_data`/`stack_trace` pass through from its cause
     // chain, so an inner failure's payload survives this boundary.
     let wire = child_err.failure_wire();
-    let update = build_child_fail_update(wire_id, name, ctx, &wire);
+    let update = build_child_fail_update(wire_id, name, sub_type, ctx, &wire);
 
     // A rejected FAIL write routes unrecoverable: discarding it would
     // leave the record claiming less than what executed (#43).
@@ -522,7 +554,7 @@ async fn checkpoint_live_failure(
         // terminal FAIL retry (the original carried the child error's
         // payload).
         let cwire = crate::error::checkpoint_failure_wire(&client_err);
-        let terminal = build_child_fail_update(wire_id, name, ctx, &cwire);
+        let terminal = build_child_fail_update(wire_id, name, sub_type, ctx, &cwire);
         return ctx
             .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
             .await;
@@ -540,13 +572,14 @@ async fn checkpoint_live_failure(
 fn build_child_fail_update(
     wire_id: &str,
     name: Option<&str>,
+    sub_type: &str,
     ctx: &DurableContext,
     wire: &crate::error::WireError,
 ) -> OperationUpdate {
     let mut fail_builder = OperationUpdate::builder()
         .id(wire_id.to_owned())
         .r#type(OperationType::Context)
-        .sub_type(CHILD_SUB_TYPE.to_owned())
+        .sub_type(sub_type.to_owned())
         .action(OperationAction::Fail)
         .error(wire.to_error_object());
     if let Some(n) = name {
@@ -668,6 +701,7 @@ mod tests {
     use super::*;
     use crate::context::DurableContext;
     use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
+    use std::future::IntoFuture;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -897,6 +931,241 @@ mod tests {
                 end_timestamp: None,
             },
         )
+    }
+
+    /// A fresh root context over an in-memory client, and the client.
+    fn live_ctx() -> (DurableContext, Arc<crate::client::InMemoryExecutionClient>) {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+        );
+        (ctx, client)
+    }
+
+    fn checkout() -> crate::OperationSubType {
+        crate::OperationSubType::new("Checkout").expect("a valid subtype")
+    }
+
+    /// The actions of the updates named `name`, after asserting that each
+    /// of them carries the subtype `Checkout`.
+    fn checkout_actions(updates: &[OperationUpdate], name: &str) -> Vec<OperationAction> {
+        updates
+            .iter()
+            .filter(|u| u.name() == Some(name))
+            .map(|u| {
+                assert_eq!(u.sub_type(), Some("Checkout"), "{u:?}");
+                u.action().clone()
+            })
+            .collect()
+    }
+
+    /// A serdes whose `serialize` returns a plain, unmarked error.
+    struct PlainSerializeFailure;
+
+    impl<T: serde::de::DeserializeOwned + Send + 'static> Serdes<T> for PlainSerializeFailure {
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            _value: T,
+            _context: SerdesContext,
+        ) -> Result<String, crate::BoxError> {
+            Err("cannot encode".into())
+        }
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            wire: String,
+            _context: SerdesContext,
+        ) -> Result<T, crate::BoxError> {
+            Ok(serde_json::from_str(&wire)?)
+        }
+    }
+
+    /// Every update of a succeeded child, of a child whose body fails and
+    /// of a child whose result fails to serialize carries the custom
+    /// subtype.
+    #[tokio::test]
+    async fn custom_sub_type_on_every_child_update() {
+        let (ctx, client) = live_ctx();
+        let ok: Result<u32, OperationError> = ctx
+            .run_in_child_context(|_child| async { Ok(1_u32) })
+            .name("ok")
+            .sub_type(checkout())
+            .await;
+        assert_eq!(ok.ok(), Some(1));
+        let body_fails: Result<u32, OperationError> = ctx
+            .run_in_child_context(|_child| async { Err("declined".into()) })
+            .name("body-fails")
+            .sub_type(checkout())
+            .await;
+        assert!(body_fails.is_err());
+        let serdes_fails: Result<u32, OperationError> = ctx
+            .run_in_child_context(|_child| async { Ok(3_u32) })
+            .name("serdes-fails")
+            .sub_type(checkout())
+            .serdes(PlainSerializeFailure)
+            .await;
+        assert!(serdes_fails.is_err());
+
+        let updates = client.recorded_updates();
+        assert_eq!(
+            checkout_actions(&updates, "ok"),
+            [OperationAction::Start, OperationAction::Succeed]
+        );
+        assert_eq!(
+            checkout_actions(&updates, "body-fails"),
+            [OperationAction::Start, OperationAction::Fail]
+        );
+        assert_eq!(
+            checkout_actions(&updates, "serdes-fails"),
+            [OperationAction::Start, OperationAction::Fail]
+        );
+    }
+
+    /// A result too large to checkpoint writes a `ReplayChildren` SUCCEED
+    /// that carries the custom subtype.
+    #[tokio::test]
+    async fn custom_sub_type_on_replay_children_succeed() {
+        let (ctx, client) = live_ctx();
+        let value: Result<String, OperationError> = ctx
+            .run_in_child_context(|_child| async { Ok("x".repeat(300 * 1024)) })
+            .name("big")
+            .sub_type(checkout())
+            .await;
+        assert_eq!(value.map(|v| v.len()).ok(), Some(300 * 1024));
+
+        let updates = client.recorded_updates();
+        let succeed = updates
+            .iter()
+            .find(|u| matches!(u.action(), OperationAction::Succeed))
+            .expect("the SUCCEED update is recorded");
+        assert_eq!(
+            succeed
+                .context_options()
+                .and_then(aws_sdk_lambda::types::ContextOptions::replay_children),
+            Some(true)
+        );
+        assert_eq!(succeed.payload(), None);
+        assert_eq!(succeed.sub_type(), Some("Checkout"));
+    }
+
+    /// Runs `child` with the START write accepted and the next write
+    /// rejected, and returns the recorded updates.
+    async fn reject_second_write<F>(
+        ctx: DurableContext,
+        client: &crate::client::InMemoryExecutionClient,
+        child: F,
+    ) -> Vec<OperationUpdate>
+    where
+        F: IntoFuture + Send + 'static,
+        F::IntoFuture: Send + 'static,
+    {
+        use crate::client::TestResponse;
+
+        client.enqueue_checkpoint_response(TestResponse::Success(vec![]));
+        client.enqueue_checkpoint_response(TestResponse::NonRetryableError(
+            "payload rejected".to_owned(),
+        ));
+        let signal = Arc::clone(ctx.coordinator());
+        let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            child,
+        )
+        .await;
+        assert!(
+            matches!(outcome, crate::driver::InvocationOutcome::Failed { .. }),
+            "a rejected write fails the execution: {outcome:?}"
+        );
+        client.recorded_updates()
+    }
+
+    /// The terminal FAIL the SDK writes after the service rejects a write
+    /// carries the custom subtype: after a rejected SUCCEED, after a
+    /// rejected FAIL of a body failure, and after a rejected FAIL of a
+    /// serialization failure.
+    #[tokio::test]
+    async fn custom_sub_type_on_terminal_fail_after_rejected_write() {
+        // A rejected SUCCEED.
+        let (ctx, client) = live_ctx();
+        let child = ctx
+            .run_in_child_context(|_child| async { Ok(1_u32) })
+            .name("c")
+            .sub_type(checkout());
+        let updates = reject_second_write(ctx, &client, child).await;
+        assert_eq!(
+            checkout_actions(&updates, "c"),
+            [
+                OperationAction::Start,
+                OperationAction::Succeed,
+                OperationAction::Fail
+            ]
+        );
+
+        // A rejected FAIL of a body failure.
+        let (ctx, client) = live_ctx();
+        let child = ctx
+            .run_in_child_context(|_child| async { Err::<u32, crate::BoxError>("no".into()) })
+            .name("c")
+            .sub_type(checkout());
+        let updates = reject_second_write(ctx, &client, child).await;
+        assert_eq!(
+            checkout_actions(&updates, "c"),
+            [
+                OperationAction::Start,
+                OperationAction::Fail,
+                OperationAction::Fail
+            ]
+        );
+
+        // A rejected FAIL of a serialization failure.
+        let (ctx, client) = live_ctx();
+        let child = ctx
+            .run_in_child_context(|_child| async { Ok(1_u32) })
+            .name("c")
+            .sub_type(checkout())
+            .serdes(PlainSerializeFailure);
+        let updates = reject_second_write(ctx, &client, child).await;
+        assert_eq!(
+            checkout_actions(&updates, "c"),
+            [
+                OperationAction::Start,
+                OperationAction::Fail,
+                OperationAction::Fail
+            ]
+        );
+    }
+
+    /// A record with the custom subtype replays its success and its
+    /// failure when the child sets the same subtype.
+    #[tokio::test]
+    async fn custom_sub_type_replays_recorded_outcomes() {
+        let (wire_id, mut record) = succeeded_record("1", "7");
+        record.op_type = Some("CONTEXT".to_owned());
+        record.sub_type = Some("Checkout".to_owned());
+        let ctx = test_ctx(CheckpointLog::from_records(vec![(wire_id, record)]));
+        let value: Result<u32, OperationError> = ctx
+            .run_in_child_context(|_child| async { unreachable!("replayed") })
+            .sub_type(checkout())
+            .await;
+        assert_eq!(value.ok(), Some(7));
+
+        let (wire_id, mut record) = failed_record("1", "Error", "no");
+        record.op_type = Some("CONTEXT".to_owned());
+        record.sub_type = Some("Checkout".to_owned());
+        let ctx = test_ctx(CheckpointLog::from_records(vec![(wire_id, record)]));
+        let value: Result<u32, OperationError> = ctx
+            .run_in_child_context(|_child| async { unreachable!("replayed") })
+            .sub_type(checkout())
+            .await;
+        assert!(value.is_err());
     }
 
     #[tokio::test]

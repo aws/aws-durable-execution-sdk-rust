@@ -1008,3 +1008,78 @@ async fn custom_step_and_callback_subtypes_reach_plugin_operations() {
         assert_eq!(info.sub_type(), recorded.sub_type());
     }
 }
+
+/// A custom child-context and `with_retry` subtype reach the operations
+/// map of the last invocation's end info, with the value the runner
+/// records. The `with_retry` subtype labels the block, not its attempts.
+#[tokio::test]
+async fn custom_child_and_with_retry_subtypes_reach_plugin_operations() {
+    use std::sync::atomic::AtomicU32;
+
+    let plugin = Lifecycle::default();
+    let work_runs = Arc::new(AtomicU32::new(0));
+    let result = lifecycle_runner(&plugin)
+        .run(
+            move |_e: (), ctx: DurableContext| {
+                let work_runs = Arc::clone(&work_runs);
+                async move {
+                    let b = ctx
+                        .run_in_child_context(|_child| async { Ok(2_u32) })
+                        .name("case-b")
+                        .sub_type(durable::OperationSubType::new("Checkout")?)
+                        .await?;
+                    let d = ctx
+                        .with_retry(move |child| {
+                            let work_runs = Arc::clone(&work_runs);
+                            async move {
+                                let v = child
+                                    .step(move |_| async move {
+                                        if work_runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                                            Err::<u32, BoxError>("transient".into())
+                                        } else {
+                                            Ok(4)
+                                        }
+                                    })
+                                    .name("work")
+                                    .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                                    .await?;
+                                Ok(v)
+                            }
+                        })
+                        .name("block")
+                        .sub_type(durable::OperationSubType::new("Checkout")?)
+                        .retry_strategy(|_err, attempt| {
+                            if attempt >= 2 {
+                                RetryDecision::Stop
+                            } else {
+                                RetryDecision::Retry {
+                                    delay: Duration::from_secs(1),
+                                }
+                            }
+                        })
+                        .await?;
+                    Ok::<_, BoxError>(b + d)
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+
+    let ends = plugin.ends();
+    let operations = ends.last().expect("an end info").operations();
+    for (name, sub_type) in [
+        ("case-b", "Checkout"),
+        ("block", "Checkout"),
+        ("attempt-1", "RunInChildContext"),
+        ("attempt-2", "RunInChildContext"),
+    ] {
+        let recorded = result.operation(name).expect("the runner records it");
+        let info = operations
+            .get(recorded.id())
+            .expect("the operation is in the operations map");
+        assert_eq!(info.sub_type(), Some(sub_type), "{name}");
+        assert_eq!(info.sub_type(), recorded.sub_type(), "{name}");
+    }
+}

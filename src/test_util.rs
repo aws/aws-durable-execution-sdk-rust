@@ -322,8 +322,9 @@ impl TestOperation {
     /// `"WaitForCondition"`, or `None` if the operation carried none.
     ///
     /// The constants of [`OperationSubType`](crate::OperationSubType) hold
-    /// the built-in values. A step or a callback built with a `sub_type`
-    /// setter records the custom value instead.
+    /// the built-in values. A step, a callback, a child context or a
+    /// `with_retry` block built with a `sub_type` setter records the custom
+    /// value instead.
     pub fn sub_type(&self) -> Option<&str> {
         self.sub_type.as_deref()
     }
@@ -6586,6 +6587,113 @@ mod tests {
                 (OperationKind::Step, Some("Step"))
             ]
         );
+    }
+
+    /// The recorded subtypes of cases A to E: a child context and a
+    /// `with_retry` block without a setter keep `RunInChildContext`, a
+    /// custom subtype is recorded on a succeeded and on a failed child
+    /// context, and on `with_retry` it labels the block only.
+    #[tokio::test]
+    async fn child_and_with_retry_record_custom_sub_type() {
+        use crate::OperationSubType;
+
+        let work_runs = Arc::new(AtomicU32::new(0));
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let work_runs = Arc::clone(&work_runs);
+                    async move {
+                        let checkout = || OperationSubType::new("Checkout");
+                        // Case A.
+                        let case_a = ctx
+                            .run_in_child_context(|_child| async { Ok(1_u32) })
+                            .name("case-a")
+                            .await?;
+                        // Case B.
+                        let case_b = ctx
+                            .run_in_child_context(|_child| async { Ok(2_u32) })
+                            .name("case-b")
+                            .sub_type(checkout()?)
+                            .await?;
+                        // Case C.
+                        let case_c = ctx
+                            .run_in_child_context(|_child| async {
+                                Err::<u32, BoxError>("declined".into())
+                            })
+                            .name("case-c")
+                            .sub_type(checkout()?)
+                            .await;
+                        assert!(case_c.is_err(), "case C must fail");
+                        // Case D: the step fails on its first run, so attempt
+                        // 1 fails and attempt 2 succeeds.
+                        let case_d = ctx
+                            .with_retry(move |child| {
+                                let work_runs = Arc::clone(&work_runs);
+                                async move {
+                                    let v = child
+                                        .step(move |_| async move {
+                                            if work_runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                                                Err::<u32, BoxError>("transient".into())
+                                            } else {
+                                                Ok(4)
+                                            }
+                                        })
+                                        .name("work")
+                                        .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+                                        .await?;
+                                    Ok(v)
+                                }
+                            })
+                            .name("block")
+                            .sub_type(checkout()?)
+                            .retry_strategy(|_err, attempt| {
+                                if attempt >= 2 {
+                                    RetryDecision::Stop
+                                } else {
+                                    RetryDecision::Retry {
+                                        delay: std::time::Duration::from_secs(1),
+                                    }
+                                }
+                            })
+                            .await?;
+                        // Case E.
+                        let case_e = ctx
+                            .with_retry(|_child| async { Ok(5_u32) })
+                            .name("case-e")
+                            .await?;
+                        Ok::<_, BoxError>(case_a + case_b + case_d + case_e)
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&12));
+
+        let op = |name: &str| result.operation(name).expect("the operation is recorded");
+        assert_eq!(op("case-a").sub_type(), Some("RunInChildContext"));
+        assert_eq!(op("case-b").sub_type(), Some("Checkout"));
+        assert!(op("case-b").succeeded());
+        let case_c_op = op("case-c");
+        assert!(case_c_op.failed(), "{case_c_op:?}");
+        assert_eq!(case_c_op.sub_type(), Some("Checkout"));
+        let block = op("block");
+        assert!(block.succeeded(), "{block:?}");
+        assert_eq!(block.sub_type(), Some("Checkout"));
+        assert!(op("attempt-1").failed());
+        assert!(op("attempt-2").succeeded());
+        assert_eq!(op("attempt-1").sub_type(), Some("RunInChildContext"));
+        assert_eq!(op("attempt-2").sub_type(), Some("RunInChildContext"));
+        assert_eq!(op("retry-delay-1").sub_type(), Some("Wait"));
+        let works: Vec<Option<&str>> = result
+            .operations()
+            .iter()
+            .filter(|o| o.name() == Some("work"))
+            .map(TestOperation::sub_type)
+            .collect();
+        assert_eq!(works, [Some("Step"), Some("Step")]);
+        assert_eq!(op("case-e").sub_type(), Some("RunInChildContext"));
     }
 
     #[tokio::test]

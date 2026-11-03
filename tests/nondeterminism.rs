@@ -1127,3 +1127,64 @@ async fn same_sub_type_replays_successfully() {
     assert_eq!(result.output().map(String::as_str), Some("paid"));
     assert!(result.invocation_count() >= 2);
 }
+
+/// A changed subtype on a child context or a `with_retry` block fails
+/// replay. Invocation 1 records the operation with `Payment` and suspends
+/// on a wait; invocation 2 creates the same operation with `Refund`.
+#[tokio::test]
+async fn child_sub_type_change_detected() {
+    fn sub_type(call: u32) -> durable::OperationSubType {
+        durable::OperationSubType::new(if call == 0 { "Payment" } else { "Refund" })
+            .expect("a valid subtype")
+    }
+
+    // A child context.
+    let result = run_per_invocation(|ctx, call| async move {
+        ctx.run_in_child_context(|_child| async { Ok(1_u32) })
+            .name("pay")
+            .sub_type(sub_type(call))
+            .await?;
+        ctx.wait(Duration::from_secs(1)).name("pause").await?;
+        Ok("done".to_owned())
+    })
+    .await;
+    assert!(result.is_failure(), "{:?}", result.error_message());
+    assert_eq!(result.error_type(), Some("NonDeterministicExecutionError"));
+
+    // A with_retry block.
+    let result = run_per_invocation(|ctx, call| async move {
+        ctx.with_retry(|_child| async { Ok(1_u32) })
+            .name("pay")
+            .sub_type(sub_type(call))
+            .await?;
+        ctx.wait(Duration::from_secs(1)).name("pause").await?;
+        Ok("done".to_owned())
+    })
+    .await;
+    assert!(result.is_failure(), "{:?}", result.error_message());
+    assert_eq!(result.error_type(), Some("NonDeterministicExecutionError"));
+}
+
+/// The handler of `child_sub_type_change_detected` with an unchanged
+/// subtype replays and succeeds.
+#[tokio::test]
+async fn child_same_sub_type_replays_successfully() {
+    let result = run_per_invocation(|ctx, _call| async move {
+        let a = ctx
+            .run_in_child_context(|_child| async { Ok(1_u32) })
+            .name("pay")
+            .sub_type(durable::OperationSubType::new("Payment")?)
+            .await?;
+        let b = ctx
+            .with_retry(|_child| async { Ok(2_u32) })
+            .name("pay-block")
+            .sub_type(durable::OperationSubType::new("Payment")?)
+            .await?;
+        ctx.wait(Duration::from_secs(1)).name("pause").await?;
+        Ok(format!("{}", a + b))
+    })
+    .await;
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.output().map(String::as_str), Some("3"));
+    assert!(result.invocation_count() >= 2);
+}

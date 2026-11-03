@@ -8,6 +8,7 @@ use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
 
 use crate::BoxError;
+use crate::OperationSubType;
 use crate::Serdes;
 use crate::context::DurableContext;
 use crate::engine::OperationId;
@@ -46,6 +47,7 @@ pub struct ChildBuilder<O, F, Fut, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
+    sub_type: Option<OperationSubType>,
     serdes: S,
     closure: F,
     _marker: PhantomData<fn() -> (O, Fut)>,
@@ -72,6 +74,7 @@ where
             ctx,
             op_id,
             name: None,
+            sub_type: None,
             serdes: JsonSerdes,
             closure,
             _marker: PhantomData,
@@ -94,6 +97,49 @@ where
         self
     }
 
+    /// Records `sub_type` instead of the default subtype.
+    ///
+    /// The subtype labels this child context in its checkpoint, in place
+    /// of `RunInChildContext`. So the child contexts of an operation
+    /// composed from several durable operations can be told apart.
+    /// Execution history and plugins read it. Without this call the child
+    /// context records [`OperationSubType::RUN_IN_CHILD_CONTEXT`]. A second
+    /// call replaces the first.
+    ///
+    /// Replay compares the recorded subtype with this one, as it compares
+    /// the name. So changing the subtype of an existing child context
+    /// breaks the executions in flight: their replay fails with
+    /// `NonDeterministicExecutionError`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::OperationSubType;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, durable::BoxError> {
+    ///     let order = ctx
+    ///         .run_in_child_context(|child| async move {
+    ///             let id = child
+    ///                 .step(|_| async { Ok("order-1".to_owned()) })
+    ///                 .name("reserve")
+    ///                 .await?;
+    ///             Ok(id)
+    ///         })
+    ///         .name("checkout")
+    ///         .sub_type(OperationSubType::new("Checkout")?)
+    ///         .await?;
+    ///     Ok(order)
+    /// }
+    /// ```
+    pub fn sub_type(mut self, sub_type: OperationSubType) -> Self {
+        self.sub_type = Some(sub_type);
+        self
+    }
+
     /// Overrides the serialization strategy for the child result.
     ///
     /// Replaces the builder's serdes type parameter with `S2`, which must
@@ -109,6 +155,7 @@ where
             ctx: self.ctx,
             op_id: self.op_id,
             name: self.name,
+            sub_type: self.sub_type,
             serdes,
             closure: self.closure,
             _marker: PhantomData,
@@ -183,7 +230,13 @@ where
     fn into_future(self) -> Self::IntoFuture {
         use crate::child::ChildExecution;
 
-        preflight_identity!(self, "Context", crate::child::CHILD_SUB_TYPE);
+        preflight_identity!(
+            self,
+            "Context",
+            self.sub_type
+                .as_ref()
+                .map_or(crate::child::CHILD_SUB_TYPE, OperationSubType::as_str)
+        );
 
         let gate = self.ctx.clone();
 
@@ -191,11 +244,35 @@ where
             ctx: self.ctx,
             op_id: self.op_id,
             name: self.name,
+            sub_type: self
+                .sub_type
+                .unwrap_or(OperationSubType::RUN_IN_CHILD_CONTEXT),
             serdes: self.serdes,
             closure: self.closure,
             _marker: PhantomData,
         };
 
         DurableFuture::for_operation(&gate, execution.execute())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A second `sub_type` call replaces the first, and `serdes` keeps
+    /// the subtype.
+    #[test]
+    fn sub_type_setter_replaces_and_survives_serdes() {
+        let ctx = DurableContext::test_context();
+        let builder = ctx
+            .run_in_child_context(|_child| async { Ok(1_u32) })
+            .sub_type(OperationSubType::new("First").unwrap())
+            .sub_type(OperationSubType::new("Second").unwrap())
+            .serdes(std::sync::Arc::new(JsonSerdes));
+        assert_eq!(
+            builder.sub_type.as_ref().map(OperationSubType::as_str),
+            Some("Second")
+        );
     }
 }

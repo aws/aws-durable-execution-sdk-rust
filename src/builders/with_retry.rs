@@ -11,6 +11,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::BoxError;
+use crate::OperationSubType;
 use crate::RetryStrategy;
 use crate::Serdes;
 use crate::context::DurableContext;
@@ -75,6 +76,7 @@ pub struct WithRetryBuilder<O, F, Fut, S = JsonSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
+    sub_type: Option<OperationSubType>,
     retry_strategy: Option<RetryStrategy>,
     serdes: S,
     closure: F,
@@ -102,6 +104,7 @@ where
             ctx,
             op_id,
             name: None,
+            sub_type: None,
             retry_strategy: None,
             serdes: JsonSerdes,
             closure,
@@ -122,6 +125,51 @@ where
     /// debugging purposes.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Records `sub_type` instead of the default subtype.
+    ///
+    /// The subtype labels this block's child context in its checkpoint, in
+    /// place of `RunInChildContext`. So the blocks of an operation composed
+    /// from several durable operations can be told apart. Execution history
+    /// and plugins read it. Without this call the block records
+    /// [`OperationSubType::RUN_IN_CHILD_CONTEXT`]. A second call replaces
+    /// the first.
+    ///
+    /// The subtype labels the block, not its attempts. Each attempt's
+    /// child context `attempt-N` keeps `RunInChildContext`, each delay
+    /// `retry-delay-N` keeps `Wait`, and every operation inside an attempt
+    /// keeps its own subtype.
+    ///
+    /// Replay compares the recorded subtype with this one, as it compares
+    /// the name. So changing the subtype of an existing block breaks the
+    /// executions in flight: their replay fails with
+    /// `NonDeterministicExecutionError`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    /// use aws_durable_execution_sdk::OperationSubType;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<u32, durable::BoxError> {
+    ///     let total = ctx
+    ///         .with_retry(|child| async move {
+    ///             let v = child.step(|_| async { Ok(42_u32) }).name("work").await?;
+    ///             Ok(v)
+    ///         })
+    ///         .name("block")
+    ///         .sub_type(OperationSubType::new("Checkout")?)
+    ///         .await?;
+    ///     Ok(total)
+    /// }
+    /// ```
+    pub fn sub_type(mut self, sub_type: OperationSubType) -> Self {
+        self.sub_type = Some(sub_type);
         self
     }
 
@@ -222,6 +270,7 @@ where
             ctx: self.ctx,
             op_id: self.op_id,
             name: self.name,
+            sub_type: self.sub_type,
             retry_strategy: self.retry_strategy,
             serdes,
             closure: self.closure,
@@ -300,7 +349,13 @@ where
 
         // The block is a child context on the wire; validate against the
         // recorded identity exactly as `run_in_child_context` does.
-        preflight_identity!(self, "Context", crate::child::CHILD_SUB_TYPE);
+        preflight_identity!(
+            self,
+            "Context",
+            self.sub_type
+                .as_ref()
+                .map_or(crate::child::CHILD_SUB_TYPE, OperationSubType::as_str)
+        );
 
         let closure = Arc::new(self.closure);
         let strategy: Arc<RetryStrategy> = Arc::new(
@@ -319,6 +374,9 @@ where
             ctx: self.ctx,
             op_id: self.op_id,
             name: self.name,
+            sub_type: self
+                .sub_type
+                .unwrap_or(OperationSubType::RUN_IN_CHILD_CONTEXT),
             serdes,
             // A concrete closure returning the concrete retry-loop future:
             // no erasure here: the one box is the DurableFuture below.
@@ -329,5 +387,26 @@ where
         };
 
         DurableFuture::for_operation(&gate, execution.execute())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A second `sub_type` call replaces the first, and `serdes` keeps
+    /// the subtype.
+    #[test]
+    fn sub_type_setter_replaces_and_survives_serdes() {
+        let ctx = DurableContext::test_context();
+        let builder = ctx
+            .with_retry(|_child| async { Ok(1_u32) })
+            .sub_type(OperationSubType::new("First").unwrap())
+            .sub_type(OperationSubType::new("Second").unwrap())
+            .serdes(Arc::new(JsonSerdes));
+        assert_eq!(
+            builder.sub_type.as_ref().map(OperationSubType::as_str),
+            Some("Second")
+        );
     }
 }
