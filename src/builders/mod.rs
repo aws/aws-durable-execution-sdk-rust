@@ -127,7 +127,7 @@ pub use self::callback::{CreateCallbackBuilder, WaitForCallbackBuilder};
 pub use self::child::ChildBuilder;
 pub use self::combinator::{JoinAllBuilder, RaceBuilder, SelectOkBuilder, TryJoinAllBuilder};
 pub use self::invoke::InvokeBuilder;
-pub use self::map_parallel::{MapBuilder, ParallelBuilder};
+pub use self::map_parallel::{MapBuilder, ParallelBuilder, ParallelMixedBuilder};
 pub use self::step::StepBuilder;
 pub use self::wait::WaitBuilder;
 pub use self::wait_for_condition::WaitForConditionBuilder;

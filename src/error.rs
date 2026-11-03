@@ -1454,6 +1454,12 @@ pub enum ChildContextErrorKind {
     /// (`CUSTOM_COMPLETION_FAILED`), and no item failed.
     #[non_exhaustive]
     BatchCompletionFailed,
+    /// A [`BranchHandle`](crate::BranchHandle) has no result: the
+    /// `parallel_mixed` operation that owns its branch has not returned, the
+    /// branch never started, or the batch completed while the branch still
+    /// ran.
+    #[non_exhaustive]
+    NotCompleted,
 }
 
 impl fmt::Display for ChildContextErrorKind {
@@ -1462,6 +1468,7 @@ impl fmt::Display for ChildContextErrorKind {
             Self::ChildFailed => write!(f, "child failed"),
             Self::Internal => write!(f, "internal error"),
             Self::BatchCompletionFailed => write!(f, "batch completed as failed"),
+            Self::NotCompleted => write!(f, "branch has no result"),
         }
     }
 }

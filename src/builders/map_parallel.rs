@@ -851,6 +851,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
+            child_ids: None,
         };
 
         DurableFuture::for_operation(&gate, execution.execute_batch_result())
@@ -923,9 +924,125 @@ where
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
+            child_ids: None,
         };
 
         DurableFuture::for_operation(&gate, execution.execute())
+    }
+}
+
+/// Builder for a parallel operation over branches whose results have
+/// different types.
+///
+/// Created by [`DurableContext::parallel_mixed`]. Each branch's result is
+/// read through the [`BranchHandle`](crate::BranchHandle) that
+/// [`BranchSet`](crate::BranchSet) returned when the branch was added, so
+/// the builder has no item serdes and no `await_batch`. `.await` returns
+/// the batch's [`CompletionReason`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use aws_durable_execution_sdk as durable;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<String, durable::BoxError> {
+///     let mut branches = durable::BranchSet::new();
+///     let count = branches.add("count", |_| async { Ok(7_u32) });
+///     let label = branches.add("label", |_| async { Ok("ready".to_owned()) });
+///     ctx.parallel_mixed(branches)
+///         .name("fan-out")
+///         .max_concurrency(2)
+///         .await?;
+///     Ok(format!("{}: {}", count.into_result()?, label.into_result()?))
+/// }
+/// ```
+#[must_use = "builders do nothing unless awaited"]
+#[non_exhaustive]
+pub struct ParallelMixedBuilder {
+    ctx: DurableContext,
+    op_id: OperationId,
+    name: Option<String>,
+    max_concurrency: Option<usize>,
+    branches: crate::future::BranchSet,
+}
+
+impl std::fmt::Debug for ParallelMixedBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParallelMixedBuilder")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ParallelMixedBuilder {
+    /// Creates a new builder (internal).
+    pub(crate) fn new_internal(
+        ctx: DurableContext,
+        op_id: OperationId,
+        branches: crate::future::BranchSet,
+    ) -> Self {
+        Self {
+            ctx,
+            op_id,
+            name: None,
+            max_concurrency: None,
+            branches,
+        }
+    }
+
+    /// Sets a human-readable name for this parallel operation.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Sets the maximum number of concurrent branches.
+    ///
+    /// `0` fails the execution with the error `Invalid max_concurrency: 0.
+    /// Must be a positive number or unset for unlimited concurrency.`; it
+    /// cannot be caught, and the parallel records nothing. Unset means
+    /// unlimited.
+    pub fn max_concurrency(mut self, max: usize) -> Self {
+        self.max_concurrency = Some(max);
+        self
+    }
+}
+
+impl IntoFuture for ParallelMixedBuilder {
+    type Output = Result<CompletionReason, OperationError>;
+    type IntoFuture = DurableFuture<CompletionReason>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        use crate::map_parallel::{
+            MixedItemSerdes, PARALLEL_SUB_TYPE, ParallelExecution, publish_outcome,
+        };
+
+        preflight_identity!(self, "Context", PARALLEL_SUB_TYPE);
+
+        let gate = self.ctx.clone();
+        let (branches, decoders, json) = self.branches.into_parts();
+        let serdes = MixedItemSerdes::new(self.op_id.wire(), Arc::clone(&decoders));
+        let child_ids = Some(serdes.child_ids());
+        let execution = ParallelExecution {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            max_concurrency: self.max_concurrency,
+            completion: None,
+            serdes,
+            encoding: ItemEncoding::PerItem(json),
+            result_serdes: PassthroughSerdes,
+            nesting: NestingMode::Normal,
+            branches,
+            child_ids,
+        };
+
+        DurableFuture::for_operation(&gate, async move {
+            publish_outcome(execution.execute_batch_result().await, &decoders)
+        })
     }
 }
 

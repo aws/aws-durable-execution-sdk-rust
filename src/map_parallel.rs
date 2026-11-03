@@ -906,6 +906,7 @@ where
             MAP_SUB_TYPE,
             MAP_ITERATION_SUB_TYPE,
             &dispatch,
+            None,
         )
         .await
     }
@@ -923,6 +924,10 @@ pub(crate) struct ParallelExecution<O, IS, RS> {
     pub(crate) result_serdes: RS,
     pub(crate) nesting: NestingMode,
     pub(crate) branches: Vec<(Option<String>, crate::future::BranchBody<O>)>,
+    /// Where the batch engine registers the child ID of each branch:
+    /// `Some` for `parallel_mixed`, whose item serdes finds a branch by its
+    /// child ID, and `None` for `parallel`.
+    pub(crate) child_ids: Option<ChildIds>,
 }
 
 impl<O, IS, RS> ParallelExecution<O, IS, RS>
@@ -982,6 +987,7 @@ where
             PARALLEL_SUB_TYPE,
             PARALLEL_BRANCH_SUB_TYPE,
             &dispatch,
+            self.child_ids.as_ref(),
         )
         .await
     }
@@ -1015,43 +1021,185 @@ fn record_names_of(user_names: &[Option<String>], prefix: &str) -> Vec<String> {
 /// `CustomCompletionFailed` batch with no failed item becomes a
 /// `BatchCompletionFailed` error instead.
 fn collect_successful<O>(batch_result: BatchResult<O>) -> Result<Vec<O>, OperationError> {
-    let fails_batch = matches!(
-        batch_result.reason,
+    if let Some(err) = await_error(&batch_result) {
+        return Err(err);
+    }
+    // Failed items within tolerance and items still started at batch
+    // completion carry no value, so the `Vec<O>` view skips them.
+    Ok(batch_result
+        .items
+        .into_iter()
+        .filter(|item| item.status == BatchItemStatus::Succeeded)
+        .filter_map(|item| item.result)
+        .collect())
+}
+
+/// The error the `.await` of a map or parallel returns for `batch`, or
+/// `None` when it returns the values.
+///
+/// A batch that ended because the failure tolerance was exceeded
+/// (including the default fail-fast case) or because the predicate
+/// completed it as failed returns the first failed item's error: a
+/// `ChildFailed` error that carries the item's recorded wire record (type,
+/// message, `error_data`, `stack_trace`), reserving `Internal` for
+/// coordinator defects. When no item failed, the first case returns a
+/// batch error and the second a `BatchCompletionFailed` error. Every other
+/// batch returns `None`. `collect_successful` and `publish_outcome` both
+/// call it, so `parallel` and `parallel_mixed` fail on the same batches
+/// with the same error.
+fn await_error<O>(batch: &BatchResult<O>) -> Option<OperationError> {
+    if !matches!(
+        batch.reason,
         CompletionReason::FailureToleranceExceeded | CompletionReason::CustomCompletionFailed
-    );
-    let mut results = Vec::with_capacity(batch_result.items.len());
-    for item in batch_result.items {
+    ) {
+        return None;
+    }
+    if let Some(item) = batch
+        .items
+        .iter()
+        .find(|item| item.status == BatchItemStatus::Failed)
+    {
+        return Some(item_failure_error(item.failure_wire()));
+    }
+    Some(match batch.reason {
+        CompletionReason::FailureToleranceExceeded => batch_error("failure tolerance exceeded"),
+        _ => batch_completion_failed_error(),
+    })
+}
+
+/// The child IDs of a `parallel_mixed` batch, mapped to the indexes of
+/// their branches.
+///
+/// The batch engine takes each child ID from the next ID of the caller's
+/// context when it starts the item, after the batch parent's START. An
+/// operation that runs beside the batch on the same context can take IDs
+/// in between. So the IDs are not known before the batch runs, and the
+/// engine registers each child ID here when it assigns the ID to an item.
+#[derive(Clone, Default)]
+pub(crate) struct ChildIds(Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>);
+
+impl ChildIds {
+    fn insert(&self, wire: String, index: usize) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(wire, index);
+    }
+
+    fn get(&self, wire: &str) -> Option<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(wire)
+            .copied()
+    }
+}
+
+/// Registers `op_id` as the child ID of item `index`, when the batch has a
+/// [`ChildIds`] map.
+fn register_child_id(child_ids: Option<&ChildIds>, index: usize, op_id: &OperationId) {
+    if let Some(child_ids) = child_ids {
+        child_ids.insert(op_id.wire().to_owned(), index);
+    }
+}
+
+/// The item serdes of `parallel_mixed`: each branch's serdes, found from
+/// the operation ID of the child that is being encoded or decoded.
+///
+/// `Serdes::deserialize` receives no item index, but its `SerdesContext`
+/// names the child. So `by_op_id` maps each child wire ID to the branch
+/// index: the batch engine registers each child ID when it assigns it (see
+/// [`ChildIds`]). `by_op_id` also maps the `{parent_wire}/item-{index}`
+/// context a preview batch record replays with. A value encodes itself: it
+/// carries its own branch's serdes.
+pub(crate) struct MixedItemSerdes {
+    by_op_id: ChildIds,
+    decoders: Arc<Vec<Arc<dyn crate::future::BranchDecoder>>>,
+}
+
+impl MixedItemSerdes {
+    /// Builds the item serdes of a batch whose parent has the wire ID
+    /// `parent_wire`, with the preview contexts of its branches mapped. The
+    /// batch registers the child IDs into [`Self::child_ids`].
+    pub(crate) fn new(
+        parent_wire: &str,
+        decoders: Arc<Vec<Arc<dyn crate::future::BranchDecoder>>>,
+    ) -> Self {
+        let by_op_id = ChildIds::default();
+        for index in 0..decoders.len() {
+            by_op_id.insert(format!("{parent_wire}/item-{index}"), index);
+        }
+        Self { by_op_id, decoders }
+    }
+
+    /// The map the batch engine registers the child IDs into.
+    pub(crate) fn child_ids(&self) -> ChildIds {
+        self.by_op_id.clone()
+    }
+}
+
+impl Serdes<crate::future::MixedValue> for MixedItemSerdes {
+    async fn serialize(
+        &self,
+        value: crate::future::MixedValue,
+        context: SerdesContext,
+    ) -> Result<String, BoxError> {
+        value.0.encode(context).await
+    }
+
+    async fn deserialize(
+        &self,
+        wire: String,
+        context: SerdesContext,
+    ) -> Result<crate::future::MixedValue, BoxError> {
+        let decoder = self
+            .by_op_id
+            .get(context.operation_id())
+            .and_then(|index| self.decoders.get(index))
+            .ok_or_else(|| {
+                format!(
+                    "parallel_mixed: no branch has operation ID \"{}\"",
+                    context.operation_id()
+                )
+            })?;
+        decoder.decode(wire, context).await
+    }
+}
+
+/// Publishes each settled branch of a `parallel_mixed` batch to its handle,
+/// and returns what the `.await` of `parallel_mixed` returns.
+///
+/// An `Err` from the batch publishes nothing. For an `Ok` batch, every
+/// settled item is published, whatever [`await_error`] returns: a
+/// succeeded item with a value fills its handle with the value, and a
+/// failed item fills its handle with the error `parallel(...).await`
+/// returns for it. Every other item publishes nothing, so a handle has a
+/// result exactly when its branch settled. A failed item whose index names
+/// no branch is skipped, because the item indexes of a recorded batch are
+/// not checked against the branch count.
+pub(crate) fn publish_outcome(
+    result: Result<BatchResult<crate::future::MixedValue>, OperationError>,
+    decoders: &[Arc<dyn crate::future::BranchDecoder>],
+) -> Result<CompletionReason, OperationError> {
+    let batch = result?;
+    let error = await_error(&batch);
+    let reason = batch.reason;
+    for item in batch.items {
         match item.status {
             BatchItemStatus::Succeeded => {
                 if let Some(value) = item.result {
-                    results.push(value);
+                    value.0.publish();
                 }
             }
             BatchItemStatus::Failed => {
-                if fails_batch {
-                    // A user item body failed: classify as ChildFailed
-                    // carrying the item's COMPLETE recorded wire record
-                    // (type, message, `error_data`, `stack_trace`),
-                    // reserving `Internal` for coordinator defects.
-                    return Err(item_failure_error(item.failure_wire()));
+                if let Some(decoder) = decoders.get(item.index) {
+                    decoder.publish_error(item_failure_error(item.failure_wire()));
                 }
-                // Within tolerance: skip this item in the Vec<O> output.
             }
-            // Started-but-not-terminal at batch completion (live, or
-            // replayed from the decision record): carries no value, so it is
-            // skipped in the Vec<O> success view exactly like a tolerated
-            // failure.
             BatchItemStatus::Started => {}
         }
     }
-    // Check if the batch itself failed with no failed item.
-    match batch_result.reason {
-        CompletionReason::FailureToleranceExceeded => {
-            Err(batch_error("failure tolerance exceeded"))
-        }
-        CompletionReason::CustomCompletionFailed => Err(batch_completion_failed_error()),
-        _ => Ok(results),
-    }
+    error.map_or(Ok(reason), Err)
 }
 
 /// A pre-claimed child operation with its metadata.
@@ -1781,6 +1929,7 @@ async fn execute_batch<O, IS, RS>(
     parent_sub_type: &str,
     child_sub_type: &str,
     dispatch: &dyn ItemDispatch<O, IS>,
+    child_ids: Option<&ChildIds>,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -1882,6 +2031,7 @@ where
                         &record_names,
                         &serdes,
                         child_sub_type,
+                        child_ids,
                     )
                     .await
                     {
@@ -1926,10 +2076,11 @@ where
                     parent_name.as_deref(),
                     &snapshot,
                     &serdes,
-                    encoding,
+                    encoding.clone(),
                     total_items,
                     &result_serdes,
                     &serdes_ctx,
+                    child_ids,
                 )
                 .await
                 {
@@ -2018,7 +2169,7 @@ where
             items: Vec::new(),
             reason,
         };
-        let payload = from_batch_result(&result, &[], encoding);
+        let payload = from_batch_result(&result, &[], &encoding);
         let serialized_payload = serialize_value(
             &ctx,
             parent_name.as_deref(),
@@ -2063,6 +2214,7 @@ where
     if concurrency > 1 {
         for i in 0..total_items {
             let child_op_id = ctx.mint_id();
+            register_child_id(child_ids, i, &child_op_id);
             // Under a replay plan, only indexes the record admits as
             // COMPLETED have their child checkpoints consulted. Started-set
             // entries are reconstructed from the record alone and
@@ -2271,6 +2423,7 @@ where
                 }
             } else {
                 let child_op_id = ctx.peek_id_at(0);
+                register_child_id(child_ids, i, &child_op_id);
                 // Non-determinism detection on child items happens inside
                 // the validated view fetch; only the status is consumed.
                 let view = ctx.checkpoint_view_validated(
@@ -2493,7 +2646,7 @@ where
     // serdes call), then pass it through the SAME `serialize_value` helper
     // as every other path. `result_serdes` receives the record's JSON text
     // and returns the payload to store.
-    let payload = from_batch_result(&batch_result, &final_wires, encoding);
+    let payload = from_batch_result(&batch_result, &final_wires, &encoding);
     let serialized_payload = serialize_value(
         &ctx,
         parent_name.as_deref(),
@@ -2537,6 +2690,7 @@ async fn replay_terminal_batch<O, IS, RS>(
     total_items: usize,
     result_serdes: &RS,
     serdes_ctx: &SerdesContext,
+    child_ids: Option<&ChildIds>,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -2573,6 +2727,7 @@ where
                 total_items,
                 serdes_ctx.operation_id(),
                 serdes_ctx.durable_execution_arn(),
+                child_ids,
             )
             .await
         }
@@ -2895,6 +3050,7 @@ async fn replay_batch_from_record<O, IS>(
     record_names: &[String],
     serdes: &Arc<IS>,
     child_sub_type: &str,
+    child_ids: Option<&ChildIds>,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -2928,6 +3084,7 @@ where
             continue;
         }
         let op_id = ctx.peek_id_at(i);
+        register_child_id(child_ids, i, &op_id);
         // Non-determinism detection: validate the claimed child identity
         // against the record before decoding its terminal payload.
         ctx.checkpoint_view_validated(
@@ -3405,7 +3562,7 @@ fn item_fault_name(item_name: &str) -> Option<&str> {
 /// as it is. The builder knows which serdes it holds: it starts with the
 /// default JSON serdes, and `.serdes(..)` replaces it. The record itself
 /// has no field for the encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ItemEncoding {
     /// Every item uses the default JSON serdes. The record embeds each
     /// value as the JSON value of its child wire string.
@@ -3413,6 +3570,31 @@ pub(crate) enum ItemEncoding {
     /// Every item uses a custom serdes. The record stores each value as its
     /// child wire string, in a JSON string.
     AllSerdes,
+    /// Each item has its own serdes, as in `parallel_mixed`. Entry `i` is
+    /// `true` when item `i` uses the default JSON serdes, and `false` when
+    /// it uses a custom serdes. There is one entry per item.
+    PerItem(Arc<[bool]>),
+}
+
+impl ItemEncoding {
+    /// Whether the record embeds the value of item `index` as JSON, rather
+    /// than as its wire string in a JSON string.
+    fn is_json(&self, index: usize) -> bool {
+        match self {
+            Self::AllJson => true,
+            Self::AllSerdes => false,
+            // `parallel_mixed` builds one flag per branch, and every item
+            // index of a batch is below its item count: the live batch
+            // numbers its items, and a recorded batch with more items than
+            // the input fails before any item is decoded. So the lookup
+            // cannot miss.
+            #[expect(clippy::expect_used)]
+            // reason: there is one flag per item, and every item index is below the item count
+            Self::PerItem(flags) => *flags
+                .get(index)
+                .expect("parallel_mixed has one encoding flag per branch"),
+        }
+    }
 }
 
 /// The serdes context of an item value inside a batch record that an
@@ -3735,7 +3917,7 @@ fn js_item_error<O>(item: &BatchItem<O>) -> JsErrorObject {
 fn from_batch_result<O>(
     result: &BatchResult<O>,
     wires: &[Option<String>],
-    encoding: ItemEncoding,
+    encoding: &ItemEncoding,
 ) -> String {
     let all = result
         .items
@@ -3744,13 +3926,12 @@ fn from_batch_result<O>(
         .map(|(item, wire)| {
             // Only a succeeded item has a wire string.
             let value = wire.as_ref().map(|wire| {
-                let text = match encoding {
-                    ItemEncoding::AllJson => wire.clone(),
+                let text = if encoding.is_json(item.index) {
+                    wire.clone()
+                } else {
                     #[expect(clippy::expect_used)]
                     // reason: serializing a `String` to JSON cannot fail
-                    ItemEncoding::AllSerdes => {
-                        serde_json::to_string(wire).expect("a string serializes to JSON")
-                    }
+                    serde_json::to_string(wire).expect("a string serializes to JSON")
                 };
                 // The default JSON serdes wrote `wire` with
                 // `serde_json::to_string`, or read it back with
@@ -3834,6 +4015,7 @@ fn oversized_batch_summary<O>(result: &BatchResult<O>, parent_sub_type: &str) ->
 /// child's serdes context. A record from an earlier release decodes it with
 /// the context that release used (see [`preview_item_serdes_ctx`]).
 /// `total_items` is the length of the current input.
+#[expect(clippy::too_many_arguments)] // reason: the record decode needs the child-ID map beside the serdes inputs
 async fn to_batch_result<O, IS>(
     ctx: &DurableContext,
     record_text: &str,
@@ -3842,6 +4024,7 @@ async fn to_batch_result<O, IS>(
     total_items: usize,
     parent_wire: &str,
     execution_arn: &str,
+    child_ids: Option<&ChildIds>,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -3849,7 +4032,16 @@ where
 {
     match parse_batch_record(record_text).map_err(|message| batch_error(&message))? {
         BatchRecord::Js(record) => {
-            js_to_batch_result(ctx, record, serdes, encoding, total_items, execution_arn).await
+            js_to_batch_result(
+                ctx,
+                record,
+                serdes,
+                encoding,
+                total_items,
+                execution_arn,
+                child_ids,
+            )
+            .await
         }
         BatchRecord::Preview(record) => {
             preview_to_batch_result(ctx, record, serdes, parent_wire, execution_arn).await
@@ -3880,6 +4072,7 @@ async fn js_to_batch_result<O, IS>(
     encoding: ItemEncoding,
     total_items: usize,
     execution_arn: &str,
+    child_ids: Option<&ChildIds>,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -3909,18 +4102,19 @@ where
             .ok_or_else(|| batch_error(&format!("batch record item {index}: missing name")))?;
         let result = match (status, item.result) {
             (BatchItemStatus::Succeeded, Some(value)) => {
-                let wire = match encoding {
+                let wire = if encoding.is_json(index) {
                     // The item serdes reads the exact JSON text it wrote.
-                    ItemEncoding::AllJson => value.get().to_owned(),
-                    ItemEncoding::AllSerdes => serde_json::from_str::<String>(value.get())
-                        .map_err(|_| {
-                            batch_error(&format!(
-                                "batch record item {index}: expected a string result"
-                            ))
-                        })?,
+                    value.get().to_owned()
+                } else {
+                    serde_json::from_str::<String>(value.get()).map_err(|_| {
+                        batch_error(&format!(
+                            "batch record item {index}: expected a string result"
+                        ))
+                    })?
                 };
-                let item_ctx =
-                    SerdesContext::new(ctx.peek_id_at(index).wire().to_owned(), execution_arn);
+                let child_op_id = ctx.peek_id_at(index);
+                register_child_id(child_ids, index, &child_op_id);
+                let item_ctx = SerdesContext::new(child_op_id.wire().to_owned(), execution_arn);
                 Some(
                     deserialize_value::<O, _>(
                         ctx,
@@ -6976,7 +7170,7 @@ mod tests {
         let payload = from_batch_result(
             &original,
             &[Some("7".to_owned()), None],
-            ItemEncoding::AllJson,
+            &ItemEncoding::AllJson,
         );
         let replayed: BatchResult<i32> = to_batch_result(
             &test_ctx(CheckpointLog::empty()),
@@ -6986,6 +7180,7 @@ mod tests {
             2,
             "parent-wire",
             "arn:test",
+            None,
         )
         .await
         .expect("deserializing the payload must succeed");
@@ -7032,7 +7227,7 @@ mod tests {
         let payload = record_json(&from_batch_result(
             &original,
             &[None],
-            ItemEncoding::AllJson,
+            &ItemEncoding::AllJson,
         ));
         assert_eq!(
             payload.pointer("/all/0/error/Cause/ErrorType"),
@@ -7053,7 +7248,11 @@ mod tests {
             )],
             CompletionReason::AllCompleted,
         );
-        let payload = record_json(&from_batch_result(&untyped, &[None], ItemEncoding::AllJson));
+        let payload = record_json(&from_batch_result(
+            &untyped,
+            &[None],
+            &ItemEncoding::AllJson,
+        ));
         assert_eq!(
             payload.pointer("/all/0/error/Cause/ErrorMessage"),
             Some(&serde_json::json!(""))
@@ -7075,6 +7274,7 @@ mod tests {
             2,
             "parent-wire",
             "arn:test",
+            None,
         )
         .await
         .expect("deserializing the payload must succeed");
@@ -7270,6 +7470,166 @@ mod tests {
 
     fn indexes<'a>(items: impl Iterator<Item = &'a BatchItem<i32>>) -> Vec<usize> {
         items.map(|item| item.index).collect()
+    }
+
+    /// A `parallel_mixed` item serdes with one branch, on a fresh context.
+    fn one_branch_mixed_serdes() -> (MixedItemSerdes, crate::BranchHandle<u32>) {
+        let mut set = crate::BranchSet::new();
+        let handle = set.add("only", |_ctx| async { Ok(1_u32) });
+        let (_bodies, decoders, _json) = set.into_parts();
+        (MixedItemSerdes::new("parent-wire", decoders), handle)
+    }
+
+    #[tokio::test]
+    async fn mixed_item_serdes_rejects_unknown_operation_id() {
+        let (serdes, _handle) = one_branch_mixed_serdes();
+        let err = serdes
+            .deserialize("1".to_owned(), SerdesContext::new("other", "arn:test"))
+            .await
+            .err()
+            .expect("an unknown operation ID is an error");
+        assert_eq!(
+            err.to_string(),
+            r#"parallel_mixed: no branch has operation ID "other""#
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_item_serdes_finds_child_and_preview_ids() {
+        let mut set = crate::BranchSet::new();
+        let _first = set.add("first", |_ctx| async { Ok(1_u32) });
+        let second = set.add("second", |_ctx| async { Ok(2_u32) });
+        let (_bodies, decoders, _json) = set.into_parts();
+        let ctx = test_ctx(CheckpointLog::empty());
+        let parent = "parent-wire";
+        let serdes = MixedItemSerdes::new(parent, decoders);
+        // The batch engine registers the child ID it gives branch 1.
+        let child_op_id = ctx.peek_id_at(5);
+        register_child_id(Some(&serdes.child_ids()), 1, &child_op_id);
+        // The registered child ID of branch 1 and the preview context of
+        // branch 1 both reach branch 1's decoder: publishing the decoded
+        // value fills branch 1's handle.
+        let child = SerdesContext::new(child_op_id.wire().to_owned(), "arn:test");
+        let value = serdes
+            .deserialize("7".to_owned(), child)
+            .await
+            .expect("the child ID names branch 1");
+        value.0.publish();
+        let preview = SerdesContext::new(format!("{parent}/item-1"), "arn:test");
+        let value = serdes
+            .deserialize("8".to_owned(), preview)
+            .await
+            .expect("the preview context names branch 1");
+        // The later publish replaces the earlier value in the slot.
+        value.0.publish();
+        assert_eq!(second.into_result().expect("branch 1 holds a value"), 8);
+    }
+
+    #[test]
+    fn publish_outcome_publishes_nothing_for_an_error_or_a_valueless_item() {
+        let mut set = crate::BranchSet::new();
+        let handle = set.add("only", |_ctx| async { Ok(1_u32) });
+        let (_bodies, decoders, _json) = set.into_parts();
+        let err = publish_outcome(Err(batch_error("checkpoint failed")), &decoders)
+            .expect_err("the batch error is returned");
+        assert_eq!(
+            format!("{err:#}"),
+            format!("{:#}", batch_error("checkpoint failed"))
+        );
+        // A succeeded item without a value publishes nothing either.
+        let item = BatchItem::<crate::future::MixedValue>::new(
+            0,
+            "only".to_owned(),
+            BatchItemStatus::Succeeded,
+            None,
+            None,
+            None,
+        );
+        let reason = publish_outcome(
+            Ok(BatchResult::new(vec![item], CompletionReason::AllCompleted)),
+            &decoders,
+        )
+        .expect("an all-completed batch succeeds");
+        assert_eq!(reason, CompletionReason::AllCompleted);
+        let err = handle.into_result().expect_err("the handle has no result");
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::ChildContext(child)
+                if matches!(child.kind(), ChildContextErrorKind::NotCompleted)
+        ));
+    }
+
+    #[test]
+    fn parallel_mixed_builder_debug_shows_the_name() {
+        let ctx = test_ctx(CheckpointLog::empty());
+        let builder = ctx.parallel_mixed(crate::BranchSet::new()).name("pm");
+        assert_eq!(
+            format!("{builder:?}"),
+            r#"ParallelMixedBuilder { name: Some("pm"), .. }"#
+        );
+    }
+
+    #[test]
+    fn publish_outcome_skips_item_without_branch() {
+        let mut set = crate::BranchSet::new();
+        let handle = set.add("only", |_ctx| async { Ok(1_u32) });
+        let (_bodies, decoders, _json) = set.into_parts();
+        let failed = |index: usize| {
+            BatchItem::<crate::future::MixedValue>::new(
+                index,
+                format!("item-{index}"),
+                BatchItemStatus::Failed,
+                None,
+                Some(format!("boom-{index}")),
+                Some(format!("Type{index}")),
+            )
+        };
+        let batch = BatchResult::new(
+            vec![failed(0), failed(1)],
+            CompletionReason::FailureToleranceExceeded,
+        );
+        let err = publish_outcome(Ok(batch), &decoders)
+            .expect_err("a batch over its failure tolerance fails");
+        let wire = err.wire().expect("the error carries item 0's record");
+        assert_eq!(wire.error_type(), Some("Type0"));
+        assert_eq!(wire.error_message(), Some("boom-0"));
+        let held = handle
+            .into_result()
+            .expect_err("handle 0 holds item 0's error");
+        let held = held.wire().expect("the handle's error carries a record");
+        assert_eq!(held.error_type(), Some("Type0"));
+        assert_eq!(held.error_message(), Some("boom-0"));
+    }
+
+    /// A batch whose reason is `FailureToleranceExceeded` but that holds no
+    /// failed item, as only a corrupt record can, fails with the internal
+    /// error `failure tolerance exceeded`. `parallel(...).await` and
+    /// `parallel_mixed(...).await` return that same error.
+    #[test]
+    fn tolerance_exceeded_without_failed_item_is_an_internal_error() {
+        let batch = || {
+            BatchResult::new(
+                vec![item(0, BatchItemStatus::Succeeded, Some(1))],
+                CompletionReason::FailureToleranceExceeded,
+            )
+        };
+        let is_tolerance_error = |err: &OperationError| {
+            matches!(
+                err.kind(),
+                OperationErrorKind::ChildContext(child)
+                    if matches!(child.kind(), ChildContextErrorKind::Internal)
+            ) && crate::error::chain_string(err).contains("failure tolerance exceeded")
+        };
+        let err = await_error(&batch()).expect("the reason is a failing reason");
+        assert!(is_tolerance_error(&err), "{err:?}");
+        let err = collect_successful(batch()).expect_err("parallel fails the batch");
+        assert!(is_tolerance_error(&err), "{err:?}");
+        let mixed = BatchResult::<crate::future::MixedValue>::new(
+            Vec::new(),
+            CompletionReason::FailureToleranceExceeded,
+        );
+        let err = publish_outcome(Ok(mixed), &[]).expect_err("parallel_mixed fails the batch");
+        assert!(is_tolerance_error(&err), "{err:?}");
     }
 
     #[test]
@@ -10130,7 +10490,7 @@ mod tests {
             )],
             CompletionReason::AllCompleted,
         );
-        let json = from_batch_result(&result, &[Some(String::new())], ItemEncoding::AllSerdes);
+        let json = from_batch_result(&result, &[Some(String::new())], &ItemEncoding::AllSerdes);
         assert!(json.contains(r#""result":"""#), "json: {json}");
         let back = js_record(&json);
         assert_eq!(
@@ -10150,6 +10510,7 @@ mod tests {
             2,
             "parent-wire",
             "arn:test",
+            None,
         )
         .await
         .expect("a preview summary replays");
@@ -10167,7 +10528,11 @@ mod tests {
             )],
             CompletionReason::MinSuccessfulReached,
         );
-        let json = record_json(&from_batch_result(&started, &[None], ItemEncoding::AllJson));
+        let json = record_json(&from_batch_result(
+            &started,
+            &[None],
+            &ItemEncoding::AllJson,
+        ));
         let item = json.pointer("/all/0").expect("one item");
         assert!(item.get("result").is_none(), "item: {item}");
         assert!(item.get("error").is_none(), "item: {item}");
@@ -10457,7 +10822,7 @@ mod tests {
     }
 
     /// The batch record text of `wires`, one succeeded `map` item per wire.
-    fn record_of_wires(wires: &[&str], encoding: ItemEncoding) -> String {
+    fn record_of_wires(wires: &[&str], encoding: &ItemEncoding) -> String {
         let items = (0..wires.len())
             .map(|index| {
                 BatchItem::new(
@@ -10531,7 +10896,7 @@ mod tests {
             "1.0",
             "-0",
         ];
-        let text = record_of_wires(&wires, ItemEncoding::AllJson);
+        let text = record_of_wires(&wires, &ItemEncoding::AllJson);
         for wire in wires {
             assert!(
                 text.contains(&format!(r#""result":{wire}}}"#)),
@@ -10556,6 +10921,7 @@ mod tests {
             wires.len(),
             "parent-wire",
             "arn:test",
+            None,
         )
         .await
         .expect("the record replays");
@@ -10580,7 +10946,7 @@ mod tests {
             "340282366920938463463374607431768211455",
             "plain",
         ];
-        let text = record_of_wires(&wires, ItemEncoding::AllSerdes);
+        let text = record_of_wires(&wires, &ItemEncoding::AllSerdes);
         assert_eq!(
             result_texts(&text),
             vec![
@@ -10598,6 +10964,7 @@ mod tests {
             wires.len(),
             "parent-wire",
             "arn:test",
+            None,
         )
         .await
         .expect("the record replays");
@@ -10624,6 +10991,7 @@ mod tests {
             3,
             "parent-wire",
             "arn:test",
+            None,
         )
         .await
         .expect("the earlier record replays");
@@ -11088,7 +11456,7 @@ mod tests {
         item.error_data = Some("data".to_owned());
         item.stack_trace = vec!["frame-a".to_owned(), "frame-b".to_owned()];
         let result = BatchResult::new(vec![item], CompletionReason::AllCompleted);
-        let payload = record_json(&from_batch_result(&result, &[None], ItemEncoding::AllJson));
+        let payload = record_json(&from_batch_result(&result, &[None], &ItemEncoding::AllJson));
         assert_eq!(
             payload.pointer("/all/0/error"),
             Some(&serde_json::json!({

@@ -14,8 +14,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::BoxError;
 use crate::builders::{
     ChildBuilder, CreateCallbackBuilder, InvokeBuilder, JoinAllBuilder, MapBuilder,
-    ParallelBuilder, RaceBuilder, SelectOkBuilder, StepBuilder, TryJoinAllBuilder, WaitBuilder,
-    WaitForCallbackBuilder, WaitForConditionBuilder, WithRetryBuilder,
+    ParallelBuilder, ParallelMixedBuilder, RaceBuilder, SelectOkBuilder, StepBuilder,
+    TryJoinAllBuilder, WaitBuilder, WaitForCallbackBuilder, WaitForConditionBuilder,
+    WithRetryBuilder,
 };
 use crate::checkpoint_coalescer::{
     Admission, BatchLimits, CheckpointBatch, CheckpointCoalescer, TrackedUpdate,
@@ -2869,11 +2870,105 @@ impl DurableContext {
     pub fn parallel<Branches, O>(&self, branches: Branches) -> ParallelBuilder<O>
     where
         Branches: IntoIterator<Item = Branch<O>>,
-        O: Serialize + DeserializeOwned + Send + 'static,
+        O: Send + 'static,
     {
         let op_id = self.claim_operation_id("parallel");
         let branch_tuples: Vec<_> = branches.into_iter().map(Branch::into_parts).collect();
         ParallelBuilder::new_internal(self.clone(), op_id, branch_tuples)
+    }
+
+    /// Creates a parallel operation over branches whose results have
+    /// different types.
+    ///
+    /// Each branch of `branches` returns its own type, and the
+    /// [`BranchHandle`](crate::BranchHandle) that
+    /// [`BranchSet::add`](crate::BranchSet::add) or
+    /// [`BranchSet::add_with_serdes`](crate::BranchSet::add_with_serdes)
+    /// returned gives that type back. The operation records the same
+    /// history as [`parallel`](Self::parallel) over branches with the same
+    /// names and outcomes: one parallel parent and one child context per
+    /// branch. Only the encoded branch values differ, because each branch
+    /// encodes its value with its own serdes.
+    ///
+    /// `.await` returns the [`CompletionReason`](crate::builders::map_parallel::CompletionReason)
+    /// of the batch. It returns an error in exactly the cases where
+    /// `parallel(...).await` does, with the same error. When it returns,
+    /// each handle whose branch settled holds the branch's value or error.
+    /// A handle whose branch never started, or still ran when the batch
+    /// completed, holds no result. When `.await` returns an error other
+    /// than a failed branch's error, no handle holds a result.
+    ///
+    /// The operation ID is claimed when this method is called, as
+    /// [`parallel`](Self::parallel) claims it.
+    ///
+    /// # Which form to use
+    ///
+    /// - [`parallel`](Self::parallel), when every branch returns the same
+    ///   type.
+    /// - [`parallel`](Self::parallel) over an enum, when the results are
+    ///   cases of one type that the handler processes together. Use serde's
+    ///   default enum representation: with `#[serde(untagged)]`, a result
+    ///   can decode into the wrong variant when two variants accept the
+    ///   same JSON.
+    /// - `parallel_mixed`, when each branch returns its own type.
+    ///
+    /// A panic in a branch propagates to the caller with its original
+    /// payload, the SDK records nothing for it, and no handle receives a
+    /// result.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::serdes::SerdesContext;
+    /// use durable::{BoxError, BranchSet, Serdes};
+    ///
+    /// #[derive(serde::Serialize, serde::Deserialize)]
+    /// struct Reservation {
+    ///     sku: String,
+    /// }
+    ///
+    /// struct PaymentAuth {
+    ///     code: u32,
+    /// }
+    ///
+    /// // A serdes for `PaymentAuth` only.
+    /// struct PaymentSerdes;
+    ///
+    /// impl Serdes<PaymentAuth> for PaymentSerdes {
+    ///     async fn serialize(&self, value: PaymentAuth, _ctx: SerdesContext) -> Result<String, BoxError> {
+    ///         Ok(value.code.to_string())
+    ///     }
+    ///     async fn deserialize(&self, wire: String, _ctx: SerdesContext) -> Result<PaymentAuth, BoxError> {
+    ///         Ok(PaymentAuth { code: wire.parse()? })
+    ///     }
+    /// }
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, BoxError> {
+    ///     let mut branches = BranchSet::new();
+    ///     let inventory = branches.add("inventory", |_ctx| async {
+    ///         Ok(Reservation { sku: "sku-1".to_owned() })
+    ///     });
+    ///     let payment = branches.add_with_serdes("payment", PaymentSerdes, |_ctx| async {
+    ///         Ok(PaymentAuth { code: 7 })
+    ///     });
+    ///
+    ///     ctx.parallel_mixed(branches)
+    ///         .name("process-order")
+    ///         .max_concurrency(2)
+    ///         .await?;
+    ///
+    ///     let inventory: Reservation = inventory.into_result()?;
+    ///     let payment: PaymentAuth = payment.into_result()?;
+    ///     Ok(format!("{}: {}", payment.code, inventory.sku))
+    /// }
+    /// ```
+    pub fn parallel_mixed(&self, branches: crate::BranchSet) -> ParallelMixedBuilder {
+        let op_id = self.claim_operation_id("parallel_mixed");
+        ParallelMixedBuilder::new_internal(self.clone(), op_id, branches)
     }
 
     /// Joins all futures, failing fast on the first error.

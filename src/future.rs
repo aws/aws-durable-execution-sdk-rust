@@ -1,8 +1,10 @@
 //! Future types for durable operations.
 //!
 //! [`DurableFuture`] is the uniform handle for all durable operation
-//! results. [`Branch`] defines a named parallel branch. [`Callback`]
-//! holds a callback token and its result future.
+//! results. [`Branch`] defines a named parallel branch, and [`BranchSet`]
+//! a set of branches with different result types whose results each
+//! [`BranchHandle`] returns. [`Callback`] holds a callback token and its
+//! result future.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -566,6 +568,374 @@ impl<O: Send + 'static> Callback<O> {
     }
 }
 
+/// A set of parallel branches whose results have different types, for
+/// [`DurableContext::parallel_mixed`].
+///
+/// Each [`add`](Self::add) or [`add_with_serdes`](Self::add_with_serdes)
+/// call adds one branch and returns a [`BranchHandle`] typed with that
+/// branch's result. Branches start, and are numbered, in the order they
+/// were added. The number of branches is unlimited.
+///
+/// # Examples
+///
+/// ```no_run
+/// use aws_durable_execution_sdk as durable;
+/// use durable::BranchSet;
+///
+/// async fn handler(
+///     _event: serde_json::Value,
+///     ctx: durable::DurableContext,
+/// ) -> Result<String, durable::BoxError> {
+///     let mut branches = BranchSet::new();
+///     let count = branches.add("count", |_ctx| async { Ok(7_u32) });
+///     let label = branches.add("label", |_ctx| async { Ok("ready".to_owned()) });
+///     ctx.parallel_mixed(branches).name("fan-out").await?;
+///     Ok(format!("{}: {}", count.into_result()?, label.into_result()?))
+/// }
+/// ```
+#[non_exhaustive]
+pub struct BranchSet {
+    /// Each branch's caller name and erased body, in the order added.
+    branches: Vec<(Option<String>, BranchBody<MixedValue>)>,
+    /// Each branch's decoder, at the branch's index.
+    decoders: Vec<Arc<dyn BranchDecoder>>,
+    /// Whether each branch uses the default JSON serdes, at its index.
+    json: Vec<bool>,
+}
+
+impl Default for BranchSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for BranchSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self
+            .branches
+            .iter()
+            .map(|(name, _)| name.as_deref().unwrap_or_default())
+            .collect();
+        f.debug_struct("BranchSet")
+            .field("names", &names)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BranchSet {
+    /// Creates an empty set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            branches: Vec::new(),
+            decoders: Vec::new(),
+            json: Vec::new(),
+        }
+    }
+
+    /// Adds a branch whose result is encoded and decoded as JSON.
+    ///
+    /// This is [`add_with_serdes`](Self::add_with_serdes) with
+    /// [`JsonSerdes`](crate::JsonSerdes). The batch record holds the
+    /// branch's value as JSON, as [`DurableContext::parallel`] does with
+    /// its default serdes.
+    #[must_use]
+    pub fn add<T, F, Fut>(&mut self, name: impl Into<String>, factory: F) -> BranchHandle<T>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+        F: FnOnce(DurableContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, BoxError>> + Send + 'static,
+    {
+        self.insert(name.into(), crate::JsonSerdes, factory, true)
+    }
+
+    /// Adds a branch whose result is encoded and decoded by `serdes`.
+    ///
+    /// `name` and `factory` have the same types as in [`Branch::new`].
+    /// History records `name`, or `parallel-branch-{index}` when it is
+    /// empty, and a completion predicate sees `Some(name)`. `serdes` must
+    /// implement [`Serdes<T>`](crate::Serdes), so a serdes written for
+    /// another type fails to compile. It is called wherever the item serdes
+    /// of [`DurableContext::parallel`] is called for this branch, with the
+    /// same [`SerdesContext`](crate::serdes::SerdesContext). To share one
+    /// serdes across branches, pass a clone of one `Arc` to each call.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::serdes::{FileSystemSerdes, SerdesContext};
+    /// use durable::{BoxError, BranchSet, Serdes};
+    ///
+    /// struct Order {
+    ///     id: u64,
+    /// }
+    ///
+    /// // A serdes for `Order` only: attaching it to a branch of another
+    /// // type fails to compile.
+    /// struct OrderSerdes;
+    ///
+    /// impl Serdes<Order> for OrderSerdes {
+    ///     async fn serialize(&self, value: Order, _ctx: SerdesContext) -> Result<String, BoxError> {
+    ///         Ok(value.id.to_string())
+    ///     }
+    ///     async fn deserialize(&self, wire: String, _ctx: SerdesContext) -> Result<Order, BoxError> {
+    ///         Ok(Order { id: wire.parse()? })
+    ///     }
+    /// }
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<u64, durable::BoxError> {
+    ///     let files = Arc::new(FileSystemSerdes::new("/mnt/efs"));
+    ///     let mut branches = BranchSet::new();
+    ///     let order = branches.add_with_serdes("order", OrderSerdes, |_ctx| async {
+    ///         Ok(Order { id: 42 })
+    ///     });
+    ///     let report = branches.add_with_serdes("report", Arc::clone(&files), |_ctx| async {
+    ///         Ok("a large report".to_owned())
+    ///     });
+    ///     ctx.parallel_mixed(branches).name("process-order").await?;
+    ///     let order = order.into_result()?;
+    ///     let _report: String = report.into_result()?;
+    ///     Ok(order.id)
+    /// }
+    /// ```
+    #[must_use]
+    pub fn add_with_serdes<T, S, F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        serdes: S,
+        factory: F,
+    ) -> BranchHandle<T>
+    where
+        T: Send + 'static,
+        S: crate::Serdes<T> + 'static,
+        F: FnOnce(DurableContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, BoxError>> + Send + 'static,
+    {
+        self.insert(name.into(), serdes, factory, false)
+    }
+
+    /// Adds one branch (internal). `json` is `true` when the batch record
+    /// holds the branch's value as JSON.
+    fn insert<T, S, F, Fut>(
+        &mut self,
+        name: String,
+        serdes: S,
+        factory: F,
+        json: bool,
+    ) -> BranchHandle<T>
+    where
+        T: Send + 'static,
+        S: crate::Serdes<T> + 'static,
+        F: FnOnce(DurableContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, BoxError>> + Send + 'static,
+    {
+        let index = self.branches.len();
+        let record_name = if name.is_empty() {
+            format!("parallel-branch-{index}")
+        } else {
+            name.clone()
+        };
+        let slot: BranchSlot<T> = Arc::new(std::sync::Mutex::new(None));
+        let serdes = Arc::new(serdes);
+        let decoder = BranchShared {
+            serdes: Arc::clone(&serdes),
+            slot: Arc::clone(&slot),
+        };
+        let body_slot = Arc::clone(&slot);
+        let branch = Branch::new(name, move |ctx: DurableContext| async move {
+            let value = factory(ctx).await?;
+            Ok(MixedValue(Box::new(TypedBranchValue {
+                value,
+                serdes,
+                slot: body_slot,
+            })))
+        });
+        self.branches.push(branch.into_parts());
+        self.decoders.push(Arc::new(decoder));
+        self.json.push(json);
+        BranchHandle {
+            name: record_name,
+            slot,
+        }
+    }
+
+    /// Consumes the set and returns each branch's caller name and body,
+    /// the decoders and the JSON flags, all in branch order (internal).
+    #[expect(clippy::type_complexity)]
+    // reason: the three parts go to three different places, and a named type for each would add nothing
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<(Option<String>, BranchBody<MixedValue>)>,
+        Arc<Vec<Arc<dyn BranchDecoder>>>,
+        Arc<[bool]>,
+    ) {
+        (self.branches, Arc::new(self.decoders), Arc::from(self.json))
+    }
+}
+
+/// The result of one branch of a [`BranchSet`].
+///
+/// [`into_result`](Self::into_result) returns the branch's result once the
+/// `.await` of the [`DurableContext::parallel_mixed`] that ran the set has
+/// returned. Before that, the handle has no result, even when its branch
+/// has finished, so what a handle returns never depends on timing. Dropping
+/// a handle does not cancel or skip its branch.
+#[non_exhaustive]
+pub struct BranchHandle<T> {
+    /// The name history records for the branch.
+    name: String,
+    /// Shared with the branch: filled when the parallel's `.await` returns.
+    slot: BranchSlot<T>,
+}
+
+impl<T> std::fmt::Debug for BranchHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has_result = lock_slot(&self.slot).is_some();
+        f.debug_struct("BranchHandle")
+            .field("name", &self.name)
+            .field("has_result", &has_result)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> BranchHandle<T> {
+    /// Returns the branch's result, without waiting.
+    ///
+    /// - `Ok(value)` when the branch succeeded. `value` is what the
+    ///   branch's serdes decoded, so the first run and replay return the
+    ///   same value.
+    /// - The branch's own error when the branch failed: a
+    ///   [`ChildContextError`](crate::ChildContextError) of kind
+    ///   [`ChildFailed`](crate::ChildContextErrorKind::ChildFailed) that
+    ///   holds the recorded failure, the error `parallel(...).await`
+    ///   returns when a failed item ends the batch.
+    ///
+    /// # Errors
+    ///
+    /// Besides the branch's own error, returns an error of kind
+    /// [`NotCompleted`](crate::ChildContextErrorKind::NotCompleted), whose
+    /// message names the branch, when the handle has no result: the
+    /// parallel has not returned, it returned an error of its own, the
+    /// branch never started, or the batch completed while the branch still
+    /// ran.
+    pub fn into_result(self) -> Result<T, OperationError> {
+        let taken = lock_slot(&self.slot).take();
+        taken.unwrap_or_else(|| Err(not_completed_error(&self.name)))
+    }
+}
+
+/// The slot a [`BranchHandle`] shares with its branch.
+type BranchSlot<T> = Arc<std::sync::Mutex<Option<Result<T, OperationError>>>>;
+
+/// Locks a branch slot. A poisoned lock still holds a valid slot value.
+fn lock_slot<T>(
+    slot: &std::sync::Mutex<Option<Result<T, OperationError>>>,
+) -> std::sync::MutexGuard<'_, Option<Result<T, OperationError>>> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The error of a [`BranchHandle`] that has no result.
+fn not_completed_error(name: &str) -> OperationError {
+    OperationError::from_kind(crate::OperationErrorKind::ChildContext(
+        crate::error::ChildContextError::new(
+            crate::ChildContextErrorKind::NotCompleted,
+            Some(format!("parallel branch \"{name}\" has no result").into()),
+        ),
+    ))
+}
+
+/// The item type of `parallel_mixed`: one branch's value, erased, carrying
+/// its own encoder and its handle's slot (crate-internal).
+pub(crate) struct MixedValue(pub(crate) Box<dyn ErasedBranchValue>);
+
+/// A branch value whose type is erased (crate-internal).
+pub(crate) trait ErasedBranchValue: Send {
+    /// Encodes the value with the branch's serdes.
+    fn encode(
+        self: Box<Self>,
+        ctx: crate::serdes::SerdesContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, BoxError>> + Send>>;
+    /// Stores `Ok(value)` in the branch handle's slot.
+    fn publish(self: Box<Self>);
+}
+
+/// Decodes the values of one branch and fails its handle (crate-internal).
+pub(crate) trait BranchDecoder: Send + Sync {
+    /// Decodes a wire string with the branch's serdes.
+    fn decode(
+        &self,
+        wire: String,
+        ctx: crate::serdes::SerdesContext,
+    ) -> Pin<Box<dyn Future<Output = Result<MixedValue, BoxError>> + Send + '_>>;
+    /// Stores `Err(err)` in the branch handle's slot.
+    fn publish_error(&self, err: OperationError);
+}
+
+/// A branch's value with its serdes and its handle's slot.
+struct TypedBranchValue<T, S> {
+    value: T,
+    serdes: Arc<S>,
+    slot: BranchSlot<T>,
+}
+
+impl<T, S> ErasedBranchValue for TypedBranchValue<T, S>
+where
+    T: Send + 'static,
+    S: crate::Serdes<T>,
+{
+    fn encode(
+        self: Box<Self>,
+        ctx: crate::serdes::SerdesContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, BoxError>> + Send>> {
+        let Self { value, serdes, .. } = *self;
+        Box::pin(async move { serdes.serialize(value, ctx).await })
+    }
+
+    fn publish(self: Box<Self>) {
+        let Self { value, slot, .. } = *self;
+        *lock_slot(&slot) = Some(Ok(value));
+    }
+}
+
+/// One branch's serdes and handle slot: the branch's [`BranchDecoder`].
+struct BranchShared<T, S> {
+    serdes: Arc<S>,
+    slot: BranchSlot<T>,
+}
+
+impl<T, S> BranchDecoder for BranchShared<T, S>
+where
+    T: Send + 'static,
+    S: crate::Serdes<T>,
+{
+    fn decode(
+        &self,
+        wire: String,
+        ctx: crate::serdes::SerdesContext,
+    ) -> Pin<Box<dyn Future<Output = Result<MixedValue, BoxError>> + Send + '_>> {
+        Box::pin(async move {
+            let value = self.serdes.deserialize(wire, ctx).await?;
+            Ok(MixedValue(Box::new(TypedBranchValue {
+                value,
+                serdes: Arc::clone(&self.serdes),
+                slot: Arc::clone(&self.slot),
+            })))
+        })
+    }
+
+    fn publish_error(&self, err: OperationError) {
+        *lock_slot(&self.slot) = Some(Err(err));
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::panic)]
 // reason: test assertions
@@ -697,6 +1067,62 @@ mod tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "spawned body must be dropped (cancelled) when the handle is dropped"
+        );
+    }
+
+    #[test]
+    fn handle_of_a_set_that_never_ran() {
+        let mut set = BranchSet::new();
+        let handle = set.add("inventory", |_ctx| async { Ok(1_u32) });
+        drop(set);
+        let Err(err) = handle.into_result() else {
+            panic!("a handle whose set never ran has no result");
+        };
+        let crate::OperationErrorKind::ChildContext(child) = err.kind() else {
+            panic!("the error is a child context error: {err:?}");
+        };
+        assert!(matches!(
+            child.kind(),
+            crate::ChildContextErrorKind::NotCompleted
+        ));
+        assert_eq!(child.kind().to_string(), "branch has no result");
+        let source = std::error::Error::source(child).expect("the error has a source");
+        assert_eq!(
+            source.to_string(),
+            r#"parallel branch "inventory" has no result"#
+        );
+    }
+
+    #[test]
+    fn empty_branch_name_records_the_default_name() {
+        let mut set = BranchSet::default();
+        let handle = set.add("", |_ctx| async { Ok(1_u32) });
+        drop(set);
+        let err = handle.into_result().expect_err("no result");
+        let source = std::error::Error::source(&err)
+            .and_then(std::error::Error::source)
+            .map(ToString::to_string);
+        assert_eq!(
+            source.as_deref(),
+            Some(r#"parallel branch "parallel-branch-0" has no result"#)
+        );
+    }
+
+    #[test]
+    fn branch_set_and_handle_debug() {
+        let mut set = BranchSet::new();
+        assert_eq!(format!("{set:?}"), "BranchSet { names: [], .. }");
+        let handle = set.add("a", |_ctx| async { Ok(1_u32) });
+        let _other = set.add_with_serdes("b", crate::JsonSerdes, |_ctx| async { Ok(2_u32) });
+        assert_eq!(format!("{set:?}"), r#"BranchSet { names: ["a", "b"], .. }"#);
+        assert_eq!(
+            format!("{handle:?}"),
+            r#"BranchHandle { name: "a", has_result: false, .. }"#
+        );
+        *lock_slot(&handle.slot) = Some(Ok(1));
+        assert_eq!(
+            format!("{handle:?}"),
+            r#"BranchHandle { name: "a", has_result: true, .. }"#
         );
     }
 }
