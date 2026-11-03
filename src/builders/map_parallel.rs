@@ -959,17 +959,25 @@ where
 ///     Ok(format!("{}: {}", count.into_result()?, label.into_result()?))
 /// }
 /// ```
-#[must_use = "builders do nothing unless awaited"]
+#[must_use = "builders do nothing unless awaited or spawned"]
 #[non_exhaustive]
-pub struct ParallelMixedBuilder {
+pub struct ParallelMixedBuilder<RS = PassthroughSerdes> {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
     max_concurrency: Option<usize>,
-    branches: crate::future::BranchSet,
+    completion: Option<CompletionConfig>,
+    result_serdes: RS,
+    nesting: NestingMode,
+    branches: Vec<(
+        Option<String>,
+        crate::future::BranchBody<crate::future::MixedValue>,
+    )>,
+    decoders: Arc<Vec<Arc<dyn crate::future::BranchDecoder>>>,
+    json: Arc<[bool]>,
 }
 
-impl std::fmt::Debug for ParallelMixedBuilder {
+impl<RS> std::fmt::Debug for ParallelMixedBuilder<RS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParallelMixedBuilder")
             .field("name", &self.name)
@@ -984,15 +992,23 @@ impl ParallelMixedBuilder {
         op_id: OperationId,
         branches: crate::future::BranchSet,
     ) -> Self {
+        let (branches, decoders, json) = branches.into_parts();
         Self {
             ctx,
             op_id,
             name: None,
             max_concurrency: None,
+            completion: None,
+            result_serdes: PassthroughSerdes,
+            nesting: NestingMode::Normal,
             branches,
+            decoders,
+            json,
         }
     }
+}
 
+impl<RS> ParallelMixedBuilder<RS> {
     /// Sets a human-readable name for this parallel operation.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
@@ -1009,40 +1025,157 @@ impl ParallelMixedBuilder {
         self.max_concurrency = Some(max);
         self
     }
-}
 
-impl IntoFuture for ParallelMixedBuilder {
-    type Output = Result<CompletionReason, OperationError>;
-    type IntoFuture = DurableFuture<CompletionReason>;
+    /// Sets the completion configuration.
+    ///
+    /// **Default: fail fast.** Without this call, or with an empty
+    /// [`CompletionConfig`] (no threshold, no predicate), the first branch
+    /// failure fails the batch, matching the Python and JS SDKs.
+    /// Configuring any criterion replaces that implicit fail-fast with the
+    /// configured criteria:
+    ///
+    /// - explicit fail-fast:
+    ///   [`CompletionConfig::with_tolerated_failure_count(0)`](CompletionConfig::with_tolerated_failure_count)
+    /// - tolerate all failures:
+    ///   [`CompletionConfig::with_tolerated_failure_percentage(100.0)`](CompletionConfig::with_tolerated_failure_percentage)
+    ///
+    /// A failure percentage applies to `parallel_mixed` as it does to
+    /// `map`, as in JS and Python `ParallelConfig`.
+    ///
+    /// A [`BranchHandle`](crate::BranchHandle) has a result exactly when its
+    /// branch settled, whatever the parallel's own outcome. A succeeded
+    /// branch's handle returns its value, and a failed branch's handle
+    /// returns its error. A branch that was waiting or running when the
+    /// batch ended, or that never started, returns
+    /// [`ChildContextErrorKind::NotCompleted`](crate::ChildContextErrorKind::NotCompleted).
+    /// This holds when the completion rule fails the batch too: after a
+    /// predicate completes the batch as failed with no failed branch,
+    /// `.await` returns
+    /// [`ChildContextErrorKind::BatchCompletionFailed`](crate::ChildContextErrorKind::BatchCompletionFailed),
+    /// and every branch that succeeded still returns its value.
+    pub fn completion(mut self, config: CompletionConfig) -> Self {
+        self.completion = Some(config);
+        self
+    }
 
-    fn into_future(self) -> Self::IntoFuture {
-        use crate::map_parallel::{
-            MixedItemSerdes, PARALLEL_SUB_TYPE, ParallelExecution, publish_outcome,
-        };
+    /// Sets a custom serializer/deserializer for the whole batch record.
+    ///
+    /// The serdes is a [`Serdes<String>`](crate::Serdes). Its serializer
+    /// receives the batch record as JSON text, in the shape of the JS SDK's
+    /// batch result (`{"all": [...], "completionReason": "..."}`), and
+    /// returns the payload to store. Its deserializer receives that stored
+    /// payload on replay, and must reconstruct the exact input record text:
+    /// `deserialize(serialize(record_text))` must return `record_text`
+    /// unchanged. The stored payload may use any format, for example a
+    /// compressed or binary encoding of the text. The SDK does not read the
+    /// record back on the live path, so a serdes that changes the record
+    /// text is not supported.
+    ///
+    /// The default, [`PassthroughSerdes`], stores
+    /// the record text unchanged. [`JsonSerdes`] stores it as a quoted JSON
+    /// string.
+    ///
+    /// `result_serdes` corresponds to JS and Python `serdes`. Those receive
+    /// the batch result object.
+    pub fn result_serdes<RS2>(self, serdes: RS2) -> ParallelMixedBuilder<RS2>
+    where
+        RS2: Serdes<String>,
+    {
+        ParallelMixedBuilder {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            max_concurrency: self.max_concurrency,
+            completion: self.completion,
+            result_serdes: serdes,
+            nesting: self.nesting,
+            branches: self.branches,
+            decoders: self.decoders,
+            json: self.json,
+        }
+    }
+
+    /// Sets the nesting mode for the parallel operation.
+    ///
+    /// [`NestingMode::Flat`] causes branches to run in virtual contexts
+    /// without per-branch context events.
+    pub fn nesting(mut self, mode: NestingMode) -> Self {
+        self.nesting = mode;
+        self
+    }
+
+    /// Eagerly spawns the parallel operation on a tokio task.
+    ///
+    /// The returned [`DurableFuture`] is already running; this is the
+    /// replay-safe alternative to bare `tokio::spawn` for durable
+    /// operations. The handles receive their results when the returned
+    /// future is awaited, not when the spawned task finishes.
+    ///
+    /// Dropping the returned future cancels the operation. When the handler
+    /// returns while a cancelled operation still waits, the execution ends
+    /// with the handler's result, and the operation's record can stay
+    /// `STARTED`.
+    ///
+    /// # Errors
+    ///
+    /// When no Tokio runtime is running, the returned future resolves to an
+    /// error and the operation records nothing.
+    pub fn spawn(self) -> DurableFuture<CompletionReason>
+    where
+        RS: Serdes<String>,
+    {
+        use crate::map_parallel::publish_outcome;
+
+        let decoders = Arc::clone(&self.decoders);
+        let spawned = spawn_terminal!(self, batch_future);
+        DurableFuture::from_async(async move { publish_outcome(spawned.await, &decoders) })
+    }
+
+    /// The lazy terminal of the full [`BatchResult`], shared by `.await`
+    /// and `.spawn()`. So both run the same replay identity check and the
+    /// same admission check.
+    fn batch_future(self) -> DurableFuture<BatchResult<crate::future::MixedValue>>
+    where
+        RS: Serdes<String>,
+    {
+        use crate::map_parallel::{MixedItemSerdes, PARALLEL_SUB_TYPE, ParallelExecution};
 
         preflight_identity!(self, "Context", PARALLEL_SUB_TYPE);
 
         let gate = self.ctx.clone();
-        let (branches, decoders, json) = self.branches.into_parts();
-        let serdes = MixedItemSerdes::new(self.op_id.wire(), Arc::clone(&decoders));
+        let serdes = MixedItemSerdes::new(self.op_id.wire(), self.decoders);
         let child_ids = Some(serdes.child_ids());
         let execution = ParallelExecution {
             ctx: self.ctx,
             op_id: self.op_id,
             name: self.name,
             max_concurrency: self.max_concurrency,
-            completion: None,
+            completion: self.completion,
             serdes,
-            encoding: ItemEncoding::PerItem(json),
-            result_serdes: PassthroughSerdes,
-            nesting: NestingMode::Normal,
-            branches,
+            encoding: ItemEncoding::PerItem(self.json),
+            result_serdes: self.result_serdes,
+            nesting: self.nesting,
+            branches: self.branches,
             child_ids,
         };
 
-        DurableFuture::for_operation(&gate, async move {
-            publish_outcome(execution.execute_batch_result().await, &decoders)
-        })
+        DurableFuture::for_operation(&gate, execution.execute_batch_result())
+    }
+}
+
+impl<RS> IntoFuture for ParallelMixedBuilder<RS>
+where
+    RS: Serdes<String>,
+{
+    type Output = Result<CompletionReason, OperationError>;
+    type IntoFuture = DurableFuture<CompletionReason>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        use crate::map_parallel::publish_outcome;
+
+        let decoders = Arc::clone(&self.decoders);
+        let batch = self.batch_future();
+        DurableFuture::from_async(async move { publish_outcome(batch.await, &decoders) })
     }
 }
 
@@ -1936,6 +2069,45 @@ mod tests {
             Ok(1_i32)
         })];
         let future = ctx.parallel(branches).batch_future();
+        let fatal = ctx
+            .coordinator()
+            .fatal_error()
+            .expect("the mismatch is recorded before the first poll");
+        assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
+        drop(future);
+    }
+
+    /// A `BranchSet` with one `i32` branch, for the `parallel_mixed` tests.
+    fn one_branch_set() -> crate::BranchSet {
+        let mut set = crate::BranchSet::new();
+        let _handle = set.add("b", |_child| async { Ok(1_i32) });
+        set
+    }
+
+    /// `parallel_mixed`'s `into_future` checks the replay identity when it is
+    /// called, before the returned future is polled. The log holds a STEP
+    /// where the parallel claims a `Context`. So the fatal mismatch is
+    /// recorded at once. If `into_future` called `batch_future` inside the
+    /// returned async block, the mismatch would be recorded only at the first
+    /// poll, and this test would fail.
+    #[tokio::test]
+    async fn parallel_mixed_into_future_checks_replay_identity_before_first_poll() {
+        let ctx = ctx_with_step_record_at_1();
+        let future = ctx.parallel_mixed(one_branch_set()).into_future();
+        let fatal = ctx
+            .coordinator()
+            .fatal_error()
+            .expect("the mismatch is recorded before the first poll");
+        assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
+        drop(future);
+    }
+
+    /// The `.spawn()` counterpart of
+    /// `parallel_mixed_into_future_checks_replay_identity_before_first_poll`.
+    #[tokio::test]
+    async fn parallel_mixed_spawn_checks_replay_identity_before_first_poll() {
+        let ctx = ctx_with_step_record_at_1();
+        let future = ctx.parallel_mixed(one_branch_set()).spawn();
         let fatal = ctx
             .coordinator()
             .fatal_error()

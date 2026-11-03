@@ -2895,8 +2895,12 @@ impl DurableContext {
     /// `parallel(...).await` does, with the same error. When it returns,
     /// each handle whose branch settled holds the branch's value or error.
     /// A handle whose branch never started, or still ran when the batch
-    /// completed, holds no result. When `.await` returns an error other
-    /// than a failed branch's error, no handle holds a result.
+    /// completed, holds no result. This holds whatever the parallel's own
+    /// outcome, including an error from a completion rule that fails the
+    /// batch. When the batch does not complete, for example because a
+    /// checkpoint write fails, no handle holds a result. With
+    /// [`spawn`](crate::builders::ParallelMixedBuilder::spawn), the handles
+    /// are filled when the returned future is awaited.
     ///
     /// The operation ID is claimed when this method is called, as
     /// [`parallel`](Self::parallel) claims it.

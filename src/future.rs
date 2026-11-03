@@ -784,7 +784,8 @@ impl BranchSet {
 ///
 /// [`into_result`](Self::into_result) returns the branch's result once the
 /// `.await` of the [`DurableContext::parallel_mixed`] that ran the set has
-/// returned. Before that, the handle has no result, even when its branch
+/// returned, or the `.await` of the future its `.spawn()` returned. Before
+/// that, the handle has no result, even when its branch
 /// has finished, so what a handle returns never depends on timing. Dropping
 /// a handle does not cancel or skip its branch.
 #[non_exhaustive]

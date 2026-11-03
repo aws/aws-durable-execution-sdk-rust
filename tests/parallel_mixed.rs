@@ -15,11 +15,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
+use durable::builders::map_parallel::{
+    CompletionConfig, CompletionDecision, CompletionOutcome, CompletionReason, NestingMode,
+};
 use durable::serdes::{FileSystemSerdes, SerdesContext};
-use durable::test_util::{ExecutionStatus, LocalRunner, TestOperation, TestResult};
+use durable::test_util::{
+    ExecutionStatus, LocalRunner, TestOperation, TestOperationDetails, TestResult,
+};
 use durable::{
     BoxError, Branch, BranchSet, ChildContextErrorKind, DurableContext, OperationError,
-    OperationErrorKind, RetryDecision, Serdes, TypedError, WireError,
+    OperationErrorKind, RetryDecision, Serdes, StepErrorKind, TypedError, WireError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1311,4 +1316,511 @@ async fn history_equals_parallel_after_a_sequential_early_stop() {
     assert!(mixed.is_success(), "parallel_mixed succeeds: {mixed}");
     assert!(homogeneous.is_success(), "parallel succeeds: {homogeneous}");
     assert_eq!(sorted_shapes(&mixed), sorted_shapes(&homogeneous));
+}
+
+/// What one invocation saw: the `.await` outcome of the parallel and a
+/// summary of each handle.
+#[derive(Debug, Clone, PartialEq)]
+struct CompletionRun {
+    reason: Option<CompletionReason>,
+    await_error: Option<String>,
+    handles: Vec<Result<String, (bool, Option<WireError>)>>,
+}
+
+/// The kind name of a `ChildContext` error, or `None` for any other kind.
+fn child_kind(err: &OperationError) -> Option<String> {
+    match err.kind() {
+        OperationErrorKind::ChildContext(child) => Some(match child.kind() {
+            ChildContextErrorKind::ChildFailed { .. } => "ChildFailed".to_owned(),
+            ChildContextErrorKind::BatchCompletionFailed { .. } => {
+                "BatchCompletionFailed".to_owned()
+            }
+            other => format!("{other:?}"),
+        }),
+        _ => None,
+    }
+}
+
+/// The message of the record a handle's error carries.
+fn handle_message(handle: Option<&Result<String, (bool, Option<WireError>)>>) -> Option<String> {
+    match handle {
+        Some(Err((false, Some(wire)))) => wire.error_message().map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn handle_not_completed(handle: Option<&Result<String, (bool, Option<WireError>)>>) -> bool {
+    matches!(handle, Some(Err((true, _))))
+}
+
+#[tokio::test]
+async fn tolerated_failure_fills_every_handle() {
+    let seen: Log<CompletionRun> = log();
+    let seen_h = Arc::clone(&seen);
+    let result = run(move |(), ctx| {
+        let seen = Arc::clone(&seen_h);
+        async move {
+            let mut set = BranchSet::new();
+            let first = set.add("first", |_ctx| async { Ok(10_u32) });
+            let failing = set.add("failing", |_ctx| async {
+                Err::<u32, BoxError>("boom".into())
+            });
+            let last = set.add("last", |_ctx| async { Ok("two".to_owned()) });
+            let outcome = ctx
+                .parallel_mixed(set)
+                .name("pm")
+                .completion(CompletionConfig::with_tolerated_failure_count(1))
+                .await;
+            let failed = failing.into_result();
+            assert!(
+                failed.as_ref().is_err_and(is_child_failed),
+                "handle 1 holds a ChildFailed error: {failed:?}"
+            );
+            push(
+                &seen,
+                CompletionRun {
+                    reason: outcome.as_ref().ok().copied(),
+                    await_error: outcome.err().map(|err| err.to_string()),
+                    handles: vec![
+                        summarize(first.into_result()),
+                        summarize(failed),
+                        summarize(last.into_result()),
+                    ],
+                },
+            );
+            wait_then_replay(&ctx).await
+        }
+    })
+    .await;
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    let seen = entries(&seen);
+    assert_eq!(seen.len(), 2, "two invocations ran: {seen:?}");
+    for run in &seen {
+        assert_eq!(run.reason, Some(CompletionReason::AllCompleted), "{run:?}");
+        assert_eq!(run.handles.first(), Some(&Ok("10".to_owned())), "{run:?}");
+        assert_eq!(handle_message(run.handles.get(1)).as_deref(), Some("boom"));
+        assert_eq!(run.handles.get(2), Some(&Ok("two".to_owned())), "{run:?}");
+    }
+    assert_eq!(seen.first(), seen.get(1), "replay returns the same");
+}
+
+/// Runs a `min_successful(1)` batch whose branch 0 returns `value`,
+/// branch 1 runs a step that never ends, and branch 2 waits 5 s. Returns
+/// what each invocation saw and the run's result.
+async fn min_successful_run<T>(value: T) -> (Vec<CompletionRun>, TestResult<()>)
+where
+    T: Clone + ToString + Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    let seen: Log<CompletionRun> = log();
+    let seen_h = Arc::clone(&seen);
+    let result = run(move |(), ctx| {
+        let seen = Arc::clone(&seen_h);
+        let value = value.clone();
+        async move {
+            let mut set = BranchSet::new();
+            let first = set.add("first", move |_ctx| async move { Ok(value) });
+            let running = set.add("running", |child: DurableContext| async move {
+                child
+                    .step(|_| async {
+                        std::future::pending::<()>().await;
+                        Ok(1_u32)
+                    })
+                    .name("forever")
+                    .await
+                    .map_err(BoxError::from)
+            });
+            let waiting = set.add("waiting", |child: DurableContext| async move {
+                child.wait(Duration::from_secs(5)).name("long").await?;
+                Ok(2_u32)
+            });
+            let outcome = ctx
+                .parallel_mixed(set)
+                .name("pm")
+                .completion(CompletionConfig::with_min_successful(1))
+                .await;
+            push(
+                &seen,
+                CompletionRun {
+                    reason: outcome.as_ref().ok().copied(),
+                    await_error: outcome.err().map(|err| err.to_string()),
+                    handles: vec![
+                        summarize(first.into_result()),
+                        summarize(running.into_result()),
+                        summarize(waiting.into_result()),
+                    ],
+                },
+            );
+            wait_then_replay(&ctx).await
+        }
+    })
+    .await;
+    (entries(&seen), result)
+}
+
+/// Whether the context record of `op` carries `ReplayChildren`.
+fn replays_children(op: &TestOperation) -> bool {
+    matches!(op.details(), TestOperationDetails::Context(c) if c.replay_children())
+}
+
+fn assert_min_successful_runs(seen: &[CompletionRun], expected: &str) {
+    assert_eq!(seen.len(), 2, "two invocations ran: {seen:?}");
+    for run in seen {
+        assert_eq!(
+            run.reason,
+            Some(CompletionReason::MinSuccessfulReached),
+            "{run:?}"
+        );
+        assert_eq!(run.handles.first(), Some(&Ok(expected.to_owned())));
+        assert!(handle_not_completed(run.handles.get(1)), "{run:?}");
+        assert!(handle_not_completed(run.handles.get(2)), "{run:?}");
+    }
+}
+
+#[tokio::test]
+async fn min_successful_leaves_running_and_waiting_branches_not_completed() {
+    let (seen, result) = min_successful_run(1_u32).await;
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    assert!(!replays_children(op(&result, "pm")), "the record is inline");
+    assert_min_successful_runs(&seen, "1");
+
+    let big = "x".repeat(300_000);
+    let (seen, result) = min_successful_run(big.clone()).await;
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    assert!(
+        replays_children(op(&result, "pm")),
+        "the oversized record replays its children"
+    );
+    assert_min_successful_runs(&seen, &big);
+}
+
+#[tokio::test]
+async fn exceeded_tolerance_returns_the_first_branch_error() {
+    let seen: Log<(Option<String>, Option<String>, CompletionRun)> = log();
+    let seen_h = Arc::clone(&seen);
+    let result = run(move |(), ctx| {
+        let seen = Arc::clone(&seen_h);
+        async move {
+            let mut set = BranchSet::new();
+            let a = set.add("a", |_ctx| async { Err::<u32, BoxError>("a".into()) });
+            let b = set.add("b", |_ctx| async { Err::<String, BoxError>("b".into()) });
+            let c = set.add("c", |_ctx| async { Ok(3_u32) });
+            let outcome = ctx
+                .parallel_mixed(set)
+                .name("pm")
+                .max_concurrency(1)
+                .completion(CompletionConfig::with_tolerated_failure_count(1))
+                .await;
+            let err = outcome.as_ref().err();
+            push(
+                &seen,
+                (
+                    err.and_then(child_kind),
+                    err.and_then(|err| err.wire()?.error_message().map(str::to_owned)),
+                    CompletionRun {
+                        reason: outcome.as_ref().ok().copied(),
+                        await_error: None,
+                        handles: vec![
+                            summarize(a.into_result()),
+                            summarize(b.into_result()),
+                            summarize(c.into_result()),
+                        ],
+                    },
+                ),
+            );
+            wait_then_replay(&ctx).await
+        }
+    })
+    .await;
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    let seen = entries(&seen);
+    assert_eq!(seen.len(), 2, "two invocations ran: {seen:?}");
+    for (kind, message, run) in &seen {
+        assert_eq!(kind.as_deref(), Some("ChildFailed"), "{run:?}");
+        assert_eq!(message.as_deref(), Some("a"), "{run:?}");
+        assert_eq!(handle_message(run.handles.first()).as_deref(), Some("a"));
+        assert_eq!(handle_message(run.handles.get(1)).as_deref(), Some("b"));
+        assert!(handle_not_completed(run.handles.get(2)), "{run:?}");
+    }
+    assert_eq!(seen.first(), seen.get(1), "replay returns the same");
+}
+
+#[tokio::test]
+async fn custom_completion_failure_publishes_settled_handles() {
+    let seen: Log<(Option<String>, CompletionRun)> = log();
+    let seen_h = Arc::clone(&seen);
+    let result = run(move |(), ctx| {
+        let seen = Arc::clone(&seen_h);
+        async move {
+            let mut set = BranchSet::new();
+            let h0 = set.add("zero", |_ctx| async { Ok(0_u32) });
+            let h1 = set.add("one", |_ctx| async { Ok(1_u32) });
+            let h2 = set.add("two", |_ctx| async { Ok(2_u32) });
+            let outcome = ctx
+                .parallel_mixed(set)
+                .name("pm")
+                .max_concurrency(1)
+                .completion(CompletionConfig::with_completion_predicate(|stats| {
+                    if stats.settled() >= 2 {
+                        CompletionDecision::Complete(CompletionOutcome::Failed)
+                    } else {
+                        CompletionDecision::Continue
+                    }
+                }))
+                .await;
+            push(
+                &seen,
+                (
+                    outcome.as_ref().err().and_then(child_kind),
+                    CompletionRun {
+                        reason: outcome.as_ref().ok().copied(),
+                        await_error: None,
+                        handles: vec![
+                            summarize(h0.into_result()),
+                            summarize(h1.into_result()),
+                            summarize(h2.into_result()),
+                        ],
+                    },
+                ),
+            );
+            wait_then_replay(&ctx).await
+        }
+    })
+    .await;
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    let seen = entries(&seen);
+    assert_eq!(seen.len(), 2, "two invocations ran: {seen:?}");
+    for (kind, run) in &seen {
+        assert_eq!(kind.as_deref(), Some("BatchCompletionFailed"), "{run:?}");
+        assert_eq!(run.handles.first(), Some(&Ok("0".to_owned())), "{run:?}");
+        assert_eq!(run.handles.get(1), Some(&Ok("1".to_owned())), "{run:?}");
+        assert!(handle_not_completed(run.handles.get(2)), "{run:?}");
+    }
+    assert_eq!(seen.first(), seen.get(1), "replay returns the same");
+}
+
+#[tokio::test]
+async fn spawn_outside_runtime_returns_error() {
+    let seen: Log<Option<String>> = log();
+    let seen_h = Arc::clone(&seen);
+    let result = run(move |(), ctx| {
+        let seen = Arc::clone(&seen_h);
+        async move {
+            let mut set = BranchSet::new();
+            let _handle = set.add("only", |_ctx| async { Ok(1_u32) });
+            let builder = ctx.parallel_mixed(set).name("pm");
+            let polled = std::thread::spawn(move || {
+                assert!(
+                    tokio::runtime::Handle::try_current().is_err(),
+                    "the thread has no Tokio runtime"
+                );
+                let future = std::pin::pin!(builder.spawn());
+                match future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+                    std::task::Poll::Ready(Err(err)) => Some(err),
+                    std::task::Poll::Ready(Ok(_)) | std::task::Poll::Pending => None,
+                }
+            })
+            .join()
+            .expect("spawn does not panic");
+            let err = polled.expect("the first poll returns the error");
+            assert!(
+                matches!(
+                    err.kind(),
+                    OperationErrorKind::Step(step)
+                        if matches!(step.kind(), StepErrorKind::ExecutionFailed { .. })
+                ),
+                "the error is the no-runtime error: {err:?}"
+            );
+            let mut chain = vec![err.to_string()];
+            let mut source = std::error::Error::source(&err);
+            while let Some(cause) = source {
+                chain.push(cause.to_string());
+                source = cause.source();
+            }
+            let chain = chain.join(": ");
+            push(&seen, Some(chain));
+            Ok(())
+        }
+    })
+    .await;
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    let seen = entries(&seen);
+    assert_eq!(seen.len(), 1, "one invocation ran: {seen:?}");
+    let message = seen.first().cloned().flatten().expect("an error message");
+    assert!(
+        message.contains("no Tokio runtime is running"),
+        "the message names the cause: {message}"
+    );
+    assert!(
+        result.operation("pm").is_none(),
+        "the parallel records nothing"
+    );
+}
+
+#[tokio::test]
+async fn spawned_handles_fill_on_await() {
+    let seen: Log<(bool, Option<CompletionReason>, Option<String>)> = log();
+    let seen_h = Arc::clone(&seen);
+    let result = run(move |(), ctx| {
+        let seen = Arc::clone(&seen_h);
+        async move {
+            let started = Arc::new(AtomicUsize::new(0));
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let mut set = BranchSet::new();
+            let (s0, n0) = (Arc::clone(&started), Arc::clone(&notify));
+            let h0 = set.add("zero", move |_ctx| async move {
+                if s0.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                    n0.notify_one();
+                }
+                Ok(0_u32)
+            });
+            let (s1, n1) = (Arc::clone(&started), Arc::clone(&notify));
+            let h1 = set.add("one", move |_ctx| async move {
+                if s1.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                    n1.notify_one();
+                }
+                Ok("one".to_owned())
+            });
+            let batch = ctx.parallel_mixed(set).name("pm").spawn();
+            notify.notified().await;
+            let before = h0.into_result().is_err_and(|err| is_not_completed(&err));
+            let reason = batch.await.ok();
+            push(&seen, (before, reason, h1.into_result().ok()));
+            Ok(())
+        }
+    })
+    .await;
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    assert_eq!(
+        entries(&seen),
+        vec![(
+            true,
+            Some(CompletionReason::AllCompleted),
+            Some("one".to_owned())
+        )]
+    );
+}
+
+/// A `Serdes<String>` for the batch record: adds `summary:` before the
+/// record's JSON text, and removes it on replay.
+struct PrefixSerdes;
+
+impl Serdes<String> for PrefixSerdes {
+    fn serialize(
+        &self,
+        value: String,
+        _ctx: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
+        std::future::ready(Ok(format!("summary:{value}")))
+    }
+
+    fn deserialize(
+        &self,
+        wire: String,
+        _ctx: SerdesContext,
+    ) -> impl Future<Output = Result<String, BoxError>> + Send {
+        std::future::ready(
+            wire.strip_prefix("summary:")
+                .map(str::to_owned)
+                .ok_or_else(|| BoxError::from("missing summary: prefix")),
+        )
+    }
+}
+
+#[tokio::test]
+async fn result_serdes_encodes_the_record() {
+    let seen: Log<(u32, String)> = log();
+    let counters = [counter(), counter()];
+    let (seen_h, counters_h) = (Arc::clone(&seen), counters.clone());
+    let result = run(move |(), ctx| {
+        let seen = Arc::clone(&seen_h);
+        let [c0, c1] = counters_h.clone();
+        async move {
+            let mut set = BranchSet::new();
+            let number = set.add("number", move |_ctx| async move {
+                c0.fetch_add(1, Ordering::SeqCst);
+                Ok(5_u32)
+            });
+            let text = set.add("text", move |_ctx| async move {
+                c1.fetch_add(1, Ordering::SeqCst);
+                Ok("hi".to_owned())
+            });
+            ctx.parallel_mixed(set)
+                .name("pm")
+                .result_serdes(PrefixSerdes)
+                .await?;
+            push(&seen, (number.into_result()?, text.into_result()?));
+            wait_then_replay(&ctx).await
+        }
+    })
+    .await;
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    let payload = op(&result, "pm")
+        .result()
+        .expect("the parallel has a payload");
+    assert!(payload.starts_with("summary:"), "the payload: {payload}");
+    assert_eq!(
+        entries(&seen),
+        vec![(5, "hi".to_owned()), (5, "hi".to_owned())],
+        "every handle returns its value in both invocations"
+    );
+    for c in &counters {
+        assert_eq!(count(c), 1, "replay reads the record");
+    }
+}
+
+#[tokio::test]
+async fn flat_nesting_history_equals_parallel() {
+    let mixed = run(|(), ctx| async move {
+        let mut set = BranchSet::new();
+        let _object = set.add("object", |_ctx| async {
+            Ok(Unsorted {
+                zeta: 1,
+                alpha: "a".to_owned(),
+            })
+        });
+        let _number = set.add("number", |_ctx| async { Ok(5_u32) });
+        let _text = set.add("text", |_ctx| async { Ok("hi".to_owned()) });
+        ctx.parallel_mixed(set)
+            .name("pm")
+            .nesting(NestingMode::Flat)
+            .await?;
+        wait_then_replay(&ctx).await
+    })
+    .await;
+    let homogeneous = run(|(), ctx| async move {
+        let branches: Vec<Branch<serde_json::Value>> = vec![
+            Branch::new("object", |_ctx| async {
+                Ok(serde_json::json!({"zeta": 1, "alpha": "a"}))
+            }),
+            Branch::new("number", |_ctx| async { Ok(serde_json::json!(5)) }),
+            Branch::new("text", |_ctx| async { Ok(serde_json::json!("hi")) }),
+        ];
+        let _values = ctx
+            .parallel(branches)
+            .name("pm")
+            .nesting(NestingMode::Flat)
+            .await?;
+        wait_then_replay(&ctx).await
+    })
+    .await;
+    assert!(mixed.is_success(), "parallel_mixed succeeds: {mixed}");
+    assert!(homogeneous.is_success(), "parallel succeeds: {homogeneous}");
+    assert_eq!(shapes(&mixed), shapes(&homogeneous));
+    assert!(
+        mixed
+            .operations()
+            .iter()
+            .all(|op| op.sub_type() != Some("ParallelBranch")),
+        "Flat nesting records no branch context: {mixed}"
+    );
+    let (mixed_record, homogeneous_record) = (record(&mixed, "pm"), record(&homogeneous, "pm"));
+    for index in 0..3 {
+        let parse = |value: &serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&value.to_string()).expect("a result is JSON")
+        };
+        assert_eq!(
+            parse(item_result(&mixed_record, index)),
+            parse(item_result(&homogeneous_record, index)),
+        );
+    }
 }
