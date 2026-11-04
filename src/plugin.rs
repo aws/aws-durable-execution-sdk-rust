@@ -1281,11 +1281,26 @@ pub(crate) fn attempt_started(
     is_replay: bool,
 ) {
     let started = operation.with_status(OperationStatus::Started);
-    let start = started.clone().with_replay(is_replay);
-    plugins.dispatch_work("on_operation_start", |plugin| {
-        plugin.on_operation_start(&start)
-    });
-    let info = AttemptInfo::new(started.with_start_timestamp(SystemTime::now()), attempt);
+    operation_started(plugins, &started.clone().with_replay(is_replay));
+    attempt_start_only(plugins, started, attempt);
+}
+
+/// Fires only `on_attempt_start` of a live attempt that starts, with the
+/// attempt's start time. The operation's start step already fired
+/// `on_operation_start` (see [`crate::start`]), as JS fires
+/// `onOperationAttemptStart` after `onOperationStart`.
+///
+/// `operation` is the info [`OperationInfo::for_operation`] built; the hook
+/// sees it with the status `Started`.
+pub(crate) fn attempt_start_only(
+    plugins: &InvocationPlugins,
+    operation: OperationInfo,
+    attempt: u32,
+) {
+    let started = operation
+        .with_status(OperationStatus::Started)
+        .with_start_timestamp(SystemTime::now());
+    let info = AttemptInfo::new(started, attempt);
     plugins.dispatch_work("on_attempt_start", |plugin| plugin.on_attempt_start(&info));
 }
 

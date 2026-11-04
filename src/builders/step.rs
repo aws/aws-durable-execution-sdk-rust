@@ -364,8 +364,6 @@ where
                 .map_or(crate::step::STEP_SUB_TYPE, OperationSubType::as_str)
         );
 
-        let gate = self.ctx.clone();
-
         let execution = StepExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -379,7 +377,7 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::for_operation(&gate, execution.execute())
+        DurableFuture::for_started_operation(execution.execute())
     }
 }
 

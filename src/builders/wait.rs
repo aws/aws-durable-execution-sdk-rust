@@ -136,8 +136,6 @@ impl IntoFuture for WaitBuilder {
 
         preflight_identity!(self, "Wait", crate::wait::WAIT_SUB_TYPE);
 
-        let gate = self.ctx.clone();
-
         let execution = WaitExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -145,6 +143,6 @@ impl IntoFuture for WaitBuilder {
             duration_secs: self.duration_secs,
         };
 
-        DurableFuture::for_operation(&gate, execution.execute())
+        DurableFuture::for_started_operation(execution.execute())
     }
 }

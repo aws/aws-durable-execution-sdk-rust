@@ -13,6 +13,7 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate, Wai
 use crate::context::DurableContext;
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, WaitError, WaitErrorKind};
+use crate::start::StartStep;
 
 /// Wire sub-type for wait operations.
 pub(crate) const WAIT_SUB_TYPE: &str = "Wait";
@@ -28,54 +29,69 @@ pub(crate) struct WaitExecution {
 impl WaitExecution {
     /// Executes the wait operation: replay path or live path.
     pub(crate) async fn execute(self) -> Result<(), OperationError> {
-        // 1. Task-ownership check.
-        self.ctx.enforce_task_ownership()?;
-
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
 
-        // 2. Check checkpoint log for replay. The validated view carries
-        // everything the wait replay path reads, so nothing is cloned.
-        if let Some(view) = self.ctx.checkpoint_view_validated(
-            &positional_id,
-            &wire_id,
-            "Wait",
-            Some(WAIT_SUB_TYPE),
-            self.name.as_deref(),
-        )? {
-            match view.status {
-                CheckpointStatus::Succeeded => {
-                    // Timer completed: return immediately.
-                    self.ctx.emit_operation_replayed(
-                        &wire_id,
-                        self.name.as_deref(),
-                        "Wait",
-                        Some(WAIT_SUB_TYPE),
-                        view.attempt,
-                    );
-                    // A replayed completion is live only in the first
-                    // invocation after the service completed the wait.
-                    self.ended(&wire_id, |plugins| !plugins.is_updated(&wire_id));
-                    return Ok(());
-                }
-                CheckpointStatus::Started => {
+        // 1. The start step: admission, task ownership, the replay identity
+        // check, and the START of the live path (see `crate::start`). A
+        // STARTED record resumes the timer, and fires the replay start hook.
+        let started = crate::start::start_step(
+            &self.ctx,
+            &crate::start::StartSpec {
+                op_id: &self.op_id,
+                operation_type: "Wait",
+                sub_type: WAIT_SUB_TYPE,
+                name: self.name.as_deref(),
+                order: crate::start::StartOrder::AwaitResponse,
+            },
+            |view| match view.status {
+                CheckpointStatus::Started => crate::start::Cycle::Resume,
+                _ => crate::start::Cycle::Record,
+            },
+            || {
+                build_wait_start_update(
+                    &wire_id,
+                    self.name.as_deref(),
+                    self.ctx.parent_wire_id(),
+                    self.duration_secs,
+                )
+            },
+            |plugins, _| {
+                let info = self.info(&wire_id).with_replay(true);
+                crate::plugin::operation_started(plugins, &info);
+            },
+        )?;
+
+        // 2. A recorded wait returns its outcome, or keeps waiting.
+        let start = match started {
+            StartStep::Refused => return std::future::pending().await,
+            StartStep::Queued(write) => write,
+            StartStep::Recorded(view) => {
+                return match view.status {
+                    CheckpointStatus::Succeeded => {
+                        // Timer completed: return immediately.
+                        self.ctx.emit_operation_replayed(
+                            &wire_id,
+                            self.name.as_deref(),
+                            "Wait",
+                            Some(WAIT_SUB_TYPE),
+                            view.attempt,
+                        );
+                        // A replayed completion is live only in the first
+                        // invocation after the service completed the wait.
+                        self.ended(&wire_id, |plugins| !plugins.is_updated(&wire_id));
+                        Ok(())
+                    }
                     // Timer started but not yet completed: wait for the
                     // record to change.
-                    self.started(&wire_id, |info| info.with_replay(true));
-                    return self.resume(&positional_id, &wire_id).await;
-                }
-                status => return recorded_outcome(&self.ctx, &wire_id, &status),
+                    CheckpointStatus::Started => self.resume(&positional_id, &wire_id).await,
+                    status => recorded_outcome(&self.ctx, &wire_id, &status),
+                };
             }
-        }
+        };
 
-        // 3. Live path: checkpoint WaitStarted then suspend.
-        let update = build_wait_start_update(
-            &wire_id,
-            self.name.as_deref(),
-            self.ctx.parent_wire_id(),
-            self.duration_secs,
-        );
-        if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
+        // 3. Live path: await the WaitStarted response, then suspend.
+        if let Err(err) = start.await {
             // Audit (#43): wait START: no user code ran, so there is no
             // side effect needing a recorded outcome. No terminal FAIL:
             // the invocation dies, the service re-invokes, and replay

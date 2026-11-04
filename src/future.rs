@@ -209,6 +209,20 @@ impl<O: Send + 'static> DurableFuture<O> {
         })
     }
 
+    /// Creates the future of one operation whose execution begins with the
+    /// start step (see [`crate::start`]): a step, a wait or a
+    /// `create_callback`.
+    ///
+    /// The start step runs on the first poll, and checks admission itself
+    /// before it queues anything. So this adds no admission gate of its
+    /// own, unlike [`Self::for_operation`].
+    pub(crate) fn for_started_operation<F>(fut: F) -> Self
+    where
+        F: Future<Output = Result<O, OperationError>> + Send + 'static,
+    {
+        Self::from_async(fut)
+    }
+
     /// Spawns the operation future on its own task, blessed in the task
     /// ownership of `ctx` before its first poll.
     ///

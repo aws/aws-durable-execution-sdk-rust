@@ -382,11 +382,23 @@ where
                 self.initial_state.clone()
             };
 
-        // Checkpoint START if not already started. The check runs while
-        // START is in flight; the write is awaited after the check returns
-        // and before the outcome write (see `WfcPrelude::Run`).
-        let mut start = None;
-        if !already_started {
+        // A plugin sees the start of every check. It is a replay from the
+        // second check on, and on re-entry into a `STARTED` record. The
+        // hooks fire while the START write is in flight, as the check does
+        // not wait for it either.
+        //
+        // Checkpoint START if not already started. START is reserved while
+        // `on_operation_start` runs, and released when its dispatch returns,
+        // so the hook returns before the request is sent, as in JS (see
+        // `crate::start`). The check runs while START is in flight; the
+        // write is awaited after the check returns and before the outcome
+        // write (see `WfcPrelude::Run`).
+        let start = if already_started {
+            if let Some(plugins) = self.ctx.plugins() {
+                crate::plugin::attempt_started(plugins, self.info(), attempt, true);
+            }
+            None
+        } else {
             let start_update = build_wfc_update(
                 &wire_id,
                 self.name.as_deref(),
@@ -395,21 +407,21 @@ where
                 None,
                 None,
             );
-            start = Some(self.ctx.submit_checkpoint_updates(vec![start_update]));
-        }
-
-        // A plugin sees the start of every check. It is a replay from the
-        // second check on, and on re-entry into a `STARTED` record. The
-        // hooks fire while the START write is in flight, as the check does
-        // not wait for it either.
-        if let Some(plugins) = self.ctx.plugins() {
-            crate::plugin::attempt_started(
-                plugins,
-                self.info(),
-                attempt,
-                already_started || attempt > 1,
-            );
-        }
+            let reserved = self.ctx.reserve_checkpoint_updates(vec![start_update]);
+            let plugins = self.ctx.plugins();
+            if let Some(plugins) = plugins {
+                let info = self
+                    .info()
+                    .with_status(crate::OperationStatus::Started)
+                    .with_replay(attempt > 1);
+                crate::plugin::operation_started(plugins, &info);
+            }
+            let start = reserved.release();
+            if let Some(plugins) = plugins {
+                crate::plugin::attempt_start_only(plugins, self.info(), attempt);
+            }
+            Some(start)
+        };
 
         Ok(WfcPrelude::Run {
             attempt,

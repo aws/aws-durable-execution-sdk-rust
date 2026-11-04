@@ -28,6 +28,7 @@ use crate::error::{
 };
 use crate::future::Callback;
 use crate::serdes::{PayloadOrigin, Serdes, SerdesContext};
+use crate::start::StartStep;
 
 /// Wire sub-type for callback operations.
 pub(crate) const CALLBACK_SUB_TYPE: &str = "Callback";
@@ -59,73 +60,138 @@ where
 {
     /// Executes the create-callback operation: replay or live path.
     pub(crate) async fn execute(self) -> Result<Callback<O>, OperationError> {
-        // 1. Task-ownership check.
-        self.ctx.enforce_task_ownership()?;
-
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
 
-        // 2. Check checkpoint log for replay. Every branch consumes the
-        // backend-assigned callback ID; the terminal branches additionally
-        // fetch only the field they consume.
-        if let Some(view) = self.ctx.checkpoint_view_validated(
-            &positional_id,
-            &wire_id,
-            "Callback",
-            Some(self.sub_type.as_str()),
-            self.name.as_deref(),
-        )? {
-            // The backend assigns the callback ID in the START response, so
-            // every checkpointed callback record must carry one. A record
-            // without it is an invariant violation: fail at the fault
-            // instead of continuing with an empty ID (issue #47; the JS and
-            // Python SDKs fail the same way).
-            let callback_id = self
-                .ctx
-                .checkpoint_callback_id(&positional_id)
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| missing_callback_id_error(&wire_id, view.status.wire_str()))?;
-            // Terminal statuses replay the recorded outcome without waiting
-            // on the external system again (see `crate::observability`).
-            if matches!(
-                view.status,
-                CheckpointStatus::Started | CheckpointStatus::Pending
-            ) {
-                // Callback is in flight: return pending (`result()` waits
-                // for the record).
-                if let Some(plugins) = self.ctx.plugins() {
-                    let info = self.info(&wire_id).with_replay(true);
-                    crate::plugin::operation_started(plugins, &info);
+        // 1. The start step: admission, task ownership, the replay identity
+        // check, and the urgent START of the first invocation (see
+        // `crate::start`). An in-flight record with its callback ID fires
+        // the replay start hook.
+        let started = crate::start::start_step(
+            &self.ctx,
+            &crate::start::StartSpec {
+                op_id: &self.op_id,
+                operation_type: "Callback",
+                sub_type: self.sub_type.as_str(),
+                name: self.name.as_deref(),
+                order: crate::start::StartOrder::AwaitUrgentResponse,
+            },
+            |view| {
+                let in_flight = matches!(
+                    view.status,
+                    CheckpointStatus::Started | CheckpointStatus::Pending
+                );
+                // A record without a callback ID fails below, before any
+                // hook, so it does not resume.
+                if in_flight && self.recorded_callback_id(&positional_id).is_some() {
+                    crate::start::Cycle::Resume
+                } else {
+                    crate::start::Cycle::Record
                 }
-                return Ok(self.into_pending(callback_id));
+            },
+            || self.start_update(&wire_id),
+            |plugins, _| {
+                let info = self.info(&wire_id).with_replay(true);
+                crate::plugin::operation_started(plugins, &info);
+            },
+        )?;
+
+        // 2. Replay: a recorded callback returns its ID, and its outcome
+        // when it has one.
+        let start = match started {
+            StartStep::Refused => return std::future::pending().await,
+            StartStep::Queued(write) => write,
+            StartStep::Recorded(view) => {
+                // The backend assigns the callback ID in the START response,
+                // so every checkpointed callback record must carry one. A
+                // record without it is an invariant violation: fail at the
+                // fault instead of continuing with an empty ID (issue #47;
+                // the JS and Python SDKs fail the same way).
+                let callback_id = self
+                    .recorded_callback_id(&positional_id)
+                    .ok_or_else(|| missing_callback_id_error(&wire_id, view.status.wire_str()))?;
+                // Terminal statuses replay the recorded outcome without
+                // waiting on the external system again (see
+                // `crate::observability`).
+                if matches!(
+                    view.status,
+                    CheckpointStatus::Started | CheckpointStatus::Pending
+                ) {
+                    // Callback is in flight: return pending (`result()`
+                    // waits for the record). The start step fired the
+                    // replay start hook.
+                    return Ok(self.into_pending(callback_id));
+                }
+                // A terminal record fires the end hook when the callback is
+                // created, as JS does. It is live only in the first
+                // invocation after the service completed the callback.
+                if let Some(plugins) = self.ctx.plugins()
+                    && is_terminal_callback_status(&view.status)
+                {
+                    let info = self
+                        .info(&wire_id)
+                        .with_replay(!plugins.is_updated(&wire_id));
+                    crate::plugin::operation_ended(plugins, &info);
+                }
+                let outcome = callback_outcome(
+                    &self.ctx,
+                    &positional_id,
+                    self.name.as_deref(),
+                    self.sub_type.as_str(),
+                    &self.serdes,
+                    &view,
+                    true,
+                )
+                .await?;
+                return Ok(Callback::new_settled(callback_id, outcome));
             }
-            // A terminal record fires the end hook when the callback is
-            // created, as JS does. It is live only in the first invocation
-            // after the service completed the callback.
-            if let Some(plugins) = self.ctx.plugins()
-                && is_terminal_callback_status(&view.status)
-            {
-                let info = self
-                    .info(&wire_id)
-                    .with_replay(!plugins.is_updated(&wire_id));
-                crate::plugin::operation_ended(plugins, &info);
-            }
-            let outcome = callback_outcome(
-                &self.ctx,
-                &positional_id,
-                self.name.as_deref(),
-                self.sub_type.as_str(),
-                &self.serdes,
-                &view,
-                true,
-            )
-            .await?;
-            return Ok(Callback::new_settled(callback_id, outcome));
+        };
+
+        // 3. First invocation: await the START response. Callback creation
+        // is a flush point of the checkpoint-delay contract: the backend
+        // assigns the callback_id in this response, so the start step
+        // queued the write as urgent.
+        if let Err(err) = start.await {
+            // Audit (#43): callback-creation START: no user code ran (the
+            // callback ID does not exist yet), so no terminal FAIL is
+            // needed; re-invocation reconverges on the same write.
+            return self
+                .ctx
+                .checkpoint_failure_unrecoverable(&wire_id, err, None)
+                .await;
         }
 
-        // 3. First invocation: checkpoint START with callback options.
+        // After checkpointing START, the backend assigns a callback_id.
+        // Read it from the (now-updated) checkpoint log. A record without
+        // one is an invariant violation: fail at the fault instead of
+        // handing the caller an empty ID (issue #47).
+        let callback_id = self.recorded_callback_id(&positional_id).ok_or_else(|| {
+            missing_callback_id_error(&wire_id, CheckpointStatus::Started.wire_str())
+        })?;
+
+        if let Some(plugins) = self.ctx.plugins() {
+            let info = self
+                .info(&wire_id)
+                .with_status(crate::OperationStatus::Started)
+                .with_replay(false);
+            crate::plugin::operation_started(plugins, &info);
+        }
+
+        // Return pending: `result()` waits for the record.
+        Ok(self.into_pending(callback_id))
+    }
+
+    /// The non-empty callback ID the record of `positional_id` carries.
+    fn recorded_callback_id(&self, positional_id: &str) -> Option<String> {
+        self.ctx
+            .checkpoint_callback_id(positional_id)
+            .filter(|id| !id.is_empty())
+    }
+
+    /// The START update of this callback, with its callback options.
+    fn start_update(&self, wire_id: &str) -> OperationUpdate {
         let mut builder = OperationUpdate::builder()
-            .id(wire_id.clone())
+            .id(wire_id.to_owned())
             .r#type(OperationType::Callback)
             .sub_type(self.sub_type.as_str())
             .action(OperationAction::Start);
@@ -144,45 +210,9 @@ where
         }
 
         #[expect(clippy::expect_used)] // reason: all required fields set above
-        let update = builder
+        builder
             .build()
-            .expect("all required OperationUpdate fields set");
-
-        // Callback creation is a flush point of the checkpoint-delay
-        // contract: the backend assigns the callback_id in this response,
-        // so the write cannot wait out a coalescing window.
-        if let Err(err) = self.ctx.checkpoint_updates_urgent(vec![update]).await {
-            // Audit (#43): callback-creation START: no user code ran (the
-            // callback ID does not exist yet), so no terminal FAIL is
-            // needed; re-invocation reconverges on the same write.
-            return self
-                .ctx
-                .checkpoint_failure_unrecoverable(&wire_id, err, None)
-                .await;
-        }
-
-        // After checkpointing START, the backend assigns a callback_id.
-        // Read it from the (now-updated) checkpoint log. A record without
-        // one is an invariant violation: fail at the fault instead of
-        // handing the caller an empty ID (issue #47).
-        let callback_id = self
-            .ctx
-            .checkpoint_callback_id(&positional_id)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                missing_callback_id_error(&wire_id, CheckpointStatus::Started.wire_str())
-            })?;
-
-        if let Some(plugins) = self.ctx.plugins() {
-            let info = self
-                .info(&wire_id)
-                .with_status(crate::OperationStatus::Started)
-                .with_replay(false);
-            crate::plugin::operation_started(plugins, &info);
-        }
-
-        // Return pending: `result()` waits for the record.
-        Ok(self.into_pending(callback_id))
+            .expect("all required OperationUpdate fields set")
     }
 
     /// The plugin info of this callback, read from its current record.

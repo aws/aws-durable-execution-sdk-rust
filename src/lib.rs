@@ -121,6 +121,7 @@ mod operation_sub_type;
 mod options;
 pub mod plugin;
 pub mod serdes;
+pub(crate) mod start;
 pub(crate) mod step;
 mod task;
 #[cfg(feature = "test-util")]

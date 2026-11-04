@@ -22,6 +22,7 @@ use crate::context::{
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
 use crate::serdes::SerdesContext;
+use crate::start::StartStep;
 use crate::tracing_layer;
 use crate::{BoxError, OperationSubType, RetryDecision, RetryStrategy, Serdes};
 
@@ -377,125 +378,74 @@ where
     /// invocation. A terminal record then changed during this invocation,
     /// so it returns its outcome without an `operation_replayed` event.
     async fn before(&self, resumed: bool) -> Result<StepPrelude<O>, OperationError> {
-        // 1. Task-ownership check.
-        self.ctx.enforce_task_ownership()?;
+        // 1. The start step: admission, task ownership, the replay identity
+        // check, and the START of a live attempt (see `crate::start`).
+        let started = crate::start::start_step(
+            &self.ctx,
+            &crate::start::StartSpec {
+                op_id: &self.op_id,
+                operation_type: "Step",
+                sub_type: self.sub_type.as_str(),
+                name: self.name.as_deref(),
+                order: match self.semantics {
+                    StepSemantics::AtLeastOncePerRetry => crate::start::StartOrder::QueueThenHook,
+                    StepSemantics::AtMostOncePerRetry => crate::start::StartOrder::AwaitResponse,
+                },
+            },
+            |view| self.cycle(view),
+            || self.start_update(),
+            |plugins, is_replay| self.operation_started(plugins, is_replay),
+        )?;
 
-        let positional_id = self.op_id.positional();
         let wire_id = self.op_id.wire();
 
-        // 2. Check checkpoint log for replay. The validated view covers the
-        // non-terminal branches without cloning; the terminal branches fetch
-        // only the one field they consume.
-        let mut already_started = false;
-        if let Some(view) = self.ctx.checkpoint_view_validated(
-            positional_id,
-            wire_id,
-            "Step",
-            Some(self.sub_type.as_str()),
-            self.name.as_deref(),
-        )? {
-            match view.status {
-                CheckpointStatus::Succeeded => {
-                    // Decode the recorded payload FIRST: `operation_replayed`
-                    // promises a recorded terminal outcome was returned, so a
-                    // corrupt payload or failing serdes surfaces as an error
-                    // without the event.
-                    let serdes_ctx = SerdesContext::new(wire_id, self.ctx.execution_arn());
-                    let payload = self.ctx.checkpoint_result_payload(positional_id);
-                    let value = replay_success(
-                        &self.ctx,
-                        self.name.as_deref(),
-                        &self.serdes,
-                        payload,
-                        serdes_ctx,
-                    )
-                    .await?;
-                    self.emit_replayed(resumed, view.attempt);
-                    return Ok(StepPrelude::Done(Ok(value)));
-                }
-                CheckpointStatus::Failed => {
-                    self.emit_replayed(resumed, view.attempt);
-                    let wire = self
-                        .ctx
-                        .checkpoint_wire_error(positional_id)
-                        .unwrap_or_default();
-                    return Ok(StepPrelude::Done(Err(replay_failure(wire, wire_id))));
-                }
-                CheckpointStatus::Pending => {
-                    // Retry timer hasn't fired yet: wait for it.
-                    return Ok(StepPrelude::Wait);
-                }
-                CheckpointStatus::Started => {
-                    // Already started: behavior depends on semantics.
-                    if self.semantics == StepSemantics::AtMostOncePerRetry {
-                        // The previous attempt was interrupted before
-                        // recording an outcome. Do NOT re-execute; treat as
-                        // a step-interrupted failure and consult the retry
-                        // strategy to decide FAIL or RETRY.
-                        let attempt = self.ctx.get_attempt(&self.op_id).saturating_add(1);
-                        handle_failure(
-                            &self.ctx,
-                            wire_id,
-                            self.name.as_deref(),
-                            self.sub_type.as_str(),
-                            self.plugin_name.as_deref(),
-                            self.retry_strategy.as_ref(),
-                            StepErrorKind::Interrupted,
-                            STEP_INTERRUPTED_MESSAGE.into(),
-                            attempt,
-                        )
-                        .await?;
-                        return Ok(StepPrelude::Wait);
-                    }
-                    // AtLeastOncePerRetry (default): skip re-checkpointing
-                    // START but re-execute the body.
-                    already_started = true;
-                }
-                CheckpointStatus::Ready
-                | CheckpointStatus::Cancelled
-                | CheckpointStatus::TimedOut
-                | CheckpointStatus::Stopped => {
-                    // Fall through to live execution.
-                }
-                CheckpointStatus::Unknown(ref raw) => {
-                    // Unreachable in production: `checkpoint_view_validated`
-                    // already failed the execution (issue #45). Kept as a
-                    // typed arm so a future bypass cannot fall through to
-                    // live execution and re-run a possibly-terminal step.
-                    return Err(self.ctx.unrecognized_status_error(wire_id, raw));
-                }
+        // 2. A record that queues no START: replay its outcome, wait for
+        // its retry timer, or re-enter its interrupted attempt.
+        let start = match started {
+            StartStep::Refused => return std::future::pending().await,
+            StartStep::Queued(write) => Some(write),
+            // AtLeastOncePerRetry (default): skip re-checkpointing START but
+            // re-execute the body. The start step fired the replay start
+            // hook.
+            StartStep::Recorded(view)
+                if view.status == CheckpointStatus::Started
+                    && self.semantics == StepSemantics::AtLeastOncePerRetry =>
+            {
+                None
             }
-        }
+            StartStep::Recorded(view) => return self.recorded(resumed, &view).await,
+        };
 
         // 3. Live execution path.
         // Derive the current attempt from checkpoint log: if there's a
         // recorded operation with step details, attempt = recorded + 1.
         let attempt = self.ctx.get_attempt(&self.op_id).saturating_add(1);
 
-        // Checkpoint START (skip if step was already in Started state).
         // An at-least-once attempt runs its body while START is in flight
         // and awaits it before the outcome write (see `StepPrelude::Run`).
         // An at-most-once body must not run without a recorded START, so
-        // that attempt awaits START here.
-        let mut start = None;
-        if !already_started {
-            let submitted = self
-                .ctx
-                .submit_checkpoint_updates(vec![self.start_update()]);
-            if self.semantics == StepSemantics::AtLeastOncePerRetry {
-                start = Some(submitted);
-            } else if let Err(err) = submitted.await {
-                // Audit (#43): step START: no user code has run for this
-                // attempt, so there is no side effect needing a recorded
-                // outcome. No terminal FAIL: the invocation dies, the
-                // service re-invokes, and replay reaches this point and
-                // attempts the same write, losing only one invocation.
-                return self
-                    .ctx
-                    .checkpoint_failure_unrecoverable(wire_id, err, None)
-                    .await;
+        // that attempt awaits START here, then fires its start hooks.
+        let start = match start {
+            None => None,
+            Some(start) if self.semantics == StepSemantics::AtLeastOncePerRetry => Some(start),
+            Some(start) => {
+                if let Err(err) = start.await {
+                    // Audit (#43): step START: no user code has run for this
+                    // attempt, so there is no side effect needing a recorded
+                    // outcome. No terminal FAIL: the invocation dies, the
+                    // service re-invokes, and replay reaches this point and
+                    // attempts the same write, losing only one invocation.
+                    return self
+                        .ctx
+                        .checkpoint_failure_unrecoverable(wire_id, err, None)
+                        .await;
+                }
+                if let Some(plugins) = self.ctx.plugins() {
+                    self.operation_started(plugins, attempt > 1);
+                }
+                None
             }
-        }
+        };
 
         // The body runs inside a tracing span carrying the structured-log
         // field contract.
@@ -510,7 +460,7 @@ where
             is_replay,
         );
 
-        self.attempt_started(attempt, already_started || attempt > 1);
+        self.attempt_started(attempt);
 
         Ok(StepPrelude::Run {
             attempt,
@@ -519,14 +469,108 @@ where
         })
     }
 
-    /// Fires the start hooks of the live attempt `attempt`. It is a replay
-    /// from the second attempt on, and on re-entry into a `STARTED` record.
-    ///
-    /// An at-least-once attempt fires them while its START write is in
-    /// flight, as JS does: its body does not wait for the write either.
-    fn attempt_started(&self, attempt: u32, is_replay: bool) {
+    /// Handles a record for which this cycle neither queues a `START` nor
+    /// re-enters an at-least-once attempt: it replays a terminal outcome,
+    /// waits for a retry timer, or fails an interrupted at-most-once
+    /// attempt.
+    async fn recorded(
+        &self,
+        resumed: bool,
+        view: &crate::engine::CheckpointStatusView,
+    ) -> Result<StepPrelude<O>, OperationError> {
+        let positional_id = self.op_id.positional();
+        let wire_id = self.op_id.wire();
+        match view.status {
+            CheckpointStatus::Succeeded => {
+                // Decode the recorded payload FIRST: `operation_replayed`
+                // promises a recorded terminal outcome was returned, so a
+                // corrupt payload or failing serdes surfaces as an error
+                // without the event.
+                let serdes_ctx = SerdesContext::new(wire_id, self.ctx.execution_arn());
+                let payload = self.ctx.checkpoint_result_payload(positional_id);
+                let value = replay_success(
+                    &self.ctx,
+                    self.name.as_deref(),
+                    &self.serdes,
+                    payload,
+                    serdes_ctx,
+                )
+                .await?;
+                self.emit_replayed(resumed, view.attempt);
+                Ok(StepPrelude::Done(Ok(value)))
+            }
+            CheckpointStatus::Failed => {
+                self.emit_replayed(resumed, view.attempt);
+                let wire = self
+                    .ctx
+                    .checkpoint_wire_error(positional_id)
+                    .unwrap_or_default();
+                Ok(StepPrelude::Done(Err(replay_failure(wire, wire_id))))
+            }
+            CheckpointStatus::Started => {
+                // AtMostOncePerRetry: the previous attempt was interrupted
+                // before recording an outcome. Do NOT re-execute; treat as
+                // a step-interrupted failure and consult the retry
+                // strategy to decide FAIL or RETRY.
+                let attempt = self.ctx.get_attempt(&self.op_id).saturating_add(1);
+                handle_failure(
+                    &self.ctx,
+                    wire_id,
+                    self.name.as_deref(),
+                    self.sub_type.as_str(),
+                    self.plugin_name.as_deref(),
+                    self.retry_strategy.as_ref(),
+                    StepErrorKind::Interrupted,
+                    STEP_INTERRUPTED_MESSAGE.into(),
+                    attempt,
+                )
+                .await?;
+                Ok(StepPrelude::Wait)
+            }
+            CheckpointStatus::Unknown(ref raw) => {
+                // Unreachable in production: `checkpoint_view_validated`
+                // already failed the execution (issue #45). Kept as a typed
+                // arm so a future bypass cannot fall through to live
+                // execution and re-run a possibly-terminal step.
+                Err(self.ctx.unrecognized_status_error(wire_id, raw))
+            }
+            // PENDING: the retry timer hasn't fired yet, so wait for it.
+            // `cycle` starts a new attempt for the other statuses of this
+            // arm, so only PENDING reaches it.
+            CheckpointStatus::Pending
+            | CheckpointStatus::Ready
+            | CheckpointStatus::Cancelled
+            | CheckpointStatus::TimedOut
+            | CheckpointStatus::Stopped => Ok(StepPrelude::Wait),
+        }
+    }
+
+    /// What the start step does with this step's record (see
+    /// [`step_cycle`]).
+    fn cycle(&self, view: &crate::engine::CheckpointStatusView) -> crate::start::Cycle {
+        step_cycle(self.semantics, view)
+    }
+
+    /// Fires `on_operation_start` of this step with the status `Started`.
+    fn operation_started(&self, plugins: &crate::plugin::InvocationPlugins, is_replay: bool) {
+        let info = step_info(
+            &self.ctx,
+            self.op_id.wire(),
+            self.sub_type.as_str(),
+            self.name.as_deref(),
+            self.plugin_name.as_deref(),
+        )
+        .with_status(crate::OperationStatus::Started)
+        .with_replay(is_replay);
+        crate::plugin::operation_started(plugins, &info);
+    }
+
+    /// Fires `on_attempt_start` of the live attempt `attempt`, after
+    /// `on_operation_start` fired: in the start step for an at-least-once
+    /// attempt, or after the START response for an at-most-once one.
+    fn attempt_started(&self, attempt: u32) {
         if let Some(plugins) = self.ctx.plugins() {
-            crate::plugin::attempt_started(
+            crate::plugin::attempt_start_only(
                 plugins,
                 step_info(
                     &self.ctx,
@@ -536,7 +580,6 @@ where
                     self.plugin_name.as_deref(),
                 ),
                 attempt,
-                is_replay,
             );
         }
     }
@@ -600,6 +643,30 @@ where
 }
 
 // Free functions for post-closure operations
+
+/// What the start step does with a step's record under `semantics`: a
+/// `READY`, `CANCELLED`, `TIMED_OUT` or `STOPPED` record begins a new
+/// attempt, which is a replay from the second attempt on. A `STARTED`
+/// record under `AtLeastOncePerRetry` re-enters its attempt, and every
+/// other record queues no `START`.
+pub(crate) fn step_cycle(
+    semantics: StepSemantics,
+    view: &crate::engine::CheckpointStatusView,
+) -> crate::start::Cycle {
+    use crate::start::Cycle;
+    match view.status {
+        CheckpointStatus::Ready
+        | CheckpointStatus::Cancelled
+        | CheckpointStatus::TimedOut
+        | CheckpointStatus::Stopped => Cycle::Start {
+            is_replay: view.attempt > 0,
+        },
+        CheckpointStatus::Started if semantics == StepSemantics::AtLeastOncePerRetry => {
+            Cycle::Resume
+        }
+        _ => Cycle::Record,
+    }
+}
 
 /// The plugin info of the step `wire_id`, created in `ctx`. A
 /// `plugin_name` replaces the name the info reports.

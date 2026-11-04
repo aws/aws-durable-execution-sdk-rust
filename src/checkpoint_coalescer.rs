@@ -351,6 +351,8 @@ pub(crate) struct CheckpointCoalescer {
     writer: tokio::sync::Mutex<()>,
     /// Per-request size caps applied when a sealed batch is written.
     limits: BatchLimits,
+    /// Wakes a flusher waiting for the open batch's holds to be released.
+    unheld: Notify,
 }
 
 /// Buffer state guarded by the coalescer lock.
@@ -395,6 +397,10 @@ struct CoalescerState {
     /// failures but never clears the latch: the coalescer lives for one
     /// invocation, and its write channel does not come back within it.
     latched: Option<ExecutionClientError>,
+    /// The reservations that hold the open batch (see
+    /// [`CheckpointCoalescer::join_owned`] with `reserve`). A held batch is
+    /// not claimed for a flush.
+    holds: usize,
 }
 
 /// The checkpoint permits of one claimed batch. Dropping them releases the
@@ -494,6 +500,7 @@ impl CheckpointCoalescer {
             state: Mutex::new(CoalescerState::default()),
             writer: tokio::sync::Mutex::new(()),
             limits,
+            unheld: Notify::new(),
         }
     }
 
@@ -523,7 +530,7 @@ impl CheckpointCoalescer {
         owners: &[String],
         updates: Vec<TrackedUpdate>,
     ) -> Option<(Arc<CheckpointBatch>, bool)> {
-        self.join_owned(admission, coordinator, owners, updates, None)
+        self.join_owned(admission, coordinator, owners, updates, None, false)
     }
 
     /// Adds `updates` to the buffer and returns the batch they joined,
@@ -546,6 +553,9 @@ impl CheckpointCoalescer {
     /// owners under the buffer lock. A batch is claimed under the same
     /// lock, so the owner is in place before the batch can be written and
     /// its result published.
+    ///
+    /// With `reserve`, the join also holds the batch: no flusher claims it
+    /// until [`Self::release_hold`] is called once for this join.
     pub(crate) fn join_owned(
         &self,
         admission: &Admission,
@@ -553,6 +563,7 @@ impl CheckpointCoalescer {
         owners: &[String],
         updates: Vec<TrackedUpdate>,
         failure_owner: Option<&str>,
+        reserve: bool,
     ) -> Option<(Arc<CheckpointBatch>, bool)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if !admission.admits(owners) {
@@ -561,6 +572,9 @@ impl CheckpointCoalescer {
         let permit = coordinator.acquire(PermitKind::Checkpoint)?;
         state.pending.extend(updates);
         state.permits.push(permit);
+        if reserve {
+            state.holds = state.holds.saturating_add(1);
+        }
         let opened = state.batch.is_none();
         let batch = Arc::clone(state.batch.get_or_insert_with(Arc::default));
         if let Some(owner) = failure_owner {
@@ -573,47 +587,76 @@ impl CheckpointCoalescer {
         Some((batch, opened))
     }
 
+    /// Releases one hold of the open batch, and wakes a flusher waiting
+    /// for it (see [`Self::join_owned`]).
+    pub(crate) fn release_hold(&self) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.holds = state.holds.saturating_sub(1);
+        }
+        self.unheld.notify_waiters();
+    }
+
+    /// Waits until no reservation holds the open batch, then runs `take`
+    /// under the buffer lock. A hold is taken under the same lock, so no
+    /// hold is added between the check and the claim.
+    async fn when_unheld<T>(&self, take: impl Fn(&mut CoalescerState) -> T) -> T {
+        loop {
+            // `enable()` registers the waiter before the check, so a
+            // release between the check and the await still wakes it.
+            let mut unheld = std::pin::pin!(self.unheld.notified());
+            unheld.as_mut().enable();
+            {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if state.holds == 0 {
+                    return take(&mut state);
+                }
+            }
+            unheld.await;
+        }
+    }
+
     /// Claims `target`'s buffered updates for flushing, if `target` is still
-    /// the open batch. Returns `None` when another flusher already claimed
-    /// it (its result will be published by that flusher).
+    /// the open batch, once no reservation holds it. Returns `None` when
+    /// another flusher already claimed it (its result will be published by
+    /// that flusher).
     ///
     /// The returned permits are the batch's checkpoint permits: the flusher
     /// drops them after the response is merged and published.
+    pub(crate) async fn take_batch_unheld(
+        &self,
+        target: &Arc<CheckpointBatch>,
+    ) -> Option<(Vec<TrackedUpdate>, BatchPermits)> {
+        self.when_unheld(|state| take_target(state, target)).await
+    }
+
+    /// [`Self::take_batch_unheld`] without the wait for holds. Tests use it.
+    #[cfg(test)]
     pub(crate) fn take_batch(
         &self,
         target: &Arc<CheckpointBatch>,
     ) -> Option<(Vec<TrackedUpdate>, BatchPermits)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        match &state.batch {
-            Some(open) if Arc::ptr_eq(open, target) => {
-                state.batch = None;
-                Some((
-                    std::mem::take(&mut state.pending),
-                    BatchPermits {
-                        held: std::mem::take(&mut state.permits),
-                    },
-                ))
-            }
-            _ => None,
-        }
+        take_target(&mut state, target)
     }
 
-    /// Claims whatever batch is open, unconditionally. Used by the flush
-    /// points (suspension, end of invocation) that must drain the buffer
-    /// regardless of which batch is pending. Returns `None` when the buffer
-    /// is idle.
+    /// Claims whatever batch is open, once no reservation holds it. Used by
+    /// the flush points (suspension, end of invocation) that must drain the
+    /// buffer regardless of which batch is pending. Returns `None` when the
+    /// buffer is idle.
+    pub(crate) async fn take_any_unheld(
+        &self,
+    ) -> Option<(Arc<CheckpointBatch>, Vec<TrackedUpdate>, BatchPermits)> {
+        self.when_unheld(take_open).await
+    }
+
+    /// [`Self::take_any_unheld`] without the wait for holds. Tests use it.
+    #[cfg(test)]
     pub(crate) fn take_any(
         &self,
     ) -> Option<(Arc<CheckpointBatch>, Vec<TrackedUpdate>, BatchPermits)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let batch = state.batch.take()?;
-        Some((
-            batch,
-            std::mem::take(&mut state.pending),
-            BatchPermits {
-                held: std::mem::take(&mut state.permits),
-            },
-        ))
+        take_open(&mut state)
     }
 
     /// Retains a checkpoint write failure for the end-of-invocation flush
@@ -654,6 +697,18 @@ impl CheckpointCoalescer {
             .len()
     }
 
+    /// The IDs of the buffered updates, in join order.
+    #[cfg(test)]
+    pub(crate) fn pending_ids(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .iter()
+            .map(|tracked| tracked.update.id().to_owned())
+            .collect()
+    }
+
     /// Drains the retained write failures, in occurrence order. The
     /// failure latch is deliberately NOT cleared (see
     /// [`CoalescerState::latched`]): the write channel stays poisoned for
@@ -662,6 +717,39 @@ impl CheckpointCoalescer {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut state.failed)
     }
+}
+
+/// Claims `target`'s updates and permits when it is the open batch.
+fn take_target(
+    state: &mut CoalescerState,
+    target: &Arc<CheckpointBatch>,
+) -> Option<(Vec<TrackedUpdate>, BatchPermits)> {
+    match &state.batch {
+        Some(open) if Arc::ptr_eq(open, target) => {
+            state.batch = None;
+            Some((
+                std::mem::take(&mut state.pending),
+                BatchPermits {
+                    held: std::mem::take(&mut state.permits),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Claims the open batch, its updates and its permits, if one is open.
+fn take_open(
+    state: &mut CoalescerState,
+) -> Option<(Arc<CheckpointBatch>, Vec<TrackedUpdate>, BatchPermits)> {
+    let batch = state.batch.take()?;
+    Some((
+        batch,
+        std::mem::take(&mut state.pending),
+        BatchPermits {
+            held: std::mem::take(&mut state.permits),
+        },
+    ))
 }
 
 #[cfg(test)]
