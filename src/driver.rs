@@ -312,6 +312,27 @@ impl Drop for PanicOwnershipGuard {
     }
 }
 
+/// Ends the invocation and stops its operation tasks when dropped.
+///
+/// The drive holds one. Its normal cleanup aborts and joins every task
+/// itself. When the drive future is dropped before that, for example at a
+/// platform timeout, this guard's drop is what stops the operation tasks
+/// whose handles were dropped.
+///
+/// The root task can still be in a poll on another worker thread when the
+/// drive is dropped, and that poll can start an operation task after the
+/// drop. So the drop moves the phase to `Finished`, which refuses every
+/// later spawn, and closes the tracker, which aborts a task whose spawn
+/// took its permit before that.
+struct TeardownGuard(Arc<InvocationCoordinator>);
+
+impl Drop for TeardownGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+        self.0.tasks().close();
+    }
+}
+
 /// Drives a single invocation of the user's handler future.
 ///
 /// The handler runs as the invocation's root task, started through the
@@ -364,7 +385,9 @@ impl Drop for PanicOwnershipGuard {
 ///
 /// When this future is dropped before it decides the outcome, a guard
 /// closes panic ownership and drops a kept panic (see
-/// [`PanicOwnershipGuard`]).
+/// [`PanicOwnershipGuard`]), and another ends the invocation and aborts
+/// every tracked operation task, including one started after the drop (see
+/// [`TeardownGuard`]).
 pub(crate) async fn drive_invocation<F>(
     handler_future: F,
     task_ownership: Arc<TaskOwnership>,
@@ -399,6 +422,12 @@ where
     S: Future<Output = ()>,
 {
     let ownership_guard = PanicOwnershipGuard(Arc::clone(&coordinator));
+    // Dropping a `.spawn()` handle does not stop its task. So when this
+    // future is dropped before the cleanup below, this guard ends the
+    // invocation and stops every tracked operation task, including one the
+    // root starts after the drop. After the cleanup no task is live, the
+    // phase is already `Finished`, and its drop only closes the tracker.
+    let _teardown = TeardownGuard(Arc::clone(&coordinator));
     coordinator.start_deadline(remaining);
     // Boxed, so the cleanup below can drop it before it waits for the tasks.
     let mut scheduler = Box::pin(scheduler);
@@ -2099,10 +2128,11 @@ mod suspension_containment_and_task_ownership {
         }
     }
 
-    // 5. Dropping a .spawn() handle cancels its task
+    // 5. Dropping a .spawn() handle loses only the result: the task keeps
+    // running until the tracker aborts it.
 
     #[tokio::test]
-    async fn dropping_spawn_handle_cancels_task() {
+    async fn dropping_spawn_handle_keeps_task_running() {
         let ctx = live_ctx(Arc::new(InMemoryExecutionClient::new(Vec::new())));
         let started = Arc::new(AtomicBool::new(false));
         let reached_end = Arc::new(AtomicBool::new(false));
@@ -2142,17 +2172,21 @@ mod suspension_containment_and_task_ownership {
             );
             drop(handle);
         }
-        // Let the runtime process the abort.
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
         assert!(
-            dropped.load(Ordering::SeqCst),
-            "dropped .spawn() handle must cancel the task"
+            !dropped.load(Ordering::SeqCst),
+            "a dropped .spawn() handle does not cancel the task"
         );
+        // The drive's teardown still stops it.
+        let tasks = Arc::clone(ctx.coordinator().tasks());
+        tasks.abort_all();
+        tasks.wait_idle().await;
+        assert!(dropped.load(Ordering::SeqCst), "abort_all stops the task");
         assert!(
             !reached_end.load(Ordering::SeqCst),
-            "cancelled task must not reach its end"
+            "the stopped task does not reach its end"
         );
     }
 
@@ -2160,11 +2194,11 @@ mod suspension_containment_and_task_ownership {
     // invocation until the Lambda timeout fires. The timeout drops the
     // `drive_invocation` future, so the driver's cleanup never runs. Dropping
     // it drops the root task's `TrackedTask` handle, which aborts the root
-    // task. When tokio unwinds the root task, the handler drops the
-    // straggler's `TrackedTask` handle, which aborts the straggler. No
-    // SUCCEED checkpoint is made for the aborted straggler. This is Case G
-    // from the S2a diagnosis: the bounded timeout simulates the Lambda
-    // platform's execution timeout backstop.
+    // task, and the drive's teardown guard, which aborts every tracked
+    // operation task. Dropping the straggler's own handle would not stop
+    // it. No SUCCEED checkpoint is made for the aborted straggler. The
+    // bounded timeout simulates the Lambda platform's execution timeout
+    // backstop.
 
     #[tokio::test]
     async fn straggler_is_aborted_by_timeout_no_succeed_checkpoint() {
@@ -2266,6 +2300,99 @@ mod suspension_containment_and_task_ownership {
                 .all(|u| u.action() != &OperationAction::Succeed),
             "no operation should have checkpointed SUCCEED — the straggler \
              was aborted before reaching its terminal"
+        );
+    }
+
+    // The drive is dropped while the root task is inside a poll on another
+    // worker thread. Aborting the root does not interrupt that poll, and
+    // the tracker has no live task, so the root can still start an
+    // operation task after the drop. The teardown must stop it: the task
+    // never runs, or it is aborted, and no work of the invocation remains.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_spawn_after_drive_drop_is_stopped() {
+        let ctx = live_ctx(Arc::new(InMemoryExecutionClient::new(Vec::new())));
+        let coordinator = Arc::clone(ctx.coordinator());
+        let (in_poll_tx, in_poll_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let body_started = Arc::new(AtomicBool::new(false));
+        let body_dropped = Arc::new(AtomicBool::new(false));
+        let spawned = Arc::new(AtomicBool::new(false));
+
+        let ctx_h = ctx.clone();
+        let started = Arc::clone(&body_started);
+        let dropped = Arc::clone(&body_dropped);
+        let after_spawn = Arc::clone(&spawned);
+        let handler = async move {
+            // Hold this worker inside the root's poll until the test has
+            // dropped the drive.
+            in_poll_tx.send(()).expect("the test waits for this signal");
+            resume_rx.recv().expect("the test resumes the root");
+            let handle = ctx_h
+                .step(move |_| {
+                    let started = Arc::clone(&started);
+                    let dropped = Arc::clone(&dropped);
+                    async move {
+                        struct G(Arc<AtomicBool>);
+                        impl Drop for G {
+                            fn drop(&mut self) {
+                                self.0.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        let _g = G(dropped);
+                        started.store(true, Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                        Ok(1i32)
+                    }
+                })
+                .name("late")
+                .spawn();
+            drop(handle);
+            after_spawn.store(true, Ordering::SeqCst);
+            std::future::pending::<Result<String, crate::error::WireError>>().await
+        };
+
+        let mut drive = Box::pin(super::drive_invocation(
+            handler,
+            Arc::clone(ctx.task_ownership()),
+            Arc::clone(&coordinator),
+            ctx.clone(),
+            None,
+        ));
+        // One poll spawns the root, which a worker then polls.
+        std::future::poll_fn(|cx| {
+            assert!(drive.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        in_poll_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the root is inside its poll");
+        assert_eq!(coordinator.phase(), super::Phase::Running);
+        assert!(!coordinator.tasks().is_closed());
+        drop(drive);
+        // The teardown refuses every later spawn, and aborts a task whose
+        // spawn took its permit before that.
+        assert_eq!(coordinator.phase(), super::Phase::Finished);
+        assert!(coordinator.tasks().is_closed());
+        resume_tx.send(()).expect("the root waits for this signal");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !spawned.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the root reaches its spawn after the drop");
+        // Give a spawned task time to be polled, if it was started.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(5), coordinator.tasks().wait_idle())
+            .await
+            .expect("no operation task outlives the dropped drive");
+        assert_eq!(coordinator.tasks().live(), 0);
+        assert!(
+            !body_started.load(Ordering::SeqCst) || body_dropped.load(Ordering::SeqCst),
+            "a late operation task that ran was aborted"
         );
     }
 }
@@ -2949,8 +3076,8 @@ mod task_gateway {
     }
 
     /// A spawned step body still mid-await when the handler resolves is
-    /// dropped before `drive_invocation` returns, and the invocation
-    /// completes with the handler's result.
+    /// dropped by the drive's cleanup before `drive_invocation` returns, and
+    /// the invocation completes with the handler's result.
     #[tokio::test]
     async fn aborted_spawned_body_drops_before_invocation_returns() {
         let ctx = live_ctx();
@@ -3705,6 +3832,8 @@ mod coordinator_suspension {
                     Some("the wait never registered"),
                 ));
             }
+            // The dropped wait keeps waiting until the drive ends, which
+            // stops it. The handler's result decides the outcome.
             drop(w);
             Ok(serde_json::to_string("done").expect("a string serializes"))
         })
@@ -3769,18 +3898,20 @@ mod coordinator_suspension {
         assert_eq!(outcome, InvocationOutcome::Complete("a".to_owned()));
         assert_clean(&coordinator);
 
-        // (b) The handler awaits the wait alone after dropping the step.
+        // (b) The handler drops both handles and returns Ok. The detached
+        // step and wait keep running until the drive ends, which stops
+        // them.
         let ctx = scripted_ctx(&Arc::new(ScriptedClient::empty()));
         let coordinator = Arc::clone(ctx.coordinator());
         let outcome = drive_handler(ctx, None, |ctx| async move {
-            let (wait, step) = spawn_wait_and_stuck_step(&ctx);
-            drop(step);
-            wait.await.map_err(wire_err)?;
+            drop(spawn_wait_and_stuck_step(&ctx));
+            ctx.hold_activity(tokio::time::sleep(Duration::from_millis(10)))
+                .await;
             Ok("b".to_owned())
         })
         .await
         .expect("no panic");
-        assert_eq!(outcome, InvocationOutcome::Pending);
+        assert_eq!(outcome, InvocationOutcome::Complete("b".to_owned()));
         assert_clean(&coordinator);
 
         // (c) The handler returns Err.
@@ -5176,7 +5307,10 @@ mod refresh_scheduler {
                 .name("cb")
                 .await
                 .map_err(wire_err)?;
-            let mut cb_h = cb.spawn_result();
+            // A lazy result future, polled once, registers the wait.
+            // Dropping it retires the registration. (Dropping the handle of
+            // `spawn_result()` would not: the wait keeps running.)
+            let mut cb_h = cb.result();
             poll_once(std::pin::Pin::new(&mut cb_h)).await;
             let w = ctx.wait(secs(3)).name("w").spawn();
             let (waited, ()) = tokio::join!(w, async move {
@@ -5202,13 +5336,6 @@ mod refresh_scheduler {
         Invoke,
         Condition,
     }
-
-    const SPAWNED: [Spawned; 4] = [
-        Spawned::Wait,
-        Spawned::Callback,
-        Spawned::Invoke,
-        Spawned::Condition,
-    ];
 
     impl Spawned {
         /// The name the operation gets.
@@ -5306,9 +5433,11 @@ mod refresh_scheduler {
         }
     }
 
+    /// A wait, an invoke and a callback result start refreshing only after
+    /// their handle is first polled.
     #[tokio::test(start_paused = true)]
     async fn unawaited_spawned_operation_is_not_refreshed() {
-        for kind in SPAWNED {
+        for kind in [Spawned::Wait, Spawned::Callback, Spawned::Invoke] {
             let client = Arc::new(kind.client());
             let ctx = refresh_ctx(&client);
             let coordinator = Arc::clone(ctx.coordinator());
@@ -5354,9 +5483,73 @@ mod refresh_scheduler {
         }
     }
 
+    /// A `wait_for_condition` started with `.spawn()` arms its refresh when
+    /// it registers its wait, so its next check runs when the delay ends
+    /// although nothing polls its handle.
+    #[tokio::test(start_paused = true)]
+    async fn unawaited_spawned_condition_is_refreshed() {
+        let client = Arc::new(Spawned::Condition.client());
+        let ctx = refresh_ctx(&client);
+        let checks = Arc::new(Mutex::new(Vec::new()));
+        let handler_checks = Arc::clone(&checks);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            // The handle is kept and never polled.
+            let _h = Spawned::Condition.start(&ctx, &handler_checks).await?;
+            sleeping_step(&ctx, "s", secs(3)).await.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        assert_times(&checks.lock().expect("lock"), &[secs(0), secs(1)]);
+        assert!(
+            !client.empty_calls().is_empty(),
+            "the condition is refreshed"
+        );
+    }
+
+    /// Dropping the handle of `Callback::spawn_result()` keeps the result
+    /// wait registered.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_callback_spawn_result_keeps_waiting() {
+        let client = Arc::new(Spawned::Callback.client());
+        let ctx = refresh_ctx(&client);
+        let seen = Arc::new(Mutex::new(None));
+        let handler_seen = Arc::clone(&seen);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let cb = ctx
+                .create_callback::<String>()
+                .name("cb")
+                .await
+                .map_err(wire_err)?;
+            drop(cb.spawn_result());
+            let live = ctx
+                .hold_activity(async {
+                    for _ in 0..1000 {
+                        if ctx.coordinator().live_waits() == 1 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    ctx.coordinator().live_waits()
+                })
+                .await;
+            *handler_seen.lock().expect("lock") = Some(live);
+            sleeping_step(&ctx, "s", secs(1)).await.map_err(wire_err)?;
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(*seen.lock().expect("lock"), Some(1), "the wait stays live");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+    }
+
+    /// A wait, an invoke and a callback result start refreshing at the
+    /// first poll of their handle. A condition refreshes from its
+    /// registration (see `unawaited_spawned_condition_is_refreshed`).
     #[tokio::test(start_paused = true)]
     async fn spawned_operation_refresh_starts_at_first_poll() {
-        for kind in SPAWNED {
+        for kind in [Spawned::Wait, Spawned::Callback, Spawned::Invoke] {
             let client = Arc::new(kind.client());
             let ctx = refresh_ctx(&client);
             let resolved = Arc::new(Mutex::new(None));
@@ -5677,8 +5870,9 @@ mod panic_owner {
     }
 
     /// Test 8. The handler drops the handle of a pending step whose body
-    /// panics when it is dropped. The abort drops the body, and the
-    /// gateway records that panic.
+    /// panics when it is dropped, and returns. Dropping the handle does not
+    /// stop the step. The drive's cleanup aborts it, which drops the body,
+    /// and the gateway records that panic.
     #[tokio::test]
     async fn panic_while_aborting_dropped_task_fails_invocation() {
         let (driven, live) = drive(live_ctx(), |ctx| async move {

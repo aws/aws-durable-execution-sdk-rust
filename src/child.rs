@@ -18,6 +18,7 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use tracing::Instrument as _;
 
 use crate::Serdes;
+use crate::checkpoint_coalescer::ScopeClose;
 use crate::context::{ActiveBody, DurableContext, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
@@ -105,16 +106,21 @@ where
                 // runs before it returns its future is checked too.
                 let child_span = child_ctx.replay_span();
                 let body = ActiveBody::Context(child_ctx.prefix().to_owned());
+                // The child's scope closes when the body returns, and also
+                // when this future is dropped before that, because the
+                // operation that owns the child was stopped.
+                let scope = ScopeClose::new(after.ctx.admission(), &after.wire_id);
                 let result = run_body(body, async move { (closure)(child_ctx).await })
                     .instrument(child_span)
                     .await
                     .map_err(Into::into);
                 // The body returned, so the child is finished. An operation
-                // it started and did not await writes no further checkpoint
-                // (see `Admission`). The child's own terminal update below
-                // is written through the parent context, whose owners do not
-                // include this child, so it is admitted.
-                after.abandon_child();
+                // it started and did not await writes no further checkpoint,
+                // and its task stops (see `Admission`). The child's own
+                // terminal update below is written through the parent
+                // context, whose owners do not include this child, so it is
+                // admitted.
+                drop(scope);
                 after.settle(mode, result).await
             }
         }
@@ -353,12 +359,6 @@ where
     O: Send + 'static,
     S: Serdes<O>,
 {
-    /// Abandons the child context: every later checkpoint update from a
-    /// context inside it is rejected.
-    fn abandon_child(&self) {
-        self.ctx.admission().abandon([self.wire_id.as_str()]);
-    }
-
     /// Settles the child body's outcome.
     ///
     /// Live mode checkpoints it: success through [`build_succeed_update`]

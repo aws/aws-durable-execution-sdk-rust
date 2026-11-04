@@ -148,6 +148,13 @@ pub trait PluginFactory: Send + Sync + 'static {
 /// await it until the drain deadline, 500 ms before the invocation
 /// deadline.
 ///
+/// An operation whose `.spawn()` handle the handler dropped still runs, so
+/// its hooks fire as for any other operation: its end hook fires when it
+/// settles, and the futures its hooks return follow the same
+/// invocation-end drain. An operation the SDK stops, because its scope
+/// closed, a combinator stopped it, or the invocation ended, fires no end
+/// hook.
+///
 /// No hook future may block a thread, in `poll` or in `Drop`. The futures
 /// of [`wrap_task`](Self::wrap_task) and of the operation hooks are
 /// `'static`; a plugin that needs its own state there clones an owned

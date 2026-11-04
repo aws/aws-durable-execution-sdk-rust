@@ -60,6 +60,7 @@ use std::time::Duration;
 use aws_sdk_lambda::types::OperationUpdate;
 use tokio::sync::Notify;
 use tokio::sync::futures::Notified;
+use tokio::task::AbortHandle;
 
 use crate::client::{CheckpointOutput, ExecutionClientError};
 use crate::coordinator::{InvocationCoordinator, Permit, PermitKind};
@@ -97,50 +98,136 @@ impl TrackedUpdate {
     }
 }
 
-/// Abandoned owners of one invocation: non-virtual child contexts, batch
-/// items included.
+/// The scopes of one invocation: child contexts, `with_retry` blocks and
+/// attempts, and batch items, flat items included. Tracks which scopes
+/// have closed, and the operation tasks started inside each scope.
 ///
-/// An owner is named by the wire ID of its child context. Every context
-/// carries the owners it runs in, outermost first (see
-/// `DurableContext::owners`). A checkpoint update is admitted only when no
-/// owner of the context that writes it is abandoned. So once an owner is
-/// abandoned, no later update from it or from any context nested in it is
-/// sent.
+/// A scope is named by the wire ID of its child context. Every context
+/// carries the scopes it runs in, outermost first (see
+/// `DurableContext::owners`). The root context runs in no scope.
+///
+/// A closed scope does two things:
+///
+/// 1. It rejects checkpoint updates. An update is admitted only when no
+///    owner of the context that writes it is closed. So once a scope is
+///    closed, no later update from it or from any context nested in it is
+///    sent.
+/// 2. It stops tasks. An operation task started with `.spawn()` is
+///    registered with the owners of the context that started it (see
+///    [`Self::register_task`]). Closing a scope aborts every registered task
+///    whose owners include it, so nested work stops too. An aborted task
+///    stops at its next `.await`.
 ///
 /// The admission check runs where an update enters the ordered write path:
 /// inside [`CheckpointCoalescer::join`] under the buffer lock, and after a
 /// direct write takes the checkpoint-token lock. An update admitted before
-/// an owner is abandoned is already in the buffer or already holds the
-/// token lock. The parent's final update is issued after the abandonment,
-/// so it is written after that update. [`Self::abandon`] takes only the
-/// admission lock, and the buffer lock is never taken inside it.
+/// a scope closes is already in the buffer or already holds the token
+/// lock. The parent's final update is issued after the close, so it is
+/// written after that update. [`Self::abandon`] takes only the admission
+/// lock, and the buffer lock is never taken inside it.
 #[derive(Debug, Default)]
 pub(crate) struct Admission {
-    abandoned: Mutex<BTreeSet<String>>,
+    state: Mutex<AdmissionState>,
+}
+
+/// The closed scopes and the registered tasks of an [`Admission`].
+#[derive(Debug, Default)]
+struct AdmissionState {
+    /// The wire IDs of the closed scopes.
+    abandoned: BTreeSet<String>,
+    /// Each registered task that no close has aborted yet, with the owners
+    /// of the context that started it.
+    tasks: Vec<(Vec<String>, AbortHandle)>,
 }
 
 impl Admission {
-    /// Creates an admission with no abandoned owner.
+    /// Creates an admission with no closed scope.
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// Marks these owners abandoned. Later updates from them are rejected.
-    pub(crate) fn abandon<'a>(&self, owners: impl IntoIterator<Item = &'a str>) {
-        let mut abandoned = self
-            .abandoned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        abandoned.extend(owners.into_iter().map(str::to_owned));
+    fn lock(&self) -> std::sync::MutexGuard<'_, AdmissionState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// True when no owner in `owners` is abandoned.
+    /// Closes these scopes. Later updates from them are rejected, and every
+    /// registered task started inside one of them is aborted.
+    pub(crate) fn abandon<'a>(&self, owners: impl IntoIterator<Item = &'a str>) {
+        let stopped = {
+            let mut guard = self.lock();
+            let state = &mut *guard;
+            state
+                .abandoned
+                .extend(owners.into_iter().map(str::to_owned));
+            let abandoned = &state.abandoned;
+            let (stopped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.tasks)
+                .into_iter()
+                .partition(|(owners, _)| owners.iter().any(|owner| abandoned.contains(owner)));
+            state.tasks = kept;
+            stopped
+        };
+        // Tokio is not asked to abort under the lock.
+        for (_, task) in stopped {
+            task.abort();
+        }
+    }
+
+    /// True when no owner in `owners` is closed.
     pub(crate) fn admits(&self, owners: &[String]) -> bool {
-        let abandoned = self
-            .abandoned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        !owners.iter().any(|owner| abandoned.contains(owner))
+        let state = self.lock();
+        !owners.iter().any(|owner| state.abandoned.contains(owner))
+    }
+
+    /// Registers an operation task started inside `owners`, so the close
+    /// of any of them aborts it. Aborts it at once when one of them is
+    /// already closed. Forgets the registered tasks that have finished.
+    pub(crate) fn register_task(&self, owners: &[String], task: AbortHandle) {
+        let late = {
+            let mut state = self.lock();
+            if owners.iter().any(|owner| state.abandoned.contains(owner)) {
+                Some(task)
+            } else {
+                state.tasks.retain(|(_, task)| !task.is_finished());
+                state.tasks.push((owners.to_vec(), task));
+                None
+            }
+        };
+        if let Some(task) = late {
+            task.abort();
+        }
+    }
+
+    /// The number of registered tasks.
+    #[cfg(test)]
+    fn registered(&self) -> usize {
+        self.lock().tasks.len()
+    }
+}
+
+/// Closes one scope of an [`Admission`] when dropped.
+///
+/// A child body, an item body and a `with_retry` attempt hold one while
+/// they run. So the scope closes when the body ends, and also when the
+/// body's future is dropped because the operation that owns it is
+/// stopped.
+pub(crate) struct ScopeClose {
+    admission: Arc<Admission>,
+    scope: String,
+}
+
+impl ScopeClose {
+    /// A guard that closes the scope `scope` of `admission` on drop.
+    pub(crate) fn new(admission: &Arc<Admission>, scope: &str) -> Self {
+        Self {
+            admission: Arc::clone(admission),
+            scope: scope.to_owned(),
+        }
+    }
+}
+
+impl Drop for ScopeClose {
+    fn drop(&mut self) {
+        self.admission.abandon([self.scope.as_str()]);
     }
 }
 
@@ -627,6 +714,68 @@ mod tests {
         );
         assert!(admission.admits(&sibling), "a sibling owner is admitted");
         assert!(admission.admits(&[]), "the root is admitted");
+    }
+
+    /// A task that never finishes, and its abort handle.
+    fn parked() -> (tokio::task::JoinHandle<()>, AbortHandle) {
+        #[expect(clippy::disallowed_methods)]
+        // reason: a plain task stands in for an operation task; only its
+        // abort handle is registered.
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        (task, abort)
+    }
+
+    async fn is_cancelled(task: tokio::task::JoinHandle<()>) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .is_ok_and(|joined| joined.is_err_and(|err| err.is_cancelled()))
+    }
+
+    #[tokio::test]
+    async fn closing_a_scope_aborts_its_nested_tasks_only() {
+        let admission = Admission::new();
+        let (nested, nested_abort) = parked();
+        let (sibling, sibling_abort) = parked();
+        admission.register_task(&["item".to_owned(), "inner".to_owned()], nested_abort);
+        admission.register_task(&["other".to_owned()], sibling_abort);
+        admission.abandon(["item"]);
+        assert!(is_cancelled(nested).await, "the nested task is aborted");
+        assert!(!sibling.is_finished(), "the sibling task keeps running");
+        assert_eq!(admission.registered(), 1, "the sibling stays registered");
+        sibling.abort();
+    }
+
+    #[tokio::test]
+    async fn a_task_registered_in_a_closed_scope_is_aborted_at_once() {
+        let admission = Admission::new();
+        admission.abandon(["item"]);
+        let (task, abort) = parked();
+        admission.register_task(&["item".to_owned()], abort);
+        assert!(is_cancelled(task).await, "the late task is aborted");
+        assert_eq!(admission.registered(), 0);
+    }
+
+    #[tokio::test]
+    async fn registration_forgets_finished_tasks() {
+        let admission = Admission::new();
+        let (finished, finished_abort) = parked();
+        finished.abort();
+        assert!(is_cancelled(finished).await);
+        admission.register_task(&["a".to_owned()], finished_abort);
+        let (running, running_abort) = parked();
+        admission.register_task(&["b".to_owned()], running_abort);
+        assert_eq!(admission.registered(), 1, "the finished task is forgotten");
+        running.abort();
+    }
+
+    #[tokio::test]
+    async fn scope_close_closes_its_scope_on_drop() {
+        let admission = Arc::new(Admission::new());
+        let guard = ScopeClose::new(&admission, "item");
+        assert!(admission.admits(&["item".to_owned()]));
+        drop(guard);
+        assert!(!admission.admits(&["item".to_owned()]));
     }
 
     #[test]

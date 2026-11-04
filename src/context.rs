@@ -202,10 +202,7 @@ struct Inner {
     execution_arn: String,
     lambda_context: lambda_runtime::Context,
     /// Engine state (ID counter + checkpoint log) for this context's
-    /// namespace. Shared behind an `Arc` because a clone of the context with
-    /// another owner set (see [`DurableContext::with_owner`]) must mint from
-    /// the same ID counter: two contexts minting from separate counters
-    /// would diverge on replay.
+    /// namespace.
     engine: Arc<EngineState>,
     /// The invocation coordinator, shared by every context of the
     /// invocation and by the driver.
@@ -770,34 +767,8 @@ impl DurableContext {
         }
     }
 
-    /// Creates a clone of this context whose owners also include the child
-    /// context at `positional_id`. Everything else is this context's.
-    ///
-    /// A batch item writes its own terminal update through it. So the
-    /// write is rejected once the batch abandoned the item, as every write
-    /// of the item's body is (see [`Admission`]).
-    pub(crate) fn with_owner(&self, positional_id: &str) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                execution_arn: self.inner.execution_arn.clone(),
-                lambda_context: self.inner.lambda_context.clone(),
-                engine: Arc::clone(&self.inner.engine),
-                coordinator: Arc::clone(&self.inner.coordinator),
-                task_ownership: Arc::clone(&self.inner.task_ownership),
-                execution_client: self.inner.execution_client.clone(),
-                checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
-                coalescer: self.inner.coalescer.clone(),
-                parent_wire_id: self.inner.parent_wire_id.clone(),
-                admission: Arc::clone(&self.inner.admission),
-                owners: self.owners_with(positional_id),
-                replay_span: self.inner.replay_span.clone(),
-                plugins: self.inner.plugins.clone(),
-            }),
-            awaited: None,
-        }
-    }
-
-    /// The abandoned owners of this invocation (see [`Admission`]).
+    /// The scopes of this invocation: which are closed, and the tasks
+    /// started in each (see [`Admission`]).
     pub(crate) fn admission(&self) -> &Arc<Admission> {
         &self.inner.admission
     }
@@ -4903,8 +4874,8 @@ mod tests {
     }
 
     /// Every context derived from the root shares the root's plugins: the
-    /// child of `new_child`, the flat child of `new_flat_child`, and the
-    /// clone of `with_owner`. The test compares the `Arc`s by address.
+    /// child of `new_child` and the flat child of `new_flat_child`. The test
+    /// compares the `Arc`s by address.
     #[test]
     fn derived_contexts_share_the_root_plugins() {
         let plugins = crate::plugin::test_support::invocation_plugins();
@@ -4932,7 +4903,6 @@ mod tests {
             same(&root.new_flat_child("2", "parent", None)),
             "new_flat_child copies the plugins"
         );
-        assert!(same(&root.with_owner("3")), "with_owner copies the plugins");
         assert!(
             DurableContext::test_context().plugins().is_none(),
             "a root constructor without the parameter sets none"

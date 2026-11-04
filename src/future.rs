@@ -33,9 +33,28 @@ use crate::error::{ChildFnError, OperationError};
 /// body runs when polled (lazy) unless the builder was terminated with
 /// `.spawn()` (eager).
 ///
-/// When produced by `.spawn()` the operation runs eagerly on an owned tokio
-/// task. Dropping the `DurableFuture` before it resolves aborts that task,
-/// so spawned durable work never outlives its handle.
+/// When produced by `.spawn()`, `.spawn_batch()` or
+/// [`Callback::spawn_result`], the operation runs eagerly on its own SDK
+/// task. Dropping the `DurableFuture` loses only the result: the operation
+/// runs until it settles, records its outcome and fires its plugin hooks.
+/// Its error goes into its record and is returned to nobody. A panic in it
+/// fails the invocation.
+///
+/// The SDK stops work in three cases:
+///
+/// - a combinator stops the `.future()` inputs it started that are still
+///   running when it resolves, and lets an input started with `.spawn()`
+///   run;
+/// - a closed scope stops the work still running inside it. A scope closes
+///   when a child context's body returns, when a `with_retry` block or one
+///   of its attempts ends, and when a `map`, `parallel` or `parallel_mixed`
+///   item, or the whole batch, completes;
+/// - the end of the invocation stops all remaining operation work.
+///
+/// A stopped task stops at its next `.await`, and its record can stay
+/// `STARTED`. The SDK cannot stop code between two `.await`s,
+/// `spawn_blocking` work, tasks or threads the handler starts itself, or a
+/// request already sent to another service.
 ///
 /// An operation that waits on the service (a wait, a callback result, an
 /// invoke) stays pending while other SDK work runs, and continues in the
@@ -190,17 +209,21 @@ impl<O: Send + 'static> DurableFuture<O> {
         })
     }
 
-    /// Spawns the operation future on its own task, blessed in
-    /// `task_ownership` before its first poll.
+    /// Spawns the operation future on its own task, blessed in the task
+    /// ownership of `ctx` before its first poll.
     ///
     /// The task starts through the task gateway
-    /// ([`crate::task::spawn_tracked`]) and holds a permit of `coordinator`
-    /// whenever it can make progress, so the invocation does not suspend
-    /// while it runs. A wait inside it registers like any other wait.
-    /// Dropping the returned future aborts the task. A panic in the
-    /// operation resumes on the task that awaits the handle, with its
-    /// original payload. When no Tokio runtime is running, the returned
-    /// future resolves to an error and the operation records nothing.
+    /// ([`crate::task::spawn_tracked`]) and holds a permit of the
+    /// invocation's coordinator whenever it can make progress, so the
+    /// invocation does not suspend while it runs. A wait inside it registers
+    /// like any other wait. The task is registered with the scopes of `ctx`
+    /// (see [`crate::checkpoint_coalescer::Admission`]), so it stops when
+    /// one of them closes. Dropping the returned future loses only the
+    /// result: the task keeps running. A panic in the operation resumes on
+    /// the task that awaits the handle, with its original payload, and
+    /// fails the invocation when nothing awaits it. When no Tokio runtime is
+    /// running, the returned future resolves to an error and the operation
+    /// records nothing.
     ///
     /// `awaited` is the first-poll flag the operation's wait registrations
     /// carry. The returned handle sets it on its first poll and asks the
@@ -208,12 +231,15 @@ impl<O: Send + 'static> DurableFuture<O> {
     /// [`crate::coordinator`]).
     pub(crate) fn spawn_blessed(
         future: Self,
-        task_ownership: &Arc<crate::driver::TaskOwnership>,
-        coordinator: &Arc<InvocationCoordinator>,
+        ctx: &DurableContext,
         awaited: Option<Arc<AtomicBool>>,
     ) -> Self {
-        match crate::task::spawn_tracked(coordinator, task_ownership, future) {
+        let coordinator = ctx.coordinator();
+        match crate::task::spawn_tracked(coordinator, ctx.task_ownership(), future) {
             Ok(task) => {
+                if let Some(abort) = task.abort_handle() {
+                    ctx.admission().register_task(ctx.owners(), abort);
+                }
                 let mut handle = Self::from_async(async move { task.await.into_value() });
                 handle.awaited = awaited.map(|flag| (flag, Arc::clone(coordinator)));
                 handle
@@ -614,7 +640,10 @@ impl<O: Send + 'static> Callback<O> {
     /// Waits for the callback result on its own SDK task, as `.spawn()` does
     /// for other operations, and returns its handle. The SDK refreshes the
     /// callback's status only after the handle is first polled. Dropping the
-    /// handle cancels the wait.
+    /// handle loses only the result: the wait keeps running until the
+    /// callback settles, until its scope closes, or until the invocation
+    /// ends, and dropping it does not count as the first poll. A stopped
+    /// wait stops at its next `.await`.
     ///
     /// For a settled callback (replay) it returns the same future as
     /// [`result()`](Self::result), which resolves with the stored outcome
@@ -653,12 +682,7 @@ impl<O: Send + 'static> Callback<O> {
                 let flag = Arc::new(AtomicBool::new(false));
                 let waiting = ctx.with_awaited(Arc::clone(&flag));
                 let future = Self::pending_result(waiting, wire_id, identity, resolver);
-                DurableFuture::spawn_blessed(
-                    future,
-                    ctx.task_ownership(),
-                    ctx.coordinator(),
-                    Some(flag),
-                )
+                DurableFuture::spawn_blessed(future, &ctx, Some(flag))
             }
         }
     }
@@ -1204,11 +1228,11 @@ mod tests {
         assert!(client.recorded_updates().is_empty(), "nothing is recorded");
     }
 
-    /// Dropping the handle of a `.spawn()`ed operation cancels the spawned
-    /// task (abort-on-drop): cancellation, distinct from a panic, tears the
-    /// body down without unwinding anything into the caller.
+    /// Dropping the handle of a `.spawn()`ed operation does not cancel the
+    /// spawned task: the body keeps running. The task stops, without
+    /// unwinding anything into the caller, when the tracker aborts it.
     #[tokio::test]
-    async fn dropped_spawned_future_cancels_task_without_panic() {
+    async fn dropped_spawned_future_keeps_task_running_without_panic() {
         #[derive(Clone)]
         struct DropGuard(Arc<AtomicBool>);
         impl Drop for DropGuard {
@@ -1219,31 +1243,40 @@ mod tests {
 
         let ctx = test_ctx_with_client();
         let dropped = Arc::new(AtomicBool::new(false));
-        // The guard lives in the closure environment: whether the spawned
-        // task is aborted before or after its first poll, cancelling the
-        // task drops the body and the guard with it.
+        let started = Arc::new(AtomicBool::new(false));
+        // The guard lives in the closure environment, so the body and the
+        // guard drop together.
         let guard = DropGuard(Arc::clone(&dropped));
+        let body_started = Arc::clone(&started);
 
         let fut: DurableFuture<i32> = ctx
             .step(move |_| async move {
                 let _guard = guard;
+                body_started.store(true, Ordering::SeqCst);
                 std::future::pending::<()>().await;
                 Ok(0)
             })
             .spawn();
         drop(fut);
 
-        // Give the runtime a moment to process the abort.
         for _ in 0..50 {
-            if dropped.load(Ordering::SeqCst) {
+            if started.load(Ordering::SeqCst) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(
-            dropped.load(Ordering::SeqCst),
-            "spawned body must be dropped (cancelled) when the handle is dropped"
+            started.load(Ordering::SeqCst),
+            "the body runs after the drop"
         );
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the dropped handle does not cancel the body"
+        );
+        let tasks = Arc::clone(ctx.coordinator().tasks());
+        tasks.abort_all();
+        tasks.wait_idle().await;
+        assert!(dropped.load(Ordering::SeqCst), "abort_all cancels the body");
     }
 
     #[test]

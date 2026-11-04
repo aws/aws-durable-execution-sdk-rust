@@ -39,8 +39,10 @@ struct Claimed {
 /// The returned value has passed through the combinator's JSON encoding,
 /// so it equals the value replay returns.
 ///
-/// When the combinator resolves, it cancels every input that is still
-/// running. A cancelled input stops at its next `.await`.
+/// When the combinator resolves, it stops every input that it started from
+/// `.future()` and that is still running. A stopped input stops at its next
+/// `.await`. An input started with `.spawn()` keeps running, and its result
+/// is dropped.
 ///
 /// # Examples
 ///
@@ -122,10 +124,15 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
     /// against the recorded history before the task starts. The returned
     /// handle has claimed, so it is a valid input to another combinator.
     ///
-    /// Dropping the returned future cancels the operation. When the handler
-    /// returns while a cancelled operation still waits, the execution ends
-    /// with the handler's result, and the operation's record can stay
-    /// `STARTED`.
+    /// Dropping the returned future loses only the result: the operation
+    /// runs until it settles. The SDK stops it earlier only when the scope
+    /// it was started in closes, such as a child context whose body
+    /// returned, or when the invocation ends. The SDK also stops the
+    /// `.future()` inputs a combinator started. A stopped task stops at its
+    /// next `.await`, and its record can stay `STARTED`. The SDK cannot stop
+    /// code between two `.await`s, `spawn_blocking` work, tasks or threads
+    /// the handler starts itself, or a request already sent to another
+    /// service.
     ///
     /// # Errors
     ///
@@ -280,10 +287,15 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     /// against the recorded history before the task starts. The returned
     /// handle has claimed, so it is a valid input to another combinator.
     ///
-    /// Dropping the returned future cancels the operation. When the handler
-    /// returns while a cancelled operation still waits, the execution ends
-    /// with the handler's result, and the operation's record can stay
-    /// `STARTED`.
+    /// Dropping the returned future loses only the result: the operation
+    /// runs until it settles. The SDK stops it earlier only when the scope
+    /// it was started in closes, such as a child context whose body
+    /// returned, or when the invocation ends. The SDK also stops the
+    /// `.future()` inputs a combinator started. A stopped task stops at its
+    /// next `.await`, and its record can stay `STARTED`. The SDK cannot stop
+    /// code between two `.await`s, `spawn_blocking` work, tasks or threads
+    /// the handler starts itself, or a request already sent to another
+    /// service.
     ///
     /// # Errors
     ///
@@ -331,8 +343,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// The returned value has passed through the combinator's JSON encoding,
 /// so it equals the value replay returns.
 ///
-/// When the combinator resolves, it cancels every input that is still
-/// running. A cancelled input stops at its next `.await`.
+/// When the combinator resolves, it stops every input that it started from
+/// `.future()` and that is still running. A stopped input stops at its next
+/// `.await`. An input started with `.spawn()` keeps running, and its result
+/// is dropped.
 ///
 /// # Examples
 ///
@@ -413,10 +427,15 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
     /// against the recorded history before the task starts. The returned
     /// handle has claimed, so it is a valid input to another combinator.
     ///
-    /// Dropping the returned future cancels the operation. When the handler
-    /// returns while a cancelled operation still waits, the execution ends
-    /// with the handler's result, and the operation's record can stay
-    /// `STARTED`.
+    /// Dropping the returned future loses only the result: the operation
+    /// runs until it settles. The SDK stops it earlier only when the scope
+    /// it was started in closes, such as a child context whose body
+    /// returned, or when the invocation ends. The SDK also stops the
+    /// `.future()` inputs a combinator started. A stopped task stops at its
+    /// next `.await`, and its record can stay `STARTED`. The SDK cannot stop
+    /// code between two `.await`s, `spawn_blocking` work, tasks or threads
+    /// the handler starts itself, or a request already sent to another
+    /// service.
     ///
     /// # Errors
     ///
@@ -464,8 +483,10 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// The returned value has passed through the combinator's JSON encoding,
 /// so it equals the value replay returns.
 ///
-/// When the combinator resolves, it cancels every input that is still
-/// running. A cancelled input stops at its next `.await`.
+/// When the combinator resolves, it stops every input that it started from
+/// `.future()` and that is still running. A stopped input stops at its next
+/// `.await`. An input started with `.spawn()` keeps running, and its result
+/// is dropped.
 ///
 /// # Examples
 ///
@@ -546,10 +567,15 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
     /// against the recorded history before the task starts. The returned
     /// handle has claimed, so it is a valid input to another combinator.
     ///
-    /// Dropping the returned future cancels the operation. When the handler
-    /// returns while a cancelled operation still waits, the execution ends
-    /// with the handler's result, and the operation's record can stay
-    /// `STARTED`.
+    /// Dropping the returned future loses only the result: the operation
+    /// runs until it settles. The SDK stops it earlier only when the scope
+    /// it was started in closes, such as a child context whose body
+    /// returned, or when the invocation ends. The SDK also stops the
+    /// `.future()` inputs a combinator started. A stopped task stops at its
+    /// next `.await`, and its record can stay `STARTED`. The SDK cannot stop
+    /// code between two `.await`s, `spawn_blocking` work, tasks or threads
+    /// the handler starts itself, or a request already sent to another
+    /// service.
     ///
     /// # Errors
     ///

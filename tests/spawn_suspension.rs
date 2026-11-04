@@ -24,10 +24,10 @@ use aws_durable_execution_sdk as durable;
 use durable::test_util::LocalRunner;
 
 /// Reproducer from issue #48. On a current-thread runtime the spawned task
-/// cannot be polled until the handler yields, so dropping the handle aborts
-/// the task before its first poll. The settling guard must still fire and
-/// balance the spawn count, or the following `ctx.wait` can never suspend
-/// the invocation.
+/// cannot be polled until the handler yields, so the handle is dropped
+/// before the task's first poll. The dropped operation keeps running and
+/// settles, and the following `ctx.wait` must still suspend the
+/// invocation.
 #[tokio::test(flavor = "current_thread")]
 async fn dropping_unpolled_spawn_does_not_deadlock_next_wait() {
     let runner = LocalRunner::new();
@@ -37,7 +37,8 @@ async fn dropping_unpolled_spawn_does_not_deadlock_next_wait() {
             // until the current handler yields.
             let handle = ctx.step(|_| async { Ok(()) }).spawn();
 
-            // Dropping the handle aborts the task before its first poll.
+            // Dropping the handle loses only the result: the step still
+            // runs.
             drop(handle);
 
             // This must still be able to suspend the invocation.

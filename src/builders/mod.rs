@@ -78,17 +78,20 @@ macro_rules! preflight_identity {
 /// combinator claims its ID and runs the identity preflight at the
 /// `.spawn()` call. Then it starts the future on its own task through
 /// [`DurableFuture::spawn_blessed`](crate::future::DurableFuture), which
-/// blesses the task with the builder context's ownership handle.
+/// blesses the task with the builder context's ownership handle and
+/// registers it with the context's scopes. Dropping the returned handle
+/// loses only the result.
 ///
 /// The builder must have a `ctx: DurableContext` field and implement
 /// [`IntoFuture`] with
 /// `IntoFuture = DurableFuture<_>`.
 ///
-/// The `awaited` arm is for an operation that waits on the service: a
-/// wait, an invoke or a `wait_for_condition`. It runs the operation on a
-/// clone of the context that carries a first-poll flag, so the refresh
+/// The `awaited` arm is for a wait and an invoke. It runs the operation on
+/// a clone of the context that carries a first-poll flag, so the refresh
 /// scheduler refreshes the operation only once the returned handle is
-/// first polled (see [`crate::coordinator`]).
+/// first polled (see [`crate::coordinator`]). A `wait_for_condition` uses
+/// the plain arm: it arms its refresh when it registers its wait, as JS
+/// starts its retry timer whether or not anything awaits the promise.
 ///
 /// The `batch_future` arm is for `spawn_batch()` on the map and parallel
 /// builders. It is the one-argument form with the builder's
@@ -97,32 +100,24 @@ macro_rules! preflight_identity {
 macro_rules! spawn_terminal {
     ($builder:expr) => {{
         let builder = $builder;
-        let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
-        let coordinator = ::std::sync::Arc::clone(builder.ctx.coordinator());
+        let ctx = builder.ctx.clone();
         let mut future = ::std::future::IntoFuture::into_future(builder);
         future.claim_now();
-        $crate::future::DurableFuture::spawn_blessed(future, &task_ownership, &coordinator, None)
+        $crate::future::DurableFuture::spawn_blessed(future, &ctx, None)
     }};
     ($builder:expr, batch_future) => {{
         let builder = $builder;
-        let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
-        let coordinator = ::std::sync::Arc::clone(builder.ctx.coordinator());
+        let ctx = builder.ctx.clone();
         let future = builder.batch_future();
-        $crate::future::DurableFuture::spawn_blessed(future, &task_ownership, &coordinator, None)
+        $crate::future::DurableFuture::spawn_blessed(future, &ctx, None)
     }};
     ($builder:expr, awaited) => {{
         let mut builder = $builder;
         let flag = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
         builder.ctx = builder.ctx.with_awaited(::std::sync::Arc::clone(&flag));
-        let task_ownership = ::std::sync::Arc::clone(builder.ctx.task_ownership());
-        let coordinator = ::std::sync::Arc::clone(builder.ctx.coordinator());
+        let ctx = builder.ctx.clone();
         let future = ::std::future::IntoFuture::into_future(builder);
-        $crate::future::DurableFuture::spawn_blessed(
-            future,
-            &task_ownership,
-            &coordinator,
-            Some(flag),
-        )
+        $crate::future::DurableFuture::spawn_blessed(future, &ctx, Some(flag))
     }};
 }
 

@@ -217,6 +217,25 @@ timer?;
 let value = result?;
 ```
 
+Dropping the handle that `.spawn()` returns loses only the result. The
+operation runs until it settles, records its outcome and fires its plugin
+hooks. Its error goes into its record and is returned to nobody, and a
+panic in it fails the invocation. A running detached operation keeps the
+invocation open; one that waits only on the service, such as a wait, lets
+it suspend. The same holds for `.spawn_batch()` and
+`Callback::spawn_result()`.
+
+The SDK stops work in three cases. A combinator stops the `.future()`
+inputs it started that still run when it resolves, and lets an input
+started with `.spawn()` run. A closed scope stops the work still running
+inside it: a scope closes when a child context's body returns, when a
+`with_retry` block or one of its attempts ends, and when a batch item or the
+whole batch completes. The end of the invocation stops all remaining
+operation work. A stopped task stops at its next `.await`, and its record
+can stay `STARTED`. The SDK cannot stop code between two `.await`s,
+`spawn_blocking` work, tasks or threads the handler starts itself, or a
+request already sent to another service.
+
 ### What determinism requires
 
 The SDK claims each operation's ID synchronously at the call site, so replay
@@ -369,7 +388,7 @@ durable::wrap(handler, options);
 | `ctx.parallel_mixed(branches)` | Runs named branches that each return their own type; each branch handle returns its result after the parallel completes. |
 | `ctx.try_join_all(futures)` | Collects every result, failing on the first error. |
 | `ctx.join_all(futures)` | Collects every outcome as `Result<O, OperationError>`, never failing fast. |
-| `ctx.select_ok(futures)` | Returns the first success and cancels the inputs still running. |
+| `ctx.select_ok(futures)` | Returns the first success and cancels the `.future()` inputs still running. |
 | `ctx.race(futures)` | Returns the first outcome to settle, success or failure. |
 
 ### step
@@ -585,7 +604,8 @@ submitter with the same retry strategy shape a step uses.
 
 A callback that an external system completes while other work runs
 continues in the same invocation. `cb.spawn_result()` waits for the result
-on its own task, as `.spawn()` does for other operations.
+on its own task, as `.spawn()` does for other operations. Dropping its
+handle loses only the result; the wait keeps running.
 
 ### child contexts
 
@@ -805,6 +825,8 @@ configured tolerance too.
 `.spawn_batch()` starts the batch on its own task at once and returns a
 `DurableFuture<BatchResult<O>>`, as `.spawn()` does for the `Vec<O>` form,
 so the handler can run other operations before it awaits the batch.
+Dropping the returned handle loses only the result; the batch keeps
+running.
 
 ```rust ignore
 let batch = ctx
@@ -828,7 +850,8 @@ same invocation.
 
 When the completion rule ends the batch early, items that are still running
 are cancelled at their next `.await` and reported as `Started`. A cancelled
-item writes no further checkpoint.
+item writes no further checkpoint. Work that any item started and that still
+runs, including work of an item that already settled, stops too.
 
 ### parallel_mixed
 
@@ -892,8 +915,10 @@ A combinator returns the value decoded from the payload it records, so the
 first run returns the value a replay returns. A `join_all` item's `Err` is
 therefore a child-context error whose `wire()` carries the input's recorded
 failure on both paths. When `try_join_all`, `select_ok` or `race` resolves,
-it cancels every input that is still running, and a cancelled input stops at
-its next `.await`. `join_all` cancels nothing.
+it cancels every input it started from `.future()` that is still running,
+and a cancelled input stops at its next `.await`. An input started with
+`.spawn()` keeps running, and its result is dropped. `join_all` cancels
+nothing.
 
 A combined result larger than 256 KiB is not stored in the combinator's
 record, which then carries `ReplayChildren`. Replay drives the inputs again

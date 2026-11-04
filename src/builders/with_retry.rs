@@ -302,10 +302,15 @@ where
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
-    /// Dropping the returned future cancels the operation. When the handler
-    /// returns while a cancelled operation still waits, the execution ends
-    /// with the handler's result, and the operation's record can stay
-    /// `STARTED`.
+    /// Dropping the returned future loses only the result: the operation
+    /// runs until it settles. The SDK stops it earlier only when the scope
+    /// it was started in closes, such as a child context whose body
+    /// returned, or when the invocation ends. The SDK also stops the
+    /// `.future()` inputs a combinator started. A stopped task stops at its
+    /// next `.await`, and its record can stay `STARTED`. The SDK cannot stop
+    /// code between two `.await`s, `spawn_blocking` work, tasks or threads
+    /// the handler starts itself, or a request already sent to another
+    /// service.
     ///
     /// # Errors
     ///
@@ -398,6 +403,79 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The end of a `with_retry` block closes the block's own scope: a step
+    /// started with `.spawn()` directly on the block's context stops,
+    /// although its handle outlives the block.
+    #[tokio::test(start_paused = true)]
+    async fn with_retry_block_end_stops_direct_block_task() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use crate::child::ChildExecution;
+        use crate::driver::InvocationOutcome;
+        use crate::driver::test_support::{RefreshClient, drive_handler, refresh_ctx, wire_err};
+
+        let client = Arc::new(RefreshClient::new(|_| Ok(Vec::new())));
+        let ctx = refresh_ctx(&client);
+        let effects = Arc::new(AtomicUsize::new(0));
+        let block_effects = Arc::clone(&effects);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let holder: Arc<Mutex<Vec<DurableFuture<()>>>> = Arc::new(Mutex::new(Vec::new()));
+            let block_holder = Arc::clone(&holder);
+            let attempt = Arc::new(|_attempt_ctx: DurableContext| async { Ok::<(), BoxError>(()) });
+            // The outer child execution `WithRetryBuilder` builds, with a
+            // closure that starts `escaped` on the block's own context
+            // before it runs the retry loop.
+            let execution = ChildExecution {
+                ctx: ctx.clone(),
+                op_id: ctx.claim_operation_id("with_retry"),
+                name: Some("block".to_owned()),
+                sub_type: OperationSubType::RUN_IN_CHILD_CONTEXT,
+                serdes: Arc::new(JsonSerdes),
+                closure: move |outer_ctx: DurableContext| async move {
+                    let handle = outer_ctx
+                        .step(move |_| async move {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            block_effects.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .name("escaped")
+                        .spawn();
+                    block_holder.lock().expect("lock").push(handle);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    crate::with_retry::retry_loop(
+                        outer_ctx,
+                        Some("block".to_owned()),
+                        attempt,
+                        Arc::new(crate::step::default_retry_strategy()),
+                        Arc::new(JsonSerdes),
+                    )
+                    .await
+                },
+                _marker: PhantomData,
+            };
+            execution.execute().await.map_err(wire_err)?;
+            ctx.step(|_| async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(())
+            })
+            .name("keep")
+            .await
+            .map_err(wire_err)?;
+            drop(holder);
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
+        assert_eq!(
+            effects.load(Ordering::SeqCst),
+            0,
+            "the escaped body stopped"
+        );
+    }
 
     /// A second `sub_type` call replaces the first, and `serdes` keeps
     /// the subtype.

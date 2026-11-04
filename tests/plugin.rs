@@ -3747,3 +3747,131 @@ async fn every_resumed_combinator_starts_with_replay() {
         );
     }
 }
+
+/// Records the operation hooks of the step `held` and the invocation end.
+/// Each operation hook returns a future that sleeps 1 s before it records
+/// its completion.
+#[derive(Clone, Default)]
+struct DelayedHooks {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl DelayedHooks {
+    fn events(&self) -> Vec<String> {
+        self.events.lock().unwrap().clone()
+    }
+
+    fn delayed(&self, hook: &str, info: &OperationInfo) -> Option<HookFuture<'static>> {
+        if info.name() != Some("held") {
+            return None;
+        }
+        let events = Arc::clone(&self.events);
+        let done = format!("{hook} done");
+        Some(Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            events.lock().unwrap().push(done);
+            Ok(())
+        }))
+    }
+}
+
+impl Plugin for DelayedHooks {
+    fn on_operation_start(&self, info: &OperationInfo) -> HookWork {
+        if info.name() == Some("held") {
+            self.events.lock().unwrap().push("start".to_owned());
+        }
+        Ok(self.delayed("start", info))
+    }
+
+    fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
+        if info.name() == Some("held") {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("end {:?}", info.status()));
+        }
+        Ok(self.delayed("end", info))
+    }
+
+    fn on_invocation_end<'a>(&'a self, _info: &'a InvocationEndInfo) -> HookFuture<'a> {
+        self.events
+            .lock()
+            .unwrap()
+            .push("invocation end".to_owned());
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl PluginFactory for DelayedHooks {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        Ok(Some(Box::new(self.clone())))
+    }
+}
+
+/// A step whose handle the handler dropped fires both operation hooks
+/// when it settles, and the futures those hooks return finish in the
+/// invocation-end drain, before `on_invocation_end`.
+#[tokio::test(start_paused = true)]
+async fn detached_operation_hooks_finish_and_drain() {
+    let plugin = DelayedHooks::default();
+    let handler_plugin = plugin.clone();
+    let result = LocalRunner::new()
+        .options(
+            Options::builder()
+                .plugin(plugin.clone())
+                .build()
+                .expect("valid options"),
+        )
+        .run(
+            move |(), ctx: DurableContext| {
+                let plugin = handler_plugin.clone();
+                async move {
+                    let started = Arc::new(tokio::sync::Notify::new());
+                    let release = Arc::new(tokio::sync::Notify::new());
+                    let (body_started, body_release) = (Arc::clone(&started), Arc::clone(&release));
+                    let held = ctx
+                        .step(move |_| async move {
+                            body_started.notify_one();
+                            body_release.notified().await;
+                            Ok(())
+                        })
+                        .name("held")
+                        .spawn();
+                    started.notified().await;
+                    drop(held);
+                    release.notify_one();
+                    for _ in 0..1_000 {
+                        if plugin.events().iter().any(|e| e.starts_with("end ")) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<_, BoxError>(())
+                }
+            },
+            (),
+        )
+        .await
+        .expect("the run finishes");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(
+        result
+            .operation("held")
+            .map(durable::test_util::TestOperation::status),
+        Some(OperationStatus::Succeeded)
+    );
+    let events = plugin.events();
+    assert!(events.contains(&"start".to_owned()), "{events:?}");
+    assert!(
+        events.contains(&format!("end {:?}", Some(OperationStatus::Succeeded))),
+        "{events:?}"
+    );
+    let at = |event: &str| {
+        events
+            .iter()
+            .position(|e| e == event)
+            .unwrap_or_else(|| unreachable!("no {event} in {events:?}"))
+    };
+    assert!(at("start done") < at("invocation end"), "{events:?}");
+    assert!(at("end done") < at("invocation end"), "{events:?}");
+}

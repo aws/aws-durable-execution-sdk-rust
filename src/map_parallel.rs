@@ -22,7 +22,6 @@
 //! - Each branch runs in its own child context
 //! - Fail-fast when `min_successful` can no longer be met
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -31,6 +30,7 @@ use tracing::Instrument as _;
 
 use crate::BoxError;
 use crate::Serdes;
+use crate::checkpoint_coalescer::ScopeClose;
 use crate::child::CHECKPOINT_SIZE_LIMIT_BYTES;
 use crate::context::{ActiveBody, DurableContext, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
@@ -1322,10 +1322,12 @@ where
     let child_wire = req.child_op_id.wire().to_owned();
     let serdes_ctx = SerdesContext::new(child_wire.clone(), req.ctx.execution_arn());
     let serdes = &req.serdes;
-    // The item's own terminal update is written on the item's behalf: once
-    // the batch abandoned the item at early completion, the write is
-    // rejected, as every write of the item's body is.
-    let writer = req.ctx.with_owner(req.child_op_id.positional());
+    // The item's own terminal update is written through the batch's
+    // context, as a child context's is written through its parent. The
+    // item's scope already closed when its body returned, so the item's
+    // owners would reject it. The batch scope closes at early completion,
+    // so a running item's terminal update is rejected from then on.
+    let writer = &req.ctx;
 
     // FLAT nesting emits no child-context events: only the value transform
     // (round-trip for live == replay consistency) happens here. A terminal
@@ -1639,9 +1641,11 @@ where
             // wait inside the body keeps this task pending in the join set.
             let body = ActiveBody::Context(child_ctx.prefix().to_owned());
             let item_ctx = child_ctx.clone();
+            let scope = item_scope(&req);
             let outcome = run_body(body, async move { run_item(child_ctx, index).await })
                 .instrument(span)
                 .await;
+            drop(scope);
             item_after(&req, outcome, item_ctx.is_replaying()).await
         }
     }
@@ -1663,6 +1667,7 @@ where
         ItemPrelude::Run { child_ctx } => {
             let span = child_ctx.replay_span();
             let item_ctx = child_ctx.clone();
+            let scope = item_scope(&req);
             let outcome = match take_branch_body(&slots, req.index) {
                 Ok(body) => {
                     // `start` injects the child context and returns the
@@ -1677,9 +1682,20 @@ where
                 }
                 Err(err) => Err(err),
             };
+            drop(scope);
             item_after(&req, outcome, item_ctx.is_replaying()).await
         }
     }
+}
+
+/// The scope of one item, normal or flat: it closes when the item's body
+/// returns, and when the item's future is dropped before that because the
+/// batch aborted the item (see `Admission`). An operation the body started
+/// and did not await then writes no further checkpoint, and its task
+/// stops. The item's own terminal update is written through the batch's
+/// context, so it is admitted.
+fn item_scope<IS>(req: &ItemRequest<IS>) -> ScopeClose {
+    ScopeClose::new(req.ctx.admission(), req.child_op_id.wire())
 }
 
 /// Takes one branch body out of its take-once slot.
@@ -1856,19 +1872,17 @@ where
     /// call) is returned. A panic of the task resumes unwinding here, with
     /// its original payload, and nothing is recorded for it: a panic fails
     /// the invocation, not the item.
-    ///
-    /// Returns the index of the item.
     fn settle_joined(
         &self,
         joined: TaskOutcome<ItemJoin<O>>,
         progress: &mut BatchProgress<O>,
-    ) -> Result<usize, OperationError> {
+    ) -> Result<(), OperationError> {
         let (index, outcome) = joined.into_value();
         // A coordinator-level failure surfaces; the caller's join set drop
         // aborts the remaining branches.
         let item = outcome?;
         progress.settle_outcome(self.completion_cfg, self.total_items, index, item);
-        Ok(index)
+        Ok(())
     }
 
     /// Resolves a recorded-terminal child inline on the coordinator, in
@@ -1945,7 +1959,7 @@ where
                         "re-executed replay child joined an unexpected task",
                     ));
                 }
-                self.settle_joined(joined, progress).map(drop)
+                self.settle_joined(joined, progress)
             }
         }
     }
@@ -2320,10 +2334,10 @@ where
         progress.tracker.stop_evaluating();
     }
     let mut running: usize = 0;
-    // The owner of each dispatched item that is not terminal, running or
-    // parked: its index and its child wire ID. At early completion these
-    // owners are abandoned (see `Admission`).
-    let mut running_owners: BTreeMap<usize, String> = BTreeMap::new();
+    // The batch's scope: every item context runs inside it. It closes at
+    // early completion, before the running items are aborted, and when
+    // this future ends or is dropped (see `Admission`).
+    let batch_scope = ScopeClose::new(ctx.admission(), &parent_wire);
     let mut next_index: usize = 0;
 
     // A child holding ANY checkpoint record was admitted by a prior
@@ -2576,7 +2590,6 @@ where
                 .spawn_item(&mut join_set, req)
                 .map_err(NoRuntime::operation_error)?;
             running += 1;
-            running_owners.insert(branch_index, branch_wire);
         }
 
         if running == 0 {
@@ -2591,19 +2604,19 @@ where
             break; // set is empty: unreachable while running > 0
         };
         running -= 1;
-        let settled = env.settle_joined(joined, &mut progress)?;
-        running_owners.remove(&settled);
+        env.settle_joined(joined, &mut progress)?;
 
         // Early completion: the completion rule is met, so the batch ends
-        // now, without waiting for its running items (as in JS). Their
-        // owners are abandoned first, so a write they issue from now on is
-        // rejected. Then their tasks are aborted and never joined: an
-        // outcome of an abandoned item is never observed. Each aborted task
-        // stays counted until it unwinds. Under a replay plan the recorded
-        // outcome is reproduced instead, so nothing is abandoned.
+        // now, without waiting for its running items (as in JS). The batch
+        // scope closes first, so a write a running item issues from now on
+        // is rejected, and every task started inside the batch, by a
+        // running or a settled item, is aborted. Then the item tasks are
+        // aborted and never joined: an outcome of an abandoned item is
+        // never observed. Each aborted task stays counted until it unwinds.
+        // Under a replay plan the recorded outcome is reproduced instead,
+        // so nothing is abandoned.
         if replay_plan.is_none() && progress.tracker.stop_reason.is_some() {
-            ctx.admission()
-                .abandon(running_owners.values().map(String::as_str));
+            drop(batch_scope);
             join_set.abort_all();
             break;
         }
@@ -9575,13 +9588,11 @@ mod tests {
         assert_started_defaults(&batch.items[1], "map-item-1");
         assert_eq!(item_action_count(&client, 0, &OperationAction::Succeed), 1);
         assert_eq!(item_action_count(&client, 1, &OperationAction::Succeed), 0);
-        // The batch abandoned only the item that was still running.
+        // The whole batch scope is closed: the settled item and the running
+        // item admit no later checkpoint.
         let [settled, running] = item_wires();
-        assert!(
-            ctx.admission().admits(&[settled]),
-            "item 0 is not abandoned"
-        );
-        assert!(!ctx.admission().admits(&[running]), "item 1 is abandoned");
+        assert!(!ctx.admission().admits(&[settled]), "item 0 is closed");
+        assert!(!ctx.admission().admits(&[running]), "item 1 is closed");
     }
 
     /// A client that, at the batch parent's `SUCCEED`, yields until

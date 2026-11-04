@@ -68,7 +68,10 @@
 //!    record which branch won.
 //! 4. Do not use `tokio::spawn` to run a durable operation in the
 //!    background; use `.spawn()` on the operation's builder, which keeps
-//!    the spawned work inside the execution's replay accounting.
+//!    the spawned work inside the execution's replay accounting. Dropping
+//!    the handle `.spawn()` returns loses only the result: the operation
+//!    keeps running until it settles, until the scope it was started in
+//!    closes, or until the invocation ends (see [`DurableFuture`]).
 //! 5. On suspension, the user future is dropped, so do not rely on `Drop`
 //!    ordering for correctness between durable operations. For example, a
 //!    guard that unlocks a resource in `Drop` runs the moment the execution

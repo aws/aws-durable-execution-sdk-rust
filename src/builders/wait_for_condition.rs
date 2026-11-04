@@ -259,10 +259,20 @@ where
     /// replay-safe alternative to bare `tokio::spawn` for durable
     /// operations.
     ///
-    /// Dropping the returned future cancels the operation. When the handler
-    /// returns while a cancelled operation still waits, the execution ends
-    /// with the handler's result, and the operation's record can stay
-    /// `STARTED`.
+    /// Dropping the returned future loses only the result: the operation
+    /// runs until it settles. The SDK stops it earlier only when the scope
+    /// it was started in closes, such as a child context whose body
+    /// returned, or when the invocation ends. The SDK also stops the
+    /// `.future()` inputs a combinator started. A stopped task stops at its
+    /// next `.await`, and its record can stay `STARTED`. The SDK cannot stop
+    /// code between two `.await`s, `spawn_blocking` work, tasks or threads
+    /// the handler starts itself, or a request already sent to another
+    /// service.
+    ///
+    /// The SDK refreshes the condition while it waits for its next check
+    /// whether or not anything polls the returned future, so its next check
+    /// runs in the same invocation when its delay ends while other work
+    /// runs.
     ///
     /// # Errors
     ///
@@ -272,7 +282,7 @@ where
     where
         SD: Serdes<S>,
     {
-        spawn_terminal!(self, awaited)
+        spawn_terminal!(self)
     }
 }
 

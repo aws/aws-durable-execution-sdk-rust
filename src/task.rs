@@ -16,6 +16,12 @@
 //! abortable task at the end of the drive and waits until the count is
 //! zero. So no SDK task outlives its invocation.
 //!
+//! Dropping the handle of an operation task does not abort the task: the
+//! operation loses only its result. A task stops early only when its scope
+//! closes (see [`crate::checkpoint_coalescer::Admission`]), when the join
+//! set that owns it is dropped or aborts it, or when the drive aborts every
+//! task. Dropping the root's handle aborts the root task.
+//!
 //! The wrapper around each task catches a panic of the task's future and
 //! hands it to the consumer as [`TaskOutcome::Panicked`]. The consumer
 //! calls [`TaskOutcome::into_value`], which resumes the panic with its
@@ -117,7 +123,7 @@ impl<T> std::fmt::Debug for TaskOutcome<T> {
 }
 
 /// Counts live tracked tasks of one invocation, and keeps an abort handle
-/// for each task that is aborted on drop.
+/// for each operation task, which [`TaskTracker::abort_all`] aborts.
 #[derive(Debug)]
 pub(crate) struct TaskTracker {
     /// The number of tasks that have not exited yet.
@@ -147,6 +153,7 @@ impl TaskTracker {
             abortable: Mutex::new(Abortable {
                 handles: BTreeMap::new(),
                 aborting: false,
+                closed: false,
             }),
             idle: tokio::sync::Notify::new(),
             unread: Mutex::new(Vec::new()),
@@ -224,6 +231,39 @@ impl TaskTracker {
         }
     }
 
+    /// Aborts every tracked task, as [`Self::abort_all`] does, and aborts
+    /// every task registered later, for good.
+    ///
+    /// The drive calls it when it is dropped before its cleanup. The root
+    /// task is not counted here, and aborting it does not interrupt a poll
+    /// that runs on another worker thread. So the tracker can have no live
+    /// task while the root, still in that poll, starts a new operation
+    /// task. `abort_all` would let that task run, because it leaves its
+    /// flag clear when no task is live. A closed tracker aborts it as soon
+    /// as it is registered, and [`Self::release`] never reopens it.
+    pub(crate) fn close(&self) {
+        let handles = {
+            let mut abortable = self
+                .abortable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            abortable.closed = true;
+            std::mem::take(&mut abortable.handles)
+        };
+        for handle in handles.into_values() {
+            handle.abort();
+        }
+    }
+
+    /// Returns whether [`Self::close`] has run.
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.abortable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed
+    }
+
     /// Returns the number of stored abort handles.
     #[cfg(test)]
     fn abortable_count(&self) -> usize {
@@ -250,14 +290,15 @@ impl TaskTracker {
     }
 
     /// Stores the abort handle of a task that [`Self::abort_all`] aborts.
-    /// After `abort_all` has run, aborts the task instead.
+    /// After `abort_all` has run, or once the tracker is closed, aborts the
+    /// task instead.
     fn register_abort(&self, handle: AbortHandle) {
         let late = {
             let mut abortable = self
                 .abortable
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if abortable.aborting {
+            if abortable.aborting || abortable.closed {
                 Some(handle)
             } else {
                 abortable.handles.insert(handle.id(), handle);
@@ -299,6 +340,9 @@ struct Abortable {
     /// only a live task can start a tracked task, so after that point no
     /// task of the teardown can register.
     aborting: bool,
+    /// Set by [`TaskTracker::close`] and never cleared. While it is set, a
+    /// new registration aborts its task at once.
+    closed: bool,
 }
 
 /// One live task. Dropping it subtracts 1. At zero the tracker clears its
@@ -975,16 +1019,24 @@ mod raw {
     }
 }
 
-/// Aborts its task on drop. Holds the outcome slot it shares with its
+/// The handle of a tracked task. Holds the outcome slot it shares with its
 /// task, and the task's `AbortHandle`. A handle without an abort handle
 /// belongs to a spawn the coordinator refused: it never resolves.
 ///
 /// Dropping the handle closes the slot. An outcome the task stored before
 /// and did not hand over, or stores after, is disposed of: a panic is
 /// recorded on the coordinator, and a value is dropped inside a catch.
+///
+/// Dropping the root's handle also aborts the root task. Dropping the
+/// handle of an operation task loses only its result: the task runs until
+/// it ends, until the scope it was started in closes (see
+/// [`crate::checkpoint_coalescer::Admission`]), or until the drive aborts
+/// every tracked task.
 pub(crate) struct TrackedTask<T> {
     slot: Arc<Slot<T>>,
     abort: Option<AbortHandle>,
+    /// Set for the root, whose handle aborts the task on drop.
+    abort_on_drop: bool,
 }
 
 impl<T> std::fmt::Debug for TrackedTask<T> {
@@ -1001,6 +1053,7 @@ impl<T> TrackedTask<T> {
         Self {
             slot: Arc::new(Slot::new(None)),
             abort: None,
+            abort_on_drop: false,
         }
     }
 
@@ -1010,6 +1063,11 @@ impl<T> TrackedTask<T> {
         if let Some(abort) = &self.abort {
             abort.abort();
         }
+    }
+
+    /// The task's abort handle. `None` for a spawn that started nothing.
+    pub(crate) fn abort_handle(&self) -> Option<AbortHandle> {
+        self.abort.clone()
     }
 }
 
@@ -1023,13 +1081,16 @@ impl<T> Future for TrackedTask<T> {
 
 impl<T> Drop for TrackedTask<T> {
     fn drop(&mut self) {
-        self.abort();
+        if self.abort_on_drop {
+            self.abort();
+        }
         self.slot.close();
     }
 }
 
 /// Starts an operation task, counted on the coordinator's tracker and
-/// aborted by [`TaskTracker::abort_all`].
+/// aborted by [`TaskTracker::abort_all`]. Dropping the returned handle does
+/// not abort the task.
 ///
 /// Blesses the task in `ownership` before the first poll of `future`. Takes
 /// an activity permit for the task on the calling task. When the phase is
@@ -1062,6 +1123,7 @@ where
     Ok(TrackedTask {
         slot,
         abort: Some(handle.abort_handle()),
+        abort_on_drop: false,
     })
 }
 
@@ -1098,6 +1160,7 @@ where
     let task = TrackedTask {
         slot,
         abort: Some(handle.abort_handle()),
+        abort_on_drop: true,
     };
     Ok((task, handle))
 }
@@ -1635,6 +1698,7 @@ mod tests {
         })
         .expect("runtime");
         tokio::task::yield_now().await;
+        task.abort();
         drop(task);
         assert_eq!(tasks.live(), 1, "the aborted task still counts");
         assert!(
@@ -1644,6 +1708,49 @@ mod tests {
         tasks.wait_idle().await;
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(tasks.live(), 0);
+    }
+
+    /// Dropping the handle of an operation task loses only its result: the
+    /// task runs to its end.
+    #[tokio::test]
+    async fn dropped_tracked_task_keeps_running() {
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = spawn_tracked(&coord, &ownership(), async move {
+            assert!(tx.send(()).is_ok(), "the test waits for the signal");
+        })
+        .expect("runtime");
+        drop(task);
+        assert!(rx.await.is_ok(), "the task ran after its handle dropped");
+        tasks.wait_idle().await;
+        assert_eq!(tasks.live(), 0);
+    }
+
+    /// Dropping the root's handle still aborts the root task.
+    #[tokio::test]
+    async fn dropped_root_handle_aborts_the_root_task() {
+        let coord = coordinator();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        let (root, join) = spawn_root(&ownership(), &coord, async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        })
+        .expect("runtime");
+        tokio::task::yield_now().await;
+        drop(root);
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), join)
+            .await
+            .expect("the root task ends within 5 s");
+        assert!(
+            joined.is_err_and(|err| err.is_cancelled()),
+            "the root task was aborted"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the root future was dropped"
+        );
     }
 
     #[tokio::test]
@@ -1811,6 +1918,59 @@ mod tests {
         assert!(matches!(outcome, TaskOutcome::Value(7)));
     }
 
+    /// A closed tracker aborts every task registered later, through both
+    /// gateways, even across an interval with no live task: a release does
+    /// not reopen it. It also aborts the tasks that were live when it
+    /// closed.
+    #[tokio::test]
+    async fn closed_tracker_aborts_every_later_registration() {
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
+        let own = ownership();
+        let live_dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&live_dropped));
+        let live = spawn_tracked(&coord, &own, async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        })
+        .expect("runtime");
+        tokio::task::yield_now().await;
+        assert!(!tasks.is_closed());
+        tasks.close();
+        assert!(tasks.is_closed());
+        tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait_idle())
+            .await
+            .expect("close aborts the live task");
+        assert!(live_dropped.load(Ordering::SeqCst));
+        assert_eq!(tasks.live(), 0);
+        drop(live);
+
+        for _ in 0..2 {
+            let tracked_dropped = Arc::new(AtomicBool::new(false));
+            let guard = DropFlag(Arc::clone(&tracked_dropped));
+            let late_task = spawn_tracked(&coord, &own, async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })
+            .expect("runtime");
+            let joined_dropped = Arc::new(AtomicBool::new(false));
+            let mut set = TrackedJoinSet::new(Arc::clone(&coord));
+            let guard = DropFlag(Arc::clone(&joined_dropped));
+            set.spawn(&own, async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })
+            .expect("runtime");
+            tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait_idle())
+                .await
+                .expect("a closed tracker aborts a late task, so it goes idle");
+            assert!(tracked_dropped.load(Ordering::SeqCst));
+            assert!(joined_dropped.load(Ordering::SeqCst));
+            assert_eq!(tasks.live(), 0);
+            drop((late_task, set));
+        }
+    }
+
     /// A tracked task keeps starting nested tracked tasks on a worker
     /// thread while the test thread tears the tracker down. Each nested
     /// handle escapes into a shared list, so only `abort_all` can stop the
@@ -1950,6 +2110,7 @@ mod tests {
         .expect("runtime");
         rx.await.expect("the task signals");
         assert_eq!(own.blessed_count(), 1);
+        task.abort();
         drop(task);
         tasks.wait_idle().await;
         assert_eq!(own.blessed_count(), 0);
@@ -2095,6 +2256,7 @@ mod tests {
             .clone()
             .expect("the task was polled");
         waker.wake_by_ref();
+        task.abort();
         drop(task);
         tasks.wait_idle().await;
         assert_eq!(tasks.live(), 0);
@@ -2231,6 +2393,7 @@ mod tests {
         drop(super::TrackedTask {
             slot: Arc::clone(&slot),
             abort: None,
+            abort_on_drop: false,
         });
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
