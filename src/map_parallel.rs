@@ -32,12 +32,13 @@ use crate::BoxError;
 use crate::Serdes;
 use crate::checkpoint_coalescer::ScopeClose;
 use crate::child::CHECKPOINT_SIZE_LIMIT_BYTES;
-use crate::context::{ActiveBody, DurableContext, run_body};
+use crate::context::{ActiveBody, DurableContext, SubmittedWrite, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     ChildContextError, ChildContextErrorKind, ChildFnError, OperationError, OperationErrorKind,
 };
 use crate::serdes::SerdesContext;
+use crate::start::StartStep;
 use crate::task::{NoRuntime, TaskOutcome, TrackedJoinSet};
 use serde_json::value::RawValue;
 
@@ -848,6 +849,27 @@ where
         collect_successful(self.execute_batch_result().await?)
     }
 
+    /// Runs the batch's start step now, on the caller's task, and returns
+    /// the future of the rest of [`Self::execute_batch_result`] (see
+    /// [`crate::start`]).
+    pub(crate) fn execute_batch_result_started(
+        self,
+    ) -> impl Future<Output = Result<BatchResult<O>, OperationError>> + Send + 'static {
+        let started = self.start();
+        self.run(started)
+    }
+
+    /// The start step of the batch parent (see [`batch_start`]).
+    fn start(&self) -> Result<StartStep, OperationError> {
+        batch_start(
+            &self.ctx,
+            &self.op_id,
+            self.name.as_deref(),
+            MAP_SUB_TYPE,
+            self.max_concurrency,
+        )
+    }
+
     /// Executes the map operation and returns the full `BatchResult`.
     ///
     /// The user closure enters the batch engine only through the
@@ -857,6 +879,16 @@ where
     /// [`Self::execute`], whose `Vec<O>` view is projected by
     /// [`collect_successful`].
     pub(crate) async fn execute_batch_result(self) -> Result<BatchResult<O>, OperationError> {
+        let started = self.start();
+        self.run(started).await
+    }
+
+    /// The rest of the map after its start step `started`.
+    async fn run(
+        self,
+        started: Result<StartStep, OperationError>,
+    ) -> Result<BatchResult<O>, OperationError> {
+        let started = started?;
         let total_items = self.items.len();
         // Every name is computed here, once per input item, while the items
         // are still readable: after `into_item_slots` they sit behind
@@ -903,6 +935,7 @@ where
             MAP_ITERATION_SUB_TYPE,
             &dispatch,
             &item_ids,
+            started,
         )
         .await
     }
@@ -940,6 +973,27 @@ where
         collect_successful(self.execute_batch_result().await?)
     }
 
+    /// Runs the batch's start step now, on the caller's task, and returns
+    /// the future of the rest of [`Self::execute_batch_result`] (see
+    /// [`crate::start`]).
+    pub(crate) fn execute_batch_result_started(
+        self,
+    ) -> impl Future<Output = Result<BatchResult<O>, OperationError>> + Send + 'static {
+        let started = self.start();
+        self.run(started)
+    }
+
+    /// The start step of the batch parent (see [`batch_start`]).
+    fn start(&self) -> Result<StartStep, OperationError> {
+        batch_start(
+            &self.ctx,
+            &self.op_id,
+            self.name.as_deref(),
+            PARALLEL_SUB_TYPE,
+            self.max_concurrency,
+        )
+    }
+
     /// Executes the parallel operation and returns the full `BatchResult`.
     ///
     /// Branch bodies are heterogeneous, so each carries exactly one erased
@@ -948,6 +1002,16 @@ where
     /// code. Used directly by `await_batch` and by [`Self::execute`], whose
     /// `Vec<O>` view is projected by [`collect_successful`].
     pub(crate) async fn execute_batch_result(self) -> Result<BatchResult<O>, OperationError> {
+        let started = self.start();
+        self.run(started).await
+    }
+
+    /// The rest of the parallel after its start step `started`.
+    async fn run(
+        self,
+        started: Result<StartStep, OperationError>,
+    ) -> Result<BatchResult<O>, OperationError> {
+        let started = started?;
         let total = self.branches.len();
         // Split each branch into the name the caller gave (`None` for
         // `Branch::unnamed`) and its erased body (kept in a take-once slot
@@ -983,6 +1047,7 @@ where
             PARALLEL_BRANCH_SUB_TYPE,
             &dispatch,
             &self.item_ids,
+            started,
         )
         .await
     }
@@ -1015,7 +1080,9 @@ fn record_names_of(user_names: &[Option<String>], prefix: &str) -> Vec<String> {
 /// item's recorded wire record (`error_type`, message). A
 /// `CustomCompletionFailed` batch with no failed item becomes a
 /// `BatchCompletionFailed` error instead.
-fn collect_successful<O>(batch_result: BatchResult<O>) -> Result<Vec<O>, OperationError> {
+pub(crate) fn collect_successful<O>(
+    batch_result: BatchResult<O>,
+) -> Result<Vec<O>, OperationError> {
     if let Some(err) = await_error(&batch_result) {
         return Err(err);
     }
@@ -1234,6 +1301,26 @@ struct ItemRequest<IS> {
     /// forwarding `impl Serdes for Arc<S>` makes the handle itself a
     /// serdes).
     serdes: Arc<IS>,
+    /// The item's `START` write, queued at dispatch and still in flight.
+    /// The outcome write takes it and waits for it. `None` for a flat
+    /// item, and for an item whose record already existed. A mutex keeps
+    /// the request `Sync`, so the item future can hold a reference to it.
+    start: std::sync::Mutex<Option<SubmittedWrite>>,
+}
+
+impl<IS> ItemRequest<IS> {
+    /// Waits for the item's retained `START` write before the item writes
+    /// its outcome `action` (see [`DurableContext::await_retained_start`]).
+    async fn await_start(&self, action: OperationAction) -> Result<(), OperationError> {
+        let start = self
+            .start
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.ctx
+            .await_retained_start(self.child_op_id.wire(), start, action)
+            .await
+    }
 }
 
 /// What [`item_before`] decided: the item is already resolved from the
@@ -1439,6 +1526,7 @@ where
             {
                 Ok(serialized) => serialized,
                 Err(op_err) => {
+                    req.await_start(OperationAction::Fail).await?;
                     let wire = crate::error::serialization_failure_wire(&op_err);
                     let update = build_child_fail_update(
                         &child_wire,
@@ -1507,6 +1595,7 @@ where
             // a `ReplayChildren` result.
             let result = update.payload().map(str::to_owned);
 
+            req.await_start(OperationAction::Succeed).await?;
             if let Err(err) = writer.checkpoint_updates(vec![update]).await {
                 // Audit (#43): batch child SUCCEED: the item closure
                 // ran, so its side effects need a recorded outcome. A
@@ -1578,6 +1667,7 @@ where
                 .build()
                 .expect("all required OperationUpdate fields set");
 
+            req.await_start(OperationAction::Fail).await?;
             if let Err(client_err) = writer.checkpoint_updates(vec![update]).await {
                 // Audit (#43): batch child FAIL: the item closure ran
                 // and failed; the failed FAIL write routes unrecoverable
@@ -1941,6 +2031,7 @@ where
                     item_name: item_name.to_owned(),
                     nesting: self.nesting,
                     serdes: Arc::clone(self.serdes),
+                    start: std::sync::Mutex::new(None),
                 };
                 let reconstruction_id = self
                     .dispatch
@@ -1991,6 +2082,7 @@ async fn execute_batch<O, IS, RS>(
     child_sub_type: &str,
     dispatch: &dyn ItemDispatch<O, IS>,
     item_ids: &ItemIds,
+    started: StartStep,
 ) -> Result<BatchResult<O>, OperationError>
 where
     O: Send + 'static,
@@ -2002,18 +2094,15 @@ where
     // `Clone` bound is required of the user's implementation.
     let serdes = Arc::new(serdes);
 
-    // 1. Task-ownership check.
-    ctx.enforce_task_ownership()?;
-
-    // 1b. Validate max_concurrency BEFORE any checkpointing. Zero is a
-    // configuration mistake that fails the same way on every retry. A
-    // catchable error would let the handler record a different outcome, so
-    // the execution fails, as in JS, and this future never resolves.
-    if max_concurrency == Some(0) {
-        ctx.coordinator()
-            .record_fatal("Error".to_owned(), MAX_CONCURRENCY_ZERO_MESSAGE.to_owned());
-        return std::future::pending().await;
-    }
+    // 1. The start step ran (see `batch_start`): admission, task
+    // ownership, the `max_concurrency` check, the replay identity check,
+    // and the parent START with its start hook. The items do not wait for
+    // a queued START: the parent's outcome write does.
+    let (recorded, parent_start) = match started {
+        StartStep::Refused => return std::future::pending().await,
+        StartStep::Recorded(view) => (Some(view), None),
+        StartStep::Queued(write) => (None, Some(write)),
+    };
 
     // The caller computed both name lists once per input item, before the
     // items moved. `user_names` holds the name the caller gave, which only
@@ -2053,95 +2142,51 @@ where
     // the recorded admission set and completion reason.
     let mut replay_plan: Option<ReplayPlan> = None;
 
-    if let Some(view) = ctx.checkpoint_view_validated(
-        &parent_positional,
-        &parent_wire,
-        "Context",
-        Some(parent_sub_type),
-        parent_name.as_deref(),
-    )? {
-        if view.status.is_terminal() {
-            let snapshot = ctx
-                .checkpoint_terminal_replay(&parent_positional)
-                .ok_or_else(|| batch_error("terminal batch has no checkpoint record"))?;
-            let serdes_ctx = SerdesContext::new(&parent_wire, ctx.execution_arn());
+    // A non-terminal record (Started/Pending) continues from where it left
+    // off. The start step fired its replay start hook.
+    if let Some(view) = recorded
+        && view.status.is_terminal()
+    {
+        let snapshot = ctx
+            .checkpoint_terminal_replay(&parent_positional)
+            .ok_or_else(|| batch_error("terminal batch has no checkpoint record"))?;
+        let serdes_ctx = SerdesContext::new(&parent_wire, ctx.execution_arn());
 
-            // A successful batch too large to checkpoint inline recorded a
-            // decision record (`totalCount`, `completionReason`, index set)
-            // instead of its payload. A payload that fails to parse is
-            // corrupt and fails the replay.
-            let decision = if matches!(snapshot.status, CheckpointStatus::Succeeded)
-                && snapshot.replay_children
-            {
+        // A successful batch too large to checkpoint inline recorded a
+        // decision record (`totalCount`, `completionReason`, index set)
+        // instead of its payload. A payload that fails to parse is
+        // corrupt and fails the replay.
+        let decision =
+            if matches!(snapshot.status, CheckpointStatus::Succeeded) && snapshot.replay_children {
                 Some(parse_replay_children_payload(snapshot.result.as_deref())?)
             } else {
                 None
             };
 
-            if let Some(record) = decision {
-                let plan = ReplayPlan::from_record(&record, total_items)?;
-                // Fast path (Normal nesting): decode every completed item
-                // straight from its child record (after validating each
-                // child's replay identity), report items in the started
-                // set as STARTED without consulting their child
-                // checkpoints, and omit every index at or beyond
-                // `totalCount`. Flat items have no
-                // child records, so Flat always reconstructs through the
-                // plan-constrained re-execution below.
-                if nesting != NestingMode::Flat {
-                    match replay_batch_from_record(
-                        &batch_ctx,
-                        &plan,
-                        &record_names,
-                        &serdes,
-                        child_sub_type,
-                        item_ids,
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            // Recorded terminal batch returned without
-                            // re-running the batch.
-                            ctx.emit_operation_replayed(
-                                &parent_wire,
-                                parent_name.as_deref(),
-                                "Context",
-                                Some(parent_sub_type),
-                                view.attempt,
-                            );
-                            return Ok(result);
-                        }
-                        Err(e) => {
-                            let is_replay_children =
-                                crate::error::chain_string(&e).contains(REPLAY_CHILDREN_SENTINEL);
-                            if !is_replay_children {
-                                return Err(e);
-                            }
-                            // A completed CHILD whose own result was too
-                            // large to checkpoint inline: reconstruct it by
-                            // re-execution, still constrained by the plan.
-                        }
-                    }
-                }
-                replay_plan = Some(plan);
-                // Fall through: re-execute ONLY the recorded admission set.
-            } else {
-                match replay_terminal_batch(
-                    &ctx,
-                    parent_name.as_deref(),
-                    &snapshot,
+        if let Some(record) = decision {
+            let plan = ReplayPlan::from_record(&record, total_items)?;
+            // Fast path (Normal nesting): decode every completed item
+            // straight from its child record (after validating each
+            // child's replay identity), report items in the started
+            // set as STARTED without consulting their child
+            // checkpoints, and omit every index at or beyond
+            // `totalCount`. Flat items have no
+            // child records, so Flat always reconstructs through the
+            // plan-constrained re-execution below.
+            if nesting != NestingMode::Flat {
+                match replay_batch_from_record(
+                    &batch_ctx,
+                    &plan,
+                    &record_names,
                     &serdes,
-                    encoding.clone(),
-                    total_items,
-                    &result_serdes,
-                    &serdes_ctx,
+                    child_sub_type,
                     item_ids,
                 )
                 .await
                 {
                     Ok(result) => {
-                        // Recorded terminal batch record returned without
-                        // re-running the batch (see `crate::observability`).
+                        // Recorded terminal batch returned without
+                        // re-running the batch.
                         ctx.emit_operation_replayed(
                             &parent_wire,
                             parent_name.as_deref(),
@@ -2152,63 +2197,73 @@ where
                         return Ok(result);
                     }
                     Err(e) => {
-                        // ReplayChildren sentinel: fall through to
-                        // re-execution. The children's operations are still
-                        // in the checkpoint log, so re-executing the batch
-                        // will replay each child from its terminal record.
                         let is_replay_children =
                             crate::error::chain_string(&e).contains(REPLAY_CHILDREN_SENTINEL);
                         if !is_replay_children {
-                            // A recorded batch FAILURE replays as this
-                            // error; an internal replay problem
-                            // (missing/corrupt payload) is not a replayed
-                            // outcome and emits nothing.
-                            if matches!(snapshot.status, CheckpointStatus::Failed) {
-                                ctx.emit_operation_replayed(
-                                    &parent_wire,
-                                    parent_name.as_deref(),
-                                    "Context",
-                                    Some(parent_sub_type),
-                                    view.attempt,
-                                );
-                            }
                             return Err(e);
                         }
-                        // Fall through: the batch parent is terminal but we
-                        // need to re-execute children to reconstruct the
-                        // result.
+                        // A completed CHILD whose own result was too
+                        // large to checkpoint inline: reconstruct it by
+                        // re-execution, still constrained by the plan.
                     }
                 }
             }
-        }
-        // Non-terminal (Started/Pending): continue from where we left off.
-        else if let Some(plugins) = ctx.plugins() {
-            let info = container_info(&ctx, &parent_wire, parent_sub_type, parent_name.as_deref())
-                .with_replay(true);
-            crate::plugin::operation_started(plugins, &info);
-        }
-    } else {
-        // 3. First invocation: checkpoint the parent START.
-        let update = build_parent_update(
-            &parent_wire,
-            parent_name.as_deref(),
-            parent_sub_type,
-            OperationAction::Start,
-            &ctx,
-        );
-        if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-            // Audit (#43): batch parent START: no item closure has run,
-            // so no terminal FAIL is needed; re-invocation reconverges
-            // on the same write.
-            return ctx
-                .checkpoint_failure_unrecoverable(&parent_wire, err, None)
-                .await;
-        }
-        if let Some(plugins) = ctx.plugins() {
-            let info = container_info(&ctx, &parent_wire, parent_sub_type, parent_name.as_deref())
-                .with_status(crate::OperationStatus::Started)
-                .with_replay(false);
-            crate::plugin::operation_started(plugins, &info);
+            replay_plan = Some(plan);
+            // Fall through: re-execute ONLY the recorded admission set.
+        } else {
+            match replay_terminal_batch(
+                &ctx,
+                parent_name.as_deref(),
+                &snapshot,
+                &serdes,
+                encoding.clone(),
+                total_items,
+                &result_serdes,
+                &serdes_ctx,
+                item_ids,
+            )
+            .await
+            {
+                Ok(result) => {
+                    // Recorded terminal batch record returned without
+                    // re-running the batch (see `crate::observability`).
+                    ctx.emit_operation_replayed(
+                        &parent_wire,
+                        parent_name.as_deref(),
+                        "Context",
+                        Some(parent_sub_type),
+                        view.attempt,
+                    );
+                    return Ok(result);
+                }
+                Err(e) => {
+                    // ReplayChildren sentinel: fall through to
+                    // re-execution. The children's operations are still
+                    // in the checkpoint log, so re-executing the batch
+                    // will replay each child from its terminal record.
+                    let is_replay_children =
+                        crate::error::chain_string(&e).contains(REPLAY_CHILDREN_SENTINEL);
+                    if !is_replay_children {
+                        // A recorded batch FAILURE replays as this
+                        // error; an internal replay problem
+                        // (missing/corrupt payload) is not a replayed
+                        // outcome and emits nothing.
+                        if matches!(snapshot.status, CheckpointStatus::Failed) {
+                            ctx.emit_operation_replayed(
+                                &parent_wire,
+                                parent_name.as_deref(),
+                                "Context",
+                                Some(parent_sub_type),
+                                view.attempt,
+                            );
+                        }
+                        return Err(e);
+                    }
+                    // Fall through: the batch parent is terminal but we
+                    // need to re-execute children to reconstruct the
+                    // result.
+                }
+            }
         }
     }
 
@@ -2242,6 +2297,7 @@ where
             parent_sub_type,
             &serialized_payload,
             &summary_json,
+            parent_start,
         )
         .await?;
         return Ok(result);
@@ -2538,26 +2594,23 @@ where
             // start committed before the child's own writes, and no start
             // exists for a child that never ran. A child holding a record
             // from a prior invocation resumes without a second `Start`.
-            if nesting != NestingMode::Flat && !pc.has_record {
-                let update = build_child_update(
+            //
+            // As in JS, the START is queued, then `on_operation_start`
+            // fires, then the START is released, and the body starts
+            // without waiting for its response. The item's outcome write
+            // waits for it (see `ItemRequest::await_start`). A failed
+            // START ends the invocation there, rather than as an item
+            // failure, so a tolerant completion config cannot absorb a
+            // checkpoint failure.
+            let reserved = (nesting != NestingMode::Flat && !pc.has_record).then(|| {
+                ctx.reserve_checkpoint_updates(vec![build_child_update(
                     &branch_wire,
                     &item_name,
                     &child_sub_type_owned,
                     &parent_wire,
                     OperationAction::Start,
-                );
-                if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43): batch child START: the item closure has
-                    // not run, so no terminal FAIL is needed; re-invocation
-                    // reconverges on the same write. Routing unrecoverable
-                    // (not as an item failure) matters doubly here: a
-                    // tolerant completion config must not absorb a
-                    // checkpoint failure.
-                    return ctx
-                        .checkpoint_failure_unrecoverable(&branch_wire, err, None)
-                        .await;
-                }
-            }
+                )])
+            });
             if let Some(plugins) = ctx.plugins() {
                 let info = item_info(&batch_ctx, &branch_wire, &child_sub_type_owned, &item_name);
                 let info = if nesting == NestingMode::Flat {
@@ -2574,6 +2627,7 @@ where
                 };
                 crate::plugin::operation_started(plugins, &info);
             }
+            let start = reserved.map(crate::context::ReservedWrite::release);
 
             let req = ItemRequest {
                 ctx: batch_ctx.clone(),
@@ -2585,6 +2639,7 @@ where
                 item_name: item_name.clone(),
                 nesting,
                 serdes: Arc::clone(&serdes),
+                start: std::sync::Mutex::new(start),
             };
             dispatch
                 .spawn_item(&mut join_set, req)
@@ -2717,10 +2772,69 @@ where
         parent_sub_type,
         &serialized_payload,
         &summary_json,
+        parent_start,
     )
     .await?;
 
     Ok(batch_result)
+}
+
+/// The start step of a batch parent (see [`crate::start`]).
+///
+/// It returns [`StartStep::Refused`] when admission refuses the batch. It
+/// runs the task-ownership check. A `max_concurrency` of zero is a
+/// configuration mistake that fails the same way on every retry, and a
+/// catchable error would let the handler record a different outcome. So,
+/// as in JS, it fails the execution, queues nothing, and returns
+/// [`StartStep::Refused`], whose future never resolves. Then it runs the
+/// start step: without a record, the parent `START` is queued, then
+/// `on_operation_start` fires, then the `START` is released, as JS orders
+/// them. A non-terminal record fires the replay start hook.
+fn batch_start(
+    ctx: &DurableContext,
+    op_id: &OperationId,
+    name: Option<&str>,
+    sub_type: &'static str,
+    max_concurrency: Option<usize>,
+) -> Result<StartStep, OperationError> {
+    if !ctx.admission().admits(ctx.owners()) {
+        return Ok(StartStep::Refused);
+    }
+    ctx.enforce_task_ownership()?;
+    if max_concurrency == Some(0) {
+        ctx.coordinator()
+            .record_fatal("Error".to_owned(), MAX_CONCURRENCY_ZERO_MESSAGE.to_owned());
+        return Ok(StartStep::Refused);
+    }
+    let wire_id = op_id.wire();
+    crate::start::start_step(
+        ctx,
+        &crate::start::StartSpec {
+            op_id,
+            operation_type: "Context",
+            sub_type,
+            name,
+            order: crate::start::StartOrder::QueueThenHook,
+        },
+        |view| {
+            if view.status.is_terminal() {
+                crate::start::Cycle::Record
+            } else {
+                crate::start::Cycle::Resume
+            }
+        },
+        || build_parent_update(wire_id, name, sub_type, OperationAction::Start, ctx),
+        |plugins, is_replay| {
+            let info = container_info(ctx, wire_id, sub_type, name);
+            let info = if is_replay {
+                info.with_replay(true)
+            } else {
+                info.with_status(crate::OperationStatus::Started)
+                    .with_replay(false)
+            };
+            crate::plugin::operation_started(plugins, &info);
+        },
+    )
 }
 
 /// Replays a terminal batch (parent already succeeded/failed in the log).
@@ -3142,6 +3256,7 @@ async fn checkpoint_batch_success_serialized(
     parent_sub_type: &str,
     serialized_payload: &str,
     summary_json: &str,
+    start: Option<SubmittedWrite>,
 ) -> Result<(), OperationError> {
     let mut builder = OperationUpdate::builder()
         .id(parent_wire.to_owned())
@@ -3183,6 +3298,10 @@ async fn checkpoint_batch_success_serialized(
     // The end hook reports the payload the update carries.
     let result = update.payload().map(str::to_owned);
 
+    // The outcome waits for the parent's START write, still in flight
+    // when this invocation queued it.
+    ctx.await_retained_start(parent_wire, start, OperationAction::Succeed)
+        .await?;
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
         // Audit (#43): batch parent SUCCEED: the batch's items ran, so
         // the batch outcome needs a recorded terminal. A permanent
@@ -4383,6 +4502,7 @@ mod tests {
             item_name: "map-item-0".to_owned(),
             nesting,
             serdes: Arc::new(crate::serdes::JsonSerdes),
+            start: std::sync::Mutex::new(None),
         }
     }
 
@@ -9401,6 +9521,7 @@ mod tests {
             MAP_SUB_TYPE,
             &oversized_payload,
             &oversized_decision,
+            None,
         )
         .await;
 

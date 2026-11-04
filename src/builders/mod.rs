@@ -97,6 +97,18 @@ macro_rules! preflight_identity {
 /// builders. It is the one-argument form with the builder's
 /// `batch_future()`, which yields the full `BatchResult`, in place of
 /// `into_future`.
+///
+/// The `started`, `started_awaited` and `started_batch` arms are for the
+/// operations whose JS form begins inside the call: step, wait, child
+/// context, map, parallel, `parallel_mixed`, `create_callback`,
+/// `wait_for_callback` and `with_retry`. They check for a runtime first,
+/// then run the operation's start step (see [`crate::start`]) on the
+/// caller's task through the builder's `started_future()` (or
+/// `started_batch_future()`), and spawn the rest through
+/// [`DurableFuture::spawn_started`](crate::future::DurableFuture). So the
+/// operation's `START` is queued, and a "queue, then hook" start hook has
+/// fired, before `.spawn()` returns. `started_awaited` is the `awaited`
+/// arm in that form, for a wait.
 macro_rules! spawn_terminal {
     ($builder:expr) => {{
         let builder = $builder;
@@ -110,6 +122,27 @@ macro_rules! spawn_terminal {
         let ctx = builder.ctx.clone();
         let future = builder.batch_future();
         $crate::future::DurableFuture::spawn_blessed(future, &ctx, None)
+    }};
+    ($builder:expr, started) => {{
+        let builder = $builder;
+        let ctx = builder.ctx.clone();
+        $crate::future::DurableFuture::spawn_started(&ctx, None, move || builder.started_future())
+    }};
+    ($builder:expr, started_batch) => {{
+        let builder = $builder;
+        let ctx = builder.ctx.clone();
+        $crate::future::DurableFuture::spawn_started(&ctx, None, move || {
+            builder.started_batch_future()
+        })
+    }};
+    ($builder:expr, started_awaited) => {{
+        let mut builder = $builder;
+        let flag = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
+        builder.ctx = builder.ctx.with_awaited(::std::sync::Arc::clone(&flag));
+        let ctx = builder.ctx.clone();
+        $crate::future::DurableFuture::spawn_started(&ctx, Some(flag), move || {
+            builder.started_future()
+        })
     }};
     ($builder:expr, awaited) => {{
         let mut builder = $builder;
@@ -384,6 +417,357 @@ mod tests {
     use super::*;
     use crate::context::DurableContext;
     use crate::future::{Branch, DurableFuture};
+
+    /// A root context over a recording in-memory client, with the
+    /// coalescer `window` (`None`: direct writes).
+    fn recording_context(
+        window: Option<Duration>,
+    ) -> (
+        DurableContext,
+        std::sync::Arc<crate::client::InMemoryExecutionClient>,
+    ) {
+        let client = std::sync::Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            std::sync::Arc::new(crate::engine::CheckpointLog::from_records(Vec::new())),
+            client.clone(),
+            "token-0".to_owned(),
+            window,
+            None,
+        );
+        (ctx, client)
+    }
+
+    /// `.spawn()` outside a Tokio runtime checks for the runtime before
+    /// the start step: for each `spawn_terminal!` arm, the handle resolves
+    /// to the no-runtime error and no `START` is queued or written.
+    #[test]
+    fn spawn_without_runtime_queues_nothing() {
+        let (ctx, client) = recording_context(None);
+        let step = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
+        let (wait_ctx, wait_client) = recording_context(None);
+        let wait = wait_ctx.wait(Duration::from_secs(1)).name("w").spawn();
+        let (map_ctx, map_client) = recording_context(None);
+        let map = map_ctx
+            .map(vec![1_u32], |_child, item, _| async move { Ok(item) })
+            .name("m")
+            .spawn_batch();
+        for (name, ctx) in [("step", &ctx), ("wait", &wait_ctx), ("map", &map_ctx)] {
+            assert_eq!(ctx.queued_update_ids(), Vec::<String>::new(), "{name}");
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime builds");
+        let errors = runtime.block_on(async move {
+            [
+                step.await.expect_err("no runtime").to_string(),
+                wait.await.expect_err("no runtime").to_string(),
+                map.await.map(drop).expect_err("no runtime").to_string(),
+            ]
+        });
+        let expected = crate::task::NoRuntime::operation_error(crate::task::NoRuntime).to_string();
+        for error in errors {
+            assert_eq!(error, expected);
+        }
+        for (name, client) in [("step", client), ("wait", wait_client), ("map", map_client)] {
+            assert_eq!(client.recorded_updates(), Vec::new(), "{name}");
+        }
+    }
+
+    /// The number of terminals [`started_spawn`] covers.
+    const STARTED_SPAWNS: usize = 11;
+
+    /// The `index`-th `.spawn()` or `.spawn_batch()` terminal that runs the
+    /// start step on the caller, as a handle over `ctx`, with its name.
+    fn started_spawn(ctx: &DurableContext, index: usize) -> (&'static str, DurableFuture<()>) {
+        fn erase<O: Send + 'static>(future: DurableFuture<O>) -> DurableFuture<()> {
+            DurableFuture::from_async(async move { future.await.map(drop) })
+        }
+        match index {
+            0 => (
+                "step",
+                erase(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn()),
+            ),
+            1 => ("wait", ctx.wait(Duration::from_secs(1)).name("a").spawn()),
+            2 => (
+                "create_callback",
+                erase(ctx.create_callback::<String>().name("a").spawn()),
+            ),
+            3 => (
+                "wait_for_callback",
+                erase(
+                    ctx.wait_for_callback::<String, _, _>(|_, _id| async { Ok(()) })
+                        .name("a")
+                        .spawn(),
+                ),
+            ),
+            4 => (
+                "child",
+                erase(
+                    ctx.run_in_child_context(|_child| async { Ok(1_u32) })
+                        .name("a")
+                        .spawn(),
+                ),
+            ),
+            5 => (
+                "with_retry",
+                erase(
+                    ctx.with_retry(|_child| async { Ok(1_u32) })
+                        .name("a")
+                        .spawn(),
+                ),
+            ),
+            6 => (
+                "map",
+                erase(
+                    ctx.map(vec![1_u32], |_child, item, _| async move { Ok(item) })
+                        .name("a")
+                        .spawn(),
+                ),
+            ),
+            7 => (
+                "map batch",
+                erase(
+                    ctx.map(vec![1_u32], |_child, item, _| async move { Ok(item) })
+                        .name("a")
+                        .spawn_batch(),
+                ),
+            ),
+            8 => (
+                "parallel",
+                erase(
+                    ctx.parallel(vec![Branch::new("b", |_child| async { Ok(1_u32) })])
+                        .name("a")
+                        .spawn(),
+                ),
+            ),
+            9 => (
+                "parallel batch",
+                erase(
+                    ctx.parallel(vec![Branch::new("b", |_child| async { Ok(1_u32) })])
+                        .name("a")
+                        .spawn_batch(),
+                ),
+            ),
+            10 => (
+                "parallel_mixed",
+                erase({
+                    let mut branches = crate::BranchSet::new();
+                    let _handle = branches.add("b", |_child| async { Ok(1_u32) });
+                    ctx.parallel_mixed(branches).name("a").spawn()
+                }),
+            ),
+            _ => unreachable!("index below STARTED_SPAWNS"),
+        }
+    }
+
+    /// `.spawn()` of an operation inside an abandoned owner queues nothing,
+    /// runs no body, and its handle never resolves.
+    #[tokio::test]
+    async fn spawn_from_abandoned_owner_stays_refused() {
+        let (root, client) = recording_context(Some(Duration::ZERO));
+        let child = root.new_child("1", None);
+        root.admission()
+            .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body_ran = std::sync::Arc::clone(&ran);
+        let handle = child
+            .step(move |_| {
+                let body_ran = std::sync::Arc::clone(&body_ran);
+                async move {
+                    body_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(1_u32)
+                }
+            })
+            .name("a")
+            .spawn();
+        assert_eq!(child.queued_update_ids(), Vec::<String>::new());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), handle)
+                .await
+                .is_err(),
+            "the handle never resolves"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "no body ran"
+        );
+        for index in 0..STARTED_SPAWNS {
+            let (name, handle) = started_spawn(&child, index);
+            assert_eq!(child.queued_update_ids(), Vec::<String>::new(), "{name}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), handle)
+                    .await
+                    .is_err(),
+                "{name}: the handle never resolves"
+            );
+        }
+        assert_eq!(client.recorded_updates(), Vec::new());
+    }
+
+    /// A root context whose history holds an invoke record `a` at the
+    /// first operation ID, which contradicts every started spawn.
+    fn mismatched_record_context() -> (
+        DurableContext,
+        std::sync::Arc<crate::client::InMemoryExecutionClient>,
+    ) {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let record = crate::engine::CheckpointRecord {
+            id: wire.clone(),
+            status: crate::engine::CheckpointStatus::Started,
+            result: None,
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: Some("Invoke".to_owned()),
+            sub_type: Some("ChainedInvoke".to_owned()),
+            due_at: None,
+            op_name: Some("a".to_owned()),
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
+        };
+        let client = std::sync::Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            std::sync::Arc::new(crate::engine::CheckpointLog::from_records(vec![(
+                wire, record,
+            )])),
+            client.clone(),
+            "token-0".to_owned(),
+            Some(Duration::ZERO),
+            None,
+        );
+        (ctx, client)
+    }
+
+    /// `.spawn()` of an operation whose record contradicts it fails the
+    /// replay identity check on the caller: the handle resolves to the
+    /// non-determinism error and no `START` is queued.
+    #[tokio::test]
+    async fn spawn_with_mismatched_record_queues_nothing() {
+        for index in 0..STARTED_SPAWNS {
+            let (ctx, client) = mismatched_record_context();
+            let (name, handle) = started_spawn(&ctx, index);
+            assert_eq!(ctx.queued_update_ids(), Vec::<String>::new(), "{name}");
+            let err = handle
+                .await
+                .expect_err("the record contradicts the operation");
+            assert!(
+                err.to_string().contains("non_deterministic"),
+                "{name}: {err}"
+            );
+            assert_eq!(client.recorded_updates(), Vec::new(), "{name}");
+        }
+    }
+
+    /// `.spawn()` from a task the SDK did not start runs the task-ownership
+    /// check before the replay identity check: with a record that also
+    /// contradicts the operation, the handle resolves to the
+    /// task-ownership error, not the non-determinism error, and no `START`
+    /// is queued.
+    #[tokio::test]
+    #[expect(clippy::disallowed_methods)] // reason: the test calls `.spawn()` from a task the SDK did not start
+    async fn spawn_from_unblessed_caller_with_mismatched_record_reports_ownership() {
+        for index in 0..STARTED_SPAWNS {
+            let (ctx, client) = mismatched_record_context();
+            let spawn_ctx = ctx.clone();
+            let (name, chain) = tokio::spawn(async move {
+                let (name, handle) = started_spawn(&spawn_ctx, index);
+                let err = handle.await.expect_err("an unblessed caller is refused");
+                let mut chain = err.to_string();
+                let mut source = std::error::Error::source(&err);
+                while let Some(cause) = source {
+                    chain = format!("{chain}: {cause}");
+                    source = cause.source();
+                }
+                (name, chain)
+            })
+            .await
+            .expect("the bare task completes");
+            assert!(chain.contains("Use .spawn()"), "{name}: {chain}");
+            assert!(!chain.contains("non_deterministic"), "{name}: {chain}");
+            assert_eq!(ctx.queued_update_ids(), Vec::<String>::new(), "{name}");
+            assert_eq!(client.recorded_updates(), Vec::new(), "{name}");
+        }
+    }
+
+    /// The admission check runs before the task-ownership check on the
+    /// caller, as in the start step: `.spawn()` from a task the SDK did not
+    /// start, inside an abandoned owner, leaves the handle refused rather
+    /// than resolving it to the task-ownership error.
+    #[tokio::test]
+    #[expect(clippy::disallowed_methods)] // reason: the test calls `.spawn()` from a task the SDK did not start
+    async fn spawn_from_unblessed_caller_in_abandoned_owner_stays_refused() {
+        let (root, client) = recording_context(Some(Duration::ZERO));
+        let child = root.new_child("1", None);
+        root.admission()
+            .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
+        for index in 0..STARTED_SPAWNS {
+            let spawn_ctx = child.clone();
+            let (name, resolved) = tokio::spawn(async move {
+                let (name, handle) = started_spawn(&spawn_ctx, index);
+                let resolved = tokio::time::timeout(Duration::from_millis(20), handle)
+                    .await
+                    .is_ok();
+                (name, resolved)
+            })
+            .await
+            .expect("the bare task completes");
+            assert!(!resolved, "{name}: the handle never resolves");
+            assert_eq!(child.queued_update_ids(), Vec::<String>::new(), "{name}");
+        }
+        assert_eq!(client.recorded_updates(), Vec::new());
+    }
+
+    /// `.spawn()` of an invoke and of a `wait_for_condition` runs no
+    /// caller-side start step: before the spawned tasks run, neither has a
+    /// `START` in the coalescer. Both queue it once their tasks run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_of_invoke_and_condition_queues_no_start_before_returning() {
+        let (ctx, _client) = recording_context(Some(Duration::from_hours(1)));
+        let invoke = ctx
+            .invoke::<serde_json::Value, _>("target", serde_json::json!({}))
+            .name("i")
+            .spawn();
+        let condition = ctx
+            .wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0)
+            .name("c")
+            .spawn();
+        assert_eq!(
+            ctx.queued_update_ids(),
+            Vec::<String>::new(),
+            "no START before the spawned tasks run"
+        );
+        let invoke_id = crate::engine::compute_wire_id_public("1");
+        let condition_id = crate::engine::compute_wire_id_public("2");
+        let mut queued = false;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            let ids = ctx.queued_update_ids();
+            if ids.contains(&invoke_id) && ids.contains(&condition_id) {
+                queued = true;
+                break;
+            }
+        }
+        assert!(
+            queued,
+            "both STARTs joined the coalescer: {:?}",
+            ctx.queued_update_ids()
+        );
+        drop((invoke, condition));
+    }
 
     /// The `RetryStrategyConfig` builder round-trips every knob through the
     /// accessors, and unset knobs keep their `Default` value.

@@ -604,4 +604,387 @@ mod tests {
         assert!(start.replay, "the retry's start hook is a replay");
         assert_eq!(start.probe, "true", "response a came before the hook");
     }
+
+    /// One submitted update the recorder saw: its name, wire ID, action
+    /// and the first-poll flag of its write.
+    type Submission = (
+        String,
+        String,
+        OperationAction,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
+
+    /// A client that fails, with a non-retryable error, the request that
+    /// carries the `START` of `target`, and accepts every other request.
+    struct FailStartClient {
+        target: &'static str,
+    }
+
+    /// The error [`FailStartClient`] returns.
+    fn start_rejection() -> ExecutionClientError {
+        ExecutionClientError::new(
+            crate::client::ExecutionClientErrorScope::Execution,
+            "START rejected",
+        )
+    }
+
+    impl ExecutionClient for FailStartClient {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>>
+        {
+            let fails = updates
+                .iter()
+                .any(|u| u.action() == &OperationAction::Start && u.name() == Some(self.target));
+            Box::pin(async move {
+                if fails {
+                    Err(start_rejection())
+                } else {
+                    Ok(CheckpointOutput::new(
+                        Some("t".to_owned()),
+                        Vec::new(),
+                        None,
+                    ))
+                }
+            })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _marker: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(GetStateOutput::new(Vec::new(), None)) })
+        }
+    }
+
+    /// The child-backed operations whose outcome waits for a failed
+    /// `START` (test 26).
+    #[derive(Debug, Clone, Copy)]
+    enum Settler {
+        ChildSuccess,
+        ChildFailure,
+        BatchParentEmpty,
+        BatchParentAfterItems,
+        BatchItemSuccess,
+        BatchItemFailure,
+        /// A child whose result fails to serialize: it writes `FAIL`.
+        ChildSerializeFailure,
+        /// A map item whose result fails to serialize: it writes `FAIL`.
+        BatchItemSerializeFailure,
+    }
+
+    /// A serdes whose `serialize` always fails.
+    struct FailSerialize;
+
+    impl<T: Send + 'static> crate::Serdes<T> for FailSerialize {
+        fn serialize(
+            &self,
+            _value: T,
+            _context: crate::serdes::SerdesContext,
+        ) -> impl Future<Output = Result<String, crate::BoxError>> + Send {
+            std::future::ready(Err("cannot serialize".into()))
+        }
+
+        fn deserialize(
+            &self,
+            _wire: String,
+            _context: crate::serdes::SerdesContext,
+        ) -> impl Future<Output = Result<T, crate::BoxError>> + Send {
+            std::future::ready(Err("cannot deserialize".into()))
+        }
+    }
+
+    impl Settler {
+        /// The name of the operation whose `START` is held and fails.
+        fn target(self) -> &'static str {
+            match self {
+                Self::ChildSuccess | Self::ChildFailure | Self::ChildSerializeFailure => "c",
+                Self::BatchParentEmpty | Self::BatchParentAfterItems => "m",
+                Self::BatchItemSuccess
+                | Self::BatchItemFailure
+                | Self::BatchItemSerializeFailure => "map-item-0",
+            }
+        }
+
+        /// The outcome action the settler is about to write.
+        fn action(self) -> OperationAction {
+            match self {
+                Self::ChildFailure
+                | Self::BatchItemFailure
+                | Self::ChildSerializeFailure
+                | Self::BatchItemSerializeFailure => OperationAction::Fail,
+                _ => OperationAction::Succeed,
+            }
+        }
+
+        /// Whether a body runs and logs `result ready` as its last
+        /// statement.
+        fn has_body(self) -> bool {
+            !matches!(self, Self::BatchParentEmpty)
+        }
+
+        /// The operation's future on `ctx`. A body logs `result ready` to
+        /// `log` as its last statement.
+        fn future(
+            self,
+            ctx: &DurableContext,
+            log: Arc<Mutex<Vec<String>>>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let ready = move || log.lock().unwrap().push("result ready".to_owned());
+            match self {
+                Self::ChildSuccess | Self::ChildFailure => {
+                    let fail = matches!(self, Self::ChildFailure);
+                    let future = ctx
+                        .run_in_child_context(move |_child| async move {
+                            ready();
+                            if fail {
+                                Err::<u32, crate::BoxError>("boom".into())
+                            } else {
+                                Ok(1_u32)
+                            }
+                        })
+                        .name("c")
+                        .into_future();
+                    Box::pin(async move {
+                        let _ignored = future.await;
+                    })
+                }
+                Self::ChildSerializeFailure => {
+                    let future = ctx
+                        .run_in_child_context(move |_child| async move {
+                            ready();
+                            Ok(1_u32)
+                        })
+                        .name("c")
+                        .serdes(FailSerialize)
+                        .into_future();
+                    Box::pin(async move {
+                        let _ignored = future.await;
+                    })
+                }
+                Self::BatchItemSerializeFailure => {
+                    let ready = Arc::new(ready);
+                    let future = ctx
+                        .map(vec![1_u32], move |_child, item, _| {
+                            let ready = Arc::clone(&ready);
+                            async move {
+                                ready();
+                                Ok(item)
+                            }
+                        })
+                        .name("m")
+                        .serdes(FailSerialize)
+                        .completion(
+                            crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(100.0),
+                        )
+                        .into_future();
+                    Box::pin(async move {
+                        let _ignored = future.await;
+                    })
+                }
+                Self::BatchParentEmpty => {
+                    let future = ctx
+                        .map(Vec::<u32>::new(), |_child, item, _| async move { Ok(item) })
+                        .name("m")
+                        .into_future();
+                    Box::pin(async move {
+                        let _ignored = future.await;
+                    })
+                }
+                Self::BatchParentAfterItems | Self::BatchItemSuccess | Self::BatchItemFailure => {
+                    let fail = matches!(self, Self::BatchItemFailure);
+                    let nesting = if matches!(self, Self::BatchParentAfterItems) {
+                        crate::map_parallel::NestingMode::Flat
+                    } else {
+                        crate::map_parallel::NestingMode::Normal
+                    };
+                    let ready = Arc::new(ready);
+                    let future = ctx
+                        .map(vec![1_u32], move |_child, item, _| {
+                            let ready = Arc::clone(&ready);
+                            async move {
+                                ready();
+                                if fail {
+                                    Err::<u32, crate::BoxError>("boom".into())
+                                } else {
+                                    Ok(item)
+                                }
+                            }
+                        })
+                        .name("m")
+                        .nesting(nesting)
+                        .completion(
+                            crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(100.0),
+                        )
+                        .into_future();
+                    Box::pin(async move {
+                        let _ignored = future.await;
+                    })
+                }
+            }
+        }
+    }
+
+    /// Waits up to two seconds for `ready`, failing the test with `what`.
+    async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !ready() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Runs test 26 for `case` (see [`Settler`]).
+    #[expect(clippy::too_many_lines)] // reason: the test's setup and its ordered checks read as one scenario
+    async fn outcome_waits_for_failed_start(case: Settler) {
+        let target = case.target();
+        let ctx = context(Vec::new(), Arc::new(FailStartClient { target }), None, None);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let held = Arc::clone(&gate);
+        ctx.set_pre_lock_gate(Arc::new(move |updates: &[OperationUpdate]| {
+            updates
+                .iter()
+                .any(|u| u.action() == &OperationAction::Start && u.name() == Some(target))
+                .then(|| Arc::clone(&held))
+        }));
+        let submissions: Arc<Mutex<Vec<Submission>>> = Arc::default();
+        let recorded = Arc::clone(&submissions);
+        ctx.set_submission_recorder(Arc::new(move |updates, flag| {
+            let mut recorded = recorded.lock().unwrap();
+            for u in updates {
+                recorded.push((
+                    u.name().unwrap_or("-").to_owned(),
+                    u.id().to_owned(),
+                    u.action().clone(),
+                    Arc::clone(flag),
+                ));
+            }
+        }));
+        let entries: Arc<Mutex<Vec<(String, OperationAction)>>> = Arc::default();
+        let entered = Arc::clone(&entries);
+        ctx.set_settler_entry_recorder(Arc::new(move |wire_id, action| {
+            entered.lock().unwrap().push((wire_id.to_owned(), action));
+        }));
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let operation = case.future(&ctx, Arc::clone(&log));
+
+        let start_of = |submissions: &[Submission]| {
+            submissions
+                .iter()
+                .find(|(name, _, action, _)| name == target && action == &OperationAction::Start)
+                .map(|(_, id, _, flag)| (id.clone(), Arc::clone(flag)))
+        };
+        let outcomes_of = |submissions: &[Submission], id: &str| {
+            submissions
+                .iter()
+                .filter(|(_, sid, action, _)| {
+                    sid == id && matches!(action, OperationAction::Succeed | OperationAction::Fail)
+                })
+                .count()
+        };
+        let observe = async {
+            wait_until("the target's START is submitted", || {
+                start_of(&submissions.lock().unwrap()).is_some()
+            })
+            .await;
+            let (id, flag) = start_of(&submissions.lock().unwrap()).expect("checked above");
+            let action = case.action();
+            wait_until("the settler-entry marker", || {
+                entries
+                    .lock()
+                    .unwrap()
+                    .contains(&(id.clone(), action.clone()))
+            })
+            .await;
+            if case.has_body() {
+                wait_until("the body's result", || {
+                    log.lock().unwrap().iter().any(|e| e == "result ready")
+                })
+                .await;
+            }
+            assert!(
+                flag.load(std::sync::atomic::Ordering::SeqCst),
+                "{case:?}: the outcome path polls the retained START"
+            );
+            assert_eq!(
+                outcomes_of(&submissions.lock().unwrap(), &id),
+                0,
+                "{case:?}: no outcome while START is held"
+            );
+            gate.notify_one();
+            wait_until("the invocation's fatal error", || {
+                ctx.coordinator().fatal_error().is_some()
+            })
+            .await;
+            let fatal = ctx.coordinator().fatal_error().expect("checked above");
+            let wire = crate::error::checkpoint_execution_failure_wire(&start_rejection());
+            assert_eq!(
+                fatal.error_type, "CheckpointUnrecoverableExecutionError",
+                "{case:?}"
+            );
+            assert_eq!(
+                Some(fatal.error_message.as_str()),
+                wire.error_message(),
+                "{case:?}"
+            );
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                outcomes_of(&submissions.lock().unwrap(), &id),
+                0,
+                "{case:?}: no outcome after the failed START"
+            );
+        };
+        tokio::select! {
+            () = operation => panic!("{case:?}: the operation resolved after a failed START"),
+            () = observe => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn child_success_waits_for_failed_start() {
+        outcome_waits_for_failed_start(Settler::ChildSuccess).await;
+    }
+
+    #[tokio::test]
+    async fn child_failure_waits_for_failed_start() {
+        outcome_waits_for_failed_start(Settler::ChildFailure).await;
+    }
+
+    #[tokio::test]
+    async fn batch_parent_success_waits_for_failed_start() {
+        outcome_waits_for_failed_start(Settler::BatchParentEmpty).await;
+    }
+
+    #[tokio::test]
+    async fn batch_parent_nonempty_success_waits_for_failed_start() {
+        outcome_waits_for_failed_start(Settler::BatchParentAfterItems).await;
+    }
+
+    #[tokio::test]
+    async fn batch_item_success_waits_for_failed_start() {
+        outcome_waits_for_failed_start(Settler::BatchItemSuccess).await;
+    }
+
+    #[tokio::test]
+    async fn batch_item_failure_waits_for_failed_start() {
+        outcome_waits_for_failed_start(Settler::BatchItemFailure).await;
+    }
+
+    #[tokio::test]
+    async fn child_serialize_failure_waits_for_failed_start() {
+        outcome_waits_for_failed_start(Settler::ChildSerializeFailure).await;
+    }
+
+    #[tokio::test]
+    async fn batch_item_serialize_failure_waits_for_failed_start() {
+        outcome_waits_for_failed_start(Settler::BatchItemSerializeFailure).await;
+    }
 }

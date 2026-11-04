@@ -386,7 +386,7 @@ impl std::fmt::Display for NoRuntime {
 impl std::error::Error for NoRuntime {}
 
 /// Returns `Err(NoRuntime)` when no Tokio runtime is running on this thread.
-fn ensure_runtime() -> Result<(), NoRuntime> {
+pub(crate) fn ensure_runtime() -> Result<(), NoRuntime> {
     tokio::runtime::Handle::try_current()
         .map(drop)
         .map_err(|_| NoRuntime)

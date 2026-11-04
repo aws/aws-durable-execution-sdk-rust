@@ -364,6 +364,22 @@ where
     /// the handler starts itself, or a request already sent to another
     /// service.
     ///
+    /// `.spawn_batch()` runs the operation's start step on the caller's task
+    /// before it returns, as JS starts the operation inside the call. When
+    /// the operation's current state requires a `START` (it has no record,
+    /// or its record begins a new attempt), that `START` is admitted to the
+    /// write order before `.spawn_batch()` returns, so it reaches the service
+    /// before every update the caller sends afterwards, on any runtime
+    /// flavor. The task-ownership check runs on the caller too: a
+    /// `.spawn_batch()` from a task the SDK did not start returns a handle that
+    /// resolves to the task-ownership error, queues no `START` and runs no
+    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// replay start hook of a record that resumes work, fire before
+    /// `.spawn_batch()` returns. The rest of the operation, including
+    /// `on_attempt_start` and the body, runs on the spawned task. The
+    /// exceptions are `invoke`, `wait_for_condition` and the combinators,
+    /// whose `.spawn()` starts the whole operation on the spawned task.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -396,7 +412,7 @@ where
         IS: Serdes<O>,
         RS: Serdes<String>,
     {
-        spawn_terminal!(self, batch_future)
+        spawn_terminal!(self, started_batch)
     }
 
     /// The lazy terminal of the full [`BatchResult`]: the body of
@@ -408,11 +424,28 @@ where
         IS: Serdes<O>,
         RS: Serdes<String>,
     {
+        self.batch_future_with(false)
+    }
+
+    /// [`Self::batch_future`] with the start step run now, on the caller's
+    /// task (see [`crate::start`]). `spawn_batch()` and `.spawn()` use it.
+    fn started_batch_future(self) -> DurableFuture<BatchResult<O>>
+    where
+        IS: Serdes<O>,
+        RS: Serdes<String>,
+    {
+        self.batch_future_with(true)
+    }
+
+    /// The body of [`Self::batch_future`] and [`Self::started_batch_future`].
+    fn batch_future_with(self, started: bool) -> DurableFuture<BatchResult<O>>
+    where
+        IS: Serdes<O>,
+        RS: Serdes<String>,
+    {
         use crate::map_parallel::MapExecution;
 
         preflight_identity!(self, "Context", crate::map_parallel::MAP_SUB_TYPE);
-
-        let gate = self.ctx.clone();
 
         let execution = MapExecution {
             ctx: self.ctx,
@@ -430,7 +463,11 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::for_operation(&gate, execution.execute_batch_result())
+        if started {
+            DurableFuture::for_started_operation(execution.execute_batch_result_started())
+        } else {
+            DurableFuture::for_started_operation(execution.execute_batch_result())
+        }
     }
 
     /// Converts this builder into a [`DurableFuture`] without starting it.
@@ -465,6 +502,22 @@ where
     /// the handler starts itself, or a request already sent to another
     /// service.
     ///
+    /// `.spawn()` runs the operation's start step on the caller's task
+    /// before it returns, as JS starts the operation inside the call. When
+    /// the operation's current state requires a `START` (it has no record,
+    /// or its record begins a new attempt), that `START` is admitted to the
+    /// write order before `.spawn()` returns, so it reaches the service
+    /// before every update the caller sends afterwards, on any runtime
+    /// flavor. The task-ownership check runs on the caller too: a
+    /// `.spawn()` from a task the SDK did not start returns a handle that
+    /// resolves to the task-ownership error, queues no `START` and runs no
+    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// replay start hook of a record that resumes work, fire before
+    /// `.spawn()` returns. The rest of the operation, including
+    /// `on_attempt_start` and the body, runs on the spawned task. The
+    /// exceptions are `invoke`, `wait_for_condition` and the combinators,
+    /// whose `.spawn()` starts the whole operation on the spawned task.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -474,7 +527,20 @@ where
         IS: Serdes<O>,
         RS: Serdes<String>,
     {
-        spawn_terminal!(self)
+        spawn_terminal!(self, started)
+    }
+
+    /// The `Vec<O>` future of `.spawn()`: the full batch, started now on
+    /// the caller's task, projected as `.await` projects it.
+    fn started_future(self) -> DurableFuture<Vec<O>>
+    where
+        IS: Serdes<O>,
+        RS: Serdes<String>,
+    {
+        let batch = self.started_batch_future();
+        DurableFuture::from_async(
+            async move { crate::map_parallel::collect_successful(batch.await?) },
+        )
     }
 }
 
@@ -495,8 +561,6 @@ where
 
         preflight_identity!(self, "Context", crate::map_parallel::MAP_SUB_TYPE);
 
-        let gate = self.ctx.clone();
-
         let execution = MapExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -513,7 +577,7 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::for_operation(&gate, execution.execute())
+        DurableFuture::for_started_operation(execution.execute())
     }
 }
 
@@ -806,6 +870,22 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// the handler starts itself, or a request already sent to another
     /// service.
     ///
+    /// `.spawn_batch()` runs the operation's start step on the caller's task
+    /// before it returns, as JS starts the operation inside the call. When
+    /// the operation's current state requires a `START` (it has no record,
+    /// or its record begins a new attempt), that `START` is admitted to the
+    /// write order before `.spawn_batch()` returns, so it reaches the service
+    /// before every update the caller sends afterwards, on any runtime
+    /// flavor. The task-ownership check runs on the caller too: a
+    /// `.spawn_batch()` from a task the SDK did not start returns a handle that
+    /// resolves to the task-ownership error, queues no `START` and runs no
+    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// replay start hook of a record that resumes work, fire before
+    /// `.spawn_batch()` returns. The rest of the operation, including
+    /// `on_attempt_start` and the body, runs on the spawned task. The
+    /// exceptions are `invoke`, `wait_for_condition` and the combinators,
+    /// whose `.spawn()` starts the whole operation on the spawned task.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -837,7 +917,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
         IS: Serdes<O>,
         RS: Serdes<String>,
     {
-        spawn_terminal!(self, batch_future)
+        spawn_terminal!(self, started_batch)
     }
 
     /// The lazy terminal of the full [`BatchResult`]: the body of
@@ -849,11 +929,28 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
         IS: Serdes<O>,
         RS: Serdes<String>,
     {
+        self.batch_future_with(false)
+    }
+
+    /// [`Self::batch_future`] with the start step run now, on the caller's
+    /// task (see [`crate::start`]). `spawn_batch()` and `.spawn()` use it.
+    fn started_batch_future(self) -> DurableFuture<BatchResult<O>>
+    where
+        IS: Serdes<O>,
+        RS: Serdes<String>,
+    {
+        self.batch_future_with(true)
+    }
+
+    /// The body of [`Self::batch_future`] and [`Self::started_batch_future`].
+    fn batch_future_with(self, started: bool) -> DurableFuture<BatchResult<O>>
+    where
+        IS: Serdes<O>,
+        RS: Serdes<String>,
+    {
         use crate::map_parallel::{ItemIds, ParallelExecution};
 
         preflight_identity!(self, "Context", crate::map_parallel::PARALLEL_SUB_TYPE);
-
-        let gate = self.ctx.clone();
 
         let item_ids = ItemIds::new(&self.op_id, self.branches.len());
         let execution = ParallelExecution {
@@ -870,7 +967,11 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
             item_ids,
         };
 
-        DurableFuture::for_operation(&gate, execution.execute_batch_result())
+        if started {
+            DurableFuture::for_started_operation(execution.execute_batch_result_started())
+        } else {
+            DurableFuture::for_started_operation(execution.execute_batch_result())
+        }
     }
 
     /// Converts this builder into a [`DurableFuture`] without starting it.
@@ -905,6 +1006,22 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// the handler starts itself, or a request already sent to another
     /// service.
     ///
+    /// `.spawn()` runs the operation's start step on the caller's task
+    /// before it returns, as JS starts the operation inside the call. When
+    /// the operation's current state requires a `START` (it has no record,
+    /// or its record begins a new attempt), that `START` is admitted to the
+    /// write order before `.spawn()` returns, so it reaches the service
+    /// before every update the caller sends afterwards, on any runtime
+    /// flavor. The task-ownership check runs on the caller too: a
+    /// `.spawn()` from a task the SDK did not start returns a handle that
+    /// resolves to the task-ownership error, queues no `START` and runs no
+    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// replay start hook of a record that resumes work, fire before
+    /// `.spawn()` returns. The rest of the operation, including
+    /// `on_attempt_start` and the body, runs on the spawned task. The
+    /// exceptions are `invoke`, `wait_for_condition` and the combinators,
+    /// whose `.spawn()` starts the whole operation on the spawned task.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -914,7 +1031,20 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
         IS: Serdes<O>,
         RS: Serdes<String>,
     {
-        spawn_terminal!(self)
+        spawn_terminal!(self, started)
+    }
+
+    /// The `Vec<O>` future of `.spawn()`: the full batch, started now on
+    /// the caller's task, projected as `.await` projects it.
+    fn started_future(self) -> DurableFuture<Vec<O>>
+    where
+        IS: Serdes<O>,
+        RS: Serdes<String>,
+    {
+        let batch = self.started_batch_future();
+        DurableFuture::from_async(
+            async move { crate::map_parallel::collect_successful(batch.await?) },
+        )
     }
 }
 
@@ -932,8 +1062,6 @@ where
 
         preflight_identity!(self, "Context", crate::map_parallel::PARALLEL_SUB_TYPE);
 
-        let gate = self.ctx.clone();
-
         let item_ids = ItemIds::new(&self.op_id, self.branches.len());
         let execution = ParallelExecution {
             ctx: self.ctx,
@@ -949,7 +1077,7 @@ where
             item_ids,
         };
 
-        DurableFuture::for_operation(&gate, execution.execute())
+        DurableFuture::for_started_operation(execution.execute())
     }
 }
 
@@ -1143,6 +1271,22 @@ impl<RS> ParallelMixedBuilder<RS> {
     /// the handler starts itself, or a request already sent to another
     /// service.
     ///
+    /// `.spawn()` runs the operation's start step on the caller's task
+    /// before it returns, as JS starts the operation inside the call. When
+    /// the operation's current state requires a `START` (it has no record,
+    /// or its record begins a new attempt), that `START` is admitted to the
+    /// write order before `.spawn()` returns, so it reaches the service
+    /// before every update the caller sends afterwards, on any runtime
+    /// flavor. The task-ownership check runs on the caller too: a
+    /// `.spawn()` from a task the SDK did not start returns a handle that
+    /// resolves to the task-ownership error, queues no `START` and runs no
+    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// replay start hook of a record that resumes work, fire before
+    /// `.spawn()` returns. The rest of the operation, including
+    /// `on_attempt_start` and the body, runs on the spawned task. The
+    /// exceptions are `invoke`, `wait_for_condition` and the combinators,
+    /// whose `.spawn()` starts the whole operation on the spawned task.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -1154,7 +1298,7 @@ impl<RS> ParallelMixedBuilder<RS> {
         use crate::map_parallel::publish_outcome;
 
         let decoders = Arc::clone(&self.decoders);
-        let spawned = spawn_terminal!(self, batch_future);
+        let spawned = spawn_terminal!(self, started_batch);
         DurableFuture::from_async(async move { publish_outcome(spawned.await, &decoders) })
     }
 
@@ -1165,11 +1309,30 @@ impl<RS> ParallelMixedBuilder<RS> {
     where
         RS: Serdes<String>,
     {
+        self.batch_future_with(false)
+    }
+
+    /// [`Self::batch_future`] with the start step run now, on the caller's
+    /// task (see [`crate::start`]). `spawn_batch()` and `.spawn()` use it.
+    fn started_batch_future(self) -> DurableFuture<BatchResult<crate::future::MixedValue>>
+    where
+        RS: Serdes<String>,
+    {
+        self.batch_future_with(true)
+    }
+
+    /// The body of [`Self::batch_future`] and [`Self::started_batch_future`].
+    fn batch_future_with(
+        self,
+        started: bool,
+    ) -> DurableFuture<BatchResult<crate::future::MixedValue>>
+    where
+        RS: Serdes<String>,
+    {
         use crate::map_parallel::{ItemIds, MixedItemSerdes, PARALLEL_SUB_TYPE, ParallelExecution};
 
         preflight_identity!(self, "Context", PARALLEL_SUB_TYPE);
 
-        let gate = self.ctx.clone();
         // One table of branch IDs, read by the batch engine and by the item
         // serdes, which finds each branch's serdes from it.
         let item_ids = ItemIds::new(&self.op_id, self.branches.len());
@@ -1188,7 +1351,11 @@ impl<RS> ParallelMixedBuilder<RS> {
             item_ids,
         };
 
-        DurableFuture::for_operation(&gate, execution.execute_batch_result())
+        if started {
+            DurableFuture::for_started_operation(execution.execute_batch_result_started())
+        } else {
+            DurableFuture::for_started_operation(execution.execute_batch_result())
+        }
     }
 }
 

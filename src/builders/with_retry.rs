@@ -312,6 +312,22 @@ where
     /// the handler starts itself, or a request already sent to another
     /// service.
     ///
+    /// `.spawn()` runs the operation's start step on the caller's task
+    /// before it returns, as JS starts the operation inside the call. When
+    /// the operation's current state requires a `START` (it has no record,
+    /// or its record begins a new attempt), that `START` is admitted to the
+    /// write order before `.spawn()` returns, so it reaches the service
+    /// before every update the caller sends afterwards, on any runtime
+    /// flavor. The task-ownership check runs on the caller too: a
+    /// `.spawn()` from a task the SDK did not start returns a handle that
+    /// resolves to the task-ownership error, queues no `START` and runs no
+    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// replay start hook of a record that resumes work, fire before
+    /// `.spawn()` returns. The rest of the operation, including
+    /// `on_attempt_start` and the body, runs on the spawned task. The
+    /// exceptions are `invoke`, `wait_for_condition` and the combinators,
+    /// whose `.spawn()` starts the whole operation on the spawned task.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -338,21 +354,20 @@ where
     where
         S: Serdes<O>,
     {
-        spawn_terminal!(self)
+        spawn_terminal!(self, started)
     }
 }
 
-impl<O, F, Fut, S> IntoFuture for WithRetryBuilder<O, F, Fut, S>
+impl<O, F, Fut, S> WithRetryBuilder<O, F, Fut, S>
 where
     O: Send + 'static,
     F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
-    type Output = Result<O, OperationError>;
-    type IntoFuture = DurableFuture<O>;
-
-    fn into_future(self) -> Self::IntoFuture {
+    /// The operation's future. With `started`, its start step runs now, on
+    /// the caller's task (see [`crate::start`]); `.spawn()` uses that.
+    fn build(self, started: bool) -> DurableFuture<O> {
         use crate::child::ChildExecution;
 
         // The block is a child context on the wire; validate against the
@@ -376,8 +391,6 @@ where
         let serdes = Arc::new(self.serdes);
         let loop_serdes = Arc::clone(&serdes);
 
-        let gate = self.ctx.clone();
-
         let loop_name = self.name.clone();
 
         let execution = ChildExecution {
@@ -396,7 +409,31 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::for_operation(&gate, execution.execute())
+        if started {
+            DurableFuture::for_started_operation(execution.execute_started())
+        } else {
+            DurableFuture::for_started_operation(execution.execute())
+        }
+    }
+
+    /// The operation's future, with its start step run now.
+    fn started_future(self) -> DurableFuture<O> {
+        self.build(true)
+    }
+}
+
+impl<O, F, Fut, S> IntoFuture for WithRetryBuilder<O, F, Fut, S>
+where
+    O: Send + 'static,
+    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
+    S: Serdes<O>,
+{
+    type Output = Result<O, OperationError>;
+    type IntoFuture = DurableFuture<O>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        self.build(false)
     }
 }
 

@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use tracing::Instrument as _;
 
 use crate::BoxError;
-use crate::context::{DurableContext, StepContext};
+use crate::context::{DurableContext, StepContext, SubmittedWrite};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     CallbackError, CallbackErrorKind, ChildContextError, ChildContextErrorKind, OperationError,
@@ -60,14 +60,28 @@ where
 {
     /// Executes the create-callback operation: replay or live path.
     pub(crate) async fn execute(self) -> Result<Callback<O>, OperationError> {
-        let positional_id = self.op_id.positional().to_owned();
-        let wire_id = self.op_id.wire().to_owned();
+        let started = self.start();
+        self.execute_after_start(started).await
+    }
 
-        // 1. The start step: admission, task ownership, the replay identity
-        // check, and the urgent START of the first invocation (see
-        // `crate::start`). An in-flight record with its callback ID fires
-        // the replay start hook.
-        let started = crate::start::start_step(
+    /// Runs the callback's start step now, on the caller's task, and
+    /// returns the future of the rest of the operation (see
+    /// [`crate::start`]).
+    pub(crate) fn execute_started(
+        self,
+    ) -> impl Future<Output = Result<Callback<O>, OperationError>> + Send + 'static {
+        let started = self.start();
+        self.execute_after_start(started)
+    }
+
+    /// The start step: admission, task ownership, the replay identity
+    /// check, and the urgent START of the first invocation (see
+    /// `crate::start`). An in-flight record with its callback ID fires the
+    /// replay start hook.
+    fn start(&self) -> Result<StartStep, OperationError> {
+        let positional_id = self.op_id.positional();
+        let wire_id = self.op_id.wire();
+        crate::start::start_step(
             &self.ctx,
             &crate::start::StartSpec {
                 op_id: &self.op_id,
@@ -83,18 +97,28 @@ where
                 );
                 // A record without a callback ID fails below, before any
                 // hook, so it does not resume.
-                if in_flight && self.recorded_callback_id(&positional_id).is_some() {
+                if in_flight && self.recorded_callback_id(positional_id).is_some() {
                     crate::start::Cycle::Resume
                 } else {
                     crate::start::Cycle::Record
                 }
             },
-            || self.start_update(&wire_id),
+            || self.start_update(wire_id),
             |plugins, _| {
-                let info = self.info(&wire_id).with_replay(true);
+                let info = self.info(wire_id).with_replay(true);
                 crate::plugin::operation_started(plugins, &info);
             },
-        )?;
+        )
+    }
+
+    /// The rest of the operation after its start step `started`.
+    async fn execute_after_start(
+        self,
+        started: Result<StartStep, OperationError>,
+    ) -> Result<Callback<O>, OperationError> {
+        let started = started?;
+        let positional_id = self.op_id.positional().to_owned();
+        let wire_id = self.op_id.wire().to_owned();
 
         // 2. Replay: a recorded callback returns its ID, and its outcome
         // when it has one.
@@ -416,6 +440,24 @@ where
     /// checkpoint plumbing, callback creation and the submitter step,
     /// is likewise non-generic) between them.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
+        let (core, rest) = self.split();
+        let started = core.start();
+        Self::run(core, rest, started).await
+    }
+
+    /// Runs the operation's start step now, on the caller's task, and
+    /// returns the future of the rest of it (see [`crate::start`]).
+    pub(crate) fn execute_started(
+        self,
+    ) -> impl Future<Output = Result<O, OperationError>> + Send + 'static {
+        let (core, rest) = self.split();
+        let started = core.start();
+        Self::run(core, rest, started)
+    }
+
+    /// Splits the execution into its non-generic core and the inputs of
+    /// its body.
+    fn split(self) -> (WfcbCore<O>, WfcbBody<F, S>) {
         let Self {
             ctx,
             op_id,
@@ -435,9 +477,38 @@ where
             name,
             _marker: std::marker::PhantomData,
         };
-        match core.before().await? {
+        let rest = WfcbBody {
+            plugin_names,
+            timeout,
+            heartbeat,
+            submitter,
+            submitter_retry,
+            serdes,
+        };
+        (core, rest)
+    }
+
+    /// The rest of the operation after its start step `started`.
+    async fn run(
+        core: WfcbCore<O>,
+        rest: WfcbBody<F, S>,
+        started: Result<StartStep, OperationError>,
+    ) -> Result<O, OperationError> {
+        let WfcbBody {
+            plugin_names,
+            timeout,
+            heartbeat,
+            submitter,
+            submitter_retry,
+            serdes,
+        } = rest;
+        match core.before(started?).await? {
             WfcbPrelude::Done(result) => result,
-            WfcbPrelude::Run { child_ctx, after } => {
+            WfcbPrelude::Run {
+                child_ctx,
+                start,
+                after,
+            } => {
                 // Run inner body: create_callback + submitter step + await
                 // result. Instrumented with the child namespace's
                 // replay-aware span so a resumed body's log lines are
@@ -459,10 +530,20 @@ where
                 // The terminal update below goes through the parent
                 // context, so it is admitted.
                 after.ctx.admission().abandon([after.wire_id.as_str()]);
-                after.settle(body_result).await
+                after.settle(start, body_result).await
             }
         }
     }
+}
+
+/// The inputs of a `wait_for_callback` body.
+struct WfcbBody<F, S> {
+    plugin_names: InnerPluginNames,
+    timeout: Option<Duration>,
+    heartbeat: Option<Duration>,
+    submitter: F,
+    submitter_retry: Option<crate::RetryStrategy>,
+    serdes: S,
 }
 
 /// The names the plugin hooks report for the inner operations of a
@@ -520,6 +601,9 @@ enum WfcbPrelude<O> {
     Run {
         /// The fresh child context (chained prefix) the body runs in.
         child_ctx: DurableContext,
+        /// The `START` write of this invocation, still in flight. The
+        /// outcome write waits for it. `None` when the record existed.
+        start: Option<SubmittedWrite>,
         /// The post-body half that checkpoints the outcome.
         after: WfcbAfter<O>,
     },
@@ -538,26 +622,62 @@ impl<O> WfcbCore<O>
 where
     O: DeserializeOwned + Serialize + Send + 'static,
 {
-    /// Runs everything that precedes the inner body: replay path, or the
-    /// live-path preamble ending at the START checkpoint.
-    async fn before(self) -> Result<WfcbPrelude<O>, OperationError> {
-        // 1. Task-ownership check.
-        self.ctx.enforce_task_ownership()?;
+    /// The start step of the outer context (see [`crate::start`]):
+    /// admission, task ownership, the replay identity check, and, without
+    /// a record, the `START`, queued, then `on_operation_start`, then
+    /// released, as JS orders them. A record that re-enters the body fires
+    /// the replay start hook here.
+    fn start(&self) -> Result<StartStep, OperationError> {
+        let wire_id = self.op_id.wire();
+        crate::start::start_step(
+            &self.ctx,
+            &crate::start::StartSpec {
+                op_id: &self.op_id,
+                operation_type: "Context",
+                sub_type: WFCB_SUB_TYPE,
+                name: self.name.as_deref(),
+                order: crate::start::StartOrder::QueueThenHook,
+            },
+            |view| match view.status {
+                CheckpointStatus::Succeeded | CheckpointStatus::Failed => {
+                    crate::start::Cycle::Record
+                }
+                // Started/Pending/Ready: re-enter the body.
+                _ => crate::start::Cycle::Resume,
+            },
+            || {
+                build_wfcb_update(
+                    wire_id,
+                    self.name.as_deref(),
+                    OperationAction::Start,
+                    &self.ctx,
+                )
+            },
+            |plugins, is_replay| {
+                let info = wfcb_info(&self.ctx, wire_id, self.name.as_deref());
+                let info = if is_replay {
+                    info.with_replay(true)
+                } else {
+                    info.with_status(crate::OperationStatus::Started)
+                        .with_replay(false)
+                };
+                crate::plugin::operation_started(plugins, &info);
+            },
+        )
+    }
 
+    /// Runs everything that follows the start step `started` and precedes
+    /// the inner body: the replay path, or the child context of the body.
+    /// The body does not wait for a queued `START`: the outcome write does.
+    async fn before(self, started: StartStep) -> Result<WfcbPrelude<O>, OperationError> {
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
         let Self { ctx, name, .. } = self;
 
-        // 2. Check checkpoint log for replay (context-level terminal). The
-        // validated view covers the non-terminal branches without cloning.
-        if let Some(view) = ctx.checkpoint_view_validated(
-            &positional_id,
-            &wire_id,
-            "Context",
-            Some(WFCB_SUB_TYPE),
-            name.as_deref(),
-        )? {
-            match view.status {
+        let start = match started {
+            StartStep::Refused => return std::future::pending().await,
+            StartStep::Queued(write) => Some(write),
+            StartStep::Recorded(view) => match view.status {
                 CheckpointStatus::Succeeded => {
                     // WaitForCallback context completed: deserialize the
                     // result FIRST, then emit `operation_replayed`: a corrupt
@@ -594,38 +714,18 @@ where
                         view.status.wire_str(),
                     ))));
                 }
-                // Started/Pending/Ready: fall through to execute/resume.
-                _ => {
-                    if let Some(plugins) = ctx.plugins() {
-                        let info = wfcb_info(&ctx, &wire_id, name.as_deref()).with_replay(true);
-                        crate::plugin::operation_started(plugins, &info);
-                    }
-                }
-            }
-        } else {
-            // 3. First invocation: checkpoint ContextStarted.
-            let update = build_wfcb_update(&wire_id, name.as_deref(), OperationAction::Start, &ctx);
-            if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43): wait-for-callback context START: no user
-                // code ran (the submitter has not been called), so no
-                // terminal FAIL is needed; re-invocation reconverges.
-                return ctx
-                    .checkpoint_failure_unrecoverable(&wire_id, err, None)
-                    .await;
-            }
-            if let Some(plugins) = ctx.plugins() {
-                let info = wfcb_info(&ctx, &wire_id, name.as_deref())
-                    .with_status(crate::OperationStatus::Started)
-                    .with_replay(false);
-                crate::plugin::operation_started(plugins, &info);
-            }
-        }
+                // Started/Pending/Ready: execute/resume. The start step
+                // fired the replay start hook.
+                _ => None,
+            },
+        };
 
         // 4. Create child context with chained prefix.
         let child_ctx = ctx.new_child(&positional_id, name.as_deref());
 
         Ok(WfcbPrelude::Run {
             child_ctx,
+            start,
             after: WfcbAfter {
                 ctx,
                 wire_id,
@@ -642,7 +742,15 @@ where
 {
     /// Settles the inner body's outcome: checkpoints `ContextSucceeded` with
     /// the serialized result, or `ContextFailed` with the classified error.
-    async fn settle(self, body_result: Result<O, OperationError>) -> Result<O, OperationError> {
+    ///
+    /// The outcome write first waits for `start`, the retained `START`
+    /// write. When that write fails, the invocation ends and no outcome is
+    /// written.
+    async fn settle(
+        self,
+        start: Option<SubmittedWrite>,
+        body_result: Result<O, OperationError>,
+    ) -> Result<O, OperationError> {
         let Self {
             ctx, wire_id, name, ..
         } = self;
@@ -668,6 +776,8 @@ where
                     .build()
                     .expect("all required OperationUpdate fields set");
 
+                ctx.await_retained_start(&wire_id, start, OperationAction::Succeed)
+                    .await?;
                 if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
                     // Audit (#43): wait-for-callback SUCCEED: the
                     // submitter ran and the external system completed the
@@ -718,6 +828,8 @@ where
                 // the wire record are present either way. A rejected
                 // write routes unrecoverable: discarding it would leave
                 // the record claiming less than what executed (#43).
+                ctx.await_retained_start(&wire_id, start, OperationAction::Fail)
+                    .await?;
                 if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
                     // Audit (#43): wait-for-callback FAIL: the submitter
                     // (and possibly the external system) ran; the failed
@@ -3033,5 +3145,315 @@ mod coordinator_tests {
         );
         let hooks_of_cb: Vec<_> = hooks.of("cb").iter().map(|r| r.hook).collect();
         assert_eq!(hooks_of_cb, ["start"]);
+    }
+}
+
+/// The start order of `wait_for_callback`: its outcome waits for the
+/// retained outer `START`, and its body starts before the `START`
+/// response.
+#[cfg(test)]
+#[expect(clippy::panic)] // reason: test assertions
+mod start_order_tests {
+    use std::future::{Future, IntoFuture as _};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
+
+    use super::WfcbAfter;
+    use crate::client::InMemoryExecutionClient;
+    use crate::context::DurableContext;
+    use crate::engine::CheckpointLog;
+    use crate::error::{CallbackError, CallbackErrorKind, OperationError, OperationErrorKind};
+
+    /// One submitted update the recorder saw: its name, wire ID and
+    /// action.
+    type Submission = (String, String, OperationAction);
+
+    /// A context with direct writes over `client`, whose submissions
+    /// `submissions` records, and with the plugin `hooks`.
+    fn recorded_context(
+        client: Arc<dyn crate::client::ExecutionClient>,
+        submissions: &Arc<std::sync::Mutex<Vec<Submission>>>,
+        hooks: Option<&crate::plugin::test_support::OpHooks>,
+    ) -> DurableContext {
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(Vec::new())),
+            client,
+            "token-0".to_owned(),
+            None,
+            hooks.map(crate::plugin::test_support::OpHooks::plugins),
+        );
+        let recorded = Arc::clone(submissions);
+        ctx.set_submission_recorder(Arc::new(move |updates, _flag| {
+            let mut recorded = recorded.lock().unwrap();
+            for u in updates {
+                recorded.push((
+                    u.name().unwrap_or("-").to_owned(),
+                    u.id().to_owned(),
+                    u.action().clone(),
+                ));
+            }
+        }));
+        ctx
+    }
+
+    /// Waits up to two seconds for `ready`, failing the test with `what`.
+    async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !ready() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Runs test 27: the `wait_for_callback` settler with a retained START
+    /// that fails, after a body that returned `body_result`.
+    async fn wfcb_outcome_waits_for_failed_start(
+        body_result: Result<String, OperationError>,
+        action: OperationAction,
+    ) {
+        let submissions: Arc<std::sync::Mutex<Vec<Submission>>> = Arc::default();
+        let ctx = recorded_context(
+            Arc::new(InMemoryExecutionClient::new(Vec::new())),
+            &submissions,
+            None,
+        );
+        let entries: Arc<std::sync::Mutex<Vec<(String, OperationAction)>>> = Arc::default();
+        let entered = Arc::clone(&entries);
+        ctx.set_settler_entry_recorder(Arc::new(move |wire_id, action| {
+            entered.lock().unwrap().push((wire_id.to_owned(), action));
+        }));
+        let wire_id = crate::engine::compute_wire_id_public("1");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let after: WfcbAfter<String> = WfcbAfter {
+            ctx: ctx.clone(),
+            wire_id: wire_id.clone(),
+            name: Some("wcb".to_owned()),
+            _marker: std::marker::PhantomData,
+        };
+        let settle = after.settle(
+            Some(crate::context::SubmittedWrite::from_receiver(receiver)),
+            body_result,
+        );
+        let outcomes = |submissions: &[Submission]| {
+            submissions
+                .iter()
+                .filter(|(_, id, action)| {
+                    *id == wire_id
+                        && matches!(action, OperationAction::Succeed | OperationAction::Fail)
+                })
+                .count()
+        };
+        let observe = async {
+            wait_until("the settler-entry marker", || {
+                entries
+                    .lock()
+                    .unwrap()
+                    .contains(&(wire_id.clone(), action.clone()))
+            })
+            .await;
+            assert_eq!(outcomes(&submissions.lock().unwrap()), 0, "no outcome yet");
+            let rejection = crate::client::ExecutionClientError::new(
+                crate::client::ExecutionClientErrorScope::Execution,
+                "START rejected",
+            );
+            let wire = crate::error::checkpoint_execution_failure_wire(&rejection);
+            sender.send(Err(rejection)).expect("the settler waits");
+            wait_until("the invocation's fatal error", || {
+                ctx.coordinator().fatal_error().is_some()
+            })
+            .await;
+            let fatal = ctx.coordinator().fatal_error().expect("checked above");
+            assert_eq!(fatal.error_type, "CheckpointUnrecoverableExecutionError");
+            assert_eq!(Some(fatal.error_message.as_str()), wire.error_message());
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(outcomes(&submissions.lock().unwrap()), 0, "no outcome");
+        };
+        tokio::select! {
+            _ = settle => panic!("the settler resolved after a failed START"),
+            () = observe => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_callback_success_waits_for_failed_start() {
+        wfcb_outcome_waits_for_failed_start(Ok("ok".to_owned()), OperationAction::Succeed).await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_callback_failure_waits_for_failed_start() {
+        let failed = Err(OperationError::from_kind(OperationErrorKind::Callback(
+            CallbackError::new(CallbackErrorKind::ExternalFailure, Some("declined".into())),
+        )));
+        wfcb_outcome_waits_for_failed_start(failed, OperationAction::Fail).await;
+    }
+
+    /// A client that logs `response <name>` for each `START` it accepts
+    /// into `log`, and answers a callback `START` with its callback ID.
+    struct ResponseLog(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl crate::client::ExecutionClient for ResponseLog {
+        fn checkpoint(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::client::CheckpointOutput,
+                            crate::client::ExecutionClientError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            let mut records = Vec::new();
+            {
+                let mut log = self.0.lock().unwrap();
+                for u in updates
+                    .iter()
+                    .filter(|u| u.action() == &OperationAction::Start)
+                {
+                    log.push(format!("response {}", u.name().unwrap_or("-")));
+                    if u.r#type() == &OperationType::Callback {
+                        records.push(
+                            aws_sdk_lambda::types::Operation::builder()
+                                .id(u.id())
+                                .r#type(OperationType::Callback)
+                                .status(aws_sdk_lambda::types::OperationStatus::Started)
+                                .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+                                .callback_details(
+                                    aws_sdk_lambda::types::CallbackDetails::builder()
+                                        .callback_id("cb-id")
+                                        .build(),
+                                )
+                                .build()
+                                .expect("every required Operation field is set"),
+                        );
+                    }
+                }
+            }
+            Box::pin(async move {
+                Ok(crate::client::CheckpointOutput::new(
+                    Some("t".to_owned()),
+                    records,
+                    None,
+                ))
+            })
+        }
+
+        fn get_state(
+            &self,
+            _execution_arn: &str,
+            _checkpoint_token: &str,
+            _marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::client::GetStateOutput,
+                            crate::client::ExecutionClientError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(crate::client::GetStateOutput::new(Vec::new(), None)) })
+        }
+    }
+
+    /// The body of a `wait_for_callback` starts before its outer `START`
+    /// response: while the outer `START` is held, the body submits the
+    /// inner callback's `START`, and the order is hook, marker, response.
+    #[tokio::test]
+    async fn wait_for_callback_body_starts_before_start_response() {
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let probe_log = Arc::clone(&log);
+        // Each hook record carries the log length when the hook fired.
+        let hooks = crate::plugin::test_support::OpHooks::probing(move || {
+            probe_log.lock().unwrap().len().to_string()
+        });
+        let submissions: Arc<std::sync::Mutex<Vec<Submission>>> = Arc::default();
+        let ctx = recorded_context(
+            Arc::new(ResponseLog(Arc::clone(&log))),
+            &submissions,
+            Some(&hooks),
+        );
+        let marker_log = Arc::clone(&log);
+        let recorded = Arc::clone(&submissions);
+        ctx.set_submission_recorder(Arc::new(move |updates, _flag| {
+            for u in updates {
+                if u.action() == &OperationAction::Start && u.r#type() == &OperationType::Callback {
+                    marker_log
+                        .lock()
+                        .unwrap()
+                        .push("inner callback START submitted".to_owned());
+                }
+                recorded.lock().unwrap().push((
+                    u.name().unwrap_or("-").to_owned(),
+                    u.id().to_owned(),
+                    u.action().clone(),
+                ));
+            }
+        }));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let held = Arc::clone(&gate);
+        ctx.set_pre_lock_gate(Arc::new(move |updates: &[OperationUpdate]| {
+            updates
+                .iter()
+                .any(|u| u.action() == &OperationAction::Start && u.name() == Some("wcb"))
+                .then(|| Arc::clone(&held))
+        }));
+        let operation = ctx
+            .wait_for_callback::<String, _, _>(|_, _id| async { Ok(()) })
+            .name("wcb")
+            .into_future();
+        let marker = "inner callback START submitted";
+        let observe = async {
+            wait_until("the inner callback START", || {
+                log.lock().unwrap().iter().any(|e| e == marker)
+            })
+            .await;
+            assert!(
+                !log.lock().unwrap().iter().any(|e| e == "response wcb"),
+                "the body ran while the outer START was held: {:?}",
+                log.lock().unwrap()
+            );
+            gate.notify_one();
+            wait_until("the outer START response", || {
+                log.lock().unwrap().iter().any(|e| e == "response wcb")
+            })
+            .await;
+        };
+        tokio::select! {
+            _ = operation => {}
+            () = observe => {}
+        }
+        let entries = log.lock().unwrap().clone();
+        let index = |entry: &str| {
+            entries
+                .iter()
+                .position(|e| e == entry)
+                .unwrap_or_else(|| panic!("{entry:?} is missing from {entries:?}"))
+        };
+        let hook: usize = hooks
+            .of("wcb")
+            .into_iter()
+            .find(|r| r.hook == "start")
+            .expect("the start hook of wcb fired")
+            .probe
+            .parse()
+            .expect("the probe is a log length");
+        assert!(
+            hook <= index(marker) && index(marker) < index("response wcb"),
+            "hook at {hook}: {entries:?}"
+        );
     }
 }

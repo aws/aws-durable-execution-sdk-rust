@@ -8,6 +8,8 @@
 //! backend invokes the function again when the duration elapses. On replay
 //! a completed wait returns immediately.
 
+use std::future::Future;
+
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate, WaitOptions};
 
 use crate::context::DurableContext;
@@ -29,13 +31,25 @@ pub(crate) struct WaitExecution {
 impl WaitExecution {
     /// Executes the wait operation: replay path or live path.
     pub(crate) async fn execute(self) -> Result<(), OperationError> {
-        let positional_id = self.op_id.positional().to_owned();
-        let wire_id = self.op_id.wire().to_owned();
+        let started = self.start();
+        self.execute_after_start(started).await
+    }
 
-        // 1. The start step: admission, task ownership, the replay identity
-        // check, and the START of the live path (see `crate::start`). A
-        // STARTED record resumes the timer, and fires the replay start hook.
-        let started = crate::start::start_step(
+    /// Runs the wait's start step now, on the caller's task, and returns
+    /// the future of the rest of the wait (see [`crate::start`]).
+    pub(crate) fn execute_started(
+        self,
+    ) -> impl Future<Output = Result<(), OperationError>> + Send + 'static {
+        let started = self.start();
+        self.execute_after_start(started)
+    }
+
+    /// The start step: admission, task ownership, the replay identity
+    /// check, and the START of the live path (see `crate::start`). A
+    /// STARTED record resumes the timer, and fires the replay start hook.
+    fn start(&self) -> Result<StartStep, OperationError> {
+        let wire_id = self.op_id.wire();
+        crate::start::start_step(
             &self.ctx,
             &crate::start::StartSpec {
                 op_id: &self.op_id,
@@ -50,17 +64,27 @@ impl WaitExecution {
             },
             || {
                 build_wait_start_update(
-                    &wire_id,
+                    wire_id,
                     self.name.as_deref(),
                     self.ctx.parent_wire_id(),
                     self.duration_secs,
                 )
             },
             |plugins, _| {
-                let info = self.info(&wire_id).with_replay(true);
+                let info = self.info(wire_id).with_replay(true);
                 crate::plugin::operation_started(plugins, &info);
             },
-        )?;
+        )
+    }
+
+    /// The rest of the wait after its start step `started`.
+    async fn execute_after_start(
+        self,
+        started: Result<StartStep, OperationError>,
+    ) -> Result<(), OperationError> {
+        let started = started?;
+        let positional_id = self.op_id.positional().to_owned();
+        let wire_id = self.op_id.wire().to_owned();
 
         // 2. A recorded wait returns its outcome, or keeps waiting.
         let start = match started {

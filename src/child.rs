@@ -19,12 +19,13 @@ use tracing::Instrument as _;
 
 use crate::Serdes;
 use crate::checkpoint_coalescer::ScopeClose;
-use crate::context::{ActiveBody, DurableContext, run_body};
+use crate::context::{ActiveBody, DurableContext, SubmittedWrite, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     ChildContextError, ChildContextErrorKind, ChildFnError, OperationError, OperationErrorKind,
 };
 use crate::serdes::SerdesContext;
+use crate::start::StartStep;
 
 /// Wire sub-type for child context operations.
 pub(crate) const CHILD_SUB_TYPE: &str = "RunInChildContext";
@@ -59,7 +60,7 @@ where
     O: Send + 'static,
     F: FnOnce(DurableContext) -> Fut + Send + 'static,
     Fut: Future<Output = Result<O, E>> + Send + 'static,
-    E: Into<ChildFnError>,
+    E: Into<ChildFnError> + 'static,
     S: Serdes<O>,
 {
     /// Executes the child context operation.
@@ -71,6 +72,23 @@ where
     /// between them, in a fresh child context under the child namespace's
     /// replay-aware span.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
+        let (core, closure) = self.split();
+        let started = core.start();
+        Self::run(core, closure, started).await
+    }
+
+    /// Runs the child's start step now, on the caller's task, and returns
+    /// the future of the rest of the operation (see [`crate::start`]).
+    pub(crate) fn execute_started(
+        self,
+    ) -> impl Future<Output = Result<O, OperationError>> + Send + 'static {
+        let (core, closure) = self.split();
+        let started = core.start();
+        Self::run(core, closure, started)
+    }
+
+    /// Splits the execution into its non-generic core and the closure.
+    fn split(self) -> (ChildCore<O, S>, F) {
         let Self {
             ctx,
             op_id,
@@ -88,11 +106,21 @@ where
             serdes,
             _marker: std::marker::PhantomData,
         };
-        match core.before().await? {
+        (core, closure)
+    }
+
+    /// The rest of the operation after its start step `started`.
+    async fn run(
+        core: ChildCore<O, S>,
+        closure: F,
+        started: Result<StartStep, OperationError>,
+    ) -> Result<O, OperationError> {
+        match core.before(started?).await? {
             ChildPrelude::Done(result) => result,
             ChildPrelude::Run {
                 child_ctx,
                 mode,
+                start,
                 after,
             } => {
                 // Run the child closure, instrumented with the child
@@ -121,7 +149,7 @@ where
                 // context, whose owners do not include this child, so it is
                 // admitted.
                 drop(scope);
-                after.settle(mode, result).await
+                after.settle(mode, start, result).await
             }
         }
     }
@@ -163,6 +191,9 @@ enum ChildPrelude<O, S> {
         child_ctx: DurableContext,
         /// Live execution vs `ReplayChildren` reconstruction.
         mode: ChildRunMode,
+        /// The `START` write of this cycle, still in flight. The outcome
+        /// write waits for it. `None` when the record already existed.
+        start: Option<SubmittedWrite>,
         /// The post-closure half that settles the outcome.
         after: ChildAfter<O, S>,
     },
@@ -185,37 +216,77 @@ where
     O: Send + 'static,
     S: Serdes<O>,
 {
-    /// Runs everything that precedes the child closure: replay resolution
-    /// or the live-path preamble ending at the START checkpoint.
-    ///
-    /// This is the dispatcher: it validates task ownership and replay
-    /// identity, then resolves recorded outcomes ([`Self::replay_succeeded`],
-    /// [`Self::replay_failed`]) or prepares the child context for the body
-    /// to run (live, or `ReplayChildren` reconstruction).
-    async fn before(self) -> Result<ChildPrelude<O, S>, OperationError> {
-        // 1. Task-ownership check.
-        self.ctx.enforce_task_ownership()?;
+    /// The start step of the child (see [`crate::start`]): admission, task
+    /// ownership, the replay identity check, and, without a record, the
+    /// `START`, queued, then `on_operation_start`, then released, as JS
+    /// orders them. A record that re-enters the body fires the replay
+    /// start hook here.
+    fn start(&self) -> Result<StartStep, OperationError> {
+        let wire_id = self.op_id.wire();
+        crate::start::start_step(
+            &self.ctx,
+            &crate::start::StartSpec {
+                op_id: &self.op_id,
+                operation_type: "Context",
+                sub_type: self.sub_type.as_str(),
+                name: self.name.as_deref(),
+                order: crate::start::StartOrder::QueueThenHook,
+            },
+            |view| match view.status {
+                CheckpointStatus::Succeeded | CheckpointStatus::Failed => {
+                    crate::start::Cycle::Record
+                }
+                // Started/Pending/Ready: re-enter the child body.
+                _ => crate::start::Cycle::Resume,
+            },
+            || {
+                build_update(
+                    wire_id,
+                    self.name.as_deref(),
+                    self.sub_type.as_str(),
+                    OperationAction::Start,
+                    &self.ctx,
+                )
+            },
+            |plugins, is_replay| {
+                let info = child_info(
+                    &self.ctx,
+                    wire_id,
+                    self.sub_type.as_str(),
+                    self.name.as_deref(),
+                );
+                let info = if is_replay {
+                    info.with_replay(true)
+                } else {
+                    info.with_status(crate::OperationStatus::Started)
+                        .with_replay(false)
+                };
+                crate::plugin::operation_started(plugins, &info);
+            },
+        )
+    }
 
+    /// Runs everything that follows the start step `started` and precedes
+    /// the child closure: replay resolution, or the child context for the
+    /// body (live, or `ReplayChildren` reconstruction).
+    ///
+    /// The body does not wait for a queued `START`: the outcome write does
+    /// (see [`ChildAfter::settle`]), as in JS.
+    async fn before(self, started: StartStep) -> Result<ChildPrelude<O, S>, OperationError> {
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
         let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
 
-        // 2. Check checkpoint log for replay. The validated view carries
-        // status and `replay_children` without cloning; the terminal
-        // branches fetch only the fields they consume.
         let mut mode = ChildRunMode::Live;
-        if let Some(view) = self.ctx.checkpoint_view_validated(
-            &positional_id,
-            &wire_id,
-            "Context",
-            Some(self.sub_type.as_str()),
-            self.name.as_deref(),
-        )? {
-            match view.status {
+        let start = match started {
+            StartStep::Refused => return std::future::pending().await,
+            StartStep::Queued(write) => Some(write),
+            StartStep::Recorded(view) => match view.status {
                 CheckpointStatus::Succeeded if view.replay_children => {
                     // Recorded success whose result was too large to
                     // checkpoint: re-execute the body to reconstruct it.
                     mode = ChildRunMode::Reconstruct;
+                    None
                 }
                 CheckpointStatus::Succeeded => {
                     return Ok(ChildPrelude::Done(
@@ -231,49 +302,10 @@ where
                     )));
                 }
                 // Started/Pending/Ready: re-enter child body (resume path).
-                _ => {
-                    if let Some(plugins) = self.ctx.plugins() {
-                        let info = child_info(
-                            &self.ctx,
-                            &wire_id,
-                            self.sub_type.as_str(),
-                            self.name.as_deref(),
-                        )
-                        .with_replay(true);
-                        crate::plugin::operation_started(plugins, &info);
-                    }
-                }
-            }
-        } else {
-            // 3. No checkpoint record: first invocation: checkpoint START.
-            let update = build_update(
-                &wire_id,
-                self.name.as_deref(),
-                self.sub_type.as_str(),
-                OperationAction::Start,
-                &self.ctx,
-            );
-            if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43): child-context START: no user code ran (the
-                // closure has not been called), so no terminal FAIL is
-                // needed; re-invocation reconverges on the same write.
-                return self
-                    .ctx
-                    .checkpoint_failure_unrecoverable(&wire_id, err, None)
-                    .await;
-            }
-            if let Some(plugins) = self.ctx.plugins() {
-                let info = child_info(
-                    &self.ctx,
-                    &wire_id,
-                    self.sub_type.as_str(),
-                    self.name.as_deref(),
-                )
-                .with_status(crate::OperationStatus::Started)
-                .with_replay(false);
-                crate::plugin::operation_started(plugins, &info);
-            }
-        }
+                // The start step fired the replay start hook.
+                _ => None,
+            },
+        };
 
         // 4. Create child context with chained prefix.
         let Self {
@@ -288,6 +320,7 @@ where
         Ok(ChildPrelude::Run {
             child_ctx,
             mode,
+            start,
             after: ChildAfter {
                 ctx,
                 wire_id,
@@ -367,9 +400,15 @@ where
     /// (`ReplayChildren` replay) round-trips the result through
     /// serialization for consistency with the checkpointed path and
     /// checkpoints nothing.
+    ///
+    /// A live outcome write first waits for `start`, the cycle's `START`
+    /// write. When that write fails, the invocation ends and no outcome is
+    /// written.
+    #[expect(clippy::too_many_lines)] // reason: the two modes and both outcomes read better in one match
     async fn settle(
         self,
         mode: ChildRunMode,
+        start: Option<SubmittedWrite>,
         result: Result<O, ChildFnError>,
     ) -> Result<O, OperationError> {
         let Self {
@@ -418,6 +457,8 @@ where
                 {
                     Ok(serialized) => serialized,
                     Err(op_err) => {
+                        ctx.await_retained_start(&wire_id, start, OperationAction::Fail)
+                            .await?;
                         let wire = crate::error::serialization_failure_wire(&op_err);
                         let update = build_child_fail_update(
                             &wire_id,
@@ -453,6 +494,8 @@ where
                             .with_wire(wire));
                     }
                 };
+                ctx.await_retained_start(&wire_id, start, OperationAction::Succeed)
+                    .await?;
                 let update =
                     build_succeed_update(&wire_id, name.as_deref(), sub_type, &ctx, &serialized);
                 // The end hook reports the payload the update carries: none
@@ -483,6 +526,8 @@ where
             }
             (ChildRunMode::Live, Err(child_err)) => {
                 // Failure: checkpoint FAIL with error details.
+                ctx.await_retained_start(&wire_id, start, OperationAction::Fail)
+                    .await?;
                 Err(
                     checkpoint_live_failure(&ctx, name.as_deref(), sub_type, &wire_id, child_err)
                         .await,

@@ -201,6 +201,22 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     /// the handler starts itself, or a request already sent to another
     /// service.
     ///
+    /// `.spawn()` runs the operation's start step on the caller's task
+    /// before it returns, as JS starts the operation inside the call. When
+    /// the operation's current state requires a `START` (it has no record,
+    /// or its record begins a new attempt), that `START` is admitted to the
+    /// write order before `.spawn()` returns, so it reaches the service
+    /// before every update the caller sends afterwards, on any runtime
+    /// flavor. The task-ownership check runs on the caller too: a
+    /// `.spawn()` from a task the SDK did not start returns a handle that
+    /// resolves to the task-ownership error, queues no `START` and runs no
+    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// replay start hook of a record that resumes work, fire before
+    /// `.spawn()` returns. The rest of the operation, including
+    /// `on_attempt_start` and the body, runs on the spawned task. The
+    /// exceptions are `invoke`, `wait_for_condition` and the combinators,
+    /// whose `.spawn()` starts the whole operation on the spawned task.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -209,7 +225,49 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     where
         S: Serdes<O>,
     {
-        spawn_terminal!(self)
+        spawn_terminal!(self, started)
+    }
+
+    /// The callback's future, with its start step run now on the caller's
+    /// task (see [`crate::start`]).
+    fn started_future(self) -> DurableFuture<Callback<O>>
+    where
+        S: Serdes<O>,
+    {
+        match self.execution() {
+            Ok(execution) => DurableFuture::for_started_operation(execution.execute_started()),
+            Err(future) => future,
+        }
+    }
+
+    /// The callback's execution, or the error future of a failed identity
+    /// preflight.
+    fn execution(
+        self,
+    ) -> Result<crate::callback::CreateCallbackExecution<O, S>, DurableFuture<Callback<O>>> {
+        if let Err(err) = self.ctx.preflight_replay_identity(
+            &self.op_id,
+            "Callback",
+            Some(
+                self.sub_type
+                    .as_ref()
+                    .map_or(crate::callback::CALLBACK_SUB_TYPE, OperationSubType::as_str),
+            ),
+            self.name.as_deref(),
+        ) {
+            return Err(DurableFuture::from_async(async move { Err(err) }));
+        }
+        Ok(crate::callback::CreateCallbackExecution {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            timeout: self.timeout,
+            heartbeat: self.heartbeat,
+            sub_type: self.sub_type.unwrap_or(OperationSubType::CALLBACK),
+            plugin_name: None,
+            serdes: self.serdes,
+            _marker: PhantomData,
+        })
     }
 }
 
@@ -222,29 +280,10 @@ where
     type IntoFuture = DurableFuture<Callback<O>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        use crate::callback::CreateCallbackExecution;
-
-        preflight_identity!(
-            self,
-            "Callback",
-            self.sub_type
-                .as_ref()
-                .map_or(crate::callback::CALLBACK_SUB_TYPE, OperationSubType::as_str)
-        );
-
-        let execution = CreateCallbackExecution {
-            ctx: self.ctx,
-            op_id: self.op_id,
-            name: self.name,
-            timeout: self.timeout,
-            heartbeat: self.heartbeat,
-            sub_type: self.sub_type.unwrap_or(OperationSubType::CALLBACK),
-            plugin_name: None,
-            serdes: self.serdes,
-            _marker: PhantomData,
-        };
-
-        DurableFuture::for_started_operation(execution.execute())
+        match self.execution() {
+            Ok(execution) => DurableFuture::for_started_operation(execution.execute()),
+            Err(future) => future,
+        }
     }
 }
 
@@ -493,12 +532,63 @@ where
     /// the handler starts itself, or a request already sent to another
     /// service.
     ///
+    /// `.spawn()` runs the operation's start step on the caller's task
+    /// before it returns, as JS starts the operation inside the call. When
+    /// the operation's current state requires a `START` (it has no record,
+    /// or its record begins a new attempt), that `START` is admitted to the
+    /// write order before `.spawn()` returns, so it reaches the service
+    /// before every update the caller sends afterwards, on any runtime
+    /// flavor. The task-ownership check runs on the caller too: a
+    /// `.spawn()` from a task the SDK did not start returns a handle that
+    /// resolves to the task-ownership error, queues no `START` and runs no
+    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// replay start hook of a record that resumes work, fire before
+    /// `.spawn()` returns. The rest of the operation, including
+    /// `on_attempt_start` and the body, runs on the spawned task. The
+    /// exceptions are `invoke`, `wait_for_condition` and the combinators,
+    /// whose `.spawn()` starts the whole operation on the spawned task.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
     /// error and the operation records nothing.
     pub fn spawn(self) -> DurableFuture<O> {
-        spawn_terminal!(self)
+        spawn_terminal!(self, started)
+    }
+
+    /// The operation's future, with its start step run now on the caller's
+    /// task (see [`crate::start`]).
+    fn started_future(self) -> DurableFuture<O> {
+        match self.execution() {
+            Ok(execution) => DurableFuture::for_started_operation(execution.execute_started()),
+            Err(future) => future,
+        }
+    }
+
+    /// The operation's execution, or the error future of a failed identity
+    /// preflight.
+    fn execution(
+        self,
+    ) -> Result<crate::callback::WaitForCallbackExecution<O, F, S>, DurableFuture<O>> {
+        if let Err(err) = self.ctx.preflight_replay_identity(
+            &self.op_id,
+            "Context",
+            Some(crate::callback::WFCB_SUB_TYPE),
+            self.name.as_deref(),
+        ) {
+            return Err(DurableFuture::from_async(async move { Err(err) }));
+        }
+        Ok(crate::callback::WaitForCallbackExecution {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            timeout: self.timeout,
+            heartbeat: self.heartbeat,
+            submitter: self.submitter,
+            submitter_retry: self.submitter_retry,
+            serdes: self.serdes,
+            _marker: PhantomData,
+        })
     }
 }
 
@@ -513,25 +603,10 @@ where
     type IntoFuture = DurableFuture<O>;
 
     fn into_future(self) -> Self::IntoFuture {
-        use crate::callback::WaitForCallbackExecution;
-
-        preflight_identity!(self, "Context", crate::callback::WFCB_SUB_TYPE);
-
-        let gate = self.ctx.clone();
-
-        let execution = WaitForCallbackExecution {
-            ctx: self.ctx,
-            op_id: self.op_id,
-            name: self.name,
-            timeout: self.timeout,
-            heartbeat: self.heartbeat,
-            submitter: self.submitter,
-            submitter_retry: self.submitter_retry,
-            serdes: self.serdes,
-            _marker: PhantomData,
-        };
-
-        DurableFuture::for_operation(&gate, execution.execute())
+        match self.execution() {
+            Ok(execution) => DurableFuture::for_started_operation(execution.execute()),
+            Err(future) => future,
+        }
     }
 }
 

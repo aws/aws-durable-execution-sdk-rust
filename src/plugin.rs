@@ -346,9 +346,17 @@ pub trait Plugin: Send + Sync {
     /// `FAIL` record, so these rules do not apply to it; its own rules
     /// follow the list.
     ///
-    /// - an operation without a record fires `on_operation_start` with
+    /// - a child context, a `wait_for_callback`, a `with_retry` block and
+    ///   its attempts, a `map`, `parallel` or `parallel_mixed` container
+    ///   and a map item or `parallel` or `parallel_mixed` branch without a
+    ///   record fire `on_operation_start` with status `Started` and
+    ///   `is_replay` `false` once their `START` is
+    ///   queued, as JS does. The SDK sends that `START` only after the
+    ///   hook returns, and the body or the first item runs without waiting
+    ///   for its response. The outcome write waits for it;
+    /// - a combinator without a record fires `on_operation_start` with
     ///   status `Started` and `is_replay` `false` once its `START` is
-    ///   written, before its body or its first item runs;
+    ///   written, before its first input runs;
     /// - a record that is not terminal (`STARTED`, `PENDING` or `READY`)
     ///   fires `on_operation_start` with `is_replay` `true`, before the
     ///   body or the first item runs;
@@ -398,6 +406,19 @@ pub trait Plugin: Send + Sync {
     /// A step that is terminal on replay fires nothing.
     ///
     /// The hook runs synchronously, on the task that runs the operation.
+    /// For `.spawn()` and `.spawn_batch()` of a step, a wait, a child
+    /// context, a `map`, a `parallel`, a `parallel_mixed`, a
+    /// `create_callback`, a `wait_for_callback` and a `with_retry`, the
+    /// start step runs on the caller's task before the call returns (see
+    /// [`StepBuilder::spawn`](crate::builders::StepBuilder::spawn)). So when the operation's
+    /// JS order is "queue `START`, then hook" (a step under
+    /// `AtLeastOncePerRetry` and every child-backed operation above), or
+    /// when its record resumes work and fires the replay start hook, this
+    /// hook runs on the caller's task before `.spawn()` returns. An
+    /// operation that fires it after the `START` response fires it on the
+    /// spawned task. `on_attempt_start` always runs on the operation's own
+    /// task, before the body.
+    ///
     /// It can return work: the SDK
     /// runs that future on its own task, and waits for it before
     /// `on_invocation_end` until 500 ms before the invocation deadline.
@@ -466,15 +487,24 @@ pub trait Plugin: Send + Sync {
     /// `FAIL` record, so these rules do not apply to it; its own rules
     /// follow the list.
     ///
-    /// - an operation without a record fires `on_operation_start` with
+    /// - a child context, a `wait_for_callback`, a `with_retry` block and
+    ///   its attempts, a `map`, `parallel` or `parallel_mixed` container
+    ///   and a map item or `parallel` or `parallel_mixed` branch without a
+    ///   record fire `on_operation_start` with status `Started` and
+    ///   `is_replay` `false` once their `START` is queued, as JS does. The
+    ///   SDK sends that `START` only after the hook returns, and the body or
+    ///   the first item runs without waiting for its response;
+    /// - a combinator without a record fires `on_operation_start` with
     ///   status `Started` and `is_replay` `false` once its `START` is
-    ///   written, before its body or its first item runs;
+    ///   written, before its first input runs;
     /// - a record that is not terminal (`STARTED`, `PENDING` or `READY`)
     ///   fires `on_operation_start` with `is_replay` `true`, before the
     ///   body or the first item runs;
     /// - a body or batch that succeeds fires `on_operation_end` with status
     ///   `Succeeded`, `is_replay` `false` and the payload the `SUCCEED`
-    ///   carries as `result()`, once the `SUCCEED` is written. A result
+    ///   carries as `result()`, once the `SUCCEED` is written. The
+    ///   `SUCCEED` of an operation whose `START` was queued is written only
+    ///   after that `START` is. A result
     ///   too large for the record is written with `ReplayChildren`, and
     ///   `result()` is the payload that update carries instead: `None` for
     ///   a child context and a map item or parallel branch, which write no

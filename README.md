@@ -217,6 +217,30 @@ timer?;
 let value = result?;
 ```
 
+`.spawn()` of a step, a wait, a child context, a `map`, a `parallel`, a
+`parallel_mixed`, a `create_callback`, a `wait_for_callback` and a
+`with_retry`, and `.spawn_batch()` of a `map` and a `parallel`, start the
+operation inside the call, as JS does. Before the call returns, the SDK runs
+the task-ownership check on the calling task and, when the operation's state
+requires a `START`, admits that `START` to the write order. So the `START`
+reaches the service before every update the caller sends afterwards. A
+`.spawn()` from a task the SDK did not start returns a handle that resolves
+to the task-ownership error and queues nothing. A plugin start hook that JS
+fires when it queues the `START`, and the replay start hook of a record that
+resumes work, also fire before the call returns; `on_attempt_start` and the
+body run on the spawned task. `.spawn()` of an `invoke`, a
+`wait_for_condition` and a combinator starts the whole operation on the
+spawned task instead.
+
+A child context, a `map`, `parallel` or `parallel_mixed` container, each
+map item and `parallel` or `parallel_mixed` branch with
+`NestingMode::Normal`, and the outer context of `wait_for_callback` and
+`with_retry` queue their `START`, fire `on_operation_start`, and start their
+body without waiting for the `START` response, as JS does. Their outcome
+write waits for that response, and when the `START` write fails, the
+invocation ends without an outcome for the operation. An item or branch with
+`NestingMode::Flat` writes no record, so it queues no `START`.
+
 Dropping the handle that `.spawn()` returns loses only the result. The
 operation runs until it settles, records its outcome and fires its plugin
 hooks. Its error goes into its record and is returned to nobody, and a

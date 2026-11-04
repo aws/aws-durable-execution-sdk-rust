@@ -101,6 +101,22 @@ impl WaitBuilder {
     /// the handler starts itself, or a request already sent to another
     /// service.
     ///
+    /// `.spawn()` runs the operation's start step on the caller's task
+    /// before it returns, as JS starts the operation inside the call. When
+    /// the operation's current state requires a `START` (it has no record,
+    /// or its record begins a new attempt), that `START` is admitted to the
+    /// write order before `.spawn()` returns, so it reaches the service
+    /// before every update the caller sends afterwards, on any runtime
+    /// flavor. The task-ownership check runs on the caller too: a
+    /// `.spawn()` from a task the SDK did not start returns a handle that
+    /// resolves to the task-ownership error, queues no `START` and runs no
+    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// replay start hook of a record that resumes work, fire before
+    /// `.spawn()` returns. The rest of the operation, including
+    /// `on_attempt_start` and the body, runs on the spawned task. The
+    /// exceptions are `invoke`, `wait_for_condition` and the combinators,
+    /// whose `.spawn()` starts the whole operation on the spawned task.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an
@@ -123,7 +139,35 @@ impl WaitBuilder {
     /// }
     /// ```
     pub fn spawn(self) -> DurableFuture<()> {
-        spawn_terminal!(self, awaited)
+        spawn_terminal!(self, started_awaited)
+    }
+
+    /// The wait's future, with its start step run now on the caller's
+    /// task (see [`crate::start`]).
+    fn started_future(self) -> DurableFuture<()> {
+        match self.execution() {
+            Ok(execution) => DurableFuture::for_started_operation(execution.execute_started()),
+            Err(future) => future,
+        }
+    }
+
+    /// The wait's execution, or the error future of a failed identity
+    /// preflight.
+    fn execution(self) -> Result<crate::wait::WaitExecution, DurableFuture<()>> {
+        if let Err(err) = self.ctx.preflight_replay_identity(
+            &self.op_id,
+            "Wait",
+            Some(crate::wait::WAIT_SUB_TYPE),
+            self.name.as_deref(),
+        ) {
+            return Err(DurableFuture::from_async(async move { Err(err) }));
+        }
+        Ok(crate::wait::WaitExecution {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            duration_secs: self.duration_secs,
+        })
     }
 }
 
@@ -132,17 +176,9 @@ impl IntoFuture for WaitBuilder {
     type IntoFuture = DurableFuture<()>;
 
     fn into_future(self) -> Self::IntoFuture {
-        use crate::wait::WaitExecution;
-
-        preflight_identity!(self, "Wait", crate::wait::WAIT_SUB_TYPE);
-
-        let execution = WaitExecution {
-            ctx: self.ctx,
-            op_id: self.op_id,
-            name: self.name,
-            duration_secs: self.duration_secs,
-        };
-
-        DurableFuture::for_started_operation(execution.execute())
+        match self.execution() {
+            Ok(execution) => DurableFuture::for_started_operation(execution.execute()),
+            Err(future) => future,
+        }
     }
 }

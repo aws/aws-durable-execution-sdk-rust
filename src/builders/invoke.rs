@@ -227,6 +227,12 @@ where
     /// the handler starts itself, or a request already sent to another
     /// service.
     ///
+    /// Unlike `.spawn()` of a step, a wait or a child context, `.spawn()`
+    /// of an invoke runs no start step on the caller's task: the spawned task
+    /// runs the whole operation, including the task-ownership check and
+    /// the `START`, so that `START` can follow updates the caller sends
+    /// after `.spawn()` returns.
+    ///
     /// # Errors
     ///
     /// When no Tokio runtime is running, the returned future resolves to an

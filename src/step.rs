@@ -214,6 +214,23 @@ where
     /// here for the next attempt, so its captures never move into an
     /// attempt.
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
+        let (core, closure) = self.split();
+        Self::run(core, closure, None).await
+    }
+
+    /// Runs the step's start step now, on the caller's task, and returns
+    /// the future of the rest of the step (see [`crate::start`]).
+    /// `.spawn()` uses it, so the `START` is queued before it returns.
+    pub(crate) fn execute_started(
+        self,
+    ) -> impl Future<Output = Result<O, OperationError>> + Send + 'static {
+        let (core, closure) = self.split();
+        let first = core.start();
+        Self::run(core, closure, Some(first))
+    }
+
+    /// Splits the execution into its non-generic core and the closure.
+    fn split(self) -> (StepCore<O, S>, F) {
         let Self {
             ctx,
             op_id,
@@ -237,12 +254,22 @@ where
             plugin_name,
             _marker: std::marker::PhantomData,
         };
+        (core, closure)
+    }
+
+    /// The step loop. `first` is the result of the first cycle's start
+    /// step when it already ran; `None` runs it in the first cycle.
+    async fn run(
+        core: StepCore<O, S>,
+        closure: F,
+        mut first: Option<Result<StartStep, OperationError>>,
+    ) -> Result<O, OperationError> {
         // True once the step has waited for its record in this invocation.
         // A terminal record found after that wait changed during this
         // invocation, so it is a continuation, not a replay.
         let mut resumed = false;
         loop {
-            match core.before(resumed).await? {
+            match core.before(resumed, first.take()).await? {
                 StepPrelude::Done(result) => return result,
                 StepPrelude::Wait => {}
                 StepPrelude::Run {
@@ -377,10 +404,31 @@ where
     /// `resumed` is true when the step waited for its record in this
     /// invocation. A terminal record then changed during this invocation,
     /// so it returns its outcome without an `operation_replayed` event.
-    async fn before(&self, resumed: bool) -> Result<StepPrelude<O>, OperationError> {
+    ///
+    /// `first` is the result of this cycle's start step when the caller
+    /// already ran it (see [`StepExecution::execute_started`]).
+    async fn before(
+        &self,
+        resumed: bool,
+        first: Option<Result<StartStep, OperationError>>,
+    ) -> Result<StepPrelude<O>, OperationError> {
         // 1. The start step: admission, task ownership, the replay identity
         // check, and the START of a live attempt (see `crate::start`).
-        let started = crate::start::start_step(
+        let started = match first {
+            Some(started) => started,
+            None => self.start(),
+        }?;
+
+        let wire_id = self.op_id.wire();
+
+        // 2. A record that queues no START: replay its outcome, wait for
+        // its retry timer, or re-enter its interrupted attempt.
+        self.after_start(resumed, started, wire_id).await
+    }
+
+    /// The start step of one cycle (see [`crate::start`]).
+    fn start(&self) -> Result<StartStep, OperationError> {
+        crate::start::start_step(
             &self.ctx,
             &crate::start::StartSpec {
                 op_id: &self.op_id,
@@ -395,12 +443,16 @@ where
             |view| self.cycle(view),
             || self.start_update(),
             |plugins, is_replay| self.operation_started(plugins, is_replay),
-        )?;
+        )
+    }
 
-        let wire_id = self.op_id.wire();
-
-        // 2. A record that queues no START: replay its outcome, wait for
-        // its retry timer, or re-enter its interrupted attempt.
+    /// The rest of one cycle after its start step `started`.
+    async fn after_start(
+        &self,
+        resumed: bool,
+        started: StartStep,
+        wire_id: &str,
+    ) -> Result<StepPrelude<O>, OperationError> {
         let start = match started {
             StartStep::Refused => return std::future::pending().await,
             StartStep::Queued(write) => Some(write),

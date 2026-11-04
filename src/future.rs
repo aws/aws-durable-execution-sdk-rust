@@ -267,6 +267,40 @@ impl<O: Send + 'static> DurableFuture<O> {
             }
         }
     }
+
+    /// Starts an operation whose JS form begins inside the call: runs its
+    /// start step on the caller's task, then spawns the rest of it.
+    ///
+    /// The runtime check runs first: when no Tokio runtime is running, the
+    /// returned future resolves to an error, `start` is not called, and
+    /// nothing is queued. Otherwise `start` builds the operation future
+    /// after it ran the start step (see [`crate::start`]) on this task: the
+    /// admission check, the task-ownership check, and the `START` the
+    /// operation's record requires, with the start hook its JS order fires
+    /// at the call. Then the future runs on its own task, as
+    /// [`Self::spawn_blessed`] describes.
+    pub(crate) fn spawn_started(
+        ctx: &DurableContext,
+        awaited: Option<Arc<AtomicBool>>,
+        start: impl FnOnce() -> Self,
+    ) -> Self {
+        if let Err(no_runtime) = crate::task::ensure_runtime() {
+            return Self::from_async(async move {
+                Err(crate::task::NoRuntime::operation_error(no_runtime))
+            });
+        }
+        // The task-ownership check runs before the builder's replay
+        // identity preflight, as in the start step: an unblessed caller
+        // gets the task-ownership error even when the record also
+        // contradicts the operation. An abandoned owner skips it, so its
+        // handle stays refused.
+        if ctx.admission().admits(ctx.owners())
+            && let Err(err) = ctx.enforce_task_ownership()
+        {
+            return Self::from_async(async move { Err(err) });
+        }
+        Self::spawn_blessed(start(), ctx, awaited)
+    }
 }
 
 impl<O: Send + 'static> Future for DurableFuture<O> {

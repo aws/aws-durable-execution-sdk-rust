@@ -37,7 +37,7 @@ use crate::error::{
 };
 use crate::future::{Branch, DurableFuture};
 
-use aws_sdk_lambda::types::OperationUpdate;
+use aws_sdk_lambda::types::{OperationAction, OperationUpdate};
 use tokio::sync::Mutex;
 
 /// The receiving half of a detached write, which drops a result that
@@ -78,6 +78,9 @@ pub(crate) struct SubmittedWrite {
     result: std::pin::Pin<
         Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send>,
     >,
+    /// Set on the first poll (see [`SubmissionRecorder`]).
+    #[cfg(test)]
+    first_poll: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SubmittedWrite {
@@ -86,7 +89,23 @@ impl SubmittedWrite {
     ) -> Self {
         Self {
             result: Box::pin(result),
+            #[cfg(test)]
+            first_poll: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// A write whose result `receiver` delivers. A test builds the retained
+    /// `START` of an operation with it.
+    #[cfg(test)]
+    pub(crate) fn from_receiver(
+        receiver: tokio::sync::oneshot::Receiver<Result<CheckpointOutput, ExecutionClientError>>,
+    ) -> Self {
+        Self::new(async move {
+            match receiver.await {
+                Ok(result) => result,
+                Err(_closed) => std::future::pending().await,
+            }
+        })
     }
 
     /// A rejected write: nothing is sent, and the result never resolves.
@@ -103,7 +122,11 @@ impl Future for SubmittedWrite {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        self.get_mut().result.as_mut().poll(cx)
+        let this = self.get_mut();
+        #[cfg(test)]
+        this.first_poll
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        this.result.as_mut().poll(cx)
     }
 }
 
@@ -184,6 +207,31 @@ impl Drop for ReservedWrite {
 pub(crate) type PreLockGate =
     Arc<dyn Fn(&[OperationUpdate]) -> Option<Arc<tokio::sync::Notify>> + Send + Sync>;
 
+/// The test hook that sees every admitted submission: its updates and the
+/// first-poll flag of its [`SubmittedWrite`]. It runs before the write can
+/// be sent: an ordinary write calls it before it joins the coalescer or
+/// enters the [`DirectWriteQueue`], and a reservation calls it while its
+/// entry is held.
+#[cfg(test)]
+pub(crate) type SubmissionRecorder =
+    Arc<dyn Fn(&[OperationUpdate], &Arc<std::sync::atomic::AtomicBool>) + Send + Sync>;
+
+/// The test hook that each child-backed outcome path calls with the
+/// operation's wire ID and the action it is about to write, just before it
+/// awaits the operation's retained `START` write.
+#[cfg(test)]
+pub(crate) type SettlerEntryRecorder = Arc<dyn Fn(&str, OperationAction) + Send + Sync>;
+
+/// The test hooks a [`DirectWriteQueue`] carries for every context of the
+/// invocation.
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    gate: Option<PreLockGate>,
+    submissions: Option<SubmissionRecorder>,
+    settler_entries: Option<SettlerEntryRecorder>,
+}
+
 /// The FIFO of the invocation's unbuffered checkpoint writes.
 ///
 /// Without a coalescer, every write enters this queue under a synchronous
@@ -202,9 +250,10 @@ pub(crate) struct DirectWriteQueue {
     state: std::sync::Mutex<DirectQueueState>,
     /// Wakes the writer when a held entry is released.
     released: tokio::sync::Notify,
-    /// The pre-lock gate tests install (see [`PreLockGate`]).
+    /// The hooks tests install (see [`PreLockGate`],
+    /// [`SubmissionRecorder`] and [`SettlerEntryRecorder`]).
     #[cfg(test)]
-    gate: std::sync::Mutex<Option<PreLockGate>>,
+    hooks: std::sync::Mutex<TestHooks>,
 }
 
 #[derive(Default)]
@@ -277,12 +326,15 @@ impl DirectWriteQueue {
     /// Waits on the pre-lock gate for `updates`, when one is installed and
     /// returns a `Notify` for them.
     #[cfg(test)]
-    async fn pass_gate(&self, updates: &[OperationUpdate]) {
-        let gate = self
-            .gate
+    fn hooks(&self) -> std::sync::MutexGuard<'_, TestHooks> {
+        self.hooks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+    }
+
+    #[cfg(test)]
+    async fn pass_gate(&self, updates: &[OperationUpdate]) {
+        let gate = self.hooks().gate.clone();
         if let Some(notify) = gate.and_then(|gate| gate(updates)) {
             notify.notified().await;
         }
@@ -416,7 +468,7 @@ fn wfc_retries(updates: &[OperationUpdate]) -> Vec<(String, Option<String>)> {
     updates
         .iter()
         .filter(|update| {
-            *update.action() == aws_sdk_lambda::types::OperationAction::Retry
+            *update.action() == OperationAction::Retry
                 && update.sub_type() == Some(crate::wait_for_condition::WFC_SUB_TYPE)
         })
         .map(|update| (update.id().to_owned(), update.payload().map(str::to_owned)))
@@ -1062,12 +1114,64 @@ impl DurableContext {
     /// The root context and every child share it.
     #[cfg(test)]
     pub(crate) fn set_pre_lock_gate(&self, gate: PreLockGate) {
-        *self
-            .inner
-            .direct
-            .gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
+        self.inner.direct.hooks().gate = Some(gate);
+    }
+
+    /// Installs the submission recorder (see [`SubmissionRecorder`]). The
+    /// root context and every child share it.
+    #[cfg(test)]
+    pub(crate) fn set_submission_recorder(&self, recorder: SubmissionRecorder) {
+        self.inner.direct.hooks().submissions = Some(recorder);
+    }
+
+    /// Installs the settler-entry recorder (see [`SettlerEntryRecorder`]).
+    /// The root context and every child share it.
+    #[cfg(test)]
+    pub(crate) fn set_settler_entry_recorder(&self, recorder: SettlerEntryRecorder) {
+        self.inner.direct.hooks().settler_entries = Some(recorder);
+    }
+
+    /// Passes `updates` and `write`'s first-poll flag to the submission
+    /// recorder, when one is installed.
+    #[cfg(test)]
+    fn record_submission(&self, updates: &[OperationUpdate], write: &SubmittedWrite) {
+        let recorder = self.inner.direct.hooks().submissions.clone();
+        if let Some(recorder) = recorder
+            && !updates.is_empty()
+        {
+            recorder(updates, &write.first_poll);
+        }
+    }
+
+    /// Waits for `start`, the retained `START` write of the child-backed
+    /// operation `wire_id`, before the operation writes its outcome
+    /// `action`. A failed `START` ends the invocation, as
+    /// [`Self::checkpoint_failure_unrecoverable`] describes, and the
+    /// outcome is never written. `None` means the operation's `START` was
+    /// recorded before this cycle.
+    pub(crate) async fn await_retained_start(
+        &self,
+        wire_id: &str,
+        start: Option<SubmittedWrite>,
+        action: OperationAction,
+    ) -> Result<(), OperationError> {
+        #[cfg(test)]
+        {
+            let recorder = self.inner.direct.hooks().settler_entries.clone();
+            if let Some(recorder) = recorder {
+                recorder(wire_id, action.clone());
+            }
+        }
+        #[cfg(not(test))]
+        let _ = action;
+        if let Some(start) = start
+            && let Err(err) = start.await
+        {
+            return self
+                .checkpoint_failure_unrecoverable(wire_id, err, None)
+                .await;
+        }
+        Ok(())
     }
 
     /// The IDs of the updates that wait to be sent: those of the direct
@@ -1771,6 +1875,8 @@ impl DurableContext {
         &self,
         updates: Vec<OperationUpdate>,
     ) -> ReservedWrite {
+        #[cfg(test)]
+        let recorded = updates.clone();
         let tracked = self.track_updates(updates);
         let Some(coalescer) = self.inner.coalescer.clone() else {
             let (updates, events): (Vec<_>, Vec<_>) =
@@ -1779,6 +1885,10 @@ impl DurableContext {
                 return ReservedWrite::rejected();
             };
             let (write, id) = self.enqueue_direct(updates, events, Some(permit), None, true);
+            #[cfg(test)]
+            if id.is_some() {
+                self.record_submission(&recorded, &write);
+            }
             return ReservedWrite {
                 write,
                 hold: id.map(|id| WriteHold::Direct {
@@ -1790,8 +1900,11 @@ impl DurableContext {
         let Some(batch) = self.join_batch(&coalescer, tracked, false, None, true) else {
             return ReservedWrite::rejected();
         };
+        let write = batch_result(batch);
+        #[cfg(test)]
+        self.record_submission(&recorded, &write);
         ReservedWrite {
-            write: batch_result(batch),
+            write,
             hold: Some(WriteHold::Batch(coalescer)),
         }
     }
@@ -1895,6 +2008,39 @@ impl DurableContext {
     /// The join or the direct write happens before this returns, so the
     /// returned [`SubmittedWrite`] only waits for the result.
     fn write_with_urgency(
+        &self,
+        updates: Vec<TrackedUpdate>,
+        urgent: bool,
+        failure_owner: Option<&str>,
+    ) -> SubmittedWrite {
+        // The recorder sees the submission before it joins the coalescer
+        // or enters the queue, so before the writer can send it. The write
+        // built below takes the flag the recorder saw.
+        #[cfg(test)]
+        let flag = {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let recorder = self.inner.direct.hooks().submissions.clone();
+            if let Some(recorder) = recorder
+                && !updates.is_empty()
+                && self.admission().admits(self.owners())
+            {
+                let submitted: Vec<OperationUpdate> =
+                    updates.iter().map(|t| t.update.clone()).collect();
+                recorder(&submitted, &flag);
+            }
+            flag
+        };
+        #[cfg_attr(not(test), expect(unused_mut))] // reason: only the test build sets the flag
+        let mut write = self.write_with_urgency_unrecorded(updates, urgent, failure_owner);
+        #[cfg(test)]
+        {
+            write.first_poll = flag;
+        }
+        write
+    }
+
+    /// [`Self::write_with_urgency`] without the test submission recorder.
+    fn write_with_urgency_unrecorded(
         &self,
         updates: Vec<TrackedUpdate>,
         urgent: bool,
@@ -5307,7 +5453,7 @@ mod tests {
         OperationUpdate::builder()
             .id(id.to_owned())
             .r#type(aws_sdk_lambda::types::OperationType::Step)
-            .action(aws_sdk_lambda::types::OperationAction::Start)
+            .action(OperationAction::Start)
             .build()
             .expect("all required OperationUpdate fields set")
     }
