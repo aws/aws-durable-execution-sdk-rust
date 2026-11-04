@@ -678,9 +678,10 @@ impl FileSystemSerdesConfigBuilder {
 ///   stores the value in a file under `base_path`
 ///
 /// The marker key is reserved, so an inline value that itself contains a
-/// `"file"` key can never be misread as a file reference. Envelopes
-/// written by earlier versions (`{"file":...}`, `{"data":...}`,
-/// `{"raw":...}`) remain readable.
+/// `"file"` key can never be misread as a file reference. The unversioned
+/// envelopes that the JS and Python SDKs write, `{"file":"<path>"}` and
+/// `{"data":"<serialized JSON>"}`, are readable too. A `file` path is read
+/// only from under `base_path`.
 ///
 /// # Write and read guarantees
 ///
@@ -850,11 +851,12 @@ impl FileSystemSerdes {
 
         /// Envelope shape. Versioned envelopes carry the
         /// `"__aws_durable_serdes"` marker with `value` (inline) or `file`
-        /// (relative path). Records written by earlier SDK versions carry
-        /// `{"file":"<path>"}`, `{"data":<json>}`, or `{"raw":"<string>"}`
-        /// with no marker. `RawValue` keeps inline data as unparsed JSON
-        /// text so `T` is parsed straight from the wire bytes with no
-        /// intermediate DOM.
+        /// (relative path). The unversioned envelopes that the JS and
+        /// Python SDKs write carry no marker: `{"file":"<path>"}`, or
+        /// `{"data":"<serialized JSON>"}`, whose `data` is a JSON string
+        /// holding the value's serialized JSON. `RawValue` keeps a
+        /// versioned inline value as unparsed JSON text so `T` is parsed
+        /// straight from the wire bytes with no intermediate DOM.
         #[derive(serde::Deserialize)]
         struct Envelope<'a> {
             #[serde(rename = "__aws_durable_serdes")]
@@ -864,8 +866,7 @@ impl FileSystemSerdes {
             #[serde(borrow)]
             file: Option<std::borrow::Cow<'a, str>>,
             #[serde(borrow)]
-            data: Option<&'a serde_json::value::RawValue>,
-            raw: Option<String>,
+            data: Option<std::borrow::Cow<'a, str>>,
         }
 
         // External payloads (callback completions) are opaque application
@@ -925,42 +926,25 @@ impl FileSystemSerdes {
             };
         }
 
-        // No marker: a record written by an earlier SDK version.
+        // No marker: an unversioned envelope, the form the JS and Python
+        // SDKs write.
         if let Some(file_path) = parsed.file.as_deref() {
-            // Legacy file pointer (stored as the resolved path). It came
-            // from an SDK-written record, but resolution is still strict:
-            // the file must physically live under `base_path`.
+            // Unversioned file pointer (stored as the resolved path). It
+            // came from an SDK-written record, but resolution is still
+            // strict: the file must physically live under `base_path`.
             self.read_contained_file(std::path::Path::new(file_path), file_path)
         } else if let Some(data) = parsed.data {
-            // Legacy inline data: the "data" field holds the value's JSON
-            // verbatim.
-            serde_json::from_str(data.get()).map_err(|e| -> BoxError {
+            // Unversioned inline data: the "data" field is a JSON string
+            // whose content is the value's serialized JSON.
+            serde_json::from_str(&data).map_err(|e| -> BoxError {
                 Box::new(FileSystemSerdesError::with_source(
                     "invalid inline data in envelope",
                     e,
                 ))
             })
-        } else if let Some(raw) = parsed.raw {
-            // Legacy inline envelope. The writer no longer produces
-            // `{"raw":..}`, but executions checkpointed by an earlier version
-            // may still contain one, so the read path keeps handling it. The
-            // raw form stored the value as a plain string; re-encode it as a
-            // JSON string literal and parse `T` from that.
-            let as_json = serde_json::to_string(&raw).map_err(|e| -> BoxError {
-                Box::new(FileSystemSerdesError::with_source(
-                    "failed to re-encode legacy raw envelope",
-                    e,
-                ))
-            })?;
-            serde_json::from_str(&as_json).map_err(|e| -> BoxError {
-                Box::new(FileSystemSerdesError::with_source(
-                    "invalid legacy raw data in envelope",
-                    e,
-                ))
-            })
         } else {
             Err(Box::new(FileSystemSerdesError::new(
-                "envelope carries no '__aws_durable_serdes' marker and no legacy 'file' or 'data' field"
+                "envelope carries no '__aws_durable_serdes' marker and no unversioned 'file' or 'data' field"
                     .to_owned(),
             )))
         }
@@ -2070,7 +2054,7 @@ mod tests {
             "arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/e/i".to_owned(),
         );
 
-        // This will exceed the 50-byte threshold once wrapped in {"data":...}
+        // This will exceed the 50-byte threshold once wrapped in the versioned inline envelope.
         let large =
             serde_json::json!({"big": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"});
         let envelope = serdes
@@ -2141,12 +2125,13 @@ mod tests {
         let err_msg = crate::error::chain_string(&*result.unwrap_err());
         assert!(err_msg.contains("failed to resolve file"), "err: {err_msg}");
 
-        // Legacy envelope naming a missing file under base fails the same way.
-        let legacy = format!(
+        // An unversioned envelope naming a missing file under base fails
+        // the same way.
+        let unversioned = format!(
             r#"{{"file":"{}/does-not-exist.json"}}"#,
             tmp.to_string_lossy()
         );
-        let result = serdes.deserialize_sync::<serde_json::Value>(&legacy, &ctx);
+        let result = serdes.deserialize_sync::<serde_json::Value>(&unversioned, &ctx);
         assert!(result.is_err());
         let err_msg = crate::error::chain_string(&*result.unwrap_err());
         assert!(err_msg.contains("failed to resolve file"), "err: {err_msg}");
@@ -2224,53 +2209,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The JS and Python SDKs write `{"data":"<serialized JSON>"}`: the
+    /// `data` field is a JSON string holding the value's serialized JSON.
     #[test]
-    fn deserialize_reads_inline_data_envelope() {
-        let tmp = std::env::temp_dir().join("fs_serdes_test_trait");
-        let _ = std::fs::remove_dir_all(&tmp);
-
-        let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
-        let ctx = SerdesContext::new("op", "arn:test");
-
-        // Inline envelope: the value is returned verbatim, not re-rendered.
-        let result = serdes
-            .deserialize_sync::<serde_json::Value>(r#"{"data":"hello"}"#, &ctx)
-            .expect("should parse inline");
-        assert_eq!(result, serde_json::json!("hello"));
-
-        let result = serdes
-            .deserialize_sync::<serde_json::Value>(r#"{"data":{"value":42}}"#, &ctx)
-            .expect("should parse inline object");
-        assert_eq!(result, serde_json::json!({"value": 42}));
-
-        // Neither 'file' nor 'data': a loud error, never a silent passthrough.
-        assert!(
-            serdes
-                .deserialize_sync::<serde_json::Value>(r#"{"value":42}"#, &ctx)
-                .is_err()
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// The writer no longer emits `{"raw":...}`, a `Value` is always
-    /// embeddable under `"data"`, but executions checkpointed before the
-    /// value-based boundary may still contain one, so the READ path must keep
-    /// handling it. Deleting the reader alongside the writer would strand
-    /// in-flight executions.
-    #[test]
-    fn deserialize_still_reads_legacy_raw_envelope() {
+    fn deserialize_reads_js_python_inline_data_envelopes() {
         let serdes = FileSystemSerdes::new("/unused");
         let ctx = SerdesContext::new("op", "arn:test");
 
-        let result = serdes
-            .deserialize_sync::<serde_json::Value>(r#"{"raw":"not json at all"}"#, &ctx)
-            .expect("legacy raw envelope must still be readable");
-        assert_eq!(result, serde_json::Value::String("not json at all".into()));
+        let object = serdes
+            .deserialize_sync::<serde_json::Value>(r#"{"data":"{\"value\":42}"}"#, &ctx)
+            .expect("an object in a data envelope decodes");
+        assert_eq!(object, serde_json::json!({"value": 42}));
+
+        let string = serdes
+            .deserialize_sync::<serde_json::Value>(r#"{"data":"\"hello\""}"#, &ctx)
+            .expect("a string in a data envelope decodes");
+        assert_eq!(string, serde_json::json!("hello"));
     }
 
-    /// Overflow mode must never write a `{"raw":...}` envelope now that the
-    /// input is always a `Value`.
+    /// No SDK writes an unquoted `{"data":<JSON>}` or a `{"raw":...}`
+    /// envelope, so both are rejected, as is an object with neither
+    /// `file` nor `data`.
+    #[test]
+    fn deserialize_rejects_rust_only_inline_envelopes() {
+        let serdes = FileSystemSerdes::new("/unused");
+        let ctx = SerdesContext::new("op", "arn:test");
+
+        let unquoted = serdes
+            .deserialize_sync::<serde_json::Value>(r#"{"data":{"value":42}}"#, &ctx)
+            .expect_err("an unquoted data envelope is rejected");
+        assert!(
+            crate::error::chain_string(&*unquoted).contains("invalid envelope JSON"),
+            "{unquoted}"
+        );
+
+        for envelope in [r#"{"raw":"not json at all"}"#, r#"{"value":42}"#] {
+            let err = serdes
+                .deserialize_sync::<serde_json::Value>(envelope, &ctx)
+                .expect_err("the envelope is rejected");
+            assert!(
+                crate::error::chain_string(&*err).contains(
+                    "envelope carries no '__aws_durable_serdes' marker and no unversioned 'file' or 'data' field"
+                ),
+                "{envelope}: {err}"
+            );
+        }
+    }
+
+    /// Overflow mode writes a bare string as a versioned inline envelope,
+    /// and reads it back.
     #[test]
     fn overflow_mode_never_writes_raw_envelope() {
         let tmp = std::env::temp_dir().join("fs_serdes_test_no_raw");
@@ -2283,7 +2270,7 @@ mod tests {
         let serdes = FileSystemSerdes::with_config(tmp.to_string_lossy().to_string(), config);
         let ctx = SerdesContext::new("op", "arn:test");
 
-        // A bare string is the case that previously took the {"raw":...} arm.
+        // A bare string is stored inline under the versioned marker.
         let value = serde_json::json!("plain text");
         let envelope = serdes.serialize_sync(&value, &ctx).expect("serialize");
         assert_eq!(
@@ -3129,7 +3116,7 @@ mod tests {
     }
 
     /// An externally delivered payload must NEVER be honored as a file
-    /// reference: neither in the legacy shape nor with a spoofed
+    /// reference: neither as an unversioned file pointer nor with a spoofed
     /// versioned marker. It parses directly as the value.
     #[test]
     fn external_origin_never_resolves_file_references() {
@@ -3146,10 +3133,10 @@ mod tests {
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
         let ctx = SerdesContext::new("cb-1", "arn:test").with_origin(PayloadOrigin::External);
 
-        // Legacy-shaped reference.
-        let legacy = format!(r#"{{"file":"{}"}}"#, secret.to_string_lossy());
+        // An unversioned file pointer.
+        let unversioned = format!(r#"{{"file":"{}"}}"#, secret.to_string_lossy());
         let out: serde_json::Value = serdes
-            .deserialize_sync(&legacy, &ctx)
+            .deserialize_sync(&unversioned, &ctx)
             .expect("external payload parses as its own JSON");
         assert_eq!(
             out,
@@ -3254,36 +3241,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Legacy (marker-less) file pointers from SDK records written by
-    /// earlier versions still read, but only from under `base_path`.
+    /// Unversioned (marker-less) file pointers, the form the JS and Python
+    /// SDKs write, are read only from under `base_path`.
     #[test]
-    fn legacy_file_envelope_strictly_contained() {
-        let tmp = std::env::temp_dir().join("fs_serdes_legacy_containment");
+    fn unversioned_file_envelope_strictly_contained() {
+        let tmp = std::env::temp_dir().join("fs_serdes_unversioned_containment");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
         let serdes = FileSystemSerdes::new(tmp.to_string_lossy().to_string());
         let ctx = SerdesContext::new("op", "arn:test");
 
-        // A genuine legacy record: absolute path under base_path.
-        let inside = tmp.join("legacy-op.json");
-        std::fs::write(&inside, r#"{"legacy": true}"#).unwrap();
-        let legacy_ok = format!(r#"{{"file":"{}"}}"#, inside.to_string_lossy());
+        // An unversioned record: absolute path under base_path.
+        let inside = tmp.join("unversioned-op.json");
+        std::fs::write(&inside, r#"{"unversioned": true}"#).unwrap();
+        let unversioned_ok = format!(r#"{{"file":"{}"}}"#, inside.to_string_lossy());
         let out: serde_json::Value = serdes
-            .deserialize_sync(&legacy_ok, &ctx)
-            .expect("legacy record under base_path must stay readable");
-        assert_eq!(out, serde_json::json!({"legacy": true}));
+            .deserialize_sync(&unversioned_ok, &ctx)
+            .expect("an unversioned record under base_path is readable");
+        assert_eq!(out, serde_json::json!({"unversioned": true}));
 
-        // A legacy-shaped record pointing outside base_path is rejected,
+        // An unversioned record pointing outside base_path is rejected,
         // even though the file exists and is readable.
-        let outside_dir = std::env::temp_dir().join("fs_serdes_legacy_outside");
+        let outside_dir = std::env::temp_dir().join("fs_serdes_unversioned_outside");
         let _ = std::fs::remove_dir_all(&outside_dir);
         std::fs::create_dir_all(&outside_dir).unwrap();
         let outside = outside_dir.join("outside.json");
         std::fs::write(&outside, r#""outside""#).unwrap();
-        let legacy_escape = format!(r#"{{"file":"{}"}}"#, outside.to_string_lossy());
+        let unversioned_escape = format!(r#"{{"file":"{}"}}"#, outside.to_string_lossy());
         let err = serdes
-            .deserialize_sync::<serde_json::Value>(&legacy_escape, &ctx)
+            .deserialize_sync::<serde_json::Value>(&unversioned_escape, &ctx)
             .unwrap_err();
         assert!(
             err.to_string().contains("escapes base_path"),

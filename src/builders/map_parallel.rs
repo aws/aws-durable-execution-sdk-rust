@@ -1148,7 +1148,7 @@ impl<RS> ParallelMixedBuilder<RS> {
         // One table of branch IDs, read by the batch engine and by the item
         // serdes, which finds each branch's serdes from it.
         let item_ids = ItemIds::new(&self.op_id, self.branches.len());
-        let serdes = MixedItemSerdes::new(&self.op_id, &item_ids, self.decoders);
+        let serdes = MixedItemSerdes::new(&item_ids, self.decoders);
         let execution = ParallelExecution {
             ctx: self.ctx,
             op_id: self.op_id,

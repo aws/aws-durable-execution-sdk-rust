@@ -323,9 +323,7 @@ CI runs four workflows on a pull request. `ci.yml` splits `make check` into a
 version with an `msrv` job, guards the public API surface with an
 `external-types` job (no foreign type may reach the public API unless the
 allowlist under `[package.metadata.cargo_check_external_types]` in
-`Cargo.toml` names it deliberately) and a `semver` job (cargo-semver-checks
-compares the pull request against its base branch, so a breaking API change
-needs the matching version bump), proves every feature combination compiles
+`Cargo.toml` names it deliberately), proves every feature combination compiles
 with a `feature-powerset` job (cargo-hack), then builds and lints the
 `conformance` and `examples` workspaces.
 `codeql.yml` runs static analysis over the Rust sources.
@@ -361,8 +359,7 @@ change as small as the problem.
    in a rare case is not.
 2. Do not add configuration that nobody asked for.
 3. For a new feature, prefer the simpler option, even if it loses a minor capability of a
-   more complex option. An existing feature has users, so removing a capability of it is
-   a breaking change and follows the release rules instead.
+   more complex option.
 
 #### 2. Simplify before you add
 

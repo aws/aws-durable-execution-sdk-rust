@@ -639,7 +639,7 @@ mod tests {
     /// ISSUE #46: a target function's result payload must never be honored
     /// as a `FileSystemSerdes` file reference. The result is produced by
     /// the external target function, not this SDK's serialize path, so a
-    /// payload shaped like a legacy or versioned file pointer, even one
+    /// payload shaped like an unversioned or versioned file pointer, even one
     /// naming a real, readable file under `base_path`, decodes as plain
     /// data, and a realistic inline payload containing a `file` key is not
     /// misparsed.
@@ -658,9 +658,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).expect("create temp base");
         std::fs::write(tmp.join("secret.json"), r#""stolen contents""#).expect("plant file");
 
-        // Two attack shapes: the legacy file pointer and the versioned
+        // Two attack shapes: an unversioned file pointer and the versioned
         // file envelope, both naming the planted file.
-        let legacy = format!(
+        let unversioned = format!(
             r#"{{"file":"{}","data":{{"status":"ready"}}}}"#,
             tmp.join("secret.json").to_string_lossy()
         );
@@ -668,7 +668,7 @@ mod tests {
             r#"{"__aws_durable_serdes":{"version":1,"kind":"file"},"file":"secret.json"}"#
                 .to_owned();
 
-        for (label, payload) in [("legacy", legacy), ("versioned", versioned)] {
+        for (label, payload) in [("unversioned", unversioned), ("versioned", versioned)] {
             let wire_key = crate::engine::compute_wire_id_public("1");
             let record = CheckpointRecord {
                 id: wire_key.clone(),
@@ -727,7 +727,7 @@ mod tests {
                 value.get("file").is_some(),
                 "{label}: the 'file' key is plain data"
             );
-            if label == "legacy" {
+            if label == "unversioned" {
                 assert_eq!(
                     value["data"],
                     serde_json::json!({"status": "ready"}),

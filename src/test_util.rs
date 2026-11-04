@@ -6685,7 +6685,7 @@ mod tests {
         assert!(op("attempt-2").succeeded());
         assert_eq!(op("attempt-1").sub_type(), Some("RunInChildContext"));
         assert_eq!(op("attempt-2").sub_type(), Some("RunInChildContext"));
-        assert_eq!(op("retry-delay-1").sub_type(), Some("Wait"));
+        assert_eq!(op("block-backoff-1").sub_type(), Some("Wait"));
         let works: Vec<Option<&str>> = result
             .operations()
             .iter()

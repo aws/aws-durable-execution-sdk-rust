@@ -411,9 +411,77 @@ async fn custom_sub_type_labels_only_the_block_in_history() {
             ("attempt-1", Some("RunInChildContext")),
             ("attempt-2", Some("RunInChildContext")),
             ("block", Some("Checkout")),
-            ("retry-delay-1", Some("Wait")),
+            ("block-backoff-1", Some("Wait")),
             ("work", Some("Step")),
             ("work", Some("Step")),
         ]
     );
+}
+
+/// An unnamed block, and a block named `""`, leave the wait between
+/// attempts unnamed, as JS does. Each run fails attempt 1, succeeds on
+/// attempt 2, and records exactly one wait, which has no name.
+#[tokio::test]
+async fn unnamed_block_waits_are_unnamed() {
+    for name in [None, Some("")] {
+        let runs = Arc::new(AtomicU32::new(0));
+        let result = LocalRunner::new()
+            .run(
+                move |_: serde_json::Value, ctx: DurableContext| {
+                    let runs = Arc::clone(&runs);
+                    async move {
+                        let block = ctx
+                            .with_retry(move |_child| {
+                                let runs = Arc::clone(&runs);
+                                async move {
+                                    if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                                        Err::<u32, durable::BoxError>("transient".into())
+                                    } else {
+                                        Ok(3)
+                                    }
+                                }
+                            })
+                            .retry_strategy(|_err, attempt| {
+                                if attempt >= 2 {
+                                    RetryDecision::Stop
+                                } else {
+                                    RetryDecision::Retry {
+                                        delay: Duration::from_secs(1),
+                                    }
+                                }
+                            });
+                        let block = match name {
+                            Some(name) => block.name(name),
+                            None => block,
+                        };
+                        Ok::<_, durable::BoxError>(block.await?)
+                    }
+                },
+                serde_json::Value::Null,
+            )
+            .await
+            .expect("runner");
+        assert!(
+            result.is_success(),
+            "{name:?}: {:?}",
+            result.error_message()
+        );
+        assert_eq!(result.output(), Some(&3));
+        assert!(result.operation("attempt-1").expect("attempt 1").failed());
+        assert!(
+            result
+                .operation("attempt-2")
+                .expect("attempt 2")
+                .succeeded()
+        );
+
+        let waits: Vec<Option<&str>> = result
+            .operations()
+            .iter()
+            .filter(|op| op.kind() == durable::OperationKind::Wait)
+            .map(|op| op.name())
+            .collect();
+        assert_eq!(waits, [None], "{name:?}");
+        assert!(result.operation("retry-delay-1").is_none(), "{name:?}");
+    }
 }

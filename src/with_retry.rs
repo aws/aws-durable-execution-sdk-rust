@@ -16,9 +16,10 @@
 //!   1's operations live under `<id>-1-*`, attempt 2's under `<id>-3-*`,
 //!   and so on. A failed attempt's recorded operations can therefore never
 //!   be confused with (or replayed into) the next attempt's.
-//! - The delay between attempts is a durable wait (named `retry-delay-N`),
-//!   so the backend owns the retry timer and the execution suspends between
-//!   attempts exactly as a retrying step does.
+//! - The delay after failed attempt N is a durable wait, named
+//!   `{name}-backoff-N` when the block has a non-empty name and unnamed
+//!   otherwise, as in the JS SDK. So the backend owns the retry timer, and
+//!   the execution suspends between attempts exactly as a retrying step does.
 //!
 //! Retry-state checkpointing: the loop carries no in-process state that
 //! matters across a suspension. The current attempt number is re-derived on
@@ -56,8 +57,10 @@ use crate::{BoxError, RetryDecision, RetryStrategy};
 /// each attempt round-trips `O` through the SAME wire format as the block
 /// itself, which is also what lets a custom serdes carry an `O` without
 /// `Serialize`/`DeserializeOwned` implementations.
+/// `name` is the block's name. It names the wait between attempts.
 pub(crate) async fn retry_loop<O, F, Fut, S>(
     outer: DurableContext,
+    name: Option<String>,
     closure: Arc<F>,
     strategy: Arc<RetryStrategy>,
     serdes: Arc<S>,
@@ -97,17 +100,22 @@ where
                 // Durable wait between attempts: checkpoint-suspend, the
                 // backend owns the timer. Enforce the same 1-second minimum
                 // a step retry does (`ctx.wait` already rounds fractional
-                // delays up to whole seconds).
-                outer
-                    .wait(delay.max(Duration::from_secs(1)))
-                    .name(format!("retry-delay-{attempt}"))
-                    .await
-                    .map_err(|wait_err| {
-                        ChildFnError::new(crate::error::ContextualError::source_from(
-                            "with_retry delay wait failed",
-                            Box::new(wait_err) as crate::error::Source,
-                        ))
-                    })?;
+                // delays up to whole seconds). JS names this wait
+                // `{name}-backoff-{attempt}` only when the block's name is
+                // non-empty, so an unnamed block's waits are unnamed.
+                let wait = outer.wait(delay.max(Duration::from_secs(1)));
+                let wait = match name.as_deref() {
+                    Some(name) if !name.is_empty() => {
+                        wait.name(format!("{name}-backoff-{attempt}"))
+                    }
+                    _ => wait,
+                };
+                wait.await.map_err(|wait_err| {
+                    ChildFnError::new(crate::error::ContextualError::source_from(
+                        "with_retry delay wait failed",
+                        Box::new(wait_err) as crate::error::Source,
+                    ))
+                })?;
                 attempt = attempt.saturating_add(1);
             }
             RetryDecision::Stop => {

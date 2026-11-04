@@ -665,9 +665,13 @@ closure, and without either the step default applies (6 total attempts with
 exponential backoff). When retries exhaust, the operation fails with the
 attempt count and the last attempt's error.
 
+The wait after failed attempt `N` is named `{name}-backoff-N` when the
+block has a non-empty name, as in the JS SDK. The waits of an unnamed block
+are unnamed.
+
 `.sub_type(...)` on `with_retry` labels the block's own child context; each
-`attempt-N` child context keeps `RunInChildContext`, and each
-`retry-delay-N` wait keeps `Wait`.
+`attempt-N` child context keeps `RunInChildContext`, and each wait between
+attempts keeps `Wait`.
 
 ### map and parallel
 

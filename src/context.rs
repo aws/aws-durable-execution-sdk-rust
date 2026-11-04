@@ -3428,8 +3428,8 @@ pub(crate) fn canonical_op_type(raw: &str) -> String {
 
 /// Compares a checkpoint record's stored identity against a claimed one.
 ///
-/// Returns `None` when the identities match (or the record predates
-/// identity recording), and `Some(expected)`, the stored identity
+/// Returns `None` when the identities match (or the record carries no
+/// operation type), and `Some(expected)`, the stored identity
 /// formatted for the mismatch error, when they differ. The comparisons
 /// borrow the record, so the match path clones nothing; only the cold
 /// mismatch path allocates. This is the shared core behind
@@ -3441,10 +3441,10 @@ fn replay_identity_mismatch(
     claimed_sub_type: Option<&str>,
     claimed_name: Option<&str>,
 ) -> Option<String> {
-    // A record without a stored operation type predates identity
-    // recording (legacy checkpoint): there is genuinely nothing to
-    // validate against, so skip. This is the ONLY lenient path; once a
-    // record carries identity, every field is compared in full.
+    // A record without a stored operation type has nothing to validate
+    // against, so the check skips it, as JS does. This is the ONLY
+    // lenient path; once a record carries identity, every field is
+    // compared in full.
     let expected_type = record.op_type.as_deref()?;
 
     let mismatch = || {
@@ -4455,7 +4455,6 @@ mod tests {
 
     #[test]
     fn validate_replay_identity_skips_when_no_identity_stored() {
-        // Backwards compatibility: old checkpoint data has no identity fields.
         let log = Arc::new(CheckpointLog::empty());
         let ctx = DurableContext::new_root(
             "arn:test".to_owned(),
@@ -4758,7 +4757,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_replay_identity_legacy_record_skips_name_and_subtype() {
+    fn validate_replay_identity_untyped_record_skips_name_and_subtype() {
         // A record genuinely lacking identity (no op_type) is the ONLY
         // lenient path: nothing is compared, whatever the claim carries.
         let ctx = test_ctx();

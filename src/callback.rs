@@ -2370,7 +2370,7 @@ mod tests {
         let filesystem_serdes = FileSystemSerdes::new(tmp.to_string_lossy().into_owned());
 
         // The external caller delivered a payload that LOOKS like a file
-        // pointer (legacy shape). It must come back as data.
+        // pointer (an unversioned file pointer). It must come back as data.
         let payload = format!(
             r#"{{"file":"{}","data":{{"status":"ready"}}}}"#,
             tmp.join("secret.json").to_string_lossy()

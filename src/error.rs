@@ -143,9 +143,8 @@ impl WireError {
     /// you know its shape. The one record the SDK decodes is its own
     /// `select_ok` `AllFailed` aggregate, whose `error_data` is
     /// SDK-authored (never pass-through) and holds the losers' recorded
-    /// failure fields; combinator replay decodes it defensively (a
-    /// malformed payload falls back to synthetic losers) and only stores
-    /// and re-exposes the decoded strings, never branching on them.
+    /// failure fields; combinator replay decodes it defensively and only
+    /// stores and re-exposes the decoded strings, never branching on them.
     pub fn error_data(&self) -> Option<&str> {
         self.error_data.as_deref()
     }

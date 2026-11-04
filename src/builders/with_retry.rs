@@ -119,10 +119,12 @@ where
     F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
-    /// Sets a human-readable name for this operation.
+    /// Sets a human-readable name for this block.
     ///
-    /// Names appear in logs, traces, and the execution history for
-    /// debugging purposes.
+    /// A non-empty name also names each wait between attempts
+    /// `{name}-backoff-{attempt}`. Without a name, or with an empty name,
+    /// those waits are unnamed. Names appear in logs, traces, and execution
+    /// history for debugging.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -139,8 +141,9 @@ where
     ///
     /// The subtype labels the block, not its attempts. Each attempt's
     /// child context `attempt-N` keeps `RunInChildContext`, each delay
-    /// `retry-delay-N` keeps `Wait`, and every operation inside an attempt
-    /// keeps its own subtype.
+    /// keeps `Wait`, and every operation inside an attempt keeps its own
+    /// subtype. A delay is named `{name}-backoff-N` for a block with a
+    /// non-empty name, and is unnamed for an unnamed block.
     ///
     /// Replay compares the recorded subtype with this one, as it compares
     /// the name. So changing the subtype of an existing block breaks the
@@ -370,6 +373,8 @@ where
 
         let gate = self.ctx.clone();
 
+        let loop_name = self.name.clone();
+
         let execution = ChildExecution {
             ctx: self.ctx,
             op_id: self.op_id,
@@ -381,7 +386,7 @@ where
             // A concrete closure returning the concrete retry-loop future:
             // no erasure here: the one box is the DurableFuture below.
             closure: move |outer_ctx| {
-                crate::with_retry::retry_loop(outer_ctx, closure, strategy, loop_serdes)
+                crate::with_retry::retry_loop(outer_ctx, loop_name, closure, strategy, loop_serdes)
             },
             _marker: PhantomData,
         };

@@ -10,7 +10,6 @@
 # This file uses only features of GNU make 3.81, the version macOS ships.
 
 # The ci.yml jobs that run on a push to main, plus the tool pin check.
-# ci.yml's semver job runs only on pull requests, so it is not here.
 CI_TARGETS = pins check-sdk msrv dependencies external-types feature-powerset workspaces
 
 # The cargo workspaces the workspaces job builds. CI's matrix passes one,
