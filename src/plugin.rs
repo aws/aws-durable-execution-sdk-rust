@@ -687,10 +687,26 @@ pub trait Plugin: Send + Sync {
     /// Returns the X-Ray trace header the SDK puts on a chained invoke's
     /// `START` checkpoint, or `None` for no header.
     ///
+    /// The SDK calls it once for each new chained-invoke `START`, after it
+    /// serialized the invoke's input and before it writes the `START`. It
+    /// never calls it when the invoke's `START` is already recorded. A
+    /// `START` whose write failed is not recorded, so the next invocation
+    /// calls it again.
+    ///
+    /// The SDK asks every plugin, in registration order. The first
+    /// non-blank value is sent unchanged as the `X-Amzn-Trace-Id` of the
+    /// chained invoke. A value that is empty or only whitespace counts as no
+    /// value. When a later plugin returns a different non-blank value, the
+    /// SDK keeps the first value and logs a warning that names both plugins.
+    /// A panic is logged and counts as no value.
+    ///
+    /// The hook is synchronous and runs on the operation's task, so it must
+    /// not block.
+    ///
     /// # Errors
     ///
-    /// An error is logged, and the invoke starts without a header from this
-    /// plugin.
+    /// An error is logged and counts as no value: the next plugin's value
+    /// is used.
     fn propagation_trace_id(&self, _input: &PropagationInput) -> Result<Option<String>, BoxError> {
         Ok(None)
     }
@@ -1438,6 +1454,23 @@ pub struct PropagationInput {
 }
 
 impl PropagationInput {
+    /// The input of the propagation hook for the chained invoke
+    /// `operation_id`, whose parent is `parent_operation_id` and which calls
+    /// `target_function_name`.
+    pub(crate) fn new(
+        execution_arn: String,
+        operation_id: String,
+        parent_operation_id: Option<String>,
+        target_function_name: String,
+    ) -> Self {
+        Self {
+            execution_arn,
+            operation_id,
+            parent_operation_id,
+            target_function_name,
+        }
+    }
+
     /// The ARN of the durable execution.
     pub fn execution_arn(&self) -> &str {
         &self.execution_arn
@@ -1947,6 +1980,67 @@ impl InvocationPlugins {
         }
     }
 
+    /// Asks every plugin, in registration order, for the X-Ray trace header
+    /// of the chained invoke that `input` describes, and returns the header
+    /// to send, or `None` for no header.
+    ///
+    /// Each call runs inside its own catch, and the remaining plugins are
+    /// asked whatever one call did:
+    ///
+    /// 1. A panic is logged at WARN, and its payload is dropped through
+    ///    [`crate::task::discard_panic`]: a plugin panic does not fail the
+    ///    invocation.
+    /// 2. `Err(error)` is logged at WARN by [`report_propagation_error`].
+    /// 3. `Ok(None)` and a value that is empty or only whitespace count as
+    ///    no value.
+    /// 4. The first other value is kept unchanged. A later value equal to
+    ///    it does nothing. A later different value is logged at WARN with
+    ///    both plugins' identities and the number of conflicts so far in
+    ///    this call, and the first value stays.
+    pub(crate) fn propagation_trace_id(&self, input: &PropagationInput) -> Option<String> {
+        let mut kept: Option<(String, &str)> = None;
+        let mut conflict_count: u64 = 0;
+        for slot in &self.plugins {
+            let value =
+                match catch_unwind(AssertUnwindSafe(|| slot.plugin.propagation_trace_id(input))) {
+                    Ok(Ok(Some(value))) => value,
+                    Ok(Ok(None)) => continue,
+                    Ok(Err(error)) => {
+                        report_propagation_error(&slot.identity, &self.undelivered, error);
+                        continue;
+                    }
+                    Err(payload) => {
+                        tracing::warn!(
+                            target: TARGET,
+                            plugin = %slot.identity,
+                            "plugin propagation_trace_id panicked; the value is ignored"
+                        );
+                        crate::task::discard_panic(payload);
+                        continue;
+                    }
+                };
+            if value.trim().is_empty() {
+                continue;
+            }
+            match &kept {
+                None => kept = Some((value, slot.identity.as_str())),
+                Some((first, _)) if *first == value => {}
+                Some((_, first_identity)) => {
+                    conflict_count = conflict_count.saturating_add(1);
+                    tracing::warn!(
+                        target: TARGET,
+                        field = "x_amzn_trace_id",
+                        first_plugin = %first_identity,
+                        later_plugin = %slot.identity,
+                        conflict_count,
+                        "conflicting propagation trace ids; keeping the first value"
+                    );
+                }
+            }
+        }
+        kept.map(|(value, _)| value)
+    }
+
     /// Runs `work`, which the operation hook `hook` of the plugin at index
     /// `slot` returned, on its own task.
     ///
@@ -2147,6 +2241,37 @@ fn report_hook_error(
                 hook,
                 "plugin hook failed, and its error panicked while it was formatted; \
                  the error is ignored"
+            );
+            crate::task::discard_panic(payload);
+        }
+    }
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(error))) {
+        Undelivered::record(undelivered, payload);
+    }
+}
+
+/// Logs the error the `propagation_trace_id` hook of the plugin `identity`
+/// returned, and drops it.
+///
+/// The error's `Display` is plugin code. So it runs inside a catch that
+/// only borrows the error, and a panic there is logged and dropped. The
+/// SDK delivers the error to nobody, so it then drops the error inside a
+/// second catch. A panic from its destructor fails the invocation, so it is
+/// recorded on the coordinator through `undelivered`.
+fn report_propagation_error(identity: &str, undelivered: &Mutex<Undelivered>, error: BoxError) {
+    match catch_unwind(AssertUnwindSafe(|| error.to_string())) {
+        Ok(message) => tracing::warn!(
+            target: TARGET,
+            plugin = %identity,
+            error = %message,
+            "plugin propagation_trace_id failed; the value is ignored"
+        ),
+        Err(payload) => {
+            tracing::warn!(
+                target: TARGET,
+                plugin = %identity,
+                "plugin propagation_trace_id failed, and its error panicked while it was \
+                 formatted; the value is ignored"
             );
             crate::task::discard_panic(payload);
         }
@@ -2610,6 +2735,78 @@ pub(crate) mod test_support {
         ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
             Ok(Some(Box::new(self.clone())))
         }
+    }
+
+    type TraceFn =
+        dyn Fn(&super::PropagationInput) -> Result<Option<String>, BoxError> + Send + Sync;
+
+    /// A plugin whose `propagation_trace_id` answers with a closure. Every
+    /// input it receives is recorded.
+    #[derive(Clone)]
+    pub(crate) struct TraceHook {
+        answer: Arc<TraceFn>,
+        inputs: Arc<Mutex<Vec<super::PropagationInput>>>,
+    }
+
+    impl TraceHook {
+        pub(crate) fn new(
+            answer: impl Fn(&super::PropagationInput) -> Result<Option<String>, BoxError>
+            + Send
+            + Sync
+            + 'static,
+        ) -> Self {
+            Self {
+                answer: Arc::new(answer),
+                inputs: Arc::default(),
+            }
+        }
+
+        /// A plugin that answers `Ok(value)`.
+        pub(crate) fn value(value: Option<&'static str>) -> Self {
+            Self::new(move |_| Ok(value.map(str::to_owned)))
+        }
+
+        /// The inputs the hook received, in call order.
+        pub(crate) fn inputs(&self) -> Vec<super::PropagationInput> {
+            self.inputs.lock().unwrap().clone()
+        }
+    }
+
+    impl Plugin for TraceHook {
+        fn name(&self) -> &'static str {
+            "TraceHook"
+        }
+
+        fn propagation_trace_id(
+            &self,
+            input: &super::PropagationInput,
+        ) -> Result<Option<String>, BoxError> {
+            self.inputs.lock().unwrap().push(input.clone());
+            (self.answer)(input)
+        }
+    }
+
+    impl PluginFactory for TraceHook {
+        fn create_plugin(
+            &self,
+            _info: &InvocationInfo,
+        ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// The plugins of an invocation whose plugins are `hooks`, in order.
+    pub(crate) fn trace_plugins(hooks: &[TraceHook]) -> Arc<super::InvocationPlugins> {
+        let factories: Vec<(&'static str, Arc<dyn PluginFactory>)> = hooks
+            .iter()
+            .map(|hook| {
+                (
+                    "test::TraceHook",
+                    Arc::new(hook.clone()) as Arc<dyn PluginFactory>,
+                )
+            })
+            .collect();
+        super::create_plugins(&factories, None, empty_info).expect("a factory is registered")
     }
 
     /// The info of a first invocation with no operations.
@@ -4918,5 +5115,293 @@ mod tests {
         let shut = catch_unwind(AssertUnwindSafe(|| plugins.shut_down()));
         assert!(shut.is_ok(), "a nested payload's destructor panic escaped");
         assert!(plugins.take_error_drop_panics().is_empty());
+    }
+
+    // Propagation hook.
+
+    use super::test_support::{TraceHook, trace_plugins};
+
+    const CONFLICT: &str = "conflicting propagation trace ids; keeping the first value";
+    const TRACE_PANICKED: &str = "plugin propagation_trace_id panicked; the value is ignored";
+    const TRACE_FAILED: &str = "plugin propagation_trace_id failed; the value is ignored";
+
+    /// The input every propagation test passes.
+    fn trace_input() -> PropagationInput {
+        PropagationInput::new(
+            "arn:exec".to_owned(),
+            "op-1".to_owned(),
+            Some("parent-1".to_owned()),
+            "target-fn".to_owned(),
+        )
+    }
+
+    /// Asks `hooks` for a trace header, and returns the header and the
+    /// plugin-target warnings.
+    ///
+    /// The scenario retries until it captures `expected` warnings, as the
+    /// other capture tests of this module do: a concurrent test can
+    /// rebuild `tracing`'s callsite-interest cache and drop a warning
+    /// before it reaches this thread's subscriber. The returned header is
+    /// the same on every attempt.
+    #[expect(clippy::panic)] // reason: reports that no attempt captured the warnings
+    fn trace_id_of(
+        hooks: &[TraceHook],
+        expected: usize,
+    ) -> (Option<String>, Vec<serde_json::Value>) {
+        for _attempt in 0..5 {
+            let (buffer, guard) = capture();
+            let value = trace_plugins(hooks).propagation_trace_id(&trace_input());
+            drop(guard);
+            let warnings = warnings(&buffer);
+            if warnings.len() == expected {
+                return (value, warnings);
+            }
+            assert!(
+                warnings.len() < expected,
+                "more warnings than expected: {warnings:?}"
+            );
+        }
+        panic!("no attempt captured {expected} warnings");
+    }
+
+    #[test]
+    fn trace_id_none_without_answers() {
+        let (value, warnings) = trace_id_of(&[TraceHook::value(None), TraceHook::value(None)], 0);
+        assert_eq!(value, None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// A plugin that answers no value does not end the loop: every later
+    /// plugin is asked, and a conflict names the plugins that gave the two
+    /// values, not the first plugin asked.
+    #[test]
+    fn trace_id_none_continues_to_later_plugins() {
+        let hooks = [
+            TraceHook::value(None),
+            TraceHook::value(Some("Root=1-a")),
+            TraceHook::value(None),
+            TraceHook::value(Some("Root=1-b")),
+        ];
+        let (value, warnings) = trace_id_of(&hooks, 1);
+        assert_eq!(value.as_deref(), Some("Root=1-a"));
+        // `trace_id_of` may retry, and each attempt asks every plugin once,
+        // so every hook was called the same, non-zero number of times.
+        let calls: Vec<usize> = hooks.iter().map(|hook| hook.inputs().len()).collect();
+        let first = calls.first().copied().unwrap_or(0);
+        assert!(first > 0, "{calls:?}");
+        assert!(calls.iter().all(|&count| count == first), "{calls:?}");
+        let [conflict] = with_message(&warnings, CONFLICT)[..] else {
+            unreachable!("one conflict: {warnings:?}");
+        };
+        assert_eq!(field(conflict, "first_plugin"), "TraceHook (plugins[1])");
+        assert_eq!(field(conflict, "later_plugin"), "TraceHook (plugins[3])");
+        assert_eq!(conflict.get("conflict_count"), Some(&serde_json::json!(1)));
+    }
+
+    #[test]
+    fn trace_id_first_non_blank_wins() {
+        let (value, warnings) = trace_id_of(
+            &[
+                TraceHook::value(Some("Root=1-a")),
+                TraceHook::value(Some("Root=1-b")),
+            ],
+            1,
+        );
+        assert_eq!(value.as_deref(), Some("Root=1-a"));
+        let [conflict] = with_message(&warnings, CONFLICT)[..] else {
+            unreachable!("one conflict: {warnings:?}");
+        };
+        assert_eq!(field(conflict, "field"), "x_amzn_trace_id");
+        assert!(
+            field(conflict, "first_plugin").ends_with("(plugins[0])"),
+            "{conflict}"
+        );
+        assert!(
+            field(conflict, "later_plugin").ends_with("(plugins[1])"),
+            "{conflict}"
+        );
+        assert_eq!(conflict.get("conflict_count"), Some(&serde_json::json!(1)));
+    }
+
+    /// Each conflict of one call counts from 1, and every later value is
+    /// compared with the first value.
+    #[test]
+    fn trace_id_conflicts_are_counted() {
+        let (value, warnings) = trace_id_of(
+            &[
+                TraceHook::value(Some("Root=1-a")),
+                TraceHook::value(Some("Root=1-b")),
+                TraceHook::value(Some("Root=1-c")),
+            ],
+            2,
+        );
+        assert_eq!(value.as_deref(), Some("Root=1-a"));
+        let conflicts = with_message(&warnings, CONFLICT);
+        let counts: Vec<_> = conflicts
+            .iter()
+            .map(|w| {
+                (
+                    w.get("conflict_count").cloned(),
+                    field(w, "later_plugin").to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                (
+                    Some(serde_json::json!(1)),
+                    "TraceHook (plugins[1])".to_owned()
+                ),
+                (
+                    Some(serde_json::json!(2)),
+                    "TraceHook (plugins[2])".to_owned()
+                ),
+            ]
+        );
+        for conflict in conflicts {
+            assert_eq!(field(conflict, "first_plugin"), "TraceHook (plugins[0])");
+        }
+    }
+
+    #[test]
+    fn trace_id_blank_is_skipped() {
+        let (value, warnings) = trace_id_of(
+            &[
+                TraceHook::value(Some("  ")),
+                TraceHook::value(Some("Root=1-a")),
+            ],
+            0,
+        );
+        assert_eq!(value.as_deref(), Some("Root=1-a"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// A blank value after a kept value is no value, not a conflict.
+    #[test]
+    fn trace_id_blank_after_value_is_no_conflict() {
+        let (value, warnings) = trace_id_of(
+            &[
+                TraceHook::value(Some("Root=1-a")),
+                TraceHook::value(Some("")),
+            ],
+            0,
+        );
+        assert_eq!(value.as_deref(), Some("Root=1-a"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn trace_id_same_value_is_no_conflict() {
+        let (value, warnings) = trace_id_of(
+            &[
+                TraceHook::value(Some("Root=1-a")),
+                TraceHook::value(Some("Root=1-a")),
+            ],
+            0,
+        );
+        assert_eq!(value.as_deref(), Some("Root=1-a"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn trace_id_kept_unchanged() {
+        let (value, warnings) = trace_id_of(&[TraceHook::value(Some(" Root=1-a "))], 0);
+        assert_eq!(value.as_deref(), Some(" Root=1-a "));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    #[expect(clippy::panic)] // reason: the plugin panic under test
+    fn trace_id_panic_is_ignored() {
+        let (value, warnings) = trace_id_of(
+            &[
+                TraceHook::new(|_| panic!("trace boom")),
+                TraceHook::value(Some("Root=1-a")),
+            ],
+            1,
+        );
+        assert_eq!(value.as_deref(), Some("Root=1-a"));
+        let [panicked] = with_message(&warnings, TRACE_PANICKED)[..] else {
+            unreachable!("one panic record: {warnings:?}");
+        };
+        assert!(
+            field(panicked, "plugin").ends_with("(plugins[0])"),
+            "{panicked}"
+        );
+    }
+
+    #[test]
+    fn propagation_err_is_logged_and_skipped() {
+        let (value, warnings) = trace_id_of(
+            &[
+                TraceHook::new(|_| Err("x".into())),
+                TraceHook::value(Some("Root=1-a")),
+            ],
+            1,
+        );
+        assert_eq!(value.as_deref(), Some("Root=1-a"));
+        let [failed] = with_message(&warnings, TRACE_FAILED)[..] else {
+            unreachable!("one failure record: {warnings:?}");
+        };
+        assert!(
+            field(failed, "plugin").ends_with("(plugins[0])"),
+            "{failed}"
+        );
+        assert_eq!(field(failed, "error"), "x");
+    }
+
+    /// An error whose `Display` panics is logged without its text, and the
+    /// next plugin's value is used.
+    #[test]
+    fn propagation_err_display_panic_is_logged() {
+        let (value, warnings) = trace_id_of(
+            &[
+                TraceHook::new(|_| Err(Box::new(PanickingDisplayError))),
+                TraceHook::value(Some("Root=1-a")),
+            ],
+            1,
+        );
+        assert_eq!(value.as_deref(), Some("Root=1-a"));
+        let [unformatted] = with_message(
+            &warnings,
+            "plugin propagation_trace_id failed, and its error panicked while it was \
+             formatted; the value is ignored",
+        )[..] else {
+            unreachable!("one record: {warnings:?}");
+        };
+        assert_eq!(field(unformatted, "plugin"), "TraceHook (plugins[0])");
+    }
+
+    /// The SDK drops an error it delivers to nobody inside a catch, and
+    /// records a panic of its destructor, which fails the invocation.
+    #[test]
+    fn propagation_err_destructor_panic_is_recorded() {
+        let plugins = trace_plugins(&[
+            TraceHook::new(|_| Err(Box::new(DropPanicError))),
+            TraceHook::value(Some("Root=1-a")),
+        ]);
+        let value = plugins.propagation_trace_id(&trace_input());
+        assert_eq!(value.as_deref(), Some("Root=1-a"));
+        let kept = plugins.take_error_drop_panics();
+        let [payload] = kept.as_slice() else {
+            unreachable!("one kept panic, got {}", kept.len());
+        };
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"error drop"));
+    }
+
+    #[test]
+    fn trace_id_input_fields() {
+        let hook = TraceHook::value(None);
+        let value = trace_plugins(std::slice::from_ref(&hook)).propagation_trace_id(&trace_input());
+        assert_eq!(value, None);
+        let inputs = hook.inputs();
+        let [input] = inputs.as_slice() else {
+            unreachable!("one call, got {}", inputs.len());
+        };
+        assert_eq!(input.execution_arn(), "arn:exec");
+        assert_eq!(input.operation_id(), "op-1");
+        assert_eq!(input.parent_operation_id(), Some("parent-1"));
+        assert_eq!(input.target_function_name(), "target-fn");
     }
 }

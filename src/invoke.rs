@@ -88,6 +88,18 @@ where
         )
         .await?;
 
+        // Ask the plugins for the chained invoke's trace header. A recorded
+        // invoke returned above, so only a new START asks. The hook runs on
+        // this task before the checkpoint call.
+        let x_amzn_trace_id = self.ctx.plugins().and_then(|plugins| {
+            plugins.propagation_trace_id(&crate::plugin::PropagationInput::new(
+                self.ctx.execution_arn().to_owned(),
+                wire_id.clone(),
+                self.ctx.parent_wire_id().map(str::to_owned),
+                self.function_id.clone(),
+            ))
+        });
+
         // Checkpoint ChainedInvokeStarted then suspend.
         let update = build_chained_invoke_start(
             &wire_id,
@@ -96,6 +108,7 @@ where
             &self.function_id,
             &wire_payload,
             self.tenant_id.as_deref(),
+            x_amzn_trace_id.as_deref(),
         );
         if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
             // Audit (#43): chained-invoke START: no user code ran (the
@@ -415,10 +428,14 @@ fn build_chained_invoke_start(
     function_name: &str,
     payload: &str,
     tenant_id: Option<&str>,
+    x_amzn_trace_id: Option<&str>,
 ) -> OperationUpdate {
     let mut invoke_opts_builder = ChainedInvokeOptions::builder().function_name(function_name);
     if let Some(tid) = tenant_id {
         invoke_opts_builder = invoke_opts_builder.tenant_id(tid);
+    }
+    if let Some(trace_id) = x_amzn_trace_id {
+        invoke_opts_builder = invoke_opts_builder.x_amzn_trace_id(trace_id);
     }
     #[expect(clippy::expect_used)] // reason: function_name is always set
     let invoke_opts = invoke_opts_builder
@@ -1460,6 +1477,234 @@ mod tests {
             "serdes deserialize failed",
         )
         .await;
+    }
+
+    // Propagation hook.
+
+    use crate::plugin::test_support::{TraceHook, trace_plugins};
+
+    /// A root context over an empty log, with `plugins`, whose transport is
+    /// `client`.
+    fn trace_ctx(
+        client: &Arc<crate::client::InMemoryExecutionClient>,
+        log: CheckpointLog,
+        plugins: Option<Arc<crate::plugin::InvocationPlugins>>,
+    ) -> DurableContext {
+        DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+            Arc::clone(client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+            None,
+            plugins,
+        )
+    }
+
+    /// Runs `body` as the handler until it suspends, and asserts that it did.
+    async fn run_until_pending<F>(ctx: &DurableContext, body: F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send,
+    {
+        let signal = Arc::clone(ctx.coordinator());
+        let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            body,
+        )
+        .await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+    }
+
+    /// The chained-invoke `START` updates `client` recorded.
+    fn invoke_starts(client: &crate::client::InMemoryExecutionClient) -> Vec<OperationUpdate> {
+        client
+            .recorded_updates()
+            .into_iter()
+            .filter(|u| {
+                u.r#type() == &OperationType::ChainedInvoke && u.action() == &OperationAction::Start
+            })
+            .collect()
+    }
+
+    /// The trace header of the one chained-invoke `START` a live invoke
+    /// with `plugins` records, and that update.
+    async fn live_start(plugins: Option<Arc<crate::plugin::InvocationPlugins>>) -> OperationUpdate {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = trace_ctx(&client, CheckpointLog::empty(), plugins);
+        run_until_pending(
+            &ctx,
+            ctx.invoke::<u32, _>("target-fn", 1_u32)
+                .name("call")
+                .tenant_id("tenant-1".to_owned())
+                .into_future(),
+        )
+        .await;
+        let starts = invoke_starts(&client);
+        let [start] = starts.as_slice() else {
+            unreachable!("one invoke START, got {}", starts.len());
+        };
+        start.clone()
+    }
+
+    #[tokio::test]
+    async fn invoke_start_carries_plugin_trace_id() {
+        let start = live_start(Some(trace_plugins(&[TraceHook::value(Some("Root=1-abc"))]))).await;
+        let options = start.chained_invoke_options().expect("invoke options");
+        assert_eq!(options.x_amzn_trace_id(), Some("Root=1-abc"));
+        assert_eq!(options.function_name(), "target-fn");
+    }
+
+    #[tokio::test]
+    async fn invoke_start_without_plugins_has_no_trace_id() {
+        let start = live_start(None).await;
+        let options = start.chained_invoke_options().expect("invoke options");
+        assert_eq!(options.x_amzn_trace_id(), None);
+        assert_eq!(options.function_name(), "target-fn");
+        assert_eq!(options.tenant_id(), Some("tenant-1"));
+    }
+
+    #[tokio::test]
+    async fn invoke_start_blank_trace_id_is_absent() {
+        let start = live_start(Some(trace_plugins(&[TraceHook::value(Some(""))]))).await;
+        let options = start.chained_invoke_options().expect("invoke options");
+        assert_eq!(options.x_amzn_trace_id(), None);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::panic)] // reason: the plugin panic under test
+    async fn invoke_start_panicking_trace_hook_is_ignored() {
+        let start = live_start(Some(trace_plugins(&[
+            TraceHook::new(|_| panic!("trace boom")),
+            TraceHook::value(Some("Root=1-abc")),
+        ])))
+        .await;
+        let options = start.chained_invoke_options().expect("invoke options");
+        assert_eq!(options.x_amzn_trace_id(), Some("Root=1-abc"));
+    }
+
+    #[tokio::test]
+    async fn invoke_replay_does_not_ask_plugins() {
+        let wire_key = crate::engine::compute_wire_id_public("1");
+        let mut record = CheckpointRecord::with_status(&wire_key, CheckpointStatus::Started);
+        record.op_type = Some("ChainedInvoke".to_owned());
+        record.sub_type = Some(CHAINED_INVOKE_SUB_TYPE.to_owned());
+        record.op_name = Some("call".to_owned());
+        let hook = TraceHook::value(Some("Root=1-abc"));
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = trace_ctx(
+            &client,
+            CheckpointLog::from_records(vec![(wire_key, record)]),
+            Some(trace_plugins(std::slice::from_ref(&hook))),
+        );
+        run_until_pending(
+            &ctx,
+            ctx.invoke::<u32, _>("target-fn", 1_u32)
+                .name("call")
+                .into_future(),
+        )
+        .await;
+        assert_eq!(hook.inputs().len(), 0);
+        assert!(
+            client.recorded_updates().is_empty(),
+            "{:?}",
+            client.recorded_updates()
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_nested_trace_input_has_parent() {
+        let hook = TraceHook::value(None);
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = trace_ctx(
+            &client,
+            CheckpointLog::empty(),
+            Some(trace_plugins(std::slice::from_ref(&hook))),
+        );
+        run_until_pending(
+            &ctx,
+            ctx.run_in_child_context(|child| async move {
+                Ok(child
+                    .invoke::<u32, _>("target-fn", 1_u32)
+                    .name("call")
+                    .await?)
+            })
+            .name("outer")
+            .into_future(),
+        )
+        .await;
+        let child_start = client
+            .recorded_updates()
+            .into_iter()
+            .find(|u| u.name() == Some("outer"))
+            .expect("the child context's START");
+        let starts = invoke_starts(&client);
+        let [start] = starts.as_slice() else {
+            unreachable!("one invoke START, got {}", starts.len());
+        };
+        let inputs = hook.inputs();
+        let [input] = inputs.as_slice() else {
+            unreachable!("one hook call, got {}", inputs.len());
+        };
+        assert_eq!(input.parent_operation_id(), Some(child_start.id()));
+        assert_eq!(input.operation_id(), start.id());
+        assert_eq!(input.execution_arn(), "arn:test");
+        assert_eq!(input.target_function_name(), "target-fn");
+    }
+
+    #[tokio::test]
+    async fn invoke_serialize_failure_skips_trace_hook() {
+        /// A payload serdes whose serialization fails.
+        struct FailingSerdes;
+        impl Serdes<u32> for FailingSerdes {
+            // reason: exercises the async-fn impl form user code writes
+            #[expect(clippy::unused_async_trait_impl)]
+            async fn serialize(
+                &self,
+                _value: u32,
+                _context: SerdesContext,
+            ) -> Result<String, crate::BoxError> {
+                Err("boom: cannot serialize".into())
+            }
+            // reason: exercises the async-fn impl form user code writes
+            #[expect(clippy::unused_async_trait_impl)]
+            async fn deserialize(
+                &self,
+                _wire: String,
+                _context: SerdesContext,
+            ) -> Result<u32, crate::BoxError> {
+                Ok(0)
+            }
+        }
+
+        let hook = TraceHook::value(Some("Root=1-abc"));
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = trace_ctx(
+            &client,
+            CheckpointLog::empty(),
+            Some(trace_plugins(std::slice::from_ref(&hook))),
+        );
+        let err = ctx
+            .invoke::<u32, _>("target-fn", 1_u32)
+            .name("charge")
+            .payload_serdes(FailingSerdes)
+            .await
+            .unwrap_err();
+        let OperationErrorKind::Invoke(inner) = err.kind() else {
+            panic!("expected Invoke error, got {:?}", err.kind());
+        };
+        assert!(
+            matches!(inner.kind(), InvokeErrorKind::SerializationFailed),
+            "expected SerializationFailed, got {inner}"
+        );
+        assert!(format!("{err:#}").contains("boom"), "{err:#}");
+        assert!(
+            client.recorded_updates().is_empty(),
+            "must not checkpoint when input serialization fails"
+        );
+        assert_eq!(hook.inputs().len(), 0);
     }
 }
 
