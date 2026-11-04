@@ -46,13 +46,14 @@
 //! remaining input waits and nothing else runs, the invocation coordinator
 //! suspends the invocation (issue #49).
 
+use std::future::Future;
 use std::sync::Arc;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::child::CHECKPOINT_SIZE_LIMIT_BYTES;
-use crate::context::DurableContext;
+use crate::context::{DurableContext, SubmittedWrite};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     ChildContextError, ChildContextErrorKind, CombinatorError, CombinatorErrorKind, OperationError,
@@ -198,7 +199,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         // inputs again (`reconstruct`). Reconstruction writes no checkpoint
         // and emits no `operation_replayed` event, as child-context
         // reconstruction does.
-        let reconstruct = if let Some(view) = self.ctx.checkpoint_view_validated(
+        let run = if let Some(view) = self.ctx.checkpoint_view_validated(
             &positional_id,
             &wire_id,
             "Context",
@@ -206,7 +207,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
             self.name.as_deref(),
         )? {
             match view.status {
-                CheckpointStatus::Succeeded if view.replay_children => true,
+                CheckpointStatus::Succeeded if view.replay_children => Run::Reconstruct,
                 CheckpointStatus::Succeeded => {
                     // Decode FIRST, then emit `operation_replayed`: a corrupt
                     // payload surfaces as an error without the event.
@@ -235,28 +236,29 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
                         .unwrap_or_default();
                     return Err(replay_combinator_failure(wire, &wire_id));
                 }
-                _ => {
-                    // Started/Pending: fall through to re-execute.
-                    combinator_resumed(&self.ctx, &wire_id, self.name.as_deref());
-                    false
-                }
+                // Started/Pending/Ready: run the inputs again.
+                _ => Run::Resumed,
             }
         } else {
-            // First invocation: checkpoint START.
-            checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
-            false
+            Run::Live
         };
-
-        reject_unclaimed_inputs(&self.ctx, &positional_id, &self.futures)?;
+        let reconstruct = run == Run::Reconstruct;
 
         // Live path: run all futures concurrently, fail-fast on first error.
         let count = self.futures.len();
         let mut results: Vec<Option<O>> = (0..count).map(|_| None).collect();
-        let mut join_set = constituent_set(&self.ctx);
-
-        for (idx, future) in self.futures.into_iter().enumerate() {
-            spawn_constituent(&self.ctx, &mut join_set, idx, future)?;
-        }
+        let Running {
+            mut join_set,
+            start,
+        } = start_inputs(
+            &self.ctx,
+            &positional_id,
+            &wire_id,
+            self.name.as_deref(),
+            run,
+            self.futures,
+        )
+        .await?;
 
         let mut first_error: Option<(usize, OperationError)> = None;
         while let Some((_, joined)) = join_set.join_next_with_id().await {
@@ -288,7 +290,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
                 &format!("{JOIN_FAILED_ERROR_TYPE_PREFIX}{failed_index}"),
             );
             if !reconstruct {
-                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire).await?;
             }
             // The loser is preserved as an error, reachable via source().
             return Err(OperationError::from_kind(OperationErrorKind::Combinator(
@@ -318,8 +320,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         // so it returns what the live path returned, and writes nothing.
         let serialized = serialize_result(&collected)?;
         if !reconstruct {
-            checkpoint_collection_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized)
-                .await?;
+            checkpoint_collection_succeed(
+                &self.ctx,
+                &wire_id,
+                self.name.as_deref(),
+                start,
+                &serialized,
+            )
+            .await?;
         }
         drop(collected);
 
@@ -375,6 +383,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
     /// Replay path: returns frozen `Vec<Result<O, OperationError>>`, or,
     /// for a record with `ReplayChildren`, drives the inputs again without
     /// writing.
+    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<Vec<Result<O, OperationError>>, OperationError> {
         // Task-ownership check.
         self.ctx.enforce_task_ownership()?;
@@ -391,7 +400,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
         // inputs again (`reconstruct`). Reconstruction writes no checkpoint
         // and emits no `operation_replayed` event, as child-context
         // reconstruction does.
-        let reconstruct = if let Some(view) = self.ctx.checkpoint_view_validated(
+        let run = if let Some(view) = self.ctx.checkpoint_view_validated(
             &positional_id,
             &wire_id,
             "Context",
@@ -399,7 +408,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             self.name.as_deref(),
         )? {
             match view.status {
-                CheckpointStatus::Succeeded if view.replay_children => true,
+                CheckpointStatus::Succeeded if view.replay_children => Run::Reconstruct,
                 CheckpointStatus::Succeeded => {
                     // Decode FIRST, then emit `operation_replayed`: a corrupt
                     // payload surfaces as an error without the event.
@@ -428,27 +437,30 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
                         .unwrap_or_default();
                     return Err(replay_combinator_failure(wire, &wire_id));
                 }
-                _ => {
-                    combinator_resumed(&self.ctx, &wire_id, self.name.as_deref());
-                    false
-                }
+                // Started/Pending/Ready: run the inputs again.
+                _ => Run::Resumed,
             }
         } else {
-            checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
-            false
+            Run::Live
         };
-
-        reject_unclaimed_inputs(&self.ctx, &positional_id, &self.futures)?;
+        let reconstruct = run == Run::Reconstruct;
 
         // Live path: run all futures, never short-circuit.
         let count = self.futures.len();
         let mut outcomes: Vec<Option<Result<O, OperationError>>> =
             (0..count).map(|_| None).collect();
-        let mut join_set = constituent_set(&self.ctx);
-
-        for (idx, future) in self.futures.into_iter().enumerate() {
-            spawn_constituent(&self.ctx, &mut join_set, idx, future)?;
-        }
+        let Running {
+            mut join_set,
+            start,
+        } = start_inputs(
+            &self.ctx,
+            &positional_id,
+            &wire_id,
+            self.name.as_deref(),
+            run,
+            self.futures,
+        )
+        .await?;
 
         while let Some((_, joined)) = join_set.join_next_with_id().await {
             // A panicked input resumes its panic here.
@@ -499,8 +511,14 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
             serialize_result(&serializable)?
         };
         if !reconstruct {
-            checkpoint_collection_succeed(&self.ctx, &wire_id, self.name.as_deref(), &serialized)
-                .await?;
+            checkpoint_collection_succeed(
+                &self.ctx,
+                &wire_id,
+                self.name.as_deref(),
+                start,
+                &serialized,
+            )
+            .await?;
         }
         drop(collected);
 
@@ -538,7 +556,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
 
         // Replay path. The validated view covers the non-terminal branches
         // without cloning.
-        if let Some(view) = self.ctx.checkpoint_view_validated(
+        let run = if let Some(view) = self.ctx.checkpoint_view_validated(
             &positional_id,
             &wire_id,
             "Context",
@@ -579,21 +597,36 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                         .unwrap_or_default();
                     return Err(replay_combinator_failure(wire, &wire_id));
                 }
-                _ => combinator_resumed(&self.ctx, &wire_id, self.name.as_deref()),
+                // Started/Pending/Ready: run the inputs again.
+                _ => Run::Resumed,
             }
         } else {
-            checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
-        }
+            Run::Live
+        };
+
+        let empty = self.futures.is_empty();
+        let Running {
+            mut join_set,
+            start,
+        } = start_inputs(
+            &self.ctx,
+            &positional_id,
+            &wire_id,
+            self.name.as_deref(),
+            run,
+            self.futures,
+        )
+        .await?;
 
         // Empty input: there is no future that could succeed. Fail
         // explicitly with `EmptyInput` (matching `race`) rather than an
         // `AllFailed` carrying zero errors.
-        if self.futures.is_empty() {
+        if empty {
             let wire = crate::error::WireError::new(
                 Some(EMPTY_INPUT_ERROR_TYPE),
                 Some("select_ok called with no futures"),
             );
-            checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+            checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire).await?;
             // Attach the checkpointed context so the live error matches
             // what a replay of this record reconstructs.
             return Err(combinator_empty_input_error()
@@ -601,15 +634,8 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                 .with_wire(wire));
         }
 
-        reject_unclaimed_inputs(&self.ctx, &positional_id, &self.futures)?;
-
         // Live path: race all futures, keep going until one succeeds or all
         // fail.
-        let mut join_set = constituent_set(&self.ctx);
-
-        for (idx, future) in self.futures.into_iter().enumerate() {
-            spawn_constituent(&self.ctx, &mut join_set, idx, future)?;
-        }
 
         let mut errors: Vec<(usize, crate::error::Source)> = Vec::new();
 
@@ -627,6 +653,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
                         &self.ctx,
                         &wire_id,
                         self.name.as_deref(),
+                        start,
                         idx,
                         &serialized,
                     )
@@ -688,7 +715,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         )
         .with_error_data(Some(losers_json));
 
-        checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+        checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire).await?;
 
         Err(
             OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
@@ -717,6 +744,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
     /// cancelled input stops at its next `.await`.
     /// Replay path: returns the frozen result, or, for a record with
     /// `ReplayChildren`, drives only the recorded winner again.
+    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         self.ctx.enforce_task_ownership()?;
 
@@ -725,7 +753,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
 
         // Replay path. The validated view covers the non-terminal branches
         // without cloning.
-        if let Some(view) = self.ctx.checkpoint_view_validated(
+        let run = if let Some(view) = self.ctx.checkpoint_view_validated(
             &positional_id,
             &wire_id,
             "Context",
@@ -766,20 +794,35 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                         .unwrap_or_default();
                     return Err(replay_combinator_failure(wire, &wire_id));
                 }
-                _ => combinator_resumed(&self.ctx, &wire_id, self.name.as_deref()),
+                // Started/Pending/Ready: run the inputs again.
+                _ => Run::Resumed,
             }
         } else {
-            checkpoint_start(&self.ctx, &wire_id, self.name.as_deref()).await?;
-        }
+            Run::Live
+        };
+
+        let empty = self.futures.is_empty();
+        let Running {
+            mut join_set,
+            start,
+        } = start_inputs(
+            &self.ctx,
+            &positional_id,
+            &wire_id,
+            self.name.as_deref(),
+            run,
+            self.futures,
+        )
+        .await?;
 
         // Empty input: there is no future that could settle. Fail
         // explicitly with `EmptyInput` (matching `select_ok`).
-        if self.futures.is_empty() {
+        if empty {
             let wire = crate::error::WireError::new(
                 Some(EMPTY_INPUT_ERROR_TYPE),
                 Some("race called with no futures"),
             );
-            checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+            checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire).await?;
             // Attach the checkpointed context so the live error matches
             // what a replay of this record reconstructs.
             return Err(combinator_empty_input_error()
@@ -787,17 +830,10 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                 .with_wire(wire));
         }
 
-        reject_unclaimed_inputs(&self.ctx, &positional_id, &self.futures)?;
-
         // Live path: race all futures, first settled wins. A losing input
         // that waits stays pending and never suspends the invocation once
         // the winner settled (issue #49): the winner is recorded, and the
         // losers are aborted.
-        let mut join_set = constituent_set(&self.ctx);
-
-        for (idx, future) in self.futures.into_iter().enumerate() {
-            spawn_constituent(&self.ctx, &mut join_set, idx, future)?;
-        }
 
         // Wait for the first SETTLED task. When every input waits, the race
         // stays pending here.
@@ -823,6 +859,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                     &self.ctx,
                     &wire_id,
                     self.name.as_deref(),
+                    start,
                     idx,
                     &serialized,
                 )
@@ -842,7 +879,7 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
                 // records none).
                 let wire =
                     crate::error::wire_error_with_type(&op_err, FIRST_SETTLED_FAILED_ERROR_TYPE);
-                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), &wire).await?;
+                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire).await?;
                 Err(OperationError::from_kind(OperationErrorKind::Combinator(
                     CombinatorError::new(
                         CombinatorErrorKind::FirstSettledFailed,
@@ -854,6 +891,28 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
             }
         }
     }
+}
+
+/// The test hook called with an input's index immediately before the
+/// input's retained remainder is spawned.
+#[cfg(test)]
+type RemainderRecorder = Box<dyn Fn(usize)>;
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's [`RemainderRecorder`], when a test installed one.
+    static REMAINDER_RECORDER: std::cell::RefCell<Option<RemainderRecorder>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Calls the remainder recorder of this thread, when a test installed one.
+#[cfg(test)]
+fn record_remainder(idx: usize) {
+    REMAINDER_RECORDER.with(|recorder| {
+        if let Some(recorder) = &*recorder.borrow() {
+            recorder(idx);
+        }
+    });
 }
 
 /// Spawns one combinator input onto `join_set`.
@@ -874,34 +933,168 @@ fn spawn_constituent<O: Send + 'static>(
         .map_err(NoRuntime::operation_error)
 }
 
-/// Fails a combinator that would start a still-unclaimed combinator input.
+/// The message of the context usage error for the first still-unclaimed
+/// combinator input, or `None` when every input claimed its ID.
 ///
 /// A combinator claims its operation ID on its first poll or at `.spawn()`.
 /// An outer combinator polls its inputs on tasks it spawns, so two
 /// unclaimed inner combinators would claim their IDs in scheduler order,
 /// and the IDs would differ between runs. JS rejects the same handler with
-/// its context usage error. So every path that would start inputs calls
-/// this first, after any START write the path needs and before it starts
-/// any input. For the first unclaimed combinator input, it records an
-/// execution-fatal context usage error and returns it. No input runs, and
-/// the outer combinator writes neither `SUCCEED` nor `FAIL`.
+/// its context usage error. So every path that would start inputs checks
+/// this before it begins any input. It records nothing:
+/// [`reject_unclaimed`] does, once the combinator's own start step allows.
 ///
 /// `outer` is the positional ID of the outer combinator.
-fn reject_unclaimed_inputs<O: Send + 'static>(
-    ctx: &DurableContext,
+fn unclaimed_input_message<O: Send + 'static>(
     outer: &str,
     futures: &[DurableFuture<O>],
-) -> Result<(), OperationError> {
-    let message = futures
+) -> Option<String> {
+    futures
         .iter()
         .find(|future| future.is_unclaimed_combinator())
-        .and_then(|future| future.unclaimed_input_message(outer));
-    if let Some(message) = message {
-        ctx.coordinator()
-            .record_fatal("Error".to_owned(), message.clone());
-        return Err(combinator_internal_error(&message));
+        .and_then(|future| future.unclaimed_input_message(outer))
+}
+
+/// Records the context usage error `message` as execution-fatal, and
+/// returns it. No input runs, and the outer combinator writes neither
+/// `SUCCEED` nor `FAIL`.
+fn reject_unclaimed(ctx: &DurableContext, message: &str) -> OperationError {
+    ctx.coordinator()
+        .record_fatal("Error".to_owned(), message.to_owned());
+    combinator_internal_error(message)
+}
+
+/// How a combinator runs its inputs in this cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// No record: queue `START`, then run the inputs.
+    Live,
+    /// A `STARTED`, `PENDING` or `READY` record: fire the replay start
+    /// hook, then run the inputs.
+    Resumed,
+    /// A `SUCCEEDED` record with `ReplayChildren`: run the inputs again to
+    /// rebuild the result, and write nothing.
+    Reconstruct,
+}
+
+/// A combinator's running inputs, and its retained `START` write.
+struct Running<O> {
+    join_set: TrackedJoinSet<(usize, Result<O, OperationError>)>,
+    /// The combinator's `START` write, which its outcome write awaits.
+    /// `None` when the cycle queued no `START`.
+    start: Option<SubmittedWrite>,
+}
+
+/// Begins the combinator's inputs, then runs its own start step, then
+/// spawns the inputs' remainders, in that order:
+///
+/// 1. A still-unclaimed combinator input is detected first (see
+///    [`unclaimed_input_message`]). Reconstruction records and returns the
+///    error at once. Otherwise the combinator runs its own start step,
+///    waits for its `START` write when it queued one, and only then
+///    records and returns the error. A failed `START` write ends the
+///    invocation instead, so its failure wins. No input begins.
+/// 2. Each input's start phase begins, in input order. A lazy operation
+///    whose execution begins with the start step runs it now, on this
+///    task (see [`DurableFuture::begin_now`]). A lazy invoke or
+///    `wait_for_condition` is spawned unchanged, and this waits until it
+///    has been polled once, but not for its `START`. Every other input,
+///    such as a handle that `.spawn()` returned, is left as it is.
+/// 3. The combinator's own start step: without a record, its `START` is
+///    reserved, `on_operation_start` fires, and the `START` is released
+///    without waiting for the response, as a JS child context does. A
+///    resumable record fires the replay start hook instead.
+/// 4. The retained remainders of step 2 are spawned, in input order.
+async fn start_inputs<O: Send + 'static>(
+    ctx: &DurableContext,
+    positional_id: &str,
+    wire_id: &str,
+    name: Option<&str>,
+    run: Run,
+    futures: Vec<DurableFuture<O>>,
+) -> Result<Running<O>, OperationError> {
+    if let Some(message) = unclaimed_input_message(positional_id, &futures) {
+        drop(futures);
+        if let Some(start) = combinator_start(ctx, wire_id, name, run)
+            && let Err(err) = start.await
+        {
+            return ctx
+                .checkpoint_failure_unrecoverable(wire_id, err, None)
+                .await;
+        }
+        return Err(reject_unclaimed(ctx, &message));
     }
-    Ok(())
+
+    let mut join_set = constituent_set(ctx);
+    let mut remainders = Vec::with_capacity(futures.len());
+    for (idx, mut future) in futures.into_iter().enumerate() {
+        if future.starts_on_first_poll() {
+            let (polled, acknowledged) = tokio::sync::oneshot::channel();
+            let future = FirstPoll {
+                future,
+                polled: Some(polled),
+            };
+            join_set
+                .spawn(ctx.task_ownership(), async move { (idx, future.await) })
+                .map_err(NoRuntime::operation_error)?;
+            // A dropped sender means the task stopped before its first
+            // poll: there is nothing to wait for.
+            let _polled = acknowledged.await;
+        } else {
+            future.begin_now();
+            remainders.push((idx, future));
+        }
+    }
+
+    let start = combinator_start(ctx, wire_id, name, run);
+
+    for (idx, future) in remainders {
+        #[cfg(test)]
+        record_remainder(idx);
+        spawn_constituent(ctx, &mut join_set, idx, future)?;
+    }
+    Ok(Running { join_set, start })
+}
+
+/// An input future that reports its first poll through `polled`.
+struct FirstPoll<O> {
+    future: DurableFuture<O>,
+    polled: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl<O: Send + 'static> Future for FirstPoll<O> {
+    type Output = Result<O, OperationError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = &mut *self;
+        let poll = std::pin::Pin::new(&mut this.future).poll(cx);
+        if let Some(polled) = this.polled.take() {
+            // The combinator may have stopped waiting; nothing to report.
+            let _sent = polled.send(());
+        }
+        poll
+    }
+}
+
+/// The combinator's own start step for `run` (see [`start_inputs`]).
+/// Returns the retained `START` write when it queued one.
+fn combinator_start(
+    ctx: &DurableContext,
+    wire_id: &str,
+    name: Option<&str>,
+    run: Run,
+) -> Option<SubmittedWrite> {
+    match run {
+        Run::Live => Some(checkpoint_start(ctx, wire_id, name)),
+        Run::Resumed => {
+            combinator_resumed(ctx, wire_id, name);
+            None
+        }
+        Run::Reconstruct => None,
+    }
 }
 
 /// Creates the join set of one combinator's inputs, counted on the
@@ -934,12 +1127,12 @@ fn fatal_gate(ctx: &DurableContext) -> Result<(), OperationError> {
     Ok(())
 }
 
-/// Checkpoints a START action for a combinator operation.
-async fn checkpoint_start(
-    ctx: &DurableContext,
-    wire_id: &str,
-    name: Option<&str>,
-) -> Result<(), OperationError> {
+/// Queues the `START` of a combinator operation, as the start step of a
+/// child context does (see [`crate::start`]): the `START` is reserved,
+/// `on_operation_start` fires, and the `START` is released. Returns the
+/// write without waiting for it, so no request carries the `START` before
+/// the hook dispatch returns.
+fn checkpoint_start(ctx: &DurableContext, wire_id: &str, name: Option<&str>) -> SubmittedWrite {
     use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 
     let mut builder = OperationUpdate::builder()
@@ -960,21 +1153,14 @@ async fn checkpoint_start(
         .build()
         .expect("all required OperationUpdate fields set");
 
-    if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43): combinator START: no user code ran for the
-        // combined operation itself, so no terminal FAIL is needed;
-        // re-invocation reconverges on the same write.
-        return ctx
-            .checkpoint_failure_unrecoverable(wire_id, err, None)
-            .await;
-    }
+    let reserved = ctx.reserve_checkpoint_updates(vec![update]);
     if let Some(plugins) = ctx.plugins() {
         let info = combinator_info(ctx, wire_id, name)
             .with_status(crate::OperationStatus::Started)
             .with_replay(false);
         crate::plugin::operation_started(plugins, &info);
     }
-    Ok(())
+    reserved.release()
 }
 
 /// The plugin info of the combinator `wire_id`, created in `ctx`.
@@ -1023,12 +1209,13 @@ async fn checkpoint_collection_succeed(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
+    start: Option<SubmittedWrite>,
     serialized: &str,
 ) -> Result<(), OperationError> {
     if serialized.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
-        checkpoint_succeed(ctx, wire_id, name, "", true).await
+        checkpoint_succeed(ctx, wire_id, name, start, "", true).await
     } else {
-        checkpoint_succeed(ctx, wire_id, name, serialized, false).await
+        checkpoint_succeed(ctx, wire_id, name, start, serialized, false).await
     }
 }
 
@@ -1044,6 +1231,7 @@ async fn checkpoint_winner_succeed(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
+    start: Option<SubmittedWrite>,
     winner: usize,
     serialized: &str,
 ) -> Result<(), OperationError> {
@@ -1052,9 +1240,9 @@ async fn checkpoint_winner_succeed(
         // reason: a struct holding one `usize` always serializes to JSON.
         let record =
             serde_json::to_string(&RecordedWinner { winner }).expect("a RecordedWinner serializes");
-        checkpoint_succeed(ctx, wire_id, name, &record, true).await
+        checkpoint_succeed(ctx, wire_id, name, start, &record, true).await
     } else {
-        checkpoint_succeed(ctx, wire_id, name, serialized, false).await
+        checkpoint_succeed(ctx, wire_id, name, start, serialized, false).await
     }
 }
 
@@ -1062,7 +1250,7 @@ async fn checkpoint_winner_succeed(
 /// carries `ReplayChildren` and a [`RecordedWinner`] payload.
 ///
 /// 1. A still-unclaimed combinator input fails the execution (see
-///    [`reject_unclaimed_inputs`]), before any input is driven.
+///    [`unclaimed_input_message`]), before any input is driven.
 /// 2. The payload names the winner's input index. A missing payload, or one
 ///    that does not decode, is an internal error.
 /// 3. An index past the inputs is an internal error.
@@ -1079,7 +1267,9 @@ async fn replay_recorded_winner<O: Serialize + DeserializeOwned + Send + 'static
     positional_id: &str,
     futures: Vec<DurableFuture<O>>,
 ) -> Result<O, OperationError> {
-    reject_unclaimed_inputs(ctx, positional_id, &futures)?;
+    if let Some(message) = unclaimed_input_message(positional_id, &futures) {
+        return Err(reject_unclaimed(ctx, &message));
+    }
     let RecordedWinner { winner } = ctx
         .checkpoint_result_payload(positional_id)
         .and_then(|payload| serde_json::from_str(&payload).ok())
@@ -1110,10 +1300,14 @@ async fn checkpoint_succeed(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
+    start: Option<SubmittedWrite>,
     payload: &str,
     replay_children: bool,
 ) -> Result<(), OperationError> {
     use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
+
+    ctx.await_retained_start(wire_id, start, OperationAction::Succeed)
+        .await?;
 
     fatal_gate(ctx)?;
 
@@ -1173,9 +1367,13 @@ async fn checkpoint_fail(
     ctx: &DurableContext,
     wire_id: &str,
     name: Option<&str>,
+    start: Option<SubmittedWrite>,
     error: &crate::error::WireError,
 ) -> Result<(), OperationError> {
     use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
+
+    ctx.await_retained_start(wire_id, start, OperationAction::Fail)
+        .await?;
 
     fatal_gate(ctx)?;
 
@@ -1858,6 +2056,24 @@ mod tests {
             DurableFuture::from_async(async { Ok(1) }),
             DurableFuture::from_async(async { Ok(2) }),
         ]
+    }
+
+    /// An invoke or `wait_for_condition` input is spawned to be polled
+    /// once before the combinator's start step. Without a runtime that
+    /// spawn fails, and the combinator returns the error.
+    #[test]
+    fn first_poll_input_without_runtime_returns_error() {
+        assert_no_runtime_error(|ctx| {
+            let op_id = ctx.mint_id();
+            let input = DurableFuture::for_first_poll_operation(&ctx, async { Ok(1) });
+            TryJoinAllExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![input],
+            }
+            .execute()
+        });
     }
 
     #[test]
@@ -3477,6 +3693,588 @@ mod tests {
             }
         }
     }
+    /// The four outer combinators, in the order the tests below run them.
+    const OUTERS: [Outer; 4] = [
+        Outer::TryJoinAll,
+        Outer::JoinAll,
+        Outer::SelectOk,
+        Outer::Race,
+    ];
+
+    /// Awaits the combinator `outer`, named `all`, over `inputs`, and
+    /// drops its result.
+    fn run_outer<O>(
+        ctx: &DurableContext,
+        outer: Outer,
+        inputs: Vec<DurableFuture<O>>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+    where
+        O: Serialize + DeserializeOwned + Send + 'static,
+    {
+        use std::future::IntoFuture;
+        match outer {
+            Outer::TryJoinAll => {
+                let f = ctx.try_join_all(inputs).name("all").into_future();
+                Box::pin(async move { drop(f.await) })
+            }
+            Outer::JoinAll => {
+                let f = ctx.join_all(inputs).name("all").into_future();
+                Box::pin(async move { drop(f.await) })
+            }
+            Outer::SelectOk => {
+                let f = ctx.select_ok(inputs).name("all").into_future();
+                Box::pin(async move { drop(f.await) })
+            }
+            Outer::Race => {
+                let f = ctx.race(inputs).name("all").into_future();
+                Box::pin(async move { drop(f.await) })
+            }
+        }
+    }
+
+    /// Starts the combinator `outer`, named `all`, over `inputs` with its
+    /// own `.spawn()`. The returned future resolves to whether it
+    /// succeeded.
+    fn spawn_outer<O>(
+        ctx: &DurableContext,
+        outer: Outer,
+        inputs: Vec<DurableFuture<O>>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send>>
+    where
+        O: Serialize + DeserializeOwned + Send + 'static,
+    {
+        match outer {
+            Outer::TryJoinAll => {
+                let h = ctx.try_join_all(inputs).name("all").spawn();
+                Box::pin(async move { h.await.is_ok() })
+            }
+            Outer::JoinAll => {
+                let h = ctx.join_all(inputs).name("all").spawn();
+                Box::pin(async move { h.await.is_ok() })
+            }
+            Outer::SelectOk => {
+                let h = ctx.select_ok(inputs).name("all").spawn();
+                Box::pin(async move { h.await.is_ok() })
+            }
+            Outer::Race => {
+                let h = ctx.race(inputs).name("all").spawn();
+                Box::pin(async move { h.await.is_ok() })
+            }
+        }
+    }
+
+    /// Waits up to two seconds for `ready`. Returns whether it held.
+    async fn within_two_seconds(mut ready: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        true
+    }
+
+    /// One submission the recorder saw: the update's name, ID and action,
+    /// and the first-poll flag of its write.
+    type Submitted = (
+        String,
+        String,
+        aws_sdk_lambda::types::OperationAction,
+        Arc<AtomicBool>,
+    );
+
+    /// Installs a submission recorder on `ctx` and returns what it records.
+    fn record_submissions(ctx: &DurableContext) -> Arc<std::sync::Mutex<Vec<Submitted>>> {
+        let submissions: Arc<std::sync::Mutex<Vec<Submitted>>> = Arc::default();
+        let recorded = Arc::clone(&submissions);
+        ctx.set_submission_recorder(Arc::new(move |updates, flag| {
+            let mut recorded = recorded.lock().unwrap();
+            for u in updates {
+                recorded.push((
+                    u.name().unwrap_or("-").to_owned(),
+                    u.id().to_owned(),
+                    u.action().clone(),
+                    Arc::clone(flag),
+                ));
+            }
+        }));
+        submissions
+    }
+
+    /// The outcome a test-7 case expects the combinator to write.
+    #[derive(Clone, Copy, Debug)]
+    enum Written {
+        /// Both inputs succeed: `SUCCEED`.
+        Succeed,
+        /// Both inputs fail: `FAIL`.
+        Fail,
+        /// No inputs (`select_ok` and `race`): `FAIL`.
+        Empty,
+    }
+
+    impl Written {
+        fn action(self) -> aws_sdk_lambda::types::OperationAction {
+            match self {
+                Self::Succeed => aws_sdk_lambda::types::OperationAction::Succeed,
+                Self::Fail | Self::Empty => aws_sdk_lambda::types::OperationAction::Fail,
+            }
+        }
+
+        fn inputs(self) -> Vec<DurableFuture<i32>> {
+            match self {
+                Self::Succeed => vec![ready(1), ready(2)],
+                Self::Fail => vec![failing_input(), failing_input()],
+                Self::Empty => Vec::new(),
+            }
+        }
+    }
+
+    /// Every test-7 case. `join_all` records a failed input as an item and
+    /// never writes `FAIL`, and only `select_ok` and `race` fail on no
+    /// inputs.
+    fn outcome_cases() -> Vec<(Outer, Written)> {
+        let mut cases: Vec<(Outer, Written)> =
+            OUTERS.iter().map(|o| (*o, Written::Succeed)).collect();
+        cases.extend(
+            [Outer::TryJoinAll, Outer::SelectOk, Outer::Race]
+                .into_iter()
+                .map(|o| (o, Written::Fail)),
+        );
+        cases.extend(
+            [Outer::SelectOk, Outer::Race]
+                .into_iter()
+                .map(|o| (o, Written::Empty)),
+        );
+        cases
+    }
+
+    /// Runs one case of test 7. With `fail_start`, the first checkpoint
+    /// call, which carries the combinator's `START`, fails.
+    async fn outcome_case(outer: Outer, written: Written, fail_start: bool) -> Result<(), String> {
+        use aws_sdk_lambda::types::OperationAction;
+        let (ctx, client) = recording_ctx(CheckpointLog::empty());
+        if fail_start {
+            client.enqueue_checkpoint_response(crate::client::TestResponse::NonRetryableError(
+                "START rejected".to_owned(),
+            ));
+        }
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let held = Arc::clone(&gate);
+        ctx.set_pre_lock_gate(Arc::new(move |updates| {
+            updates
+                .iter()
+                .any(|u| u.action() == &OperationAction::Start && u.name() == Some("all"))
+                .then(|| Arc::clone(&held))
+        }));
+        let submissions = record_submissions(&ctx);
+        let entries: Arc<std::sync::Mutex<Vec<(String, OperationAction)>>> = Arc::default();
+        let entered = Arc::clone(&entries);
+        ctx.set_settler_entry_recorder(Arc::new(move |wire_id, action| {
+            entered.lock().unwrap().push((wire_id.to_owned(), action));
+        }));
+        let wire = crate::engine::compute_wire_id_public("1");
+        let action = written.action();
+        let outcomes = |submissions: &[Submitted]| {
+            submissions
+                .iter()
+                .filter(|(_, id, a, _)| {
+                    *id == wire && matches!(a, OperationAction::Succeed | OperationAction::Fail)
+                })
+                .count()
+        };
+        let mut combinator = run_outer(&ctx, outer, written.inputs());
+
+        let marker = within_two_seconds(|| {
+            entries
+                .lock()
+                .unwrap()
+                .contains(&(wire.clone(), action.clone()))
+        });
+        tokio::select! {
+            () = &mut combinator => return Err("resolved before the settler-entry marker".to_owned()),
+            reached = marker => if !reached {
+                return Err("no settler-entry marker within two seconds".to_owned());
+            },
+        }
+        let start_polled = submissions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _, a, _)| name == "all" && a == &OperationAction::Start)
+            .is_some_and(|(_, _, _, flag)| flag.load(Ordering::SeqCst));
+        if !start_polled {
+            return Err("the retained START was not polled".to_owned());
+        }
+        if outcomes(&submissions.lock().unwrap()) != 0 {
+            return Err("an outcome was submitted while START was held".to_owned());
+        }
+        gate.notify_one();
+        if fail_start {
+            if tokio::time::timeout(std::time::Duration::from_millis(500), &mut combinator)
+                .await
+                .is_ok()
+            {
+                return Err("resolved after a failed START".to_owned());
+            }
+            let fatal = ctx
+                .coordinator()
+                .fatal_error()
+                .ok_or_else(|| "no fatal error".to_owned())?;
+            let expected = crate::error::checkpoint_execution_failure_wire(
+                &crate::client::ExecutionClientError::non_retryable("START rejected".to_owned()),
+            );
+            if fatal.error_type != "CheckpointUnrecoverableExecutionError"
+                || Some(fatal.error_message.as_str()) != expected.error_message()
+            {
+                return Err(format!("fatal {fatal:?}"));
+            }
+            if outcomes(&submissions.lock().unwrap()) != 0 {
+                return Err("an outcome was submitted after a failed START".to_owned());
+            }
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut combinator)
+                .await
+                .map_err(|_| "did not resolve after the release".to_owned())?;
+            if outcomes(&submissions.lock().unwrap()) != 1 {
+                return Err("no outcome after the release".to_owned());
+            }
+            let recorded: Vec<OperationAction> = client
+                .recorded_updates()
+                .iter()
+                .filter(|u| u.id() == wire)
+                .map(|u| u.action().clone())
+                .collect();
+            if recorded != [OperationAction::Start, action] {
+                return Err(format!("recorded {recorded:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Test 7: a combinator reaches its outcome path while its `START` is
+    /// held, and writes its `SUCCEED` or `FAIL` only after the `START`
+    /// write completes, and neither when it fails.
+    #[tokio::test]
+    async fn combinator_outcome_waits_for_retained_start_write() {
+        let mut failures = Vec::new();
+        for (outer, written) in outcome_cases() {
+            for fail_start in [false, true] {
+                if let Err(err) = outcome_case(outer, written, fail_start).await {
+                    failures.push(format!(
+                        "{outer:?} {written:?} fail_start={fail_start}: {err}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "failed cases: {failures:#?}");
+    }
+
+    /// A record at `positional` with `status`, of the record type
+    /// `op_type` and sub-type `sub_type`, named `name`.
+    fn record_of(
+        positional: &str,
+        status: CheckpointStatus,
+        op_type: &str,
+        sub_type: &str,
+        name: &str,
+    ) -> (String, CheckpointRecord) {
+        let (wire_id, mut record) = succeeded_record(positional, "");
+        record.result = None;
+        record.status = status;
+        record.op_type = Some(op_type.to_owned());
+        record.sub_type = Some(sub_type.to_owned());
+        record.op_name = Some(name.to_owned());
+        (wire_id, record)
+    }
+
+    /// A root context over `log` with an in-memory client, the coalescer
+    /// `window` and `plugins`.
+    fn plugin_ctx(
+        log: CheckpointLog,
+        window: Option<std::time::Duration>,
+        plugins: Arc<crate::plugin::InvocationPlugins>,
+    ) -> (DurableContext, Arc<InMemoryExecutionClient>) {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token-1".to_owned(),
+            window,
+            Some(plugins),
+        );
+        (ctx, client)
+    }
+
+    /// Test 13: on a `PENDING` or `READY` combinator record, the replay
+    /// start hooks of resuming waits fire before the combinator's.
+    #[tokio::test]
+    async fn resumable_combinator_inputs_start_before_combinator_replay_hook() {
+        let mut failures = Vec::new();
+        for status in [CheckpointStatus::Pending, CheckpointStatus::Ready] {
+            for outer in OUTERS {
+                let hooks = crate::plugin::test_support::OpHooks::default();
+                let log = CheckpointLog::from_records(vec![
+                    record_of("1", CheckpointStatus::Started, "Wait", "Wait", "a"),
+                    record_of("2", CheckpointStatus::Started, "Wait", "Wait", "b"),
+                    record_of("3", status.clone(), "Context", COMBINATOR_SUB_TYPE, "all"),
+                ]);
+                let (ctx, _client) = plugin_ctx(log, None, hooks.plugins());
+                let a = ctx
+                    .wait(std::time::Duration::from_secs(1))
+                    .name("a")
+                    .future();
+                let b = ctx
+                    .wait(std::time::Duration::from_secs(2))
+                    .name("b")
+                    .future();
+                let replays = || -> Vec<String> {
+                    hooks
+                        .records()
+                        .into_iter()
+                        .filter(|r| r.hook == "start" && r.replay)
+                        .filter_map(|r| r.name)
+                        .collect()
+                };
+                let combinator = run_outer(&ctx, outer, vec![a, b]);
+                tokio::select! {
+                    () = combinator => {}
+                    _ = within_two_seconds(|| replays().len() >= 3) => {}
+                }
+                let replays = replays();
+                if replays != ["a", "b", "all"] {
+                    failures.push(format!("{outer:?} {status:?}: {replays:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "failed cases: {failures:#?}");
+    }
+
+    /// Test 14: a combinator's own `.spawn()` starts its inputs, then
+    /// itself, on its task, in input order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawned_combinator_starts_inputs_on_its_task_in_order() {
+        let mut failures = Vec::new();
+        for outer in OUTERS {
+            let (ctx, _client) = recording_ctx(CheckpointLog::empty());
+            let submissions = record_submissions(&ctx);
+            let starts = || -> Vec<String> {
+                submissions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, _, a, _)| a == &aws_sdk_lambda::types::OperationAction::Start)
+                    .map(|(name, _, _, _)| name.clone())
+                    .collect()
+            };
+            let a = ctx.step(|_| async { Ok(1_i32) }).name("a").future();
+            let b = ctx.step(|_| async { Ok(2_i32) }).name("b").future();
+            let handle = spawn_outer(&ctx, outer, vec![a, b]);
+            let at_spawn = starts();
+            for _ in 0..10 {
+                if starts().len() >= 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let after = starts();
+            if !at_spawn.is_empty() || after != ["a", "b", "all"] {
+                failures.push(format!("{outer:?}: at spawn {at_spawn:?}, after {after:?}"));
+            }
+            let _succeeded = handle.await;
+        }
+        assert!(failures.is_empty(), "failed cases: {failures:#?}");
+    }
+
+    /// The state of [`LogHooks`]'s blocking start hook.
+    #[derive(Default)]
+    struct HookGate {
+        entered: bool,
+        released: bool,
+    }
+
+    /// A plugin that logs `hook <name>` when `on_operation_start` begins,
+    /// and `hook-return <name>` as its last statement. With a gate, the
+    /// hook of `all` blocks in `block_in_place` between the two until the
+    /// gate is released or five seconds pass.
+    #[derive(Clone, Default)]
+    struct LogHooks {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        gate: Option<Arc<(std::sync::Mutex<HookGate>, std::sync::Condvar)>>,
+    }
+
+    impl LogHooks {
+        fn entries(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn position(&self, entry: &str) -> Option<usize> {
+            self.entries().iter().position(|e| e == entry)
+        }
+
+        fn release(&self) {
+            if let Some(gate) = &self.gate {
+                gate.0.lock().unwrap().released = true;
+                gate.1.notify_all();
+            }
+        }
+
+        fn entered(&self) -> bool {
+            self.gate
+                .as_ref()
+                .is_some_and(|gate| gate.0.lock().unwrap().entered)
+        }
+    }
+
+    impl crate::plugin::Plugin for LogHooks {
+        fn on_operation_start(
+            &self,
+            info: &crate::plugin::OperationInfo,
+        ) -> crate::plugin::HookWork {
+            let name = info.name().unwrap_or("-");
+            self.log.lock().unwrap().push(format!("hook {name}"));
+            if name == "all"
+                && let Some(gate) = &self.gate
+            {
+                tokio::task::block_in_place(|| {
+                    let (state, condvar) = &**gate;
+                    let mut state = state.lock().unwrap();
+                    state.entered = true;
+                    let _unused = condvar
+                        .wait_timeout_while(state, std::time::Duration::from_secs(5), |s| {
+                            !s.released
+                        })
+                        .unwrap();
+                });
+            }
+            self.log.lock().unwrap().push(format!("hook-return {name}"));
+            Ok(None)
+        }
+    }
+
+    impl crate::plugin::PluginFactory for LogHooks {
+        fn create_plugin(
+            &self,
+            _info: &crate::plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn crate::plugin::Plugin>>, crate::BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// Test 15: while the combinator's start hook dispatch blocks, the
+    /// client receives no `START` of the combinator, on a multi-thread
+    /// runtime, with checkpoint batching off and on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn combinator_queue_then_hook_blocks_start_send_until_hook_dispatch() {
+        let mut failures = Vec::new();
+        for outer in OUTERS {
+            for window in [None, Some(std::time::Duration::ZERO)] {
+                let hooks = LogHooks {
+                    gate: Some(Arc::default()),
+                    ..LogHooks::default()
+                };
+                let (ctx, client) = plugin_ctx(
+                    CheckpointLog::empty(),
+                    window,
+                    crate::plugin::test_support::plugins_of(hooks.clone()),
+                );
+                let sent = || {
+                    client.recorded_updates().iter().any(|u| {
+                        u.action() == &aws_sdk_lambda::types::OperationAction::Start
+                            && u.name() == Some("all")
+                    })
+                };
+                let handle = spawn_outer(&ctx, outer, vec![ready(1_i32), ready(2_i32)]);
+                let entered = within_two_seconds(|| hooks.entered()).await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let sent_while_blocked = sent();
+                hooks.release();
+                let succeeded = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                    .await
+                    .unwrap_or(false);
+                let sent_after = sent();
+                if !entered || sent_while_blocked || !sent_after || !succeeded {
+                    failures.push(format!(
+                        "{outer:?} window={window:?}: entered={entered} \
+                         sent_while_blocked={sent_while_blocked} sent_after={sent_after} \
+                         succeeded={succeeded}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "failed cases: {failures:#?}");
+    }
+
+    /// A response-first input of test 16.
+    #[derive(Clone, Copy, Debug)]
+    enum ResponseFirst {
+        Wait,
+        AtMostOnceStep,
+    }
+
+    impl ResponseFirst {
+        /// The input `name` on `ctx`. A step's body never returns, so no
+        /// input settles before both hooks fire.
+        fn input(self, ctx: &DurableContext, name: &str) -> DurableFuture<()> {
+            match self {
+                Self::Wait => ctx
+                    .wait(std::time::Duration::from_secs(1))
+                    .name(name)
+                    .future(),
+                Self::AtMostOnceStep => ctx
+                    .step(|_| std::future::pending::<Result<(), crate::BoxError>>())
+                    .name(name)
+                    .semantics(crate::StepSemantics::AtMostOncePerRetry)
+                    .future(),
+            }
+        }
+    }
+
+    /// Test 16: the remainders of response-first inputs are spawned after
+    /// the combinator's start hook returns, so their hooks follow it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_first_remainders_start_after_combinator_start_hook() {
+        let mut failures = Vec::new();
+        for outer in OUTERS {
+            for kind in [ResponseFirst::Wait, ResponseFirst::AtMostOnceStep] {
+                let hooks = LogHooks::default();
+                let (ctx, _client) = plugin_ctx(
+                    CheckpointLog::empty(),
+                    None,
+                    crate::plugin::test_support::plugins_of(hooks.clone()),
+                );
+                let log = Arc::clone(&hooks.log);
+                REMAINDER_RECORDER.with(|recorder| {
+                    *recorder.borrow_mut() = Some(Box::new(move |idx| {
+                        let name = if idx == 0 { "a" } else { "b" };
+                        log.lock().unwrap().push(format!("remainder {name}"));
+                    }));
+                });
+                let inputs = vec![kind.input(&ctx, "a"), kind.input(&ctx, "b")];
+                let combinator = run_outer(&ctx, outer, inputs);
+                tokio::select! {
+                    () = combinator => {}
+                    _ = within_two_seconds(|| {
+                        hooks.position("hook a").is_some() && hooks.position("hook b").is_some()
+                    }) => {}
+                }
+                REMAINDER_RECORDER.with(|recorder| *recorder.borrow_mut() = None);
+                let at = |entry: &str| hooks.position(entry);
+                let ordered = ["hook all", "hook-return all", "remainder a", "remainder b"]
+                    .windows(2)
+                    .all(|pair| matches!((at(pair[0]), at(pair[1])), (Some(x), Some(y)) if x < y));
+                let inputs_after = ["hook a", "hook b"].iter().all(|entry| {
+                    matches!((at("hook-return all"), at(entry)), (Some(x), Some(y)) if x < y)
+                });
+                if !ordered || !inputs_after {
+                    failures.push(format!("{outer:?} {kind:?}: {:?}", hooks.entries()));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "failed cases: {failures:#?}");
+    }
 }
 
 #[cfg(test)]
@@ -3534,16 +4332,22 @@ mod coordinator_tests {
         .expect("no panic");
         assert_eq!(outcome, InvocationOutcome::Pending);
         let calls = client.calls();
-        assert_eq!(calls.len(), 3, "the race START and the two wait STARTs");
-        for (_, updates) in calls.iter().skip(1) {
-            assert!(
-                updates
-                    .iter()
-                    .all(|u| u.r#type() == &OperationType::Wait
-                        && u.action() == &OperationAction::Start),
-                "no checkpoint call after the two wait STARTs"
-            );
-        }
+        // The inputs' STARTs come before the race's, and nothing follows.
+        let starts: Vec<OperationType> = calls
+            .iter()
+            .flat_map(|(_, updates)| updates.iter())
+            .inspect(|u| assert_eq!(u.action(), &OperationAction::Start))
+            .map(|u| u.r#type().clone())
+            .collect();
+        assert_eq!(
+            starts,
+            [
+                OperationType::Wait,
+                OperationType::Wait,
+                OperationType::Context
+            ],
+            "the two wait STARTs, then the race START, and no later call"
+        );
     }
 
     #[tokio::test(start_paused = true)]

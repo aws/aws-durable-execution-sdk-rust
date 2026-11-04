@@ -844,14 +844,16 @@ where
     IS: Serdes<O>,
     RS: Serdes<String>,
 {
-    /// Executes the map operation.
-    pub(crate) async fn execute(self) -> Result<Vec<O>, OperationError> {
-        collect_successful(self.execute_batch_result().await?)
-    }
-
+    /// Executes the map operation and returns the full `BatchResult`.
+    ///
+    /// The user closure enters the batch engine only through the
+    /// [`ItemDispatch`] object, so [`execute_batch`], the checkpoint state
+    /// machine, compiles once per result type while every item still runs
+    /// as a concrete, unboxed future. The `Vec<O>` view of `.await` is
+    /// projected by [`collect_successful`].
+    ///
     /// Runs the batch's start step now, on the caller's task, and returns
-    /// the future of the rest of [`Self::execute_batch_result`] (see
-    /// [`crate::start`]).
+    /// the future of the rest of the operation (see [`crate::start`]).
     pub(crate) fn execute_batch_result_started(
         self,
     ) -> impl Future<Output = Result<BatchResult<O>, OperationError>> + Send + 'static {
@@ -868,19 +870,6 @@ where
             MAP_SUB_TYPE,
             self.max_concurrency,
         )
-    }
-
-    /// Executes the map operation and returns the full `BatchResult`.
-    ///
-    /// The user closure enters the batch engine only through the
-    /// [`ItemDispatch`] object, so [`execute_batch`], the checkpoint state
-    /// machine, compiles once per result type while every item still runs
-    /// as a concrete, unboxed future. Used directly by `await_batch` and by
-    /// [`Self::execute`], whose `Vec<O>` view is projected by
-    /// [`collect_successful`].
-    pub(crate) async fn execute_batch_result(self) -> Result<BatchResult<O>, OperationError> {
-        let started = self.start();
-        self.run(started).await
     }
 
     /// The rest of the map after its start step `started`.
@@ -964,18 +953,18 @@ where
     IS: Serdes<O>,
     RS: Serdes<String>,
 {
-    /// Executes the parallel operation.
-    pub(crate) async fn execute(self) -> Result<Vec<O>, OperationError> {
-        // Mirrors map through the shared [`collect_successful`] projection:
-        // failed branches within tolerance are skipped; the batch errors
-        // when the failure tolerance was exceeded or the predicate
-        // completed it as failed.
-        collect_successful(self.execute_batch_result().await?)
-    }
-
+    /// Executes the parallel operation and returns the full `BatchResult`.
+    ///
+    /// Branch bodies are heterogeneous, so each carries exactly one erased
+    /// future ([`crate::future::BranchBody`], built at `Branch::new`); the
+    /// batch engine and its per-item state machine are shared, non-generic
+    /// code. The `Vec<O>` view of `.await` is projected by
+    /// [`collect_successful`], as for map: failed branches within
+    /// tolerance are skipped, and the batch errors when the failure
+    /// tolerance was exceeded or the predicate completed it as failed.
+    ///
     /// Runs the batch's start step now, on the caller's task, and returns
-    /// the future of the rest of [`Self::execute_batch_result`] (see
-    /// [`crate::start`]).
+    /// the future of the rest of the operation (see [`crate::start`]).
     pub(crate) fn execute_batch_result_started(
         self,
     ) -> impl Future<Output = Result<BatchResult<O>, OperationError>> + Send + 'static {
@@ -992,18 +981,6 @@ where
             PARALLEL_SUB_TYPE,
             self.max_concurrency,
         )
-    }
-
-    /// Executes the parallel operation and returns the full `BatchResult`.
-    ///
-    /// Branch bodies are heterogeneous, so each carries exactly one erased
-    /// future ([`crate::future::BranchBody`], built at `Branch::new`); the
-    /// batch engine and its per-item state machine are shared, non-generic
-    /// code. Used directly by `await_batch` and by [`Self::execute`], whose
-    /// `Vec<O>` view is projected by [`collect_successful`].
-    pub(crate) async fn execute_batch_result(self) -> Result<BatchResult<O>, OperationError> {
-        let started = self.start();
-        self.run(started).await
     }
 
     /// The rest of the parallel after its start step `started`.

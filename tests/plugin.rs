@@ -3064,8 +3064,9 @@ async fn combinator_hooks() {
         hooks.get(gather_start).map(TreeRec::shape),
         Some((1, "start", "gather".to_owned(), false, STARTED))
     );
-    assert!(gather_start < position("start", "a"));
-    assert!(gather_start < position("start", "b"));
+    // The inputs' queue-time start hooks fire before the combinator's.
+    assert!(position("start", "a") < gather_start);
+    assert!(position("start", "b") < gather_start);
     let last = hooks.last().expect("a record");
     assert_eq!(
         last.shape(),

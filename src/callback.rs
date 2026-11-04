@@ -439,6 +439,10 @@ where
     /// `O` only); this wrapper just runs the inner body (whose own
     /// checkpoint plumbing, callback creation and the submitter step,
     /// is likewise non-generic) between them.
+    ///
+    /// Tests call it; the SDK builds every operation future with the start
+    /// step form (see [`crate::future::DurableFuture::for_start_step`]).
+    #[cfg(test)]
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         let (core, rest) = self.split();
         let started = core.start();

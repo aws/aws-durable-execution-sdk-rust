@@ -91,7 +91,20 @@ pub struct DurableFuture<O> {
     /// ID yet. `None` for every other future, and once the claim ran. While
     /// it is `Some`, `inner` is a placeholder that is never polled.
     claim: Option<PendingClaim<O>>,
+    /// The start step of a lazy operation whose execution begins with one
+    /// (see [`crate::start`]): it runs the start step and returns the rest
+    /// of the operation. `None` for every other future, and once it ran.
+    /// While it is `Some`, `inner` is a placeholder that is never polled.
+    begin: Option<BeginFn<O>>,
+    /// Whether a combinator begins this future by polling it once on its
+    /// own task: a lazy invoke or `wait_for_condition`, whose first poll
+    /// serializes its input before it can queue its `START`.
+    first_poll_start: bool,
 }
+
+/// The start step of a lazy operation, and the builder of its remainder.
+type BeginFn<O> =
+    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<O, OperationError>> + Send>> + Send>;
 
 /// The claim a combinator future runs on its first poll or at `.spawn()`.
 ///
@@ -140,6 +153,8 @@ impl<O: Send + 'static> DurableFuture<O> {
             inner: Box::pin(fut),
             awaited: None,
             claim: None,
+            begin: None,
+            first_poll_start: false,
         }
     }
 
@@ -151,6 +166,8 @@ impl<O: Send + 'static> DurableFuture<O> {
             inner: Box::pin(std::future::pending()),
             awaited: None,
             claim: Some(claim),
+            begin: None,
+            first_poll_start: false,
         }
     }
 
@@ -209,18 +226,67 @@ impl<O: Send + 'static> DurableFuture<O> {
         })
     }
 
-    /// Creates the future of one operation whose execution begins with the
-    /// start step (see [`crate::start`]): a step, a wait or a
-    /// `create_callback`.
-    ///
-    /// The start step runs on the first poll, and checks admission itself
-    /// before it queues anything. So this adds no admission gate of its
-    /// own, unlike [`Self::for_operation`].
+    /// Creates the future of one operation whose start step already ran on
+    /// the caller's task (see [`crate::start`]): `fut` is the rest of the
+    /// operation.
     pub(crate) fn for_started_operation<F>(fut: F) -> Self
     where
         F: Future<Output = Result<O, OperationError>> + Send + 'static,
     {
         Self::from_async(fut)
+    }
+
+    /// Creates the lazy future of one operation whose execution begins with
+    /// the start step (see [`crate::start`]): a step, a wait, a child
+    /// context, `with_retry`, a map, a parallel, a `parallel_mixed`, a
+    /// `create_callback` or a `wait_for_callback`.
+    ///
+    /// `begin` runs the start step and returns the rest of the operation.
+    /// It runs on the first poll, or earlier when a combinator begins the
+    /// future as an input ([`Self::begin_now`]). The start step checks
+    /// admission itself before it queues anything, so this adds no
+    /// admission gate of its own, unlike [`Self::for_operation`].
+    pub(crate) fn for_start_step<F>(begin: impl FnOnce() -> F + Send + 'static) -> Self
+    where
+        F: Future<Output = Result<O, OperationError>> + Send + 'static,
+    {
+        Self {
+            // A placeholder: `begin_now` replaces it before the first poll.
+            inner: Box::pin(std::future::pending()),
+            awaited: None,
+            claim: None,
+            begin: Some(Box::new(move || Box::pin(begin()))),
+            first_poll_start: false,
+        }
+    }
+
+    /// Runs the start step of a lazy operation now, on the calling task.
+    ///
+    /// The first poll and a combinator that begins its inputs call this. It
+    /// runs the start step once, and does nothing for a future without one.
+    pub(crate) fn begin_now(&mut self) {
+        if let Some(begin) = self.begin.take() {
+            self.inner = begin();
+        }
+    }
+
+    /// Creates the future of a lazy invoke or `wait_for_condition` on
+    /// `ctx`, as [`Self::for_operation`] does. A combinator begins such an
+    /// input by polling it once on its own task, because its first poll
+    /// serializes its input before it can queue its `START`.
+    pub(crate) fn for_first_poll_operation<F>(ctx: &DurableContext, fut: F) -> Self
+    where
+        F: Future<Output = Result<O, OperationError>> + Send + 'static,
+    {
+        let mut future = Self::for_operation(ctx, fut);
+        future.first_poll_start = true;
+        future
+    }
+
+    /// Reports whether a combinator begins this future by polling it once
+    /// on its own task (see [`Self::for_first_poll_operation`]).
+    pub(crate) fn starts_on_first_poll(&self) -> bool {
+        self.first_poll_start
     }
 
     /// Spawns the operation future on its own task, blessed in the task
@@ -309,6 +375,9 @@ impl<O: Send + 'static> Future for DurableFuture<O> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // The first poll of a combinator claims its operation ID.
         self.claim_now();
+        // The first poll of a lazy operation runs its start step, unless a
+        // combinator ran it already.
+        self.begin_now();
         // The first poll of the handle of an operation started on its own
         // task: from now on the scheduler refreshes its registrations.
         if let Some((flag, coordinator)) = self.awaited.take() {

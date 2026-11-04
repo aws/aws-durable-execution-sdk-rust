@@ -30,6 +30,10 @@ pub(crate) struct WaitExecution {
 
 impl WaitExecution {
     /// Executes the wait operation: replay path or live path.
+    ///
+    /// Tests call it; the SDK builds every operation future with the start
+    /// step form (see [`crate::future::DurableFuture::for_start_step`]).
+    #[cfg(test)]
     pub(crate) async fn execute(self) -> Result<(), OperationError> {
         let started = self.start();
         self.execute_after_start(started).await

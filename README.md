@@ -935,6 +935,23 @@ The four combinators take `DurableFuture` values, which `.future()` and
 that waits stays pending. When every remaining input waits and nothing else
 runs, the invocation suspends.
 
+When a combinator runs, it begins the start phase of each `.future()` input,
+in input order, before its own start step, as a JS combinator awaits inputs
+that already run. A step, a wait, a child context, a `with_retry`, a `map`, a
+`parallel` or a `wait_for_callback` input queues its `START` then, so its
+first checkpoint comes before the combinator's, and a start hook it fires
+when it queues `START` runs before the combinator's. A start hook that waits
+for the `START` response, that of a wait or of a step under
+`AtMostOncePerRetry`, keeps that timing and runs after the combinator's. A
+lazy invoke or `wait_for_condition` is polled once, in input order, before
+the combinator's start step, and the combinator does not wait for its
+`START`. The combinator then queues its own `START`, fires its start hook,
+and runs the inputs without waiting for the `START` response; its `SUCCEED`
+or `FAIL` waits for it. A replay of a final record starts no `.future()`
+input. A handle that `.spawn()` returned already runs independently, and a
+combinator never starts it again. Callback creation is not a combinator
+input: await `create_callback` first, and pass `Callback::result()`.
+
 A combinator returns the value decoded from the payload it records, so the
 first run returns the value a replay returns. A `join_all` item's `Err` is
 therefore a child-context error whose `wire()` carries the input's recorded

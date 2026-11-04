@@ -207,6 +207,18 @@ where
     /// so `.future()` is how operations of different kinds join or race
     /// together. It does not start the operation: whatever awaits the
     /// returned future drives it, and a combinator drops the losers.
+    ///
+    /// A combinator begins its `.future()` inputs' start phases, in input
+    /// order, before its own start step. This operation first serializes
+    /// its input, so the combinator polls it once on its own task, and does
+    /// not wait for its `START`: its `START` and its start hook can come
+    /// after the combinator's. A replay of the combinator's final record
+    /// starts no `.future()` input.
+    ///
+    /// A handle that [`.spawn()`](Self::spawn) returned already runs on its
+    /// own task. A combinator that receives it never starts it again, and
+    /// it keeps running independently: when the combinator resolves first,
+    /// it does not cancel the handle, and the handle's result is dropped.
     pub fn future(self) -> DurableFuture<O> {
         <Self as IntoFuture>::into_future(self)
     }
@@ -292,6 +304,6 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::for_operation(&gate, execution.execute())
+        DurableFuture::for_first_poll_operation(&gate, execution.execute())
     }
 }

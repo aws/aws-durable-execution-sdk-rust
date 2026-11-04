@@ -416,7 +416,7 @@ where
     }
 
     /// The lazy terminal of the full [`BatchResult`]: the body of
-    /// `into_future`, with `execute_batch_result` in place of `execute`.
+    /// `into_future`, with the full `BatchResult` in place of its `Vec<O>` view.
     /// So `.await`, `await_batch()` and `spawn_batch()` run the same
     /// replay identity check and the same admission check.
     fn batch_future(self) -> DurableFuture<BatchResult<O>>
@@ -466,7 +466,7 @@ where
         if started {
             DurableFuture::for_started_operation(execution.execute_batch_result_started())
         } else {
-            DurableFuture::for_started_operation(execution.execute_batch_result())
+            DurableFuture::for_start_step(move || execution.execute_batch_result_started())
         }
     }
 
@@ -478,6 +478,18 @@ where
     /// so `.future()` is how operations of different kinds join or race
     /// together. It does not start the operation: whatever awaits the
     /// returned future drives it, and a combinator drops the losers.
+    ///
+    /// A combinator begins its `.future()` inputs' start phases, in input
+    /// order, before its own start step. So this operation's `START` is
+    /// queued before the combinator's, and a start hook it fires when it
+    /// queues `START` runs before the combinator's; a start hook that waits
+    /// for the `START` response keeps that timing. A replay of the
+    /// combinator's final record starts no `.future()` input.
+    ///
+    /// A handle that [`.spawn()`](Self::spawn) returned already runs on its
+    /// own task. A combinator that receives it never starts it again, and
+    /// it keeps running independently: when the combinator resolves first,
+    /// it does not cancel the handle, and the handle's result is dropped.
     pub fn future(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
@@ -577,7 +589,10 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::for_started_operation(execution.execute())
+        DurableFuture::for_start_step(move || {
+            let batch = execution.execute_batch_result_started();
+            async move { crate::map_parallel::collect_successful(batch.await?) }
+        })
     }
 }
 
@@ -921,7 +936,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     }
 
     /// The lazy terminal of the full [`BatchResult`]: the body of
-    /// `into_future`, with `execute_batch_result` in place of `execute`.
+    /// `into_future`, with the full `BatchResult` in place of its `Vec<O>` view.
     /// So `.await`, `await_batch()` and `spawn_batch()` run the same
     /// replay identity check and the same admission check.
     fn batch_future(self) -> DurableFuture<BatchResult<O>>
@@ -970,7 +985,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
         if started {
             DurableFuture::for_started_operation(execution.execute_batch_result_started())
         } else {
-            DurableFuture::for_started_operation(execution.execute_batch_result())
+            DurableFuture::for_start_step(move || execution.execute_batch_result_started())
         }
     }
 
@@ -982,6 +997,18 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// so `.future()` is how operations of different kinds join or race
     /// together. It does not start the operation: whatever awaits the
     /// returned future drives it, and a combinator drops the losers.
+    ///
+    /// A combinator begins its `.future()` inputs' start phases, in input
+    /// order, before its own start step. So this operation's `START` is
+    /// queued before the combinator's, and a start hook it fires when it
+    /// queues `START` runs before the combinator's; a start hook that waits
+    /// for the `START` response keeps that timing. A replay of the
+    /// combinator's final record starts no `.future()` input.
+    ///
+    /// A handle that [`.spawn()`](Self::spawn) returned already runs on its
+    /// own task. A combinator that receives it never starts it again, and
+    /// it keeps running independently: when the combinator resolves first,
+    /// it does not cancel the handle, and the handle's result is dropped.
     pub fn future(self) -> DurableFuture<Vec<O>>
     where
         IS: Serdes<O>,
@@ -1077,7 +1104,10 @@ where
             item_ids,
         };
 
-        DurableFuture::for_started_operation(execution.execute())
+        DurableFuture::for_start_step(move || {
+            let batch = execution.execute_batch_result_started();
+            async move { crate::map_parallel::collect_successful(batch.await?) }
+        })
     }
 }
 
@@ -1354,7 +1384,7 @@ impl<RS> ParallelMixedBuilder<RS> {
         if started {
             DurableFuture::for_started_operation(execution.execute_batch_result_started())
         } else {
-            DurableFuture::for_started_operation(execution.execute_batch_result())
+            DurableFuture::for_start_step(move || execution.execute_batch_result_started())
         }
     }
 }

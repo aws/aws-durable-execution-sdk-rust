@@ -81,6 +81,18 @@ impl WaitBuilder {
     /// so `.future()` is how operations of different kinds join or race
     /// together. It does not start the operation: whatever awaits the
     /// returned future drives it, and a combinator drops the losers.
+    ///
+    /// A combinator begins its `.future()` inputs' start phases, in input
+    /// order, before its own start step. So this operation's `START` is
+    /// queued before the combinator's, and a start hook it fires when it
+    /// queues `START` runs before the combinator's; a start hook that waits
+    /// for the `START` response keeps that timing. A replay of the
+    /// combinator's final record starts no `.future()` input.
+    ///
+    /// A handle that [`.spawn()`](Self::spawn) returned already runs on its
+    /// own task. A combinator that receives it never starts it again, and
+    /// it keeps running independently: when the combinator resolves first,
+    /// it does not cancel the handle, and the handle's result is dropped.
     pub fn future(self) -> DurableFuture<()> {
         self.into_future()
     }
@@ -177,7 +189,7 @@ impl IntoFuture for WaitBuilder {
 
     fn into_future(self) -> Self::IntoFuture {
         match self.execution() {
-            Ok(execution) => DurableFuture::for_started_operation(execution.execute()),
+            Ok(execution) => DurableFuture::for_start_step(move || execution.execute_started()),
             Err(future) => future,
         }
     }

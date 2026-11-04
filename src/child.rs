@@ -71,6 +71,10 @@ where
     /// `O` only); this wrapper just polls the user's concrete future
     /// between them, in a fresh child context under the child namespace's
     /// replay-aware span.
+    ///
+    /// Tests call it; the SDK builds every operation future with the start
+    /// step form (see [`crate::future::DurableFuture::for_start_step`]).
+    #[cfg(test)]
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         let (core, closure) = self.split();
         let started = core.start();

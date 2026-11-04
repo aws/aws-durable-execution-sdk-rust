@@ -354,12 +354,20 @@ pub trait Plugin: Send + Sync {
     ///   queued, as JS does. The SDK sends that `START` only after the
     ///   hook returns, and the body or the first item runs without waiting
     ///   for its response. The outcome write waits for it;
-    /// - a combinator without a record fires `on_operation_start` with
-    ///   status `Started` and `is_replay` `false` once its `START` is
-    ///   written, before its first input runs;
+    /// - a combinator without a record first begins the start phase of
+    ///   each of its `.future()` inputs, in input order. Then it fires
+    ///   `on_operation_start` with status `Started` and `is_replay`
+    ///   `false` once its `START` is queued, as a JS combinator does. The
+    ///   SDK sends that `START` only after the hook returns, and the inputs
+    ///   run without waiting for its response. So the hook of an input that
+    ///   fires when its `START` is queued comes before the combinator's,
+    ///   and the hook of an input that waits for its `START` response, a
+    ///   wait or a step under `AtMostOncePerRetry`, comes after it;
     /// - a record that is not terminal (`STARTED`, `PENDING` or `READY`)
     ///   fires `on_operation_start` with `is_replay` `true`, before the
-    ///   body or the first item runs;
+    ///   body or the first item runs. A combinator fires it after its
+    ///   `.future()` inputs' start phases begin, so the replay hook of a
+    ///   step, wait or child-context input that resumes comes first;
     /// - a body or batch that succeeds fires `on_operation_end` with status
     ///   `Succeeded`, `is_replay` `false` and the payload the `SUCCEED`
     ///   carries as `result()`, once the `SUCCEED` is written. A result
@@ -494,12 +502,20 @@ pub trait Plugin: Send + Sync {
     ///   `is_replay` `false` once their `START` is queued, as JS does. The
     ///   SDK sends that `START` only after the hook returns, and the body or
     ///   the first item runs without waiting for its response;
-    /// - a combinator without a record fires `on_operation_start` with
-    ///   status `Started` and `is_replay` `false` once its `START` is
-    ///   written, before its first input runs;
+    /// - a combinator without a record first begins the start phase of
+    ///   each of its `.future()` inputs, in input order. Then it fires
+    ///   `on_operation_start` with status `Started` and `is_replay`
+    ///   `false` once its `START` is queued, as a JS combinator does. The
+    ///   SDK sends that `START` only after the hook returns, and the inputs
+    ///   run without waiting for its response. So the hook of an input that
+    ///   fires when its `START` is queued comes before the combinator's,
+    ///   and the hook of an input that waits for its `START` response, a
+    ///   wait or a step under `AtMostOncePerRetry`, comes after it;
     /// - a record that is not terminal (`STARTED`, `PENDING` or `READY`)
     ///   fires `on_operation_start` with `is_replay` `true`, before the
-    ///   body or the first item runs;
+    ///   body or the first item runs. A combinator fires it after its
+    ///   `.future()` inputs' start phases begin, so the replay hook of a
+    ///   step, wait or child-context input that resumes comes first;
     /// - a body or batch that succeeds fires `on_operation_end` with status
     ///   `Succeeded`, `is_replay` `false` and the payload the `SUCCEED`
     ///   carries as `result()`, once the `SUCCEED` is written. The
@@ -2608,6 +2624,15 @@ pub(crate) mod test_support {
             true,
             None,
         )
+    }
+
+    /// The plugins of an invocation whose one plugin `factory` builds.
+    pub(crate) fn plugins_of(
+        factory: impl PluginFactory + 'static,
+    ) -> Arc<super::InvocationPlugins> {
+        let factories: Vec<(&'static str, Arc<dyn PluginFactory>)> =
+            vec![("test::Plugin", Arc::new(factory))];
+        super::create_plugins(&factories, None, empty_info).expect("one factory is registered")
     }
 
     /// The plugins of an invocation with one [`Hooks`] plugin, as
