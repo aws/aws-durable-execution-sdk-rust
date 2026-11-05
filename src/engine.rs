@@ -484,12 +484,21 @@ impl CheckpointLog {
     /// Used to merge backend-assigned fields (e.g. `callback_id`) from
     /// checkpoint responses into the live log so that subsequent reads
     /// in the same invocation observe the updated state.
-    pub(crate) fn insert(&self, wire_id: String, record: CheckpointRecord) {
+    ///
+    /// Returns the status of the record it replaced, or `None` when the log
+    /// held no record of `wire_id`.
+    pub(crate) fn insert(
+        &self,
+        wire_id: String,
+        record: CheckpointRecord,
+    ) -> Option<CheckpointStatus> {
         let mut guard = self
             .records
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(wire_id, record);
+        guard
+            .insert(wire_id, record)
+            .map(|previous| previous.status)
     }
 
     /// Applies `f` to every record under one read guard and returns the
@@ -638,6 +647,27 @@ mod tests {
         assert_eq!(CheckpointStatus::Started.wire_str(), "STARTED");
         assert!(!CheckpointStatus::Started.is_terminal());
         assert!(CheckpointStatus::TimedOut.is_terminal());
+    }
+
+    /// `insert` returns `None` for a new record, and the replaced record's
+    /// status for a replacement.
+    #[test]
+    fn insert_returns_previous_status() {
+        let log = CheckpointLog::empty();
+        assert_eq!(
+            log.insert(
+                "op".to_owned(),
+                CheckpointRecord::with_status("op", CheckpointStatus::Started),
+            ),
+            None
+        );
+        assert_eq!(
+            log.insert(
+                "op".to_owned(),
+                CheckpointRecord::with_status("op", CheckpointStatus::Succeeded),
+            ),
+            Some(CheckpointStatus::Started)
+        );
     }
 
     // Counter basics

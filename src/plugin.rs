@@ -611,12 +611,60 @@ pub trait Plugin: Send + Sync {
         Ok(None)
     }
 
-    /// Runs when a checkpoint response reports operations the service
-    /// changed.
+    /// Runs after a checkpoint response that changed the status of at
+    /// least one operation.
+    ///
+    /// The SDK calls the hook after it merged the response into its state,
+    /// once per plugin, in registration order, and once per such response,
+    /// in response order. A refresh checkpoint without updates is a
+    /// checkpoint response too. A paginated response and the state pages
+    /// the SDK reads after it count as one response. When reading those
+    /// pages fails, the changes already merged are still reported.
+    ///
+    /// An operation counts as changed when the SDK held no record of it,
+    /// or held one with another status. Other fields do not count. The
+    /// `EXECUTION` operation is listed like any other. The state the
+    /// invocation starts with is not a change.
+    ///
+    /// [`OperationChangeInfo::updated_operations`] lists the changed
+    /// operations as of that response. [`OperationChangeInfo::operations`]
+    /// is the full map when the hook is called, including the `EXECUTION`
+    /// operation, and contains every updated ID. Every [`OperationInfo`]
+    /// has `is_replay() == false`.
+    ///
+    /// Every call finishes before
+    /// [`on_invocation_end`](Self::on_invocation_end), including the call
+    /// for a write whose caller dropped it and for the end-of-invocation
+    /// flush. The change that completes a waiting operation comes before
+    /// that operation's [`on_operation_end`](Self::on_operation_end).
+    ///
+    /// Against [`on_operation_start`](Self::on_operation_start): a wait,
+    /// `create_callback`, an invoke and a step under
+    /// `StepSemantics::AtMostOncePerRetry` call `on_operation_start` after
+    /// their `START` response, so the change that lists them `STARTED`
+    /// comes first. A default step, `wait_for_condition` and every
+    /// child-backed operation that writes a record, including a map, a
+    /// parallel and a combinator, reserve `START` in submission order,
+    /// call `on_operation_start` synchronously, and only then release
+    /// `START` to the checkpoint writer, without awaiting its response. So
+    /// their `STARTED` change comes after their start hook, on every
+    /// runtime flavor.
+    ///
+    /// The hook runs synchronously. A plugin must not assume which task
+    /// calls it: an operation's task, a task that sent a refresh, or the
+    /// invocation wrapper, not necessarily the task that submitted the
+    /// write. One task delivers at a time, and an operation whose change
+    /// another task is delivering waits for that delivery before it calls
+    /// its next hook, on every runtime flavor. So a hook that blocks delays
+    /// those operations. It never runs while the SDK holds a checkpoint
+    /// lock. It can return work: the SDK runs that future on its own task,
+    /// and waits for it before `on_invocation_end` until 500 ms before the
+    /// invocation deadline.
     ///
     /// # Errors
     ///
-    /// An error is logged and does not change the execution.
+    /// An error or a panic is logged at WARN with the plugin's name and
+    /// registration index, and does not change the execution.
     fn on_operation_change(&self, _info: &OperationChangeInfo) -> HookWork {
         Ok(None)
     }
@@ -1454,6 +1502,19 @@ pub struct OperationInfo {
     is_virtual: bool,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// How many times [`OperationInfo::from_record`] ran on this thread. A
+    /// `#[tokio::test]` runs every SDK task on the test's own thread.
+    static INFOS_FROM_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of [`OperationInfo::from_record`] calls on this thread.
+#[cfg(test)]
+pub(crate) fn infos_from_records() -> usize {
+    INFOS_FROM_RECORDS.with(std::cell::Cell::get)
+}
+
 impl OperationInfo {
     /// Converts the checkpoint record stored under the wire ID `id`.
     ///
@@ -1463,6 +1524,8 @@ impl OperationInfo {
     /// it is `None`. An attempt of 0 means the service sent none, so it
     /// gives `None`.
     pub(crate) fn from_record(id: &str, record: &CheckpointRecord) -> Self {
+        #[cfg(test)]
+        INFOS_FROM_RECORDS.with(|count| count.set(count.get() + 1));
         let (status, status_str) = status_fields(&record.status);
         let error = wire_error_from_fields(
             record.error_type.as_deref(),
@@ -1944,6 +2007,19 @@ impl OperationChangeInfo {
     pub fn operations(&self) -> &BTreeMap<String, OperationInfo> {
         &self.operations
     }
+
+    /// The change info of one checkpoint response.
+    pub(crate) fn new(
+        execution_arn: String,
+        updated_operations: Vec<OperationInfo>,
+        operations: BTreeMap<String, OperationInfo>,
+    ) -> Self {
+        Self {
+            execution_arn,
+            updated_operations,
+            operations,
+        }
+    }
 }
 
 /// What a plugin knows when it supplies the trace header of a chained
@@ -2044,16 +2120,14 @@ fn wire_error_from_fields(
 }
 
 /// Projects every record of `log` into an operation info, with one read of
-/// the log, and skips any `EXECUTION` record.
+/// the log.
 ///
-/// The bootstrap parsers drop the `EXECUTION` record, but a checkpoint
-/// response can insert one into the log. So this function skips it itself;
-/// the `EXECUTION` slot of an operations map comes from the bootstrap
-/// state instead.
+/// The log holds no `EXECUTION` record: the bootstrap parsers and the
+/// checkpoint-response merge both skip it. The `EXECUTION` slot of an
+/// operations map comes from the plugins' own slot instead.
 pub(crate) fn operation_infos(log: &CheckpointLog) -> BTreeMap<String, OperationInfo> {
     log.project_records(OperationInfo::from_record)
         .into_iter()
-        .filter(|info| info.kind != Some(OperationKind::Execution))
         .map(|info| (info.id.clone(), info))
         .collect()
 }
@@ -2232,6 +2306,76 @@ pub(crate) struct InvocationPlugins {
     undelivered: Arc<Mutex<Undelivered>>,
     /// The work the operation hooks returned.
     work: Mutex<WorkState>,
+    /// The change sets of the checkpoint responses not yet delivered to
+    /// `on_operation_change`, in response order.
+    change_queue: Mutex<std::collections::VecDeque<Vec<OperationInfo>>>,
+    /// Whether a task is delivering the change sets of `change_queue`.
+    draining: std::sync::atomic::AtomicBool,
+    /// The number of change sets ever pushed to `change_queue`. It grows
+    /// under the queue lock.
+    changes_pushed: std::sync::atomic::AtomicU64,
+    /// How many change sets were delivered, and the tasks that wait for a
+    /// delivery (see [`Self::poll_changes_delivered`]).
+    delivery: Mutex<ChangeDelivery>,
+    /// Runs right after a drain cleared the drain flag, before the drain
+    /// checks the queue again. A test pushes a change set there.
+    #[cfg(test)]
+    after_release: Mutex<Option<AfterRelease>>,
+}
+
+/// The test hook of [`InvocationPlugins::set_after_release`].
+#[cfg(test)]
+type AfterRelease = Box<dyn FnMut(&InvocationPlugins) + Send>;
+
+/// The delivery progress of the change sets of one invocation.
+#[derive(Default)]
+pub(crate) struct ChangeDelivery {
+    /// The number of change sets whose `on_operation_change` calls
+    /// returned.
+    delivered: u64,
+    /// The waker of each pending waiter, keyed by the waiter's
+    /// registration key. A waiter has at most one entry: a later poll
+    /// replaces its waker instead of adding one, so the map holds at most
+    /// one entry per live waiter. Each delivery takes and wakes them all.
+    waiters: BTreeMap<u64, std::task::Waker>,
+    /// The key the next registering waiter receives.
+    next_key: u64,
+}
+
+/// The state of one wait for change-set deliveries (see
+/// [`InvocationPlugins::poll_changes_delivered`]). Its owner calls
+/// [`InvocationPlugins::cancel_wait`] when it stops waiting before the
+/// wait is ready, so no registration outlives it.
+#[derive(Debug, Default)]
+pub(crate) struct DeliveryWait {
+    /// The number of change sets to wait for. The first poll sets it.
+    target: Option<u64>,
+    /// The key of this wait's waker registration, once it has one.
+    key: Option<u64>,
+}
+
+std::thread_local! {
+    /// The address of the [`InvocationPlugins`] whose change sets this
+    /// thread is delivering, or 0. A hook that waits for deliveries on the
+    /// thread that runs it would wait for itself.
+    static DRAINING_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the current thread as the drain of one [`InvocationPlugins`]
+/// while it lives, and restores the previous mark when dropped.
+struct DrainingHere(usize);
+
+impl DrainingHere {
+    fn enter(plugins: &InvocationPlugins) -> Self {
+        let address = std::ptr::from_ref(plugins) as usize;
+        Self(DRAINING_HERE.with(|here| here.replace(address)))
+    }
+}
+
+impl Drop for DrainingHere {
+    fn drop(&mut self) {
+        DRAINING_HERE.with(|here| here.set(self.0));
+    }
 }
 
 impl InvocationPlugins {
@@ -2263,6 +2407,251 @@ impl InvocationPlugins {
             .updated_operations()
             .iter()
             .any(|operation| operation.id() == id)
+    }
+
+    /// Replaces the `EXECUTION` slot with `info`, the `EXECUTION` operation
+    /// a checkpoint response returned. Returns whether that is a change:
+    /// the slot held no operation, or held one with another status.
+    pub(crate) fn replace_execution(&self, info: OperationInfo) -> bool {
+        let mut slot = self
+            .execution
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = slot
+            .as_ref()
+            .is_none_or(|held| held.status_str != info.status_str);
+        *slot = Some(info);
+        changed
+    }
+
+    /// Queues the change set of one checkpoint response for
+    /// `on_operation_change`. The SDK never queues an empty change set.
+    pub(crate) fn push_operation_change(&self, updated: Vec<OperationInfo>) {
+        let mut queue = self
+            .change_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.push_back(updated);
+        self.changes_pushed
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Delivers every queued change set to `on_operation_change`, in queue
+    /// order, unless another task is delivering them already.
+    ///
+    /// One task delivers at a time, which keeps the calls in response
+    /// order. A task that finds the drain flag set returns at once: the
+    /// task that holds the flag delivers its entry, because it checks the
+    /// queue again after it clears the flag. The queue lock is released
+    /// before each delivery, so a hook never runs under it.
+    ///
+    /// Each entry builds one operations map, the operations of `log` with
+    /// the `EXECUTION` slot, and every plugin receives the same info.
+    pub(crate) fn drain_operation_changes(&self, log: &CheckpointLog) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        loop {
+            if self
+                .draining
+                .compare_exchange(false, true, AcqRel, Acquire)
+                .is_err()
+            {
+                return;
+            }
+            let here = DrainingHere::enter(self);
+            while let Some(entry) = self.pop_operation_change() {
+                let operations = {
+                    let execution = self
+                        .execution
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    operations_map(log, execution.as_ref())
+                };
+                let info = OperationChangeInfo::new(
+                    self.info().execution_arn().to_owned(),
+                    entry,
+                    operations,
+                );
+                self.dispatch_work("on_operation_change", |p| p.on_operation_change(&info));
+                drop(info);
+                self.finish_delivery();
+            }
+            drop(here);
+            self.draining
+                .store(false, std::sync::atomic::Ordering::Release);
+            #[cfg(test)]
+            self.run_after_release();
+            if self.change_queue_is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// Counts one delivered change set, then wakes every task that waits
+    /// for a delivery.
+    fn finish_delivery(&self) {
+        let waiters = {
+            let mut delivery = self
+                .delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            delivery.delivered += 1;
+            std::mem::take(&mut delivery.waiters)
+        };
+        for waiter in waiters.into_values() {
+            waiter.wake();
+        }
+    }
+
+    /// Delivers the queued change sets, and is ready once every change set
+    /// pushed before the first poll was delivered.
+    ///
+    /// A drain that finds another task delivering returns at once (see
+    /// [`Self::drain_operation_changes`]). A caller whose own change set
+    /// must reach `on_operation_change` before it continues, such as an
+    /// operation that fires `on_operation_start` or `on_operation_end`
+    /// next, waits here instead, until the delivering task got through
+    /// that change set. `target` holds the number of change sets to wait
+    /// for; the first poll sets it.
+    ///
+    /// On the thread that is delivering change sets, the poll is ready at
+    /// once: a hook that waited there would wait for itself.
+    pub(crate) fn poll_changes_delivered(
+        &self,
+        log: &CheckpointLog,
+        wait: &mut DeliveryWait,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        use std::sync::atomic::Ordering::Acquire;
+        let target = *wait
+            .target
+            .get_or_insert_with(|| self.changes_pushed.load(Acquire));
+        self.drain_operation_changes(log);
+        let mut delivery = self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if delivery.delivered >= target
+            || DRAINING_HERE.with(std::cell::Cell::get) == std::ptr::from_ref(self) as usize
+        {
+            // A delivery takes every registration, and the owner's
+            // `cancel_wait` removes any other one when it drops the wait.
+            return Poll::Ready(());
+        }
+        // The drain above lost to a task that was delivering. That task,
+        // or the one that takes the flag after it, delivers every change
+        // set pushed before this poll, because a drain checks the queue
+        // again after it clears the flag. Each delivery wakes this task.
+        // The registration happens under the lock a delivery counts
+        // under, so no delivery is missed. A repeated poll refreshes this
+        // wait's one entry rather than adding another.
+        let key = *wait.key.get_or_insert_with(|| {
+            let key = delivery.next_key;
+            delivery.next_key += 1;
+            key
+        });
+        match delivery.waiters.entry(key) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if !entry.get().will_wake(cx.waker()) {
+                    entry.insert(cx.waker().clone());
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(cx.waker().clone());
+            }
+        }
+        Poll::Pending
+    }
+
+    /// Removes the waker registration of `wait`, whose owner stops
+    /// waiting before the wait was ready.
+    pub(crate) fn cancel_wait(&self, wait: &mut DeliveryWait) {
+        if let Some(key) = wait.key.take() {
+            self.delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .waiters
+                .remove(&key);
+        }
+    }
+
+    /// [`Self::poll_changes_delivered`] as a future. Dropping it before it
+    /// is ready removes its registration.
+    pub(crate) async fn changes_delivered(&self, log: &CheckpointLog) {
+        /// Cancels the wait when the future is dropped.
+        struct Guard<'a> {
+            plugins: &'a InvocationPlugins,
+            wait: DeliveryWait,
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.plugins.cancel_wait(&mut self.wait);
+            }
+        }
+        let mut guard = Guard {
+            plugins: self,
+            wait: DeliveryWait::default(),
+        };
+        std::future::poll_fn(|cx| {
+            guard
+                .plugins
+                .poll_changes_delivered(log, &mut guard.wait, cx)
+        })
+        .await;
+    }
+
+    /// The number of waker registrations of pending waiters.
+    #[cfg(test)]
+    pub(crate) fn delivery_waiter_count(&self) -> usize {
+        self.delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters
+            .len()
+    }
+
+    /// Runs and clears the test hook of `after_release`.
+    #[cfg(test)]
+    fn run_after_release(&self) {
+        let hook = self
+            .after_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut hook) = hook {
+            hook(self);
+        }
+    }
+
+    /// Sets a hook that runs once, right after a drain cleared the drain
+    /// flag and before it checks the queue again.
+    #[cfg(test)]
+    pub(crate) fn set_after_release(&self, hook: impl FnMut(&Self) + Send + 'static) {
+        *self
+            .after_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Takes the oldest queued change set.
+    fn pop_operation_change(&self) -> Option<Vec<OperationInfo>> {
+        self.change_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+    }
+
+    /// Whether no change set is queued.
+    fn change_queue_is_empty(&self) -> bool {
+        self.change_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Whether a task is delivering change sets now.
+    #[cfg(test)]
+    pub(crate) fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Returns the kept destructor panics, and leaves none behind.
@@ -3033,6 +3422,12 @@ pub(crate) fn create_plugins(
         execution: Mutex::new(execution),
         undelivered: Arc::new(Mutex::new(Undelivered::Kept(error_drop_panics))),
         work: Mutex::new(WorkState::Open(Vec::new())),
+        change_queue: Mutex::new(std::collections::VecDeque::new()),
+        draining: std::sync::atomic::AtomicBool::new(false),
+        changes_pushed: std::sync::atomic::AtomicU64::new(0),
+        delivery: Mutex::new(ChangeDelivery::default()),
+        #[cfg(test)]
+        after_release: Mutex::new(None),
     }))
 }
 
@@ -3251,6 +3646,121 @@ pub(crate) mod test_support {
         ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
             Ok(Some(Box::new(self.clone())))
         }
+    }
+
+    type ChangeFn = dyn Fn(&super::OperationChangeInfo) + Send + Sync;
+
+    /// A plugin that records every [`super::OperationChangeInfo`] its
+    /// `on_operation_change` receives, then runs its closure, if any. With
+    /// `panics`, the hook panics instead and records nothing.
+    ///
+    /// Its timeline records, in call order, `change:<name>:<status>` for
+    /// each updated operation of a change call (its wire status token), `start:<name>` and
+    /// `end:<name>` for the operation hooks, and `invocation_end:<status>`.
+    /// An operation without a name is named by its wire ID.
+    #[derive(Clone, Default)]
+    pub(crate) struct Changes {
+        pub(crate) calls: Arc<Mutex<Vec<super::OperationChangeInfo>>>,
+        pub(crate) timeline: Arc<Mutex<Vec<String>>>,
+        pub(crate) on_change: Option<Arc<ChangeFn>>,
+        pub(crate) panics: bool,
+    }
+
+    impl Changes {
+        /// The infos recorded so far.
+        pub(crate) fn calls(&self) -> Vec<super::OperationChangeInfo> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// The timeline so far.
+        pub(crate) fn timeline(&self) -> Vec<String> {
+            self.timeline.lock().unwrap().clone()
+        }
+
+        /// The plugins of an invocation whose one plugin is this recorder.
+        pub(crate) fn plugins(&self) -> Arc<super::InvocationPlugins> {
+            plugins_of(self.clone())
+        }
+
+        fn label(info: &super::OperationInfo) -> String {
+            info.name().unwrap_or(info.id()).to_owned()
+        }
+
+        /// The updated wire IDs of each recorded call.
+        pub(crate) fn updated_ids(&self) -> Vec<Vec<String>> {
+            self.calls()
+                .iter()
+                .map(|info| {
+                    info.updated_operations()
+                        .iter()
+                        .map(|op| op.id().to_owned())
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    impl Plugin for Changes {
+        fn name(&self) -> &'static str {
+            "Changes"
+        }
+
+        fn on_operation_change(&self, info: &super::OperationChangeInfo) -> super::HookWork {
+            assert!(!self.panics, "change hook panicked");
+            self.calls.lock().unwrap().push(info.clone());
+            {
+                let mut timeline = self.timeline.lock().unwrap();
+                for op in info.updated_operations() {
+                    timeline.push(format!(
+                        "change:{}:{}",
+                        Self::label(op),
+                        op.status_str().unwrap_or_default()
+                    ));
+                }
+            }
+            if let Some(hook) = &self.on_change {
+                hook(info);
+            }
+            Ok(None)
+        }
+
+        fn on_operation_start(&self, info: &super::OperationInfo) -> super::HookWork {
+            let label = format!("start:{}", Self::label(info));
+            self.timeline.lock().unwrap().push(label);
+            Ok(None)
+        }
+
+        fn on_operation_end(&self, info: &super::OperationInfo) -> super::HookWork {
+            let label = format!("end:{}", Self::label(info));
+            self.timeline.lock().unwrap().push(label);
+            Ok(None)
+        }
+
+        fn on_invocation_end<'a>(&'a self, info: &'a InvocationEndInfo) -> HookFuture<'a> {
+            let label = format!("invocation_end:{:?}", info.status());
+            self.timeline.lock().unwrap().push(label);
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    impl PluginFactory for Changes {
+        fn create_plugin(
+            &self,
+            _info: &InvocationInfo,
+        ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// The plugins of an invocation with one plugin per factory, in order.
+    pub(crate) fn plugins_of_all(
+        factories: Vec<Arc<dyn PluginFactory>>,
+    ) -> Arc<super::InvocationPlugins> {
+        let factories: Vec<(&'static str, Arc<dyn PluginFactory>)> = factories
+            .into_iter()
+            .map(|factory| ("test::Plugin", factory))
+            .collect();
+        super::create_plugins(&factories, None, empty_info).expect("a factory is registered")
     }
 
     /// One operation or attempt hook call that [`OpHooks`] recorded.
@@ -3645,6 +4155,41 @@ pub(crate) mod test_support {
             .iter()
             .filter(|w| field(w, "message") == message)
             .collect()
+    }
+
+    /// A waker that counts its wakes and signals each one on a channel, so
+    /// a test sees a wake without polling again.
+    pub(crate) struct SignalWaker {
+        woken: std::sync::atomic::AtomicUsize,
+        signal: Mutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl SignalWaker {
+        /// A waker and the receiver of its wake signals.
+        pub(crate) fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+            let (signal, signals) = std::sync::mpsc::channel();
+            let waker = Arc::new(Self {
+                woken: std::sync::atomic::AtomicUsize::new(0),
+                signal: Mutex::new(signal),
+            });
+            (waker, signals)
+        }
+
+        /// How often the waker was woken.
+        pub(crate) fn woken(&self) -> usize {
+            self.woken.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl std::task::Wake for SignalWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _receiver_gone = self.signal.lock().unwrap().send(());
+        }
     }
 }
 
@@ -4779,17 +5324,326 @@ mod tests {
         assert_eq!(crate::engine::projections() - before, 1);
     }
 
+    /// A change set holding one started step info with wire ID `id`.
+    fn change_entry(id: &str) -> Vec<OperationInfo> {
+        vec![OperationInfo::from_record(
+            id,
+            &record("STEP", CheckpointStatus::Started),
+        )]
+    }
+
+    /// The drain delivers every queued change set once, in push order,
+    /// and leaves the queue empty.
     #[test]
-    fn operation_infos_skips_execution_record() {
-        let log = CheckpointLog::from_records(vec![
-            (
-                "exec".to_owned(),
-                record("EXECUTION", CheckpointStatus::Started),
-            ),
-            ("s".to_owned(), record("STEP", CheckpointStatus::Started)),
+    fn drain_delivers_in_order_and_empties_queue() {
+        let recorder = test_support::Changes::default();
+        let plugins = test_support::plugins_of(recorder.clone());
+        let log = CheckpointLog::empty();
+        for id in ["a", "b", "c"] {
+            plugins.push_operation_change(change_entry(id));
+        }
+        plugins.drain_operation_changes(&log);
+        assert_eq!(recorder.updated_ids(), [["a"], ["b"], ["c"]]);
+        plugins.drain_operation_changes(&log);
+        assert_eq!(recorder.calls().len(), 3, "a second drain makes no call");
+    }
+
+    /// A drain started while another one runs returns at once, and the
+    /// running drain delivers the entry that was pushed meanwhile.
+    #[test]
+    fn drain_is_skipped_while_another_drain_runs() {
+        let target: Arc<std::sync::OnceLock<Weak<InvocationPlugins>>> = Arc::default();
+        let inner_calls = Arc::new(Mutex::new(None::<usize>));
+        let mut recorder = test_support::Changes::default();
+        let first = Arc::new(AtomicBool::new(true));
+        {
+            let target = Arc::clone(&target);
+            let calls = Arc::clone(&recorder.calls);
+            let inner_calls = Arc::clone(&inner_calls);
+            recorder.on_change = Some(Arc::new(move |_info| {
+                if !first.swap(false, Ordering::SeqCst) {
+                    return;
+                }
+                let plugins = target.get().unwrap().upgrade().unwrap();
+                plugins.push_operation_change(change_entry("d"));
+                plugins.drain_operation_changes(&CheckpointLog::empty());
+                *inner_calls.lock().unwrap() = Some(calls.lock().unwrap().len());
+            }));
+        }
+        let plugins = test_support::plugins_of(recorder.clone());
+        target.set(Arc::downgrade(&plugins)).unwrap();
+        for id in ["a", "b", "c"] {
+            plugins.push_operation_change(change_entry(id));
+        }
+        plugins.drain_operation_changes(&CheckpointLog::empty());
+        assert_eq!(
+            *inner_calls.lock().unwrap(),
+            Some(1),
+            "the inner drain made no call"
+        );
+        assert_eq!(recorder.updated_ids(), [["a"], ["b"], ["c"], ["d"]]);
+        assert!(!plugins.is_draining());
+    }
+
+    /// A change set pushed after a drain cleared its flag, by a task that
+    /// does not drain, is delivered by that drain's check of the queue,
+    /// exactly once and after the earlier one.
+    #[test]
+    fn drain_rechecks_queue_after_clearing_flag() {
+        let recorder = test_support::Changes::default();
+        let plugins = test_support::plugins_of(recorder.clone());
+        let log = CheckpointLog::empty();
+        plugins.set_after_release(|plugins| {
+            assert!(
+                !plugins.is_draining(),
+                "the hook runs after the flag is clear"
+            );
+            plugins.push_operation_change(change_entry("b"));
+        });
+        plugins.push_operation_change(change_entry("a"));
+        plugins.drain_operation_changes(&log);
+        assert_eq!(recorder.updated_ids(), [["a"], ["b"]]);
+        assert!(!plugins.is_draining());
+        plugins.drain_operation_changes(&log);
+        assert_eq!(recorder.calls().len(), 2, "the entry was delivered once");
+    }
+
+    /// A no-op waker, for polling a future once by hand.
+    fn noop_context() -> Context<'static> {
+        Context::from_waker(std::task::Waker::noop())
+    }
+
+    /// A drain of change set `a` held open by its change hook on another
+    /// thread, with change set `b` queued behind it.
+    struct HeldDrain {
+        plugins: Arc<InvocationPlugins>,
+        log: Arc<CheckpointLog>,
+        recorder: test_support::Changes,
+        release: std::sync::mpsc::Sender<()>,
+        holder: std::thread::JoinHandle<()>,
+    }
+
+    impl HeldDrain {
+        fn start() -> Self {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+            let first = AtomicBool::new(true);
+            let recorder = test_support::Changes {
+                on_change: Some(Arc::new(move |_info| {
+                    if first.swap(false, Ordering::SeqCst) {
+                        entered_tx.send(()).unwrap();
+                        release_rx.lock().unwrap().recv().unwrap();
+                    }
+                })),
+                ..test_support::Changes::default()
+            };
+            let plugins = test_support::plugins_of(recorder.clone());
+            let log = Arc::new(CheckpointLog::empty());
+            plugins.push_operation_change(change_entry("a"));
+            let holder = {
+                let plugins = Arc::clone(&plugins);
+                let log = Arc::clone(&log);
+                std::thread::spawn(move || plugins.drain_operation_changes(&log))
+            };
+            entered_rx.recv().unwrap();
+            plugins.push_operation_change(change_entry("b"));
+            Self {
+                plugins,
+                log,
+                recorder,
+                release,
+                holder,
+            }
+        }
+
+        /// Lets the holder deliver both change sets, and waits until it
+        /// returned.
+        fn finish(self) {
+            self.release.send(()).unwrap();
+            self.holder.join().unwrap();
+        }
+    }
+
+    /// The holder's delivery wakes a pending waiter's registered waker by
+    /// itself: the test sees the wake before it polls the waiter again.
+    /// Once both change sets are delivered, the waiter is ready and its
+    /// registration is gone.
+    #[test]
+    fn delivery_wakes_registered_waiter() {
+        let held = HeldDrain::start();
+        let (signal, signals) = test_support::SignalWaker::new();
+        let waker = std::task::Waker::from(Arc::clone(&signal));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = Box::pin(held.plugins.changes_delivered(&held.log));
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(held.plugins.delivery_waiter_count(), 1);
+        assert_eq!(signal.woken(), 0);
+        assert_eq!(held.recorder.updated_ids(), [["a"]]);
+        held.release.send(()).unwrap();
+        signals
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a delivery woke the registered waker");
+        held.holder.join().unwrap();
+        assert!(waiter.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(held.plugins.delivery_waiter_count(), 0);
+        assert_eq!(held.recorder.updated_ids(), [["a"], ["b"]]);
+    }
+
+    /// Repeated polls of one pending waiter keep one registration, and a
+    /// poll with another waker replaces the registered one: the delivery
+    /// wakes only the latest waker.
+    #[test]
+    fn repeated_polls_keep_one_registration() {
+        let held = HeldDrain::start();
+        let (first, _first_signals) = test_support::SignalWaker::new();
+        let (latest, latest_signals) = test_support::SignalWaker::new();
+        let first_waker = std::task::Waker::from(Arc::clone(&first));
+        let latest_waker = std::task::Waker::from(Arc::clone(&latest));
+        let mut waiter = Box::pin(held.plugins.changes_delivered(&held.log));
+        for _ in 0..100 {
+            assert!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&first_waker))
+                    .is_pending()
+            );
+        }
+        assert_eq!(held.plugins.delivery_waiter_count(), 1);
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&latest_waker))
+                .is_pending()
+        );
+        assert_eq!(held.plugins.delivery_waiter_count(), 1);
+        held.release.send(()).unwrap();
+        latest_signals
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the delivery woke the latest waker");
+        held.holder.join().unwrap();
+        assert_eq!(first.woken(), 0, "the replaced waker is not woken");
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&latest_waker))
+                .is_ready()
+        );
+        assert_eq!(held.plugins.delivery_waiter_count(), 0);
+    }
+
+    /// A waiter dropped while it waits removes its registration, so a
+    /// cancelled wait leaves nothing behind for a delivery to wake.
+    #[test]
+    fn dropped_waiter_removes_registration() {
+        let held = HeldDrain::start();
+        let mut waiter = Box::pin(held.plugins.changes_delivered(&held.log));
+        assert!(waiter.as_mut().poll(&mut noop_context()).is_pending());
+        assert_eq!(held.plugins.delivery_waiter_count(), 1);
+        drop(waiter);
+        assert_eq!(held.plugins.delivery_waiter_count(), 0);
+        let plugins = Arc::clone(&held.plugins);
+        let recorder = held.recorder.clone();
+        held.finish();
+        assert_eq!(recorder.updated_ids(), [["a"], ["b"]]);
+        assert_eq!(plugins.delivery_waiter_count(), 0);
+    }
+
+    /// A change hook that waits for deliveries on the thread that is
+    /// delivering is ready at once, instead of waiting for itself.
+    #[test]
+    fn waiter_on_delivering_thread_is_ready() {
+        let target: Arc<std::sync::OnceLock<Weak<InvocationPlugins>>> = Arc::default();
+        let inner = Arc::new(Mutex::new(None::<bool>));
+        let mut recorder = test_support::Changes::default();
+        {
+            let target = Arc::clone(&target);
+            let inner = Arc::clone(&inner);
+            let first = AtomicBool::new(true);
+            recorder.on_change = Some(Arc::new(move |_info| {
+                if !first.swap(false, Ordering::SeqCst) {
+                    return;
+                }
+                let plugins = target.get().unwrap().upgrade().unwrap();
+                plugins.push_operation_change(change_entry("b"));
+                let log = CheckpointLog::empty();
+                let mut waiter = Box::pin(plugins.changes_delivered(&log));
+                let ready = waiter.as_mut().poll(&mut noop_context()).is_ready();
+                inner.lock().unwrap().get_or_insert(ready);
+            }));
+        }
+        let plugins = test_support::plugins_of(recorder.clone());
+        target.set(Arc::downgrade(&plugins)).unwrap();
+        plugins.push_operation_change(change_entry("a"));
+        let log = CheckpointLog::empty();
+        let mut waiter = Box::pin(plugins.changes_delivered(&log));
+        assert!(waiter.as_mut().poll(&mut noop_context()).is_ready());
+        assert_eq!(*inner.lock().unwrap(), Some(true));
+        assert_eq!(recorder.updated_ids(), [["a"], ["b"]]);
+    }
+
+    /// A panicking change hook does not keep the next plugin from any
+    /// call, and the drain flag is cleared afterwards.
+    #[test]
+    fn panicking_change_hook_is_isolated() {
+        let recorder = test_support::Changes::default();
+        let panics = test_support::Changes {
+            panics: true,
+            ..test_support::Changes::default()
+        };
+        let plugins = test_support::plugins_of_all(vec![
+            Arc::new(panics) as Arc<dyn PluginFactory>,
+            Arc::new(recorder.clone()),
         ]);
-        let map = operation_infos(&log);
-        assert_eq!(map.keys().collect::<Vec<_>>(), ["s"]);
+        let log = CheckpointLog::empty();
+        plugins.push_operation_change(change_entry("a"));
+        plugins.push_operation_change(change_entry("b"));
+        plugins.drain_operation_changes(&log);
+        assert_eq!(recorder.updated_ids(), [["a"], ["b"]]);
+        assert!(!plugins.is_draining());
+    }
+
+    /// Each drained entry projects the log once, and its operations map
+    /// holds the log's records and the `EXECUTION` slot.
+    #[test]
+    fn drained_change_holds_the_full_map() {
+        let recorder = test_support::Changes::default();
+        let plugins = test_support::plugins_of(recorder.clone());
+        let execution = OperationInfo::execution(
+            "e",
+            "EXECUTION",
+            &CheckpointStatus::Started,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(plugins.replace_execution(execution));
+        let log = CheckpointLog::from_records(vec![(
+            "s".to_owned(),
+            record("STEP", CheckpointStatus::Started),
+        )]);
+        plugins.push_operation_change(change_entry("s"));
+        let before = crate::engine::projections();
+        plugins.drain_operation_changes(&log);
+        assert_eq!(crate::engine::projections() - before, 1);
+        let calls = recorder.calls();
+        let info = calls.first().unwrap();
+        assert_eq!(info.operations().keys().collect::<Vec<_>>(), ["e", "s"]);
+        assert_eq!(info.execution_arn(), plugins.info().execution_arn());
+    }
+
+    /// Replacing the `EXECUTION` slot is a change when the slot was empty
+    /// or held another status, and not when the status is the same.
+    #[test]
+    fn replace_execution_reports_status_changes() {
+        let plugins = test_support::plugins_of(test_support::Changes::default());
+        let exec = |status: CheckpointStatus| {
+            OperationInfo::execution("e", "EXECUTION", &status, None, None, None).unwrap()
+        };
+        assert!(plugins.replace_execution(exec(CheckpointStatus::Started)));
+        assert!(!plugins.replace_execution(exec(CheckpointStatus::Started)));
+        assert!(plugins.replace_execution(exec(CheckpointStatus::Succeeded)));
     }
 
     /// The operations map inserts the `EXECUTION` slot under its wire ID,

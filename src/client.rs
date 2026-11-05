@@ -1082,11 +1082,28 @@ pub(crate) fn operations_to_checkpoint_log(operations: &[Operation]) -> Checkpoi
 /// After a checkpoint call, the backend may return operations with
 /// backend-assigned fields (e.g. `callback_id`). These must be visible to
 /// subsequent reads in the same invocation.
-pub(crate) fn merge_operations_into_log(log: &CheckpointLog, operations: &[Operation]) {
+///
+/// Skips every `EXECUTION` operation: the log holds none, and the plugins
+/// keep the `EXECUTION` operation in their own slot. Returns the wire ID of
+/// each merged operation whose status changed, in input order: the log
+/// held no record of it, or held one with another status. Other fields do
+/// not count.
+pub(crate) fn merge_operations_into_log(
+    log: &CheckpointLog,
+    operations: &[Operation],
+) -> Vec<String> {
+    let mut changed = Vec::new();
     for op in operations {
+        if op.r#type == OperationType::Execution {
+            continue;
+        }
         let (wire_id, record) = operation_to_record(op);
-        log.insert(wire_id, record);
+        let status = record.status.clone();
+        if log.insert(wire_id.clone(), record).as_ref() != Some(&status) {
+            changed.push(wire_id);
+        }
     }
+    changed
 }
 
 /// The execution state the bootstrap reads: the checkpoint log, the
@@ -2698,6 +2715,80 @@ mod tests {
         let record = record.unwrap();
         assert_eq!(record.status, CheckpointStatus::Succeeded);
         assert_eq!(record.result.as_deref(), Some(r#""merged result""#));
+    }
+
+    /// An operation of type `ty` and status `status`, with a callback ID
+    /// when `callback_id` is set.
+    fn status_op(
+        id: &str,
+        ty: OperationType,
+        status: aws_sdk_lambda::types::OperationStatus,
+        callback_id: Option<&str>,
+    ) -> Operation {
+        let mut builder = Operation::builder()
+            .id(id)
+            .r#type(ty)
+            .status(status)
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(0));
+        if let Some(callback_id) = callback_id {
+            builder = builder.callback_details(
+                aws_sdk_lambda::types::CallbackDetails::builder()
+                    .callback_id(callback_id)
+                    .build(),
+            );
+        }
+        builder.build().unwrap()
+    }
+
+    /// The four merge cases in one call: a new record and a status change
+    /// count, a field-only change does not, and the `EXECUTION` operation
+    /// is skipped and never enters the log.
+    #[test]
+    fn merge_reports_status_changes() {
+        use aws_sdk_lambda::types::OperationStatus as S;
+        let log = CheckpointLog::from_records(vec![
+            (
+                "b".to_owned(),
+                CheckpointRecord::with_status("b", CheckpointStatus::Started),
+            ),
+            (
+                "c".to_owned(),
+                CheckpointRecord::with_status("c", CheckpointStatus::Started),
+            ),
+        ]);
+        let changed = merge_operations_into_log(
+            &log,
+            &[
+                status_op("a", OperationType::Step, S::Started, None),
+                status_op("b", OperationType::Callback, S::Started, Some("cb-1")),
+                status_op("c", OperationType::Step, S::Succeeded, None),
+                status_op("exec", OperationType::Execution, S::Started, None),
+            ],
+        );
+        assert_eq!(changed, ["a", "c"]);
+        assert_eq!(
+            log.get("b").unwrap().callback_id.as_deref(),
+            Some("cb-1"),
+            "the field-only change is still merged"
+        );
+        assert!(!log.contains("exec"));
+    }
+
+    /// Two statuses this SDK does not know differ when their tokens
+    /// differ, and are equal when the tokens are equal.
+    #[test]
+    fn merge_compares_unknown_statuses_by_token() {
+        use aws_sdk_lambda::types::OperationStatus as S;
+        let log = CheckpointLog::from_records(vec![(
+            "u".to_owned(),
+            CheckpointRecord::with_status("u", CheckpointStatus::Unknown("A".to_owned())),
+        )]);
+        let op = |token: &str| status_op("u", OperationType::Step, S::from(token), None);
+        assert_eq!(
+            merge_operations_into_log(&log, &[op("A")]),
+            Vec::<String>::new()
+        );
+        assert_eq!(merge_operations_into_log(&log, &[op("B")]), ["u"]);
     }
 
     // Pagination tests

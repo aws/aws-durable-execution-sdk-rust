@@ -227,6 +227,36 @@ Resources:
         RetentionPeriodInDays: 7
         ExecutionTimeout: 300
 
+  PluginOperationChange:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-8"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_operation_change/
+      Handler: bootstrap
+      Description: 'Conformance 10-8: Plugin operation-change hook reports the step change and the full operation map'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginChangeFieldShape:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-22"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_change_field_shape/
+      Handler: bootstrap
+      Description: 'Conformance 10-22: Plugin operation-change infos carry every field in the canonical dump'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
   PluginAttemptInfoShape:
     Type: AWS::Serverless::Function
     TestingMetadata:

@@ -5007,3 +5007,465 @@ async fn empty_containers_fire_container_hooks() {
         "{ops:?}"
     );
 }
+
+/// The `(name, status)` of each updated operation of one change call.
+type Updated = Vec<(Option<String>, Option<OperationStatus>)>;
+
+/// One call the change recorder saw, with the number of the invocation
+/// whose plugin received it.
+#[derive(Clone, Debug, PartialEq)]
+enum ChangeEvent {
+    /// `on_operation_change`: the `(name, status)` of each updated
+    /// operation, and whether every updated ID is a key of `operations()`.
+    Change {
+        n: usize,
+        updated: Updated,
+        in_map: bool,
+    },
+    /// `on_operation_start` for the operation named `name`.
+    Start { n: usize, name: Option<String> },
+}
+
+/// A factory that numbers its plugins by invocation, from 1, and records
+/// each change and operation-start call of every plugin in one list.
+#[derive(Clone, Default)]
+struct ChangeRecorder {
+    events: Arc<Mutex<Vec<ChangeEvent>>>,
+    count: Arc<AtomicUsize>,
+}
+
+struct ChangeInstance {
+    n: usize,
+    events: Arc<Mutex<Vec<ChangeEvent>>>,
+}
+
+impl Plugin for ChangeInstance {
+    fn on_operation_change(&self, info: &durable::plugin::OperationChangeInfo) -> HookWork {
+        let updated = info
+            .updated_operations()
+            .iter()
+            .map(|op| (op.name().map(str::to_owned), op.status()))
+            .collect();
+        let in_map = info
+            .updated_operations()
+            .iter()
+            .all(|op| info.operations().contains_key(op.id()));
+        self.events.lock().unwrap().push(ChangeEvent::Change {
+            n: self.n,
+            updated,
+            in_map,
+        });
+        Ok(None)
+    }
+
+    fn on_operation_start(&self, info: &OperationInfo) -> HookWork {
+        self.events.lock().unwrap().push(ChangeEvent::Start {
+            n: self.n,
+            name: info.name().map(str::to_owned),
+        });
+        Ok(None)
+    }
+}
+
+impl PluginFactory for ChangeRecorder {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(Some(Box::new(ChangeInstance {
+            n,
+            events: Arc::clone(&self.events),
+        })))
+    }
+}
+
+impl ChangeRecorder {
+    fn runner(&self) -> LocalRunner {
+        LocalRunner::new().options(
+            Options::builder()
+                .plugin(self.clone())
+                .build()
+                .expect("valid options"),
+        )
+    }
+
+    fn events(&self) -> Vec<ChangeEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    /// The change calls, as `(invocation, updated)`.
+    fn changes(&self) -> Vec<(usize, Updated)> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                ChangeEvent::Change { n, updated, .. } => Some((n, updated)),
+                ChangeEvent::Start { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The number of change calls that list `name` with `status`.
+    fn count_listing(&self, name: &str, status: OperationStatus) -> usize {
+        self.changes()
+            .iter()
+            .filter(|(_, updated)| lists(updated, name, status))
+            .count()
+    }
+
+    /// The index of the first change call that lists `name` with
+    /// `Started`, and the index of the start hook of `name`.
+    fn started_change_and_start(&self, name: &str) -> (usize, usize) {
+        let events = self.events();
+        let change = events
+            .iter()
+            .position(|event| {
+                matches!(event, ChangeEvent::Change { updated, .. }
+                    if lists(updated, name, OperationStatus::Started))
+            })
+            .expect("a change lists the operation STARTED");
+        let start = events
+            .iter()
+            .position(|event| {
+                matches!(event, ChangeEvent::Start { name: Some(started), .. } if started == name)
+            })
+            .expect("the operation's start hook ran");
+        (change, start)
+    }
+}
+
+/// Whether `updated` lists the operation `name` with `status`.
+fn lists(
+    updated: &[(Option<String>, Option<OperationStatus>)],
+    name: &str,
+    status: OperationStatus,
+) -> bool {
+    updated
+        .iter()
+        .any(|(n, s)| n.as_deref() == Some(name) && *s == Some(status))
+}
+
+/// A completed step is listed `Succeeded` by exactly one change call, and
+/// every updated ID is in the full map.
+#[tokio::test]
+async fn step_completion_reports_one_succeeded_change() {
+    let plugin = ChangeRecorder::default();
+    let result = plugin
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok(ctx
+                    .step(|_| async { Ok("hi".to_owned()) })
+                    .name("a")
+                    .await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output().map(String::as_str), Some("hi"));
+    assert_eq!(plugin.count_listing("a", OperationStatus::Succeeded), 1);
+    assert_eq!(plugin.count_listing("a", OperationStatus::Failed), 0);
+    assert!(
+        plugin
+            .events()
+            .iter()
+            .all(|event| !matches!(event, ChangeEvent::Change { in_map: false, .. })),
+        "{:?}",
+        plugin.events()
+    );
+}
+
+/// A default step calls `on_operation_start` before the change that
+/// lists it `Started`.
+#[tokio::test]
+async fn operation_start_precedes_start_change() {
+    let plugin = ChangeRecorder::default();
+    plugin
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok(ctx
+                    .step(|_| async { Ok("hi".to_owned()) })
+                    .name("a")
+                    .await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    let (change, start) = plugin.started_change_and_start("a");
+    assert!(start < change, "{:?}", plugin.events());
+}
+
+/// A wait, an at-most-once step and `create_callback` get the change that
+/// lists them `Started` before `on_operation_start`.
+#[tokio::test]
+async fn response_first_start_change_precedes_operation_start() {
+    let wait = ChangeRecorder::default();
+    wait.runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                ctx.wait(Duration::from_secs(1)).name("w").await?;
+                Ok(())
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    let (change, start) = wait.started_change_and_start("w");
+    assert!(change < start, "{:?}", wait.events());
+
+    let step = ChangeRecorder::default();
+    step.runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok(ctx
+                    .step(|_| async { Ok(1_u32) })
+                    .name("m")
+                    .semantics(durable::StepSemantics::AtMostOncePerRetry)
+                    .await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    let (change, start) = step.started_change_and_start("m");
+    assert!(change < start, "{:?}", step.events());
+
+    let callback = ChangeRecorder::default();
+    callback
+        .runner()
+        .callback_for(
+            "cb",
+            durable::test_util::CallbackReply::success(&"ok").expect("encodes"),
+        )
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let cb = ctx.create_callback::<String>().name("cb").await?;
+                Ok(cb.result().await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    let (change, start) = callback.started_change_and_start("cb");
+    assert!(change < start, "{:?}", callback.events());
+}
+
+/// A child context, a map and its item, and a combinator call
+/// `on_operation_start` before the change that lists them `Started`.
+#[tokio::test]
+async fn child_backed_operation_start_precedes_start_change() {
+    let child = ChangeRecorder::default();
+    child
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok(ctx
+                    .run_in_child_context(|child| async move {
+                        Ok(child.step(|_| async { Ok(1_u32) }).name("s").await?)
+                    })
+                    .name("c")
+                    .await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    let (change, start) = child.started_change_and_start("c");
+    assert!(start < change, "{:?}", child.events());
+
+    let map = ChangeRecorder::default();
+    map.runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok(ctx
+                    .map(vec![1_u32], |child, item, _idx| async move {
+                        Ok(child
+                            .step(move |_| async move { Ok(item) })
+                            .name("s")
+                            .await?)
+                    })
+                    .name("m")
+                    .await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    for name in ["m", "map-item-0"] {
+        let (change, start) = map.started_change_and_start(name);
+        assert!(start < change, "{name}: {:?}", map.events());
+    }
+
+    let all = ChangeRecorder::default();
+    all.runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let a = ctx.step(|_| async { Ok(1_u32) }).name("a").future();
+                let b = ctx.step(|_| async { Ok(2_u32) }).name("b").future();
+                Ok(ctx.try_join_all([a, b]).name("all").await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    let (change, start) = all.started_change_and_start("all");
+    assert!(start < change, "{:?}", all.events());
+}
+
+/// A retried step is listed `Pending` in the invocation that scheduled
+/// the retry, and `Succeeded` in the invocation that completed it.
+#[tokio::test]
+async fn retry_reports_pending_change() {
+    let plugin = ChangeRecorder::default();
+    let result = plugin
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok(ctx
+                    .step(|step| async move {
+                        if step.attempt() == 1 {
+                            return Err::<u32, BoxError>("first attempt fails".into());
+                        }
+                        Ok(2_u32)
+                    })
+                    .name("r")
+                    .retry_strategy(|_err, attempt| {
+                        if attempt >= 2 {
+                            RetryDecision::Stop
+                        } else {
+                            RetryDecision::Retry {
+                                delay: Duration::from_secs(1),
+                            }
+                        }
+                    })
+                    .await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&2));
+    let changes = plugin.changes();
+    assert!(
+        changes
+            .iter()
+            .any(|(n, updated)| *n == 1 && lists(updated, "r", OperationStatus::Pending)),
+        "{changes:?}"
+    );
+    assert!(
+        changes
+            .iter()
+            .any(|(n, updated)| *n == 2 && lists(updated, "r", OperationStatus::Succeeded)),
+        "{changes:?}"
+    );
+}
+
+/// A wait the service completed between invocations is part of the next
+/// invocation's starting state, which is not a change.
+#[tokio::test]
+async fn bootstrap_state_is_not_a_change() {
+    let plugin = ChangeRecorder::default();
+    let result = plugin
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                ctx.wait(Duration::from_secs(1)).name("w").await?;
+                Ok(())
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.invocation_count(), 2);
+    let changes = plugin.changes();
+    assert!(
+        !changes
+            .iter()
+            .any(|(n, updated)| *n == 2
+                && updated.iter().any(|(name, _)| name.as_deref() == Some("w"))),
+        "{changes:?}"
+    );
+}
+
+/// Each map item's step is listed `Succeeded` by exactly one change call.
+#[tokio::test]
+async fn map_items_report_changes() {
+    let plugin = ChangeRecorder::default();
+    plugin
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                Ok(ctx
+                    .map(vec![1_u32, 2, 3], |child, item, _idx| async move {
+                        Ok(child
+                            .step(move |_| async move { Ok(item) })
+                            .name(format!("item-{item}"))
+                            .await?)
+                    })
+                    .name("items")
+                    .await?)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    for name in ["item-1", "item-2", "item-3"] {
+        assert_eq!(
+            plugin.count_listing(name, OperationStatus::Succeeded),
+            1,
+            "{name}: {:?}",
+            plugin.changes()
+        );
+    }
+}
+
+/// A handler of a step, a wait and a map, for `no_plugin_no_change_work`.
+async fn change_work_handler(_e: (), ctx: DurableContext) -> Result<Vec<u32>, BoxError> {
+    let base = ctx.step(|_| async { Ok(10_u32) }).name("base").await?;
+    ctx.wait(Duration::from_secs(1)).name("w").await?;
+    Ok(ctx
+        .map(vec![1_u32, 2], move |child, item, _idx| async move {
+            Ok(child
+                .step(move |_| async move { Ok(base + item) })
+                .name(format!("item-{item}"))
+                .await?)
+        })
+        .name("items")
+        .await?)
+}
+
+/// The `(name, status)` of every operation of a run, in record order.
+fn named_statuses<O>(
+    result: &durable::test_util::TestResult<O>,
+) -> Vec<(Option<String>, OperationStatus)> {
+    result
+        .operations()
+        .iter()
+        .map(|op| (op.name().map(str::to_owned), op.status()))
+        .collect()
+}
+
+/// Without a plugin, the change work does not change a run: the handler
+/// returns the same value, over the same invocations and operations, as
+/// with a recording plugin, which does receive change calls.
+#[tokio::test]
+async fn no_plugin_no_change_work() {
+    let plain = LocalRunner::new()
+        .run(change_work_handler, ())
+        .await
+        .expect("runner");
+    let plugin = ChangeRecorder::default();
+    let recorded = plugin
+        .runner()
+        .run(change_work_handler, ())
+        .await
+        .expect("runner");
+    assert_eq!(plain.output(), Some(&vec![11, 12]));
+    assert_eq!(plain.output(), recorded.output());
+    assert_eq!(plain.invocation_count(), recorded.invocation_count());
+    assert_eq!(named_statuses(&plain), named_statuses(&recorded));
+    assert!(
+        !plugin.changes().is_empty(),
+        "the plugin run reported changes"
+    );
+}

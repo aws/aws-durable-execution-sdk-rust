@@ -2747,6 +2747,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin_change_field_shape"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "plugin_error_isolation"
 version = "0.0.0"
 dependencies = [
@@ -2814,6 +2825,17 @@ dependencies = [
 
 [[package]]
 name = "plugin_nested_parent_linkage"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plugin_operation_change"
 version = "0.0.0"
 dependencies = [
  "aws-durable-execution-sdk",

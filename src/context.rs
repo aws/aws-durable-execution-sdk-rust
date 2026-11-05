@@ -65,6 +65,16 @@ impl<T> Drop for UnreadResultGuard<T> {
     }
 }
 
+/// The changes one checkpoint call merged, for `on_operation_change`.
+#[derive(Default)]
+struct ChangeSet {
+    /// The wire IDs of the log records whose status changed, each once, in
+    /// merge order.
+    ids: Vec<String>,
+    /// The `EXECUTION` operations that changed the plugins' slot.
+    executions: Vec<crate::plugin::OperationInfo>,
+}
+
 /// A checkpoint write that has already started, and the future of its
 /// result.
 ///
@@ -81,6 +91,38 @@ pub(crate) struct SubmittedWrite {
     /// Set on the first poll (see [`SubmissionRecorder`]).
     #[cfg(test)]
     first_poll: Arc<std::sync::atomic::AtomicBool>,
+    /// The plugins and the log whose queued change sets the write delivers
+    /// when its result is ready (see [`Self::reported_by`]). `None` without
+    /// plugins, and once delivered.
+    report: Option<Box<WriteReport>>,
+}
+
+/// What a [`SubmittedWrite`] needs to deliver the change sets through its
+/// own before it returns its result.
+struct WriteReport {
+    plugins: Arc<crate::plugin::InvocationPlugins>,
+    log: Arc<CheckpointLog>,
+    /// Records a panic from the destructor of a retained result that no
+    /// reader receives.
+    coordinator: Arc<InvocationCoordinator>,
+    /// The result, kept while the write waits for the deliveries.
+    ready: Option<Result<CheckpointOutput, ExecutionClientError>>,
+    /// The write's wait for the deliveries (see
+    /// [`InvocationPlugins::poll_changes_delivered`](crate::plugin::InvocationPlugins::poll_changes_delivered)).
+    wait: crate::plugin::DeliveryWait,
+}
+
+impl Drop for WriteReport {
+    /// A write dropped while it waits removes its waker registration, and
+    /// drops the retained result, which no reader receives, inside a catch:
+    /// the result can hold an error of the user's checkpoint client whose
+    /// destructor panics, and such a panic is invocation-failing.
+    fn drop(&mut self) {
+        self.plugins.cancel_wait(&mut self.wait);
+        if let Some(unread) = self.ready.take() {
+            crate::task::drop_recorded(&self.coordinator, unread);
+        }
+    }
 }
 
 impl SubmittedWrite {
@@ -91,7 +133,26 @@ impl SubmittedWrite {
             result: Box::pin(result),
             #[cfg(test)]
             first_poll: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            report: None,
         }
+    }
+
+    /// Makes the write deliver the queued change sets of `ctx`'s plugins
+    /// to `on_operation_change` once its result is ready, `Ok` or `Err`, on
+    /// the task that polls it to completion. A write dropped before that
+    /// delivers nothing: another drain point delivers its change set. Does
+    /// nothing without plugins.
+    fn reported_by(mut self, ctx: &DurableContext) -> Self {
+        self.report = ctx.shared_plugins().map(|plugins| {
+            Box::new(WriteReport {
+                plugins,
+                log: Arc::clone(&ctx.inner.engine.checkpoint_log),
+                coordinator: Arc::clone(ctx.coordinator()),
+                ready: None,
+                wait: crate::plugin::DeliveryWait::default(),
+            })
+        });
+        self
     }
 
     /// A write whose result `receiver` delivers. A test builds the retained
@@ -126,7 +187,23 @@ impl Future for SubmittedWrite {
         #[cfg(test)]
         this.first_poll
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        this.result.as_mut().poll(cx)
+        let Some(report) = this.report.as_mut() else {
+            return this.result.as_mut().poll(cx);
+        };
+        let result = match report.ready.take() {
+            Some(result) => result,
+            None => std::task::ready!(this.result.as_mut().poll(cx)),
+        };
+        if report
+            .plugins
+            .poll_changes_delivered(&report.log, &mut report.wait, cx)
+            .is_pending()
+        {
+            report.ready = Some(result);
+            return std::task::Poll::Pending;
+        }
+        this.report = None;
+        std::task::Poll::Ready(result)
     }
 }
 
@@ -1252,6 +1329,23 @@ impl DurableContext {
         self.inner.plugins.as_deref()
     }
 
+    /// Delivers the queued change sets of the plugins to
+    /// `on_operation_change`, and waits until every change set queued
+    /// before the call was delivered, also when another task delivers it
+    /// (see
+    /// [`InvocationPlugins::changes_delivered`](crate::plugin::InvocationPlugins::changes_delivered)).
+    /// So an operation that awaits this before it fires
+    /// `on_operation_start` or `on_operation_end` fires that hook after its
+    /// change. Does nothing without plugins. The caller must hold no
+    /// checkpoint lock.
+    pub(crate) async fn report_operation_changes(&self) {
+        if let Some(plugins) = self.plugins() {
+            plugins
+                .changes_delivered(&self.inner.engine.checkpoint_log)
+                .await;
+        }
+    }
+
     /// [`Self::plugins`], shared: a user-function runner's own frame node
     /// holds them.
     pub(crate) fn shared_plugins(&self) -> Option<Arc<crate::plugin::InvocationPlugins>> {
@@ -1334,6 +1428,10 @@ impl DurableContext {
             }
         })
         .await;
+        // The response that readied the record queued its change set. It is
+        // delivered before the operation reads the record again, so it
+        // comes before the operation's end hook.
+        self.report_operation_changes().await;
     }
 
     /// The status and end time of the record of `wire_id`, as the refresh
@@ -1941,6 +2039,7 @@ impl DurableContext {
                 return ReservedWrite::rejected();
             };
             let (write, id) = self.enqueue_direct(updates, events, Some(permit), None, true);
+            let write = write.reported_by(self);
             #[cfg(test)]
             if id.is_some() {
                 self.record_submission(&recorded, &write);
@@ -1956,7 +2055,7 @@ impl DurableContext {
         let Some(batch) = self.join_batch(&coalescer, tracked, false, None, true) else {
             return ReservedWrite::rejected();
         };
-        let write = batch_result(batch);
+        let write = batch_result(batch).reported_by(self);
         #[cfg(test)]
         self.record_submission(&recorded, &write);
         ReservedWrite {
@@ -1982,17 +2081,18 @@ impl DurableContext {
         &self,
         first_wire_id: &str,
     ) -> Result<CheckpointOutput, ExecutionClientError> {
-        if self.inner.coalescer.is_some() {
-            return self
-                .write_with_urgency(Vec::new(), true, Some(first_wire_id))
-                .await;
-        }
-        // No checkpoint permit: the scheduler's permit keeps the invocation
-        // open until the response is merged and the readied operations are
-        // woken. The write task is counted, so the drive's cleanup waits
-        // for it after the scheduler is dropped.
-        self.write_direct_detached(Vec::new(), Vec::new(), None, Some(first_wire_id.to_owned()))
-            .await
+        let write = if self.inner.coalescer.is_some() {
+            self.write_with_urgency(Vec::new(), true, Some(first_wire_id))
+        } else {
+            // No checkpoint permit: the scheduler's permit keeps the
+            // invocation open until the response is merged and the readied
+            // operations are woken. The write task is counted, so the
+            // drive's cleanup waits for it after the scheduler is dropped.
+            self.write_direct_detached(Vec::new(), Vec::new(), None, Some(first_wire_id.to_owned()))
+        };
+        // The task that sends the refresh delivers the change sets queued
+        // so far once the call returns.
+        write.reported_by(self).await
     }
 
     /// Shared body of the buffered checkpoint paths: pairs each update
@@ -2021,6 +2121,7 @@ impl DurableContext {
         // write records nothing, so it emits nothing.
         let tracked = self.track_updates(updates);
         self.write_with_urgency(tracked, urgent, None)
+            .reported_by(self)
     }
 
     /// Pairs each update with its lifecycle-event metadata, captured now
@@ -2760,8 +2861,13 @@ impl DurableContext {
             // from an abandoned owner is.
             return std::future::pending().await;
         };
-        self.write_direct_detached(updates, Vec::new(), Some(permit), None)
-            .await
+        let result = self
+            .write_direct_detached(updates, Vec::new(), Some(permit), None)
+            .await;
+        // The detached write task merged the response and dropped the
+        // token guard, so the caller's task delivers the change sets.
+        self.report_operation_changes().await;
+        result
     }
 
     /// A direct write after the drive ended, when no permit can be taken:
@@ -2852,11 +2958,17 @@ impl DurableContext {
         // subsequent reads (e.g. reading callback_id after START) see
         // backend-assigned fields.
         let mut merged: Vec<String> = Vec::new();
+        // The change set of this call, for `on_operation_change`: the wire
+        // IDs whose status changed, each once, and the `EXECUTION`
+        // operations that changed the plugins' slot. Only collected with
+        // plugins.
+        let mut change_set = ChangeSet::default();
         if !output.updated_operations.is_empty() {
-            crate::client::merge_operations_into_log(
+            let changed_ids = crate::client::merge_operations_into_log(
                 &self.inner.engine.checkpoint_log,
                 &output.updated_operations,
             );
+            self.collect_changes(&mut change_set, changed_ids, &output.updated_operations);
             merged.extend(
                 output
                     .updated_operations
@@ -2871,20 +2983,33 @@ impl DurableContext {
         // a concurrent branch checkpoint and rotate the token, leaving this
         // get_state call with a stale token.
         if output.next_marker.is_some() {
-            let full_state = crate::client::get_full_state(
+            let full_state = match crate::client::get_full_state(
                 client.as_ref(),
                 &self.inner.execution_arn,
                 &token_guard,
             )
-            .await?;
+            .await
+            {
+                Ok(full_state) => full_state,
+                Err(err) => {
+                    // The response is merged already, so its changes are
+                    // reported even though the pages failed.
+                    self.queue_changes(change_set);
+                    return Err(err);
+                }
+            };
             if !full_state.is_empty() {
-                crate::client::merge_operations_into_log(
+                let changed_ids = crate::client::merge_operations_into_log(
                     &self.inner.engine.checkpoint_log,
                     &full_state,
                 );
+                self.collect_changes(&mut change_set, changed_ids, &full_state);
                 merged.extend(full_state.iter().map(|op| op.id().to_owned()));
             }
         }
+        // Still under the token lock, so change sets queue in response
+        // order. No hook runs here: a drain point delivers them later.
+        self.queue_changes(change_set);
 
         // A `wait_for_condition` RETRY the response did not carry: the log
         // takes the status the service recorded. This runs under the token
@@ -2908,6 +3033,59 @@ impl DurableContext {
         self.inner.coordinator.wake_operations(&merged);
 
         Ok(output)
+    }
+
+    /// Adds the changes of one merge to `change_set`: the wire IDs in
+    /// `changed_ids` not listed yet, and each `EXECUTION` operation of
+    /// `operations`, which replaces the plugins' slot and is a change when
+    /// the slot held no operation or one with another status. Does nothing
+    /// without plugins.
+    fn collect_changes(
+        &self,
+        change_set: &mut ChangeSet,
+        changed_ids: Vec<String>,
+        operations: &[aws_sdk_lambda::types::Operation],
+    ) {
+        let Some(plugins) = self.plugins() else {
+            return;
+        };
+        for id in changed_ids {
+            if !change_set.ids.contains(&id) {
+                change_set.ids.push(id);
+            }
+        }
+        for info in operations
+            .iter()
+            .filter_map(crate::client::execution_info_from_operation)
+        {
+            if plugins.replace_execution(info.clone()) {
+                change_set.executions.retain(|held| held.id() != info.id());
+                change_set.executions.push(info);
+            }
+        }
+    }
+
+    /// Queues `change_set` for `on_operation_change` when it lists anything.
+    /// Each listed operation's info is built from its borrowed record, so
+    /// no record is cloned and the full log is not projected.
+    fn queue_changes(&self, change_set: ChangeSet) {
+        let Some(plugins) = self.plugins() else {
+            return;
+        };
+        let log = &self.inner.engine.checkpoint_log;
+        let mut updated: Vec<crate::plugin::OperationInfo> = change_set
+            .ids
+            .iter()
+            .filter_map(|id| {
+                log.with_record(id, |record| {
+                    crate::plugin::OperationInfo::from_record(id, record)
+                })
+            })
+            .collect();
+        updated.extend(change_set.executions);
+        if !updated.is_empty() {
+            plugins.push_operation_change(updated);
+        }
     }
 
     /// Returns the parent wire ID if this is a child context.
@@ -8311,4 +8489,794 @@ pub(crate) fn foreign_caller_message(method: &str) -> String {
          that does not own the context. Start concurrent operations with .spawn(), map, \
          parallel or a combinator, not with tokio::spawn or std::thread::spawn."
     )
+}
+
+/// Tests of the change sets the write path queues for
+/// `on_operation_change`, and of the points that deliver them.
+#[cfg(test)]
+mod change_hook_tests {
+    use super::{CheckpointCoalescer, DurableContext};
+    use crate::OperationStatus;
+    use crate::client::{ExecutionClient, InMemoryExecutionClient, TestResponse};
+    use crate::driver::test_support::{
+        RefreshClient, ScriptedClient, drive_handler, named, operation_like,
+    };
+    use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
+    use crate::plugin::test_support::Changes;
+    use crate::plugin::{InvocationPlugins, OperationInfo, PluginFactory};
+    use aws_sdk_lambda::types::{
+        Operation, OperationAction, OperationStatus as WireStatus, OperationType, OperationUpdate,
+    };
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
+
+    /// A root context on `client` over `log`, with `plugins`.
+    fn ctx_on(
+        client: Arc<dyn ExecutionClient>,
+        log: Arc<CheckpointLog>,
+        window: Option<Duration>,
+        plugins: Arc<InvocationPlugins>,
+    ) -> DurableContext {
+        DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            log,
+            client,
+            "t0".to_owned(),
+            window,
+            Some(plugins),
+        )
+    }
+
+    /// A client whose response carries each update's operation, with the
+    /// status its action records.
+    fn echo_client() -> Arc<ScriptedClient> {
+        Arc::new(ScriptedClient::new(|updates, _history| {
+            updates
+                .iter()
+                .map(|u| {
+                    let status = match u.action() {
+                        OperationAction::Succeed => WireStatus::Succeeded,
+                        OperationAction::Fail => WireStatus::Failed,
+                        OperationAction::Retry => WireStatus::Pending,
+                        _ => WireStatus::Started,
+                    };
+                    operation_like(u, status).build().expect("all fields set")
+                })
+                .collect()
+        }))
+    }
+
+    /// A step operation `id` with `status`.
+    fn step_op(id: &str, status: WireStatus) -> Operation {
+        Operation::builder()
+            .id(id)
+            .r#type(OperationType::Step)
+            .status(status)
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+            .build()
+            .expect("all fields set")
+    }
+
+    /// A step `START` update of `id`.
+    fn start(id: &str) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(id)
+            .r#type(OperationType::Step)
+            .action(OperationAction::Start)
+            .build()
+            .expect("all fields set")
+    }
+
+    /// The change hook runs with the token mutex and the coalescer's writer
+    /// lock free, with and without batching.
+    #[tokio::test]
+    async fn change_hook_runs_outside_locks() {
+        type Locks = (
+            Arc<tokio::sync::Mutex<String>>,
+            Option<Arc<CheckpointCoalescer>>,
+        );
+        for window in [None, Some(Duration::ZERO)] {
+            let locks: Arc<OnceLock<Locks>> = Arc::default();
+            let free: Arc<Mutex<Vec<(bool, bool)>>> = Arc::default();
+            let mut recorder = Changes::default();
+            {
+                let locks = Arc::clone(&locks);
+                let free = Arc::clone(&free);
+                recorder.on_change = Some(Arc::new(move |_info| {
+                    let (token, coalescer) = locks.get().expect("set before the run");
+                    let token_free = token.try_lock().is_ok();
+                    let writer_free = coalescer
+                        .as_ref()
+                        .is_none_or(|c| c.writer_lock().try_lock().is_ok());
+                    free.lock().unwrap().push((token_free, writer_free));
+                }));
+            }
+            let ctx = ctx_on(
+                echo_client(),
+                Arc::new(CheckpointLog::empty()),
+                window,
+                recorder.plugins(),
+            );
+            locks
+                .set((ctx.checkpoint_token_mutex(), ctx.inner.coalescer.clone()))
+                .map_err(|_| "set twice")
+                .expect("set once");
+            drive_handler(ctx, None, |ctx| async move {
+                ctx.step(|_| async { Ok(1_u32) })
+                    .name("s")
+                    .await
+                    .map(|v| v.to_string())
+                    .map_err(|e| crate::error::WireError::new(None::<String>, Some(e.to_string())))
+            })
+            .await
+            .expect("no panic");
+            let free = free.lock().unwrap().clone();
+            assert!(!free.is_empty(), "window {window:?}: at least one call");
+            assert!(
+                free.iter().all(|&(token, writer)| token && writer),
+                "window {window:?}: {free:?}"
+            );
+        }
+    }
+
+    /// The retained `START` write of a default step, which its start step
+    /// reserved, delivers the `STARTED` change when the step awaits it: the
+    /// change is reported before the step sends its `SUCCEED`, with and
+    /// without batching.
+    #[tokio::test]
+    async fn retained_start_write_reports_its_change() {
+        for window in [None, Some(Duration::ZERO)] {
+            let recorder = Changes::default();
+            let seen: Arc<Mutex<Vec<(OperationAction, usize)>>> = Arc::default();
+            let client = {
+                let calls = Arc::clone(&recorder.calls);
+                let seen = Arc::clone(&seen);
+                Arc::new(ScriptedClient::new(move |updates, _history| {
+                    let delivered = calls.lock().unwrap().len();
+                    updates
+                        .iter()
+                        .map(|u| {
+                            seen.lock().unwrap().push((u.action().clone(), delivered));
+                            let status = if u.action() == &OperationAction::Succeed {
+                                WireStatus::Succeeded
+                            } else {
+                                WireStatus::Started
+                            };
+                            operation_like(u, status).build().expect("all fields set")
+                        })
+                        .collect()
+                }))
+            };
+            let ctx = ctx_on(
+                client,
+                Arc::new(CheckpointLog::empty()),
+                window,
+                recorder.plugins(),
+            );
+            drive_handler(ctx, None, |ctx| async move {
+                ctx.step(|_| async { Ok(1_u32) })
+                    .name("s")
+                    .await
+                    .map(|v| v.to_string())
+                    .map_err(|e| crate::error::WireError::new(None::<String>, Some(e.to_string())))
+            })
+            .await
+            .expect("no panic");
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(
+                seen,
+                [(OperationAction::Start, 0), (OperationAction::Succeed, 1)],
+                "window {window:?}: {:?}",
+                recorder.timeline()
+            );
+        }
+    }
+
+    /// A context whose plugin's first change hook, for change set
+    /// `earlier`, is held open on another thread, and a completed write
+    /// whose own change set `own` is queued behind it.
+    struct HeldWrite {
+        ctx: DurableContext,
+        recorder: Changes,
+        write: std::pin::Pin<Box<super::SubmittedWrite>>,
+        release: std::sync::mpsc::Sender<()>,
+        holder: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl HeldWrite {
+        fn start() -> Self {
+            Self::start_with(Ok(crate::client::CheckpointOutput::new(
+                None,
+                Vec::new(),
+                None,
+            )))
+        }
+
+        /// As [`Self::start`], with `result` as the write's result.
+        fn start_with(
+            result: Result<crate::client::CheckpointOutput, crate::client::ExecutionClientError>,
+        ) -> Self {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+            let first = std::sync::atomic::AtomicBool::new(true);
+            let recorder = Changes {
+                on_change: Some(Arc::new(move |_info| {
+                    if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        entered_tx.send(()).unwrap();
+                        release_rx.lock().unwrap().recv().unwrap();
+                    }
+                })),
+                ..Changes::default()
+            };
+            let ctx = ctx_on(
+                Arc::new(InMemoryExecutionClient::new(Vec::new())),
+                Arc::new(CheckpointLog::empty()),
+                None,
+                recorder.plugins(),
+            );
+            let entry = |id: &str| {
+                vec![OperationInfo::from_record(
+                    id,
+                    &CheckpointRecord::with_status(id, CheckpointStatus::Started),
+                )]
+            };
+            let plugins = ctx.shared_plugins().expect("the context has plugins");
+            plugins.push_operation_change(entry("earlier"));
+            let holder = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    ctx.plugins()
+                        .expect("the context has plugins")
+                        .drain_operation_changes(&ctx.inner.engine.checkpoint_log);
+                })
+            };
+            entered_rx.recv().unwrap();
+            // The write's own response queued its change set.
+            plugins.push_operation_change(entry("own"));
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let write = Box::pin(super::SubmittedWrite::from_receiver(receiver).reported_by(&ctx));
+            assert!(sender.send(result).is_ok(), "the write is waiting");
+            Self {
+                ctx,
+                recorder,
+                write,
+                release,
+                holder: Some(holder),
+            }
+        }
+
+        /// Waits until the holder delivered both change sets and returned.
+        fn join_holder(&mut self) {
+            self.holder
+                .take()
+                .expect("the holder is joined once")
+                .join()
+                .unwrap();
+        }
+
+        fn waiter_count(&self) -> usize {
+            self.ctx
+                .plugins()
+                .expect("the context has plugins")
+                .delivery_waiter_count()
+        }
+    }
+
+    /// A completed write whose change set another thread is still
+    /// delivering, held open by an earlier change hook, returns its
+    /// result only after that change set was delivered. So the operation
+    /// that awaits it fires its next hook after its change. Repeated
+    /// polls keep one waker registration, and the delivery wakes the
+    /// registered waker by itself: the test sees the wake before it polls
+    /// the write again.
+    #[test]
+    fn write_waits_for_change_delivered_by_another_task() {
+        let mut held = HeldWrite::start();
+        let (signal, signals) = crate::plugin::test_support::SignalWaker::new();
+        let waker = std::task::Waker::from(Arc::clone(&signal));
+        let mut cx = std::task::Context::from_waker(&waker);
+        for _ in 0..100 {
+            assert!(
+                held.write.as_mut().poll(&mut cx).is_pending(),
+                "the write waits while its change set is undelivered"
+            );
+        }
+        assert_eq!(held.waiter_count(), 1);
+        assert_eq!(held.recorder.updated_ids(), [["earlier"]]);
+        assert_eq!(signal.woken(), 0);
+        held.release.send(()).unwrap();
+        signals
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a delivery woke the write's waker");
+        held.join_holder();
+        match held.write.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(result) => result.expect("the write succeeded"),
+            std::task::Poll::Pending => unreachable!("the write is ready once delivered"),
+        };
+        assert_eq!(held.recorder.updated_ids(), [["earlier"], ["own"]]);
+        assert_eq!(held.waiter_count(), 0);
+    }
+
+    /// A write dropped while it waits for a delivery removes its waker
+    /// registration.
+    #[test]
+    fn dropped_write_removes_its_registration() {
+        let mut held = HeldWrite::start();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(held.write.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(held.waiter_count(), 1);
+        held.write = Box::pin(super::SubmittedWrite::rejected());
+        assert_eq!(held.waiter_count(), 0);
+        held.release.send(()).unwrap();
+        held.join_holder();
+        assert_eq!(held.recorder.updated_ids(), [["earlier"], ["own"]]);
+        assert_eq!(held.waiter_count(), 0);
+    }
+
+    /// An error source whose destructor panics with "source drop".
+    #[derive(Debug)]
+    struct DropPanickingSource;
+
+    impl std::fmt::Display for DropPanickingSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("drop-panicking source")
+        }
+    }
+
+    impl std::error::Error for DropPanickingSource {}
+
+    impl Drop for DropPanickingSource {
+        #[expect(clippy::panic)] // reason: the panic is the behavior under test
+        fn drop(&mut self) {
+            panic!("source drop");
+        }
+    }
+
+    /// A write dropped while it waits for a delivery drops the result it
+    /// retained inside a catch, and records the panic of that result's
+    /// destructor on the invocation coordinator.
+    #[test]
+    fn dropped_write_records_the_panic_of_its_retained_result() {
+        let mut held =
+            HeldWrite::start_with(Err(crate::client::ExecutionClientError::with_source(
+                crate::client::ExecutionClientErrorScope::Invocation,
+                "failed write",
+                DropPanickingSource,
+            )));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(held.write.as_mut().poll(&mut cx).is_pending());
+        assert!(!held.ctx.coordinator().has_panic());
+        held.write = Box::pin(super::SubmittedWrite::rejected());
+        assert_eq!(held.waiter_count(), 0);
+        let payload = held
+            .ctx
+            .coordinator()
+            .take_panic()
+            .expect("the retained result's destructor panic is recorded");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"source drop"));
+        held.release.send(()).unwrap();
+        held.join_holder();
+        assert_eq!(held.recorder.updated_ids(), [["earlier"], ["own"]]);
+    }
+
+    /// The operations maps and change infos one run of a step and a child
+    /// context builds, with `plugins` or without any.
+    async fn change_work_of_run(plugins: Option<Arc<InvocationPlugins>>) -> (usize, usize) {
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            echo_client(),
+            "t0".to_owned(),
+            Some(Duration::ZERO),
+            plugins,
+        );
+        let projections = crate::engine::projections();
+        let infos = crate::plugin::infos_from_records();
+        drive_handler(ctx, None, |ctx| async move {
+            let one = ctx.step(|_| async { Ok(1_u32) }).name("s").await;
+            let two = ctx
+                .run_in_child_context(|child| async move {
+                    Ok(child.step(|_| async { Ok(2_u32) }).name("inner").await?)
+                })
+                .name("c")
+                .await;
+            Ok(format!("{one:?} {two:?}"))
+        })
+        .await
+        .expect("no panic");
+        (
+            crate::engine::projections() - projections,
+            crate::plugin::infos_from_records() - infos,
+        )
+    }
+
+    /// Without a plugin, the checkpoint responses of a run build no
+    /// operations map and no operation info. With one, the same run builds
+    /// both, so the counters observe the change work.
+    #[tokio::test]
+    async fn no_plugin_builds_no_change_info() {
+        assert_eq!(change_work_of_run(None).await, (0, 0));
+        let (projected, infos) = change_work_of_run(Some(Changes::default().plugins())).await;
+        assert!(projected > 0, "a plugin's run projects the log");
+        assert!(infos > 0, "a plugin's run builds infos");
+    }
+
+    /// A direct write delivers its change on the caller's task once the
+    /// detached write task returned the result, `Ok` or `Err`.
+    #[tokio::test]
+    async fn direct_write_reports_change_on_caller() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        client.enqueue_checkpoint_response(TestResponse::Success(vec![step_op(
+            "d",
+            WireStatus::Started,
+        )]));
+        client.enqueue_checkpoint_response(TestResponse::SuccessPaginated(
+            vec![step_op("d", WireStatus::Succeeded)],
+            "page-2-token".to_owned(),
+        ));
+        client.fail_get_state("injected get_state failure");
+        let recorder = Changes::default();
+        let ctx = ctx_on(
+            client,
+            Arc::new(CheckpointLog::empty()),
+            Some(Duration::ZERO),
+            recorder.plugins(),
+        );
+        ctx.checkpoint_updates_direct(vec![start("d")])
+            .await
+            .expect("the write succeeds");
+        assert_eq!(recorder.updated_ids(), [["d"]]);
+        assert!(
+            ctx.checkpoint_updates_direct(vec![start("d")])
+                .await
+                .is_err()
+        );
+        assert_eq!(recorder.updated_ids(), [["d"], ["d"]]);
+    }
+
+    /// A response that changes no status queues nothing, so no call is
+    /// made.
+    #[tokio::test]
+    async fn unchanged_response_queues_nothing() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        client.enqueue_checkpoint_response(TestResponse::Success(vec![step_op(
+            "s",
+            WireStatus::Started,
+        )]));
+        let recorder = Changes::default();
+        let log = Arc::new(CheckpointLog::from_records(vec![(
+            "s".to_owned(),
+            CheckpointRecord::with_status("s", CheckpointStatus::Started),
+        )]));
+        let ctx = ctx_on(client, log, None, recorder.plugins());
+        ctx.checkpoint_updates(vec![start("s")])
+            .await
+            .expect("the write succeeds");
+        assert!(recorder.calls().is_empty(), "{:?}", recorder.updated_ids());
+    }
+
+    /// An `EXECUTION` operation that changes in the response and again in
+    /// the state pages is listed once, with its last status.
+    #[tokio::test]
+    async fn execution_listed_once_per_change_set() {
+        let execution = |status: WireStatus| {
+            Operation::builder()
+                .id("exec-1")
+                .r#type(OperationType::Execution)
+                .status(status)
+                .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+                .build()
+                .expect("all fields set")
+        };
+        let client = Arc::new(InMemoryExecutionClient::new(vec![execution(
+            WireStatus::Succeeded,
+        )]));
+        client.enqueue_checkpoint_response(TestResponse::SuccessPaginated(
+            vec![execution(WireStatus::Started)],
+            "page-2-token".to_owned(),
+        ));
+        let recorder = Changes::default();
+        let ctx = ctx_on(
+            client,
+            Arc::new(CheckpointLog::empty()),
+            None,
+            recorder.plugins(),
+        );
+        ctx.checkpoint_updates(Vec::new())
+            .await
+            .expect("the write succeeds");
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1, "{:?}", recorder.updated_ids());
+        let info = calls.first().expect("one call");
+        let statuses: Vec<_> = info
+            .updated_operations()
+            .iter()
+            .map(OperationInfo::status)
+            .collect();
+        assert_eq!(statuses, [Some(OperationStatus::Succeeded)]);
+    }
+
+    /// When reading the state pages fails, the caller sees the error and
+    /// the change the response merged is still reported.
+    #[tokio::test]
+    async fn change_reported_when_pagination_hydration_fails() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        client.enqueue_checkpoint_response(TestResponse::SuccessPaginated(
+            vec![step_op("op-hydration", WireStatus::Started)],
+            "page-2-token".to_owned(),
+        ));
+        client.fail_get_state("injected get_state failure");
+        let recorder = Changes::default();
+        let ctx = ctx_on(
+            client,
+            Arc::new(CheckpointLog::empty()),
+            None,
+            recorder.plugins(),
+        );
+        let result = ctx.checkpoint_updates(vec![start("op-hydration")]).await;
+        assert!(result.is_err());
+        assert_eq!(recorder.updated_ids(), [["op-hydration"]]);
+    }
+
+    /// The change that completes a waiting operation, merged from a
+    /// refresh, is reported before the operation's end hook. Without the
+    /// drain when the wait returns, the sibling step's write at 3 s would
+    /// deliver it, after the end hook.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_reports_wait_change() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            if req.empty_number == 1
+                && let Some(start) = named(req.history, "w", &OperationAction::Start)
+            {
+                let record = operation_like(start, WireStatus::Succeeded)
+                    .build()
+                    .expect("all required fields set");
+                return Ok(vec![record]);
+            }
+            Ok(Vec::new())
+        }));
+        let recorder = Changes::default();
+        let ctx = ctx_on(
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            Arc::new(CheckpointLog::empty()),
+            None,
+            recorder.plugins(),
+        );
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            let wait = ctx.wait(Duration::from_secs(1)).name("w").spawn();
+            let step = ctx
+                .step(|_| async {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Ok(1_u32)
+                })
+                .name("s")
+                .spawn();
+            let (wait, _step) = tokio::join!(wait, step);
+            Ok(format!("{}", wait.is_ok()))
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(
+            outcome,
+            crate::driver::InvocationOutcome::Complete("true".to_owned())
+        );
+        let succeeded = recorder.calls().iter().any(|info| {
+            info.updated_operations()
+                .iter()
+                .any(|op| op.name() == Some("w") && op.status() == Some(OperationStatus::Succeeded))
+        });
+        assert!(succeeded, "{:?}", recorder.timeline());
+        let timeline = recorder.timeline();
+        let change = timeline
+            .iter()
+            .position(|e| e == "change:w:SUCCEEDED")
+            .expect("the change is recorded");
+        let end = timeline
+            .iter()
+            .position(|e| e == "end:w")
+            .expect("the end hook ran");
+        assert!(change < end, "{timeline:?}");
+    }
+
+    /// The task that sends a refresh delivers the change the refresh
+    /// merged when the call returns, also for an operation nobody waits
+    /// on. Without that drain, the change waits for the next drain point:
+    /// the wait's completion at the second refresh, or the sibling step's
+    /// write at 3 s.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_sender_reports_change() {
+        let client = Arc::new(RefreshClient::new(|req| {
+            let Some(start) = named(req.history, "w", &OperationAction::Start) else {
+                return Ok(Vec::new());
+            };
+            let record = match req.empty_number {
+                1 => step_op("x", WireStatus::Succeeded),
+                2 => operation_like(start, WireStatus::Succeeded)
+                    .build()
+                    .expect("all required fields set"),
+                _ => return Ok(Vec::new()),
+            };
+            Ok(vec![record])
+        }));
+        let at: Arc<Mutex<Vec<Duration>>> = Arc::default();
+        let mut recorder = Changes::default();
+        {
+            let at = Arc::clone(&at);
+            let started = tokio::time::Instant::now();
+            recorder.on_change = Some(Arc::new(move |info| {
+                if info.updated_operations().iter().any(|op| op.id() == "x") {
+                    at.lock().unwrap().push(started.elapsed());
+                }
+            }));
+        }
+        let ctx = ctx_on(
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            Arc::new(CheckpointLog::empty()),
+            None,
+            recorder.plugins(),
+        );
+        drive_handler(ctx, None, |ctx| async move {
+            let wait = ctx.wait(Duration::from_secs(1)).name("w").spawn();
+            let step = ctx
+                .step(|_| async {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Ok(1_u32)
+                })
+                .name("s")
+                .spawn();
+            let (wait, _step) = tokio::join!(wait, step);
+            Ok(format!("{}", wait.is_ok()))
+        })
+        .await
+        .expect("no panic");
+        let at = at.lock().unwrap().clone();
+        assert_eq!(at.len(), 1, "{:?}", recorder.timeline());
+        assert!(
+            at.first()
+                .is_some_and(|t| *t < Duration::from_millis(1_500)),
+            "the change of x is reported at the first refresh: {at:?}, {:?}",
+            client.empty_answers()
+        );
+    }
+
+    /// Runs 50 new steps over a log of 2 000 succeeded steps with the
+    /// given number of recording plugins, and returns the projections the
+    /// run made and the number of change calls the first plugin received.
+    async fn projections_of_run(plugin_count: usize) -> (usize, usize) {
+        let records = (0..2_000)
+            .map(|i| {
+                let id = format!("old-{i}");
+                let mut record = CheckpointRecord::with_status(&id, CheckpointStatus::Succeeded);
+                record.op_type = Some("STEP".to_owned());
+                (id, record)
+            })
+            .collect();
+        let recorders: Vec<Changes> = (0..plugin_count).map(|_| Changes::default()).collect();
+        let plugins = crate::plugin::test_support::plugins_of_all(
+            recorders
+                .iter()
+                .map(|r| Arc::new(r.clone()) as Arc<dyn PluginFactory>)
+                .collect(),
+        );
+        let ctx = ctx_on(
+            echo_client(),
+            Arc::new(CheckpointLog::from_records(records)),
+            None,
+            plugins,
+        );
+        let before = crate::engine::projections();
+        drive_handler(ctx, None, |ctx| async move {
+            for i in 0..50_u32 {
+                ctx.step(move |_| async move { Ok(i) })
+                    .name(format!("new-{i}"))
+                    .await
+                    .map_err(|e| {
+                        crate::error::WireError::new(None::<String>, Some(e.to_string()))
+                    })?;
+            }
+            Ok("done".to_owned())
+        })
+        .await
+        .expect("no panic");
+        let projected = crate::engine::projections() - before;
+        let calls = recorders.first().expect("a plugin").calls().len();
+        (projected, calls)
+    }
+
+    /// Each change event projects the log once, whatever the number of
+    /// plugins.
+    #[tokio::test]
+    async fn change_hooks_project_once_per_response() {
+        let (one_projected, one_calls) = projections_of_run(1).await;
+        let (three_projected, three_calls) = projections_of_run(3).await;
+        assert!(one_calls > 0);
+        assert_eq!(one_projected, one_calls);
+        assert_eq!(three_projected, three_calls);
+        assert_eq!(one_calls, three_calls);
+    }
+
+    /// An `EXECUTION` operation in a response replaces the plugins' slot,
+    /// is listed as a change, and does not enter the log.
+    #[tokio::test]
+    async fn execution_update_replaces_slot() {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let execution = Operation::builder()
+            .id("exec-1")
+            .r#type(OperationType::Execution)
+            .status(WireStatus::Succeeded)
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+            .build()
+            .expect("all fields set");
+        client.enqueue_checkpoint_response(TestResponse::Success(vec![
+            execution,
+            step_op("s", WireStatus::Started),
+        ]));
+        let recorder = Changes::default();
+        let factories: Vec<(&'static str, Arc<dyn PluginFactory>)> =
+            vec![("test::Changes", Arc::new(recorder.clone()))];
+        let slot = OperationInfo::execution(
+            "exec-1",
+            "EXECUTION",
+            &CheckpointStatus::Started,
+            None,
+            None,
+            None,
+        );
+        let plugins =
+            crate::plugin::create_plugins(&factories, slot, crate::plugin::tests_support_info)
+                .expect("one factory");
+        let log = Arc::new(CheckpointLog::empty());
+        let ctx = ctx_on(client, Arc::clone(&log), None, plugins);
+        ctx.checkpoint_updates(vec![start("s")])
+            .await
+            .expect("the write succeeds");
+        let calls = recorder.calls();
+        let info = calls.first().expect("one call");
+        assert_eq!(
+            info.operations()
+                .get("exec-1")
+                .and_then(OperationInfo::status),
+            Some(OperationStatus::Succeeded)
+        );
+        assert!(
+            info.updated_operations()
+                .iter()
+                .any(|op| op.id() == "exec-1")
+        );
+        assert!(!log.contains("exec-1"));
+    }
+
+    /// A paginated response and its state pages give one change set, which
+    /// lists each changed ID once, with the status after both merges.
+    #[tokio::test]
+    async fn paginated_response_is_one_change_set() {
+        let client = Arc::new(InMemoryExecutionClient::new(vec![
+            step_op("step-1", WireStatus::Succeeded),
+            step_op("step-2", WireStatus::Succeeded),
+        ]));
+        client.enqueue_checkpoint_response(TestResponse::SuccessPaginated(
+            vec![step_op("step-1", WireStatus::Started)],
+            "page-2-token".to_owned(),
+        ));
+        let recorder = Changes::default();
+        let ctx = ctx_on(
+            client,
+            Arc::new(CheckpointLog::empty()),
+            None,
+            recorder.plugins(),
+        );
+        ctx.checkpoint_updates(Vec::new())
+            .await
+            .expect("the write succeeds");
+        assert_eq!(recorder.updated_ids(), [["step-1", "step-2"]]);
+        let calls = recorder.calls();
+        let step_1 = calls
+            .first()
+            .and_then(|info| info.updated_operations().first())
+            .expect("step-1 is listed");
+        assert_eq!(step_1.status(), Some(OperationStatus::Succeeded));
+    }
 }

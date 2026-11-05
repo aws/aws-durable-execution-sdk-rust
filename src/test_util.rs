@@ -3637,6 +3637,10 @@ enum PlannedCheckpoint {
     FailNonRetryable {
         gate: Option<Arc<tokio::sync::Semaphore>>,
     },
+    /// The call applies the updates as [`Self::Pass`] does, then holds its
+    /// answer until the test adds a permit to `gate`. So the SDK merges
+    /// the response only after the release.
+    PassGated { gate: Arc<tokio::sync::Semaphore> },
 }
 
 impl Backend {
@@ -4489,6 +4493,13 @@ impl Backend {
         if let Some(planned) = self.next_planned_checkpoint() {
             match planned {
                 PlannedCheckpoint::Pass => {}
+                PlannedCheckpoint::PassGated { gate } => {
+                    let answer = self.checkpoint_unplanned(updates);
+                    return Box::pin(async move {
+                        drop(gate.acquire().await);
+                        answer.await
+                    });
+                }
                 PlannedCheckpoint::FailNonRetryable { gate } => {
                     return Box::pin(async move {
                         if let Some(gate) = gate {
@@ -4506,6 +4517,16 @@ impl Backend {
                 }
             }
         }
+        self.checkpoint_unplanned(updates)
+    }
+
+    /// [`Self::checkpoint_now`] after the per-call plan: the injected
+    /// faults, then the request against the simulated store.
+    fn checkpoint_unplanned<'a>(
+        &'a self,
+        updates: &[OperationUpdate],
+    ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + 'a>>
+    {
         // Injected fault (`LocalRunner::fail_next_checkpoints` /
         // `fail_checkpoints_after[_retryable]`): after letting `skip`
         // calls through, reject BEFORE touching any state, so the
@@ -9133,6 +9154,77 @@ mod tests {
             OperationStatus::Failed,
             "a terminal FAIL must be recorded for the operation whose \
              retained outcome rejection was classified at the flush point"
+        );
+    }
+
+    /// The change of a write whose caller dropped it, and that no
+    /// operation task owns, is reported before `on_invocation_end`.
+    ///
+    /// Call 2, the `SUCCEED`, is applied but its answer is held until the
+    /// handler dropped the write. So the SDK merges that response only
+    /// after the drop, and only the drain before the end hook delivers it.
+    #[tokio::test]
+    async fn dropped_contributor_change_reported_before_invocation_end() {
+        let recorder = crate::plugin::test_support::Changes::default();
+        let runner = LocalRunner::new().options(
+            crate::Options::builder()
+                .plugin(recorder.clone())
+                .build()
+                .expect("valid options"),
+        );
+        let backend = Arc::new(Backend::new(
+            QueuedReplies::default(),
+            runner.checkpoint_page_size,
+        ));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        backend.plan_checkpoint_calls(vec![
+            PlannedCheckpoint::Pass,
+            PlannedCheckpoint::PassGated {
+                gate: Arc::clone(&gate),
+            },
+        ]);
+        let backend_h = Arc::clone(&backend);
+        let gate_h = Arc::clone(&gate);
+        let result = runner
+            .run_on_backend(
+                Arc::clone(&backend),
+                move |(), ctx: DurableContext| {
+                    let backend = Arc::clone(&backend_h);
+                    let gate = Arc::clone(&gate_h);
+                    async move {
+                        let update = |action: OperationAction| {
+                            OperationUpdate::builder()
+                                .id("orphan-id")
+                                .name("orphan")
+                                .r#type(OperationType::Step)
+                                .action(action)
+                                .build()
+                                .expect("valid update")
+                        };
+                        ctx.checkpoint_updates(vec![update(OperationAction::Start)])
+                            .await?;
+                        let write =
+                            ctx.submit_checkpoint_updates(vec![update(OperationAction::Succeed)]);
+                        while backend.checkpoint_call_count() < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                        drop(write);
+                        gate.add_permits(1);
+                        Ok::<_, BoxError>("done".to_owned())
+                    }
+                },
+                "null".to_owned(),
+            )
+            .await
+            .expect("runner");
+        assert_eq!(result.output().map(String::as_str), Some("done"));
+        let timeline = recorder.timeline();
+        assert!(
+            timeline.ends_with(&[
+                "change:orphan:SUCCEEDED".to_owned(),
+                "invocation_end:Succeeded".to_owned(),
+            ]),
+            "{timeline:?}"
         );
     }
 

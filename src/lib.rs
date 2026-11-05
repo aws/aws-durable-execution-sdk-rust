@@ -1700,6 +1700,10 @@ async fn end_invocation(
     fatal_won: bool,
 ) -> Option<Box<dyn std::any::Any + Send + 'static>> {
     let plugins = plugins?;
+    // Every change set still queued, including one whose writer was
+    // dropped and one from the end-of-invocation flush, reaches
+    // `on_operation_change` before `on_invocation_end`.
+    ctx.report_operation_changes().await;
     plugins
         .invocation_end(
             log,
