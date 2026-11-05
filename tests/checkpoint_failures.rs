@@ -387,6 +387,37 @@ impl<T: Send + 'static> durable::Serdes<T> for FailSerialize {
     }
 }
 
+/// A `u32` serdes that round-trips the initial state 0 and fails to
+/// serialize any other value, so a `wait_for_condition` first check runs
+/// and the state it returns fails to serialize.
+struct FailSerializeAfterInitial;
+
+impl durable::Serdes<u32> for FailSerializeAfterInitial {
+    // reason: exercises the async-fn impl form user code writes
+    #[expect(clippy::unused_async_trait_impl)]
+    async fn serialize(
+        &self,
+        value: u32,
+        _context: durable::serdes::SerdesContext,
+    ) -> Result<String, durable::BoxError> {
+        if value == 0 {
+            Ok("0".to_owned())
+        } else {
+            Err("this result cannot be serialized".into())
+        }
+    }
+
+    // reason: exercises the async-fn impl form user code writes
+    #[expect(clippy::unused_async_trait_impl)]
+    async fn deserialize(
+        &self,
+        wire: String,
+        _context: durable::serdes::SerdesContext,
+    ) -> Result<u32, durable::BoxError> {
+        Ok(wire.parse()?)
+    }
+}
+
 /// The wire error type a local serialization failure records on its
 /// terminal `FAIL`: the replay discriminator that keeps the failure's
 /// classification stable across invocations.
@@ -748,7 +779,7 @@ async fn wfc_state_serialization_failure_persists_fail_and_replays_without_rerun
                             0_u32,
                         )
                         .name("bad-wfc")
-                        .serdes(FailSerialize)
+                        .serdes(FailSerializeAfterInitial)
                         .await;
                     let err = wfc_result.expect_err("state serialization must fail");
                     let label = match err.kind() {

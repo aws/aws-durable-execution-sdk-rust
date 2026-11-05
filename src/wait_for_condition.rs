@@ -15,6 +15,10 @@
 //! - Wait strategy exhaustion raises `WaitForConditionError::MaxChecksExceeded`,
 //!   live and on replay: the terminal record carries a dedicated wire
 //!   discriminator, so the replayed error keeps the same kind and check count.
+//! - The first check receives the initial state after a serdes round trip,
+//!   as a resumed check receives the recorded state.
+//! - A check error records its own type, and the live path classifies the
+//!   record with the function replay uses, so both yield the same kind.
 
 use std::future::Future;
 use std::time::Duration;
@@ -379,7 +383,28 @@ where
                 )
                 .await?
             } else {
-                self.initial_state.clone()
+                // No recorded state: round-trip the initial state through
+                // the serdes, so the first check sees the shape a check
+                // that resumes from a checkpoint sees, as JS does. The
+                // round trip runs before START, so a failure writes nothing:
+                // a marked failure ends the invocation, and any other one
+                // returns `SerializationFailed` without running the check.
+                let serialized = serialize_state(
+                    &self.ctx,
+                    self.name.as_deref(),
+                    &self.serdes,
+                    self.initial_state.clone(),
+                    serdes_ctx.clone(),
+                )
+                .await?;
+                deserialize_state_str(
+                    &self.ctx,
+                    self.name.as_deref(),
+                    &self.serdes,
+                    serialized,
+                    serdes_ctx.clone(),
+                )
+                .await?
             };
 
         // A plugin sees the start of every check. It is a replay from the
@@ -622,9 +647,10 @@ where
             Err(check_err) => {
                 // Check function error: checkpoint FAIL immediately (no retry
                 // for check errors).
-                // The wire record is derived from the check error itself:
-                // flattened message, `error_data`/`stack_trace` pass-through.
-                let wire = crate::error::wire_error_with_type(&*check_err, "WaitForConditionError");
+                // The wire record is derived from the check error itself: a
+                // `TypedError` in its chain names the type, and an untyped
+                // error records `Error`, as JS and a step do.
+                let wire = crate::error::wire_error_for(&*check_err, "Error");
                 let update = build_wfc_fail_update(
                     wire_id,
                     self.name.as_deref(),
@@ -640,12 +666,10 @@ where
                 }
                 self.check_ended(attempt, crate::OperationStatus::Failed, None, Some(&wire));
 
-                Err(wfc_op_error_with_source(
-                    WaitForConditionErrorKind::CheckFailed,
-                    Some(check_err),
-                )
-                .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
-                .with_wire(wire))
+                // The live kind comes from the recorded type, with the
+                // function replay uses, so a check error named like an SDK
+                // type has the same kind live and on replay.
+                Err(wfc_failure_error(wire, wire_id, attempt, check_err))
             }
         }
     }
@@ -755,29 +779,65 @@ async fn replay_terminal_success<S, SD: Serdes<S>>(
 ///   story, and the recorded reason stays readable on the attached wire
 ///   record.
 /// - Anything else is a check failure.
+///
+/// The live check-failure path classifies its record with the same
+/// function ([`classify_wfc_failure`]).
 fn replay_terminal_failure(
     wire: crate::error::WireError,
     wire_id: &str,
     recorded_attempt: u32,
 ) -> OperationError {
-    if wire.error_type() == Some(crate::error::WFC_EXHAUSTED_ERROR_TYPE) {
-        return wfc_op_error(WaitForConditionErrorKind::MaxChecksExceeded(
-            crate::error::MaxChecksExceeded::new(recorded_attempt.saturating_add(1)),
-        ))
-        .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
-        .with_wire(wire);
+    let source = crate::error::ReplayedFailure::source_from(wire.clone());
+    wfc_failure_error(wire, wire_id, recorded_attempt.saturating_add(1), source)
+}
+
+/// The error kind a `wait_for_condition` FAIL record yields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WfcFailureClass {
+    /// The wait strategy ran out of checks.
+    MaxChecksExceeded,
+    /// The state failed to serialize or deserialize.
+    SerializationFailed,
+    /// The check returned an error.
+    CheckFailed,
+}
+
+/// Classifies a FAIL record by its recorded error type. Replay and the live
+/// check-failure path both use it, so they yield the same kind.
+fn classify_wfc_failure(wire_type: Option<&str>) -> WfcFailureClass {
+    match wire_type {
+        Some(crate::error::WFC_EXHAUSTED_ERROR_TYPE) => WfcFailureClass::MaxChecksExceeded,
+        Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) => WfcFailureClass::SerializationFailed,
+        _ => WfcFailureClass::CheckFailed,
     }
-    let kind = if wire.error_type() == Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE) {
-        WaitForConditionErrorKind::SerializationFailed
-    } else {
-        WaitForConditionErrorKind::CheckFailed
+}
+
+/// Builds the error a FAIL record `wire` yields, classified by
+/// [`classify_wfc_failure`]. `checks` is the 1-based number of the check
+/// that wrote the record. A `MaxChecksExceeded` error carries no source:
+/// the kind is the whole story, and the recorded reason stays readable on
+/// the attached wire record. Every other kind carries `source`.
+fn wfc_failure_error(
+    wire: crate::error::WireError,
+    wire_id: &str,
+    checks: u32,
+    source: crate::error::Source,
+) -> OperationError {
+    let err = match classify_wfc_failure(wire.error_type()) {
+        WfcFailureClass::MaxChecksExceeded => {
+            wfc_op_error(WaitForConditionErrorKind::MaxChecksExceeded(
+                crate::error::MaxChecksExceeded::new(checks),
+            ))
+        }
+        WfcFailureClass::SerializationFailed => {
+            wfc_op_error_with_source(WaitForConditionErrorKind::SerializationFailed, Some(source))
+        }
+        WfcFailureClass::CheckFailed => {
+            wfc_op_error_with_source(WaitForConditionErrorKind::CheckFailed, Some(source))
+        }
     };
-    wfc_op_error_with_source(
-        kind,
-        Some(crate::error::ReplayedFailure::source_from(wire.clone())),
-    )
-    .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
-    .with_wire(wire)
+    err.with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+        .with_wire(wire)
 }
 
 /// Serializes state through the configured serdes (ownership transfers;
@@ -1672,6 +1732,441 @@ mod tests {
 
         let result = handle.await;
         assert_eq!(result.unwrap(), 5);
+    }
+
+    // Initial-state round trip and check-failure classification.
+
+    /// A `Serdes<String>` whose `serialize` upper-cases the string and whose
+    /// `deserialize` is the identity.
+    struct UpperSerdes;
+
+    impl Serdes<String> for UpperSerdes {
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            value: String,
+            _context: SerdesContext,
+        ) -> Result<String, BoxError> {
+            Ok(value.to_uppercase())
+        }
+
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            wire: String,
+            _context: SerdesContext,
+        ) -> Result<String, BoxError> {
+            Ok(wire)
+        }
+    }
+
+    /// Which half of [`FailingSerdes`] fails, and how.
+    #[derive(Clone, Copy)]
+    enum Failure {
+        Serialize,
+        Deserialize,
+    }
+
+    /// A `Serdes<String>` that fails `failure`'s half, with a plain error
+    /// or, when `retryable`, a `RetryableSerdesError`. The other half is
+    /// the identity.
+    struct FailingSerdes {
+        failure: Failure,
+        retryable: bool,
+    }
+
+    impl FailingSerdes {
+        fn error(&self) -> BoxError {
+            if self.retryable {
+                crate::serdes::RetryableSerdesError::new("transient").into()
+            } else {
+                "plain serdes failure".into()
+            }
+        }
+    }
+
+    impl Serdes<String> for FailingSerdes {
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            value: String,
+            _context: SerdesContext,
+        ) -> Result<String, BoxError> {
+            match self.failure {
+                Failure::Serialize => Err(self.error()),
+                Failure::Deserialize => Ok(value),
+            }
+        }
+
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            wire: String,
+            _context: SerdesContext,
+        ) -> Result<String, BoxError> {
+            match self.failure {
+                Failure::Serialize => Ok(wire),
+                Failure::Deserialize => Err(self.error()),
+            }
+        }
+    }
+
+    /// A record of operation "1" with `status`, `result` and `error_type`.
+    fn wfc_record(
+        status: CheckpointStatus,
+        result: Option<&str>,
+        error_type: Option<&str>,
+        attempt: u32,
+    ) -> (String, CheckpointRecord) {
+        let wire_key = crate::engine::compute_wire_id_public("1");
+        let record = CheckpointRecord {
+            id: wire_key.clone(),
+            status,
+            result: result.map(str::to_owned),
+            error_type: error_type.map(str::to_owned),
+            error_message: error_type.map(|_| "recorded".to_owned()),
+            error_data: None,
+            stack_trace: None,
+            attempt,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: None,
+            sub_type: None,
+            due_at: None,
+            op_name: None,
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
+        };
+        (wire_key, record)
+    }
+
+    /// A root context over `records` whose transport is `client`.
+    fn ctx_with(
+        client: &Arc<InMemoryExecutionClient>,
+        records: Vec<(String, CheckpointRecord)>,
+    ) -> DurableContext {
+        DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(records)),
+            Arc::clone(client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+        )
+    }
+
+    /// Runs one `wait_for_condition` with no strategy whose check records
+    /// the state it receives and returns it.
+    async fn first_check_receives<S, SD>(
+        records: Vec<(String, CheckpointRecord)>,
+        initial_state: S,
+        serdes: SD,
+    ) -> S
+    where
+        S: Clone + Send + Sync + std::fmt::Debug + 'static,
+        SD: Serdes<S>,
+    {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = ctx_with(&client, records);
+        let op_id = ctx.mint_id();
+        let seen = Arc::new(std::sync::Mutex::new(None::<S>));
+        let seen_check = Arc::clone(&seen);
+        let exec = WaitForConditionExecution {
+            ctx,
+            op_id,
+            name: None,
+            initial_state,
+            wait_strategy: None,
+            serdes,
+            check: move |_ctx, state: S| {
+                let seen = Arc::clone(&seen_check);
+                async move {
+                    *seen.lock().unwrap() = Some(state.clone());
+                    Ok::<S, BoxError>(state)
+                }
+            },
+        };
+        exec.execute().await.expect("the operation succeeds");
+        seen.lock().unwrap().clone().expect("the check ran")
+    }
+
+    /// C2 and C3: the round trip is the identity for `JsonSerdes`, and a
+    /// recorded state wins over the initial state.
+    #[tokio::test]
+    async fn initial_state_round_trip_cases() {
+        // C2: JsonSerdes, 5, no recorded state.
+        assert_eq!(
+            first_check_receives(Vec::new(), 5_i32, crate::serdes::JsonSerdes).await,
+            5
+        );
+        // C3: UpperSerdes, "a", recorded state "B".
+        let record = wfc_record(CheckpointStatus::Ready, Some("B"), None, 1);
+        assert_eq!(
+            first_check_receives(vec![record], "a".to_owned(), UpperSerdes).await,
+            "B"
+        );
+        // The C3 control: with no recorded state, UpperSerdes shows "A".
+        assert_eq!(
+            first_check_receives(Vec::new(), "a".to_owned(), UpperSerdes).await,
+            "A"
+        );
+    }
+
+    /// An execution of initial state "a" over `serdes` whose check sets
+    /// `called`, with its context and transport.
+    fn flagged_exec(
+        serdes: FailingSerdes,
+        called: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        DurableContext,
+        Arc<InMemoryExecutionClient>,
+        impl Future<Output = Result<String, OperationError>> + Send + 'static,
+    ) {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = ctx_with(&client, Vec::new());
+        let op_id = ctx.mint_id();
+        let called = Arc::clone(called);
+        let exec = WaitForConditionExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            initial_state: "a".to_owned(),
+            wait_strategy: None,
+            serdes,
+            check: move |_ctx, state: String| {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                async move { Ok::<String, BoxError>(state) }
+            },
+        };
+        (ctx, client, exec.execute())
+    }
+
+    /// C4 and C4b: an unmarked serialize or deserialize failure of the
+    /// initial state returns `SerializationFailed`, does not call the check
+    /// and writes no update.
+    #[tokio::test]
+    async fn initial_state_round_trip_failure_writes_nothing() {
+        for failure in [Failure::Serialize, Failure::Deserialize] {
+            let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let serdes = FailingSerdes {
+                failure,
+                retryable: false,
+            };
+            let (_ctx, client, fut) = flagged_exec(serdes, &called);
+            let err = fut.await.unwrap_err();
+            match err.kind() {
+                OperationErrorKind::WaitForCondition(wfc_err) => assert!(
+                    matches!(
+                        wfc_err.kind(),
+                        WaitForConditionErrorKind::SerializationFailed
+                    ),
+                    "expected SerializationFailed, got {:?}",
+                    wfc_err.kind()
+                ),
+                other => panic!("expected WaitForCondition error, got: {other:?}"),
+            }
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                client.recorded_updates().is_empty(),
+                "no update is written: {:?}",
+                client.recorded_updates()
+            );
+        }
+    }
+
+    /// C4a and C4c: a marked serialize or deserialize failure of the
+    /// initial state ends the invocation, does not call the check and
+    /// writes no update.
+    #[tokio::test]
+    async fn initial_state_retryable_round_trip_failure_ends_invocation() {
+        for (failure, needle) in [
+            (Failure::Serialize, "serdes serialize failed"),
+            (Failure::Deserialize, "serdes deserialize failed"),
+        ] {
+            let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let serdes = FailingSerdes {
+                failure,
+                retryable: true,
+            };
+            let (ctx, client, fut) = flagged_exec(serdes, &called);
+            crate::driver::test_support::expect_serdes_fault(
+                ctx.clone(),
+                Arc::clone(ctx.task_ownership()),
+                Arc::clone(ctx.coordinator()),
+                fut,
+                needle,
+            )
+            .await;
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                client.recorded_updates().is_empty(),
+                "no update is written: {:?}",
+                client.recorded_updates()
+            );
+        }
+    }
+
+    /// The kind of a `wait_for_condition` error, with the `checks()` of a
+    /// `MaxChecksExceeded`.
+    fn wfc_kind(err: &OperationError) -> (&'static str, Option<u32>) {
+        let OperationErrorKind::WaitForCondition(wfc_err) = err.kind() else {
+            panic!("expected WaitForCondition error, got: {:?}", err.kind());
+        };
+        match wfc_err.kind() {
+            WaitForConditionErrorKind::MaxChecksExceeded(details) => {
+                ("MaxChecksExceeded", Some(details.checks()))
+            }
+            WaitForConditionErrorKind::SerializationFailed => ("SerializationFailed", None),
+            WaitForConditionErrorKind::CheckFailed => ("CheckFailed", None),
+        }
+    }
+
+    /// The source chain of a `wait_for_condition` error, rendered.
+    fn wfc_source(err: &OperationError) -> Option<String> {
+        let OperationErrorKind::WaitForCondition(wfc_err) = err.kind() else {
+            panic!("expected WaitForCondition error, got: {:?}", err.kind());
+        };
+        std::error::Error::source(wfc_err).map(crate::error::chain_string)
+    }
+
+    /// C5 to C8: a check failure records through `wire_error_for` with the
+    /// fallback `Error`, and the live kind equals the replay kind.
+    #[tokio::test]
+    async fn check_failure_records_typed_error_type() {
+        type MakeErr = fn() -> BoxError;
+        let cases: [(MakeErr, &str, &str, &str); 4] = [
+            // C5: a plain error records `Error`.
+            (
+                || "check function failed".into(),
+                "Error",
+                "CheckFailed",
+                "check function failed",
+            ),
+            // C6: a `TypedError` records its type.
+            (
+                || Box::new(crate::TypedError::with_type("Throttled", "slow down")),
+                "Throttled",
+                "CheckFailed",
+                "slow down",
+            ),
+            // C7: the exhaustion type gives `MaxChecksExceeded`.
+            (
+                || {
+                    Box::new(crate::TypedError::with_type(
+                        "WaitForCondition.MaxChecksExceeded",
+                        "x",
+                    ))
+                },
+                "WaitForCondition.MaxChecksExceeded",
+                "MaxChecksExceeded",
+                "x",
+            ),
+            // C8: the serialization type gives `SerializationFailed`.
+            (
+                || Box::new(crate::TypedError::with_type("SerializationError", "x")),
+                "SerializationError",
+                "SerializationFailed",
+                "x",
+            ),
+        ];
+        for (make_err, recorded_type, kind, message) in cases {
+            // Live.
+            let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+            let ctx = ctx_with(&client, Vec::new());
+            let op_id = ctx.mint_id();
+            let exec = WaitForConditionExecution::<i32, _, _> {
+                ctx,
+                op_id,
+                name: None,
+                initial_state: 0,
+                wait_strategy: None,
+                serdes: crate::serdes::JsonSerdes,
+                check: move |_ctx, _state: i32| async move { Err::<i32, BoxError>(make_err()) },
+            };
+            let live = exec.execute().await.unwrap_err();
+            let (live_kind, live_checks) = wfc_kind(&live);
+            assert_eq!(live_kind, kind, "live kind for {recorded_type}");
+            assert_eq!(
+                live.wire().and_then(crate::error::WireError::error_type),
+                Some(recorded_type)
+            );
+            let fail = client
+                .recorded_updates()
+                .into_iter()
+                .find(|u| u.action() == &OperationAction::Fail)
+                .expect("a FAIL update");
+            assert_eq!(
+                fail.error().and_then(|e| e.error_type()),
+                Some(recorded_type),
+                "the FAIL record's type"
+            );
+            let live_source = wfc_source(&live);
+            if kind == "MaxChecksExceeded" {
+                assert_eq!(live_source, None, "MaxChecksExceeded carries no source");
+            } else {
+                let source = live_source.expect("the check error is the source");
+                assert!(source.contains(message), "source {source:?}");
+            }
+
+            // Replay of the record the live check wrote: first check, so
+            // no completed retry.
+            let record = wfc_record(CheckpointStatus::Failed, None, Some(recorded_type), 0);
+            let ctx = make_ctx_with_log(vec![record]);
+            let op_id = ctx.mint_id();
+            let exec = WaitForConditionExecution::<i32, _, _> {
+                ctx,
+                op_id,
+                name: None,
+                initial_state: 0,
+                wait_strategy: None,
+                serdes: crate::serdes::JsonSerdes,
+                check: |_ctx, _state: i32| async move {
+                    #[expect(unreachable_code)] // reason: type anchor for the diverging body
+                    {
+                        panic!("check must NOT execute during replay");
+                        Ok::<i32, BoxError>(0)
+                    }
+                },
+            };
+            let replayed = exec.execute().await.unwrap_err();
+            let (replay_kind, replay_checks) = wfc_kind(&replayed);
+            assert_eq!(replay_kind, kind, "replay kind for {recorded_type}");
+            assert_eq!(live_checks, replay_checks, "checks() for {recorded_type}");
+            assert_eq!(
+                replayed
+                    .wire()
+                    .and_then(crate::error::WireError::error_type),
+                Some(recorded_type)
+            );
+        }
+    }
+
+    /// Each recorded type maps to its class, and every other type, or none,
+    /// is a check failure.
+    #[test]
+    fn classify_wfc_failure_maps_each_type() {
+        assert_eq!(
+            classify_wfc_failure(Some(crate::error::WFC_EXHAUSTED_ERROR_TYPE)),
+            WfcFailureClass::MaxChecksExceeded
+        );
+        assert_eq!(
+            classify_wfc_failure(Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE)),
+            WfcFailureClass::SerializationFailed
+        );
+        assert_eq!(
+            classify_wfc_failure(Some("Error")),
+            WfcFailureClass::CheckFailed
+        );
+        assert_eq!(classify_wfc_failure(None), WfcFailureClass::CheckFailed);
     }
 }
 

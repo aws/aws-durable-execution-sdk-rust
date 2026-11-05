@@ -575,7 +575,8 @@ async fn run_count_to_two(serdes: InjectedFailures, counters: Counters) -> TestR
 #[tokio::test]
 async fn wait_for_condition_marked_serialize_failure_reinvokes() {
     let counters = Counters::default();
-    let serdes = InjectedFailures::new(Mark::Marked).serialize_at(&[0]);
+    // Call 0 round-trips the initial state; call 1 is the first check's.
+    let serdes = InjectedFailures::new(Mark::Marked).serialize_at(&[1]);
     let result = run_count_to_two(serdes, counters.clone()).await;
 
     assert_eq!(result.output(), Some(&2));
@@ -591,7 +592,8 @@ async fn wait_for_condition_marked_serialize_failure_reinvokes() {
 #[tokio::test]
 async fn wait_for_condition_marked_decode_failure_reinvokes() {
     let counters = Counters::default();
-    let serdes = InjectedFailures::new(Mark::Marked).deserialize_at(&[0]);
+    // Call 0 round-trips the initial state; call 1 is the first check's.
+    let serdes = InjectedFailures::new(Mark::Marked).deserialize_at(&[1]);
     let result = run_count_to_two(serdes, counters.clone()).await;
 
     assert_eq!(result.output(), Some(&2));

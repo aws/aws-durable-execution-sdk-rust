@@ -5989,6 +5989,66 @@ mod tests {
         );
     }
 
+    /// A `Serdes<String>` whose `serialize` upper-cases the string and whose
+    /// `deserialize` is the identity.
+    struct UpperSerdes;
+
+    impl crate::Serdes<String> for UpperSerdes {
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            value: String,
+            _context: crate::serdes::SerdesContext,
+        ) -> Result<String, BoxError> {
+            Ok(value.to_uppercase())
+        }
+
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            wire: String,
+            _context: crate::serdes::SerdesContext,
+        ) -> Result<String, BoxError> {
+            Ok(wire)
+        }
+    }
+
+    #[tokio::test]
+    async fn wfc_first_check_sees_round_tripped_initial_state() {
+        // The first check receives the initial state after a serdes round
+        // trip, as JS does, so `UpperSerdes` shows it "A", not "a".
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let seen = Arc::new(Mutex::new(None::<String>));
+                    let seen_check = Arc::clone(&seen);
+                    ctx.wait_for_condition(
+                        move |_sc, state: String| {
+                            let seen = Arc::clone(&seen_check);
+                            async move {
+                                *seen.lock().expect("lock") = Some(state.clone());
+                                Ok(state)
+                            }
+                        },
+                        "a".to_owned(),
+                    )
+                    .name("poll")
+                    .serdes(UpperSerdes)
+                    .await?;
+                    let received = seen.lock().expect("lock").clone();
+                    Ok::<_, BoxError>(received)
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&Some("A".to_owned())));
+    }
+
     #[tokio::test]
     async fn wait_strategy_config_completes_on_predicate() {
         // The config-derived strategy (issue #35) completes once its

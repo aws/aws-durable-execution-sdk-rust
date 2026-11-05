@@ -3175,6 +3175,21 @@ impl DurableContext {
     /// (a custom closure). With no strategy set, the check runs exactly
     /// once and the operation completes with that state.
     ///
+    /// The first check receives the initial state after a round trip
+    /// through the configured serdes, so it sees the same shape as a check
+    /// that resumes from a recorded state. The round trip runs before the
+    /// operation's first checkpoint: a serdes error marked with
+    /// [`RetryableSerdesError`](crate::serdes::RetryableSerdesError) ends
+    /// the invocation, and any other serdes error returns
+    /// `WaitForCondition(SerializationFailed)` without calling the check.
+    ///
+    /// A check error fails the operation without a retry. It records the
+    /// type of a [`TypedError`](crate::TypedError) in its source chain, or
+    /// `Error` when there is none. The error kind follows the recorded
+    /// type, live and on replay: `WaitForCondition.MaxChecksExceeded` is
+    /// reported as `MaxChecksExceeded`, `SerializationError` as
+    /// `SerializationFailed`, and every other type as `CheckFailed`.
+    ///
     /// # Examples
     ///
     /// ```no_run
