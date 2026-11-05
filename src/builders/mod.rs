@@ -38,8 +38,11 @@ use crate::StepError;
 /// Eagerly validates the builder's claimed replay identity right after the
 /// builder claims its operation ID.
 ///
-/// Every builder except a combinator claims its ID when it is created, and
-/// its `into_future` runs this FIRST. `.future()`, `.spawn()`, and `.await`
+/// Every builder except a combinator and `with_retry` claims its ID when it
+/// is created, and its `into_future` runs this FIRST. A `with_retry` block
+/// with its own record claims and validates its ID when the builder
+/// becomes its future; an unwrapped block has no ID of its own, and each
+/// attempt child validates its own. `.future()`, `.spawn()`, and `.await`
 /// all funnel through `into_future`, so a replay identity mismatch is
 /// recorded on the execution-fatal slot synchronously at finalization,
 /// before the operation future is ever polled.
@@ -837,7 +840,7 @@ mod tests {
             5 => (
                 "with_retry",
                 erase(
-                    ctx.with_retry(|_child| async { Ok(1_u32) })
+                    ctx.with_retry(|_child, _attempt| async { Ok(1_u32) })
                         .name("a")
                         .spawn(),
                 ),
@@ -1368,11 +1371,11 @@ mod tests {
 
         // WithRetryBuilder
         let _with_retry_f = ctx
-            .with_retry(|_ctx| async move { Ok(1_i32) })
+            .with_retry(|_ctx, _attempt| async move { Ok(1_i32) })
             .name("with-retry")
             .future();
         let _with_retry_s = ctx
-            .with_retry(|_ctx| async move { Ok(1_i32) })
+            .with_retry(|_ctx, _attempt| async move { Ok(1_i32) })
             .name("with-retry")
             .spawn();
 

@@ -98,8 +98,10 @@ impl TrackedUpdate {
     }
 }
 
-/// The scopes of one invocation: child contexts, `with_retry` blocks and
-/// attempts, and batch items, flat items included. Tracks which scopes
+/// The scopes of one invocation: child contexts, `with_retry` blocks with
+/// their own record, the attempts of every `with_retry` block (an
+/// unwrapped block has no scope of its own), and batch items, flat items
+/// included. Tracks which scopes
 /// have closed, and the operation tasks started inside each scope.
 ///
 /// A scope is named by the wire ID of its child context. Every context

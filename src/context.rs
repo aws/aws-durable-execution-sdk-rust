@@ -680,8 +680,14 @@ impl std::fmt::Debug for Inner {
 ///
 /// `DurableContext` is `Clone + Send + Sync` (backed by an `Arc`). Clone it
 /// freely to share across async boundaries. Every durable operation method
-/// except the four combinators claims its operation ID synchronously at the
-/// call site: polling order never affects identity. A combinator
+/// except [`with_retry`](Self::with_retry) and the four combinators claims
+/// its operation ID synchronously at the call site: polling order never
+/// affects identity. A `with_retry` block with its own record claims its ID
+/// when its builder becomes its future (`.await`, `.future()` or
+/// `.spawn()`); a block with
+/// [`without_child_context`](crate::builders::WithRetryBuilder::without_child_context)
+/// claims none, and its first attempt claims the caller's next ID when it
+/// starts. A combinator
 /// ([`try_join_all`](Self::try_join_all), [`join_all`](Self::join_all),
 /// [`select_ok`](Self::select_ok) and [`race`](Self::race)) claims its ID
 /// when it is first awaited or polled, or when it is spawned. A combinator
@@ -3411,13 +3417,23 @@ impl DurableContext {
     /// suspension and replays deterministically.
     ///
     /// The closure is `Fn` rather than `FnOnce` because the SDK calls it
-    /// once per attempt. Configure the policy with
+    /// once per attempt. It receives the attempt's context and the 1-based
+    /// attempt number, which is `N` in the attempt's name `attempt-N`. The
+    /// number is metadata for names and logs: a resumed attempt receives
+    /// the same number, and operation IDs do not depend on it. Configure
+    /// the policy with
     /// [`retry_strategy`](WithRetryBuilder::retry_strategy) or
     /// [`retry_strategy_config`](WithRetryBuilder::retry_strategy_config);
     /// without one, the step default applies (6 total attempts with
-    /// exponential backoff). When retries exhaust, the operation fails with
-    /// a [`ChildContextError`](crate::ChildContextError) carrying the
-    /// attempt count and the last attempt's error.
+    /// exponential backoff). When retries exhaust, a block with its own
+    /// record fails with a [`ChildContextError`](crate::ChildContextError)
+    /// of kind `ChildFailed` whose source is the last attempt's
+    /// [`OperationError`](crate::OperationError).
+    /// [`without_child_context`](WithRetryBuilder::without_child_context)
+    /// runs the attempts in this context, without a record for the block;
+    /// on exhaustion such a block returns the last attempt's
+    /// `OperationError` unchanged, a `ChildContextError` of kind
+    /// `ChildFailed` whose source is the attempt body's error.
     ///
     /// # Examples
     ///
@@ -3431,7 +3447,8 @@ impl DurableContext {
     ///     ctx: durable::DurableContext,
     /// ) -> Result<String, durable::BoxError> {
     ///     // If either step fails, BOTH re-run on the next attempt.
-    ///     let result = ctx.with_retry(|child| async move {
+    ///     let result = ctx.with_retry(|child, attempt| async move {
+    ///         tracing::info!(attempt, "reserving and booking");
     ///         let quote = child
     ///             .step(|_| async { Ok("quote-17".to_owned()) })
     ///             .name("reserve-quote")
@@ -3456,12 +3473,13 @@ impl DurableContext {
     /// ```
     pub fn with_retry<O, F, Fut>(&self, f: F) -> WithRetryBuilder<O, F, Fut>
     where
-        F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+        F: Fn(DurableContext, u32) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
         O: Send + 'static,
     {
-        let op_id = self.claim_operation_id("with_retry");
-        WithRetryBuilder::new_internal(self.clone(), op_id, f)
+        // The block claims its operation ID when the builder becomes its
+        // future, because only then is its mode known.
+        WithRetryBuilder::new_internal(self.clone(), f)
     }
 
     /// Creates a wait-for-condition operation that polls until a predicate

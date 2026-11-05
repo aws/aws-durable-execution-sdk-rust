@@ -93,8 +93,11 @@ where
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     /// Marks the body as no user function: no frame and no user-function
-    /// hooks. `with_retry` sets it for its attempt children, whose outer
-    /// block is the user function, as JS wraps only that block.
+    /// hooks. `with_retry` sets it for its attempt children in both modes.
+    /// For a block with its own record, the outer block is the user
+    /// function, as JS wraps only that block. A block with
+    /// `.without_child_context()` has no outer block, so no user function
+    /// runs for it or its attempts.
     pub(crate) fn without_user_function(mut self) -> Self {
         self.user_function = crate::child::UserFunctionPolicy::None;
         self
@@ -309,8 +312,9 @@ where
         }
     }
 
-    /// The operation's future, with its start step run now.
-    fn started_future(self) -> DurableFuture<O> {
+    /// The operation's future, with its start step run now. An unwrapped
+    /// `with_retry` block also starts its first attempt this way.
+    pub(crate) fn started_future(self) -> DurableFuture<O> {
         self.build(true)
     }
 }

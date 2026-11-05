@@ -90,8 +90,9 @@ mod hex {
 /// prevents the compiler and CPU from reordering atomic operations with
 /// respect to other memory accesses on the same thread, guaranteeing that
 /// an ID is minted where the handler's control flow claims it: at the call
-/// site for every operation except a combinator, and at a combinator's
-/// first poll or `.spawn()`.
+/// site for most operations, at a combinator's first poll or `.spawn()`,
+/// when a `with_retry` builder with its own record becomes its future, and
+/// at the start of each attempt of an unwrapped `with_retry` block.
 #[derive(Debug)]
 pub(crate) struct IdCounter {
     prefix: String,
@@ -110,9 +111,13 @@ impl IdCounter {
 
     /// Mints the next operation ID. Synchronous, lock-free.
     ///
-    /// Every operation claims its ID through this. Every operation except a
-    /// combinator calls it at its call site; a combinator calls it on its
-    /// first poll or at `.spawn()`. Every invocation advances the counter by
+    /// Every operation claims its ID through this. Most operations call it at
+    /// their call site. A combinator calls it on its first poll or at
+    /// `.spawn()`. A `with_retry` block with its own record calls it when the
+    /// builder becomes its future (`.await`, `.future()` or `.spawn()`). A
+    /// block without a child context never calls it for itself; each of its
+    /// attempts and waits calls it when that attempt or wait starts. Every
+    /// invocation advances the counter by
     /// exactly one position and returns the operation identity.
     pub(crate) fn mint(&self) -> OperationId {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;

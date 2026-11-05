@@ -7,7 +7,9 @@
 //!
 //! A combinator claims its operation ID when it is first awaited or
 //! polled, or when it is spawned, not when the context method is called.
-//! Every other operation claims its ID when its builder is created. A
+//! A `with_retry` block claims its ID when its builder becomes its future,
+//! or none at all with `without_child_context`. Every other operation
+//! claims its ID when its builder is created. A
 //! combinator builder or future that is dropped before that point claims no
 //! ID and records nothing.
 //!

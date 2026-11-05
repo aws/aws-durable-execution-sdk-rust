@@ -235,12 +235,15 @@ spawned task instead.
 
 A child context, a `map`, `parallel` or `parallel_mixed` container, each
 map item and `parallel` or `parallel_mixed` branch with
-`NestingMode::Normal`, and the outer context of `wait_for_callback` and
-`with_retry` queue their `START`, fire `on_operation_start`, and start their
-body without waiting for the `START` response, as JS does. Their outcome
-write waits for that response, and when the `START` write fails, the
-invocation ends without an outcome for the operation. An item or branch with
-`NestingMode::Flat` writes no record, so it queues no `START`.
+`NestingMode::Normal`, the outer context of `wait_for_callback`, and the
+outer context of a `with_retry` block with its own record queue their
+`START`, fire `on_operation_start`, and start their body without waiting for
+the `START` response, as JS does. Their outcome write waits for that
+response, and when the `START` write fails, the invocation ends without an
+outcome for the operation. An item or branch with `NestingMode::Flat`, and a
+`with_retry` block with `.without_child_context()`, write no record of their
+own, so they queue no `START` of their own; the attempts of the block queue
+theirs.
 
 Dropping the handle that `.spawn()` returns loses only the result. The
 operation runs until it settles, records its outcome and fires its plugin
@@ -254,7 +257,8 @@ The SDK stops work in three cases. A combinator stops the `.future()`
 inputs it started that still run when it resolves, and lets an input
 started with `.spawn()` run. A closed scope stops the work still running
 inside it: a scope closes when a child context's body returns, when a
-`with_retry` block or one of its attempts ends, and when a batch item or the
+`with_retry` block with its own record ends, when an attempt of any
+`with_retry` block ends, and when a batch item or the
 whole batch completes. The end of the invocation stops all remaining
 operation work. A stopped task stops at its next `.await`, and its record
 can stay `STARTED`. The SDK cannot stop code between two `.await`s,
@@ -270,8 +274,9 @@ function of the event and of results the SDK already recorded. Iterating a
 `HashMap` or `HashSet` to create operations breaks that, because the iteration
 order changes between runs; sort into a `Vec` first.
 
-A combinator (`try_join_all`, `join_all`, `select_ok` or `race`) is the one
-exception to the call-site rule. The context method only collects the
+Combinators and `with_retry` blocks are the exceptions to the call-site
+rule. A combinator (`try_join_all`, `join_all`, `select_ok` or `race`)
+claims its ID late because the context method only collects the
 inputs, so inputs that an iterator creates take their IDs first. The
 combinator claims its own ID when it is first awaited or polled, or when it
 is spawned, as a JS combinator claims its ID when it is first awaited. That
@@ -282,6 +287,16 @@ nothing. A combinator passed to another combinator must already have
 claimed its ID: start the inner combinator with `.spawn()` and pass the
 returned handle. A still-unclaimed one fails the execution with a context
 usage error.
+
+A `with_retry` builder claims no ID at the call, because its mode is known
+only when the builder becomes its future. A block with its own record
+claims its ID at `.await`, `.future()` or `.spawn()`. A block with
+`.without_child_context()` claims no ID of its own: its first attempt
+claims the caller's next ID when it starts, at its first poll, at
+`.spawn()` or when a combinator starts it, and each later attempt and wait
+claims the caller's next ID when it starts. These points are in the
+handler's own control flow too, so they are deterministic as long as the
+handler converts and awaits the block where it did on the first run.
 
 ```rust ignore
 let a = ctx.step(|_| async { Ok(1u32) }).name("a").future();
@@ -703,10 +718,14 @@ attempts suspend the execution, exactly as step retries do, and the retry
 progress is derived from checkpointed results, so it survives suspension.
 The closure is `Fn` rather than `FnOnce` because the SDK calls it once per
 attempt.
+The closure's second argument is the 1-based attempt number, `N` in the
+attempt's name `attempt-N`, as metadata for names and logs: a resumed
+attempt receives the same number, and operation IDs do not depend on it.
 
 ```rust ignore
 let receipt = ctx
-    .with_retry(|child| async move {
+    .with_retry(|child, attempt| async move {
+        tracing::info!(attempt, "quoting and booking");
         let quote = child
             .step(|_| async { Ok(fetch_quote().await?) })
             .name("fetch-quote")
@@ -730,8 +749,7 @@ let receipt = ctx
 
 `.retry_strategy_config(...)` accepts a `RetryStrategyConfig` instead of a
 closure, and without either the step default applies (6 total attempts with
-exponential backoff). When retries exhaust, the operation fails with the
-attempt count and the last attempt's error. `RetryStrategyConfig::linear()` retries
+exponential backoff). `RetryStrategyConfig::linear()` retries
 with delays of 1 to 5 seconds and `RetryStrategyConfig::no_retry()` makes
 the first failure final, as the JS `linear` and `noRetry` presets do.
 
@@ -742,6 +760,21 @@ are unnamed.
 `.sub_type(...)` on `with_retry` labels the block's own child context; each
 `attempt-N` child context keeps `RunInChildContext`, and each wait between
 attempts keeps `Wait`.
+
+`.without_child_context()` runs the attempts in the caller's context
+without a record for the block, as JS `wrapWithRunInChildContext: false`:
+the block claims no operation ID, a block named `b` names its attempts
+`b-attempt-N` and its waits `b-backoff-N`, `sub_type` has no recorded
+effect, and no plugin hook runs for the block itself.
+
+A `with_retry` builder claims no ID at the call. A block with its own
+record claims its ID when the builder becomes its future, at `.await`,
+`.future()` or `.spawn()`.
+
+When retries exhaust, the operation fails with a `ChildContextError` of
+kind `ChildFailed` whose source is the last attempt's error. With
+`.without_child_context()`, it returns the last `attempt-N` child's error
+unchanged.
 
 ### map and parallel
 
@@ -1403,7 +1436,9 @@ point is dropped with a WARN.
 that runs an operation, of the end-of-invocation flush and of the drain of
 hook work. `wrap_user_function` brackets each poll and each drop of a user
 function: a live step attempt or condition check, a child body (including
-the `with_retry` outer block, but not its `attempt-N` contexts), the
+the outer block of a `with_retry` with its own record, but not the
+`attempt-N` contexts of either mode; a block with `.without_child_context()`
+has no outer block and so no user function of its own), the
 `wait_for_callback` body, each map item, parallel branch and
 `parallel_mixed` branch, each map, parallel and `parallel_mixed` container,
 and each combinator join. It covers map items, parallel branches and
@@ -1439,8 +1474,10 @@ the execution with a context usage error. The rule covers plugin code that
 is active during an invocation, on the SDK's stack or on a hook task, and
 the error names plugin code, as the error for a claim in a step body does.
 For that rule, the outcome counts as decided at the driver's arbitration. A
-builder claims its ID at the call, and a deferred combinator at its first
-poll or `.spawn()`. The plugin guard itself refuses nothing; admission and
+builder claims its ID at the call, a deferred combinator at its first poll
+or `.spawn()`, a `with_retry` block with its own record when the builder
+becomes its future, and the first attempt of an unwrapped `with_retry`
+block when that attempt starts. The plugin guard itself refuses nothing; admission and
 task-ownership checks still apply, and the guard does not follow a builder
 or future that the handler created, claimed and handed to the plugin. A
 claim after the drive, in `on_invocation_end` or after `wrap_invocation`'s
@@ -1564,7 +1601,7 @@ value in parentheses is the info's `is_replay`.
 | `wait` | start (`false`) | start (`true`) | end (`false`), when it succeeds while it waits in the invocation | `SUCCEEDED`: end, `is_replay` = not listed in `updated_operations`; any other status: nothing |
 | `invoke` | start (`false`) | start (`true`) | end (`false`), when it reaches `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED` while it waits in the invocation | `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED`: end, `is_replay` = not listed in `updated_operations`; unknown status: nothing |
 | `create_callback` | start (`false`) | start (`true`) | end (`false`), when `result()` reads `SUCCEEDED`, `FAILED` or `TIMED_OUT` after waiting in the invocation | `SUCCEEDED`, `FAILED` or `TIMED_OUT`: end, `is_replay` = not listed in `updated_operations` |
-| `run_in_child_context`, `with_retry`, `map`, `parallel`, `parallel_mixed`, each map item, parallel branch and `parallel_mixed` branch, `wait_for_callback`, the combinators | start (`false`) before the body | start (`true`) before the body | end (`false`) after the terminal write | nothing, including a `ReplayChildren` reconstruction |
+| `run_in_child_context`, `with_retry` with its own record, each `attempt-N` of a `with_retry` in either mode, `map`, `parallel`, `parallel_mixed`, each map item, parallel branch and `parallel_mixed` branch, `wait_for_callback`, the combinators | start (`false`) before the body | start (`true`) before the body | end (`false`) after the terminal write | nothing, including a `ReplayChildren` reconstruction |
 
 A step retry or a `wait_for_condition` check that continues in the same
 invocation after its delay fires the `READY` cell of its row: start
@@ -1573,8 +1610,10 @@ because the batch completed early fires no end hook, nor do the unfinished
 operations inside it. Each `NestingMode::Flat` map item, parallel branch or
 `parallel_mixed` branch fires start and end hooks with `is_virtual` true and
 the container as parent. It writes no record, and after abandonment, drop
-or panic it fires no end hook. The inner callback and step of a named
-`wait_for_callback` report the names `<name>-callback` and
+or panic it fires no end hook. A `with_retry` block with
+`.without_child_context()` has no record, so it fires no hook for itself;
+its `attempt-N` children and waits fire theirs. The inner callback and step
+of a named `wait_for_callback` report the names `<name>-callback` and
 `<name>-submitter`.
 
 ### Info fields

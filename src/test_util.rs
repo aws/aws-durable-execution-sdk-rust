@@ -5815,7 +5815,7 @@ mod tests {
                             })
                             .build();
                         let value = ctx
-                            .with_retry(move |_child| {
+                            .with_retry(move |_child, _attempt| {
                                 let block_runs_seen = Arc::clone(&block_runs_seen);
                                 async move {
                                     if block_runs_seen.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -7228,7 +7228,7 @@ mod tests {
                         // Case D: the step fails on its first run, so attempt
                         // 1 fails and attempt 2 succeeds.
                         let case_d = ctx
-                            .with_retry(move |child| {
+                            .with_retry(move |child, _attempt| {
                                 let work_runs = Arc::clone(&work_runs);
                                 async move {
                                     let v = child
@@ -7259,7 +7259,7 @@ mod tests {
                             .await?;
                         // Case E.
                         let case_e = ctx
-                            .with_retry(|_child| async { Ok(5_u32) })
+                            .with_retry(|_child, _attempt| async { Ok(5_u32) })
                             .name("case-e")
                             .await?;
                         Ok::<_, BoxError>(case_a + case_b + case_d + case_e)

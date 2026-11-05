@@ -15,10 +15,10 @@ use crate::OperationSubType;
 use crate::RetryStrategy;
 use crate::Serdes;
 use crate::context::DurableContext;
-use crate::engine::OperationId;
 use crate::error::OperationError;
 use crate::future::DurableFuture;
 use crate::serdes::JsonSerdes;
+use crate::with_retry::{LoopFailure, RetryWrap};
 
 /// Builder for a block-level retry operation.
 ///
@@ -30,13 +30,22 @@ use crate::serdes::JsonSerdes;
 /// between attempts suspend the execution, and retry progress survives
 /// suspension.
 ///
+/// The closure receives the attempt's context and the 1-based attempt
+/// number, which is `N` in the attempt's name `attempt-N`. The number is
+/// metadata for names and logs: a resumed attempt receives the same
+/// number, and operation IDs do not depend on it.
+///
 /// Without an explicit strategy the block uses the same default a step
 /// uses: 6 total attempts with exponential backoff (5s initial delay, 60s
 /// cap, factor 2).
 ///
-/// When retries exhaust, the operation fails with a
-/// [`ChildContextError`](crate::ChildContextError) whose message carries
-/// the attempt count and the last attempt's error.
+/// When retries exhaust, a block with its own record fails with a
+/// [`ChildContextError`](crate::ChildContextError) of kind `ChildFailed`
+/// whose source is the last attempt's [`OperationError`]. A block with
+/// [`without_child_context`](WithRetryBuilder::without_child_context)
+/// returns the last attempt's [`OperationError`] unchanged instead: a
+/// `ChildContextError` of kind `ChildFailed` whose source is the attempt
+/// body's error.
 ///
 /// The builder is generic over the block closure `F` and its future
 /// `Fut`; both parameters are inferred at the call site and never written
@@ -53,7 +62,7 @@ use crate::serdes::JsonSerdes;
 ///     _event: serde_json::Value,
 ///     ctx: durable::DurableContext,
 /// ) -> Result<String, durable::BoxError> {
-///     let result = ctx.with_retry(|child| async move {
+///     let result = ctx.with_retry(|child, _attempt| async move {
 ///         let a = child.step(|_| async { Ok(1_u32) }).name("fetch").await?;
 ///         let b = child.step(move |_| async move { Ok(a + 1) }).name("apply").await?;
 ///         Ok(format!("{a}+{b}"))
@@ -74,8 +83,9 @@ use crate::serdes::JsonSerdes;
 #[non_exhaustive]
 pub struct WithRetryBuilder<O, F, Fut, S = JsonSerdes> {
     ctx: DurableContext,
-    op_id: OperationId,
     name: Option<String>,
+    /// Whether the block writes its own child context record.
+    wrap: RetryWrap,
     sub_type: Option<OperationSubType>,
     retry_strategy: Option<RetryStrategy>,
     serdes: S,
@@ -94,16 +104,20 @@ impl<O, F, Fut, S> std::fmt::Debug for WithRetryBuilder<O, F, Fut, S> {
 impl<O, F, Fut> WithRetryBuilder<O, F, Fut>
 where
     O: Send + 'static,
-    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+    F: Fn(DurableContext, u32) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     /// Creates a new builder (internal). Taking the closure here keeps the
     /// field non-optional: a builder without a body is unrepresentable.
-    pub(crate) fn new_internal(ctx: DurableContext, op_id: OperationId, closure: F) -> Self {
+    ///
+    /// The builder claims no operation ID: a block with its own child
+    /// context claims its ID when the builder becomes its future, because
+    /// only then is its mode known.
+    pub(crate) fn new_internal(ctx: DurableContext, closure: F) -> Self {
         Self {
             ctx,
-            op_id,
             name: None,
+            wrap: RetryWrap::Child,
             sub_type: None,
             retry_strategy: None,
             serdes: JsonSerdes,
@@ -116,7 +130,7 @@ where
 impl<O, F, Fut, S> WithRetryBuilder<O, F, Fut, S>
 where
     O: Send + 'static,
-    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+    F: Fn(DurableContext, u32) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
     /// Sets a human-readable name for this block.
@@ -150,6 +164,9 @@ where
     /// executions in flight: their replay fails with
     /// `NonDeterministicExecutionError`.
     ///
+    /// With [`without_child_context`](Self::without_child_context) the
+    /// block has no record, so the subtype has no recorded effect.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -161,7 +178,7 @@ where
     ///     ctx: durable::DurableContext,
     /// ) -> Result<u32, durable::BoxError> {
     ///     let total = ctx
-    ///         .with_retry(|child| async move {
+    ///         .with_retry(|child, _attempt| async move {
     ///             let v = child.step(|_| async { Ok(42_u32) }).name("work").await?;
     ///             Ok(v)
     ///         })
@@ -173,6 +190,49 @@ where
     /// ```
     pub fn sub_type(mut self, sub_type: OperationSubType) -> Self {
         self.sub_type = Some(sub_type);
+        self
+    }
+
+    /// Runs the attempts in the caller's context, without a `with_retry`
+    /// record, as JS `wrapWithRunInChildContext: false`. When the block is
+    /// named `b`, its attempt children are named `b-attempt-N`; without
+    /// this setter they are `attempt-N` inside the block's own context. In
+    /// every mode the waits of a block named `b` are named `b-backoff-N`,
+    /// and the waits of an unnamed block have no name.
+    ///
+    /// The block claims no operation ID, so `attempt-1` takes the caller's
+    /// next positional ID, and each later attempt and wait takes the
+    /// caller's next ID when it starts. Await the block before the caller
+    /// creates another operation, so those IDs stay the same on every run.
+    /// No operation hook, user-function hook or `wrap_user_function` runs
+    /// for the block itself. On exhaustion the block returns the last
+    /// `attempt-N` child's error unchanged: a
+    /// [`ChildContextError`](crate::ChildContextError) of kind
+    /// `ChildFailed` whose source is the body's error.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<u32, durable::BoxError> {
+    ///     // Records `charge-attempt-1`, `charge-attempt-2`, ... directly in
+    ///     // the handler's context.
+    ///     let total = ctx
+    ///         .with_retry(|child, _attempt| async move {
+    ///             Ok(child.step(|_| async { Ok(42_u32) }).name("work").await?)
+    ///         })
+    ///         .name("charge")
+    ///         .without_child_context()
+    ///         .await?;
+    ///     Ok(total)
+    /// }
+    /// ```
+    pub fn without_child_context(mut self) -> Self {
+        self.wrap = RetryWrap::None;
         self
     }
 
@@ -196,7 +256,7 @@ where
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<u32, durable::BoxError> {
-    ///     let result = ctx.with_retry(|child| async move {
+    ///     let result = ctx.with_retry(|child, _attempt| async move {
     ///         let v = child.step(|_| async { Ok(42_u32) }).await?;
     ///         Ok(v)
     ///     })
@@ -248,7 +308,7 @@ where
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<u32, durable::BoxError> {
-    ///     let result = ctx.with_retry(|child| async move {
+    ///     let result = ctx.with_retry(|child, _attempt| async move {
     ///         let v = child.step(|_| async { Ok(42_u32) }).await?;
     ///         Ok(v)
     ///     })
@@ -280,8 +340,8 @@ where
     {
         WithRetryBuilder {
             ctx: self.ctx,
-            op_id: self.op_id,
             name: self.name,
+            wrap: self.wrap,
             sub_type: self.sub_type,
             retry_strategy: self.retry_strategy,
             serdes,
@@ -364,7 +424,7 @@ where
     ///     _event: serde_json::Value,
     ///     ctx: durable::DurableContext,
     /// ) -> Result<(), durable::BoxError> {
-    ///     let handle = ctx.with_retry(|child| async move {
+    ///     let handle = ctx.with_retry(|child, _attempt| async move {
     ///         let v = child.step(|_| async { Ok(1_u32) }).await?;
     ///         Ok(v)
     ///     }).name("bg").spawn();
@@ -383,24 +443,43 @@ where
 impl<O, F, Fut, S> WithRetryBuilder<O, F, Fut, S>
 where
     O: Send + 'static,
-    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+    F: Fn(DurableContext, u32) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
     /// The operation's future. With `started`, its start step runs now, on
     /// the caller's task (see [`crate::start`]); `.spawn()` uses that.
+    ///
+    /// A block with its own child context claims its operation ID here,
+    /// when the builder becomes its future. An unwrapped block claims
+    /// nothing: its first attempt claims the caller's next ID when it
+    /// starts.
     fn build(self, started: bool) -> DurableFuture<O> {
+        match self.wrap {
+            RetryWrap::Child => self.build_child(started),
+            RetryWrap::None => self.build_unwrapped(started),
+        }
+    }
+
+    /// The future of a block with its own child context record.
+    fn build_child(self, started: bool) -> DurableFuture<O> {
         use crate::child::ChildExecution;
 
+        let op_id = self.ctx.claim_operation_id("with_retry");
         // The block is a child context on the wire; validate against the
         // recorded identity exactly as `run_in_child_context` does.
-        preflight_identity!(
-            self,
+        if let Err(err) = self.ctx.preflight_replay_identity(
+            &op_id,
             "Context",
-            self.sub_type
-                .as_ref()
-                .map_or(crate::child::CHILD_SUB_TYPE, OperationSubType::as_str)
-        );
+            Some(
+                self.sub_type
+                    .as_ref()
+                    .map_or(crate::child::CHILD_SUB_TYPE, OperationSubType::as_str),
+            ),
+            self.name.as_deref(),
+        ) {
+            return DurableFuture::from_async(async move { Err(err) });
+        }
 
         let closure = Arc::new(self.closure);
         let strategy: Arc<RetryStrategy> = Arc::new(
@@ -417,7 +496,7 @@ where
 
         let execution = ChildExecution {
             ctx: self.ctx,
-            op_id: self.op_id,
+            op_id,
             name: self.name,
             sub_type: self
                 .sub_type
@@ -426,8 +505,18 @@ where
             user_function: crate::child::UserFunctionPolicy::Hooks,
             // A concrete closure returning the concrete retry-loop future:
             // no erasure here: the one box is the DurableFuture below.
-            closure: move |outer_ctx| {
-                crate::with_retry::retry_loop(outer_ctx, loop_name, closure, strategy, loop_serdes)
+            closure: move |outer_ctx| async move {
+                crate::with_retry::retry_loop(
+                    outer_ctx,
+                    loop_name,
+                    RetryWrap::Child,
+                    None,
+                    closure,
+                    strategy,
+                    loop_serdes,
+                )
+                .await
+                .map_err(LoopFailure::into_child_error)
             },
             _marker: PhantomData,
         };
@@ -444,6 +533,49 @@ where
         }
     }
 
+    /// The future of an unwrapped block: the retry loop runs in the
+    /// caller's context, and the block writes no record and fires no hook
+    /// of its own. Its start step is attempt 1's start step.
+    fn build_unwrapped(self, started: bool) -> DurableFuture<O> {
+        let ctx = self.ctx;
+        let name = self.name;
+        let closure = Arc::new(self.closure);
+        let strategy: Arc<RetryStrategy> = Arc::new(
+            self.retry_strategy
+                .unwrap_or_else(crate::step::default_retry_strategy),
+        );
+        let serdes = Arc::new(self.serdes);
+        let loop_ctx = ctx.clone();
+        let begin = move || {
+            let first = crate::with_retry::start_attempt(
+                &loop_ctx,
+                crate::with_retry::attempt_name(name.as_deref(), RetryWrap::None, 1),
+                1,
+                &closure,
+                &serdes,
+                true,
+            );
+            async move {
+                crate::with_retry::retry_loop(
+                    loop_ctx,
+                    name,
+                    RetryWrap::None,
+                    Some(first),
+                    closure,
+                    strategy,
+                    serdes,
+                )
+                .await
+                .map_err(LoopFailure::into_operation_error)
+            }
+        };
+        if started {
+            DurableFuture::for_started_operation(&ctx, begin())
+        } else {
+            DurableFuture::for_start_step(&ctx, begin)
+        }
+    }
+
     /// The operation's future, with its start step run now.
     fn started_future(self) -> DurableFuture<O> {
         self.build(true)
@@ -453,7 +585,7 @@ where
 impl<O, F, Fut, S> IntoFuture for WithRetryBuilder<O, F, Fut, S>
 where
     O: Send + 'static,
-    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
+    F: Fn(DurableContext, u32) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     S: Serdes<O>,
 {
@@ -489,7 +621,9 @@ mod tests {
         let outcome = drive_handler(ctx, None, move |ctx| async move {
             let holder: Arc<Mutex<Vec<DurableFuture<()>>>> = Arc::new(Mutex::new(Vec::new()));
             let block_holder = Arc::clone(&holder);
-            let attempt = Arc::new(|_attempt_ctx: DurableContext| async { Ok::<(), BoxError>(()) });
+            let attempt = Arc::new(|_attempt_ctx: DurableContext, _attempt: u32| async {
+                Ok::<(), BoxError>(())
+            });
             // The outer child execution `WithRetryBuilder` builds, with a
             // closure that starts `escaped` on the block's own context
             // before it runs the retry loop.
@@ -514,11 +648,14 @@ mod tests {
                     crate::with_retry::retry_loop(
                         outer_ctx,
                         Some("block".to_owned()),
+                        RetryWrap::Child,
+                        None,
                         attempt,
                         Arc::new(crate::step::default_retry_strategy()),
                         Arc::new(JsonSerdes),
                     )
                     .await
+                    .map_err(LoopFailure::into_child_error)
                 },
                 _marker: PhantomData,
             };
@@ -543,13 +680,28 @@ mod tests {
         );
     }
 
+    /// `serdes` keeps the wrap mode in both directions.
+    #[test]
+    fn serdes_keeps_wrap_mode() {
+        let ctx = DurableContext::test_context();
+        let unwrapped = ctx
+            .with_retry(|_child, _attempt| async { Ok(1_u32) })
+            .without_child_context()
+            .serdes(Arc::new(JsonSerdes));
+        assert_eq!(unwrapped.wrap, RetryWrap::None);
+        let wrapped = ctx
+            .with_retry(|_child, _attempt| async { Ok(1_u32) })
+            .serdes(Arc::new(JsonSerdes));
+        assert_eq!(wrapped.wrap, RetryWrap::Child);
+    }
+
     /// A second `sub_type` call replaces the first, and `serdes` keeps
     /// the subtype.
     #[test]
     fn sub_type_setter_replaces_and_survives_serdes() {
         let ctx = DurableContext::test_context();
         let builder = ctx
-            .with_retry(|_child| async { Ok(1_u32) })
+            .with_retry(|_child, _attempt| async { Ok(1_u32) })
             .sub_type(OperationSubType::new("First").unwrap())
             .sub_type(OperationSubType::new("Second").unwrap())
             .serdes(Arc::new(JsonSerdes));

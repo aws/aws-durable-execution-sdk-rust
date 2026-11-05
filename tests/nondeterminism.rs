@@ -1153,7 +1153,7 @@ async fn child_sub_type_change_detected() {
 
     // A with_retry block.
     let result = run_per_invocation(|ctx, call| async move {
-        ctx.with_retry(|_child| async { Ok(1_u32) })
+        ctx.with_retry(|_child, _attempt| async { Ok(1_u32) })
             .name("pay")
             .sub_type(sub_type(call))
             .await?;
@@ -1176,7 +1176,7 @@ async fn child_same_sub_type_replays_successfully() {
             .sub_type(durable::OperationSubType::new("Payment")?)
             .await?;
         let b = ctx
-            .with_retry(|_child| async { Ok(2_u32) })
+            .with_retry(|_child, _attempt| async { Ok(2_u32) })
             .name("pay-block")
             .sub_type(durable::OperationSubType::new("Payment")?)
             .await?;

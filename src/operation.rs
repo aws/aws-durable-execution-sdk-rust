@@ -10,7 +10,8 @@ pub enum OperationKind {
     Step,
     /// A timer, created by `DurableContext::wait`.
     Wait,
-    /// A child context, such as a `map` item, a `parallel` branch or a `with_retry` block.
+    /// A child context, such as a `map` item, a `parallel` branch, a `with_retry` block with
+    /// its own record or a `with_retry` attempt.
     Context,
     /// A callback that an external system completes.
     Callback,

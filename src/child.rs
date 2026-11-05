@@ -63,8 +63,9 @@ pub(crate) struct ChildExecution<O, F, S> {
 pub(crate) enum UserFunctionPolicy {
     /// A frame, wraps and user-function hooks.
     Hooks,
-    /// None of them: a `with_retry` attempt, whose outer block is the user
-    /// function.
+    /// None of them: a `with_retry` attempt. In a block with its own record
+    /// the outer block is the user function; a block without a child context
+    /// has no user function, and its attempts run inside the caller's wraps.
     None,
 }
 

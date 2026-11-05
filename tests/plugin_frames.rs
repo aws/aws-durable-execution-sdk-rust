@@ -1173,7 +1173,7 @@ async fn with_retry_attempts_are_not_user_functions() {
         let calls = std::sync::Arc::clone(&calls);
         async move {
             Ok(ctx
-                .with_retry(move |_child| {
+                .with_retry(move |_child, _attempt| {
                     let calls = std::sync::Arc::clone(&calls);
                     async move {
                         let wraps = IN_FN.with(|f| f.borrow().clone());

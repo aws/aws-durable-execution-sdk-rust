@@ -401,7 +401,7 @@ fn non_serde_output_builders_compile(ctx: &durable::DurableContext) {
 
     // with_retry: no `Serialize`/`DeserializeOwned` on the block output.
     let _wr: durable::DurableFuture<NoSerde> = ctx
-        .with_retry(|_child| async {
+        .with_retry(|_child, _attempt| async {
             Ok(NoSerde {
                 text: "compile-only".to_owned(),
             })
@@ -420,7 +420,7 @@ async fn with_retry_round_trips_non_serde_output_through_custom_serdes() {
         .run(
             |_event: (), ctx: durable::DurableContext| async move {
                 let out: NoSerde = ctx
-                    .with_retry(|_child| async {
+                    .with_retry(|_child, _attempt| async {
                         Ok(NoSerde {
                             text: "no-serde-traits".to_owned(),
                         })

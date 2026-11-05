@@ -21,8 +21,12 @@ use crate::error::{ChildFnError, OperationError};
 /// The uniform future handle for all durable operations.
 ///
 /// Every builder's [`IntoFuture`](std::future::IntoFuture) target is
-/// `DurableFuture<O>`. Every operation except a combinator has already
-/// claimed its operation ID when its builder was created. A combinator
+/// `DurableFuture<O>`. Every operation except a combinator and a
+/// [`DurableContext::with_retry`] block has already claimed its operation
+/// ID when its builder was created. A `with_retry` block with its own
+/// record claims its ID when the builder becomes this future; an unwrapped
+/// block claims none, and its first attempt claims the caller's next ID at
+/// the block's start step (its first poll or `.spawn()`). A combinator
 /// ([`DurableContext::try_join_all`], [`DurableContext::join_all`],
 /// [`DurableContext::select_ok`] and [`DurableContext::race`]) claims its ID
 /// on the first poll of this future, or at `.spawn()`. A combinator future
@@ -46,9 +50,11 @@ use crate::error::{ChildFnError, OperationError};
 ///   running when it resolves, and lets an input started with `.spawn()`
 ///   run;
 /// - a closed scope stops the work still running inside it. A scope closes
-///   when a child context's body returns, when a `with_retry` block or one
-///   of its attempts ends, and when a `map`, `parallel` or `parallel_mixed`
-///   item, or the whole batch, completes;
+///   when a child context's body returns, when a `with_retry` block with
+///   its own record ends, when an attempt of any `with_retry` block ends
+///   (a block with `.without_child_context()` has no scope of its own,
+///   only its attempts do), and when a `map`, `parallel` or
+///   `parallel_mixed` item, or the whole batch, completes;
 /// - the end of the invocation stops all remaining operation work.
 ///
 /// A stopped task stops at its next `.await`, and its record can stay

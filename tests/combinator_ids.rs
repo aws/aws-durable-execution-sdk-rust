@@ -499,7 +499,7 @@ async fn combinator_started_in_other_body_is_rejected() {
                     .await?;
                 }
                 OtherBody::WithRetry => {
-                    ctx.with_retry(move |_child| await_slot(Arc::clone(&slot)))
+                    ctx.with_retry(move |_child, _attempt| await_slot(Arc::clone(&slot)))
                         .name("retry")
                         .retry_strategy(|_err, _attempt| RetryDecision::Stop)
                         .await?;

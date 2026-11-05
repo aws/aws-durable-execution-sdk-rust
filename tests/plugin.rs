@@ -1030,7 +1030,7 @@ async fn custom_child_and_with_retry_subtypes_reach_plugin_operations() {
                         .sub_type(durable::OperationSubType::new("Checkout")?)
                         .await?;
                     let d = ctx
-                        .with_retry(move |child| {
+                        .with_retry(move |child, _attempt| {
                             let work_runs = Arc::clone(&work_runs);
                             async move {
                                 let v = child
@@ -2623,8 +2623,9 @@ async fn parent_with_child_step(_e: (), ctx: DurableContext) -> Result<String, B
 /// Fails the first run of the block and succeeds every later one.
 fn fails_first_run(
     runs: Arc<AtomicUsize>,
-) -> impl Fn(DurableContext) -> std::future::Ready<Result<u32, BoxError>> + Send + Sync + 'static {
-    move |_child: DurableContext| {
+) -> impl Fn(DurableContext, u32) -> std::future::Ready<Result<u32, BoxError>> + Send + Sync + 'static
+{
+    move |_child: DurableContext, _attempt: u32| {
         std::future::ready(if runs.fetch_add(1, Ordering::SeqCst) == 0 {
             Err("transient".into())
         } else {
@@ -4549,7 +4550,7 @@ async fn run_with_retry(
                 let (seen, calls) = (Arc::clone(&handler_seen), Arc::clone(&handler_calls));
                 async move {
                     Ok::<_, BoxError>(
-                        ctx.with_retry(move |_child| {
+                        ctx.with_retry(move |_child, _attempt| {
                             let (seen, calls) = (Arc::clone(&seen), Arc::clone(&calls));
                             async move {
                                 seen.lock().unwrap().push(frames());
@@ -4646,6 +4647,71 @@ async fn with_retry_exhaustion_end_hook() {
             "{wire:?}"
         );
     }
+}
+
+/// An unwrapped `with_retry` block `block` inside a child `outer` is no
+/// user-function site and fires no operation hook: only its
+/// `block-attempt-1` and `block-attempt-2` children fire their operation
+/// hooks, they fire no user-function hook, and each attempt body runs
+/// inside `outer`'s wraps only.
+#[tokio::test]
+async fn unwrapped_block_is_not_a_user_function_site() {
+    let uf = Uf::default();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let handler_seen = Arc::clone(&seen);
+    let result = uf
+        .runner()
+        .run(
+            move |_e: (), ctx: DurableContext| {
+                let seen = Arc::clone(&handler_seen);
+                async move {
+                    Ok::<_, BoxError>(
+                        ctx.run_in_child_context(move |outer| async move {
+                            Ok(outer
+                                .with_retry(move |_child, attempt| {
+                                    let seen = Arc::clone(&seen);
+                                    async move {
+                                        seen.lock().unwrap().push(frames());
+                                        if attempt == 1 {
+                                            Err::<u32, BoxError>("transient".into())
+                                        } else {
+                                            Ok(4)
+                                        }
+                                    }
+                                })
+                                .name("block")
+                                .without_child_context()
+                                .retry_strategy(retry_once)
+                                .await?)
+                        })
+                        .name("outer")
+                        .await?,
+                    )
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&4));
+    assert!(result.operation("block").is_none(), "{result}");
+    assert!(
+        uf.recs().iter().all(|r| r.op != "block"),
+        "{:?}",
+        uf.of("block")
+    );
+    for attempt in ["block-attempt-1", "block-attempt-2"] {
+        assert!(uf.of(attempt).is_empty(), "{:?}", uf.of(attempt));
+        for hook in ["op-start", "op-end"] {
+            let count = uf
+                .recs()
+                .into_iter()
+                .filter(|r| r.hook == hook && r.op == attempt)
+                .count();
+            assert_eq!(count, 2, "both plugins' {hook} for {attempt}");
+        }
+    }
+    assert_eq!(*seen.lock().unwrap(), [["I", "outer"], ["I", "outer"]]);
 }
 
 /// A `parallel` `p` with one branch `b` running a step `s`: each hook and

@@ -329,8 +329,9 @@ pub trait Plugin: Send + Sync {
     /// above. When the `wait_for_callback` is named `n`, they report the
     /// names `n-callback` and `n-submitter`; their records carry no name.
     ///
-    /// A child context (and so `with_retry` and each of its `attempt-N`
-    /// child contexts), a `map` or `parallel` container, each map item and
+    /// A child context (and so a `with_retry` block with its own record and
+    /// each `attempt-N` child context of a `with_retry` block in either
+    /// mode), a `map` or `parallel` container, each map item and
     /// parallel branch, and the combinators `try_join_all`, `join_all`,
     /// `select_ok` and `race` report kind `Context`. The rules below apply
     /// to each of them that writes a record, which includes a map item or
@@ -339,8 +340,9 @@ pub trait Plugin: Send + Sync {
     /// `FAIL` record, so these rules do not apply to it; its own rules
     /// follow the list.
     ///
-    /// - a child context, a `wait_for_callback`, a `with_retry` block and
-    ///   its attempts, a `map`, `parallel` or `parallel_mixed` container
+    /// - a child context, a `wait_for_callback`, a `with_retry` block with
+    ///   its own record, the attempts of any `with_retry` block, a `map`,
+    ///   `parallel` or `parallel_mixed` container
     ///   and a map item or `parallel` or `parallel_mixed` branch without a
     ///   record fire `on_operation_start` with status `Started` and
     ///   `is_replay` `false` once their `START` is
@@ -482,8 +484,9 @@ pub trait Plugin: Send + Sync {
     /// above. When the `wait_for_callback` is named `n`, they report the
     /// names `n-callback` and `n-submitter`; their records carry no name.
     ///
-    /// A child context (and so `with_retry` and each of its `attempt-N`
-    /// child contexts), a `map` or `parallel` container, each map item and
+    /// A child context (and so a `with_retry` block with its own record and
+    /// each `attempt-N` child context of a `with_retry` block in either
+    /// mode), a `map` or `parallel` container, each map item and
     /// parallel branch, and the combinators `try_join_all`, `join_all`,
     /// `select_ok` and `race` report kind `Context`. The rules below apply
     /// to each of them that writes a record, which includes a map item or
@@ -492,8 +495,9 @@ pub trait Plugin: Send + Sync {
     /// `FAIL` record, so these rules do not apply to it; its own rules
     /// follow the list.
     ///
-    /// - a child context, a `wait_for_callback`, a `with_retry` block and
-    ///   its attempts, a `map`, `parallel` or `parallel_mixed` container
+    /// - a child context, a `wait_for_callback`, a `with_retry` block with
+    ///   its own record, the attempts of any `with_retry` block, a `map`,
+    ///   `parallel` or `parallel_mixed` container
     ///   and a map item or `parallel` or `parallel_mixed` branch without a
     ///   record fire `on_operation_start` with status `Started` and
     ///   `is_replay` `false` once their `START` is queued, as JS does. The
@@ -744,8 +748,10 @@ pub trait Plugin: Send + Sync {
     /// - a step attempt, including the submitter step of a
     ///   `wait_for_callback` named `<name>-submitter`;
     /// - a `wait_for_condition` check;
-    /// - a `run_in_child_context` body, the block of a `with_retry`, and the
-    ///   body of a `wait_for_callback`;
+    /// - a `run_in_child_context` body, the block of a `with_retry` with its
+    ///   own record, and the body of a `wait_for_callback`. A `with_retry`
+    ///   block with `without_child_context` has no record and is not a user
+    ///   function;
     /// - each item of a `map` and each branch of a `parallel` or
     ///   `parallel_mixed`, and the container of each of those three, whose
     ///   user function produces the batch from the items;
@@ -865,9 +871,12 @@ pub trait Plugin: Send + Sync {
     ///   [`StepSemantics::AtMostOncePerRetry`](crate::StepSemantics::AtMostOncePerRetry),
     ///   which the SDK records as failed;
     /// - a step waiting for its retry delay;
-    /// - the `attempt-N` child contexts of a `with_retry` block. The block is
-    ///   the user function, and its attempts run inside its wraps; the
-    ///   attempts still fire their operation hooks;
+    /// - the `attempt-N` child contexts of a `with_retry` block, in either
+    ///   mode. A block with its own record is the user function, and its
+    ///   attempts run inside its wraps. A block with `without_child_context`
+    ///   has no user function, wrap or scope of its own, so its attempts run
+    ///   inside the caller's wraps. The attempts still fire their operation
+    ///   hooks;
     /// - the join of a combinator that fails because an input was not
     ///   claimed, after its own `START` and `on_operation_start`.
     ///
@@ -885,7 +894,11 @@ pub trait Plugin: Send + Sync {
     /// a `tracing` subscriber that the SDK calls for a warning about a
     /// plugin. Like the step-body check, the check runs where an operation
     /// takes its ID. Most builders take it when the operation is created; a
-    /// combinator takes it when it is first polled or spawned. The check does
+    /// combinator takes it when it is first polled or spawned; a `with_retry`
+    /// block with its own record takes it when the builder becomes its
+    /// future; and a block with `without_child_context` takes none, while
+    /// each of its attempts and waits takes the caller's next ID when it
+    /// starts. The check does
     /// not follow a builder or future that other code created and that took
     /// its ID, a later poll of it, a handle returned by `.spawn()`, or code
     /// on a task or thread that the plugin starts itself.
@@ -1262,7 +1275,7 @@ pub trait Plugin: Send + Sync {
     /// | step attempt, `wait_for_callback` submitter step | the step's error, with the type `Error` unless the error names one, as a `TypedError` does |
     /// | `wait_for_condition` check | the check's error, with the type `Error` unless the error names one, as a `TypedError` does |
     /// | `run_in_child_context` body, map item, parallel or `parallel_mixed` branch | the body's error, as the child context records it |
-    /// | `with_retry` block | the error that ends the retries |
+    /// | `with_retry` block with its own record | the error that ends the retries; a block with `without_child_context` is not a user function |
     /// | `wait_for_callback` body | the error the operation records, such as `Callback.ExternalFailure` |
     /// | `map`, `parallel` or `parallel_mixed` container | never: the batch holds the item failures |
     /// | `try_join_all` | `CombinatorError.JoinFailed.<i>` for input `i` |

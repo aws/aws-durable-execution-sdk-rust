@@ -368,7 +368,7 @@ async fn correct_contexts_succeed() {
                     .name("items")
                     .await?;
                 let retried = ctx
-                    .with_retry(|attempt_ctx| async move {
+                    .with_retry(|attempt_ctx, _attempt| async move {
                         let v = attempt_ctx
                             .step(|_| async { Ok(5_u32) })
                             .name("work")

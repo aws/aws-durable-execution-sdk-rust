@@ -6,8 +6,10 @@
 //!
 //! A combinator stops the `.future()` inputs it started, and lets an input
 //! started with `.spawn()` run. A scope closes when a child context's body
-//! returns, when a `with_retry` block or one of its attempts ends, and when
-//! a batch item or the whole batch completes. A closed scope stops the
+//! returns, when a `with_retry` block with its own record ends, when an
+//! attempt of any `with_retry` block ends (a block with
+//! `.without_child_context()` has no scope of its own, only its attempts
+//! do), and when a batch item or the whole batch completes. A closed scope stops the
 //! tracked tasks still running inside it.
 //!
 //! The scope tests share [`escape`]. It starts a step named `escaped`
@@ -596,7 +598,7 @@ async fn with_retry_attempt_end_stops_escaped_task() {
     let (result, effects) = run_scoped(move |ctx, effects, holder| {
         let attempts = Arc::clone(&attempts);
         async move {
-            ctx.with_retry(move |attempt_ctx| {
+            ctx.with_retry(move |attempt_ctx, _attempt| {
                 let (effects, holder, attempts) = (
                     Arc::clone(&effects),
                     Arc::clone(&holder),
