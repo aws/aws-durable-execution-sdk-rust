@@ -821,3 +821,61 @@ async fn failed_replay_decode_emits_no_operation_replayed() {
         "a failed replay decode must not emit operation_replayed. Got: {output}"
     );
 }
+
+/// REGRESSION: a `wait_for_callback` replays its recorded raw payload and
+/// the user serdes decodes it after the outer context settles. When that
+/// replay decode fails, the operation surfaces the error and emits NO
+/// `operation_replayed` for the context, because no recorded outcome was
+/// returned.
+#[tokio::test]
+#[expect(clippy::expect_used)] // reason: the queued reply encodes a u32, which cannot fail
+async fn failed_wait_for_callback_replay_decode_emits_no_operation_replayed() {
+    let (buffer, _guard) = capture_subscriber();
+    let decode_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    let result = LocalRunner::new()
+        .callback(CallbackReply::success(&7_u32).expect("encodes"))
+        .run(
+            {
+                let decode_calls = Arc::clone(&decode_calls);
+                move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                    let decode_calls = Arc::clone(&decode_calls);
+                    async move {
+                        let value: u32 = ctx
+                            .wait_for_callback::<u32, _, _>(|_step_ctx, _callback_id| async move {
+                                Ok(())
+                            })
+                            .name("decays-on-replay")
+                            .serdes(FailOnReplayDeserializeSerdes(decode_calls))
+                            .await?;
+                        // The wait suspends the execution, so the resume
+                        // replays the context, and the replay decode fails.
+                        ctx.wait(Duration::from_secs(1))
+                            .name("force-resume")
+                            .await?;
+                        Ok::<_, durable::BoxError>(value)
+                    }
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+
+    assert!(
+        result.output().is_none(),
+        "the failed replay decode must fail the execution"
+    );
+    assert_eq!(
+        decode_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the serdes decodes once live and once on the replay"
+    );
+
+    let output = captured(&buffer);
+    let replayed = lifecycle_events(&output, event_names::OPERATION_REPLAYED);
+    assert!(
+        events_with_field(&replayed, field_names::OPERATION_NAME, "decays-on-replay").is_empty(),
+        "a failed replay decode must not emit operation_replayed. Got: {output}"
+    );
+}

@@ -6964,10 +6964,37 @@ mod tests {
         let kinds: Vec<&str> = run.seen.iter().map(|e| e.0.as_str()).collect();
         assert_eq!(kinds, ["DeserializationFailed", "DeserializationFailed"]);
         assert_eq!(run.seen[0], run.seen[1]);
-        assert_eq!(
-            approve_error_type(&run.result),
-            Some("Callback.DeserializationFailed")
-        );
+        // The outer context records the raw payload, byte for byte, and the
+        // decode after it fails.
+        let approve = run
+            .result
+            .operation("approve")
+            .expect("the wait_for_callback is recorded");
+        assert_eq!(approve.status(), OperationStatus::Succeeded);
+        assert_eq!(approve.result(), Some("not json"));
+        assert_eq!(approve.error_type(), None);
+    }
+
+    /// `PassthroughSerdes` on `wait_for_callback` returns the raw reply the
+    /// external caller sent, which is not JSON.
+    #[tokio::test]
+    async fn wfcb_passthrough_reads_raw_reply() {
+        let result = LocalRunner::new()
+            .callback(CallbackReply::raw("approved"))
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let approval = ctx
+                        .wait_for_callback::<String, _, _>(|_step_ctx, _id| async { Ok(()) })
+                        .name("approve")
+                        .serdes(crate::PassthroughSerdes)
+                        .await?;
+                    Ok::<_, BoxError>(approval)
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert_eq!(result.output().map(String::as_str), Some("approved"));
     }
 
     #[tokio::test]

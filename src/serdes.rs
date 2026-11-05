@@ -343,6 +343,17 @@ where
 /// [`JsonSerdes`] stays the default of every other serdes, including the
 /// item serdes of a map or parallel.
 ///
+/// Use it to read a callback payload as the raw string the external
+/// caller sent, which is the JS SDK's default callback decoding:
+/// `.serdes(PassthroughSerdes)` on `create_callback::<String>()` or
+/// `wait_for_callback::<String, _, _>(..)`.
+///
+/// An operation whose record has no payload passes `"null"` to every
+/// serdes, so `PassthroughSerdes` returns the string `"null"` for a
+/// callback that succeeded without a payload. It cannot tell that case
+/// from a payload that is the literal `null`. JS's pass-through returns
+/// `undefined` there.
+///
 /// Both methods run inline in the returned future.
 ///
 /// # Examples
@@ -363,7 +374,8 @@ where
 /// # }).unwrap();
 /// ```
 // `#[non_exhaustive]` exemption: a stateless marker that user code
-// constructs by its bare name (`.result_serdes(PassthroughSerdes)`), and
+// constructs by its bare name (`.result_serdes(PassthroughSerdes)`,
+// `.serdes(PassthroughSerdes)`), and
 // the default for the result serdes type parameter of the map and parallel
 // builders. The attribute would remove that bare-name construction path,
 // and the type's whole contract is to carry no configuration.

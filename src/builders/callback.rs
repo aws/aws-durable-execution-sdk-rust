@@ -154,6 +154,13 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     /// [`Serdes<O>`](crate::Serdes) for this callback's payload type:
     /// attaching a serdes for a different type fails at compile time. The
     /// default is [`JsonSerdes`].
+    ///
+    /// `.serdes(PassthroughSerdes)` on a `create_callback::<String>()`
+    /// returns the raw payload the external caller sent, as JS does by
+    /// default. The Rust default is [`JsonSerdes`], so a typed `O` decodes
+    /// without configuration.
+    ///
+    /// [`PassthroughSerdes`]: crate::PassthroughSerdes
     pub fn serdes<S2>(self, serdes: S2) -> CreateCallbackBuilder<O, S2>
     where
         S2: Serdes<O>,
@@ -289,6 +296,11 @@ where
 ///
 /// Created by [`DurableContext::wait_for_callback`]. Registers the callback
 /// and waits for completion in one step.
+///
+/// The outer operation records the raw callback payload, byte for byte, as
+/// its result. The serdes is applied after it: each invocation that reads
+/// the outer result, live or on replay, decodes the payload once with the
+/// serdes, and never asks it to serialize.
 ///
 /// The builder is generic over the submitter closure `F` and its future
 /// `Fut`; both parameters are inferred at the call site and never written
@@ -477,8 +489,58 @@ where
     /// way out: only the deserialize half of this serdes acts on the
     /// delivered payload. The serdes must implement
     /// [`Serdes<O>`](crate::Serdes) for this callback's payload type:
-    /// attaching a serdes for a different type fails at compile time. The
-    /// default is [`JsonSerdes`].
+    /// attaching a serdes for a different type fails at compile time, and
+    /// `O` needs no `serde` traits. The default is [`JsonSerdes`].
+    ///
+    /// `.serdes(PassthroughSerdes)` on a `wait_for_callback::<String, _, _>`
+    /// returns the raw payload the external caller sent, as JS does by
+    /// default. The Rust default is [`JsonSerdes`], so a typed `O` decodes
+    /// without configuration.
+    ///
+    /// # Examples
+    ///
+    /// A payload type without `serde` derives, decoded by its own serdes:
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::serdes::{Serdes, SerdesContext};
+    ///
+    /// struct Token(String);
+    ///
+    /// struct TokenSerdes;
+    ///
+    /// impl Serdes<Token> for TokenSerdes {
+    ///     async fn serialize(
+    ///         &self,
+    ///         value: Token,
+    ///         _context: SerdesContext,
+    ///     ) -> Result<String, durable::BoxError> {
+    ///         Ok(value.0)
+    ///     }
+    ///
+    ///     async fn deserialize(
+    ///         &self,
+    ///         wire: String,
+    ///         _context: SerdesContext,
+    ///     ) -> Result<Token, durable::BoxError> {
+    ///         Ok(Token(wire))
+    ///     }
+    /// }
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<String, durable::BoxError> {
+    ///     let token = ctx
+    ///         .wait_for_callback::<Token, _, _>(|_step_ctx, _callback_id| async { Ok(()) })
+    ///         .name("token")
+    ///         .serdes(TokenSerdes)
+    ///         .await?;
+    ///     Ok(token.0)
+    /// }
+    /// ```
+    ///
+    /// [`PassthroughSerdes`]: crate::PassthroughSerdes
     pub fn serdes<S2>(self, serdes: S2) -> WaitForCallbackBuilder<O, F, Fut, S2>
     where
         S2: Serdes<O>,
@@ -499,7 +561,7 @@ where
 
 impl<O, F, Fut, S> WaitForCallbackBuilder<O, F, Fut, S>
 where
-    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    O: Send + 'static,
     F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     S: Serdes<O>,
@@ -606,7 +668,7 @@ where
 
 impl<O, F, Fut, S> IntoFuture for WaitForCallbackBuilder<O, F, Fut, S>
 where
-    O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    O: Send + 'static,
     F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     S: Serdes<O>,

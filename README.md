@@ -624,6 +624,18 @@ let approval: String = ctx
     .await?;
 ```
 
+Both builders decode the payload with `JsonSerdes` by default.
+`.serdes(PassthroughSerdes)` returns the raw string the external caller
+sent, as JS does by default:
+
+```rust ignore
+let cb = ctx.create_callback::<String>().serdes(PassthroughSerdes).await?;
+let raw: String = cb.result().await?;
+```
+
+`wait_for_callback` records the raw payload as its result and applies the
+serdes after it, once per invocation that reads the result.
+
 Both builders take `.timeout(...)` and `.heartbeat(...)`.
 `wait_for_callback` also takes `.submitter_retry(...)`, which retries the
 submitter with the same retry strategy shape a step uses.

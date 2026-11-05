@@ -3286,7 +3286,7 @@ impl DurableContext {
     where
         F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
-        O: DeserializeOwned + Send + 'static,
+        O: Send + 'static,
     {
         let op_id = self.claim_operation_id("wait_for_callback");
         WaitForCallbackBuilder::new_internal(self.clone(), op_id, submitter)

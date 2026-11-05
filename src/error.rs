@@ -1286,8 +1286,10 @@ pub enum CallbackErrorKind {
     /// This is a payload decode failure that the serdes did not mark with
     /// [`RetryableSerdesError`](crate::serdes::RetryableSerdesError); a
     /// marked failure ends the invocation instead. From
-    /// `wait_for_callback`, the wire record has the type
-    /// `Callback.DeserializationFailed`.
+    /// `wait_for_callback`, the outer operation's record has already
+    /// succeeded with the raw payload, and this error is the decode of that
+    /// payload with the operation's serdes. So every invocation that reads
+    /// the record fails the same way.
     #[non_exhaustive]
     DeserializationFailed,
     /// An internal SDK or service error occurred.

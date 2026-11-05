@@ -15,19 +15,14 @@ use std::future::Future;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use tracing::Instrument as _;
 
 use crate::BoxError;
 use crate::context::{DurableContext, StepContext, SubmittedWrite};
 use crate::engine::{CheckpointStatus, OperationId};
-use crate::error::{
-    CallbackError, CallbackErrorKind, ChildContextError, ChildContextErrorKind, OperationError,
-    OperationErrorKind,
-};
+use crate::error::{CallbackError, CallbackErrorKind, OperationError, OperationErrorKind};
 use crate::future::Callback;
-use crate::serdes::{PayloadOrigin, Serdes, SerdesContext};
+use crate::serdes::{PassthroughSerdes, PayloadOrigin, Serdes, SerdesContext};
 use crate::start::StartStep;
 
 /// Wire sub-type for callback operations.
@@ -444,7 +439,7 @@ pub(crate) struct WaitForCallbackExecution<O, F, S> {
 
 impl<O, F, Fut, S> WaitForCallbackExecution<O, F, S>
 where
-    O: DeserializeOwned + Serialize + Send + 'static,
+    O: Send + 'static,
     F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
     S: Serdes<O>,
@@ -453,18 +448,17 @@ where
     ///
     /// Thin generic wrapper: the ONLY code monomorphized per call site.
     /// The replay/checkpoint state machine lives in the non-generic
-    /// [`WfcbCore`] / [`WfcbAfter`] halves (generic over the result type
-    /// `O` only); this wrapper just runs the inner body (whose own
-    /// checkpoint plumbing, callback creation and the submitter step,
-    /// is likewise non-generic) between them.
+    /// [`WfcbCore`] / [`WfcbAfter`] halves, which carry the raw callback
+    /// payload; this wrapper runs the inner body between them, then
+    /// decodes the payload once with the user serdes.
     ///
     /// Tests call it; the SDK builds every operation future with the start
     /// step form (see [`crate::future::DurableFuture::for_start_step`]).
     #[cfg(test)]
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
-        let (core, rest) = self.split();
+        let (core, rest, serdes) = self.split();
         let started = core.start();
-        Self::run(core, rest, started).await
+        Self::run(core, rest, serdes, started).await
     }
 
     /// Runs the operation's start step now, on the caller's task, and
@@ -472,14 +466,14 @@ where
     pub(crate) fn execute_started(
         self,
     ) -> impl Future<Output = Result<O, OperationError>> + Send + 'static {
-        let (core, rest) = self.split();
+        let (core, rest, serdes) = self.split();
         let started = core.start();
-        Self::run(core, rest, started)
+        Self::run(core, rest, serdes, started)
     }
 
     /// Splits the execution into its non-generic core and the inputs of
     /// its body.
-    fn split(self) -> (WfcbCore<O>, WfcbBody<F, S>) {
+    fn split(self) -> (WfcbCore, WfcbBody<F>, S) {
         let Self {
             ctx,
             op_id,
@@ -493,39 +487,77 @@ where
         } = self;
         // The plugin names of the inner callback and submitter step.
         let plugin_names = InnerPluginNames::of(name.as_deref());
-        let core = WfcbCore {
-            ctx,
-            op_id,
-            name,
-            _marker: std::marker::PhantomData,
-        };
+        let core = WfcbCore { ctx, op_id, name };
         let rest = WfcbBody {
             plugin_names,
             timeout,
             heartbeat,
             submitter,
             submitter_retry,
-            serdes,
         };
-        (core, rest)
+        (core, rest, serdes)
     }
 
     /// The rest of the operation after its start step `started`.
+    ///
+    /// The outer context settles with the raw callback payload, live or
+    /// replayed. `serdes` then decodes that payload once, as JS applies
+    /// the user serdes after its child context completes. The user serdes
+    /// is never asked to serialize.
     async fn run(
-        core: WfcbCore<O>,
-        rest: WfcbBody<F, S>,
+        core: WfcbCore,
+        rest: WfcbBody<F>,
+        serdes: S,
         started: Result<StartStep, OperationError>,
     ) -> Result<O, OperationError> {
+        let ctx = core.ctx.clone();
+        let name = core.name.clone();
+        let wire_id = core.op_id.wire().to_owned();
+        let settled = Self::settle_raw(core, rest, started).await?;
+        let serdes_ctx = SerdesContext::new(&wire_id, ctx.execution_arn());
+        let value = deserialize_callback_result(
+            &ctx,
+            name.as_deref(),
+            &serdes,
+            settled.payload,
+            serdes_ctx,
+        )
+        .await?;
+        // A replayed success emits `operation_replayed` only after the user
+        // serdes decoded the recorded payload, so a decode failure never
+        // follows an event that claims the recorded outcome was returned.
+        if let Some(attempt) = settled.replayed_attempt {
+            ctx.emit_operation_replayed(
+                &wire_id,
+                name.as_deref(),
+                "Context",
+                Some(WFCB_SUB_TYPE),
+                attempt,
+            );
+        }
+        Ok(value)
+    }
+
+    /// Runs the outer context to its outcome: the raw callback payload it
+    /// recorded, or its error.
+    async fn settle_raw(
+        core: WfcbCore,
+        rest: WfcbBody<F>,
+        started: Result<StartStep, OperationError>,
+    ) -> Result<WfcbRaw, OperationError> {
         let WfcbBody {
             plugin_names,
             timeout,
             heartbeat,
             submitter,
             submitter_retry,
-            serdes,
         } = rest;
         match core.before(started?).await? {
-            WfcbPrelude::Done(result) => result,
+            WfcbPrelude::Failed(err) => Err(err),
+            WfcbPrelude::Replayed { payload, attempt } => Ok(WfcbRaw {
+                payload,
+                replayed_attempt: Some(attempt),
+            }),
             WfcbPrelude::Run {
                 child_ctx,
                 start,
@@ -536,14 +568,13 @@ where
                 // replay-aware span so a resumed body's log lines are
                 // suppressed while its nested operations replay.
                 let child_span = child_ctx.replay_span();
-                let body_result = run_wfcb_body::<O, _, _, _>(
+                let body_result = run_wfcb_body(
                     child_ctx,
                     plugin_names,
                     timeout,
                     heartbeat,
                     submitter,
                     submitter_retry,
-                    serdes,
                 )
                 .instrument(child_span)
                 .await;
@@ -552,20 +583,35 @@ where
                 // The terminal update below goes through the parent
                 // context, so it is admitted.
                 after.ctx.admission().abandon([after.wire_id.as_str()]);
-                after.settle(start, body_result).await
+                after
+                    .settle(start, body_result)
+                    .await
+                    .map(|payload| WfcbRaw {
+                        payload,
+                        replayed_attempt: None,
+                    })
             }
         }
     }
 }
 
+/// The raw outcome of a `wait_for_callback` outer context, before the user
+/// serdes decodes it.
+struct WfcbRaw {
+    /// The raw callback payload, `"null"` when a replayed record has none.
+    payload: String,
+    /// The recorded attempt when the payload was replayed from a
+    /// `SUCCEEDED` record, `None` when the body ran in this invocation.
+    replayed_attempt: Option<u32>,
+}
+
 /// The inputs of a `wait_for_callback` body.
-struct WfcbBody<F, S> {
+struct WfcbBody<F> {
     plugin_names: InnerPluginNames,
     timeout: Option<Duration>,
     heartbeat: Option<Duration>,
     submitter: F,
     submitter_retry: Option<crate::RetryStrategy>,
-    serdes: S,
 }
 
 /// The names the plugin hooks report for the inner operations of a
@@ -602,23 +648,26 @@ fn wfcb_info(
 }
 
 /// The pre-body half of `wait_for_callback`: task-ownership check, replay
-/// resolution, and the START checkpoint. Generic only over the result type
-/// `O`, no user closure reaches this state machine, so its replay and
-/// checkpoint logic compiles once per result type instead of once per call
-/// site.
-struct WfcbCore<O> {
+/// resolution, and the START checkpoint. Not generic: it carries the raw
+/// callback payload, so its replay and checkpoint logic compiles once.
+struct WfcbCore {
     ctx: DurableContext,
     op_id: OperationId,
     name: Option<String>,
-    _marker: std::marker::PhantomData<fn() -> O>,
 }
 
 /// What [`WfcbCore::before`] decided: the operation is already resolved
 /// from the checkpoint log, or the inner body must run in the prepared
 /// child context.
-enum WfcbPrelude<O> {
-    /// Resolved without running the body (replayed success or failure).
-    Done(Result<O, OperationError>),
+enum WfcbPrelude {
+    /// Resolved without running the body: a replayed failure. Its
+    /// `operation_replayed` event was emitted.
+    Failed(OperationError),
+    /// Resolved without running the body: a replayed success with its
+    /// recorded payload, `"null"` when the record has none, and its
+    /// recorded attempt. Its `operation_replayed` event waits until the
+    /// user serdes decoded the payload.
+    Replayed { payload: String, attempt: u32 },
     /// The body must run in `child_ctx`; `after` settles the outcome.
     Run {
         /// The fresh child context (chained prefix) the body runs in.
@@ -627,23 +676,20 @@ enum WfcbPrelude<O> {
         /// outcome write waits for it. `None` when the record existed.
         start: Option<SubmittedWrite>,
         /// The post-body half that checkpoints the outcome.
-        after: WfcbAfter<O>,
+        after: WfcbAfter,
     },
 }
 
 /// The post-body half of `wait_for_callback`: outcome checkpointing
-/// (`ContextSucceeded` / `ContextFailed`). Generic only over the result type.
-struct WfcbAfter<O> {
+/// (`ContextSucceeded` / `ContextFailed`). Not generic: a success records
+/// the raw callback payload.
+struct WfcbAfter {
     ctx: DurableContext,
     wire_id: String,
     name: Option<String>,
-    _marker: std::marker::PhantomData<fn() -> O>,
 }
 
-impl<O> WfcbCore<O>
-where
-    O: DeserializeOwned + Serialize + Send + 'static,
-{
+impl WfcbCore {
     /// The start step of the outer context (see [`crate::start`]):
     /// admission, task ownership, the replay identity check, and, without
     /// a record, the `START`, queued, then `on_operation_start`, then
@@ -691,7 +737,7 @@ where
     /// Runs everything that follows the start step `started` and precedes
     /// the inner body: the replay path, or the child context of the body.
     /// The body does not wait for a queued `START`: the outcome write does.
-    async fn before(self, started: StartStep) -> Result<WfcbPrelude<O>, OperationError> {
+    async fn before(self, started: StartStep) -> Result<WfcbPrelude, OperationError> {
         let positional_id = self.op_id.positional().to_owned();
         let wire_id = self.op_id.wire().to_owned();
         let Self { ctx, name, .. } = self;
@@ -701,22 +747,17 @@ where
             StartStep::Queued(write) => Some(write),
             StartStep::Recorded(view) => match view.status {
                 CheckpointStatus::Succeeded => {
-                    // WaitForCallback context completed: deserialize the
-                    // result FIRST, then emit `operation_replayed`: a corrupt
-                    // payload surfaces as an error without claiming a
-                    // recorded outcome was returned.
-                    let payload = ctx.checkpoint_result_payload(&positional_id);
-                    let result_str = payload.as_deref().unwrap_or("null");
-                    let value: O = serde_json::from_str(result_str)
-                        .map_err(|e| wfcb_internal_error(&format!("deserialize result: {e}")))?;
-                    ctx.emit_operation_replayed(
-                        &wire_id,
-                        name.as_deref(),
-                        "Context",
-                        Some(WFCB_SUB_TYPE),
-                        view.attempt,
-                    );
-                    return Ok(WfcbPrelude::Done(Ok(value)));
+                    // WaitForCallback context completed: return the recorded
+                    // raw payload. The user serdes decodes it after the
+                    // context settles, so a payload it cannot decode fails
+                    // that decode, not the replay of this record.
+                    let payload = ctx
+                        .checkpoint_result_payload(&positional_id)
+                        .unwrap_or_else(|| "null".to_owned());
+                    return Ok(WfcbPrelude::Replayed {
+                        payload,
+                        attempt: view.attempt,
+                    });
                 }
                 CheckpointStatus::Failed => {
                     // Context failed: classify the error.
@@ -730,11 +771,11 @@ where
                     let wire = ctx
                         .checkpoint_wire_error(&positional_id)
                         .unwrap_or_default();
-                    return Ok(WfcbPrelude::Done(Err(wfcb_failed_error(
+                    return Ok(WfcbPrelude::Failed(wfcb_failed_error(
                         wire,
                         &wire_id,
                         view.status.wire_str(),
-                    ))));
+                    )));
                 }
                 // Started/Pending/Ready: execute/resume. The start step
                 // fired the replay start hook.
@@ -748,22 +789,15 @@ where
         Ok(WfcbPrelude::Run {
             child_ctx,
             start,
-            after: WfcbAfter {
-                ctx,
-                wire_id,
-                name,
-                _marker: std::marker::PhantomData,
-            },
+            after: WfcbAfter { ctx, wire_id, name },
         })
     }
 }
 
-impl<O> WfcbAfter<O>
-where
-    O: DeserializeOwned + Serialize + Send + 'static,
-{
+impl WfcbAfter {
     /// Settles the inner body's outcome: checkpoints `ContextSucceeded` with
-    /// the serialized result, or `ContextFailed` with the classified error.
+    /// the raw callback payload, byte for byte, or `ContextFailed` with the
+    /// classified error.
     ///
     /// The outcome write first waits for `start`, the retained `START`
     /// write. When that write fails, the invocation ends and no outcome is
@@ -771,22 +805,18 @@ where
     async fn settle(
         self,
         start: Option<SubmittedWrite>,
-        body_result: Result<O, OperationError>,
-    ) -> Result<O, OperationError> {
-        let Self {
-            ctx, wire_id, name, ..
-        } = self;
+        body_result: Result<String, OperationError>,
+    ) -> Result<String, OperationError> {
+        let Self { ctx, wire_id, name } = self;
         match body_result {
-            Ok(value) => {
-                // Success: serialize and checkpoint ContextSucceeded.
-                let serialized = serde_json::to_string(&value)
-                    .map_err(|e| wfcb_internal_error(&format!("serialize result: {e}")))?;
+            Ok(raw) => {
+                // Success: checkpoint ContextSucceeded with the raw payload.
                 let mut builder = OperationUpdate::builder()
                     .id(wire_id.clone())
                     .r#type(OperationType::Context)
                     .sub_type(WFCB_SUB_TYPE.to_owned())
                     .action(OperationAction::Succeed)
-                    .payload(serialized.clone());
+                    .payload(raw.clone());
                 if let Some(n) = &name {
                     builder = builder.name(n.clone());
                 }
@@ -815,15 +845,11 @@ where
                 if let Some(plugins) = ctx.plugins() {
                     let info = wfcb_info(&ctx, &wire_id, name.as_deref())
                         .with_status(crate::OperationStatus::Succeeded)
-                        .with_result(Some(serialized.clone()))
+                        .with_result(Some(raw.clone()))
                         .with_replay(false);
                     crate::plugin::operation_ended(plugins, &info);
                 }
-
-                // Round-trip deserialize for consistency.
-                let out: O = serde_json::from_str(&serialized)
-                    .map_err(|e| wfcb_internal_error(&format!("deserialize result: {e}")))?;
-                Ok(out)
+                Ok(raw)
             }
             Err(err) => {
                 // Failure: checkpoint ContextFailed.
@@ -880,26 +906,25 @@ where
 /// await result.
 ///
 /// The submitter is executed as a proper step operation (producing
-/// `StepStarted`/`StepSucceeded`/`StepFailed` checkpoint events).
-async fn run_wfcb_body<O, F, Fut, S>(
+/// `StepStarted`/`StepSucceeded`/`StepFailed` checkpoint events). The body
+/// returns the raw callback payload: the inner callback decodes it with
+/// [`PassthroughSerdes`], and the caller applies the user serdes once the
+/// outer context has recorded it.
+async fn run_wfcb_body<F, Fut>(
     child_ctx: DurableContext,
     plugin_names: InnerPluginNames,
     timeout: Option<Duration>,
     heartbeat: Option<Duration>,
     submitter: F,
     submitter_retry: Option<crate::RetryStrategy>,
-    serdes: S,
-) -> Result<O, OperationError>
+) -> Result<String, OperationError>
 where
-    O: Send + 'static,
     F: FnOnce(StepContext, String) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
-    S: Serdes<O>,
 {
-    // Step 1: create the inner callback (no name, per wire spec). The per-op
-    // serdes flows through to the inner callback's decode so a serdes set on
-    // wait_for_callback actually reaches the delivered payload.
-    let cb_exec: CreateCallbackExecution<O, S> = CreateCallbackExecution {
+    // Step 1: create the inner callback (no name, per wire spec). It reads
+    // the payload as the raw string the external caller sent.
+    let cb_exec: CreateCallbackExecution<String, PassthroughSerdes> = CreateCallbackExecution {
         ctx: child_ctx.clone(),
         op_id: child_ctx.mint_id(),
         name: None,
@@ -907,7 +932,7 @@ where
         heartbeat,
         sub_type: crate::OperationSubType::CALLBACK,
         plugin_name: plugin_names.callback,
-        serdes,
+        serdes: PassthroughSerdes,
         _marker: std::marker::PhantomData,
     };
     let cb = cb_exec.execute().await?;
@@ -1250,15 +1275,6 @@ fn missing_callback_id_error(wire_id: &str, status: &str) -> OperationError {
     .with_operation(wire_id, status)
 }
 
-/// Creates a wait-for-callback internal error; the message becomes the
-/// source frame, keeping the kind a pure classification.
-fn wfcb_internal_error(msg: &str) -> OperationError {
-    OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
-        ChildContextErrorKind::Internal,
-        Some(msg.to_owned().into()),
-    )))
-}
-
 #[cfg(test)]
 // Tests deliberately spawn foreign (unblessed) tasks to exercise runtime
 // behavior; production spawning is confined to the src/task.rs gateway.
@@ -1267,6 +1283,9 @@ mod tests {
     use super::*;
     use crate::client::InMemoryExecutionClient;
     use crate::engine::{CheckpointLog, CheckpointRecord};
+    use crate::error::{ChildContextError, ChildContextErrorKind};
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
     use std::sync::Arc;
 
     /// Helper: create a context with a preloaded checkpoint log.
@@ -2694,45 +2713,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wfcb_per_op_serdes_threads_to_inner_decode() {
-        // A serdes set on wait_for_callback must reach the inner callback's
-        // decode of the delivered payload. The MARK:-prefixed payload is not
-        // valid JSON, so a correct result proves the per-op serdes was
-        // threaded through to the inner decode (the Go non-wiring quirk is
-        // deliberately not replicated).
-        let wfcb_wire = crate::engine::compute_wire_id_public("1");
-        let cb_wire = crate::engine::compute_wire_id_public("1-1");
-        let step_wire = crate::engine::compute_wire_id_public("1-2");
-
-        let ctx = ctx_with_log(vec![
-            // WaitForCallback context: Started (non-terminal, fall through).
-            callback_record(
-                &wfcb_wire,
-                CheckpointStatus::Started,
-                None,
-                None,
-                None,
-                None,
-            ),
-            // Inner callback: Succeeded with a non-JSON marker payload.
-            callback_record(
-                &cb_wire,
-                CheckpointStatus::Succeeded,
-                Some(r#"MARK:"wfcb""#),
-                None,
-                None,
-                Some("cb-wfcb"),
-            ),
-            // Submitter step: Succeeded (replay, not re-invoked).
-            callback_record(
-                &step_wire,
-                CheckpointStatus::Succeeded,
-                Some("null"),
-                None,
-                None,
-                None,
-            ),
-        ]);
+    async fn wfcb_per_op_serdes_decodes_raw_payload() {
+        // A serdes set on wait_for_callback decodes the raw payload the
+        // outer context returns. The MARK:-prefixed payload is not valid
+        // JSON, so a correct result proves the per-op serdes decoded it
+        // (the Go non-wiring quirk is deliberately not replicated).
+        let ctx = ctx_with_log(wfcb_settled_inner(r#"MARK:"wfcb""#));
         let op_id = ctx.mint_id();
         let exec = WaitForCallbackExecution::<String, _, _> {
             ctx: ctx.clone(),
@@ -2748,8 +2734,341 @@ mod tests {
         let result = exec
             .execute()
             .await
-            .expect("wfcb should decode via threaded serdes");
+            .expect("wfcb should decode via its serdes");
         assert_eq!(result, "wfcb");
+    }
+
+    /// The records of a `wait_for_callback` whose body resumes: the outer
+    /// context STARTED, the inner callback SUCCEEDED with `payload`, and the
+    /// submitter step SUCCEEDED.
+    fn wfcb_settled_inner(payload: &str) -> Vec<(String, CheckpointRecord)> {
+        let wfcb_wire = crate::engine::compute_wire_id_public("1");
+        let cb_wire = crate::engine::compute_wire_id_public("1-1");
+        let step_wire = crate::engine::compute_wire_id_public("1-2");
+        vec![
+            callback_record(
+                &wfcb_wire,
+                CheckpointStatus::Started,
+                None,
+                None,
+                None,
+                None,
+            ),
+            callback_record(
+                &cb_wire,
+                CheckpointStatus::Succeeded,
+                Some(payload),
+                None,
+                None,
+                Some("cb-wfcb"),
+            ),
+            callback_record(
+                &step_wire,
+                CheckpointStatus::Succeeded,
+                Some("null"),
+                None,
+                None,
+                None,
+            ),
+        ]
+    }
+
+    /// A context over `records` and the in-memory client it checkpoints to.
+    fn ctx_and_client_with_log(
+        records: Vec<(String, CheckpointRecord)>,
+    ) -> (DurableContext, Arc<InMemoryExecutionClient>) {
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:aws:lambda:us-east-1:123:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(records)),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token-1".to_owned(),
+        );
+        (ctx, client)
+    }
+
+    /// The payloads of the outer `wait_for_callback` SUCCEED updates the
+    /// client received.
+    fn outer_succeed_payloads(client: &InMemoryExecutionClient) -> Vec<Option<String>> {
+        let wfcb_wire = crate::engine::compute_wire_id_public("1");
+        client
+            .recorded_updates()
+            .into_iter()
+            .filter(|u| u.id() == wfcb_wire && *u.action() == OperationAction::Succeed)
+            .map(|u| u.payload().map(ToOwned::to_owned))
+            .collect()
+    }
+
+    /// The calls a [`Counting`] serdes saw.
+    #[derive(Debug, Default)]
+    struct Calls {
+        /// The input of each `deserialize` call, in order.
+        deserialize_inputs: std::sync::Mutex<Vec<String>>,
+        /// The number of `serialize` calls.
+        serializes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Calls {
+        fn deserialize_inputs(&self) -> Vec<String> {
+            self.deserialize_inputs.lock().unwrap().clone()
+        }
+
+        fn serializes(&self) -> usize {
+            self.serializes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A serdes that delegates to `inner` and counts its calls in `calls`.
+    struct Counting<S> {
+        inner: S,
+        calls: Arc<Calls>,
+    }
+
+    impl<S> Counting<S> {
+        fn new(inner: S) -> (Self, Arc<Calls>) {
+            let calls = Arc::new(Calls::default());
+            let serdes = Self {
+                inner,
+                calls: Arc::clone(&calls),
+            };
+            (serdes, calls)
+        }
+    }
+
+    impl<T: Send + 'static, S: Serdes<T>> Serdes<T> for Counting<S> {
+        async fn serialize(&self, value: T, context: SerdesContext) -> Result<String, BoxError> {
+            self.calls
+                .serializes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.serialize(value, context).await
+        }
+
+        async fn deserialize(&self, wire: String, context: SerdesContext) -> Result<T, BoxError> {
+            self.calls
+                .deserialize_inputs
+                .lock()
+                .unwrap()
+                .push(wire.clone());
+            self.inner.deserialize(wire, context).await
+        }
+    }
+
+    /// Runs a live `wait_for_callback` whose inner callback succeeded with
+    /// `payload`, decoded by `serdes`, and returns its result and the outer
+    /// SUCCEED payloads recorded.
+    async fn run_live_wfcb<O, S>(
+        payload: &str,
+        serdes: S,
+    ) -> (Result<O, OperationError>, Vec<Option<String>>)
+    where
+        O: Send + 'static,
+        S: Serdes<O>,
+    {
+        let (ctx, client) = ctx_and_client_with_log(wfcb_settled_inner(payload));
+        let op_id = ctx.mint_id();
+        let exec = WaitForCallbackExecution::<O, _, _> {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("wfcb-raw".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
+            submitter_retry: None,
+            serdes,
+            _marker: std::marker::PhantomData,
+        };
+        let result = exec.execute().await;
+        (result, outer_succeed_payloads(&client))
+    }
+
+    /// Cases C1 and C3: live, the outer context records the inner payload
+    /// byte for byte, and the user serdes decodes it once and never
+    /// serializes.
+    #[tokio::test]
+    async fn wfcb_records_raw_payload_and_decodes_once() {
+        // C1: a JSON payload with `JsonSerdes`.
+        let (serdes, calls) = Counting::new(crate::serdes::JsonSerdes);
+        let (result, recorded) = run_live_wfcb::<String, _>(r#""hi""#, serdes).await;
+        assert_eq!(result.expect("decodes"), "hi");
+        assert_eq!(recorded, [Some(r#""hi""#.to_owned())]);
+        assert_eq!(calls.deserialize_inputs(), [r#""hi""#]);
+        assert_eq!(calls.serializes(), 0);
+
+        // C3: a non-JSON payload with `MarkerSerdes`.
+        let (serdes, calls) = Counting::new(MarkerSerdes);
+        let (result, recorded) = run_live_wfcb::<String, _>(r#"MARK:"wfcb""#, serdes).await;
+        assert_eq!(result.expect("decodes"), "wfcb");
+        assert_eq!(recorded, [Some(r#"MARK:"wfcb""#.to_owned())]);
+        assert_eq!(calls.deserialize_inputs(), [r#"MARK:"wfcb""#]);
+        assert_eq!(calls.serializes(), 0);
+    }
+
+    /// Replays a `wait_for_callback` whose outer record is SUCCEEDED with
+    /// `payload`, decoded by `serdes`.
+    async fn replay_wfcb_succeeded<O, S>(
+        payload: Option<&str>,
+        serdes: S,
+    ) -> Result<O, OperationError>
+    where
+        O: Send + 'static,
+        S: Serdes<O>,
+    {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let ctx = ctx_with_log(vec![callback_record(
+            &wire,
+            CheckpointStatus::Succeeded,
+            payload,
+            None,
+            None,
+            None,
+        )]);
+        let op_id = ctx.mint_id();
+        let exec = WaitForCallbackExecution::<O, _, _> {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("wfcb-replay".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            submitter: |_sc: StepContext, _id: String| async {
+                Err::<(), BoxError>("a replay must not run the submitter".into())
+            },
+            submitter_retry: None,
+            serdes,
+            _marker: std::marker::PhantomData,
+        };
+        exec.execute().await
+    }
+
+    /// Cases C2, C4, C5 and C6: on replay, the user serdes decodes the
+    /// recorded outer payload once, and an absent payload reaches it as
+    /// `"null"`.
+    #[tokio::test]
+    async fn wfcb_replay_applies_user_serdes() {
+        // C2: the record case C3 writes, decoded by `MarkerSerdes`.
+        let (serdes, calls) = Counting::new(MarkerSerdes);
+        let value: String = replay_wfcb_succeeded(Some(r#"MARK:"wfcb""#), serdes)
+            .await
+            .expect("decodes");
+        assert_eq!(value, "wfcb");
+        assert_eq!(calls.deserialize_inputs(), [r#"MARK:"wfcb""#]);
+        assert_eq!(calls.serializes(), 0);
+
+        // C4: the JSON-wrapped raw-string record JavaScript writes without
+        // `defaultCallbackDeserializer`, and Python writes by default, for
+        // the raw payload `hi`.
+        let (serdes, calls) = Counting::new(crate::serdes::JsonSerdes);
+        let value: String = replay_wfcb_succeeded(Some(r#""hi""#), serdes)
+            .await
+            .expect("decodes");
+        assert_eq!(value, "hi");
+        assert_eq!(calls.deserialize_inputs(), [r#""hi""#]);
+        assert_eq!(calls.serializes(), 0);
+
+        // C5: no payload reaches the serdes as `"null"`.
+        let (serdes, calls) = Counting::new(crate::serdes::JsonSerdes);
+        let value: Option<String> = replay_wfcb_succeeded(None, serdes).await.expect("decodes");
+        assert_eq!(value, None);
+        assert_eq!(calls.deserialize_inputs(), ["null"]);
+        assert_eq!(calls.serializes(), 0);
+
+        // C6: `PassthroughSerdes` returns the string `"null"` for it.
+        let value: String = replay_wfcb_succeeded(None, PassthroughSerdes)
+            .await
+            .expect("decodes");
+        assert_eq!(value, "null");
+    }
+
+    /// A user serdes failure marked retryable ends the invocation after the
+    /// outer SUCCEED with the raw payload is recorded.
+    #[tokio::test]
+    async fn wfcb_marked_decode_failure_ends_invocation() {
+        struct MarkedDecodeFailure;
+
+        impl Serdes<String> for MarkedDecodeFailure {
+            fn serialize(
+                &self,
+                value: String,
+                _context: SerdesContext,
+            ) -> impl Future<Output = Result<String, BoxError>> + Send {
+                std::future::ready(Ok(value))
+            }
+
+            fn deserialize(
+                &self,
+                _wire: String,
+                _context: SerdesContext,
+            ) -> impl Future<Output = Result<String, BoxError>> + Send {
+                std::future::ready(Err(
+                    crate::serdes::RetryableSerdesError::new("transient").into()
+                ))
+            }
+        }
+
+        let (ctx, client) = ctx_and_client_with_log(wfcb_settled_inner("approved"));
+        let op_id = ctx.mint_id();
+        let exec = WaitForCallbackExecution::<String, _, _> {
+            ctx: ctx.clone(),
+            op_id,
+            name: Some("wfcb-marked".to_owned()),
+            timeout: None,
+            heartbeat: None,
+            submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
+            submitter_retry: None,
+            serdes: MarkedDecodeFailure,
+            _marker: std::marker::PhantomData,
+        };
+        let signal = Arc::clone(ctx.coordinator());
+        crate::driver::test_support::expect_serdes_fault(
+            ctx.clone(),
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            exec.execute(),
+            "serdes deserialize failed",
+        )
+        .await;
+        assert_eq!(
+            outer_succeed_payloads(&client),
+            [Some("approved".to_owned())]
+        );
+    }
+
+    /// `PassthroughSerdes` on `create_callback` returns the raw payload;
+    /// `JsonSerdes`, which marks no failure, returns the catchable decode
+    /// error for the same record.
+    #[tokio::test]
+    async fn create_callback_passthrough_returns_raw_payload() {
+        async fn read<S: Serdes<String>>(serdes: S) -> Result<String, OperationError> {
+            let wire = crate::engine::compute_wire_id_public("1");
+            let ctx = ctx_with_log(vec![callback_record(
+                &wire,
+                CheckpointStatus::Succeeded,
+                Some("approved"),
+                None,
+                None,
+                Some("cb-raw"),
+            )]);
+            let op_id = ctx.mint_id();
+            let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
+                ctx: ctx.clone(),
+                op_id,
+                name: None,
+                timeout: None,
+                heartbeat: None,
+                sub_type: crate::OperationSubType::CALLBACK,
+                plugin_name: None,
+                serdes,
+                _marker: std::marker::PhantomData,
+            };
+            exec.execute().await?.result().await
+        }
+
+        assert_eq!(read(PassthroughSerdes).await.expect("raw"), "approved");
+        let err = read(crate::serdes::JsonSerdes).await.expect_err("not JSON");
+        assert!(matches!(
+            callback_kind(&err),
+            Some(CallbackErrorKind::DeserializationFailed)
+        ));
     }
 
     /// The `CallbackErrorKind` of `err`, or `None` when it is not a
@@ -2975,11 +3294,10 @@ mod tests {
             "token-1".to_owned(),
         );
         let wire_id = crate::engine::compute_wire_id_public("1");
-        let after: WfcbAfter<String> = WfcbAfter {
+        let after = WfcbAfter {
             ctx,
             wire_id: wire_id.clone(),
             name: None,
-            _marker: std::marker::PhantomData,
         };
         let live = after
             .settle(None, Err(err))
@@ -3979,11 +4297,10 @@ mod start_order_tests {
         }));
         let wire_id = crate::engine::compute_wire_id_public("1");
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let after: WfcbAfter<String> = WfcbAfter {
+        let after = WfcbAfter {
             ctx: ctx.clone(),
             wire_id: wire_id.clone(),
             name: Some("wcb".to_owned()),
-            _marker: std::marker::PhantomData,
         };
         let settle = after.settle(
             Some(crate::context::SubmittedWrite::from_receiver(receiver)),
