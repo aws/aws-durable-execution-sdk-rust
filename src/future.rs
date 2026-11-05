@@ -104,6 +104,39 @@ pub struct DurableFuture<O> {
     /// own task: a lazy invoke or `wait_for_condition`, whose first poll
     /// serializes its input before it can queue its `START`.
     first_poll_start: bool,
+    /// The ownership gate of an operation future: the context whose owner
+    /// may poll it. `None` for a future that executes nothing of its own:
+    /// a spawned handle, a settled callback result, an error future, and a
+    /// combinator until it claims its ID. Boxed, so the gate adds one
+    /// pointer to every future.
+    gate: Option<Box<PollGate>>,
+}
+
+/// The ownership gate of one operation future (see [`DurableFuture`]).
+///
+/// Every poll checks ownership, before the operation checks admission: an
+/// abandoned scope makes the operation pend, so a later check would never
+/// run for a future its owner sent out unpolled. The gate keeps no
+/// identity of an earlier poller, because Tokio may give a new task the ID
+/// of a task that exited, and a cached ID would then admit a task the
+/// invocation does not own. So a future that its owner polled until it
+/// suspended and then moved to such a task fails the execution when that
+/// task resumes it. The check costs the owner comparison and, for a task
+/// other than the owner, one lookup in the set of tasks the SDK started.
+struct PollGate {
+    ctx: DurableContext,
+}
+
+impl PollGate {
+    fn new(ctx: &DurableContext) -> Self {
+        Self { ctx: ctx.clone() }
+    }
+
+    /// Admits the current poll when the calling task or thread owns the
+    /// context. A refused poll has recorded the fatal context usage error.
+    fn admit(&mut self) -> Result<(), OperationError> {
+        self.ctx.enforce_task_ownership()
+    }
 }
 
 /// The start step of a lazy operation, and the builder of its remainder.
@@ -160,6 +193,7 @@ impl<O: Send + 'static> DurableFuture<O> {
             task_cx: crate::task::TaskContext::none(),
             begin: None,
             first_poll_start: false,
+            gate: None,
         }
     }
 
@@ -178,6 +212,7 @@ impl<O: Send + 'static> DurableFuture<O> {
             task_cx,
             begin,
             first_poll_start,
+            gate,
         } = self;
         match claim {
             // An unclaimed combinator stays unclaimed: the mapped future
@@ -206,6 +241,7 @@ impl<O: Send + 'static> DurableFuture<O> {
                         Box::pin(async move { map(rest.await) })
                     })),
                     first_poll_start,
+                    gate,
                 },
                 None => DurableFuture {
                     inner: Box::pin(async move { map(inner.await) }),
@@ -214,6 +250,7 @@ impl<O: Send + 'static> DurableFuture<O> {
                     task_cx,
                     begin: None,
                     first_poll_start,
+                    gate,
                 },
             },
         }
@@ -230,6 +267,7 @@ impl<O: Send + 'static> DurableFuture<O> {
             task_cx: crate::task::TaskContext::none(),
             begin: None,
             first_poll_start: false,
+            gate: None,
         }
     }
 
@@ -244,6 +282,7 @@ impl<O: Send + 'static> DurableFuture<O> {
             let claimed = (claim.run)();
             self.inner = claimed.inner;
             self.task_cx = claimed.task_cx;
+            self.gate = claimed.gate;
         }
     }
 
@@ -288,6 +327,7 @@ impl<O: Send + 'static> DurableFuture<O> {
             fut.await
         });
         future.task_cx = crate::task::TaskContext::current();
+        future.gate = Some(Box::new(PollGate::new(ctx)));
         future
     }
 
@@ -302,12 +342,13 @@ impl<O: Send + 'static> DurableFuture<O> {
     ///
     /// It captures the task context current at the call, as
     /// [`Self::for_operation`] does.
-    pub(crate) fn for_started_operation<F>(fut: F) -> Self
+    pub(crate) fn for_started_operation<F>(ctx: &DurableContext, fut: F) -> Self
     where
         F: Future<Output = Result<O, OperationError>> + Send + 'static,
     {
         let mut future = Self::from_async(fut);
         future.task_cx = crate::task::TaskContext::current();
+        future.gate = Some(Box::new(PollGate::new(ctx)));
         future
     }
 
@@ -322,7 +363,10 @@ impl<O: Send + 'static> DurableFuture<O> {
     /// ([`Self::begin_in_creator_context`]). The start step checks
     /// admission itself before it queues anything, so this adds no
     /// admission gate of its own, unlike [`Self::for_operation`].
-    pub(crate) fn for_start_step<F>(begin: impl FnOnce() -> F + Send + 'static) -> Self
+    pub(crate) fn for_start_step<F>(
+        ctx: &DurableContext,
+        begin: impl FnOnce() -> F + Send + 'static,
+    ) -> Self
     where
         F: Future<Output = Result<O, OperationError>> + Send + 'static,
     {
@@ -334,6 +378,7 @@ impl<O: Send + 'static> DurableFuture<O> {
             begin: Some(Box::new(move || Box::pin(begin()))),
             first_poll_start: false,
             task_cx: crate::task::TaskContext::current(),
+            gate: Some(Box::new(PollGate::new(ctx))),
         }
     }
 
@@ -394,7 +439,10 @@ impl<O: Send + 'static> DurableFuture<O> {
     /// like any other wait. The task is registered with the scopes of `ctx`
     /// (see [`crate::checkpoint_coalescer::Admission`]), so it stops when
     /// one of them closes. Dropping the returned future loses only the
-    /// result: the task keeps running. A panic in the operation resumes on
+    /// result: the task keeps running. A caller that does not own the
+    /// context fails the execution with a context usage error, no task
+    /// starts, and a combinator claims no ID. Otherwise a combinator claims
+    /// its ID here, before its task starts. A panic in the operation resumes on
     /// the task that awaits the handle, with its original payload, and
     /// fails the invocation when nothing awaits it. When no Tokio runtime is
     /// running, the returned future resolves to an error and the operation
@@ -405,10 +453,17 @@ impl<O: Send + 'static> DurableFuture<O> {
     /// coordinator to arm those registrations' refreshes (see
     /// [`crate::coordinator`]).
     pub(crate) fn spawn_blessed(
-        future: Self,
+        mut future: Self,
         ctx: &DurableContext,
         awaited: Option<Arc<AtomicBool>>,
     ) -> Self {
+        // The ownership check runs before a combinator's pending claim, so
+        // a refused `.spawn()` records the error of method `spawn` rather
+        // than the claim's, and the combinator claims no ID.
+        if let Some(refused) = Self::refuse_foreign_spawn(ctx) {
+            return refused;
+        }
+        future.claim_now();
         let coordinator = ctx.coordinator();
         let task_cx = future.task_context();
         match crate::task::spawn_tracked(task_cx.clone(), coordinator, ctx.task_ownership(), future)
@@ -435,14 +490,37 @@ impl<O: Send + 'static> DurableFuture<O> {
         }
     }
 
+    /// Builds the operation future with `build` and spawns it as
+    /// [`Self::spawn_blessed`] describes, for an operation whose `.spawn()`
+    /// runs no start step on the caller's task.
+    ///
+    /// The task-ownership check runs before `build`: building an invoke or
+    /// a `wait_for_condition` future runs its replay identity preflight,
+    /// which records a fatal error on a mismatch, and the first fatal error
+    /// wins. So a caller that does not own the context fails the execution
+    /// with the error of method `spawn`, and `build` is not called.
+    pub(crate) fn spawn_built(
+        ctx: &DurableContext,
+        awaited: Option<Arc<AtomicBool>>,
+        build: impl FnOnce() -> Self,
+    ) -> Self {
+        if let Some(refused) = Self::refuse_foreign_spawn(ctx) {
+            return refused;
+        }
+        Self::spawn_blessed(build(), ctx, awaited)
+    }
+
     /// Starts an operation whose JS form begins inside the call: runs its
     /// start step on the caller's task, then spawns the rest of it.
     ///
-    /// The runtime check runs first: when no Tokio runtime is running, the
-    /// returned future resolves to an error, `start` is not called, and
-    /// nothing is queued. Otherwise `start` builds the operation future
-    /// after it ran the start step (see [`crate::start`]) on this task: the
-    /// admission check, the task-ownership check, and the `START` the
+    /// The task-ownership check runs first: a caller that does not own the
+    /// context fails the execution, `start` is not called, and nothing is
+    /// queued. The runtime check runs next: when no Tokio runtime is
+    /// running, the returned future resolves to an error, `start` is not
+    /// called, and nothing is queued. Otherwise `start` builds the
+    /// operation future after it ran the start step (see [`crate::start`])
+    /// on this task: the admission check, the task-ownership check, and the
+    /// `START` the
     /// operation's record requires, with the start hook its JS order fires
     /// at the call. Then the future runs on its own task, as
     /// [`Self::spawn_blessed`] describes.
@@ -451,22 +529,42 @@ impl<O: Send + 'static> DurableFuture<O> {
         awaited: Option<Arc<AtomicBool>>,
         start: impl FnOnce() -> Self,
     ) -> Self {
+        // The task-ownership check runs first: before the runtime check, so
+        // a thread with no runtime is refused rather than told it has none,
+        // and before the admission check and the builder's replay identity
+        // preflight, so a caller that does not own the context fails the
+        // execution in an abandoned owner and when the record also
+        // contradicts the operation.
+        if let Some(refused) = Self::refuse_foreign_spawn(ctx) {
+            return refused;
+        }
         if let Err(no_runtime) = crate::task::ensure_runtime() {
             return Self::from_async(async move {
                 Err(crate::task::NoRuntime::operation_error(no_runtime))
             });
         }
-        // The task-ownership check runs before the builder's replay
-        // identity preflight, as in the start step: an unblessed caller
-        // gets the task-ownership error even when the record also
-        // contradicts the operation. An abandoned owner skips it, so its
-        // handle stays refused.
-        if ctx.admission().admits(ctx.owners())
-            && let Err(err) = ctx.enforce_task_ownership()
-        {
-            return Self::from_async(async move { Err(err) });
-        }
         Self::spawn_blessed(start(), ctx, awaited)
+    }
+
+    /// Refuses a `.spawn()` from a task or thread that does not own `ctx`:
+    /// records the fatal context usage error for method `spawn` and returns
+    /// a handle that resolves to an error. No task starts, so the operation
+    /// takes no permit and its body never runs. Returns `None` for a caller
+    /// that owns the context.
+    fn refuse_foreign_spawn(ctx: &DurableContext) -> Option<Self> {
+        let reason = ctx.task_ownership().check_current_task().err()?;
+        ctx.coordinator().record_fatal(
+            "Error".to_owned(),
+            crate::context::foreign_caller_message("spawn"),
+        );
+        Some(Self::from_async(async move {
+            Err(OperationError::from_kind(
+                crate::error::OperationErrorKind::Step(crate::error::StepError::new(
+                    crate::error::StepErrorKind::ExecutionFailed,
+                    Some(reason.into()),
+                )),
+            ))
+        }))
     }
 }
 
@@ -476,6 +574,13 @@ impl<O: Send + 'static> Future for DurableFuture<O> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // The first poll of a combinator claims its operation ID.
         self.claim_now();
+        // Every poll checks ownership before the operation checks
+        // admission.
+        if let Some(gate) = self.gate.as_mut()
+            && let Err(refused) = gate.admit()
+        {
+            return Poll::Ready(Err(refused));
+        }
         // The first poll of a lazy operation runs its start step, unless a
         // combinator ran it already.
         self.begin_now();
@@ -810,7 +915,9 @@ impl<O: Send + 'static> Callback<O> {
     ///
     /// Awaiting the future yields `Result<O, OperationError>`: an
     /// [`OperationError`] is returned if the callback failed (timeout,
-    /// heartbeat timeout, or external failure).
+    /// heartbeat timeout, or external failure). Awaiting the result of a
+    /// pending callback on a task or thread that does not own the context
+    /// fails the execution with a context usage error.
     ///
     /// # Examples
     ///
@@ -871,7 +978,9 @@ impl<O: Send + 'static> Callback<O> {
     ///
     /// For a pending callback, when no Tokio runtime is running, the
     /// returned future resolves to an error. A settled callback needs no
-    /// runtime.
+    /// runtime. For a pending callback, a call on a task or thread that
+    /// does not own the context fails the execution with a context usage
+    /// error.
     ///
     /// # Examples
     ///
@@ -925,6 +1034,10 @@ impl<O: Send + 'static> Callback<O> {
     ) -> DurableFuture<O> {
         let gate = ctx.clone();
         DurableFuture::for_operation(&gate, async move {
+            // Execution entry: a task or thread that does not own the
+            // context fails the execution. A settled result executes
+            // nothing, so it is not checked.
+            ctx.enforce_task_ownership()?;
             ctx.wait_for_record(&wire_id, |status| {
                 !matches!(
                     status,
@@ -1576,6 +1689,44 @@ mod tests {
         });
     }
 
+    /// Tokio may give a new task the ID of a task that exited, and the
+    /// exited task's blessing is gone. So a raw task whose ID matches a
+    /// poller that passed earlier must still be refused: the gate checks
+    /// ownership on every poll. The test gives one task the identity the
+    /// gate admitted: it blesses the task, passes the gate, then removes
+    /// the blessing, as the task gateway does when a blessed task exits,
+    /// and polls the same gate again with that task ID. A gate that cached
+    /// the ID of its last passing poller would admit the second poll.
+    #[test]
+    fn poll_gate_refuses_raw_task_with_reused_identity() {
+        let ctx = test_ctx_with_client();
+        let mut gate = PollGate::new(&ctx);
+        let ownership = Arc::clone(ctx.task_ownership());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (first, second) = runtime
+            .block_on(async move {
+                tokio::spawn(async move {
+                    let id = tokio::task::id();
+                    ownership.bless_task(id);
+                    let first = gate.admit().is_ok();
+                    ownership.unbless_task(id);
+                    let second = gate.admit().is_ok();
+                    (first, second)
+                })
+                .await
+            })
+            .unwrap();
+        assert!(first, "the blessed task was refused");
+        assert!(!second, "a raw task with a reused task ID was admitted");
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert_eq!(
+            fatal.error_message,
+            crate::context::foreign_caller_message("execute")
+        );
+    }
+
     /// Test 16: a combinator future claims one ID however often
     /// `claim_now` runs, and its first poll after a claim claims nothing.
     #[tokio::test]
@@ -1639,23 +1790,23 @@ mod tests {
     #[tokio::test]
     async fn spawn_outside_runtime_returns_error() {
         let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
-        let ctx = DurableContext::new_root_with_client(
-            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
-            lambda_runtime::Context::default(),
-            Arc::new(CheckpointLog::empty()),
-            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
-            "token0".to_owned(),
-        );
         let ran = Arc::new(AtomicBool::new(false));
-        let thread_ctx = ctx.clone();
+        let thread_client = Arc::clone(&client);
         let thread_ran = Arc::clone(&ran);
+        // The context is built on the polling thread, so that thread owns it.
         let polled = crate::task::test_support::poll_once_without_runtime(move || {
-            thread_ctx
-                .step(move |_| async move {
-                    thread_ran.store(true, Ordering::SeqCst);
-                    Ok(1_i32)
-                })
-                .spawn()
+            DurableContext::new_root_with_client(
+                "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(CheckpointLog::empty()),
+                thread_client as Arc<dyn crate::client::ExecutionClient>,
+                "token0".to_owned(),
+            )
+            .step(move |_| async move {
+                thread_ran.store(true, Ordering::SeqCst);
+                Ok(1_i32)
+            })
+            .spawn()
         });
         let Poll::Ready(Err(err)) = polled else {
             panic!("expected an immediate error, got {polled:?}");

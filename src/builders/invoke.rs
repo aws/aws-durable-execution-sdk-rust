@@ -241,9 +241,14 @@ where
     ///
     /// Unlike `.spawn()` of a step, a wait or a child context, `.spawn()`
     /// of an invoke runs no start step on the caller's task: the spawned task
-    /// runs the whole operation, including the task-ownership check and
-    /// the `START`, so that `START` can follow updates the caller sends
-    /// after `.spawn()` returns.
+    /// runs the whole operation, including the `START`, so that `START` can
+    /// follow updates the caller sends after `.spawn()` returns. The
+    /// caller's task ownership is checked before the operation is built,
+    /// not on the spawned task, so that error wins over a replay mismatch:
+    /// a `.spawn()` from a task or thread that does not own the context
+    /// fails the execution with a context usage error, returns a handle
+    /// that resolves to the task-ownership error, queues no `START` and
+    /// runs no body.
     ///
     /// # Errors
     ///

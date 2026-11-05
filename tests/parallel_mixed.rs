@@ -1628,7 +1628,7 @@ async fn spawn_outside_runtime_returns_error() {
                     OperationErrorKind::Step(step)
                         if matches!(step.kind(), StepErrorKind::ExecutionFailed { .. })
                 ),
-                "the error is the no-runtime error: {err:?}"
+                "the error is the ownership error: {err:?}"
             );
             let mut chain = vec![err.to_string()];
             let mut source = std::error::Error::source(&err);
@@ -1642,12 +1642,21 @@ async fn spawn_outside_runtime_returns_error() {
         }
     })
     .await;
-    assert!(result.is_success(), "the execution succeeds: {result}");
+    // The thread does not own the context, so the call fails the execution
+    // before the runtime check.
+    assert!(result.is_failure(), "the execution fails: {result}");
+    assert!(
+        result
+            .error_message()
+            .is_some_and(|m| m.starts_with("context usage error in \"spawn\"")),
+        "the execution fails with a context usage error: {:?}",
+        result.error_message()
+    );
     let seen = entries(&seen);
     assert_eq!(seen.len(), 1, "one invocation ran: {seen:?}");
     let message = seen.first().cloned().flatten().expect("an error message");
     assert!(
-        message.contains("no Tokio runtime is running"),
+        message.contains("does not own the context"),
         "the message names the cause: {message}"
     );
     assert!(

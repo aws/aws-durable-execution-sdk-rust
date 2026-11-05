@@ -4181,8 +4181,9 @@ mod coordinator_tests {
         );
     }
 
-    /// `spawn_result()` on a thread with no Tokio runtime resolves to the
-    /// error `.spawn()` returns.
+    /// `spawn_result()` on another thread, which does not own the context,
+    /// resolves to an error and fails the execution with a context usage
+    /// error.
     #[tokio::test]
     async fn spawn_result_outside_runtime_returns_error() {
         let client = Arc::new(ScriptedClient::new(|updates, _| {
@@ -4204,8 +4205,18 @@ mod coordinator_tests {
             unreachable!("expected an immediate error, got {polled:?}");
         };
         assert!(
-            format!("{err:#}").contains(crate::task::NO_RUNTIME_MESSAGE),
+            format!("{err:#}").contains("does not own the context"),
             "unexpected error: {err:#}"
+        );
+        let fatal = ctx
+            .coordinator()
+            .fatal_error()
+            .expect("a fatal error is recorded");
+        assert!(
+            fatal
+                .error_message
+                .starts_with("context usage error in \"spawn\""),
+            "unexpected fatal error: {fatal:?}"
         );
     }
 

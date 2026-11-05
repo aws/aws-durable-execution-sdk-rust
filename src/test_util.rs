@@ -8517,7 +8517,7 @@ mod tests {
         );
         let msg = result.error_message().unwrap_or_default();
         assert!(
-            msg.contains("Use .spawn()"),
+            msg.starts_with("context usage error") && msg.contains(".spawn()"),
             "ownership rejection should carry the production guidance: {msg}"
         );
     }

@@ -2037,12 +2037,11 @@ mod tests {
     }
 
     /// On a task the SDK did not bless, as hook work runs on, an operation
-    /// claims its ID with no error, because the ownership check runs only
-    /// when the operation is awaited. So the handler's next operation gets
-    /// a different ID. The same call from a hook future, which `HookRun`
-    /// polls under the plugin guard, records the context usage error.
+    /// claim records the ownership error and still claims the ID. The same
+    /// call from a hook future, which `HookRun` polls under the plugin
+    /// guard, records the plugin-code context usage error instead.
     #[tokio::test]
-    async fn unguarded_plugin_task_claims_an_id_without_an_error() {
+    async fn unguarded_plugin_task_claim_is_refused() {
         let ctx = crate::DurableContext::test_context();
         let task_ctx = ctx.clone();
         crate::task::spawn_plugin_work(async move {
@@ -2051,7 +2050,11 @@ mod tests {
         .expect("a runtime is running")
         .await
         .expect("the task finished");
-        assert!(ctx.coordinator().fatal_error().is_none());
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert_eq!(
+            fatal.error_message,
+            crate::context::foreign_caller_message("step")
+        );
         let fresh = crate::DurableContext::test_context();
         assert_ne!(
             ctx.claim_operation_id("step").positional(),

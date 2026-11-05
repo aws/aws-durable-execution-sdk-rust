@@ -973,8 +973,10 @@ impl DurableContext {
     /// The SDK records which body it is polling in [`ACTIVE_BODY`]. The
     /// check compares that body with this context. The outcomes are:
     ///
-    /// - No body is active: the check does nothing.
-    /// - The body of this context is active: the claim passes.
+    /// - No body is active, or the body of this context is active: the
+    ///   caller must own the context (see [`TaskOwnership`]). A task or
+    ///   thread that does not own it fails the execution with a context
+    ///   usage error.
     /// - The body of another context is active: the execution fails with a
     ///   context usage error that names both contexts.
     /// - A step body or a `wait_for_condition` check is active: the
@@ -996,6 +998,8 @@ impl DurableContext {
     /// claims (inside `wait_for_callback`) call [`Self::mint_id`], because
     /// they run on the composite's context while a child body may be
     /// active.
+    ///
+    /// [`TaskOwnership`]: crate::driver::TaskOwnership
     pub(crate) fn claim_operation_id(&self, method: &'static str) -> OperationId {
         let message = ACTIVE_BODY
             .try_with(|active| match active {
@@ -1027,6 +1031,13 @@ impl DurableContext {
             })
             .ok()
             .flatten();
+        let message = message.or_else(|| {
+            self.inner
+                .task_ownership
+                .check_current_task()
+                .err()
+                .map(|_| foreign_caller_message(method))
+        });
         if let Some(message) = message {
             self.coordinator().record_fatal("Error".to_owned(), message);
         }
@@ -1387,6 +1398,8 @@ impl DurableContext {
             .task_ownership
             .check_current_task()
             .map_err(|msg| {
+                self.coordinator()
+                    .record_fatal("Error".to_owned(), foreign_caller_message("execute"));
                 OperationError::from_kind(OperationErrorKind::Step(StepError::new(
                     StepErrorKind::ExecutionFailed,
                     Some(msg.into()),
@@ -4265,13 +4278,71 @@ mod tests {
         assert_eq!(sender.send(7), Err(7));
     }
 
-    /// A claim outside any `run_body` scope does no check.
+    /// A claim outside any `run_body` scope checks only ownership, and the
+    /// owner thread passes it.
     #[test]
     fn claim_without_active_body_records_nothing() {
         let ctx = DurableContext::test_context();
         let id = ctx.claim_operation_id("step");
         assert_eq!(id.positional(), "1");
         assert!(ctx.coordinator().fatal_error().is_none());
+    }
+
+    /// A claim from a thread that does not own the context, with no body
+    /// active, records the ownership error and still claims the next ID.
+    /// The owner's claim before it records nothing.
+    #[test]
+    fn claim_from_foreign_thread_records_fatal() {
+        let ctx = DurableContext::test_context();
+        assert_eq!(ctx.claim_operation_id("step").positional(), "1");
+        assert!(ctx.coordinator().fatal_error().is_none());
+
+        let id = std::thread::scope(|scope| {
+            scope
+                .spawn(|| ctx.claim_operation_id("step"))
+                .join()
+                .expect("the claim does not panic")
+        });
+        assert_eq!(id.positional(), "2");
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert_eq!(fatal.error_type, "Error");
+        assert_eq!(fatal.error_message, foreign_caller_message("step"));
+    }
+
+    /// `enforce_task_ownership` passes for the owner thread and records
+    /// nothing. From a thread that does not own the context it returns an
+    /// `ExecutionFailed` step error and records the ownership error.
+    #[test]
+    fn enforce_task_ownership_refuses_foreign_thread() {
+        let ctx = DurableContext::test_context();
+        assert!(ctx.enforce_task_ownership().is_ok());
+        assert!(ctx.coordinator().fatal_error().is_none());
+
+        let result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| ctx.enforce_task_ownership())
+                .join()
+                .expect("the check does not panic")
+        });
+        let err = result.expect_err("a foreign thread is refused");
+        assert!(matches!(
+            err.kind(),
+            OperationErrorKind::Step(step) if matches!(step.kind(), StepErrorKind::ExecutionFailed)
+        ));
+        // The `StepError` is the operation error's source, and the ownership
+        // message is the step error's source.
+        let source = std::error::Error::source(&err)
+            .and_then(std::error::Error::source)
+            .map(ToString::to_string);
+        assert!(
+            source
+                .as_deref()
+                .is_some_and(|msg| msg.contains("which does not own the context")),
+            "unexpected source: {source:?}"
+        );
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert_eq!(fatal.error_type, "Error");
+        assert_eq!(fatal.error_message, foreign_caller_message("execute"));
     }
 
     /// A claim on the context whose body is active passes.
@@ -4284,6 +4355,26 @@ mod tests {
         .await;
         assert_eq!(id.positional(), "1");
         assert!(ctx.coordinator().fatal_error().is_none());
+    }
+
+    /// A claim on the context whose body is active, made by a raw task that
+    /// does not own the context, still runs the ownership check: the
+    /// matching body does not authorize the caller. It records the
+    /// ownership error and still claims the next ID.
+    #[tokio::test]
+    async fn claim_in_own_body_on_raw_task_records_fatal() {
+        let ctx = DurableContext::test_context();
+        assert_eq!(ctx.claim_operation_id("step").positional(), "1");
+        let foreign = ctx.clone();
+        let id = tokio::spawn(run_body(ActiveBody::Context(String::new()), async move {
+            foreign.claim_operation_id("step")
+        }))
+        .await
+        .expect("the claim does not panic");
+        assert_eq!(id.positional(), "2");
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert_eq!(fatal.error_type, "Error");
+        assert_eq!(fatal.error_message, foreign_caller_message("step"));
     }
 
     /// A claim on another context than the active body records message A
@@ -7067,12 +7158,17 @@ mod tests {
     #[test]
     fn operation_without_runtime_returns_spawn_error() {
         let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
-        let ctx = admission_root(&client, None);
-        let signal = Arc::clone(ctx.coordinator());
+        let thread_client = Arc::clone(&client);
+        // The context is built on the polling thread, so that thread owns it.
         let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
-            ctx.step(|_| async { Ok(1_u32) }).into_future().await
+            let ctx = admission_root(&thread_client, None);
+            let signal = Arc::clone(ctx.coordinator());
+            (
+                ctx.step(|_| async { Ok(1_u32) }).into_future().await,
+                signal,
+            )
         });
-        let std::task::Poll::Ready(Err(err)) = polled else {
+        let std::task::Poll::Ready((Err(err), signal)) = polled else {
             unreachable!("expected an immediate error, got {polled:?}");
         };
         let spawn_error = crate::task::NoRuntime::operation_error(crate::task::NoRuntime);
@@ -7114,22 +7210,26 @@ mod tests {
             start_timestamp: None,
             end_timestamp: None,
         };
-        let ctx = DurableContext::new_root_with_client_and_defaults(
-            "arn:test".to_owned(),
-            lambda_runtime::Context::default(),
-            Arc::new(CheckpointLog::from_records(vec![(wire, record)])),
-            Arc::clone(&client) as Arc<dyn ExecutionClient>,
-            "token-0".to_owned(),
-            None,
-            None,
-        );
-        let signal = Arc::clone(ctx.coordinator());
+        let thread_client = Arc::clone(&client);
+        // The context is built on the polling thread, so that thread owns it.
         let polled = crate::task::test_support::poll_once_without_runtime(move || async move {
-            ctx.run_in_child_context(|_child| async { Err::<u32, BoxError>("boom".into()) })
+            let ctx = DurableContext::new_root_with_client_and_defaults(
+                "arn:test".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(CheckpointLog::from_records(vec![(wire, record)])),
+                thread_client as Arc<dyn ExecutionClient>,
+                "token-0".to_owned(),
+                None,
+                None,
+            );
+            let signal = Arc::clone(ctx.coordinator());
+            let outcome = ctx
+                .run_in_child_context(|_child| async { Err::<u32, BoxError>("boom".into()) })
                 .into_future()
-                .await
+                .await;
+            (outcome, signal)
         });
-        let std::task::Poll::Ready(Err(err)) = polled else {
+        let std::task::Poll::Ready((Err(err), signal)) = polled else {
             unreachable!("expected an immediate error, got {polled:?}");
         };
         let spawn_error = crate::task::NoRuntime::operation_error(crate::task::NoRuntime);
@@ -8201,4 +8301,14 @@ mod write_order_tests {
             .expect("B is written");
         assert_eq!(*client.0.lock().unwrap(), ["B"]);
     }
+}
+
+/// The context usage error for an operation claimed, spawned or executed on
+/// a task or thread that does not own the context.
+pub(crate) fn foreign_caller_message(method: &str) -> String {
+    format!(
+        "context usage error in \"{method}\": the operation was called on a task or thread \
+         that does not own the context. Start concurrent operations with .spawn(), map, \
+         parallel or a combinator, not with tokio::spawn or std::thread::spawn."
+    )
 }

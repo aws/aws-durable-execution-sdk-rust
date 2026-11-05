@@ -1032,7 +1032,8 @@ async fn spawn_from_unblessed_task_is_rejected_before_start() {
         }
     })
     .await;
-    assert_eq!(status, "SUCCEEDED");
+    // The refused `.spawn()` fails the execution with a context usage error.
+    assert_eq!(status, "FAILED");
     let entries = log.entries();
     assert!(
         entries

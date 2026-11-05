@@ -224,11 +224,12 @@ operation inside the call, as JS does. Before the call returns, the SDK runs
 the task-ownership check on the calling task and, when the operation's state
 requires a `START`, admits that `START` to the write order. So the `START`
 reaches the service before every update the caller sends afterwards. A
-`.spawn()` from a task the SDK did not start returns a handle that resolves
-to the task-ownership error and queues nothing. A plugin start hook that JS
-fires when it queues the `START`, and the replay start hook of a record that
-resumes work, also fire before the call returns; `on_attempt_start` and the
-body run on the spawned task. `.spawn()` of an `invoke`, a
+`.spawn()` from a task or thread that does not own the context fails the
+execution with a context usage error, returns a handle that resolves to the
+task-ownership error, queues no `START` and runs no body. A plugin start hook
+that JS fires when it queues the `START`, and the replay start hook of a
+record that resumes work, also fire before the call returns;
+`on_attempt_start` and the body run on the spawned task. `.spawn()` of an `invoke`, a
 `wait_for_condition` and a combinator starts the whole operation on the
 spawned task instead.
 
@@ -315,7 +316,9 @@ between operations lets the invocation suspend. `tokio::task::yield_now()`
 outside a step body is such an await too: while an operation waits and no
 other SDK work runs, the invocation suspends at it. When an execution
 suspends, the SDK drops your handler future, so never make correctness
-between operations depend on `Drop` order.
+between operations depend on `Drop` order. An operation claimed, spawned or
+awaited on a task or thread that does not own the context, plugin hook work
+included, fails the execution with a context usage error.
 
 ### Logging
 

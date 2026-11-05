@@ -74,15 +74,17 @@ macro_rules! preflight_identity {
 
 /// The body shared by every builder's `.spawn()` terminal.
 ///
-/// Builds the operation future with the builder's lazy terminal
-/// (`into_future`, which runs the identity preflight and the admission
-/// check). For a combinator it then runs the pending claim
+/// Refuses a caller that does not own the context first, through
+/// [`DurableFuture::spawn_built`](crate::future::DurableFuture), so the
+/// refusal wins over a replay mismatch. Then it builds the operation future
+/// with the builder's lazy terminal (`into_future`, which runs the identity
+/// preflight and the admission check) and starts it on its own task
+/// through [`DurableFuture::spawn_blessed`](crate::future::DurableFuture).
+/// That runs, for a combinator, the pending claim
 /// ([`DurableFuture::claim_now`](crate::future::DurableFuture)), so the
 /// combinator claims its ID and runs the identity preflight at the
-/// `.spawn()` call. Then it starts the future on its own task through
-/// [`DurableFuture::spawn_blessed`](crate::future::DurableFuture), which
-/// blesses the task with the builder context's ownership handle and
-/// registers it with the context's scopes. Dropping the returned handle
+/// `.spawn()` call, then blesses the task with the builder context's
+/// ownership handle and registers it with the context's scopes. Dropping the returned handle
 /// loses only the result.
 ///
 /// The builder must have a `ctx: DurableContext` field and implement
@@ -104,8 +106,9 @@ macro_rules! preflight_identity {
 /// The `started`, `started_awaited` and `started_batch` arms are for the
 /// operations whose JS form begins inside the call: step, wait, child
 /// context, map, parallel, `parallel_mixed`, `create_callback`,
-/// `wait_for_callback` and `with_retry`. They check for a runtime first,
-/// then run the operation's start step (see [`crate::start`]) on the
+/// `wait_for_callback` and `with_retry`. They refuse a caller that does
+/// not own the context first, then check for a runtime, then run the
+/// operation's start step (see [`crate::start`]) on the
 /// caller's task through the builder's `started_future()` (or
 /// `started_batch_future()`), and spawn the rest through
 /// [`DurableFuture::spawn_started`](crate::future::DurableFuture). So the
@@ -116,15 +119,14 @@ macro_rules! spawn_terminal {
     ($builder:expr) => {{
         let builder = $builder;
         let ctx = builder.ctx.clone();
-        let mut future = ::std::future::IntoFuture::into_future(builder);
-        future.claim_now();
-        $crate::future::DurableFuture::spawn_blessed(future, &ctx, None)
+        $crate::future::DurableFuture::spawn_built(&ctx, None, move || {
+            ::std::future::IntoFuture::into_future(builder)
+        })
     }};
     ($builder:expr, batch_future) => {{
         let builder = $builder;
         let ctx = builder.ctx.clone();
-        let future = builder.batch_future();
-        $crate::future::DurableFuture::spawn_blessed(future, &ctx, None)
+        $crate::future::DurableFuture::spawn_built(&ctx, None, move || builder.batch_future())
     }};
     ($builder:expr, started) => {{
         let builder = $builder;
@@ -152,8 +154,9 @@ macro_rules! spawn_terminal {
         let flag = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
         builder.ctx = builder.ctx.with_awaited(::std::sync::Arc::clone(&flag));
         let ctx = builder.ctx.clone();
-        let future = ::std::future::IntoFuture::into_future(builder);
-        $crate::future::DurableFuture::spawn_blessed(future, &ctx, Some(flag))
+        $crate::future::DurableFuture::spawn_built(&ctx, Some(flag), move || {
+            ::std::future::IntoFuture::into_future(builder)
+        })
     }};
 }
 
@@ -1023,31 +1026,43 @@ mod tests {
         }
     }
 
-    /// The admission check runs before the task-ownership check on the
-    /// caller, as in the start step: `.spawn()` from a task the SDK did not
-    /// start, inside an abandoned owner, leaves the handle refused rather
-    /// than resolving it to the task-ownership error.
+    /// The task-ownership check runs before the admission check on the
+    /// caller: `.spawn()` from a task the SDK did not start, inside an
+    /// abandoned owner, fails the execution with a context usage error and
+    /// resolves the handle to the task-ownership error. Nothing is queued.
     #[tokio::test]
     #[expect(clippy::disallowed_methods)] // reason: the test calls `.spawn()` from a task the SDK did not start
-    async fn spawn_from_unblessed_caller_in_abandoned_owner_stays_refused() {
+    async fn spawn_from_unblessed_caller_in_abandoned_owner_is_refused() {
         let (root, client) = recording_context(Some(Duration::ZERO));
         let child = root.new_child("1", None);
         root.admission()
             .abandon([crate::engine::compute_wire_id_public("1").as_str()]);
         for index in 0..STARTED_SPAWNS {
             let spawn_ctx = child.clone();
-            let (name, resolved) = tokio::spawn(async move {
+            let (name, chain) = tokio::spawn(async move {
                 let (name, handle) = started_spawn(&spawn_ctx, index);
-                let resolved = tokio::time::timeout(Duration::from_millis(20), handle)
+                let err = tokio::time::timeout(Duration::from_secs(5), handle)
                     .await
-                    .is_ok();
-                (name, resolved)
+                    .expect("the refused handle resolves")
+                    .expect_err("a caller that does not own the context is refused");
+                (name, format!("{err:#}"))
             })
             .await
             .expect("the bare task completes");
-            assert!(!resolved, "{name}: the handle never resolves");
+            assert!(
+                chain.contains("does not own the context"),
+                "{name}: {chain}"
+            );
             assert_eq!(child.queued_update_ids(), Vec::<String>::new(), "{name}");
         }
+        let fatal = root
+            .coordinator()
+            .fatal_error()
+            .expect("a fatal error is recorded");
+        assert!(
+            fatal.error_message.starts_with("context usage error"),
+            "unexpected fatal error: {fatal:?}"
+        );
         assert_eq!(client.recorded_updates(), Vec::new());
     }
 

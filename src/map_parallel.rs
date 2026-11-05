@@ -8872,8 +8872,10 @@ mod tests {
         F: FnOnce(DurableContext) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Vec<i32>, OperationError>>,
     {
-        let (ctx, _client) = test_ctx_with_client(log);
-        let polled = crate::task::test_support::poll_once_without_runtime(move || run(ctx));
+        // The context is built on the polling thread, so that thread owns it.
+        let polled = crate::task::test_support::poll_once_without_runtime(move || {
+            run(test_ctx_with_client(log).0)
+        });
         let std::task::Poll::Ready(Err(err)) = polled else {
             unreachable!("expected an immediate error, got {polled:?}");
         };

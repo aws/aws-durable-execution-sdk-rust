@@ -213,9 +213,10 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     /// write order before `.spawn()` returns, so it reaches the service
     /// before every update the caller sends afterwards, on any runtime
     /// flavor. The task-ownership check runs on the caller too: a
-    /// `.spawn()` from a task the SDK did not start returns a handle that
-    /// resolves to the task-ownership error, queues no `START` and runs no
-    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// `.spawn()` from a task or thread that does not own the context
+    /// fails the execution with a context usage error, returns a handle
+    /// that resolves to the task-ownership error, queues no `START` and
+    /// runs no body. A start hook that JS fires when it queues the `START`, and the
     /// replay start hook of a record that resumes work, fire before
     /// `.spawn()` returns. The rest of the operation, including
     /// `on_attempt_start` and the body, runs on the spawned task. The
@@ -240,7 +241,10 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
         S: Serdes<O>,
     {
         match self.execution() {
-            Ok(execution) => DurableFuture::for_started_operation(execution.execute_started()),
+            Ok(execution) => DurableFuture::for_started_operation(
+                &execution.ctx.clone(),
+                execution.execute_started(),
+            ),
             Err(future) => *future,
         }
     }
@@ -287,7 +291,9 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         match self.execution() {
-            Ok(execution) => DurableFuture::for_start_step(move || execution.execute_started()),
+            Ok(execution) => DurableFuture::for_start_step(&execution.ctx.clone(), move || {
+                execution.execute_started()
+            }),
             Err(future) => *future,
         }
     }
@@ -614,9 +620,10 @@ where
     /// write order before `.spawn()` returns, so it reaches the service
     /// before every update the caller sends afterwards, on any runtime
     /// flavor. The task-ownership check runs on the caller too: a
-    /// `.spawn()` from a task the SDK did not start returns a handle that
-    /// resolves to the task-ownership error, queues no `START` and runs no
-    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// `.spawn()` from a task or thread that does not own the context
+    /// fails the execution with a context usage error, returns a handle
+    /// that resolves to the task-ownership error, queues no `START` and
+    /// runs no body. A start hook that JS fires when it queues the `START`, and the
     /// replay start hook of a record that resumes work, fire before
     /// `.spawn()` returns. The rest of the operation, including
     /// `on_attempt_start` and the body, runs on the spawned task. The
@@ -635,7 +642,10 @@ where
     /// task (see [`crate::start`]).
     fn started_future(self) -> DurableFuture<O> {
         match self.execution() {
-            Ok(execution) => DurableFuture::for_started_operation(execution.execute_started()),
+            Ok(execution) => DurableFuture::for_started_operation(
+                &execution.ctx.clone(),
+                execution.execute_started(),
+            ),
             Err(future) => *future,
         }
     }
@@ -679,7 +689,9 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         match self.execution() {
-            Ok(execution) => DurableFuture::for_start_step(move || execution.execute_started()),
+            Ok(execution) => DurableFuture::for_start_step(&execution.ctx.clone(), move || {
+                execution.execute_started()
+            }),
             Err(future) => *future,
         }
     }

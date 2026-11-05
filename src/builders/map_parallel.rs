@@ -371,9 +371,10 @@ where
     /// write order before `.spawn_batch()` returns, so it reaches the service
     /// before every update the caller sends afterwards, on any runtime
     /// flavor. The task-ownership check runs on the caller too: a
-    /// `.spawn_batch()` from a task the SDK did not start returns a handle that
-    /// resolves to the task-ownership error, queues no `START` and runs no
-    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// `.spawn_batch()` from a task or thread that does not own the context
+    /// fails the execution with a context usage error, returns a handle
+    /// that resolves to the task-ownership error, queues no `START` and
+    /// runs no body. A start hook that JS fires when it queues the `START`, and the
     /// replay start hook of a record that resumes work, fire before
     /// `.spawn_batch()` returns. The rest of the operation, including
     /// `on_attempt_start` and the body, runs on the spawned task. The
@@ -464,9 +465,14 @@ where
         };
 
         if started {
-            DurableFuture::for_started_operation(execution.execute_batch_result_started())
+            DurableFuture::for_started_operation(
+                &execution.ctx.clone(),
+                execution.execute_batch_result_started(),
+            )
         } else {
-            DurableFuture::for_start_step(move || execution.execute_batch_result_started())
+            DurableFuture::for_start_step(&execution.ctx.clone(), move || {
+                execution.execute_batch_result_started()
+            })
         }
     }
 
@@ -521,9 +527,10 @@ where
     /// write order before `.spawn()` returns, so it reaches the service
     /// before every update the caller sends afterwards, on any runtime
     /// flavor. The task-ownership check runs on the caller too: a
-    /// `.spawn()` from a task the SDK did not start returns a handle that
-    /// resolves to the task-ownership error, queues no `START` and runs no
-    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// `.spawn()` from a task or thread that does not own the context
+    /// fails the execution with a context usage error, returns a handle
+    /// that resolves to the task-ownership error, queues no `START` and
+    /// runs no body. A start hook that JS fires when it queues the `START`, and the
     /// replay start hook of a record that resumes work, fire before
     /// `.spawn()` returns. The rest of the operation, including
     /// `on_attempt_start` and the body, runs on the spawned task. The
@@ -589,7 +596,7 @@ where
             _marker: PhantomData,
         };
 
-        DurableFuture::for_start_step(move || {
+        DurableFuture::for_start_step(&execution.ctx.clone(), move || {
             let batch = execution.execute_batch_result_started();
             async move { crate::map_parallel::collect_successful(batch.await?) }
         })
@@ -892,9 +899,10 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// write order before `.spawn_batch()` returns, so it reaches the service
     /// before every update the caller sends afterwards, on any runtime
     /// flavor. The task-ownership check runs on the caller too: a
-    /// `.spawn_batch()` from a task the SDK did not start returns a handle that
-    /// resolves to the task-ownership error, queues no `START` and runs no
-    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// `.spawn_batch()` from a task or thread that does not own the context
+    /// fails the execution with a context usage error, returns a handle
+    /// that resolves to the task-ownership error, queues no `START` and
+    /// runs no body. A start hook that JS fires when it queues the `START`, and the
     /// replay start hook of a record that resumes work, fire before
     /// `.spawn_batch()` returns. The rest of the operation, including
     /// `on_attempt_start` and the body, runs on the spawned task. The
@@ -983,9 +991,14 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
         };
 
         if started {
-            DurableFuture::for_started_operation(execution.execute_batch_result_started())
+            DurableFuture::for_started_operation(
+                &execution.ctx.clone(),
+                execution.execute_batch_result_started(),
+            )
         } else {
-            DurableFuture::for_start_step(move || execution.execute_batch_result_started())
+            DurableFuture::for_start_step(&execution.ctx.clone(), move || {
+                execution.execute_batch_result_started()
+            })
         }
     }
 
@@ -1040,9 +1053,10 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// write order before `.spawn()` returns, so it reaches the service
     /// before every update the caller sends afterwards, on any runtime
     /// flavor. The task-ownership check runs on the caller too: a
-    /// `.spawn()` from a task the SDK did not start returns a handle that
-    /// resolves to the task-ownership error, queues no `START` and runs no
-    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// `.spawn()` from a task or thread that does not own the context
+    /// fails the execution with a context usage error, returns a handle
+    /// that resolves to the task-ownership error, queues no `START` and
+    /// runs no body. A start hook that JS fires when it queues the `START`, and the
     /// replay start hook of a record that resumes work, fire before
     /// `.spawn()` returns. The rest of the operation, including
     /// `on_attempt_start` and the body, runs on the spawned task. The
@@ -1104,7 +1118,7 @@ where
             item_ids,
         };
 
-        DurableFuture::for_start_step(move || {
+        DurableFuture::for_start_step(&execution.ctx.clone(), move || {
             let batch = execution.execute_batch_result_started();
             async move { crate::map_parallel::collect_successful(batch.await?) }
         })
@@ -1308,9 +1322,10 @@ impl<RS> ParallelMixedBuilder<RS> {
     /// write order before `.spawn()` returns, so it reaches the service
     /// before every update the caller sends afterwards, on any runtime
     /// flavor. The task-ownership check runs on the caller too: a
-    /// `.spawn()` from a task the SDK did not start returns a handle that
-    /// resolves to the task-ownership error, queues no `START` and runs no
-    /// body. A start hook that JS fires when it queues the `START`, and the
+    /// `.spawn()` from a task or thread that does not own the context
+    /// fails the execution with a context usage error, returns a handle
+    /// that resolves to the task-ownership error, queues no `START` and
+    /// runs no body. A start hook that JS fires when it queues the `START`, and the
     /// replay start hook of a record that resumes work, fire before
     /// `.spawn()` returns. The rest of the operation, including
     /// `on_attempt_start` and the body, runs on the spawned task. The
@@ -1384,9 +1399,14 @@ impl<RS> ParallelMixedBuilder<RS> {
         };
 
         if started {
-            DurableFuture::for_started_operation(execution.execute_batch_result_started())
+            DurableFuture::for_started_operation(
+                &execution.ctx.clone(),
+                execution.execute_batch_result_started(),
+            )
         } else {
-            DurableFuture::for_start_step(move || execution.execute_batch_result_started())
+            DurableFuture::for_start_step(&execution.ctx.clone(), move || {
+                execution.execute_batch_result_started()
+            })
         }
     }
 }

@@ -2141,8 +2141,10 @@ mod tests {
         Fut: Future<Output = Result<T, OperationError>>,
         T: Send + std::fmt::Debug + 'static,
     {
-        let ctx = test_ctx_with_client(CheckpointLog::empty());
-        let polled = crate::task::test_support::poll_once_without_runtime(move || run(ctx));
+        // The context is built on the polling thread, so that thread owns it.
+        let polled = crate::task::test_support::poll_once_without_runtime(move || {
+            run(test_ctx_with_client(CheckpointLog::empty()))
+        });
         let std::task::Poll::Ready(Err(err)) = polled else {
             panic!("expected an immediate error, got {polled:?}");
         };

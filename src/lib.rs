@@ -71,7 +71,10 @@
 //!    the spawned work inside the execution's replay accounting. Dropping
 //!    the handle `.spawn()` returns loses only the result: the operation
 //!    keeps running until it settles, until the scope it was started in
-//!    closes, or until the invocation ends (see [`DurableFuture`]).
+//!    closes, or until the invocation ends (see [`DurableFuture`]). An
+//!    operation claimed, spawned or awaited on a task or thread that does
+//!    not own the context, plugin hook work included, fails the execution
+//!    with a context usage error.
 //! 5. On suspension, the user future is dropped, so do not rely on `Drop`
 //!    ordering for correctness between durable operations. For example, a
 //!    guard that unlocks a resource in `Drop` runs the moment the execution

@@ -122,7 +122,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> TryJoin
     ///
     /// The combinator claims its operation ID at this call, and checks it
     /// against the recorded history before the task starts. The returned
-    /// handle has claimed, so it is a valid input to another combinator.
+    /// handle has claimed, so it is a valid input to another combinator. A
+    /// `.spawn()` from a task or thread that does not own the context
+    /// claims no ID, fails the execution with a context usage error,
+    /// returns a handle that resolves to the task-ownership error, queues
+    /// no `START` and runs no body.
     ///
     /// Dropping the returned future loses only the result: the operation
     /// runs until it settles. The SDK stops it earlier only when the scope
@@ -285,7 +289,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> JoinAll
     ///
     /// The combinator claims its operation ID at this call, and checks it
     /// against the recorded history before the task starts. The returned
-    /// handle has claimed, so it is a valid input to another combinator.
+    /// handle has claimed, so it is a valid input to another combinator. A
+    /// `.spawn()` from a task or thread that does not own the context
+    /// claims no ID, fails the execution with a context usage error,
+    /// returns a handle that resolves to the task-ownership error, queues
+    /// no `START` and runs no body.
     ///
     /// Dropping the returned future loses only the result: the operation
     /// runs until it settles. The SDK stops it earlier only when the scope
@@ -425,7 +433,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> SelectO
     ///
     /// The combinator claims its operation ID at this call, and checks it
     /// against the recorded history before the task starts. The returned
-    /// handle has claimed, so it is a valid input to another combinator.
+    /// handle has claimed, so it is a valid input to another combinator. A
+    /// `.spawn()` from a task or thread that does not own the context
+    /// claims no ID, fails the execution with a context usage error,
+    /// returns a handle that resolves to the task-ownership error, queues
+    /// no `START` and runs no body.
     ///
     /// Dropping the returned future loses only the result: the operation
     /// runs until it settles. The SDK stops it earlier only when the scope
@@ -565,7 +577,11 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> RaceBui
     ///
     /// The combinator claims its operation ID at this call, and checks it
     /// against the recorded history before the task starts. The returned
-    /// handle has claimed, so it is a valid input to another combinator.
+    /// handle has claimed, so it is a valid input to another combinator. A
+    /// `.spawn()` from a task or thread that does not own the context
+    /// claims no ID, fails the execution with a context usage error,
+    /// returns a handle that resolves to the task-ownership error, queues
+    /// no `START` and runs no body.
     ///
     /// Dropping the returned future loses only the result: the operation
     /// runs until it settles. The SDK stops it earlier only when the scope
