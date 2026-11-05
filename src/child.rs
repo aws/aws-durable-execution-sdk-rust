@@ -111,6 +111,90 @@ where
         Self::run(core, closure, user_function, started)
     }
 
+    /// Executes the child as a virtual child context: the body runs in a
+    /// context with its own operation namespace, and nothing is recorded
+    /// for the child itself.
+    ///
+    /// The caller has already rejected a record at the child's ID (see
+    /// [`DurableContext::reject_record_at_virtual_child`]). The body runs
+    /// in every invocation, inline on the awaiting task, as a user
+    /// function, between `on_operation_start` and `on_operation_end` with
+    /// `is_virtual` true. The child writes no update, emits no
+    /// `operation_replayed` event, and closes no scope when the body
+    /// returns, so an operation the body started and did not await keeps
+    /// running in the caller's scope.
+    pub(crate) async fn execute_virtual(self) -> Result<O, OperationError> {
+        let Self {
+            ctx,
+            op_id,
+            name,
+            sub_type,
+            serdes,
+            closure,
+            ..
+        } = self;
+        let wire_id = op_id.wire();
+        let sub_type = sub_type.as_str();
+        let child_ctx = ctx.new_virtual_child(op_id.positional(), name.as_deref());
+        let rec = child_info(&ctx, wire_id, sub_type, name.as_deref()).with_virtual(true);
+        let info = std::sync::Arc::new(rec.clone().with_replay(child_ctx.is_replaying()));
+        if let Some(plugins) = ctx.plugins() {
+            crate::plugin::operation_started(plugins, &info);
+        }
+        let span = child_ctx.replay_span();
+        let body = UserBody::Context(child_ctx.prefix().to_owned());
+        let result = crate::plugin::run_user_function(
+            ctx.shared_plugins(),
+            info,
+            body,
+            span,
+            move || async move { (closure)(child_ctx).await.map_err(Into::into) },
+            ChildFnError::failure_wire,
+        )
+        .await
+        .into_parts();
+        // The end hooks report the replay state after the body: true when
+        // an earlier invocation already got past the child.
+        let ended = |status, error| {
+            if let Some(plugins) = ctx.plugins() {
+                let info = rec
+                    .clone()
+                    .with_status(status)
+                    .with_error(error)
+                    .with_replay(ctx.is_replaying());
+                crate::plugin::operation_ended(plugins, &info);
+            }
+        };
+        match result {
+            Ok(value) => {
+                let serdes_ctx = SerdesContext::new(wire_id, ctx.execution_arn());
+                match serialize_value(&ctx, name.as_deref(), value, &serdes, serdes_ctx.clone())
+                    .await
+                {
+                    Ok(serialized) => {
+                        ended(crate::OperationStatus::Succeeded, None);
+                        deserialize_value(&ctx, name.as_deref(), serialized, &serdes, serdes_ctx)
+                            .await
+                    }
+                    Err(op_err) => {
+                        let wire = crate::error::serialization_failure_wire(&op_err);
+                        ended(crate::OperationStatus::Failed, Some(wire));
+                        Err(op_err)
+                    }
+                }
+            }
+            Err((child_err, wire)) => {
+                ended(crate::OperationStatus::Failed, Some(wire));
+                Err(OperationError::from_kind(OperationErrorKind::ChildContext(
+                    ChildContextError::new(
+                        ChildContextErrorKind::ChildFailed,
+                        Some(child_err.into_source()),
+                    ),
+                )))
+            }
+        }
+    }
+
     /// Splits the execution into its non-generic core and the closure.
     fn split(self) -> (ChildCore<O, S>, F, UserFunctionPolicy) {
         let Self {
@@ -2304,5 +2388,189 @@ mod tests {
         .await;
         assert_recorded(&client);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A serdes whose `serialize` encodes JSON and whose `deserialize`
+    /// fails, with a [`RetryableSerdesError`](crate::serdes::RetryableSerdesError)
+    /// when `marked`.
+    struct DeserializeFailure {
+        marked: bool,
+    }
+
+    impl<T: serde::Serialize + Send + 'static> Serdes<T> for DeserializeFailure {
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            value: T,
+            _context: SerdesContext,
+        ) -> Result<String, crate::BoxError> {
+            Ok(serde_json::to_string(&value)?)
+        }
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            _wire: String,
+            _context: SerdesContext,
+        ) -> Result<T, crate::BoxError> {
+            if self.marked {
+                Err(crate::serdes::RetryableSerdesError::new("injected decode failure").into())
+            } else {
+                Err("cannot decode".into())
+            }
+        }
+    }
+
+    /// Whether `err` is a child context error of kind `Internal`.
+    fn is_child_internal(err: &OperationError) -> bool {
+        matches!(
+            err.kind(),
+            OperationErrorKind::ChildContext(child)
+                if matches!(child.kind(), ChildContextErrorKind::Internal)
+        )
+    }
+
+    /// An unmarked serialize failure of a virtual child returns the serialize
+    /// helper's error, writes nothing, and ends the child with `Failed`.
+    #[tokio::test]
+    async fn virtual_child_unmarked_serialize_failure() {
+        let hooks = crate::plugin::recorder::UfHooks::default();
+        let (ctx, client) = uf_ctx(&hooks, Vec::new());
+        let err = ctx
+            .run_in_child_context(|_child| async { Ok(3_u32) })
+            .name("v")
+            .virtual_context()
+            .serdes(PlainSerializeFailure)
+            .await
+            .expect_err("serialize fails");
+        assert!(is_child_internal(&err), "{err:?}");
+        let message = format!("{err:#}");
+        assert!(message.contains("serialize result: "), "{message}");
+        assert!(message.contains("cannot encode"), "{message}");
+        assert_eq!(client.recorded_updates(), [] as [OperationUpdate; 0]);
+        let end = hooks.find("v", "end");
+        assert_eq!(end.status, Some(crate::OperationStatus::Failed));
+        assert!(end.is_virtual);
+    }
+
+    /// A marked serialize failure of a virtual child ends the invocation
+    /// and fires no end hook.
+    #[tokio::test]
+    async fn virtual_child_marked_serialize_failure_ends_invocation() {
+        let hooks = crate::plugin::recorder::UfHooks::default();
+        let (ctx, client) = uf_ctx(&hooks, Vec::new());
+        let child = ctx
+            .run_in_child_context(|_child| async { Ok(3_u32) })
+            .name("v")
+            .virtual_context()
+            .serdes(MarkedFailure);
+        crate::driver::test_support::expect_serdes_fault(
+            ctx.clone(),
+            Arc::clone(ctx.task_ownership()),
+            Arc::clone(ctx.coordinator()),
+            child,
+            "serdes serialize failed for operation \"v\"",
+        )
+        .await;
+        assert!(hooks.hooks_of("v").contains(&"start"));
+        assert!(!hooks.hooks_of("v").contains(&"end"));
+        assert_eq!(client.recorded_updates(), [] as [OperationUpdate; 0]);
+    }
+
+    /// An unmarked deserialize failure of a virtual child returns the
+    /// deserialize helper's error after the `Succeeded` end hook; a marked
+    /// one ends the invocation.
+    #[tokio::test]
+    async fn virtual_child_deserialize_failures() {
+        let hooks = crate::plugin::recorder::UfHooks::default();
+        let (ctx, client) = uf_ctx(&hooks, Vec::new());
+        let err = ctx
+            .run_in_child_context(|_child| async { Ok(3_u32) })
+            .name("v")
+            .virtual_context()
+            .serdes(DeserializeFailure { marked: false })
+            .await
+            .expect_err("deserialize fails");
+        assert!(is_child_internal(&err), "{err:?}");
+        let message = format!("{err:#}");
+        assert!(message.contains("deserialize result: "), "{message}");
+        assert!(message.contains("cannot decode"), "{message}");
+        assert_eq!(
+            hooks.find("v", "end").status,
+            Some(crate::OperationStatus::Succeeded)
+        );
+        assert_eq!(client.recorded_updates(), [] as [OperationUpdate; 0]);
+
+        let (ctx, _client) = uf_ctx(&crate::plugin::recorder::UfHooks::default(), Vec::new());
+        let child = ctx
+            .run_in_child_context(|_child| async { Ok(3_u32) })
+            .name("v")
+            .virtual_context()
+            .serdes(DeserializeFailure { marked: true });
+        crate::driver::test_support::expect_serdes_fault(
+            ctx.clone(),
+            Arc::clone(ctx.task_ownership()),
+            Arc::clone(ctx.coordinator()),
+            child,
+            "serdes deserialize failed for operation \"v\"",
+        )
+        .await;
+    }
+
+    /// A virtual child is not abandoned when its body returns: a step the
+    /// body spawned and did not await keeps running and records its
+    /// outcome, and the virtual child records nothing.
+    #[tokio::test]
+    async fn virtual_child_is_not_abandoned() {
+        let (ctx, client) = live_ctx();
+        let slot: Arc<std::sync::Mutex<Option<crate::DurableFuture<u32>>>> = Arc::default();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let (body_slot, body_notify, body_client) =
+            (Arc::clone(&slot), Arc::clone(&notify), Arc::clone(&client));
+        let value = ctx
+            .run_in_child_context(move |child| async move {
+                let handle = child
+                    .step(move |_| async move {
+                        body_notify.notified().await;
+                        Ok(7_u32)
+                    })
+                    .name("s")
+                    .spawn();
+                *body_slot.lock().expect("lock") = Some(handle);
+                let started = |client: &crate::client::InMemoryExecutionClient| {
+                    client
+                        .recorded_updates()
+                        .iter()
+                        .any(|u| u.name() == Some("s") && u.action() == &OperationAction::Start)
+                };
+                let mut yields = 0;
+                while !started(&body_client) {
+                    assert!(yields < 1_000, "the step's START is recorded");
+                    yields += 1;
+                    tokio::task::yield_now().await;
+                }
+                Ok(1_u32)
+            })
+            .name("v")
+            .virtual_context()
+            .await
+            .expect("the child succeeds");
+        assert_eq!(value, 1);
+        notify.notify_one();
+        let handle = slot.lock().expect("lock").take().expect("the handle");
+        let step = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the step settles within 1 s")
+            .expect("the step succeeds");
+        assert_eq!(step, 7);
+        let updates = client.recorded_updates();
+        let actions: Vec<_> = updates
+            .iter()
+            .filter(|u| u.name() == Some("s"))
+            .map(|u| u.action().clone())
+            .collect();
+        assert_eq!(actions, [OperationAction::Start, OperationAction::Succeed]);
+        assert!(updates.iter().all(|u| u.name() != Some("v")), "{updates:?}");
     }
 }

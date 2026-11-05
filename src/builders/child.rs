@@ -54,6 +54,9 @@ pub struct ChildBuilder<O, F, Fut, S = JsonSerdes> {
     /// for its attempt children.
     user_function: crate::child::UserFunctionPolicy,
     summary: Option<crate::child::ChildSummary<O>>,
+    /// Whether the child is a virtual child context, which writes no
+    /// record of its own.
+    is_virtual: bool,
     _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
@@ -83,6 +86,7 @@ where
             closure,
             user_function: crate::child::UserFunctionPolicy::Hooks,
             summary: None,
+            is_virtual: false,
             _marker: PhantomData,
         }
     }
@@ -177,6 +181,7 @@ where
             closure: self.closure,
             user_function: self.user_function,
             summary: self.summary,
+            is_virtual: self.is_virtual,
             _marker: PhantomData,
         }
     }
@@ -224,6 +229,69 @@ where
     /// ```
     pub fn summary(mut self, summary: impl Fn(&O) -> String + Send + Sync + 'static) -> Self {
         self.summary = Some(Box::new(summary));
+        self
+    }
+
+    /// Runs the body without recording this child context itself.
+    ///
+    /// The body still runs in a context with its own operation namespace,
+    /// so the operations it creates keep IDs independent of the caller's.
+    /// No record is written for the child: its operations name the
+    /// caller's parent as their parent, and the child adds no level to
+    /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth).
+    /// Because nothing records the child's result, the body runs inline on
+    /// the awaiting task in every invocation, and its operations replay
+    /// their recorded results.
+    ///
+    /// A body that returns `Err` fails the child with a
+    /// [`ChildContextError`](crate::ChildContextError) of kind
+    /// `ChildFailed` whose source is the body's error. A result that the
+    /// serdes cannot serialize or deserialize returns the serdes error, or
+    /// ends the invocation when the serdes marks the error with
+    /// [`RetryableSerdesError`](crate::serdes::RetryableSerdesError).
+    ///
+    /// The child is stopped with its caller's scope, not when its own body
+    /// returns: an operation the body started with `.spawn()` and did not
+    /// await keeps running and checkpointing after the body returns.
+    ///
+    /// Replay fails with `NonDeterministicExecutionError` when the log
+    /// holds a record at the child's ID. So switching an existing child to
+    /// virtual fails the replay of the executions in flight. A summary set
+    /// with [`summary`](Self::summary) is never called, because no record
+    /// exists to hold it, and a subtype set with
+    /// [`sub_type`](Self::sub_type) appears only in errors and plugin hook
+    /// infos.
+    ///
+    /// Plugins see the child: `on_operation_start` fires before the body
+    /// and `on_operation_end` after it, with `Succeeded` and no result, or
+    /// `Failed` and the error, both with
+    /// [`is_virtual`](crate::plugin::OperationInfo::is_virtual) true and
+    /// [`is_replay`](crate::plugin::OperationInfo::is_replay) the
+    /// invocation's replay state when each fires. The body is a user
+    /// function: its user-function hooks and `wrap_user_function` run in
+    /// every invocation, because the body runs in every invocation.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<u32, durable::BoxError> {
+    ///     let value = ctx
+    ///         .run_in_child_context(|child| async move {
+    ///             Ok(child.step(|_| async { Ok(7_u32) }).name("work").await?)
+    ///         })
+    ///         .name("group")
+    ///         .virtual_context()
+    ///         .await?;
+    ///     Ok(value)
+    /// }
+    /// ```
+    pub fn virtual_context(mut self) -> Self {
+        self.is_virtual = true;
         self
     }
 
@@ -328,6 +396,10 @@ where
     fn build(self, started: bool) -> DurableFuture<O> {
         use crate::child::ChildExecution;
 
+        if self.is_virtual {
+            return self.build_virtual();
+        }
+
         preflight_identity!(
             self,
             "Context",
@@ -360,6 +432,35 @@ where
                 execution.execute_started()
             })
         }
+    }
+
+    /// The future of a virtual child context. It has no start step: it
+    /// rejects a record at its ID now, and runs the body when it is polled.
+    fn build_virtual(self) -> DurableFuture<O> {
+        use crate::child::ChildExecution;
+
+        let sub_type = self
+            .sub_type
+            .unwrap_or(OperationSubType::RUN_IN_CHILD_CONTEXT);
+        if let Err(err) = self.ctx.reject_record_at_virtual_child(
+            &self.op_id,
+            sub_type.as_str(),
+            self.name.as_deref(),
+        ) {
+            return DurableFuture::from_async(async move { Err(err) });
+        }
+        let execution = ChildExecution {
+            ctx: self.ctx,
+            op_id: self.op_id,
+            name: self.name,
+            sub_type,
+            serdes: self.serdes,
+            closure: self.closure,
+            user_function: self.user_function,
+            summary: None,
+            _marker: PhantomData,
+        };
+        DurableFuture::for_operation(&execution.ctx.clone(), execution.execute_virtual())
     }
 
     /// The operation's future, with its start step run now. An unwrapped
@@ -402,6 +503,20 @@ mod tests {
             builder.sub_type.as_ref().map(OperationSubType::as_str),
             Some("Second")
         );
+    }
+
+    /// `virtual_context` sets the flag, which defaults to false, and
+    /// `serdes` keeps it.
+    #[test]
+    fn virtual_context_setter_survives_serdes() {
+        let ctx = DurableContext::test_context();
+        let plain = ctx.run_in_child_context(|_child| async { Ok(1_u32) });
+        assert!(!plain.is_virtual);
+        let builder = ctx
+            .run_in_child_context(|_child| async { Ok(1_u32) })
+            .virtual_context()
+            .serdes(std::sync::Arc::new(JsonSerdes));
+        assert!(builder.is_virtual);
     }
 
     /// A second `summary` call replaces the first, and `serdes` keeps the

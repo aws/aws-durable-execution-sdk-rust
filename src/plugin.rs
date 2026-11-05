@@ -1719,9 +1719,17 @@ impl OperationInfo {
     }
 
     /// Whether the operation is a context that writes no record: a
-    /// `NestingMode::Flat` item or branch, or a virtual child context.
+    /// `NestingMode::Flat` item or branch, or a virtual child context
+    /// ([`ChildBuilder::virtual_context`](crate::builders::ChildBuilder::virtual_context)
+    /// or [`WithRetryBuilder::virtual_context`](crate::builders::WithRetryBuilder::virtual_context)).
     /// `false` for every other operation and for every entry of an
     /// operations map.
+    ///
+    /// A virtual child context fires its hooks in every invocation, because
+    /// its body runs in every invocation. Its start hook reports
+    /// [`is_replay`](Self::is_replay) `true` when an earlier invocation
+    /// already ran its body, and its end hook reports `true` when an
+    /// earlier invocation already got past the child.
     pub fn is_virtual(&self) -> bool {
         self.is_virtual
     }

@@ -6023,3 +6023,334 @@ async fn preserved_race_drops_inputs() {
     assert_eq!(result.as_deref(), Some("null"));
     assert_eq!(gather_hooks(&rec), []);
 }
+
+// Virtual child contexts.
+
+/// The operation hook records of `tree` for `Context` and `Step`
+/// operations, as `(inv, hook, name, is_replay, status)`.
+fn context_and_step_shapes(tree: &Tree) -> Vec<TreeShape> {
+    tree.operation_hooks()
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.info().kind(),
+                Some(OperationKind::Context | OperationKind::Step)
+            )
+        })
+        .map(TreeRec::shape)
+        .collect()
+}
+
+/// Asserts that every hook record of the virtual children in `virtuals`
+/// has `is_virtual` true, and every other `Context` or `Step` record has it
+/// false.
+fn assert_virtual_flags(tree: &Tree, virtuals: &[&str]) {
+    for rec in tree.operation_hooks() {
+        let info = rec.info();
+        if !matches!(
+            info.kind(),
+            Some(OperationKind::Context | OperationKind::Step)
+        ) {
+            continue;
+        }
+        let name = info.name().unwrap_or_default();
+        assert_eq!(info.is_virtual(), virtuals.contains(&name), "{rec:?}");
+    }
+}
+
+/// The operation hooks of a virtual child bracket its body in every
+/// invocation, with `is_virtual` true and `is_replay` the invocation's
+/// replay state when each fires.
+#[tokio::test]
+async fn virtual_child_hooks_report_replay_state() {
+    // Handler 1: the virtual child `v` runs before the wait `after`.
+    let tree = Tree::default();
+    let result = tree
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let value = ctx
+                    .run_in_child_context(|v| async move {
+                        Ok(v.step(|_| async { Ok("a".to_owned()) }).name("s").await?)
+                    })
+                    .name("v")
+                    .virtual_context()
+                    .await?;
+                ctx.wait(Duration::from_secs(1)).name("after").await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(
+        context_and_step_shapes(&tree),
+        [
+            (1, "start", "v".to_owned(), false, None),
+            (1, "start", "s".to_owned(), false, STARTED),
+            (1, "end", "s".to_owned(), false, SUCCEEDED),
+            (1, "end", "v".to_owned(), false, SUCCEEDED),
+            (2, "start", "v".to_owned(), true, None),
+            (2, "end", "v".to_owned(), true, SUCCEEDED),
+        ]
+    );
+    assert_eq!(tree.find(1, "end", "v").info().result(), None);
+    assert_eq!(tree.find(1, "start", "s").info().parent_id(), None);
+    assert_virtual_flags(&tree, &["v"]);
+
+    // Handler 2: the virtual child `u` waits, then runs the step `t`.
+    let tree = Tree::default();
+    let result = tree
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let value = ctx
+                    .run_in_child_context(|u| async move {
+                        u.wait(Duration::from_secs(1)).name("inside").await?;
+                        Ok(u.step(|_| async { Ok("t".to_owned()) }).name("t").await?)
+                    })
+                    .name("u")
+                    .virtual_context()
+                    .await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(
+        context_and_step_shapes(&tree),
+        [
+            (1, "start", "u".to_owned(), false, None),
+            (2, "start", "u".to_owned(), true, None),
+            (2, "start", "t".to_owned(), false, STARTED),
+            (2, "end", "t".to_owned(), false, SUCCEEDED),
+            (2, "end", "u".to_owned(), false, SUCCEEDED),
+        ]
+    );
+    assert_virtual_flags(&tree, &["u"]);
+
+    // Handler 3: the virtual child `w` fails.
+    let tree = Tree::default();
+    let result = tree
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let err = ctx
+                    .run_in_child_context(|_w| async { Err::<u32, BoxError>("nope".into()) })
+                    .name("w")
+                    .virtual_context()
+                    .await
+                    .expect_err("the body fails");
+                drop(err);
+                Ok::<_, BoxError>(())
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    let end = tree.find(1, "end", "w");
+    assert_eq!(end.info().status(), FAILED);
+    assert!(!end.info().is_replay());
+    assert!(
+        end.error_message().is_some_and(|m| m.contains("nope")),
+        "{end:?}"
+    );
+    assert_virtual_flags(&tree, &["w"]);
+}
+
+/// The body of a virtual child is a user function in every invocation:
+/// its start hook follows `on_operation_start`, its wrap brackets the body,
+/// and its end hook precedes `on_operation_end`.
+#[tokio::test]
+async fn virtual_child_user_function_hooks_run_each_invocation() {
+    let uf = Uf::default();
+    let in_wrap: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let handler_in_wrap = Arc::clone(&in_wrap);
+    let result = uf
+        .runner()
+        .run(
+            move |_e: (), ctx: DurableContext| {
+                let in_wrap = Arc::clone(&handler_in_wrap);
+                async move {
+                    let value = ctx
+                        .run_in_child_context(move |v| async move {
+                            in_wrap
+                                .lock()
+                                .unwrap()
+                                .push(frames().contains(&"v".to_owned()));
+                            Ok(v.step(|_| async { Ok("a".to_owned()) }).name("s").await?)
+                        })
+                        .name("v")
+                        .virtual_context()
+                        .await?;
+                    ctx.wait(Duration::from_secs(1)).name("after").await?;
+                    Ok::<_, BoxError>(value)
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(*in_wrap.lock().unwrap(), [true, true]);
+    for inv in [1, 2] {
+        let recs: Vec<UfRec> = uf
+            .recs()
+            .into_iter()
+            .filter(|r| r.inv == inv && r.plugin == "p0" && r.op == "v")
+            .collect();
+        let hooks: Vec<&str> = recs.iter().map(|r| r.hook).collect();
+        let at = |hook: &str| hooks.iter().position(|h| *h == hook).unwrap();
+        assert!(at("op-start") < at("start"), "{hooks:?}");
+        assert!(at("start") < at("enter"), "{hooks:?}");
+        assert!(at("exit") < at("end"), "{hooks:?}");
+        assert!(at("end") < at("op-end"), "{hooks:?}");
+        let start = recs.iter().find(|r| r.hook == "start").unwrap();
+        assert_eq!(start.info.is_replay(), inv == 2);
+        assert!(start.info.is_virtual());
+        let end = recs.iter().find(|r| r.hook == "end").unwrap();
+        assert!(end.wire.is_none(), "v.fn-end is Succeeded");
+        uf.assert_full(inv, "v");
+    }
+}
+
+/// An error whose `Display` counts its calls.
+#[derive(Debug)]
+struct CountsDisplay(Arc<AtomicUsize>);
+
+impl std::fmt::Display for CountsDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        f.write_str("counted failure")
+    }
+}
+
+impl std::error::Error for CountsDisplay {}
+
+/// A failing virtual child derives its wire once, and its user-function end
+/// hook and its operation end hook receive the same wire.
+#[tokio::test]
+async fn virtual_child_failure_wire_derived_once() {
+    let uf = Uf::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let result = uf
+        .runner()
+        .run(
+            move |_e: (), ctx: DurableContext| {
+                let calls = Arc::clone(&handler_calls);
+                async move {
+                    let err = ctx
+                        .run_in_child_context(move |_v| async move {
+                            Err::<u32, BoxError>(Box::new(CountsDisplay(calls)))
+                        })
+                        .name("v")
+                        .virtual_context()
+                        .await
+                        .expect_err("the body fails");
+                    drop(err);
+                    Ok::<_, BoxError>(())
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let recs: Vec<UfRec> = uf
+        .recs()
+        .into_iter()
+        .filter(|r| r.plugin == "p0" && r.op == "v")
+        .collect();
+    let fn_end = recs.iter().find(|r| r.hook == "end").unwrap();
+    let op_end = recs.iter().find(|r| r.hook == "op-end").unwrap();
+    let wire = fn_end.wire.as_ref().expect("v.fn-end has a wire");
+    assert_eq!(Some(wire), op_end.info.error());
+    assert_eq!(op_end.info.status(), FAILED);
+    assert!(op_end.info.is_virtual());
+}
+
+/// An operation that a virtual child's body starts with `.spawn()` runs
+/// inside the child's wraps.
+#[tokio::test]
+async fn virtual_child_spawned_operation_carries_wraps() {
+    let uf = Uf::default();
+    let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let handler_seen = Arc::clone(&seen);
+    let result = uf
+        .runner()
+        .run(
+            move |_e: (), ctx: DurableContext| {
+                let seen = Arc::clone(&handler_seen);
+                async move {
+                    let value = ctx
+                        .run_in_child_context(move |v| async move {
+                            let handle = v
+                                .step(move |_| async move {
+                                    seen.lock().unwrap().push(frames());
+                                    Ok(1_u32)
+                                })
+                                .name("s")
+                                .spawn();
+                            Ok(handle.await?)
+                        })
+                        .name("v")
+                        .virtual_context()
+                        .await?;
+                    Ok::<_, BoxError>(value)
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let frames = seen.first().unwrap();
+    let v = frames.iter().position(|f| f == "v");
+    let s = frames.iter().position(|f| f == "s");
+    assert!(v.is_some() && v < s, "{frames:?}");
+}
+
+/// A virtual `with_retry` block fires its operation hooks with
+/// `is_virtual` true and its subtype, and its attempts fire theirs with
+/// `is_virtual` false.
+#[tokio::test]
+async fn virtual_with_retry_hooks_are_virtual() {
+    let tree = Tree::default();
+    let result = tree
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let value = ctx
+                    .with_retry(|_child, attempt| async move {
+                        if attempt == 1 {
+                            return Err::<u32, BoxError>("first".into());
+                        }
+                        Ok(attempt)
+                    })
+                    .name("b")
+                    .sub_type(durable::OperationSubType::new("Charge")?)
+                    .retry_strategy(retry_below(3))
+                    .virtual_context()
+                    .await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert!(result.operation("b").is_none());
+    let end = tree.find(2, "end", "b");
+    assert_eq!(end.info().status(), SUCCEEDED);
+    assert_eq!(end.info().sub_type(), Some("Charge"));
+    assert_virtual_flags(&tree, &["b"]);
+    assert!(!tree.of("b-attempt-1").is_empty());
+}

@@ -653,7 +653,8 @@ struct Inner {
     plugins: Option<Arc<crate::plugin::InvocationPlugins>>,
     /// How many context levels this context sits below the root: 0 at the
     /// root, plus 1 for each [`DurableContext::new_child`]. A Flat batch
-    /// item's context keeps the batch's level.
+    /// item's context keeps the batch's level, and a virtual child's context
+    /// keeps its caller's level.
     nesting_level: u32,
     /// The invocation's
     /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth),
@@ -1072,6 +1073,85 @@ impl DurableContext {
             }),
             awaited: None,
         }
+    }
+
+    /// Creates the context of the virtual child context at
+    /// `child_positional_id`, which this context claimed. It equals
+    /// [`Self::new_child`], except that its operations name this context's
+    /// parent as their parent, it keeps this context's nesting level, and
+    /// it runs in this context's owners: a virtual child writes no record,
+    /// so it is not an owner, and its scope never closes on its own. `name`
+    /// is the virtual operation's name; the child's span carries it as
+    /// `operationName`, with the virtual operation's wire ID as
+    /// `operationId`.
+    pub(crate) fn new_virtual_child(&self, child_positional_id: &str, name: Option<&str>) -> Self {
+        let wire_id = crate::engine::compute_wire_id_public(child_positional_id);
+        let engine = Arc::new(EngineState::new_child(
+            child_positional_id,
+            Arc::clone(&self.inner.engine.checkpoint_log),
+        ));
+        // The virtual namespace has its own replay high-water mark, so it
+        // gets its own span, as a child from `new_child` does.
+        let replay_span = crate::tracing_layer::scoped_execution_span(
+            &self.inner.execution_arn,
+            &self.inner.lambda_context.request_id,
+            self.inner.lambda_context.tenant_id.as_deref(),
+            &wire_id,
+            name,
+            engine.is_replaying(),
+        );
+        Self {
+            inner: Arc::new(Inner {
+                execution_arn: self.inner.execution_arn.clone(),
+                lambda_context: self.inner.lambda_context.clone(),
+                engine,
+                coordinator: Arc::clone(&self.inner.coordinator),
+                task_ownership: Arc::clone(&self.inner.task_ownership),
+                execution_client: self.inner.execution_client.clone(),
+                checkpoint_token: Arc::clone(&self.inner.checkpoint_token),
+                coalescer: self.inner.coalescer.clone(),
+                direct: Arc::clone(&self.inner.direct),
+                parent_wire_id: self.inner.parent_wire_id.clone(),
+                admission: Arc::clone(&self.inner.admission),
+                owners: Arc::clone(&self.inner.owners),
+                replay_span,
+                plugins: self.inner.plugins.clone(),
+                nesting_level: self.inner.nesting_level,
+                preserve_child_depth: self.inner.preserve_child_depth,
+            }),
+            awaited: None,
+        }
+    }
+
+    /// Fails the virtual child context claimed at `op_id` when the log
+    /// holds a record at its ID: a virtual child writes no record, so a
+    /// record there was written by another operation, such as a non-virtual
+    /// child that the handler later switched to virtual. The error is a
+    /// `NonDeterministicExecution` mismatch, recorded as the invocation's
+    /// fatal error, whose claimed identity is `virtual Context` with
+    /// `sub_type` and `name`. Without a record it returns `Ok(())`.
+    pub(crate) fn reject_record_at_virtual_child(
+        &self,
+        op_id: &OperationId,
+        sub_type: &str,
+        name: Option<&str>,
+    ) -> Result<(), OperationError> {
+        let Some(expected) = self.with_checkpoint_record(op_id.positional(), |record| {
+            format_op_identity(
+                record.op_type.as_deref().unwrap_or("Unknown"),
+                record.sub_type.as_deref(),
+                record.op_name.as_deref(),
+            )
+        }) else {
+            return Ok(());
+        };
+        Err(self.replay_mismatch_error(
+            op_id.wire(),
+            &expected,
+            "virtual Context",
+            Some(sub_type),
+            name,
+        ))
     }
 
     /// Whether a context for the child namespace `child_positional_id`
@@ -4552,6 +4632,27 @@ mod tests {
         }
     }
 
+    /// `new_virtual_child` keeps the caller's level and depth: 0 under the
+    /// root and 1 under a child of the root.
+    #[test]
+    fn virtual_child_keeps_nesting_level() {
+        let (root, _client) = DurableContext::test_context_with_depth(5);
+        let level = |ctx: &DurableContext| ctx.inner.nesting_level;
+        let under_root = root.new_virtual_child("1", None);
+        let child = root.new_child("2", None);
+        let under_child = child.new_virtual_child("2-1", None);
+        assert_eq!((level(&under_root), level(&under_child)), (0, 1));
+        for ctx in [&under_root, &under_child] {
+            assert_eq!(ctx.inner.preserve_child_depth, 5);
+        }
+        // The virtual child names its caller's parent and runs in its
+        // caller's owners.
+        assert_eq!(under_root.parent_wire_id(), None);
+        assert_eq!(under_root.owners(), [] as [String; 0]);
+        assert_eq!(under_child.parent_wire_id(), child.parent_wire_id());
+        assert_eq!(under_child.owners(), child.owners());
+    }
+
     /// Each row of the issue's table: the context that creates the record,
     /// asked with `levels_below` 1, against depths 0, 1, 2 and `u32::MAX`.
     #[test]
@@ -5140,6 +5241,63 @@ mod tests {
             lambda_runtime::Context::default(),
             log,
         )
+    }
+
+    /// A record at a virtual child's ID fails with a recorded mismatch whose
+    /// claimed identity is `virtual Context`; a record without a type reads
+    /// as `Unknown`; no record passes.
+    #[test]
+    fn reject_record_at_virtual_child_messages() {
+        let record = |op_type: Option<&str>| CheckpointRecord {
+            id: "wire-1".to_owned(),
+            status: CheckpointStatus::Succeeded,
+            result: None,
+            error_type: None,
+            error_message: None,
+            error_data: None,
+            stack_trace: None,
+            attempt: 0,
+            invoke_result: None,
+            invoke_error_type: None,
+            invoke_error_message: None,
+            invoke_error_data: None,
+            invoke_stack_trace: None,
+            replay_children: false,
+            callback_id: None,
+            op_type: op_type.map(str::to_owned),
+            sub_type: Some("RunInChildContext".to_owned()),
+            due_at: None,
+            op_name: Some("slot".to_owned()),
+            parent_id: None,
+            start_timestamp: None,
+            end_timestamp: None,
+        };
+        for (op_type, expected) in [
+            (
+                Some("Context"),
+                "expected Context/RunInChildContext named \"slot\"",
+            ),
+            (None, "expected Unknown/RunInChildContext named \"slot\""),
+        ] {
+            let ctx = ctx_with_record_at_1(record(op_type));
+            let op_id = ctx.mint_id();
+            let err = ctx
+                .reject_record_at_virtual_child(&op_id, "RunInChildContext", Some("slot"))
+                .expect_err("a record at the slot");
+            let message = crate::error::chain_string(&err);
+            assert!(message.contains(expected), "{message}");
+            assert!(
+                message.contains("got virtual Context/RunInChildContext named \"slot\""),
+                "{message}"
+            );
+            let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+            assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
+            let next = ctx.mint_id();
+            assert!(
+                ctx.reject_record_at_virtual_child(&next, "RunInChildContext", None)
+                    .is_ok()
+            );
+        }
     }
 
     #[test]

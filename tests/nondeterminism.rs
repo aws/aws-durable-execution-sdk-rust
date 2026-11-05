@@ -1188,3 +1188,74 @@ async fn child_same_sub_type_replays_successfully() {
     assert_eq!(result.output().map(String::as_str), Some("3"));
     assert!(result.invocation_count() >= 2);
 }
+
+/// Runs a non-virtual child named `slot` and then a wait on invocation 1,
+/// and on invocation 2 the operation `second` makes at the child's slot.
+async fn run_switched_to_virtual<F, Fut>(second: F) -> durable::test_util::TestResult<String>
+where
+    F: Fn(durable::DurableContext) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<u32, durable::OperationError>> + Send + 'static,
+{
+    let invocation = Arc::new(AtomicU32::new(0));
+    LocalRunner::new()
+        .run(
+            move |_event: (), ctx: durable::DurableContext| {
+                let invocation = Arc::clone(&invocation);
+                let second = second.clone();
+                async move {
+                    if invocation.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ctx.run_in_child_context(|_child| async { Ok(1_u32) })
+                            .name("slot")
+                            .await?;
+                    } else {
+                        second(ctx.clone()).await?;
+                    }
+                    ctx.wait(Duration::from_secs(1)).name("pause").await?;
+                    Ok::<_, durable::BoxError>("done".to_owned())
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner")
+}
+
+/// A record at a virtual child's slot fails the execution: invocation 2
+/// switches the child named `slot` to virtual.
+#[tokio::test]
+async fn virtual_child_rejects_record_at_its_slot() {
+    let result = run_switched_to_virtual(|ctx| async move {
+        ctx.run_in_child_context(|_child| async { Ok(1_u32) })
+            .name("slot")
+            .virtual_context()
+            .await
+    })
+    .await;
+    assert!(result.is_failure(), "{:?}", result.error_message());
+    assert_eq!(result.error_type(), Some("NonDeterministicExecutionError"));
+    let msg = result.error_message().unwrap_or("");
+    assert!(
+        msg.contains("got virtual Context/RunInChildContext named \"slot\""),
+        "{msg}"
+    );
+}
+
+/// A record at a virtual `with_retry` block's slot fails the execution
+/// the same way.
+#[tokio::test]
+async fn virtual_with_retry_rejects_record_at_its_slot() {
+    let result = run_switched_to_virtual(|ctx| async move {
+        ctx.with_retry(|_child, _attempt| async { Ok(1_u32) })
+            .name("slot")
+            .virtual_context()
+            .await
+    })
+    .await;
+    assert!(result.is_failure(), "{:?}", result.error_message());
+    assert_eq!(result.error_type(), Some("NonDeterministicExecutionError"));
+    let msg = result.error_message().unwrap_or("");
+    assert!(
+        msg.contains("got virtual Context/RunInChildContext named \"slot\""),
+        "{msg}"
+    );
+}

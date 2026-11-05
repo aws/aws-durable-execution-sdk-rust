@@ -718,6 +718,25 @@ let order = ctx
     .await?;
 ```
 
+`.virtual_context()` runs the body without recording the child context
+itself, as JS `virtualContext` does. The body still gets its own operation
+namespace, but no record is written for the child: its operations name the
+caller's parent as their parent, and the child adds no level to
+`plugin_child_operations_depth`. Because nothing records its result, the
+body runs inline on the awaiting task in every invocation, and its
+operations replay their recorded results. A body `Err` returns a
+`ChildContextError` of kind `ChildFailed` wrapping the body's error, and a
+serdes failure returns the serdes error, or ends the invocation when it is
+marked `RetryableSerdesError`. The child stops with its caller's scope, so
+an operation its body started and did not await keeps checkpointing after
+the body returns. A record at the child's ID fails replay with
+`NonDeterministicExecutionError`, so switching an existing child to virtual
+fails the executions in flight. A summary set on a virtual child is never
+called, because no record exists to hold it, and its subtype appears only
+in errors and plugin hook infos. Its user-function hooks and
+`wrap_user_function` run in every invocation, because the body runs in
+every invocation.
+
 ### with_retry
 
 `with_retry` runs a closure against a child context and applies a retry
@@ -778,14 +797,24 @@ the block claims no operation ID, a block named `b` names its attempts
 `b-attempt-N` and its waits `b-backoff-N`, `sub_type` has no recorded
 effect, and no plugin hook runs for the block itself.
 
+`.virtual_context()` makes the block a virtual child context, as on
+`run_in_child_context`: the block claims an ID and runs its attempts in its
+own namespace, but writes no record, so its attempts and waits name the
+caller's parent as their parent. A block named `b` names its attempts
+`b-attempt-N` and its waits `b-backoff-N`; an unnamed block names its
+attempts `attempt-N` and leaves its waits unnamed. The block's summary is
+never called, its subtype appears only in errors and plugin hook infos,
+and its operation hooks report `is_virtual` true. The later call of
+`.virtual_context()` and `.without_child_context()` wins.
+
 A `with_retry` builder claims no ID at the call. A block with its own
-record claims its ID when the builder becomes its future, at `.await`,
-`.future()` or `.spawn()`.
+record, and a virtual block, claim their ID when the builder becomes its
+future, at `.await`, `.future()` or `.spawn()`.
 
 When retries exhaust, the operation fails with a `ChildContextError` of
-kind `ChildFailed` whose source is the last attempt's error. With
-`.without_child_context()`, it returns the last `attempt-N` child's error
-unchanged.
+kind `ChildFailed` whose source is the last attempt's error, also for a
+virtual block. With `.without_child_context()`, it returns the last
+`attempt-N` child's error unchanged.
 
 ### map and parallel
 
@@ -1454,8 +1483,10 @@ hook work. `wrap_user_function` brackets each poll and each drop of a user
 function: a live step attempt or condition check, a child body (including
 the outer block of a `with_retry` with its own record, but not the
 `attempt-N` contexts of either mode; a block with `.without_child_context()`
-has no outer block and so no user function of its own), the
-`wait_for_callback` body, each map item, parallel branch and
+has no outer block and so no user function of its own), the body of a
+virtual child context or a virtual `with_retry` block, a user function with
+`is_virtual()` true whose hooks fire and whose wraps run in every
+invocation, the `wait_for_callback` body, each map item, parallel branch and
 `parallel_mixed` branch, each map, parallel and `parallel_mixed` container,
 and each combinator join. It covers map items, parallel branches and
 `parallel_mixed` branches in both nesting modes. Each wrap receives
@@ -1618,6 +1649,7 @@ value in parentheses is the info's `is_replay`.
 | `invoke` | start (`false`) | start (`true`) | end (`false`), when it reaches `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED` while it waits in the invocation | `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED`: end, `is_replay` = not listed in `updated_operations`; unknown status: nothing |
 | `create_callback` | start (`false`) | start (`true`) | end (`false`), when `result()` reads `SUCCEEDED`, `FAILED` or `TIMED_OUT` after waiting in the invocation | `SUCCEEDED`, `FAILED` or `TIMED_OUT`: end, `is_replay` = not listed in `updated_operations` |
 | `run_in_child_context`, `with_retry` with its own record, each `attempt-N` of a `with_retry` in either mode, `map`, `parallel`, `parallel_mixed`, each map item, parallel branch and `parallel_mixed` branch, `wait_for_callback`, the combinators | start (`false`) before the body | start (`true`) before the body | end (`false`) after the terminal write | nothing, including a `ReplayChildren` reconstruction |
+| `run_in_child_context` with `virtual_context()`, and a virtual `with_retry` block | start (`is_replay` = the invocation's replay state) before the body, in every invocation | never, because a record at its ID fails replay | end (`is_replay` = the invocation's replay state) after the body returns, with no checkpoint write | never |
 
 A step retry or a `wait_for_condition` check that continues in the same
 invocation after its delay fires the `READY` cell of its row: start
@@ -1639,8 +1671,11 @@ and `true` on a step's second and later attempts, on re-entry of an
 operation found running, and on the end hook of a wait, invoke or callback
 replayed from a record the service did not change since the previous
 invocation. `is_virtual` is `true` for a `NestingMode::Flat` map item or
-parallel branch, which records no operation of its own, and `false` for
-every other operation and every entry of `operations()`. `operations()`
+parallel branch and for a virtual child context, which record no operation
+of their own, and `false` for every other operation and every entry of
+`operations()`. The start hook of a virtual child reports `is_replay`
+`true` when an earlier invocation already ran its body, and its end hook
+reports `true` when an earlier invocation already got past the child. `operations()`
 holds every operation the service reports for this execution, including
 the `EXECUTION` operation, keyed by wire ID.
 

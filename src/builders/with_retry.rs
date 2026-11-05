@@ -168,6 +168,9 @@ where
     ///
     /// With [`without_child_context`](Self::without_child_context) the
     /// block has no record, so the subtype has no recorded effect.
+    /// With [`virtual_context`](Self::virtual_context) the block has no
+    /// record either, so the subtype appears only in errors and plugin hook
+    /// infos.
     ///
     /// # Examples
     ///
@@ -212,6 +215,9 @@ where
     /// [`ChildContextError`](crate::ChildContextError) of kind
     /// `ChildFailed` whose source is the body's error.
     ///
+    /// The last call of [`virtual_context`](Self::virtual_context) and
+    /// `without_child_context` wins.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -235,6 +241,77 @@ where
     /// ```
     pub fn without_child_context(mut self) -> Self {
         self.wrap = RetryWrap::None;
+        self
+    }
+
+    /// Runs the body without recording this child context itself.
+    ///
+    /// The block still runs its retry loop in a context with its own
+    /// operation namespace, so its attempts and waits keep IDs independent
+    /// of the caller's. No record is written for the block: its attempts
+    /// and waits name the caller's parent as their parent, and the block
+    /// adds no level to
+    /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth).
+    /// Because nothing records the block's result, the loop runs inline on
+    /// the awaiting task in every invocation, and its attempts and waits
+    /// replay their recorded outcomes.
+    ///
+    /// When retries exhaust, the block fails with a
+    /// [`ChildContextError`](crate::ChildContextError) of kind
+    /// `ChildFailed` whose source is the last attempt's error. A result
+    /// that the serdes cannot serialize or deserialize returns the serdes
+    /// error, or ends the invocation when the serdes marks the error with
+    /// [`RetryableSerdesError`](crate::serdes::RetryableSerdesError).
+    ///
+    /// The block is stopped with its caller's scope, not when its own loop
+    /// returns: an operation the block started with `.spawn()` and did not
+    /// await keeps running and checkpointing after the block returns.
+    ///
+    /// Replay fails with `NonDeterministicExecutionError` when the log
+    /// holds a record at the block's ID. So switching an existing block to
+    /// virtual fails the replay of the executions in flight. A summary set
+    /// with [`summary`](Self::summary) is never called, because no record
+    /// exists to hold it, and a subtype set with
+    /// [`sub_type`](Self::sub_type) appears only in errors and plugin hook
+    /// infos.
+    ///
+    /// Plugins see the block: `on_operation_start` fires before the loop
+    /// and `on_operation_end` after it, with `Succeeded` and no result, or
+    /// `Failed` and the error, both with
+    /// [`is_virtual`](crate::plugin::OperationInfo::is_virtual) true and
+    /// [`is_replay`](crate::plugin::OperationInfo::is_replay) the
+    /// invocation's replay state when each fires. The block is a user
+    /// function: its user-function hooks and `wrap_user_function` run in
+    /// every invocation, because the loop runs in every invocation.
+    ///
+    /// When the block is named `b`, its attempt children are named
+    /// `b-attempt-N` and its waits `b-backoff-N`; the waits of an unnamed
+    /// block have no name. The last call of `virtual_context` and
+    /// [`without_child_context`](Self::without_child_context) wins.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<u32, durable::BoxError> {
+    ///     // Records `charge-attempt-1`, `charge-attempt-2`, ... and no
+    ///     // record for the block itself.
+    ///     let total = ctx
+    ///         .with_retry(|child, _attempt| async move {
+    ///             Ok(child.step(|_| async { Ok(42_u32) }).name("work").await?)
+    ///         })
+    ///         .name("charge")
+    ///         .virtual_context()
+    ///         .await?;
+    ///     Ok(total)
+    /// }
+    /// ```
+    pub fn virtual_context(mut self) -> Self {
+        self.wrap = RetryWrap::Virtual;
         self
     }
 
@@ -362,7 +439,9 @@ where
     /// does to a child context; the `attempt-N` contexts record their
     /// results without one. With
     /// [`without_child_context`](Self::without_child_context) the block
-    /// writes no record of its own, so the summary is never called.
+    /// writes no record of its own, so the summary is never called. With
+    /// [`virtual_context`](Self::virtual_context) the block writes no
+    /// record either, and the summary is never called.
     ///
     /// The output is observability only: replay never reads it. A replay
     /// that rebuilds the result of a completed `ReplayChildren` record does
@@ -483,7 +562,60 @@ where
         match self.wrap {
             RetryWrap::Child => self.build_child(started),
             RetryWrap::None => self.build_unwrapped(started),
+            RetryWrap::Virtual => self.build_virtual(),
         }
+    }
+
+    /// The future of a virtual block: it claims its operation ID and
+    /// rejects a record at it now, then runs the retry loop in a virtual
+    /// child context when it is polled.
+    fn build_virtual(self) -> DurableFuture<O> {
+        use crate::child::ChildExecution;
+
+        let op_id = self.ctx.claim_operation_id("with_retry");
+        let sub_type = self
+            .sub_type
+            .unwrap_or(OperationSubType::RUN_IN_CHILD_CONTEXT);
+        if let Err(err) =
+            self.ctx
+                .reject_record_at_virtual_child(&op_id, sub_type.as_str(), self.name.as_deref())
+        {
+            return DurableFuture::from_async(async move { Err(err) });
+        }
+
+        let closure = Arc::new(self.closure);
+        let strategy: Arc<RetryStrategy> = Arc::new(
+            self.retry_strategy
+                .unwrap_or_else(crate::step::default_retry_strategy),
+        );
+        let serdes = Arc::new(self.serdes);
+        let loop_serdes = Arc::clone(&serdes);
+        let loop_name = self.name.clone();
+
+        let execution = ChildExecution {
+            ctx: self.ctx,
+            op_id,
+            name: self.name,
+            sub_type,
+            serdes,
+            user_function: crate::child::UserFunctionPolicy::Hooks,
+            summary: None,
+            closure: move |outer_ctx| async move {
+                crate::with_retry::retry_loop(
+                    outer_ctx,
+                    loop_name,
+                    RetryWrap::Virtual,
+                    None,
+                    closure,
+                    strategy,
+                    loop_serdes,
+                )
+                .await
+                .map_err(LoopFailure::into_child_error)
+            },
+            _marker: PhantomData,
+        };
+        DurableFuture::for_operation(&execution.ctx.clone(), execution.execute_virtual())
     }
 
     /// The future of a block with its own child context record.
@@ -720,6 +852,28 @@ mod tests {
             .with_retry(|_child, _attempt| async { Ok(1_u32) })
             .serdes(Arc::new(JsonSerdes));
         assert_eq!(wrapped.wrap, RetryWrap::Child);
+    }
+
+    /// The later of `without_child_context` and `virtual_context` wins,
+    /// and `serdes` keeps the virtual mode.
+    #[test]
+    fn last_wrap_setter_wins() {
+        let ctx = DurableContext::test_context();
+        let virtual_last = ctx
+            .with_retry(|_child, _attempt| async { Ok(1_u32) })
+            .without_child_context()
+            .virtual_context();
+        assert_eq!(virtual_last.wrap, RetryWrap::Virtual);
+        let unwrapped_last = ctx
+            .with_retry(|_child, _attempt| async { Ok(1_u32) })
+            .virtual_context()
+            .without_child_context();
+        assert_eq!(unwrapped_last.wrap, RetryWrap::None);
+        let kept = ctx
+            .with_retry(|_child, _attempt| async { Ok(1_u32) })
+            .virtual_context()
+            .serdes(Arc::new(JsonSerdes));
+        assert_eq!(kept.wrap, RetryWrap::Virtual);
     }
 
     /// A second `sub_type` call replaces the first, and `serdes` keeps

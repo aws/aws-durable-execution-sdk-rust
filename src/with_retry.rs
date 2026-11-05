@@ -12,7 +12,10 @@
 //!   `RunInChildContext` when the caller sets none. With
 //!   `WithRetryBuilder::without_child_context`, the block writes no record
 //!   of its own: the loop runs in the caller's context, and a block named
-//!   `b` names its attempts `b-attempt-N`.
+//!   `b` names its attempts `b-attempt-N`. With
+//!   `WithRetryBuilder::virtual_context`, the block is a virtual child
+//!   context: the loop runs in its own namespace but the block writes no
+//!   record, and a block named `b` names its attempts `b-attempt-N`.
 //! - Each ATTEMPT is a nested child context under it (named `attempt-N`,
 //!   sub-type `RunInChildContext` whatever the outer sub-type is),
 //!   which is what gives every attempt a fresh operation namespace: attempt
@@ -52,6 +55,10 @@ pub(crate) enum RetryWrap {
     /// The block writes no record: its attempts and waits are created in
     /// the caller's context, as JS `wrapWithRunInChildContext: false`.
     None,
+    /// The block is a virtual child context: it claims an ID and its
+    /// attempts and waits are created in its own namespace, but it writes
+    /// no record, so they name the caller's parent as their parent.
+    Virtual,
 }
 
 /// Why the retry loop ended without a value.
@@ -86,11 +93,11 @@ impl LoopFailure {
     }
 }
 
-/// The name of attempt `attempt`: `{block}-attempt-N` for an unwrapped
-/// block with a non-empty name, `attempt-N` otherwise.
+/// The name of attempt `attempt`: `{block}-attempt-N` for an unwrapped or
+/// virtual block with a non-empty name, `attempt-N` otherwise.
 pub(crate) fn attempt_name(block: Option<&str>, wrap: RetryWrap, attempt: u32) -> String {
     match (wrap, block) {
-        (RetryWrap::None, Some(block)) if !block.is_empty() => {
+        (RetryWrap::None | RetryWrap::Virtual, Some(block)) if !block.is_empty() => {
             format!("{block}-attempt-{attempt}")
         }
         _ => format!("attempt-{attempt}"),
@@ -276,12 +283,19 @@ mod tests {
         ));
     }
 
-    /// Only an unwrapped block with a non-empty name prefixes its attempts.
+    /// Only an unwrapped or virtual block with a non-empty name prefixes its
+    /// attempts.
     #[test]
     fn attempt_names() {
         assert_eq!(attempt_name(Some("b"), RetryWrap::None, 2), "b-attempt-2");
         assert_eq!(attempt_name(Some(""), RetryWrap::None, 2), "attempt-2");
         assert_eq!(attempt_name(None, RetryWrap::None, 2), "attempt-2");
         assert_eq!(attempt_name(Some("b"), RetryWrap::Child, 2), "attempt-2");
+        assert_eq!(
+            attempt_name(Some("b"), RetryWrap::Virtual, 2),
+            "b-attempt-2"
+        );
+        assert_eq!(attempt_name(Some(""), RetryWrap::Virtual, 2), "attempt-2");
+        assert_eq!(attempt_name(None, RetryWrap::Virtual, 2), "attempt-2");
     }
 }

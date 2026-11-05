@@ -16372,4 +16372,351 @@ mod tests {
             }
         }
     }
+
+    /// The kind of an operation error, as text, for a handler to record.
+    fn child_kind(err: &crate::OperationError) -> String {
+        match err.kind() {
+            crate::OperationErrorKind::ChildContext(child) => {
+                format!("ChildContext({:?})", child.kind())
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// A virtual child `v` inside child `outer` writes no record: its step
+    /// names `outer` as its parent, and replays after the wait without
+    /// running again.
+    #[tokio::test]
+    async fn virtual_child_writes_no_context_record() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let handler_runs = Arc::clone(&runs);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let runs = Arc::clone(&handler_runs);
+                    async move {
+                        let value = ctx
+                            .run_in_child_context(move |outer| async move {
+                                let value = outer
+                                    .run_in_child_context(move |v| async move {
+                                        Ok(v.step(move |_| async move {
+                                            runs.fetch_add(1, Ordering::SeqCst);
+                                            Ok(7_u32)
+                                        })
+                                        .name("inner")
+                                        .await?)
+                                    })
+                                    .name("v")
+                                    .virtual_context()
+                                    .await?;
+                                outer
+                                    .wait(std::time::Duration::from_secs(1))
+                                    .name("pause")
+                                    .await?;
+                                Ok(value)
+                            })
+                            .name("outer")
+                            .await?;
+                        Ok::<_, BoxError>(value)
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&7));
+        assert!(result.operation("v").is_none(), "{result}");
+        let outer = result.operation("outer").expect("outer");
+        let inner = result.operation("inner").expect("inner");
+        assert_eq!(inner.parent_id(), Some(outer.id()));
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// A virtual child whose body fails returns `ChildContext(ChildFailed)`
+    /// and writes no CONTEXT record.
+    #[tokio::test]
+    async fn virtual_child_failure_is_child_failed() {
+        let kind: Arc<Mutex<Option<String>>> = Arc::default();
+        let handler_kind = Arc::clone(&kind);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let kind = Arc::clone(&handler_kind);
+                    async move {
+                        let err = ctx
+                            .run_in_child_context(|_v| async {
+                                Err::<u32, BoxError>("nope".into())
+                            })
+                            .name("v")
+                            .virtual_context()
+                            .await
+                            .expect_err("the body fails");
+                        *kind.lock().expect("lock") = Some(child_kind(&err));
+                        Ok::<_, BoxError>(())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            kind.lock().expect("lock").as_deref(),
+            Some("ChildContext(ChildFailed)")
+        );
+        assert!(
+            result
+                .operations()
+                .iter()
+                .all(|op| op.kind() != OperationKind::Context),
+            "{result}"
+        );
+    }
+
+    /// A virtual child's step and wait replay: the step body runs once
+    /// over the two invocations the wait causes.
+    #[tokio::test]
+    async fn virtual_child_replays_its_operations() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let handler_runs = Arc::clone(&runs);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let runs = Arc::clone(&handler_runs);
+                    async move {
+                        let value = ctx
+                            .run_in_child_context(move |child| async move {
+                                let value = child
+                                    .step(move |_| async move {
+                                        runs.fetch_add(1, Ordering::SeqCst);
+                                        Ok(3_u32)
+                                    })
+                                    .name("s")
+                                    .await?;
+                                child
+                                    .wait(std::time::Duration::from_secs(1))
+                                    .name("w")
+                                    .await?;
+                                Ok(value)
+                            })
+                            .name("v")
+                            .virtual_context()
+                            .await?;
+                        Ok::<_, BoxError>(value)
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&3));
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// A summary set on a virtual child is never called, even for an
+    /// oversized result.
+    #[tokio::test]
+    async fn virtual_child_never_calls_summary() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let calls = Arc::clone(&handler_calls);
+                    async move {
+                        let big = ctx
+                            .run_in_child_context(|_v| async { Ok("x".repeat(300 * 1024)) })
+                            .name("v")
+                            .virtual_context()
+                            .summary(move |_s: &String| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                "unused".to_owned()
+                            })
+                            .await?;
+                        Ok::<_, BoxError>(big.len())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&307_200));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(result.operations().is_empty(), "{result}");
+    }
+
+    /// Runs, inside child `outer`, a virtual `with_retry` block named
+    /// `name` whose attempt 1 fails and whose later attempts succeed, with
+    /// a strategy that stops at attempt `stop_at`. Returns the run and the
+    /// kind of the block's error, when it failed, with whether its source
+    /// is the error of attempt 2.
+    async fn virtual_with_retry_run(
+        name: Option<&'static str>,
+        fail_until: u32,
+    ) -> (TestResult<u32>, Option<(String, bool)>) {
+        let failure: Arc<Mutex<Option<(String, bool)>>> = Arc::default();
+        let handler_failure = Arc::clone(&failure);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let failure = Arc::clone(&handler_failure);
+                    async move {
+                        let value = ctx
+                            .run_in_child_context(move |outer| async move {
+                                let block = outer
+                                    .with_retry(move |_attempt_ctx, attempt| async move {
+                                        if attempt <= fail_until {
+                                            return Err::<u32, BoxError>(
+                                                format!("fail on attempt {attempt}").into(),
+                                            );
+                                        }
+                                        Ok(attempt)
+                                    })
+                                    .virtual_context()
+                                    .retry_strategy(|_err, attempt| {
+                                        if attempt >= 2 {
+                                            RetryDecision::Stop
+                                        } else {
+                                            RetryDecision::Retry {
+                                                delay: std::time::Duration::from_secs(1),
+                                            }
+                                        }
+                                    });
+                                let block = match name {
+                                    Some(name) => block.name(name),
+                                    None => block,
+                                };
+                                match block.await {
+                                    Ok(value) => Ok(value),
+                                    Err(err) => {
+                                        let last_is_attempt_2 = std::error::Error::source(&err)
+                                            .and_then(std::error::Error::source)
+                                            .and_then(|s| s.downcast_ref::<crate::OperationError>())
+                                            .is_some_and(|last| {
+                                                format!("{last:#}").contains("fail on attempt 2")
+                                            });
+                                        *failure.lock().expect("lock") =
+                                            Some((child_kind(&err), last_is_attempt_2));
+                                        Ok(0)
+                                    }
+                                }
+                            })
+                            .name("outer")
+                            .await?;
+                        Ok::<_, BoxError>(value)
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let failure = failure.lock().expect("lock").clone();
+        (result, failure)
+    }
+
+    /// An unnamed virtual `with_retry` block writes no record at its slot:
+    /// its attempts name `outer` as their parent, and its wait is unnamed.
+    #[tokio::test]
+    async fn virtual_with_retry_writes_no_block_record() {
+        let (result, failure) = virtual_with_retry_run(None, 1).await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(failure, None);
+        assert_eq!(result.output(), Some(&2));
+        let outer = result.operation("outer").expect("outer");
+        let attempt = result.operation("attempt-1").expect("attempt-1");
+        assert_eq!(attempt.parent_id(), Some(outer.id()));
+        assert!(result.operation("attempt-2").is_some(), "{result}");
+        let contexts: Vec<_> = result
+            .operations()
+            .iter()
+            .filter(|op| op.kind() == OperationKind::Context)
+            .filter_map(TestOperation::name)
+            .collect();
+        assert_eq!(contexts, ["outer", "attempt-1", "attempt-2"], "{result}");
+        let waits: Vec<_> = result
+            .operations()
+            .iter()
+            .filter(|op| op.kind() == OperationKind::Wait)
+            .collect();
+        assert_eq!(waits.len(), 1, "{result}");
+        assert!(waits.iter().all(|w| w.name().is_none()), "{result}");
+        assert!(
+            waits.iter().all(|w| w.parent_id() == Some(outer.id())),
+            "{result}"
+        );
+    }
+
+    /// An exhausted virtual block fails with `ChildContext(ChildFailed)`
+    /// whose source is the error of the last attempt, attempt 2.
+    #[tokio::test]
+    async fn virtual_with_retry_exhaustion_kind() {
+        let (result, failure) = virtual_with_retry_run(None, 2).await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            failure,
+            Some(("ChildContext(ChildFailed)".to_owned(), true)),
+            "{result}"
+        );
+    }
+
+    /// A virtual block named `b` names its attempts `b-attempt-N` and its
+    /// waits `b-backoff-N`, under `outer`.
+    #[tokio::test]
+    async fn named_virtual_with_retry_prefixes_children() {
+        let (result, failure) = virtual_with_retry_run(Some("b"), 1).await;
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(failure, None);
+        let outer = result.operation("outer").expect("outer");
+        let attempt = result.operation("b-attempt-1").expect("b-attempt-1");
+        assert_eq!(attempt.parent_id(), Some(outer.id()));
+        assert!(result.operation("b-attempt-2").is_some(), "{result}");
+        assert!(result.operation("b-backoff-1").is_some(), "{result}");
+        assert!(result.operation("b").is_none(), "{result}");
+    }
+
+    /// `.spawn()` of a virtual child and of a virtual `with_retry` block
+    /// runs them, and writes no record for either.
+    #[tokio::test]
+    async fn spawned_virtual_child_and_block_write_no_record() {
+        let result = LocalRunner::new()
+            .run(
+                |(), ctx: DurableContext| async move {
+                    let child = ctx
+                        .run_in_child_context(|v| async move {
+                            Ok(v.step(|_| async { Ok(2_u32) }).name("s").await?)
+                        })
+                        .name("v")
+                        .virtual_context()
+                        .spawn();
+                    let block = ctx
+                        .with_retry(|_attempt_ctx, _attempt| async { Ok(3_u32) })
+                        .name("b")
+                        .virtual_context()
+                        .spawn();
+                    Ok::<_, BoxError>(child.await? + block.await?)
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&5));
+        assert!(result.operation("v").is_none(), "{result}");
+        assert!(result.operation("b").is_none(), "{result}");
+        assert_eq!(
+            result.operation("s").and_then(TestOperation::parent_id),
+            None
+        );
+        assert_eq!(
+            result
+                .operation("b-attempt-1")
+                .and_then(TestOperation::parent_id),
+            None
+        );
+    }
 }
