@@ -221,6 +221,10 @@ name = "serdes_faults"
 required-features = ["test-util"]
 
 [[test]]
+name = "filesystem_serdes_preview"
+required-features = ["test-util"]
+
+[[test]]
 name = "replay_logging"
 required-features = ["test-util"]
 

@@ -71,6 +71,10 @@ use serde::de::DeserializeOwned;
 
 use crate::BoxError;
 
+mod preview;
+
+pub use preview::{PreviewConfig, PreviewConfigBuilder, PreviewField, PreviewMode, build_preview};
+
 /// Typed, asynchronous serialization/deserialization extension point.
 ///
 /// Implement this trait to provide custom serialization formats for
@@ -568,6 +572,22 @@ pub struct FileSystemSerdesConfig {
     /// Overflow threshold in bytes. Default: 255 KB (256 KB checkpoint
     /// limit minus 1 KB headroom for envelope metadata).
     pub overflow_threshold_bytes: usize,
+    /// The function that builds the preview of a file-stored value, set
+    /// with [`FileSystemSerdesConfigBuilder::preview`]. Default: none.
+    preview: Option<PreviewFn>,
+}
+
+/// The function type [`FileSystemSerdesConfigBuilder::preview`] stores.
+type PreviewHook = dyn Fn(&str) -> Result<Option<String>, BoxError> + Send + Sync;
+
+/// A shared preview function, with a `Debug` impl that names only the type.
+#[derive(Clone)]
+struct PreviewFn(std::sync::Arc<PreviewHook>);
+
+impl std::fmt::Debug for PreviewFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreviewFn")
+    }
 }
 
 impl Default for FileSystemSerdesConfig {
@@ -577,6 +597,7 @@ impl Default for FileSystemSerdesConfig {
             path_encoding: FileSystemPathEncoding::Uri,
             // 256KB checkpoint limit - 1KB headroom for envelope wrapper
             overflow_threshold_bytes: (256 * 1024) - 1024,
+            preview: None,
         }
     }
 }
@@ -607,6 +628,7 @@ pub struct FileSystemSerdesConfigBuilder {
     storage_mode: Option<FileSystemSerdesMode>,
     path_encoding: Option<FileSystemPathEncoding>,
     overflow_threshold_bytes: Option<usize>,
+    preview: Option<PreviewFn>,
 }
 
 impl FileSystemSerdesConfigBuilder {
@@ -632,6 +654,55 @@ impl FileSystemSerdesConfigBuilder {
         self
     }
 
+    /// Sets a function that builds an inline preview of a value stored in a
+    /// file. It receives the value's JSON text and returns a JSON object as
+    /// text, or `None` for no preview.
+    ///
+    /// The preview lands under the `preview` key of the file envelope, so
+    /// the checkpoint shows the selected fields without reading the file.
+    /// The function runs only when the value goes to a file: always in
+    /// [`FileSystemSerdesMode::Always`], and above the threshold in
+    /// [`FileSystemSerdesMode::Overflow`]. It runs before the file is
+    /// written. Reading ignores the preview.
+    ///
+    /// An `Err` from the function fails the serialize with the error
+    /// `preview function failed` and writes no file. The error stays in
+    /// the [`source()`](std::error::Error::source) chain, so an error
+    /// marked with [`RetryableSerdesError`] ends the invocation, and any
+    /// other error is a permanent failure. Text that is not a JSON object
+    /// fails the serialize permanently with `preview must be a JSON
+    /// object`.
+    ///
+    /// The function runs inside the serdes' blocking task, which is why it
+    /// must be `Send + Sync + 'static`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::serdes::{
+    ///     FileSystemSerdes, FileSystemSerdesConfig, PreviewConfig, PreviewMode, build_preview,
+    /// };
+    ///
+    /// let config = PreviewConfig::builder(PreviewMode::ExcludeAll)
+    ///     .include("id")
+    ///     .mask("email")
+    ///     .build();
+    /// let serdes = FileSystemSerdes::with_config(
+    ///     "/mnt/efs",
+    ///     FileSystemSerdesConfig::builder()
+    ///         .preview(move |json| Ok(build_preview(json, &config)))
+    ///         .build(),
+    /// );
+    /// # drop(serdes);
+    /// ```
+    pub fn preview<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str) -> Result<Option<String>, BoxError> + Send + Sync + 'static,
+    {
+        self.preview = Some(PreviewFn(std::sync::Arc::new(f)));
+        self
+    }
+
     /// Builds the config.
     #[must_use]
     pub fn build(self) -> FileSystemSerdesConfig {
@@ -642,6 +713,7 @@ impl FileSystemSerdesConfigBuilder {
             overflow_threshold_bytes: self
                 .overflow_threshold_bytes
                 .unwrap_or(defaults.overflow_threshold_bytes),
+            preview: self.preview,
         }
     }
 }
@@ -688,6 +760,10 @@ impl FileSystemSerdesConfigBuilder {
 ///   stores the value inline (OVERFLOW mode, under threshold)
 /// - `{"__aws_durable_serdes":{"version":1,"kind":"file"},"file":"<relative path>"}`
 ///   stores the value in a file under `base_path`
+/// - `{"__aws_durable_serdes":{"version":1,"kind":"file"},"file":"<relative path>","preview":{...}}`
+///   is the file envelope with a preview of selected fields, written when a
+///   [`preview`](FileSystemSerdesConfigBuilder::preview) function is set
+///   and returns one. Reading ignores `preview`.
 ///
 /// The marker key is reserved, so an inline value that itself contains a
 /// `"file"` key can never be misread as a file reference. The unversioned
@@ -815,10 +891,7 @@ impl FileSystemSerdes {
             ))
         })?;
         match self.config.storage_mode {
-            FileSystemSerdesMode::Always => {
-                let relative_path = self.write_to_file(&json_str, context)?;
-                Ok(file_envelope(&relative_path))
-            }
+            FileSystemSerdesMode::Always => self.write_file_envelope(&json_str, context),
             FileSystemSerdesMode::Overflow => {
                 // `json_str` is valid JSON (it came straight from
                 // `serde_json::to_string`), so it can be embedded directly
@@ -828,13 +901,46 @@ impl FileSystemSerdes {
                 // `"file"` key cannot collide with a file reference.
                 let inline = inline_envelope(&json_str);
                 if inline.len() > self.config.overflow_threshold_bytes {
-                    let relative_path = self.write_to_file(&json_str, context)?;
-                    Ok(file_envelope(&relative_path))
+                    self.write_file_envelope(&json_str, context)
                 } else {
                     Ok(inline)
                 }
             }
         }
+    }
+
+    /// Builds the preview of `json_str`, writes the value to a file, and
+    /// returns the file envelope.
+    ///
+    /// The preview comes first, so a failing or invalid preview leaves no
+    /// payload file behind.
+    fn write_file_envelope(
+        &self,
+        json_str: &str,
+        context: &SerdesContext,
+    ) -> Result<String, BoxError> {
+        let preview = match &self.config.preview {
+            Some(PreviewFn(hook)) => match hook(json_str) {
+                Ok(Some(text)) => match preview::parse_ordered(&text) {
+                    Some(node @ preview::Node::Object(_)) => Some(preview::render_compact(&node)),
+                    _ => {
+                        return Err(Box::new(FileSystemSerdesError::new(
+                            "preview must be a JSON object",
+                        )));
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    return Err(Box::new(FileSystemSerdesError::with_source(
+                        "preview function failed",
+                        e,
+                    )));
+                }
+            },
+            None => None,
+        };
+        let relative_path = self.write_to_file(json_str, context)?;
+        Ok(file_envelope(&relative_path, preview.as_deref()))
     }
 
     /// Deserializes from the filesystem envelope format (synchronous).
@@ -1349,12 +1455,18 @@ fn inline_envelope(json_str: &str) -> String {
 }
 
 /// Builds the versioned file envelope around a path relative to
-/// `base_path`.
-fn file_envelope(relative_path: &str) -> String {
+/// `base_path`, with `preview` (compact JSON object text) under the
+/// `preview` key when it is given.
+fn file_envelope(relative_path: &str, preview: Option<&str>) -> String {
     let escaped = json_escape_string(relative_path);
-    format!(
-        r#"{{"__aws_durable_serdes":{{"version":{ENVELOPE_VERSION},"kind":"file"}},"file":"{escaped}"}}"#
-    )
+    match preview {
+        Some(preview) => format!(
+            r#"{{"__aws_durable_serdes":{{"version":{ENVELOPE_VERSION},"kind":"file"}},"file":"{escaped}","preview":{preview}}}"#
+        ),
+        None => format!(
+            r#"{{"__aws_durable_serdes":{{"version":{ENVELOPE_VERSION},"kind":"file"}},"file":"{escaped}"}}"#
+        ),
+    }
 }
 
 /// Returns a filename suffix unique across concurrent writers: wall-clock
@@ -2131,7 +2243,7 @@ mod tests {
         let ctx = SerdesContext::new("x".to_owned(), "y".to_owned());
 
         // Versioned envelope naming a file that does not exist under base.
-        let envelope = file_envelope("does-not-exist.json");
+        let envelope = file_envelope("does-not-exist.json", None);
         let result = serdes.deserialize_sync::<serde_json::Value>(&envelope, &ctx);
         assert!(result.is_err());
         let err_msg = crate::error::chain_string(&*result.unwrap_err());
@@ -3157,7 +3269,7 @@ mod tests {
         );
 
         // Spoofed versioned marker.
-        let spoofed = file_envelope("secret.json");
+        let spoofed = file_envelope("secret.json", None);
         let out: serde_json::Value = serdes
             .deserialize_sync(&spoofed, &ctx)
             .expect("external payload parses as its own JSON");
@@ -3231,7 +3343,7 @@ mod tests {
         let ctx = SerdesContext::new("op", "arn:test");
 
         // Absolute path in a versioned envelope.
-        let absolute = file_envelope("/etc/hostname");
+        let absolute = file_envelope("/etc/hostname", None);
         let err = serdes
             .deserialize_sync::<serde_json::Value>(&absolute, &ctx)
             .unwrap_err();
@@ -3241,7 +3353,7 @@ mod tests {
         );
 
         // Traversal escape in a versioned envelope.
-        let escape = file_envelope("../outside.json");
+        let escape = file_envelope("../outside.json", None);
         let err = serdes
             .deserialize_sync::<serde_json::Value>(&escape, &ctx)
             .unwrap_err();
@@ -3310,7 +3422,7 @@ mod tests {
         let serdes = FileSystemSerdes::new(base.to_string_lossy().to_string());
         let ctx = SerdesContext::new("op", "arn:test");
 
-        let envelope = file_envelope("link.json");
+        let envelope = file_envelope("link.json", None);
         let err = serdes
             .deserialize_sync::<serde_json::Value>(&envelope, &ctx)
             .unwrap_err();
@@ -3430,7 +3542,7 @@ mod tests {
         std::fs::create_dir_all(&dir_base).expect("create the base dir");
         let serdes = FileSystemSerdes::new(dir_base.to_string_lossy().into_owned());
         let err = serdes
-            .deserialize_sync::<serde_json::Value>(&file_envelope("missing.json"), &ctx)
+            .deserialize_sync::<serde_json::Value>(&file_envelope("missing.json", None), &ctx)
             .expect_err("reading a missing file fails");
         assert!(is_retryable_serdes_error(&*err), "got: {err:#}");
         let _ = std::fs::remove_dir_all(&dir_base);
@@ -3445,7 +3557,7 @@ mod tests {
 
         let unsupported_version =
             r#"{"__aws_durable_serdes":{"version":2,"kind":"inline"},"value":1}"#;
-        let escaping = file_envelope("../escape.json");
+        let escaping = file_envelope("../escape.json", None);
         for wire in ["{not json", unsupported_version, escaping.as_str()] {
             let err = serdes
                 .deserialize_sync::<serde_json::Value>(wire, &ctx)
@@ -3456,5 +3568,255 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir_base);
+    }
+
+    /// The preview config of the issue's tests: `ExcludeAll`, include `id`,
+    /// mask `secret`.
+    fn id_and_masked_secret() -> PreviewConfig {
+        PreviewConfig::builder(PreviewMode::ExcludeAll)
+            .include("id")
+            .mask("secret")
+            .build()
+    }
+
+    fn secret_value() -> serde_json::Value {
+        serde_json::json!({"id": "abc", "secret": "s3cr3t", "other": "ignored"})
+    }
+
+    fn with_preview(
+        base: &std::path::Path,
+        builder: FileSystemSerdesConfigBuilder,
+    ) -> FileSystemSerdes {
+        FileSystemSerdes::with_config(base.to_string_lossy().into_owned(), builder.build())
+    }
+
+    fn envelope_json(envelope: &str) -> serde_json::Value {
+        serde_json::from_str(envelope).expect("the envelope is JSON")
+    }
+
+    #[test]
+    fn always_mode_writes_preview_beside_file() {
+        let base = scratch_path("preview_always");
+        let config = id_and_masked_secret();
+        let serdes = with_preview(
+            &base,
+            FileSystemSerdesConfig::builder()
+                .storage_mode(FileSystemSerdesMode::Always)
+                .preview(move |json| Ok(build_preview(json, &config))),
+        );
+        let ctx = fs_context();
+
+        let envelope = serdes
+            .serialize_sync(&secret_value(), &ctx)
+            .expect("serialize");
+        let parsed = envelope_json(&envelope);
+        assert_eq!(parsed["__aws_durable_serdes"]["kind"], "file", "{envelope}");
+        assert_eq!(
+            parsed["preview"],
+            serde_json::json!({"id": "abc", "secret": "***"}),
+            "{envelope}"
+        );
+        let output: serde_json::Value = serdes
+            .deserialize_sync(&envelope, &ctx)
+            .expect("deserialize");
+        assert_eq!(output, secret_value());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn overflow_mode_writes_preview_when_value_overflows() {
+        let base = scratch_path("preview_overflow");
+        let config = id_and_masked_secret();
+        let serdes = with_preview(
+            &base,
+            FileSystemSerdesConfig::builder()
+                .storage_mode(FileSystemSerdesMode::Overflow)
+                .overflow_threshold_bytes(10)
+                .preview(move |json| Ok(build_preview(json, &config))),
+        );
+        let ctx = fs_context();
+
+        let envelope = serdes
+            .serialize_sync(&secret_value(), &ctx)
+            .expect("serialize");
+        let parsed = envelope_json(&envelope);
+        assert_eq!(parsed["__aws_durable_serdes"]["kind"], "file", "{envelope}");
+        assert_eq!(
+            parsed["preview"],
+            serde_json::json!({"id": "abc", "secret": "***"}),
+            "{envelope}"
+        );
+        assert_eq!(count_files(&base), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn overflow_inline_value_has_no_preview_and_skips_the_hook() {
+        let base = scratch_path("preview_inline");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_calls = std::sync::Arc::clone(&calls);
+        let serdes = with_preview(
+            &base,
+            FileSystemSerdesConfig::builder()
+                .storage_mode(FileSystemSerdesMode::Overflow)
+                .preview(move |_json| {
+                    hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Some(r#"{"id":"abc"}"#.to_owned()))
+                }),
+        );
+
+        let envelope = serdes
+            .serialize_sync(&secret_value(), &fs_context())
+            .expect("serialize");
+        let parsed = envelope_json(&envelope);
+        assert_eq!(
+            parsed["__aws_durable_serdes"]["kind"], "inline",
+            "{envelope}"
+        );
+        assert!(parsed.get("preview").is_none(), "{envelope}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preview_none_writes_envelope_without_preview() {
+        let base = scratch_path("preview_none");
+        let serdes = with_preview(
+            &base,
+            FileSystemSerdesConfig::builder().preview(|_json| Ok(None)),
+        );
+
+        let envelope = serdes
+            .serialize_sync(&secret_value(), &fs_context())
+            .expect("serialize");
+        let parsed = envelope_json(&envelope);
+        let file = parsed["file"].as_str().expect("the envelope names a file");
+        assert_eq!(envelope, file_envelope(file, None));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preview_that_is_not_an_object_fails_serialize() {
+        for text in ["[1]", "nope"] {
+            let base = scratch_path("preview_not_object");
+            let serdes = with_preview(
+                &base,
+                FileSystemSerdesConfig::builder().preview(move |_json| Ok(Some(text.to_owned()))),
+            );
+
+            let err = serdes
+                .serialize_sync(&secret_value(), &fs_context())
+                .expect_err("the preview is rejected");
+            assert!(
+                err.to_string().contains("preview must be a JSON object"),
+                "{text}: {err:#}"
+            );
+            assert!(!is_retryable_serdes_error(&*err), "{text}: {err:#}");
+            assert_eq!(count_files(&base), 0, "{text}: no payload file");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
+    fn deserialize_ignores_preview() {
+        let base = scratch_path("preview_read");
+        std::fs::create_dir_all(&base).expect("create the base dir");
+        let stored = base.join("stored.json");
+        std::fs::write(&stored, r#"{"id":"abc","secret":"s3cr3t"}"#).expect("write the payload");
+        let serdes = FileSystemSerdes::new(base.to_string_lossy().into_owned());
+        let ctx = fs_context();
+        let expected = serde_json::json!({"id": "abc", "secret": "s3cr3t"});
+
+        let versioned = file_envelope("stored.json", Some(r#"{"id":"abc"}"#));
+        let output: serde_json::Value = serdes
+            .deserialize_sync(&versioned, &ctx)
+            .expect("the versioned envelope reads");
+        assert_eq!(output, expected);
+
+        let unversioned = format!(
+            r#"{{"file":"{}","preview":{{"id":"abc"}}}}"#,
+            json_escape_string(&stored.to_string_lossy())
+        );
+        let output: serde_json::Value = serdes
+            .deserialize_sync(&unversioned, &ctx)
+            .expect("the JS and Python envelope reads");
+        assert_eq!(output, expected);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preview_error_is_permanent_serialize_failure() {
+        let base = scratch_path("preview_error");
+        let serdes = with_preview(
+            &base,
+            FileSystemSerdesConfig::builder().preview(|_json| Err("boom".into())),
+        );
+
+        let err = serdes
+            .serialize_sync(&secret_value(), &fs_context())
+            .expect_err("the hook fails");
+        let message = format!("{err:#}");
+        assert!(message.contains("preview function failed"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+        assert!(!is_retryable_serdes_error(&*err), "{message}");
+        assert_eq!(count_files(&base), 0, "no payload file");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preview_hook_key_order_kept_in_envelope() {
+        let base = scratch_path("preview_order");
+        let serdes = with_preview(
+            &base,
+            FileSystemSerdesConfig::builder()
+                .storage_mode(FileSystemSerdesMode::Always)
+                .preview(|_json| Ok(Some("{ \"b\": 1, \"a\": 2 }".to_owned()))),
+        );
+
+        let envelope = serdes
+            .serialize_sync(&secret_value(), &fs_context())
+            .expect("serialize");
+        assert!(
+            envelope.contains(r#""preview":{"b":1,"a":2}"#),
+            "{envelope}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preview_hook_receives_the_value_json() {
+        let base = scratch_path("preview_input");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_seen = std::sync::Arc::clone(&seen);
+        let serdes = with_preview(
+            &base,
+            FileSystemSerdesConfig::builder().preview(move |json| {
+                hook_seen.lock().expect("lock").push(json.to_owned());
+                Ok(None)
+            }),
+        );
+
+        serdes
+            .serialize_sync(&secret_value(), &fs_context())
+            .expect("serialize");
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            vec![serde_json::to_string(&secret_value()).expect("render")]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preview_config_keeps_clone_debug_and_default() {
+        assert!(FileSystemSerdesConfig::default().preview.is_none());
+        assert!(FileSystemSerdesConfig::builder().build().preview.is_none());
+
+        let config = FileSystemSerdesConfig::builder()
+            .preview(|_json| Ok(None))
+            .build();
+        let copy = config.clone();
+        assert!(copy.preview.is_some());
+        let debug = format!("{copy:?}");
+        assert!(debug.contains("preview: Some(PreviewFn)"), "{debug}");
     }
 }

@@ -1232,6 +1232,36 @@ let serdes = FileSystemSerdes::with_config(
 );
 ```
 
+A file envelope holds only the file's path, so the checkpoint shows nothing
+of the value. `FileSystemSerdesConfigBuilder::preview` sets a function that
+receives the value's JSON text and returns a JSON object as text, which the
+envelope carries under a `preview` key beside the path. The function runs
+only when the value goes to a file, and reading ignores the preview.
+`build_preview` builds one by field selection and masking, as the JS SDK's
+`buildPreview` does: `PreviewMode::ExcludeAll` starts with no field shown,
+`include` shows a field, `mask` shows it with `"***"`, and the preview stops
+at `max_preview_bytes` (default 4096). A field given as a string matches
+that name at any depth, and `PreviewField::path` matches one dotted path.
+
+```rust ignore
+use durable::serdes::{
+    FileSystemSerdes, FileSystemSerdesConfig, PreviewConfig, PreviewMode, build_preview,
+};
+
+let preview = PreviewConfig::builder(PreviewMode::ExcludeAll)
+    .include("orderId")
+    .mask("email")
+    .build();
+let serdes = FileSystemSerdes::with_config(
+    "/mnt/efs",
+    FileSystemSerdesConfig::builder()
+        .preview(move |json| Ok(build_preview(json, &preview)))
+        .build(),
+);
+// The envelope of {"orderId":"o-1","email":"a@example.com","items":[...]}:
+// {"__aws_durable_serdes":{...},"file":"...","preview":{"orderId":"o-1","email":"***"}}
+```
+
 ## Testing a handler locally
 
 Enable the `test-util` feature to get `LocalRunner`, which drives a handler
