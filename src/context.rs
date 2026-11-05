@@ -3371,6 +3371,19 @@ impl DurableContext {
     /// independent operation-ID namespace. Use `.spawn()` for eager
     /// (background) execution.
     ///
+    /// The body should run at least one durable operation. The child's
+    /// result is saved, so a replay returns it without running the body,
+    /// with three exceptions. A body that returns an error is not retried,
+    /// as a step is. A result over 256 KiB makes the body run again on
+    /// every replay, to rebuild the result; its record holds the payload of
+    /// [`ChildBuilder::summary`] instead. A context that
+    /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth)
+    /// preserves also runs its body again on every replay. So put plain
+    /// computation in a step.
+    ///
+    /// To change the error a child returns, call
+    /// [`map_err`](Result::map_err) on the awaited result.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -3633,6 +3646,24 @@ impl DurableContext {
     /// Each item gets its own child context with an independent operation
     /// namespace.
     ///
+    /// The closure should run at least one durable operation. Each item's
+    /// result is saved, so a replay returns it without running the
+    /// closure, with three exceptions. An item that returns an error is not
+    /// retried, as a step is. An item whose result is over 256 KiB runs
+    /// again on every replay, to rebuild the result. An item context that
+    /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth)
+    /// preserves also runs again on every replay. So put plain computation
+    /// in a step.
+    ///
+    /// When the whole batch result is over 256 KiB, the map records a
+    /// summary of its outcome instead. With
+    /// [`NestingMode::Normal`](crate::builders::map_parallel::NestingMode::Normal) replay reads each
+    /// item from its own record. A
+    /// [`NestingMode::Flat`](crate::builders::map_parallel::NestingMode::Flat) item has no record of
+    /// its own, so replay runs the items again to rebuild the result, even
+    /// when each item's result is small. [`MapBuilder::summary`] adds the
+    /// caller's own summary to that record.
+    ///
     /// The map claims one operation ID from this context when this method
     /// is called. Its items are numbered inside the map: item `i` has the
     /// ID of item `i` in the map's own namespace, whatever the item count,
@@ -3732,6 +3763,24 @@ impl DurableContext {
     ///
     /// A panic in a branch propagates to the caller with its original
     /// payload, and the SDK records nothing for it.
+    ///
+    /// Each branch should run at least one durable operation. Each branch's
+    /// result is saved, so a replay returns it without running the branch,
+    /// with three exceptions. A branch that returns an error is not
+    /// retried, as a step is. A branch whose result is over 256 KiB runs
+    /// again on every replay, to rebuild the result. A branch context that
+    /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth)
+    /// preserves also runs again on every replay. So put plain computation
+    /// in a step.
+    ///
+    /// When the whole batch result is over 256 KiB, the parallel records a
+    /// summary of its outcome instead. With
+    /// [`NestingMode::Normal`](crate::builders::map_parallel::NestingMode::Normal) replay reads each
+    /// branch from its own record. A
+    /// [`NestingMode::Flat`](crate::builders::map_parallel::NestingMode::Flat) branch has no record of
+    /// its own, so replay runs the branches again to rebuild the result, even
+    /// when each branch's result is small. [`ParallelBuilder::summary`] adds the
+    /// caller's own summary to that record.
     ///
     /// # Examples
     ///

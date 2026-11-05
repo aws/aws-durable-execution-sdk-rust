@@ -811,6 +811,10 @@ pub enum NestingMode {
 /// the caller gives the item.
 pub(crate) type ItemNamer<I> = Box<dyn Fn(&I, usize) -> String + Send + Sync>;
 
+/// The caller's summary of an oversized batch result (see
+/// [`MapBuilder::summary`](crate::builders::MapBuilder::summary)).
+pub(crate) type BatchSummary<O> = Arc<dyn Fn(&BatchResult<O>) -> String + Send + Sync>;
+
 /// Internal state for a map execution passed from the builder.
 ///
 /// Holds the user's map closure as `Arc<F>`: shared rather than boxed,
@@ -831,6 +835,7 @@ pub(crate) struct MapExecution<I, O, F, IS, RS> {
     pub(crate) result_serdes: RS,
     pub(crate) nesting: NestingMode,
     pub(crate) item_namer: Option<ItemNamer<I>>,
+    pub(crate) summary: Option<BatchSummary<O>>,
     pub(crate) items: Vec<I>,
     pub(crate) closure: Arc<F>,
     pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
@@ -920,6 +925,7 @@ where
             self.nesting,
             user_names,
             record_names,
+            self.summary,
             total_items,
             MAP_SUB_TYPE,
             MAP_ITERATION_SUB_TYPE,
@@ -943,6 +949,7 @@ pub(crate) struct ParallelExecution<O, IS, RS> {
     pub(crate) result_serdes: RS,
     pub(crate) nesting: NestingMode,
     pub(crate) branches: Vec<(Option<String>, crate::future::BranchBody<O>)>,
+    pub(crate) summary: Option<BatchSummary<O>>,
     /// The IDs of the branches (see [`ItemIds`]). `parallel_mixed` builds
     /// its item serdes from the same table.
     pub(crate) item_ids: ItemIds,
@@ -1020,6 +1027,7 @@ where
             self.nesting,
             user_names,
             record_names,
+            self.summary,
             total,
             PARALLEL_SUB_TYPE,
             PARALLEL_BRANCH_SUB_TYPE,
@@ -2187,6 +2195,7 @@ async fn execute_batch<O, IS, RS>(
     nesting: NestingMode,
     user_names: Vec<Option<String>>,
     record_names: Vec<String>,
+    summary: Option<BatchSummary<O>>,
     total_items: usize,
     parent_sub_type: &str,
     child_sub_type: &str,
@@ -2494,7 +2503,16 @@ where
     // The JS summary travels alongside the payload: when the payload is
     // too large to checkpoint inline, the summary is written in its place
     // so replay can obey the recorded outcome instead of re-deriving it.
-    let summary_json = oversized_batch_summary(&batch_result, parent_sub_type);
+    // The caller's summary runs only then, and its output joins the JS
+    // summary under the key `summary`.
+    let caller_summary = match summary {
+        Some(summary) if serialized_payload.len() > CHECKPOINT_SIZE_LIMIT_BYTES => {
+            Some(summary(&batch_result))
+        }
+        _ => None,
+    };
+    let summary_json =
+        oversized_batch_summary(&batch_result, parent_sub_type, caller_summary.as_deref());
 
     // 12. Checkpoint the parent SUCCEED.
     checkpoint_batch_success_serialized(
@@ -4440,7 +4458,15 @@ fn from_batch_result<O>(
 /// summary is plain JSON: it never goes through `result_serdes`, because
 /// it must stay readable even when the result serdes output is what
 /// outgrew the limit.
-fn oversized_batch_summary<O>(result: &BatchResult<O>, parent_sub_type: &str) -> String {
+///
+/// `caller_summary`, the output of the caller's summary, becomes the last
+/// key, `summary`, as JS `composeSummaryGenerator` adds it. Replay never
+/// reads it.
+fn oversized_batch_summary<O>(
+    result: &BatchResult<O>,
+    parent_sub_type: &str,
+    caller_summary: Option<&str>,
+) -> String {
     let total = result.items.len();
     let succeeded = result.success_count();
     let failed = result.failure_count();
@@ -4477,7 +4503,16 @@ fn oversized_batch_summary<O>(result: &BatchResult<O>, parent_sub_type: &str) ->
     summary.insert("completionReason".to_owned(), result.reason.as_str().into());
     summary.insert("status".to_owned(), status.into());
     summary.insert("itemStatuses".to_owned(), item_statuses.into());
-    serde_json::Value::Object(summary).to_string()
+    let mut text = serde_json::Value::Object(summary).to_string();
+    if let Some(caller_summary) = caller_summary {
+        // Appended to the text rather than inserted into the map, so the
+        // key is last whatever key order the map keeps.
+        text.pop();
+        text.push_str(",\"summary\":");
+        text.push_str(&serde_json::Value::from(caller_summary).to_string());
+        text.push('}');
+    }
+    text
 }
 
 /// Parses a batch record text and converts it back into a `BatchResult`.
@@ -11954,6 +11989,33 @@ mod tests {
         );
     }
 
+    /// The caller's summary is the last key of the summary text, as a JSON
+    /// string, and the other keys keep their values.
+    #[test]
+    fn caller_summary_is_last_key() {
+        let result = BatchResult::new(
+            vec![BatchItem::<u32>::new(
+                0,
+                "a".to_owned(),
+                BatchItemStatus::Succeeded,
+                Some(1),
+                None,
+                None,
+            )],
+            CompletionReason::AllCompleted,
+        );
+        let plain = oversized_batch_summary(&result, MAP_SUB_TYPE, None);
+        let text = oversized_batch_summary(&result, MAP_SUB_TYPE, Some("ok \"1\""));
+        assert!(text.ends_with(r#","summary":"ok \"1\""}"#), "{text}");
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+        assert_eq!(value["summary"], "ok \"1\"");
+        value.as_object_mut().expect("an object").remove("summary");
+        assert_eq!(
+            value,
+            serde_json::from_str::<serde_json::Value>(&plain).expect("JSON")
+        );
+    }
+
     /// An oversized batch with a failed item records `F` and the status
     /// `FAILED`.
     #[tokio::test]
@@ -12050,7 +12112,7 @@ mod tests {
         };
         let summary = |items, reason| -> serde_json::Value {
             let result = BatchResult::new(items, reason);
-            serde_json::from_str(&oversized_batch_summary(&result, MAP_SUB_TYPE))
+            serde_json::from_str(&oversized_batch_summary(&result, MAP_SUB_TYPE, None))
                 .expect("the summary is JSON")
         };
         let custom_ok = summary(

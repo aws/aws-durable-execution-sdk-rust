@@ -90,6 +90,7 @@ pub struct WithRetryBuilder<O, F, Fut, S = JsonSerdes> {
     retry_strategy: Option<RetryStrategy>,
     serdes: S,
     closure: F,
+    summary: Option<crate::child::ChildSummary<O>>,
     _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
@@ -122,6 +123,7 @@ where
             retry_strategy: None,
             serdes: JsonSerdes,
             closure,
+            summary: None,
             _marker: PhantomData,
         }
     }
@@ -346,8 +348,31 @@ where
             retry_strategy: self.retry_strategy,
             serdes,
             closure: self.closure,
+            summary: self.summary,
             _marker: PhantomData,
         }
+    }
+
+    /// Sets the payload recorded when the block's result is too large to
+    /// checkpoint.
+    ///
+    /// Called only when the serialized result is over 256 KiB. The summary
+    /// applies to the block's own child context, as
+    /// [`ChildBuilder::summary`](crate::builders::ChildBuilder::summary)
+    /// does to a child context; the `attempt-N` contexts record their
+    /// results without one. With
+    /// [`without_child_context`](Self::without_child_context) the block
+    /// writes no record of its own, so the summary is never called.
+    ///
+    /// The output is observability only: replay never reads it. A replay
+    /// that rebuilds the result of a completed `ReplayChildren` record does
+    /// not call the summary; a block that is still running when an
+    /// invocation resumes it calls the summary when it completes with an
+    /// oversized result. Keep it under 256 KiB, because the service rejects
+    /// a larger payload. A second call replaces the first.
+    pub fn summary(mut self, summary: impl Fn(&O) -> String + Send + Sync + 'static) -> Self {
+        self.summary = Some(Box::new(summary));
+        self
     }
 
     /// Converts this builder into a [`DurableFuture`] without starting it.
@@ -503,6 +528,7 @@ where
                 .unwrap_or(OperationSubType::RUN_IN_CHILD_CONTEXT),
             serdes,
             user_function: crate::child::UserFunctionPolicy::Hooks,
+            summary: self.summary,
             // A concrete closure returning the concrete retry-loop future:
             // no erasure here: the one box is the DurableFuture below.
             closure: move |outer_ctx| async move {
@@ -634,6 +660,7 @@ mod tests {
                 sub_type: OperationSubType::RUN_IN_CHILD_CONTEXT,
                 serdes: Arc::new(JsonSerdes),
                 user_function: crate::child::UserFunctionPolicy::Hooks,
+                summary: None,
                 closure: move |outer_ctx: DurableContext| async move {
                     let handle = outer_ctx
                         .step(move |_| async move {
@@ -709,5 +736,19 @@ mod tests {
             builder.sub_type.as_ref().map(OperationSubType::as_str),
             Some("Second")
         );
+    }
+
+    /// A second `summary` call replaces the first, and `serdes` keeps the
+    /// summary.
+    #[test]
+    fn summary_setter_replaces_and_survives_serdes() {
+        let ctx = DurableContext::test_context();
+        let builder = ctx
+            .with_retry(|_child, _attempt| async { Ok(1_u32) })
+            .summary(|v: &u32| format!("first {v}"))
+            .summary(|v: &u32| format!("second {v}"))
+            .serdes(Arc::new(JsonSerdes));
+        let summary = builder.summary.as_ref().expect("the summary is kept");
+        assert_eq!(summary(&7), "second 7");
     }
 }

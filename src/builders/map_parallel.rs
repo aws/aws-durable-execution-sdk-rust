@@ -73,6 +73,7 @@ pub struct MapBuilder<I, O, F, Fut, IS = JsonSerdes, RS = PassthroughSerdes> {
     result_serdes: RS,
     nesting: NestingMode,
     item_namer: Option<crate::map_parallel::ItemNamer<I>>,
+    summary: Option<crate::map_parallel::BatchSummary<O>>,
     items: Vec<I>,
     closure: F,
     _marker: PhantomData<fn() -> (O, Fut)>,
@@ -114,6 +115,7 @@ where
             result_serdes: PassthroughSerdes,
             nesting: NestingMode::Normal,
             item_namer: None,
+            summary: None,
             items,
             closure,
             _marker: PhantomData,
@@ -187,6 +189,7 @@ where
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             item_namer: self.item_namer,
+            summary: self.summary,
             items: self.items,
             closure: self.closure,
             _marker: PhantomData,
@@ -227,6 +230,7 @@ where
             result_serdes: serdes,
             nesting: self.nesting,
             item_namer: self.item_namer,
+            summary: self.summary,
             items: self.items,
             closure: self.closure,
             _marker: PhantomData,
@@ -259,6 +263,33 @@ where
         namer: impl Fn(&I, usize) -> String + Send + Sync + 'static,
     ) -> Self {
         self.item_namer = Some(Box::new(namer));
+        self
+    }
+
+    /// Sets a summary stored with the batch record when the batch result is
+    /// too large to checkpoint.
+    ///
+    /// Called only when the serialized result is over 256 KiB, once per
+    /// write of that record. The batch then records a summary of its
+    /// outcome instead of the item results. With [`NestingMode::Normal`] a
+    /// replay reads each item from its own record; an item with
+    /// [`NestingMode::Flat`] has no record of its own, so a replay runs the
+    /// items again to rebuild the result. The summary receives the
+    /// [`BatchResult`], and its output is stored under the key `summary`,
+    /// the last key of the `MapResult` record. A batch record that fits is
+    /// written as usual, and the summary is not called.
+    ///
+    /// The output is observability only: replay never reads it. A replay
+    /// that rebuilds a completed batch does not call the summary; a batch
+    /// that is still running when an invocation resumes it calls the
+    /// summary when it completes with an oversized result. Keep it under
+    /// 256 KiB, because the service rejects a larger payload. A second call
+    /// replaces the first.
+    pub fn summary(
+        mut self,
+        summary: impl Fn(&BatchResult<O>) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.summary = Some(Arc::new(summary));
         self
     }
 
@@ -459,6 +490,7 @@ where
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             item_namer: self.item_namer,
+            summary: self.summary,
             items: self.items,
             closure: Arc::new(self.closure),
             _marker: PhantomData,
@@ -591,6 +623,7 @@ where
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             item_namer: self.item_namer,
+            summary: self.summary,
             items: self.items,
             closure: Arc::new(self.closure),
             _marker: PhantomData,
@@ -641,6 +674,7 @@ pub struct ParallelBuilder<O, IS = JsonSerdes, RS = PassthroughSerdes> {
     result_serdes: RS,
     nesting: NestingMode,
     branches: Vec<(Option<String>, crate::future::BranchBody<O>)>,
+    summary: Option<crate::map_parallel::BatchSummary<O>>,
     _marker: PhantomData<O>,
 }
 
@@ -672,6 +706,7 @@ impl<O: Send + 'static> ParallelBuilder<O> {
             result_serdes: PassthroughSerdes,
             nesting: NestingMode::Normal,
             branches,
+            summary: None,
             _marker: PhantomData,
         }
     }
@@ -741,6 +776,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
+            summary: self.summary,
             _marker: PhantomData,
         }
     }
@@ -779,6 +815,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
             result_serdes: serdes,
             nesting: self.nesting,
             branches: self.branches,
+            summary: self.summary,
             _marker: PhantomData,
         }
     }
@@ -789,6 +826,33 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// without per-branch context events.
     pub fn nesting(mut self, mode: NestingMode) -> Self {
         self.nesting = mode;
+        self
+    }
+
+    /// Sets a summary stored with the batch record when the batch result is
+    /// too large to checkpoint.
+    ///
+    /// Called only when the serialized result is over 256 KiB, once per
+    /// write of that record. The batch then records a summary of its
+    /// outcome instead of the branch results. With [`NestingMode::Normal`] a
+    /// replay reads each branch from its own record; a branch with
+    /// [`NestingMode::Flat`] has no record of its own, so a replay runs the
+    /// branches again to rebuild the result. The summary receives the
+    /// [`BatchResult`], and its output is stored under the key `summary`,
+    /// the last key of the `ParallelResult` record. A batch record that fits is
+    /// written as usual, and the summary is not called.
+    ///
+    /// The output is observability only: replay never reads it. A replay
+    /// that rebuilds a completed batch does not call the summary; a batch
+    /// that is still running when an invocation resumes it calls the
+    /// summary when it completes with an oversized result. Keep it under
+    /// 256 KiB, because the service rejects a larger payload. A second call
+    /// replaces the first.
+    pub fn summary(
+        mut self,
+        summary: impl Fn(&BatchResult<O>) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.summary = Some(Arc::new(summary));
         self
     }
 
@@ -987,6 +1051,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
+            summary: self.summary,
             item_ids,
         };
 
@@ -1115,6 +1180,7 @@ where
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
+            summary: self.summary,
             item_ids,
         };
 
@@ -1395,6 +1461,7 @@ impl<RS> ParallelMixedBuilder<RS> {
             result_serdes: self.result_serdes,
             nesting: self.nesting,
             branches: self.branches,
+            summary: None,
             item_ids,
         };
 
@@ -2368,5 +2435,33 @@ mod tests {
             .expect("the mismatch is recorded before the first poll");
         assert_eq!(fatal.error_type, "NonDeterministicExecutionError");
         drop(future);
+    }
+
+    /// The summary of a map and of a parallel: a second call replaces the
+    /// first, and `serdes` and `result_serdes` keep it.
+    #[test]
+    fn batch_summary_setter_replaces_and_survives_serdes() {
+        let result = BatchResult::<u32>::new(Vec::new(), CompletionReason::AllCompleted);
+        let ctx = DurableContext::test_context();
+        let map = ctx
+            .map(vec![1_u32], |_child, item, _idx| async move { Ok(item) })
+            .summary(|r| format!("first {}", r.total_count()))
+            .summary(|r| format!("second {}", r.total_count()))
+            .serdes(Arc::new(JsonSerdes))
+            .result_serdes(JsonSerdes);
+        let summary = map.summary.as_ref().expect("the map keeps the summary");
+        assert_eq!(summary(&result), "second 0");
+
+        let parallel = ctx
+            .parallel(vec![crate::Branch::new("a", |_child| async { Ok(1_u32) })])
+            .summary(|r| format!("first {}", r.total_count()))
+            .summary(|r| format!("second {}", r.total_count()))
+            .serdes(Arc::new(JsonSerdes))
+            .result_serdes(JsonSerdes);
+        let summary = parallel
+            .summary
+            .as_ref()
+            .expect("the parallel keeps the summary");
+        assert_eq!(summary(&result), "second 0");
     }
 }

@@ -2827,7 +2827,7 @@ async fn replay_children_reconstruction_fires_no_hook() {
     let end = tree.find(1, "end", "parent");
     assert_eq!(end.info().status(), SUCCEEDED);
     assert!(!end.info().is_replay());
-    assert_eq!(end.info().result(), None);
+    assert_eq!(end.info().result(), Some(""));
     assert!(
         tree.of("parent").iter().all(|r| r.inv == 1),
         "{:?}",

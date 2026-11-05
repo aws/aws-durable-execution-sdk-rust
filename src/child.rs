@@ -36,6 +36,10 @@ pub(crate) const CHILD_SUB_TYPE: &str = "RunInChildContext";
 /// the checkpoint; instead the child body is re-executed on replay.
 pub(crate) const CHECKPOINT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 
+/// The caller's summary of an oversized child result (see
+/// [`ChildBuilder::summary`](crate::builders::ChildBuilder::summary)).
+pub(crate) type ChildSummary<O> = Box<dyn Fn(&O) -> String + Send + Sync>;
+
 /// Internal state for child context execution passed from the builder.
 ///
 /// Generic over the body closure `F` and, through its future's output,
@@ -54,6 +58,8 @@ pub(crate) struct ChildExecution<O, F, S> {
     pub(crate) serdes: S,
     pub(crate) closure: F,
     pub(crate) user_function: UserFunctionPolicy,
+    /// The payload of an oversized result's record; `None` records `""`.
+    pub(crate) summary: Option<ChildSummary<O>>,
     pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
 }
 
@@ -115,6 +121,7 @@ where
             serdes,
             closure,
             user_function,
+            summary,
             _marker,
         } = self;
         let core = ChildCore {
@@ -123,6 +130,7 @@ where
             name,
             sub_type,
             serdes,
+            summary,
             _marker: std::marker::PhantomData,
         };
         (core, closure, user_function)
@@ -213,6 +221,7 @@ struct ChildCore<O, S> {
     name: Option<String>,
     sub_type: crate::OperationSubType,
     serdes: S,
+    summary: Option<ChildSummary<O>>,
     _marker: std::marker::PhantomData<fn() -> O>,
 }
 
@@ -261,6 +270,7 @@ struct ChildAfter<O, S> {
     name: Option<String>,
     sub_type: crate::OperationSubType,
     serdes: S,
+    summary: Option<ChildSummary<O>>,
     _marker: std::marker::PhantomData<fn() -> O>,
 }
 
@@ -394,6 +404,7 @@ where
             name,
             sub_type,
             serdes,
+            summary,
             ..
         } = self;
         let child_ctx = ctx.new_child(&positional_id, name.as_deref());
@@ -417,6 +428,7 @@ where
                 name,
                 sub_type,
                 serdes,
+                summary,
                 _marker: std::marker::PhantomData,
             },
         })
@@ -507,6 +519,7 @@ where
             name,
             sub_type,
             serdes,
+            summary,
             ..
         } = self;
         let sub_type = sub_type.as_str();
@@ -584,12 +597,34 @@ where
                             .with_wire(wire));
                     }
                 };
+                // A result too large to checkpoint is decoded before the
+                // write, so the summary sees the value the caller gets. Its
+                // decode error is routed only after the write, because the
+                // body ran and its success needs a record.
+                let (payload, decoded) = if serialized.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
+                    let decoded = ctx
+                        .hold_activity(serdes.deserialize(serialized, serdes_ctx.clone()))
+                        .await;
+                    let payload = match (&decoded, &summary) {
+                        (Ok(value), Some(summary)) => summary(value),
+                        _ => String::new(),
+                    };
+                    (payload, Some(decoded))
+                } else {
+                    (serialized, None)
+                };
                 ctx.await_retained_start(&wire_id, start, OperationAction::Succeed)
                     .await?;
-                let update =
-                    build_succeed_update(&wire_id, name.as_deref(), sub_type, &ctx, &serialized);
-                // The end hook reports the payload the update carries: none
-                // for a `ReplayChildren` result.
+                let update = build_succeed_update(
+                    &wire_id,
+                    name.as_deref(),
+                    sub_type,
+                    &ctx,
+                    &payload,
+                    decoded.is_some(),
+                );
+                // The end hook reports the payload the update carries: the
+                // summary, or `""`, for a `ReplayChildren` result.
                 let result = update.payload().map(str::to_owned);
                 if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
                     // Audit (#43): child-context SUCCEED: the closure
@@ -611,8 +646,17 @@ where
                     crate::plugin::operation_ended(plugins, &info);
                 }
 
-                // Round-trip deserialize for consistency (first-run == replay).
-                deserialize_value(&ctx, name.as_deref(), serialized, &serdes, serdes_ctx).await
+                match decoded {
+                    Some(Ok(value)) => Ok(value),
+                    Some(Err(err)) => {
+                        Err(deserialize_failure(&ctx, name.as_deref(), &wire_id, err).await)
+                    }
+                    // Round-trip deserialize for consistency (first-run ==
+                    // replay).
+                    None => {
+                        deserialize_value(&ctx, name.as_deref(), payload, &serdes, serdes_ctx).await
+                    }
+                }
             }
             (ChildRunMode::Live, Err((child_err, wire))) => {
                 // Failure: checkpoint FAIL with error details. A runner's
@@ -697,19 +741,19 @@ fn build_update(
         .expect("all required OperationUpdate fields set")
 }
 
-/// Builds the Succeed `OperationUpdate` for a live child result, choosing
-/// between the two payload paths: a result within the checkpoint size limit
-/// travels inline, while a larger one switches the operation to
-/// `ReplayChildren` mode (no payload; the backend preserves the child
-/// operations and the body re-executes on replay to reconstruct it).
-/// Within the plugin child operations depth of `ctx`, an inline result
-/// also carries `ReplayChildren`.
+/// Builds the Succeed `OperationUpdate` for a live child result with
+/// `payload`. An `oversized` result switches the operation to
+/// `ReplayChildren` mode: `payload` is then its summary, or `""`, the
+/// backend preserves the child operations, and the body re-executes on
+/// replay to reconstruct the result. Within the plugin child operations
+/// depth of `ctx`, a result that fits also carries `ReplayChildren`.
 fn build_succeed_update(
     wire_id: &str,
     name: Option<&str>,
     sub_type: &str,
     ctx: &DurableContext,
-    serialized: &str,
+    payload: &str,
+    oversized: bool,
 ) -> OperationUpdate {
     let mut succeed_builder = OperationUpdate::builder()
         .id(wire_id.to_owned())
@@ -722,25 +766,15 @@ fn build_succeed_update(
     if let Some(parent_wire) = ctx.parent_wire_id() {
         succeed_builder = succeed_builder.parent_id(parent_wire);
     }
-    // Check payload size: if >256KB, use ReplayChildren mode.
-    if serialized.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
+    succeed_builder = succeed_builder.payload(payload.to_owned());
+    // Within the plugin child operations depth, the record keeps its
+    // children for later invocations.
+    if oversized || ctx.preserves_children(1) {
         succeed_builder = succeed_builder.context_options(
             aws_sdk_lambda::types::ContextOptions::builder()
                 .replay_children(true)
                 .build(),
         );
-        // Don't include the payload: backend preserves child ops.
-    } else {
-        succeed_builder = succeed_builder.payload(serialized.to_owned());
-        // Within the plugin child operations depth, the record keeps its
-        // children for later invocations.
-        if ctx.preserves_children(1) {
-            succeed_builder = succeed_builder.context_options(
-                aws_sdk_lambda::types::ContextOptions::builder()
-                    .replay_children(true)
-                    .build(),
-            );
-        }
     }
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     succeed_builder
@@ -910,13 +944,23 @@ async fn deserialize_value<O, S: Serdes<O>>(
         .await
     {
         Ok(value) => Ok(value),
-        Err(err) => {
-            let e = ctx
-                .route_serdes_error("deserialize", &operation_id, name, err)
-                .await;
-            Err(child_internal_error(&format!("deserialize result: {e}")))
-        }
+        Err(err) => Err(deserialize_failure(ctx, name, &operation_id, err).await),
     }
+}
+
+/// The error of a failed decode of the result of `operation_id`. A marked
+/// error ends the invocation ([`DurableContext::route_serdes_error`]); any
+/// other error becomes `Internal`.
+async fn deserialize_failure(
+    ctx: &DurableContext,
+    name: Option<&str>,
+    operation_id: &str,
+    err: crate::BoxError,
+) -> OperationError {
+    let e = ctx
+        .route_serdes_error("deserialize", operation_id, name, err)
+        .await;
+    child_internal_error(&format!("deserialize result: {e}"))
 }
 
 /// Constructs a `ChildContextError::Internal` wrapped as an
@@ -1683,7 +1727,7 @@ mod tests {
                 .and_then(aws_sdk_lambda::types::ContextOptions::replay_children),
             Some(true)
         );
-        assert_eq!(succeed.payload(), None);
+        assert_eq!(succeed.payload(), Some(""));
         assert_eq!(succeed.sub_type(), Some("Checkout"));
     }
 
@@ -2052,5 +2096,213 @@ mod tests {
 
         // Replay succeeds: ownership check passes (same task).
         assert_eq!(result.expect("should succeed"), 42);
+    }
+
+    /// A child whose result is the 300 KiB string, named `big`, with the
+    /// summary `len=<length>` that counts its calls in `calls`.
+    async fn run_big_child(
+        ctx: &DurableContext,
+        value: String,
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<String, OperationError> {
+        let calls = Arc::clone(calls);
+        ctx.run_in_child_context(move |_child| async move { Ok(value) })
+            .name("big")
+            .summary(move |s: &String| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("len={}", s.len())
+            })
+            .await
+    }
+
+    /// An oversized child records its summary as the `ReplayChildren`
+    /// payload, and the summary runs once.
+    #[tokio::test]
+    async fn child_summary_written_when_oversized() {
+        let (ctx, client) = live_ctx();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let value = run_big_child(&ctx, "x".repeat(300 * 1024), &calls)
+            .await
+            .expect("child succeeds");
+        assert_eq!(value.len(), 300 * 1024);
+        let succeed = named_update(&client.recorded_updates(), "big", &OperationAction::Succeed);
+        assert_eq!(has_replay_children(&succeed), Some(true));
+        assert_eq!(succeed.payload(), Some("len=307200"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A result that fits is recorded as before, and the summary is not
+    /// called.
+    #[tokio::test]
+    async fn child_summary_not_called_under_limit() {
+        let (ctx, client) = live_ctx();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let value = run_big_child(&ctx, "small".to_owned(), &calls)
+            .await
+            .expect("child succeeds");
+        assert_eq!(value, "small");
+        let succeed = named_update(&client.recorded_updates(), "big", &OperationAction::Succeed);
+        assert_eq!(succeed.payload(), Some("\"small\""));
+        assert!(succeed.context_options().is_none(), "{succeed:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// An oversized child without a summary records the payload `""`.
+    #[tokio::test]
+    async fn oversized_child_without_summary_writes_empty_payload() {
+        let (ctx, client) = live_ctx();
+        let value: String = ctx
+            .run_in_child_context(|_child| async { Ok("x".repeat(300 * 1024)) })
+            .name("big")
+            .await
+            .expect("child succeeds");
+        assert_eq!(value.len(), 300 * 1024);
+        let succeed = named_update(&client.recorded_updates(), "big", &OperationAction::Succeed);
+        assert_eq!(has_replay_children(&succeed), Some(true));
+        assert_eq!(succeed.payload(), Some(""));
+    }
+
+    /// A serdes that encodes a `String` as JSON and appends `!` to every
+    /// decoded value, counting its decodes in `decodes`.
+    struct SuffixOnDecode {
+        decodes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Serdes<String> for SuffixOnDecode {
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            value: String,
+            _context: SerdesContext,
+        ) -> Result<String, crate::BoxError> {
+            Ok(serde_json::to_string(&value)?)
+        }
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            wire: String,
+            _context: SerdesContext,
+        ) -> Result<String, crate::BoxError> {
+            self.decodes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let value: String = serde_json::from_str(&wire)?;
+            Ok(format!("{value}!"))
+        }
+    }
+
+    /// An oversized child decodes its serialized result once, passes the
+    /// decoded value to the summary, and returns that same value.
+    #[tokio::test]
+    async fn oversized_child_summary_sees_decoded_value_with_one_decode() {
+        let (ctx, client) = live_ctx();
+        let decodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let value: String = ctx
+            .run_in_child_context(|_child| async { Ok("x".repeat(300 * 1024)) })
+            .name("big")
+            .serdes(SuffixOnDecode {
+                decodes: Arc::clone(&decodes),
+            })
+            .summary(|s: &String| format!("len={} last={:?}", s.len(), s.chars().last()))
+            .await
+            .expect("child succeeds");
+        assert_eq!(value.len(), 300 * 1024 + 1);
+        assert!(value.ends_with("x!"), "the caller gets the decoded value");
+        let succeed = named_update(&client.recorded_updates(), "big", &OperationAction::Succeed);
+        assert_eq!(has_replay_children(&succeed), Some(true));
+        assert_eq!(succeed.payload(), Some("len=307201 last=Some('!')"));
+        assert_eq!(decodes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A serdes that encodes JSON and fails every decode, with a marked
+    /// error when `marked` is set.
+    struct DecodeFailure {
+        marked: bool,
+    }
+
+    impl<T: serde::Serialize + Send + 'static> Serdes<T> for DecodeFailure {
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            value: T,
+            _context: SerdesContext,
+        ) -> Result<String, crate::BoxError> {
+            Ok(serde_json::to_string(&value)?)
+        }
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            _wire: String,
+            _context: SerdesContext,
+        ) -> Result<T, crate::BoxError> {
+            if self.marked {
+                Err(crate::serdes::RetryableSerdesError::new("injected decode failure").into())
+            } else {
+                Err("injected decode failure".into())
+            }
+        }
+    }
+
+    /// An oversized result whose decode fails records the success with the
+    /// payload `""`, without calling the summary, and then returns the
+    /// decode error (a) or ends the invocation for a marked error (b).
+    #[tokio::test]
+    async fn oversized_child_decode_failure_records_success_then_routes() {
+        let child =
+            |ctx: &DurableContext, marked: bool, calls: &Arc<std::sync::atomic::AtomicUsize>| {
+                let calls = Arc::clone(calls);
+                ctx.run_in_child_context(|_child| async { Ok("x".repeat(300 * 1024)) })
+                    .name("big")
+                    .serdes(DecodeFailure { marked })
+                    .summary(move |s: &String| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        format!("len={}", s.len())
+                    })
+            };
+        let assert_recorded = |client: &crate::client::InMemoryExecutionClient| {
+            let succeed =
+                named_update(&client.recorded_updates(), "big", &OperationAction::Succeed);
+            assert_eq!(has_replay_children(&succeed), Some(true));
+            assert_eq!(succeed.payload(), Some(""));
+        };
+
+        // (a) An unmarked error is the deserialize helper's error.
+        let (ctx, client) = live_ctx();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let err = child(&ctx, false, &calls)
+            .await
+            .expect_err("the decode fails");
+        assert!(
+            matches!(
+                err.kind(),
+                OperationErrorKind::ChildContext(c) if matches!(c.kind(), ChildContextErrorKind::Internal)
+            ),
+            "{err:?}"
+        );
+        let chain = crate::error::chain_string(&err);
+        assert!(
+            chain.contains("deserialize result: injected decode failure"),
+            "{chain}"
+        );
+        assert_recorded(&client);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // (b) A marked error ends the invocation, with the success recorded.
+        let (ctx, client) = live_ctx();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let signal = Arc::clone(ctx.coordinator());
+        crate::driver::test_support::expect_serdes_fault(
+            ctx.clone(),
+            Arc::clone(ctx.task_ownership()),
+            signal,
+            child(&ctx, true, &calls),
+            "serdes deserialize failed for operation \"big\"",
+        )
+        .await;
+        assert_recorded(&client);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

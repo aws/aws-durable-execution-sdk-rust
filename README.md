@@ -691,6 +691,17 @@ let greeting = ctx
 When a child context's body returns, an operation it started and did not
 await writes no further checkpoint, and awaiting it never resolves.
 
+The body should run at least one durable operation. Its result is saved,
+so a replay returns it without running the body, with three exceptions: a
+body that returns an error is not retried as a step is, a result over
+256 KiB makes the body run again on every replay to rebuild it, and so does
+a context that `plugin_child_operations_depth` preserves. So put plain
+computation in a step. An oversized result records the payload `""`, or the
+output of `.summary(...)`, which receives the result and is called only
+when the serialized result is over 256 KiB. The summary is for
+observability: replay never reads it, and it must stay under 256 KiB.
+`with_retry` takes the same `.summary(...)` for its block.
+
 A child context records the subtype `RunInChildContext`, and
 `.sub_type(...)` records an `OperationSubType` of your choice instead, as
 on a step. Replay compares the subtype, so changing it on an existing
@@ -828,6 +839,11 @@ first item failure fails the batch, matching the Python and JS SDKs.
 Configuring any criterion, including a predicate, replaces that implicit
 fail-fast: use `with_tolerated_failure_count(0)` for explicit fail-fast, or
 `with_tolerated_failure_percentage(100.0)` to tolerate all failures.
+
+When a batch result is over 256 KiB, the batch records a summary of its
+outcome instead, and `.summary(...)` adds the output of a function of the
+`BatchResult` under that record's last key, `summary`, which replay never
+reads.
 
 A `CompletionConfig` can end the batch early with fixed thresholds.
 `with_min_successful(n)` stops once `n` items succeed, and

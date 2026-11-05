@@ -9884,6 +9884,432 @@ mod tests {
         assert_eq!(result.output(), Some(&307_200));
     }
 
+    // Issue #137: summaries of oversized children and batches.
+
+    /// An oversized child records its summary, and the replay after the
+    /// wait runs the body again and ignores the summary.
+    #[tokio::test]
+    async fn child_summary_ignored_on_replay() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let calls = Arc::clone(&handler_calls);
+                    async move {
+                        let big = ctx
+                            .run_in_child_context(|_child| async { Ok("x".repeat(300 * 1024)) })
+                            .name("big")
+                            .summary(move |s: &String| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                format!("len={}", s.len())
+                            })
+                            .await?;
+                        ctx.wait(std::time::Duration::from_secs(1))
+                            .name("pause")
+                            .await?;
+                        Ok::<_, BoxError>(big.len())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&307_200));
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the replay calls no summary"
+        );
+        let big = result.operation("big").expect("the child's record");
+        assert_eq!(big.result(), Some("len=307200"));
+        assert!(
+            matches!(big.details(), TestOperationDetails::Context(c) if c.replay_children()),
+            "{:?}",
+            big.details()
+        );
+    }
+
+    /// The batch record `m` of an oversized batch, parsed as JSON, with
+    /// the assertions every oversized batch summary shares.
+    fn oversized_batch_record(result: &TestResult<Vec<usize>>, type_name: &str) {
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&vec![153_600, 153_600]));
+        let text = result
+            .operation("m")
+            .and_then(TestOperation::result)
+            .expect("the batch record has a payload");
+        let record: serde_json::Value = serde_json::from_str(text).expect("the record is JSON");
+        assert_eq!(record["type"], type_name, "{text}");
+        assert_eq!(record["summary"], "ok=2", "{text}");
+        assert_eq!(record["totalCount"], 2, "{text}");
+        assert_eq!(record["itemStatuses"], "SS", "{text}");
+    }
+
+    /// An oversized map stores the caller's summary under the key
+    /// `summary` of its `MapResult` record, and replays from the record.
+    #[tokio::test]
+    async fn map_summary_stored_under_summary_key() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let calls = Arc::clone(&handler_calls);
+                    async move {
+                        let items = ctx
+                            .map(vec![0_u32, 1], |child, _item, _idx| async move {
+                                Ok(child
+                                    .step(|_| async { Ok("x".repeat(150 * 1024)) })
+                                    .name("big")
+                                    .await?)
+                            })
+                            .name("m")
+                            .summary(move |r| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                format!("ok={}", r.success_count())
+                            })
+                            .await?;
+                        ctx.wait(std::time::Duration::from_secs(1))
+                            .name("pause")
+                            .await?;
+                        Ok::<_, BoxError>(items.iter().map(String::len).collect::<Vec<_>>())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        oversized_batch_record(&result, "MapResult");
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the write calls the summary once, and the replay calls none"
+        );
+    }
+
+    /// An oversized parallel stores the caller's summary under the key
+    /// `summary` of its `ParallelResult` record.
+    #[tokio::test]
+    async fn parallel_summary_stored_under_summary_key() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let calls = Arc::clone(&handler_calls);
+                    async move {
+                        let branch = |name: &'static str| {
+                            crate::Branch::new(name, |child| async move {
+                                Ok(child
+                                    .step(|_| async { Ok("x".repeat(150 * 1024)) })
+                                    .name("big")
+                                    .await?)
+                            })
+                        };
+                        let items = ctx
+                            .parallel(vec![branch("a"), branch("b")])
+                            .name("m")
+                            .summary(move |r| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                format!("ok={}", r.success_count())
+                            })
+                            .await?;
+                        ctx.wait(std::time::Duration::from_secs(1))
+                            .name("pause")
+                            .await?;
+                        Ok::<_, BoxError>(items.iter().map(String::len).collect::<Vec<_>>())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        oversized_batch_record(&result, "ParallelResult");
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the write calls the summary once, and the replay calls none"
+        );
+    }
+
+    /// A batch whose record fits never calls the summary, and records the
+    /// normal batch payload.
+    #[tokio::test]
+    async fn map_summary_not_called_under_limit() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let calls = Arc::clone(&handler_calls);
+                    async move {
+                        let items = ctx
+                            .map(vec![0_u32, 1], |_child, item, _idx| async move { Ok(item) })
+                            .name("m")
+                            .summary(move |_r| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                "unused".to_owned()
+                            })
+                            .await?;
+                        Ok::<_, BoxError>(items)
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&vec![0, 1]));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let text = result
+            .operation("m")
+            .and_then(TestOperation::result)
+            .expect("the batch record has a payload");
+        let record: serde_json::Value = serde_json::from_str(text).expect("the record is JSON");
+        assert_eq!(record["completionReason"], "ALL_COMPLETED", "{text}");
+        assert_eq!(record["all"].as_array().map(Vec::len), Some(2), "{text}");
+        assert!(record.get("summary").is_none(), "{text}");
+    }
+
+    /// A `with_retry` block's summary becomes the payload of the block's
+    /// own oversized record.
+    #[tokio::test]
+    async fn with_retry_summary_forwarded_to_block() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let calls = Arc::clone(&handler_calls);
+                    async move {
+                        let big = ctx
+                            .with_retry(|_attempt_ctx, _attempt| async {
+                                Ok("x".repeat(300 * 1024))
+                            })
+                            .name("block")
+                            .summary(move |s: &String| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                format!("len={}", s.len())
+                            })
+                            .await?;
+                        Ok::<_, BoxError>(big.len())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            result.operation("block").and_then(TestOperation::result),
+            Some("len=307200")
+        );
+        // The attempt context records its oversized result without the
+        // summary, so the summary ran once, for the block's own record.
+        assert_eq!(
+            result
+                .operation("attempt-1")
+                .and_then(TestOperation::result),
+            Some("")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A `with_retry` block whose result fits never calls its summary.
+    #[tokio::test]
+    async fn with_retry_summary_not_called_under_limit() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let calls = Arc::clone(&handler_calls);
+                    async move {
+                        let value = ctx
+                            .with_retry(|_attempt_ctx, _attempt| async { Ok("small".to_owned()) })
+                            .name("block")
+                            .summary(move |_s: &String| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                "unused".to_owned()
+                            })
+                            .await?;
+                        Ok::<_, BoxError>(value)
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output().map(String::as_str), Some("small"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A `with_retry` block without a child context writes no record of
+    /// its own, so its summary is never called, even for an oversized
+    /// result.
+    #[tokio::test]
+    async fn with_retry_summary_never_called_without_child_context() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let calls = Arc::clone(&handler_calls);
+                    async move {
+                        let big = ctx
+                            .with_retry(|_attempt_ctx, _attempt| async {
+                                Ok("x".repeat(300 * 1024))
+                            })
+                            .name("block")
+                            .without_child_context()
+                            .summary(move |_s: &String| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                "unused".to_owned()
+                            })
+                            .await?;
+                        Ok::<_, BoxError>(big.len())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&307_200));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            result
+                .operation("block-attempt-1")
+                .and_then(TestOperation::result),
+            Some("")
+        );
+    }
+
+    /// An oversized `Flat` map calls its summary once, when it writes the
+    /// record, and the replay after the wait runs the items again to
+    /// rebuild the result without calling the summary.
+    #[tokio::test]
+    async fn flat_map_summary_called_once_and_items_rebuilt() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let bodies = Arc::new(AtomicU32::new(0));
+        let (handler_calls, handler_bodies) = (Arc::clone(&calls), Arc::clone(&bodies));
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let calls = Arc::clone(&handler_calls);
+                    let bodies = Arc::clone(&handler_bodies);
+                    async move {
+                        let items = ctx
+                            .map(vec![0_u32, 1], move |child, _item, _idx| {
+                                bodies.fetch_add(1, Ordering::SeqCst);
+                                async move {
+                                    Ok(child.step(|_| async { Ok("x".repeat(150 * 1024)) }).await?)
+                                }
+                            })
+                            .name("m")
+                            .nesting(crate::builders::map_parallel::NestingMode::Flat)
+                            .summary(move |r| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                format!("ok={}", r.success_count())
+                            })
+                            .await?;
+                        ctx.wait(std::time::Duration::from_secs(1))
+                            .name("pause")
+                            .await?;
+                        Ok::<_, BoxError>(items.iter().map(String::len).collect::<Vec<_>>())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        oversized_batch_record(&result, "MapResult");
+        assert_eq!(result.invocation_count(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            bodies.load(Ordering::SeqCst),
+            4,
+            "each Flat item runs once live and once to rebuild the result"
+        );
+    }
+
+    /// The summary set on a map or parallel reaches the batch record
+    /// through `.await_batch()` and `.spawn_batch()`, which build the
+    /// batch apart from `.await`.
+    #[tokio::test]
+    async fn batch_summary_kept_by_await_batch_and_spawn_batch() {
+        for (kind, spawn) in [
+            ("map", false),
+            ("map", true),
+            ("parallel", false),
+            ("parallel", true),
+        ] {
+            let result = LocalRunner::new()
+                .run(
+                    move |(), ctx: DurableContext| async move {
+                        let big = || async { Ok("x".repeat(150 * 1024)) };
+                        let batch = if kind == "map" {
+                            let builder = ctx
+                                .map(vec![0_u32, 1], move |child, _item, _idx| async move {
+                                    Ok(child.step(move |_| big()).name("big").await?)
+                                })
+                                .name("m")
+                                .summary(|r| format!("ok={}", r.success_count()));
+                            if spawn {
+                                builder.spawn_batch().await?
+                            } else {
+                                builder.await_batch().await?
+                            }
+                        } else {
+                            let branch = |name: &'static str| {
+                                crate::Branch::new(name, move |child| async move {
+                                    Ok(child.step(move |_| big()).name("big").await?)
+                                })
+                            };
+                            let builder = ctx
+                                .parallel(vec![branch("a"), branch("b")])
+                                .name("m")
+                                .summary(|r| format!("ok={}", r.success_count()));
+                            if spawn {
+                                builder.spawn_batch().await?
+                            } else {
+                                builder.await_batch().await?
+                            }
+                        };
+                        let items = batch.into_result()?;
+                        Ok::<_, BoxError>(
+                            items
+                                .results()
+                                .into_iter()
+                                .map(String::len)
+                                .collect::<Vec<_>>(),
+                        )
+                    },
+                    (),
+                )
+                .await
+                .expect("runner");
+            let type_name = if kind == "map" {
+                "MapResult"
+            } else {
+                "ParallelResult"
+            };
+            oversized_batch_record(&result, type_name);
+        }
+    }
+
     /// The service creates a callback in `Started`, so an open callback
     /// reports `OperationStatus::Started`, as under `CloudRunner`.
     #[tokio::test]

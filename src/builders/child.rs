@@ -53,6 +53,7 @@ pub struct ChildBuilder<O, F, Fut, S = JsonSerdes> {
     /// Whether the body is a user function. Only `with_retry` clears it,
     /// for its attempt children.
     user_function: crate::child::UserFunctionPolicy,
+    summary: Option<crate::child::ChildSummary<O>>,
     _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
@@ -81,6 +82,7 @@ where
             serdes: JsonSerdes,
             closure,
             user_function: crate::child::UserFunctionPolicy::Hooks,
+            summary: None,
             _marker: PhantomData,
         }
     }
@@ -174,8 +176,55 @@ where
             serdes,
             closure: self.closure,
             user_function: self.user_function,
+            summary: self.summary,
             _marker: PhantomData,
         }
+    }
+
+    /// Sets the payload recorded when the child's result is too large to
+    /// checkpoint.
+    ///
+    /// Called only when the serialized result is over 256 KiB. The child
+    /// then records its result with `ReplayChildren` and no value, so a
+    /// replay runs the body again to rebuild the result. The summary
+    /// receives the value the child returns, after the serdes round trip,
+    /// and its output becomes the record's payload. Without a summary the
+    /// payload is `""`. A result that fits is recorded as usual, and the
+    /// summary is not called.
+    ///
+    /// The output is observability only: replay never reads it. A replay
+    /// that rebuilds the result of a completed `ReplayChildren` record does
+    /// not call the summary; a child that is still running when an
+    /// invocation resumes it calls the summary when it completes with an
+    /// oversized result. Keep it under 256 KiB, because the service rejects
+    /// a larger payload. A second call replaces the first.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use aws_durable_execution_sdk as durable;
+    ///
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: durable::DurableContext,
+    /// ) -> Result<usize, durable::BoxError> {
+    ///     let report = ctx
+    ///         .run_in_child_context(|child| async move {
+    ///             let report = child
+    ///                 .step(|_| async { Ok("x".repeat(300 * 1024)) })
+    ///                 .name("render")
+    ///                 .await?;
+    ///             Ok(report)
+    ///         })
+    ///         .name("report")
+    ///         .summary(|report: &String| format!("len={}", report.len()))
+    ///         .await?;
+    ///     Ok(report.len())
+    /// }
+    /// ```
+    pub fn summary(mut self, summary: impl Fn(&O) -> String + Send + Sync + 'static) -> Self {
+        self.summary = Some(Box::new(summary));
+        self
     }
 
     /// Converts this builder into a [`DurableFuture`] without starting it.
@@ -297,6 +346,7 @@ where
             serdes: self.serdes,
             closure: self.closure,
             user_function: self.user_function,
+            summary: self.summary,
             _marker: PhantomData,
         };
 
@@ -352,5 +402,19 @@ mod tests {
             builder.sub_type.as_ref().map(OperationSubType::as_str),
             Some("Second")
         );
+    }
+
+    /// A second `summary` call replaces the first, and `serdes` keeps the
+    /// summary.
+    #[test]
+    fn summary_setter_replaces_and_survives_serdes() {
+        let ctx = DurableContext::test_context();
+        let builder = ctx
+            .run_in_child_context(|_child| async { Ok(1_u32) })
+            .summary(|v: &u32| format!("first {v}"))
+            .summary(|v: &u32| format!("second {v}"))
+            .serdes(std::sync::Arc::new(JsonSerdes));
+        let summary = builder.summary.as_ref().expect("the summary is kept");
+        assert_eq!(summary(&7), "second 7");
     }
 }
