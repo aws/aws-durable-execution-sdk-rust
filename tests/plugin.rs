@@ -2327,10 +2327,12 @@ async fn wait_for_callback_failure_hooks() {
                 FAILED,
                 Some("Declined".to_owned())
             ),
+            // The outer record carries the fixed external-failure type; the
+            // external caller's type stays on the callback's own record.
             (
                 Some("approve".to_owned()),
                 FAILED,
-                Some("Declined".to_owned())
+                Some("Callback.ExternalFailure".to_owned())
             ),
         ]
     );

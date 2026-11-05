@@ -666,14 +666,18 @@ fn serialize_handler_result<T: Serialize>(result: &T) -> Result<String, WireErro
 ///
 /// The wire type comes from the error's recorded wire identity when it
 /// has one (preserving the original type across boundaries), else from
-/// the kind's registry name. For callback external failures, the wire
-/// message is the externally reported message (not the full chain).
+/// the kind's registry name. For a callback external failure, the wire
+/// record is the one the operation recorded, so its message is the
+/// externally reported message (not the full chain). From
+/// `create_callback` that record is the external caller's own, type
+/// included; from `wait_for_callback` its type is
+/// `Callback.ExternalFailure` and it keeps the caller's message and data.
 fn wire_error_from_operation_error(err: &OperationError) -> WireError {
     if let OperationErrorKind::Callback(cb_err) = err.kind()
         && matches!(cb_err.kind(), CallbackErrorKind::ExternalFailure)
         && let Some(wire) = err.wire()
     {
-        // Report the external caller's own failure fields verbatim.
+        // Report the operation's recorded failure fields unchanged.
         return wire.clone();
     }
     error::wire_error_for(err, err.kind().wire_type_name())

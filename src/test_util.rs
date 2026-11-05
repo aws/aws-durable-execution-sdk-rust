@@ -6736,6 +6736,240 @@ mod tests {
         assert_eq!(cb_op.error_type(), Some("Declined"));
     }
 
+    /// What a `wait_for_callback` handler saw in one invocation: the
+    /// `CallbackErrorKind` name, then the wire type, message and data.
+    type WfcbObservation = (String, Option<String>, Option<String>, Option<String>);
+
+    /// How the submitter of [`run_wfcb_classification`] ends.
+    #[derive(Clone, Copy)]
+    enum Submitter {
+        /// It succeeds.
+        Succeeds,
+        /// It fails with a plain error, `submission failed`.
+        FailsUntyped,
+        /// It fails with `TypedError::with_type("PaymentError", "declined")`.
+        FailsTyped,
+    }
+
+    /// The run of a `wait_for_callback` named `approve` whose failure the
+    /// handler observes live and on replay.
+    struct WfcbClassification {
+        result: TestResult<String>,
+        /// One entry per invocation that read the failure.
+        seen: Vec<WfcbObservation>,
+        /// The `{:#}` text of the live error's source, when that source is
+        /// a `Step(ExecutionFailed)` operation error.
+        live_step_source: Option<String>,
+    }
+
+    /// Runs a handler that calls `wait_for_callback` and records the kind
+    /// and wire fields of its error outside any step, so a replay records
+    /// them again. When the kind is `expected`, the handler waits one
+    /// second, so a later invocation replays the failure, and returns
+    /// `output`; any other kind returns the error.
+    async fn run_wfcb_classification(
+        runner: LocalRunner,
+        submitter: Submitter,
+        expected: &'static str,
+        output: &'static str,
+    ) -> WfcbClassification {
+        let seen: Arc<Mutex<Vec<WfcbObservation>>> = Arc::default();
+        let live_source: Arc<Mutex<Option<String>>> = Arc::default();
+        let (seen_in, live_in) = (Arc::clone(&seen), Arc::clone(&live_source));
+        let result = runner
+            .run(
+                move |(), ctx: DurableContext| {
+                    let (seen, live_source) = (Arc::clone(&seen_in), Arc::clone(&live_in));
+                    async move {
+                        let outcome = ctx
+                            .wait_for_callback::<String, _, _>(move |_step_ctx, _id| async move {
+                                match submitter {
+                                    Submitter::Succeeds => Ok(()),
+                                    Submitter::FailsUntyped => Err("submission failed".into()),
+                                    Submitter::FailsTyped => Err(Box::new(
+                                        crate::TypedError::with_type("PaymentError", "declined"),
+                                    )
+                                        as BoxError),
+                                }
+                            })
+                            .name("approve")
+                            .submitter_retry(|_, _| RetryDecision::Stop)
+                            .await;
+                        let Err(err) = outcome else {
+                            return Err::<String, BoxError>("wait_for_callback succeeded".into());
+                        };
+                        let kind = match err.kind() {
+                            crate::OperationErrorKind::Callback(e) => format!("{:?}", e.kind()),
+                            other => format!("{other:?}"),
+                        };
+                        let field = |read: fn(&crate::WireError) -> Option<&str>| {
+                            err.wire().and_then(read).map(ToOwned::to_owned)
+                        };
+                        {
+                        let mut seen = seen.lock().expect("not poisoned");
+                        if seen.is_empty() {
+                            // The first invocation that reads the failure
+                            // is the live one.
+                            let step = std::error::Error::source(&err)
+                                .and_then(std::error::Error::source)
+                                .and_then(|s| s.downcast_ref::<crate::OperationError>())
+                                .filter(|op| {
+                                    matches!(
+                                        op.kind(),
+                                        crate::OperationErrorKind::Step(e)
+                                            if matches!(e.kind(), crate::StepErrorKind::ExecutionFailed)
+                                    )
+                                });
+                            *live_source.lock().expect("not poisoned") =
+                                step.map(|op| format!("{op:#}"));
+                        }
+                        seen.push((
+                            kind.clone(),
+                            field(crate::WireError::error_type),
+                            field(crate::WireError::error_message),
+                            field(crate::WireError::error_data),
+                        ));
+                        }
+                        if kind != expected {
+                            return Err(err.into());
+                        }
+                        ctx.wait(std::time::Duration::from_secs(1)).await?;
+                        Ok(output.to_owned())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        let seen = seen.lock().expect("not poisoned").clone();
+        let live_step_source = live_source.lock().expect("not poisoned").clone();
+        WfcbClassification {
+            result,
+            seen,
+            live_step_source,
+        }
+    }
+
+    /// The recorded outer FAIL type of the `wait_for_callback` named
+    /// `approve`.
+    fn approve_error_type(result: &TestResult<String>) -> Option<&str> {
+        result
+            .operation("approve")
+            .expect("the wait_for_callback is recorded")
+            .error_type()
+    }
+
+    #[tokio::test]
+    async fn wfcb_external_failure_same_kind_live_and_replay() {
+        let runner = LocalRunner::new().callback(CallbackReply::failure(
+            CallbackFailure::new("PaymentDeclined", "card declined")
+                .with_error_data(r#"{"code":7}"#),
+        ));
+        let run =
+            run_wfcb_classification(runner, Submitter::Succeeds, "ExternalFailure", "external")
+                .await;
+        assert!(run.result.is_success(), "{:?}", run.result.error_message());
+        assert_eq!(run.result.output().map(String::as_str), Some("external"));
+        let entry = (
+            "ExternalFailure".to_owned(),
+            Some("Callback.ExternalFailure".to_owned()),
+            Some("card declined".to_owned()),
+            Some(r#"{"code":7}"#.to_owned()),
+        );
+        assert_eq!(run.seen, [entry.clone(), entry]);
+        assert_eq!(
+            callback_record(&run.result).error_type(),
+            Some("PaymentDeclined")
+        );
+        assert_eq!(
+            approve_error_type(&run.result),
+            Some("Callback.ExternalFailure")
+        );
+    }
+
+    #[tokio::test]
+    async fn wfcb_submitter_failure_same_kind_live_and_replay() {
+        for (submitter, text) in [
+            (Submitter::FailsUntyped, "submission failed"),
+            (Submitter::FailsTyped, "declined"),
+        ] {
+            let run = run_wfcb_classification(
+                LocalRunner::new(),
+                submitter,
+                "SubmitterFailed",
+                "submitter",
+            )
+            .await;
+            assert!(run.result.is_success(), "{:?}", run.result.error_message());
+            let kinds: Vec<&str> = run.seen.iter().map(|e| e.0.as_str()).collect();
+            assert_eq!(kinds, ["SubmitterFailed", "SubmitterFailed"], "{text}");
+            assert_eq!(run.seen[0], run.seen[1], "{text}");
+            assert_eq!(
+                approve_error_type(&run.result),
+                Some("Callback.SubmitterFailed")
+            );
+            let message = run
+                .result
+                .operation("approve")
+                .and_then(TestOperation::error_message)
+                .unwrap_or_default();
+            assert!(message.contains(text), "{message}");
+            let live = run
+                .live_step_source
+                .expect("the live source is the step error");
+            assert!(live.contains(text), "{live}");
+        }
+    }
+
+    #[tokio::test]
+    async fn wfcb_timeout_same_kind_live_and_replay() {
+        let runner = LocalRunner::new().callback(CallbackReply::timeout());
+        let run =
+            run_wfcb_classification(runner, Submitter::Succeeds, "TimedOut", "timed out").await;
+        assert!(run.result.is_success(), "{:?}", run.result.error_message());
+        let kinds: Vec<&str> = run.seen.iter().map(|e| e.0.as_str()).collect();
+        assert_eq!(kinds, ["TimedOut", "TimedOut"]);
+        assert_eq!(run.seen[0], run.seen[1]);
+        assert_eq!(approve_error_type(&run.result), Some("Callback.Timeout"));
+    }
+
+    #[tokio::test]
+    async fn wfcb_heartbeat_timeout_same_kind_live_and_replay() {
+        let runner = LocalRunner::new().callback(CallbackReply::heartbeat_timeout());
+        let run = run_wfcb_classification(
+            runner,
+            Submitter::Succeeds,
+            "HeartbeatTimedOut",
+            "heartbeat",
+        )
+        .await;
+        assert!(run.result.is_success(), "{:?}", run.result.error_message());
+        let kinds: Vec<&str> = run.seen.iter().map(|e| e.0.as_str()).collect();
+        assert_eq!(kinds, ["HeartbeatTimedOut", "HeartbeatTimedOut"]);
+        assert_eq!(run.seen[0], run.seen[1]);
+        assert_eq!(approve_error_type(&run.result), Some("Callback.Heartbeat"));
+    }
+
+    #[tokio::test]
+    async fn wfcb_unmarked_decode_failure_same_kind_live_and_replay() {
+        let runner = LocalRunner::new().callback(CallbackReply::raw("not json"));
+        let run = run_wfcb_classification(
+            runner,
+            Submitter::Succeeds,
+            "DeserializationFailed",
+            "undecodable",
+        )
+        .await;
+        assert!(run.result.is_success(), "{:?}", run.result.error_message());
+        let kinds: Vec<&str> = run.seen.iter().map(|e| e.0.as_str()).collect();
+        assert_eq!(kinds, ["DeserializationFailed", "DeserializationFailed"]);
+        assert_eq!(run.seen[0], run.seen[1]);
+        assert_eq!(
+            approve_error_type(&run.result),
+            Some("Callback.DeserializationFailed")
+        );
+    }
+
     #[tokio::test]
     async fn callback_for_targets_named_callbacks() {
         let result = LocalRunner::new()

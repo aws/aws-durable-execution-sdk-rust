@@ -367,8 +367,10 @@ where
             emit();
             Ok(Ok(value))
         }
-        CheckpointStatus::Failed => {
-            // Callback failed externally.
+        CheckpointStatus::Failed | CheckpointStatus::Cancelled | CheckpointStatus::Stopped => {
+            // Callback failed externally, or the service cancelled or
+            // stopped it: every one settles as an external failure, as JS
+            // rejects the callback promise with `CallbackExternalError`.
             emit();
             let wire = ctx.checkpoint_wire_error(positional_id).unwrap_or_default();
             Ok(Err(replayed_callback_error(
@@ -379,21 +381,14 @@ where
         }
         CheckpointStatus::TimedOut => {
             // Callback timed out. The wire record, when the backend attached
-            // one, still travels on the error. A missed heartbeat also ends
-            // in `TimedOut`; its record carries the `Callback.Heartbeat`
-            // type.
+            // one, still travels on the error.
             emit();
-            let wire = ctx.checkpoint_wire_error(positional_id).unwrap_or_default();
-            let kind = if wire.error_type() == Some("Callback.Heartbeat") {
-                CallbackErrorKind::HeartbeatTimedOut
-            } else {
-                CallbackErrorKind::TimedOut
-            };
-            Ok(Err(OperationError::from_kind(
-                OperationErrorKind::Callback(CallbackError::new(kind, None)),
-            )
-            .with_operation(&wire_id, view.status.wire_str())
-            .with_wire(wire)))
+            let wire = ctx.checkpoint_wire_error(positional_id);
+            Ok(Err(timed_out_callback_error(
+                wire,
+                &wire_id,
+                view.status.wire_str(),
+            )))
         }
         _ => {
             // Unexpected status: treat as internal error.
@@ -403,6 +398,29 @@ where
             )))
         }
     }
+}
+
+/// The error of a `TIMED_OUT` callback record whose recorded failure is
+/// `wire`.
+///
+/// The service records a missed heartbeat as a `TIMED_OUT` callback with
+/// the type `Callback.Heartbeat`, which gives `HeartbeatTimedOut`. Every
+/// other type, and a record with no failure, gives `TimedOut`. The error
+/// has no source and carries the recorded wire.
+fn timed_out_callback_error(
+    wire: Option<crate::error::WireError>,
+    wire_id: &str,
+    status: &str,
+) -> OperationError {
+    let wire = wire.unwrap_or_default();
+    let kind = if wire.error_type() == Some("Callback.Heartbeat") {
+        CallbackErrorKind::HeartbeatTimedOut
+    } else {
+        CallbackErrorKind::TimedOut
+    };
+    OperationError::from_kind(OperationErrorKind::Callback(CallbackError::new(kind, None)))
+        .with_operation(wire_id, status)
+        .with_wire(wire)
 }
 
 /// Internal state for `wait_for_callback` execution passed from the builder.
@@ -852,9 +870,7 @@ where
                         .with_replay(false);
                     crate::plugin::operation_ended(plugins, &info);
                 }
-                Err(err
-                    .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
-                    .with_wire(wire))
+                Err(wfcb_live_error(err, wire, &wire_id))
             }
         }
     }
@@ -916,13 +932,16 @@ where
         },
         _marker: std::marker::PhantomData,
     };
-    let step_result = step_exec.execute().await;
-    if let Err(e) = step_result {
-        // Map step errors to child-context errors for consistent error
-        // propagation through the WaitForCallback context boundary.
-        return Err(OperationError::from_kind(OperationErrorKind::ChildContext(
-            ChildContextError::new(ChildContextErrorKind::ChildFailed, Some(Box::new(e))),
-        )));
+    if let Err(e) = step_exec.execute().await {
+        // A failed submitter step is a callback error, as JS maps it to
+        // `CallbackSubmitterError`. Any other error (an SDK error the step
+        // operation raised outside the body) passes through unchanged.
+        if matches!(e.kind(), OperationErrorKind::Step(_)) {
+            return Err(OperationError::from_kind(OperationErrorKind::Callback(
+                CallbackError::new(CallbackErrorKind::SubmitterFailed, Some(Box::new(e))),
+            )));
+        }
+        return Err(e);
     }
 
     // Step 3: await callback result.
@@ -1006,30 +1025,70 @@ fn build_wfcb_fail_update(
         .expect("all required OperationUpdate fields set")
 }
 
-/// Classifies a callback error kind from the wire `error_type`.
+/// The `ErrorType` the outer `wait_for_callback` FAIL record carries for an
+/// external failure, including a callback that ended `CANCELLED` or
+/// `STOPPED`.
+const WFCB_EXTERNAL_FAILURE: &str = "Callback.ExternalFailure";
+
+/// The `ErrorType` of a callback timeout.
+const CALLBACK_TIMEOUT: &str = "Callback.Timeout";
+
+/// The `ErrorType` of a missed callback heartbeat.
+const CALLBACK_HEARTBEAT: &str = "Callback.Heartbeat";
+
+/// The `ErrorType` the outer record carries for a failed submitter.
+const WFCB_SUBMITTER_FAILED: &str = "Callback.SubmitterFailed";
+
+/// The `ErrorType` the outer record carries for an internal error, and for
+/// any body error that is not a callback error.
+const WFCB_INTERNAL: &str = "Callback.Internal";
+
+/// The `ErrorType` the outer record carries for a payload decode failure.
+const WFCB_DESERIALIZATION_FAILED: &str = "Callback.DeserializationFailed";
+
+/// Classifies the kind of a callback operation's own failure record from
+/// its wire `error_type`.
 ///
-/// The registry is scoped to the SDK's own wire discriminators
-/// (`Callback.Timeout`, `Callback.Heartbeat`); any other type is an
+/// The external caller sets the type of a callback's own `FAILED` record,
+/// so only the two timeout discriminators classify; any other type is an
 /// external failure, whose reported fields travel as wire data on the
 /// error's source rather than as kind fields.
 fn classify_callback_error(error_type: Option<&str>) -> CallbackErrorKind {
     match error_type {
-        Some("Callback.Timeout") => CallbackErrorKind::TimedOut,
-        Some("Callback.Heartbeat") => CallbackErrorKind::HeartbeatTimedOut,
+        Some(CALLBACK_TIMEOUT) => CallbackErrorKind::TimedOut,
+        Some(CALLBACK_HEARTBEAT) => CallbackErrorKind::HeartbeatTimedOut,
         _ => CallbackErrorKind::ExternalFailure,
     }
 }
 
-/// Rebuilds a callback `OperationError` from a recorded wire failure.
+/// Classifies the kind of an outer `wait_for_callback` FAIL record from its
+/// wire `error_type`.
+///
+/// Only the SDK writes that record, with one fixed type per kind (see
+/// [`extract_wire_error`]). A type outside the fixed set, or no type,
+/// gives `ExternalFailure`.
+fn classify_wfcb_outer_error(error_type: Option<&str>) -> CallbackErrorKind {
+    match error_type {
+        Some(CALLBACK_TIMEOUT) => CallbackErrorKind::TimedOut,
+        Some(CALLBACK_HEARTBEAT) => CallbackErrorKind::HeartbeatTimedOut,
+        Some(WFCB_SUBMITTER_FAILED) => CallbackErrorKind::SubmitterFailed,
+        Some(WFCB_INTERNAL) => CallbackErrorKind::Internal,
+        Some(WFCB_DESERIALIZATION_FAILED) => CallbackErrorKind::DeserializationFailed,
+        _ => CallbackErrorKind::ExternalFailure,
+    }
+}
+
+/// Rebuilds a callback `OperationError` of `kind` from a recorded wire
+/// failure.
 ///
 /// The kind classifies; the recorded fields travel on the synthetic
 /// source and the attached wire record.
-fn replayed_callback_error(
+fn replayed_callback_error_with_kind(
     wire: crate::error::WireError,
     wire_id: &str,
     status: &str,
+    kind: CallbackErrorKind,
 ) -> OperationError {
-    let kind = classify_callback_error(wire.error_type());
     let source = match kind {
         // Timeouts carry no foreign cause; the kind is the whole story.
         CallbackErrorKind::TimedOut | CallbackErrorKind::HeartbeatTimedOut => None,
@@ -1042,62 +1101,89 @@ fn replayed_callback_error(
     .with_wire(wire)
 }
 
-/// Constructs the appropriate error for a failed `WaitForCallback` context.
-fn wfcb_failed_error(wire: crate::error::WireError, wire_id: &str, status: &str) -> OperationError {
-    // Propagate callback errors directly (they bubble through the
-    // child-context wrapping on the wire).
-    if matches!(
-        wire.error_type(),
-        Some("Callback.Timeout" | "Callback.Heartbeat" | "CallbackError")
-    ) {
-        return replayed_callback_error(wire, wire_id, status);
-    }
-
-    OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
-        ChildContextErrorKind::ChildFailed,
-        Some(crate::error::ReplayedFailure::source_from(wire.clone())),
-    )))
-    .with_operation(wire_id, status)
-    .with_wire(wire)
+/// Rebuilds a callback `OperationError` from a callback operation's own
+/// recorded failure, classified by [`classify_callback_error`].
+fn replayed_callback_error(
+    wire: crate::error::WireError,
+    wire_id: &str,
+    status: &str,
+) -> OperationError {
+    let kind = classify_callback_error(wire.error_type());
+    replayed_callback_error_with_kind(wire, wire_id, status, kind)
 }
 
-/// Derives the wire failure record for an `OperationError` crossing the
-/// wait-for-callback context boundary.
+/// Constructs the error of a failed `WaitForCallback` context from its
+/// recorded outer failure, classified by [`classify_wfcb_outer_error`].
+fn wfcb_failed_error(wire: crate::error::WireError, wire_id: &str, status: &str) -> OperationError {
+    let kind = classify_wfcb_outer_error(wire.error_type());
+    replayed_callback_error_with_kind(wire, wire_id, status, kind)
+}
+
+/// The error a live `wait_for_callback` returns for the body error `err`,
+/// whose outer FAIL record is `wire`.
 ///
-/// Callback kinds map to their dedicated wire discriminators; an external
-/// failure re-reports the fields the external caller supplied (from the
-/// error's attached wire record). Everything else goes through the
-/// standard wire derivation, flattening once.
+/// Its kind, operation and wire equal those that replaying `wire` with
+/// [`wfcb_failed_error`] gives. An external failure is rebuilt from the
+/// outer record, so the external caller's type does not reach the live
+/// source chain. A body error that is not a callback error becomes
+/// `Callback(Internal)` with the original error as its source. Every other
+/// callback error keeps its live source.
+fn wfcb_live_error(
+    err: OperationError,
+    wire: crate::error::WireError,
+    wire_id: &str,
+) -> OperationError {
+    let status = CheckpointStatus::Failed.wire_str();
+    match err.kind() {
+        OperationErrorKind::Callback(cb_err)
+            if matches!(cb_err.kind(), CallbackErrorKind::ExternalFailure) =>
+        {
+            wfcb_failed_error(wire, wire_id, status)
+        }
+        OperationErrorKind::Callback(_) => err.with_operation(wire_id, status).with_wire(wire),
+        _ => OperationError::from_kind(OperationErrorKind::Callback(CallbackError::new(
+            CallbackErrorKind::Internal,
+            Some(Box::new(err)),
+        )))
+        .with_operation(wire_id, status)
+        .with_wire(wire),
+    }
+}
+
+/// Derives the outer FAIL record of a `wait_for_callback` whose body
+/// failed with `err`.
+///
+/// The record always carries one fixed SDK type per callback error kind;
+/// neither the external caller's type nor a `TypedError` name in the chain
+/// sets it. An external failure keeps the external message and error data
+/// from the error's wire record.
 fn extract_wire_error(err: &OperationError) -> crate::error::WireError {
-    if let OperationErrorKind::Callback(cb_err) = err.kind() {
-        match cb_err.kind() {
-            CallbackErrorKind::TimedOut => {
-                return crate::error::WireError::new(
-                    Some("Callback.Timeout"),
-                    Some("callback timed out"),
-                );
-            }
-            CallbackErrorKind::HeartbeatTimedOut => {
-                return crate::error::WireError::new(
-                    Some("Callback.Heartbeat"),
-                    Some("heartbeat timed out"),
-                );
-            }
-            CallbackErrorKind::ExternalFailure => {
-                // Re-report the external caller's own fields verbatim.
-                if let Some(wire) = err.wire() {
-                    return wire.clone();
-                }
-            }
-            CallbackErrorKind::DeserializationFailed => {
-                return crate::error::wire_error_with_type(cb_err, "DeserializationError");
-            }
-            CallbackErrorKind::Internal => {
-                return crate::error::wire_error_with_type(cb_err, "InternalError");
-            }
+    let OperationErrorKind::Callback(cb_err) = err.kind() else {
+        return crate::error::wire_error_with_type(err, WFCB_INTERNAL);
+    };
+    match cb_err.kind() {
+        CallbackErrorKind::TimedOut => {
+            crate::error::WireError::new(Some(CALLBACK_TIMEOUT), Some("callback timed out"))
+        }
+        CallbackErrorKind::HeartbeatTimedOut => {
+            crate::error::WireError::new(Some(CALLBACK_HEARTBEAT), Some("heartbeat timed out"))
+        }
+        CallbackErrorKind::ExternalFailure => {
+            let external = err.wire();
+            crate::error::WireError::new(
+                Some(WFCB_EXTERNAL_FAILURE),
+                external.and_then(crate::error::WireError::error_message),
+            )
+            .with_error_data(external.and_then(crate::error::WireError::error_data))
+        }
+        CallbackErrorKind::SubmitterFailed => {
+            crate::error::wire_error_with_type(cb_err, WFCB_SUBMITTER_FAILED)
+        }
+        CallbackErrorKind::Internal => crate::error::wire_error_with_type(cb_err, WFCB_INTERNAL),
+        CallbackErrorKind::DeserializationFailed => {
+            crate::error::wire_error_with_type(cb_err, WFCB_DESERIALIZATION_FAILED)
         }
     }
-    crate::error::wire_error_for(err, "Error")
 }
 
 /// Creates a callback deserialization error carrying its cause.
@@ -1642,7 +1728,8 @@ mod tests {
     }
 
     /// A callback record with an ID and a status other than `STARTED`,
-    /// `PENDING`, `SUCCEEDED`, `FAILED` or `TIMED_OUT` fires no hook.
+    /// `PENDING`, `SUCCEEDED`, `FAILED` or `TIMED_OUT` fires no hook. A
+    /// `CANCELLED` callback still settles, as an external failure.
     #[tokio::test]
     async fn cancelled_callback_record_fires_no_hook() {
         let hooks = crate::plugin::test_support::OpHooks::default();
@@ -1658,9 +1745,15 @@ mod tests {
             )],
             &hooks,
         );
-        create_cb(&ctx)
-            .await
-            .expect_err("a cancelled callback is unexpected");
+        let cb = create_cb(&ctx).await.expect("a cancelled callback settles");
+        let err = cb.result().await.expect_err("a cancelled callback fails");
+        assert!(
+            matches!(
+                err.kind(),
+                OperationErrorKind::Callback(e) if matches!(e.kind(), CallbackErrorKind::ExternalFailure)
+            ),
+            "{err:?}"
+        );
         assert!(hooks.records().is_empty(), "{:?}", hooks.records());
     }
 
@@ -1907,8 +2000,9 @@ mod tests {
     async fn wfcb_submitter_failure_propagates() {
         // When the submitter closure returns an error, the step execution
         // path uses the default retry strategy. On first failure, it
-        // schedules a retry (checkpoint + suspend), and the error propagates
-        // as a ChildContext/ChildFailed wrapping the step error.
+        // schedules a retry (checkpoint + suspend). Once a strategy stops,
+        // the error propagates as `Callback(SubmitterFailed)` wrapping the
+        // step error.
         let client = Arc::new(InMemoryExecutionClient::new(vec![]));
         let ctx = DurableContext::new_root_with_client(
             "arn:test".to_owned(),
@@ -2225,8 +2319,9 @@ mod tests {
 
     #[tokio::test]
     async fn wfcb_submitter_failure_checkpoints_step_and_propagates() {
-        // When the submitter fails, the step should checkpoint failure and
-        // the error should propagate as ChildFailed through the context.
+        // When the submitter fails, the step should checkpoint failure and,
+        // once a strategy stops, the error propagates as
+        // `Callback(SubmitterFailed)` through the context.
         // Verify that checkpoints are produced (StepStart + StepFail/Retry).
         let client = Arc::new(InMemoryExecutionClient::new(vec![]));
         let ctx = DurableContext::new_root_with_client(
@@ -2655,6 +2750,654 @@ mod tests {
             .await
             .expect("wfcb should decode via threaded serdes");
         assert_eq!(result, "wfcb");
+    }
+
+    /// The `CallbackErrorKind` of `err`, or `None` when it is not a
+    /// callback error.
+    fn callback_kind(err: &OperationError) -> Option<&CallbackErrorKind> {
+        match err.kind() {
+            OperationErrorKind::Callback(e) => Some(e.kind()),
+            _ => None,
+        }
+    }
+
+    /// Replays a `wait_for_callback` whose outer record is FAILED with the
+    /// given wire fields, and returns its error.
+    async fn replay_wfcb_outer(
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        error_data: Option<&str>,
+    ) -> OperationError {
+        let wire = crate::engine::compute_wire_id_public("1");
+        let mut record = callback_record(
+            &wire,
+            CheckpointStatus::Failed,
+            None,
+            error_type,
+            error_message,
+            None,
+        );
+        record.1.error_data = error_data.map(String::from);
+        let ctx = ctx_with_log(vec![record]);
+        let op_id = ctx.mint_id();
+        let exec = WaitForCallbackExecution::<String, _, _> {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
+            submitter_retry: None,
+            serdes: crate::serdes::JsonSerdes,
+            _marker: std::marker::PhantomData,
+        };
+        exec.execute()
+            .await
+            .expect_err("a FAILED record replays its error")
+    }
+
+    /// Every fixed outer type replays as its own kind, and every other type,
+    /// or none, as `ExternalFailure`.
+    #[tokio::test]
+    async fn wfcb_replay_maps_fixed_types() {
+        let cases: [(Option<&str>, Option<&str>, &str); 10] = [
+            // C2: an external failure with no external type.
+            (Some("Callback.ExternalFailure"), None, "ExternalFailure"),
+            // C4.
+            (Some("Callback.Heartbeat"), None, "HeartbeatTimedOut"),
+            // C7 and C11.
+            (Some("Callback.Internal"), None, "Internal"),
+            // C9.
+            (
+                Some("Callback.ExternalFailure"),
+                Some(r#"{"code":7}"#),
+                "ExternalFailure",
+            ),
+            // C10.
+            (Some("Callback.SubmitterFailed"), None, "SubmitterFailed"),
+            (
+                Some("Callback.DeserializationFailed"),
+                None,
+                "DeserializationFailed",
+            ),
+            (Some("Callback.Timeout"), None, "TimedOut"),
+            // C12.
+            (Some("StepError"), None, "ExternalFailure"),
+            // C13.
+            (Some("PaymentDeclined"), None, "ExternalFailure"),
+            // C14.
+            (None, None, "ExternalFailure"),
+        ];
+        for (error_type, data, expected) in cases {
+            let err = replay_wfcb_outer(error_type, Some("recorded"), data).await;
+            let kind = callback_kind(&err).map(|k| format!("{k:?}"));
+            assert_eq!(kind.as_deref(), Some(expected), "{error_type:?}: {err:?}");
+            let wire = err.wire().expect("a replayed failure carries its record");
+            assert_eq!(wire.error_type(), error_type);
+            assert_eq!(wire.error_data(), data);
+            assert_eq!(err.status(), Some("FAILED"));
+            // A timeout carries no source; every other kind carries the
+            // recorded failure.
+            let timeout = matches!(expected, "TimedOut" | "HeartbeatTimedOut");
+            let source = std::error::Error::source(&err).and_then(std::error::Error::source);
+            assert_eq!(source.is_none(), timeout, "{expected}: {err:?}");
+        }
+    }
+
+    /// An external callback failure with `wire` as its own record.
+    fn external_failure(wire: Option<crate::error::WireError>) -> OperationError {
+        let source = wire.clone().map(crate::error::ReplayedFailure::source_from);
+        let err = OperationError::from_kind(OperationErrorKind::Callback(CallbackError::new(
+            CallbackErrorKind::ExternalFailure,
+            source,
+        )));
+        match wire {
+            Some(wire) => err.with_wire(wire),
+            None => err,
+        }
+    }
+
+    /// A failed submitter step whose body returned `source`.
+    fn submitter_failure(source: BoxError) -> OperationError {
+        let step =
+            OperationError::from_kind(OperationErrorKind::Step(crate::error::StepError::new(
+                crate::error::StepErrorKind::ExecutionFailed,
+                Some(source),
+            )));
+        OperationError::from_kind(OperationErrorKind::Callback(CallbackError::new(
+            CallbackErrorKind::SubmitterFailed,
+            Some(Box::new(step)),
+        )))
+    }
+
+    /// A callback error of `kind` whose source is `message`.
+    fn callback_failure(kind: CallbackErrorKind, message: &str) -> OperationError {
+        OperationError::from_kind(OperationErrorKind::Callback(CallbackError::new(
+            kind,
+            Some(message.to_owned().into()),
+        )))
+    }
+
+    /// The outer record carries one fixed SDK type per kind; neither the
+    /// external type nor a `TypedError` name sets it.
+    #[test]
+    fn extract_wire_error_records_fixed_sdk_types() {
+        // C1: the external type is dropped; message and data are copied.
+        let external = crate::error::WireError::new(Some("PaymentDeclined"), Some("card declined"))
+            .with_error_data(Some(r#"{"code":7}"#));
+        let wire = extract_wire_error(&external_failure(Some(external)));
+        assert_eq!(wire.error_type(), Some("Callback.ExternalFailure"));
+        assert_eq!(wire.error_message(), Some("card declined"));
+        assert_eq!(wire.error_data(), Some(r#"{"code":7}"#));
+        // An external failure without a wire record records only the type.
+        let wire = extract_wire_error(&external_failure(None));
+        assert_eq!(
+            wire,
+            crate::error::WireError::new(Some("Callback.ExternalFailure"), None::<&str>)
+        );
+
+        // C5.
+        let wire = extract_wire_error(&submitter_failure("submission failed".into()));
+        assert_eq!(wire.error_type(), Some("Callback.SubmitterFailed"));
+        assert!(
+            wire.error_message()
+                .is_some_and(|m| m.contains("submission failed")),
+            "{wire:?}"
+        );
+        // C6: the user's type does not reach the outer record.
+        let typed = crate::TypedError::with_type("PaymentError", "declined");
+        let wire = extract_wire_error(&submitter_failure(Box::new(typed)));
+        assert_eq!(wire.error_type(), Some("Callback.SubmitterFailed"));
+        assert!(
+            wire.error_message().is_some_and(|m| m.contains("declined")),
+            "{wire:?}"
+        );
+
+        // C7.
+        let wire = extract_wire_error(&callback_failure(CallbackErrorKind::Internal, "oops"));
+        assert_eq!(wire.error_type(), Some("Callback.Internal"));
+        assert!(
+            wire.error_message().is_some_and(|m| m.contains("oops")),
+            "{wire:?}"
+        );
+
+        // C8: an error that is not a callback error, with a `TypedError` in
+        // its chain.
+        let typed = crate::TypedError::with_type("PaymentError", "declined");
+        let other = OperationError::from_kind(OperationErrorKind::ChildContext(
+            ChildContextError::new(ChildContextErrorKind::ChildFailed, Some(Box::new(typed))),
+        ));
+        let wire = extract_wire_error(&other);
+        assert_eq!(wire.error_type(), Some("Callback.Internal"));
+        assert!(
+            wire.error_message().is_some_and(|m| m.contains("declined")),
+            "{wire:?}"
+        );
+
+        // A payload decode failure.
+        let wire = extract_wire_error(&callback_failure(
+            CallbackErrorKind::DeserializationFailed,
+            "bad payload",
+        ));
+        assert_eq!(wire.error_type(), Some("Callback.DeserializationFailed"));
+        assert!(
+            wire.error_message()
+                .is_some_and(|m| m.contains("bad payload")),
+            "{wire:?}"
+        );
+
+        // The timeouts.
+        let timed_out = OperationError::from_kind(OperationErrorKind::Callback(
+            CallbackError::new(CallbackErrorKind::TimedOut, None),
+        ));
+        assert_eq!(
+            extract_wire_error(&timed_out),
+            crate::error::WireError::new(Some("Callback.Timeout"), Some("callback timed out"))
+        );
+        let heartbeat = OperationError::from_kind(OperationErrorKind::Callback(
+            CallbackError::new(CallbackErrorKind::HeartbeatTimedOut, None),
+        ));
+        assert_eq!(
+            extract_wire_error(&heartbeat),
+            crate::error::WireError::new(Some("Callback.Heartbeat"), Some("heartbeat timed out"))
+        );
+    }
+
+    /// Settles a failed `wait_for_callback` body live with `err`, and
+    /// returns the live error and the outer FAIL record it wrote.
+    async fn settle_live(err: OperationError) -> (OperationError, crate::error::WireError) {
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token-1".to_owned(),
+        );
+        let wire_id = crate::engine::compute_wire_id_public("1");
+        let after: WfcbAfter<String> = WfcbAfter {
+            ctx,
+            wire_id: wire_id.clone(),
+            name: None,
+            _marker: std::marker::PhantomData,
+        };
+        let live = after
+            .settle(None, Err(err))
+            .await
+            .expect_err("a failed body fails the operation");
+        let fail = client
+            .recorded_updates()
+            .into_iter()
+            .find(|u| u.id() == wire_id && *u.action() == OperationAction::Fail)
+            .expect("the outer FAIL was written");
+        let object = fail.error().expect("the FAIL carries an error");
+        let recorded = crate::error::WireError::new(object.error_type(), object.error_message())
+            .with_error_data(object.error_data());
+        (live, recorded)
+    }
+
+    /// Asserts that `live` has the kind, operation, status and wire that a
+    /// replay of its own outer record gives.
+    fn assert_live_equals_replay(live: &OperationError) {
+        let wire = live
+            .wire()
+            .expect("the live error carries the outer record");
+        let replayed = wfcb_failed_error(
+            wire.clone(),
+            live.operation_id()
+                .expect("the live error names the operation"),
+            live.status().expect("the live error has a status"),
+        );
+        assert_eq!(
+            callback_kind(live).map(|k| format!("{k:?}")),
+            callback_kind(&replayed).map(|k| format!("{k:?}")),
+        );
+        assert_eq!(live.operation_id(), replayed.operation_id());
+        assert_eq!(live.status(), replayed.status());
+        assert_eq!(live.wire(), replayed.wire());
+    }
+
+    /// A live external failure is rebuilt from the outer record, so the
+    /// external type does not reach its source chain.
+    #[tokio::test]
+    async fn wfcb_live_external_failure_hides_external_type() {
+        let external = crate::error::WireError::new(Some("PaymentDeclined"), Some("card declined"))
+            .with_error_data(Some(r#"{"code":7}"#));
+        let (live, recorded) = settle_live(external_failure(Some(external))).await;
+        assert_eq!(live.wire(), Some(&recorded));
+        assert_eq!(recorded.error_type(), Some("Callback.ExternalFailure"));
+        let mut link: Option<&(dyn std::error::Error + 'static)> = Some(&live);
+        while let Some(e) = link {
+            if let Some(replayed) = e.downcast_ref::<crate::error::ReplayedFailure>() {
+                assert_ne!(replayed.error_type(), Some("PaymentDeclined"), "{live:?}");
+            }
+            link = e.source();
+        }
+        assert!(
+            matches!(
+                callback_kind(&live),
+                Some(CallbackErrorKind::ExternalFailure)
+            ),
+            "{live:?}"
+        );
+        assert_live_equals_replay(&live);
+    }
+
+    /// Every other body error gives the same kind and record live as on
+    /// replay. An error that is not a callback error becomes
+    /// `Callback(Internal)` with the original error as its source; every
+    /// callback error keeps its live source.
+    #[tokio::test]
+    async fn wfcb_live_errors_equal_their_replay() {
+        let not_callback = || {
+            OperationError::from_kind(OperationErrorKind::ChildContext(ChildContextError::new(
+                ChildContextErrorKind::ChildFailed,
+                Some("inner".into()),
+            )))
+        };
+        let (live, _) = settle_live(not_callback()).await;
+        assert!(
+            matches!(callback_kind(&live), Some(CallbackErrorKind::Internal)),
+            "{live:?}"
+        );
+        let source = std::error::Error::source(&live)
+            .and_then(std::error::Error::source)
+            .and_then(|s| s.downcast_ref::<OperationError>())
+            .expect("the source is the original body error");
+        assert!(matches!(source.kind(), OperationErrorKind::ChildContext(_)));
+        assert_live_equals_replay(&live);
+
+        let (live, _) = settle_live(submitter_failure("submission failed".into())).await;
+        assert!(
+            matches!(
+                callback_kind(&live),
+                Some(CallbackErrorKind::SubmitterFailed)
+            ),
+            "{live:?}"
+        );
+        let step = std::error::Error::source(&live)
+            .and_then(std::error::Error::source)
+            .and_then(|s| s.downcast_ref::<OperationError>())
+            .expect("the live source is the submitter step error");
+        assert!(matches!(step.kind(), OperationErrorKind::Step(_)));
+        assert_live_equals_replay(&live);
+
+        for kind in [
+            CallbackErrorKind::Internal,
+            CallbackErrorKind::DeserializationFailed,
+        ] {
+            let (live, _) = settle_live(callback_failure(kind, "cause")).await;
+            assert!(format!("{live:#}").contains("cause"), "{live:#}");
+            assert_live_equals_replay(&live);
+        }
+        for kind in [
+            CallbackErrorKind::TimedOut,
+            CallbackErrorKind::HeartbeatTimedOut,
+        ] {
+            let err = OperationError::from_kind(OperationErrorKind::Callback(CallbackError::new(
+                kind, None,
+            )));
+            let (live, _) = settle_live(err).await;
+            assert_live_equals_replay(&live);
+        }
+    }
+
+    /// Creates the callback of a log holding `record` at the first slot.
+    async fn create_from(
+        record: (String, CheckpointRecord),
+    ) -> Result<Callback<String>, OperationError> {
+        let ctx = ctx_with_log(vec![record]);
+        let op_id = ctx.mint_id();
+        let exec: CreateCallbackExecution<String, _> = CreateCallbackExecution {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            sub_type: crate::OperationSubType::CALLBACK,
+            plugin_name: None,
+            serdes: crate::serdes::JsonSerdes,
+            _marker: std::marker::PhantomData,
+        };
+        exec.execute().await
+    }
+
+    /// A callback record with status `status`, type `error_type` and a
+    /// callback ID.
+    fn callback_with(
+        status: CheckpointStatus,
+        error_type: Option<&str>,
+    ) -> (String, CheckpointRecord) {
+        let wire = crate::engine::compute_wire_id_public("1");
+        callback_record(
+            &wire,
+            status,
+            None,
+            error_type,
+            Some("recorded"),
+            Some("cb-1"),
+        )
+    }
+
+    /// `FAILED`, `CANCELLED` and `STOPPED` callback records settle as external
+    /// failures; a `READY` record stays an internal error of
+    /// `create_callback` itself.
+    #[tokio::test]
+    async fn replay_cancelled_and_stopped_settle_as_external_failure() {
+        // C15.
+        let cb = create_from(callback_with(
+            CheckpointStatus::Failed,
+            Some("PaymentDeclined"),
+        ))
+        .await
+        .expect("a FAILED callback settles");
+        let err = cb.result().await.expect_err("a FAILED callback fails");
+        assert!(matches!(
+            callback_kind(&err),
+            Some(CallbackErrorKind::ExternalFailure)
+        ));
+        assert_eq!(
+            err.wire().and_then(crate::error::WireError::error_type),
+            Some("PaymentDeclined")
+        );
+        // C16 and C17.
+        for status in [CheckpointStatus::Cancelled, CheckpointStatus::Stopped] {
+            let cb = create_from(callback_with(status.clone(), None))
+                .await
+                .expect("a terminal callback settles");
+            let err = cb.result().await.expect_err("the callback fails");
+            assert!(
+                matches!(
+                    callback_kind(&err),
+                    Some(CallbackErrorKind::ExternalFailure)
+                ),
+                "{status:?}: {err:?}"
+            );
+            assert_eq!(err.status(), Some(status.wire_str()));
+        }
+        // C18.
+        let err = create_from(callback_with(CheckpointStatus::Ready, None))
+            .await
+            .expect_err("a READY callback is unexpected");
+        assert!(
+            matches!(callback_kind(&err), Some(CallbackErrorKind::Internal)),
+            "{err:?}"
+        );
+    }
+
+    /// A `TIMED_OUT` callback record with type `Callback.Heartbeat` gives
+    /// `HeartbeatTimedOut`, from `create_callback` and inside
+    /// `wait_for_callback`; any other `TIMED_OUT` record gives `TimedOut`.
+    #[tokio::test]
+    async fn replay_timed_out_reads_heartbeat_type() {
+        // C19 to C21.
+        let cases: [(Option<&str>, &str); 3] = [
+            (Some("Callback.Heartbeat"), "HeartbeatTimedOut"),
+            (Some("Callback.Timeout"), "TimedOut"),
+            (None, "TimedOut"),
+        ];
+        for (error_type, expected) in cases {
+            let wire = crate::engine::compute_wire_id_public("1");
+            let mut record = callback_record(
+                &wire,
+                CheckpointStatus::TimedOut,
+                None,
+                error_type,
+                None,
+                Some("cb-1"),
+            );
+            if error_type.is_none() {
+                // C21: no recorded failure at all.
+                record.1.error_message = None;
+            }
+            let cb = create_from(record)
+                .await
+                .expect("a TIMED_OUT callback settles");
+            let err = cb.result().await.expect_err("the callback timed out");
+            let kind = callback_kind(&err).map(|k| format!("{k:?}"));
+            assert_eq!(kind.as_deref(), Some(expected), "{error_type:?}");
+            assert!(
+                std::error::Error::source(&err)
+                    .and_then(std::error::Error::source)
+                    .is_none()
+            );
+        }
+
+        // C4: the outer record is STARTED and its callback TIMED_OUT with
+        // the heartbeat type, as the service writes it.
+        let wfcb_wire = crate::engine::compute_wire_id_public("1");
+        let cb_wire = crate::engine::compute_wire_id_public("1-1");
+        let step_wire = crate::engine::compute_wire_id_public("1-2");
+        let log = CheckpointLog::from_records(vec![
+            callback_record(
+                &wfcb_wire,
+                CheckpointStatus::Started,
+                None,
+                None,
+                None,
+                None,
+            ),
+            callback_record(
+                &cb_wire,
+                CheckpointStatus::TimedOut,
+                None,
+                Some("Callback.Heartbeat"),
+                Some("heartbeat timed out"),
+                Some("cb-1"),
+            ),
+            callback_record(
+                &step_wire,
+                CheckpointStatus::Succeeded,
+                Some("null"),
+                None,
+                None,
+                None,
+            ),
+        ]);
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token-1".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+        let exec = WaitForCallbackExecution::<String, _, _> {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
+            submitter_retry: None,
+            serdes: crate::serdes::JsonSerdes,
+            _marker: std::marker::PhantomData,
+        };
+        let err = exec.execute().await.expect_err("the heartbeat timed out");
+        assert!(
+            matches!(
+                callback_kind(&err),
+                Some(CallbackErrorKind::HeartbeatTimedOut)
+            ),
+            "{err:?}"
+        );
+        let fail = client
+            .recorded_updates()
+            .into_iter()
+            .find(|u| u.id() == wfcb_wire && *u.action() == OperationAction::Fail)
+            .expect("the outer FAIL was written");
+        assert_eq!(
+            fail.error()
+                .and_then(aws_sdk_lambda::types::ErrorObject::error_type),
+            Some("Callback.Heartbeat")
+        );
+    }
+
+    /// A submitter step that fails with an error other than a step error
+    /// (here a replay mismatch) passes through `run_wfcb_body` unchanged,
+    /// and the live `wait_for_callback` reports it as `Callback(Internal)`
+    /// with that error as its source and the outer type `Callback.Internal`.
+    #[tokio::test]
+    async fn wfcb_non_step_submitter_error_is_internal() {
+        let wfcb_wire = crate::engine::compute_wire_id_public("1");
+        let cb_wire = crate::engine::compute_wire_id_public("1-1");
+        let step_wire = crate::engine::compute_wire_id_public("1-2");
+        let mut step = callback_record(
+            &step_wire,
+            CheckpointStatus::Succeeded,
+            None,
+            None,
+            None,
+            None,
+        );
+        // The submitter's slot holds a wait record, so replay of the step
+        // fails its identity check.
+        step.1.op_type = Some("Wait".to_owned());
+        let log = CheckpointLog::from_records(vec![
+            callback_record(
+                &wfcb_wire,
+                CheckpointStatus::Started,
+                None,
+                None,
+                None,
+                None,
+            ),
+            callback_record(
+                &cb_wire,
+                CheckpointStatus::Started,
+                None,
+                None,
+                None,
+                Some("cb-1"),
+            ),
+            step,
+        ]);
+        let client = Arc::new(InMemoryExecutionClient::new(vec![]));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(log),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token-1".to_owned(),
+        );
+        let op_id = ctx.mint_id();
+        let exec = WaitForCallbackExecution::<String, _, _> {
+            ctx: ctx.clone(),
+            op_id,
+            name: None,
+            timeout: None,
+            heartbeat: None,
+            submitter: |_sc: StepContext, _id: String| async { Ok::<(), BoxError>(()) },
+            submitter_retry: None,
+            serdes: crate::serdes::JsonSerdes,
+            _marker: std::marker::PhantomData,
+        };
+        let err = exec.execute().await.expect_err("the replay mismatch fails");
+        assert!(
+            matches!(callback_kind(&err), Some(CallbackErrorKind::Internal)),
+            "{err:?}"
+        );
+        let source = std::error::Error::source(&err)
+            .and_then(std::error::Error::source)
+            .and_then(|s| s.downcast_ref::<OperationError>())
+            .expect("the source is the original error");
+        assert!(
+            matches!(
+                source.kind(),
+                OperationErrorKind::NonDeterministicExecution(_)
+            ),
+            "{source:?}"
+        );
+        assert_eq!(
+            err.wire().and_then(crate::error::WireError::error_type),
+            Some("Callback.Internal")
+        );
+    }
+
+    /// A callback's own FAILED record keeps the external classification,
+    /// even when the external caller used a type the outer record uses.
+    #[tokio::test]
+    async fn callback_own_record_keeps_external_classification() {
+        // C23.
+        let cb = create_from(callback_with(
+            CheckpointStatus::Failed,
+            Some("Callback.SubmitterFailed"),
+        ))
+        .await
+        .expect("a FAILED callback settles");
+        let err = cb.result().await.expect_err("the callback failed");
+        assert!(
+            matches!(
+                callback_kind(&err),
+                Some(CallbackErrorKind::ExternalFailure)
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.wire().and_then(crate::error::WireError::error_type),
+            Some("Callback.SubmitterFailed")
+        );
     }
 }
 
@@ -3142,9 +3885,13 @@ mod coordinator_tests {
             join_result_with_sleeping_step(refresh_completing(cancelled), &hooks).await;
         assert_eq!(outcome, InvocationOutcome::Complete("done".to_owned()));
         let (value, _) = result.expect("the handler finished");
-        let err = value.expect_err("a cancelled callback is unexpected");
+        let err = value.expect_err("a cancelled callback fails");
         assert!(
-            format!("{err:?}").contains("unexpected checkpointed status"),
+            matches!(
+                err.kind(),
+                crate::OperationErrorKind::Callback(e)
+                    if matches!(e.kind(), crate::CallbackErrorKind::ExternalFailure)
+            ),
             "{err:?}"
         );
         let hooks_of_cb: Vec<_> = hooks.of("cb").iter().map(|r| r.hook).collect();

@@ -1176,9 +1176,13 @@ impl fmt::Display for InvokeErrorKind {
 /// caused by the caller's system (timeout, invalid data), internal
 /// errors are SDK/service failures. For an
 /// [`ExternalFailure`](CallbackErrorKind::ExternalFailure), the wire
-/// fields the external caller supplied are reachable through the error's
+/// record is reachable through the error's
 /// [`source()`](std::error::Error::source) (a [`ReplayedFailure`]) and
-/// through [`OperationError::wire`].
+/// through [`OperationError::wire`]. From `create_callback`, that record
+/// holds every field the external caller supplied, its type included.
+/// From `wait_for_callback`, the record has the type
+/// `Callback.ExternalFailure` in place of the caller's type, and keeps the
+/// caller's message and error data.
 ///
 /// # Examples
 ///
@@ -1188,7 +1192,9 @@ impl fmt::Display for InvokeErrorKind {
 /// fn describe(err: &CallbackError) -> String {
 ///     match err.kind() {
 ///         CallbackErrorKind::TimedOut { .. } => "callback timed out".to_owned(),
-///         // The externally reported fields travel on `source()`.
+///         // The failure record travels on `source()`. Its type is the
+///         // external caller's from `create_callback`, and
+///         // `Callback.ExternalFailure` from `wait_for_callback`.
 ///         CallbackErrorKind::ExternalFailure { .. } => format!("{err:#}"),
 ///         _ => format!("{err:#}"),
 ///     }
@@ -1245,6 +1251,7 @@ impl Error for CallbackError {
 ///         CallbackErrorKind::TimedOut { .. }
 ///             | CallbackErrorKind::HeartbeatTimedOut { .. }
 ///             | CallbackErrorKind::ExternalFailure { .. }
+///             | CallbackErrorKind::SubmitterFailed { .. }
 ///     )
 /// }
 /// ```
@@ -1255,22 +1262,43 @@ pub enum CallbackErrorKind {
     #[non_exhaustive]
     TimedOut,
     /// The callback heartbeat timed out (no keep-alive received in time).
+    ///
+    /// The service records a heartbeat timeout as a `TIMED_OUT` callback
+    /// with the error type `Callback.Heartbeat`. Both `create_callback`
+    /// and `wait_for_callback` report it with this kind.
     #[non_exhaustive]
     HeartbeatTimedOut,
-    /// The callback was completed with an external failure.
+    /// The callback was completed with an external failure, or it ended
+    /// `CANCELLED` or `STOPPED`.
     ///
-    /// The failure fields the external caller reported travel as wire
-    /// data: read them from the error's
+    /// The failure fields travel as wire data: read them from the error's
     /// [`source()`](std::error::Error::source) (a [`ReplayedFailure`]) or
-    /// from [`OperationError::wire`].
+    /// from [`OperationError::wire`]. From `create_callback`, the wire
+    /// record is the external caller's own record. From
+    /// `wait_for_callback`, the wire record has the type
+    /// `Callback.ExternalFailure` and keeps the external message and error
+    /// data; the external caller's type is on the callback operation's own
+    /// record in the history.
     #[non_exhaustive]
     ExternalFailure,
     /// The callback payload could not be deserialized.
+    ///
+    /// This is a payload decode failure that the serdes did not mark with
+    /// [`RetryableSerdesError`](crate::serdes::RetryableSerdesError); a
+    /// marked failure ends the invocation instead. From
+    /// `wait_for_callback`, the wire record has the type
+    /// `Callback.DeserializationFailed`.
     #[non_exhaustive]
     DeserializationFailed,
     /// An internal SDK or service error occurred.
     #[non_exhaustive]
     Internal,
+    /// The `wait_for_callback` submitter failed and its retry strategy stopped.
+    ///
+    /// Live, `source()` is the submitter step's `OperationError`. On replay,
+    /// `source()` is a `ReplayedFailure` holding the recorded outer failure.
+    #[non_exhaustive]
+    SubmitterFailed,
 }
 
 impl fmt::Display for CallbackErrorKind {
@@ -1281,6 +1309,7 @@ impl fmt::Display for CallbackErrorKind {
             Self::ExternalFailure => write!(f, "external failure"),
             Self::DeserializationFailed => write!(f, "deserialization failed"),
             Self::Internal => write!(f, "internal error"),
+            Self::SubmitterFailed => write!(f, "submitter failed"),
         }
     }
 }
@@ -2373,6 +2402,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn callback_submitter_failed_displays_its_kind() {
+        let err = CallbackError::new(
+            CallbackErrorKind::SubmitterFailed,
+            Some(Source::from("submission failed")),
+        );
+        assert_eq!(err.to_string(), "submitter failed");
+        assert_eq!(format!("{err:#}"), "submitter failed: submission failed");
     }
 
     #[test]

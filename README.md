@@ -627,6 +627,11 @@ let approval: String = ctx
 Both builders take `.timeout(...)` and `.heartbeat(...)`.
 `wait_for_callback` also takes `.submitter_retry(...)`, which retries the
 submitter with the same retry strategy shape a step uses.
+A submitter that fails after its retry strategy stops surfaces as
+`CallbackErrorKind::SubmitterFailed`. `wait_for_callback` reports an
+external failure with the type `Callback.ExternalFailure` and keeps the
+external message and error data, while `create_callback` keeps the
+external caller's type.
 `create_callback` also takes `.sub_type(...)`, which records an
 `OperationSubType` instead of `Callback`, as on a step.
 
