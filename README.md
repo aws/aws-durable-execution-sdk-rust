@@ -1162,9 +1162,18 @@ let a: String = ctx
 let b: u32 = ctx.step(|_| async { Ok(7_u32) }).serdes(shared).await?;
 ```
 
-Operations transfer the owned value to `serialize` and return the value
-`deserialize` reconstructs from the stored wire string, so live execution
-and replay observe identical values. Ownership transfer is also what keeps
+On a live run, an operation that records a value returns
+`deserialize(serialize(value))`, not the value the body produced. This
+holds for step results, child context and `with_retry` results, map and
+parallel item results, and `wait_for_condition` state. Replay returns
+`deserialize` of the stored wire string, so live execution and replay
+return the same value. A serdes that changes the value is therefore
+supported on those paths, and the handler sees the decoded value. The one
+requirement is that `deserialize` returns the same value for the same wire
+string; `serialize` may change the value. This does not apply to a batch
+`result_serdes`, whose deserializer must reconstruct the exact record text
+its serializer received. Operations transfer the owned value to
+`serialize`, and ownership transfer is also what keeps
 operation outputs at `Send` (not `Sync`): the serdes can move the whole
 call into a `'static` blocking task without borrowing across an `.await`.
 

@@ -91,8 +91,35 @@ pub use preview::{PreviewConfig, PreviewConfigBuilder, PreviewField, PreviewMode
 /// [`tokio::task::spawn_blocking`] closure, which is what preserves the
 /// SDK's `T: Send` output bound: a `Send` future that retained `&T` would
 /// require `T: Sync` instead. Operations round-trip successful values
-/// through the configured wire format before returning them, so
-/// transferring ownership to `serialize` loses nothing.
+/// through the configured wire format before returning them, so the
+/// handler never needs the value back from `serialize`; see the live round
+/// trip section below.
+///
+/// # Live round trip
+///
+/// On a live run, an operation that records a value returns
+/// `deserialize(serialize(value))`, not the value the body produced. This
+/// holds for step results, child context and `with_retry` results, map and
+/// parallel item results, and `wait_for_condition` state.
+///
+/// Invoke results and callback payloads come from outside the SDK, so
+/// they are only deserialized.
+///
+/// On replay, the operation returns `deserialize(stored)`. So live and
+/// replay return the same value.
+///
+/// A serdes that changes the value is supported on the paths listed above.
+/// The decoded value is the one the handler sees.
+///
+/// The one requirement: `deserialize` returns the same value for the same
+/// wire string. `serialize` may change the value.
+///
+/// None of this applies to the `result_serdes` of a map, parallel or
+/// `parallel_mixed` batch. That serdes transforms the SDK's batch-record
+/// JSON text, not a value the handler receives, and the SDK does not
+/// deserialize the whole record on the live return path. So its
+/// `deserialize` must reconstruct the exact `String` its `serialize`
+/// received.
 ///
 /// # Scheduling
 ///
