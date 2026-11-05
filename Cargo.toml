@@ -287,3 +287,7 @@ required-features = ["test-util"]
 [[test]]
 name = "operation_start_order"
 required-features = ["test-util"]
+
+[[test]]
+name = "retry_presets"
+required-features = ["test-util"]

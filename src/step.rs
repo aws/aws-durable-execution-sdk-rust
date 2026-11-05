@@ -15,7 +15,7 @@ use std::time::Duration;
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 use tracing::Instrument;
 
-use crate::builders::{JitterStrategy, RetryStrategyConfig};
+use crate::builders::{Backoff, JitterStrategy, RetryStrategyConfig};
 use crate::context::{
     ActiveBody, DurableContext, StepContext, SubmittedWrite, run_body, run_body_sync,
 };
@@ -46,7 +46,9 @@ impl RetryStrategyConfig {
     /// [`retry_if`](crate::builders::RetryStrategyConfigBuilder::retry_if),
     /// then the delay schedule.
     ///
-    /// Exponential backoff: `initial_delay * backoff_rate^(attempt - 1)`,
+    /// The base delay follows the [`Backoff`]:
+    /// `initial_delay * rate^(attempt - 1)` for an exponential backoff, and
+    /// `initial_delay + increment * (attempt - 1)` for a linear one. Both are
     /// capped at `max_delay`, jittered per the configured
     /// [`JitterStrategy`], and rounded to the nearest whole second with a
     /// one-second minimum for every jitter mode (see [`quantize_delay`]).
@@ -61,11 +63,20 @@ impl RetryStrategyConfig {
             return RetryDecision::Stop;
         }
 
-        // Exponential backoff: initial * rate^(attempt-1), capped at max.
         // attempt is 1-based: first failure is attempt=1.
-        let exponent = (i32::try_from(attempt).unwrap_or(1)) - 1;
-        let base = (self.initial_delay().as_secs_f64() * self.backoff_rate().powi(exponent))
-            .min(self.max_delay().as_secs_f64());
+        let initial = self.initial_delay().as_secs_f64();
+        let base = match self.backoff() {
+            // Exponential backoff: initial * rate^(attempt-1).
+            Backoff::Exponential { rate } => {
+                let exponent = (i32::try_from(attempt).unwrap_or(1)) - 1;
+                initial * rate.powi(exponent)
+            }
+            // Linear backoff: initial + increment * (attempt-1).
+            Backoff::Linear { increment } => {
+                initial + increment.as_secs_f64() * f64::from(attempt.saturating_sub(1))
+            }
+        }
+        .min(self.max_delay().as_secs_f64());
 
         let jittered = match self.jitter() {
             JitterStrategy::None => base,
@@ -2756,7 +2767,7 @@ mod tests {
 
     // RetryStrategyConfig delay shaping
 
-    use crate::builders::{JitterStrategy, RetryStrategyConfig};
+    use crate::builders::{Backoff, JitterStrategy, RetryStrategyConfig};
 
     fn sample_error() -> StepError {
         StepError::new(StepErrorKind::ExecutionFailed, Some("boom".into()))
@@ -2777,6 +2788,8 @@ mod tests {
     #[test]
     fn default_config_without_jitter_matches_documented_constants() {
         let config = RetryStrategyConfig::builder()
+            .max_attempts(6)
+            .max_delay(Duration::from_mins(1))
             .jitter(JitterStrategy::None)
             .build();
 
@@ -2801,6 +2814,8 @@ mod tests {
     fn default_retry_strategy_matches_default_config_modulo_jitter() {
         let strategy = default_retry_strategy();
         let no_jitter = RetryStrategyConfig::builder()
+            .max_attempts(6)
+            .max_delay(Duration::from_mins(1))
             .jitter(JitterStrategy::None)
             .build();
         let err = sample_error();
@@ -2826,6 +2841,7 @@ mod tests {
     #[test]
     fn half_jitter_delays_stay_within_bounds() {
         let config = RetryStrategyConfig::builder()
+            .max_attempts(6)
             .initial_delay(Duration::from_secs(8))
             .max_delay(Duration::from_secs(64))
             .backoff_rate(2.0)
@@ -2917,6 +2933,7 @@ mod tests {
 
         // 1 * 1.5^2 = 2.25 s.
         let slow = RetryStrategyConfig::builder()
+            .max_attempts(6)
             .initial_delay(Duration::from_secs(1))
             .backoff_rate(1.5)
             .jitter(JitterStrategy::None)
@@ -2928,6 +2945,94 @@ mod tests {
             .jitter(JitterStrategy::None)
             .build();
         assert_eq!(retry_secs(&half.decide(&sample_error(), 1)), 3);
+    }
+
+    /// Every row of the linear backoff case table, with no jitter. The
+    /// JS formula is `min(initialDelay + increment * (attempt - 1),
+    /// maxDelay)`, rounded to the nearest second with a 1 s floor. Row G
+    /// pins the exponential default schedule, unchanged.
+    #[test]
+    fn linear_backoff_cases() {
+        let linear = |initial: Duration, increment: Duration| {
+            RetryStrategyConfig::builder()
+                .initial_delay(initial)
+                .backoff(Backoff::Linear { increment })
+                .jitter(JitterStrategy::None)
+        };
+        let delays = |config: &RetryStrategyConfig, attempts: std::ops::RangeInclusive<u32>| {
+            attempts
+                .map(|attempt| retry_secs(&config.decide(&sample_error(), attempt)))
+                .collect::<Vec<_>>()
+        };
+
+        // A: the preset's 1, 2, 3, 4, 5 s.
+        let preset = RetryStrategyConfig::linear();
+        assert_eq!(delays(&preset, 1..=5), [1, 2, 3, 4, 5], "case A");
+        // B: the sixth failure is final.
+        assert_eq!(
+            preset.decide(&sample_error(), 6),
+            RetryDecision::Stop,
+            "case B"
+        );
+
+        // C: 1, 11, then 21 capped at 15.
+        let capped = linear(Duration::from_secs(1), Duration::from_secs(10))
+            .max_delay(Duration::from_secs(15))
+            .max_attempts(6)
+            .build();
+        assert_eq!(delays(&capped, 1..=3), [1, 11, 15], "case C");
+
+        // D: 1, 1.25, 1.5, 1.75 round to nearest: 1, 1, 2, 2.
+        let fractional = linear(Duration::from_secs(1), Duration::from_millis(250))
+            .max_attempts(6)
+            .build();
+        assert_eq!(delays(&fractional, 1..=4), [1, 1, 2, 2], "case D");
+
+        // E: a zero delay rises to the 1 s floor.
+        let zero = linear(Duration::ZERO, Duration::ZERO)
+            .max_attempts(3)
+            .build();
+        assert_eq!(delays(&zero, 1..=1), [1], "case E");
+
+        // F: no_retry stops on the first failure.
+        assert_eq!(
+            RetryStrategyConfig::no_retry().decide(&sample_error(), 1),
+            RetryDecision::Stop,
+            "case F"
+        );
+
+        // G: the default exponential schedule without jitter, unchanged.
+        let exponential = RetryStrategyConfig::builder()
+            .max_attempts(6)
+            .max_delay(Duration::from_mins(1))
+            .jitter(JitterStrategy::None)
+            .build();
+        assert_eq!(delays(&exponential, 1..=5), [5, 10, 20, 40, 60], "case G");
+    }
+
+    /// Half jitter on a linear backoff keeps every sampled delay within
+    /// `[base / 2, base]`, with base 8, 16 and 24 s.
+    #[test]
+    fn linear_half_jitter_stays_within_bounds() {
+        let config = RetryStrategyConfig::builder()
+            .initial_delay(Duration::from_secs(8))
+            .backoff(Backoff::Linear {
+                increment: Duration::from_secs(8),
+            })
+            .jitter(JitterStrategy::Half)
+            .build();
+
+        for (attempt, base) in [(1u32, 8u64), (2, 16), (3, 24)] {
+            for _ in 0..100 {
+                let secs = retry_secs(&config.decide(&sample_error(), attempt));
+                assert!(
+                    (base / 2..=base).contains(&secs),
+                    "attempt {attempt}: delay {secs}s outside half-jitter bounds \
+                     [{}, {base}]",
+                    base / 2
+                );
+            }
+        }
     }
 
     /// A test error type for the `retry_if` case table.

@@ -21,7 +21,7 @@
 //!   [`WaitStrategy`](wait_for_condition::WaitStrategy) and
 //!   [`WaitDecision`](wait_for_condition::WaitDecision), and [`callback`]
 //!   holds the [`Callback`](callback::Callback) handle.
-//! - [`RetryStrategyConfig`] and [`JitterStrategy`] live at this module's
+//! - [`RetryStrategyConfig`], [`Backoff`] and [`JitterStrategy`] live at this module's
 //!   root because retry shaping is shared by three operations
 //!   ([`StepBuilder`], [`WithRetryBuilder`], and
 //!   [`WaitForCallbackBuilder`]).
@@ -208,6 +208,45 @@ pub enum JitterStrategy {
     Full,
 }
 
+/// How the retry delay grows from one attempt to the next, in a
+/// [`RetryStrategyConfig`].
+///
+/// The enum is `#[non_exhaustive]`, but its variants are not, so a caller
+/// builds a variant with struct syntax.
+///
+/// # Examples
+///
+/// ```
+/// use aws_durable_execution_sdk::builders::{Backoff, RetryStrategyConfig};
+/// use std::time::Duration;
+///
+/// let config = RetryStrategyConfig::builder()
+///     .backoff(Backoff::Linear { increment: Duration::from_secs(2) })
+///     .build();
+/// assert_eq!(
+///     config.backoff(),
+///     Backoff::Linear { increment: Duration::from_secs(2) }
+/// );
+/// assert_eq!(
+///     RetryStrategyConfig::default().backoff(),
+///     Backoff::Exponential { rate: 2.0 }
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum Backoff {
+    /// The delay before attempt `n + 1` is `initial_delay * rate^(n - 1)`.
+    Exponential {
+        /// Multiplier applied to the delay after each failed attempt.
+        rate: f64,
+    },
+    /// The delay before attempt `n + 1` is `initial_delay + increment * (n - 1)`.
+    Linear {
+        /// Amount added to the delay after each failed attempt.
+        increment: Duration,
+    },
+}
+
 /// Builder-based configuration for retry delay shaping.
 ///
 /// The common retry customization is shaping delays, how many attempts,
@@ -228,20 +267,36 @@ pub enum JitterStrategy {
 ///
 /// The configured schedule stops once the failing attempt number reaches
 /// `max_attempts`, so `max_attempts` is the total number of executions
-/// (initial attempt plus retries). Before that, the delay before attempt
-/// `n + 1` is `initial_delay * backoff_rate^(n - 1)` capped at `max_delay`,
-/// then jittered per [`JitterStrategy`] and rounded to the nearest whole
-/// second with a one-second minimum, for every jitter mode, as in the JS
-/// and Go SDKs. A delay that a custom retry closure returns is rounded up
-/// to whole seconds instead, with the same one-second minimum, so it never
-/// ends early.
+/// (initial attempt plus retries). Before that, the [`Backoff`] sets the
+/// base delay before attempt `n + 1`:
 ///
-/// [`Default`] reproduces the SDK's built-in retry behavior exactly:
-/// 6 total attempts, 5 second initial delay, 60 second maximum delay,
-/// 2.0 backoff rate, full jitter.
+/// - [`Backoff::Exponential`]: `initial_delay * rate^(n - 1)`.
+/// - [`Backoff::Linear`]: `initial_delay + increment * (n - 1)`.
 ///
-/// Construct with [`RetryStrategyConfig::builder`]; unset values keep
-/// their [`Default`] value. Read values back through the accessors.
+/// The base is capped at `max_delay`, then jittered per [`JitterStrategy`]
+/// and rounded to the nearest whole second with a one-second minimum, for
+/// every jitter mode, as in the JS and Go SDKs. A delay that a custom retry
+/// closure returns is rounded up to whole seconds instead, with the same
+/// one-second minimum, so it never ends early.
+///
+/// Three constructors match the JS `retryPresets`:
+///
+/// - [`RetryStrategyConfig::default`] is the JS `default` preset and the
+///   SDK's built-in retry behavior: 6 total attempts, 5 second initial
+///   delay, 60 second maximum delay, backoff rate 2, full jitter.
+/// - [`RetryStrategyConfig::linear`] is the JS `linear` preset: 6 attempts,
+///   delays of 1, 2, 3, 4 and 5 seconds, no jitter.
+/// - [`RetryStrategyConfig::no_retry`] is the JS `noRetry` preset: one
+///   attempt, so the first failure is final.
+///
+/// Construct any other config with [`RetryStrategyConfig::builder`]. A
+/// field the builder leaves unset does not come from [`Default`]. With an
+/// unset or exponential backoff it fills 3 attempts, 5 second initial delay,
+/// 5 minute maximum delay, backoff rate 2 and full jitter, as JS
+/// `createRetryStrategy` does. With [`Backoff::Linear`] it fills 6 attempts,
+/// 1 second initial delay, 5 minute maximum delay and full jitter, as JS
+/// `createLinearRetryStrategy` does. Read values back through the
+/// accessors.
 ///
 /// # Examples
 ///
@@ -256,8 +311,6 @@ pub enum JitterStrategy {
 ///     .build();
 /// assert_eq!(config.max_attempts(), 3);
 /// assert_eq!(config.initial_delay(), Duration::from_secs(2));
-/// // Unset values keep the default.
-/// assert_eq!(config.max_delay(), RetryStrategyConfig::default().max_delay());
 /// ```
 #[derive(Clone)]
 #[non_exhaustive]
@@ -272,8 +325,8 @@ pub struct RetryStrategyConfig {
     initial_delay: Duration,
     /// Upper bound on the computed backoff delay, prior to jitter.
     max_delay: Duration,
-    /// Multiplier applied to the delay after each failed attempt.
-    backoff_rate: f64,
+    /// How the delay grows after each failed attempt.
+    backoff: Backoff,
     /// Jitter applied to each computed delay.
     jitter: JitterStrategy,
     /// Error filter: when set, only the errors for which it returns `true`
@@ -290,7 +343,7 @@ impl fmt::Debug for RetryStrategyConfig {
             .field("max_attempts", &self.max_attempts)
             .field("initial_delay", &self.initial_delay)
             .field("max_delay", &self.max_delay)
-            .field("backoff_rate", &self.backoff_rate)
+            .field("backoff", &self.backoff)
             .field("jitter", &self.jitter)
             .field("retry_if", &self.retry_if.is_some())
             .finish()
@@ -298,15 +351,15 @@ impl fmt::Debug for RetryStrategyConfig {
 }
 
 impl Default for RetryStrategyConfig {
-    /// Returns the SDK default retry configuration: 6 total attempts,
-    /// 5 second initial delay, 60 second maximum delay, 2.0 backoff rate,
-    /// full jitter.
+    /// Returns the SDK default retry configuration, the JS `default`
+    /// preset: 6 total attempts, 5 second initial delay, 60 second maximum
+    /// delay, backoff rate 2, full jitter.
     fn default() -> Self {
         Self {
             max_attempts: 6,
             initial_delay: Duration::from_secs(5),
             max_delay: Duration::from_mins(1),
-            backoff_rate: 2.0,
+            backoff: Backoff::Exponential { rate: 2.0 },
             jitter: JitterStrategy::Full,
             retry_if: None,
         }
@@ -314,21 +367,108 @@ impl Default for RetryStrategyConfig {
 }
 
 impl RetryStrategyConfig {
-    /// Creates a new [`RetryStrategyConfigBuilder`] seeded with the default
-    /// values.
+    /// Creates a new [`RetryStrategyConfigBuilder`] with every field unset.
+    ///
+    /// The [`Backoff`] sets the base delay before attempt `n + 1`:
+    ///
+    /// - [`Backoff::Exponential`]: `initial_delay * rate^(n - 1)`.
+    /// - [`Backoff::Linear`]: `initial_delay + increment * (n - 1)`.
+    ///
+    /// [`RetryStrategyConfigBuilder::build`] fills each unset field from the
+    /// backoff the builder holds, not from [`RetryStrategyConfig::default`].
+    /// With an unset or [`Backoff::Exponential`] backoff it fills 3
+    /// attempts, 5 second initial delay, 5 minute maximum delay, backoff
+    /// rate 2 and full jitter, as JS `createRetryStrategy` does. With
+    /// [`Backoff::Linear`] it fills 6 attempts, 1 second initial delay,
+    /// 5 minute maximum delay and full jitter, as JS
+    /// `createLinearRetryStrategy` does.
+    ///
+    /// For the JS presets, use the constructors instead:
+    ///
+    /// - [`RetryStrategyConfig::default`] is the JS `default` preset: 6
+    ///   attempts, 5 second initial delay, 60 second maximum delay, backoff
+    ///   rate 2, full jitter.
+    /// - [`RetryStrategyConfig::linear`] is the JS `linear` preset: 6
+    ///   attempts, delays of 1, 2, 3, 4 and 5 seconds, no jitter.
+    /// - [`RetryStrategyConfig::no_retry`] is the JS `noRetry` preset: one
+    ///   attempt.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::builders::RetryStrategyConfig;
+    /// use std::time::Duration;
+    ///
+    /// let config = RetryStrategyConfig::builder()
+    ///     .initial_delay(Duration::from_secs(1))
+    ///     .build();
+    /// assert_eq!(config.max_attempts(), 3);
+    /// assert_eq!(config.max_delay(), Duration::from_secs(300));
+    /// ```
+    pub fn builder() -> RetryStrategyConfigBuilder {
+        RetryStrategyConfigBuilder::default()
+    }
+
+    /// The JS `linear` preset: 6 attempts; delays 1 s, 2 s, 3 s, 4 s, 5 s;
+    /// no jitter.
+    ///
+    /// Every field is set: 6 attempts, 1 second initial delay,
+    /// [`Backoff::Linear`] with a 1 second increment, 5 minute maximum
+    /// delay, [`JitterStrategy::None`], and no error filter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::builders::{Backoff, JitterStrategy, RetryStrategyConfig};
+    /// use std::time::Duration;
+    ///
+    /// let config = RetryStrategyConfig::linear();
+    /// assert_eq!(config.max_attempts(), 6);
+    /// assert_eq!(config.initial_delay(), Duration::from_secs(1));
+    /// assert_eq!(
+    ///     config.backoff(),
+    ///     Backoff::Linear { increment: Duration::from_secs(1) }
+    /// );
+    /// assert_eq!(config.jitter(), JitterStrategy::None);
+    /// ```
+    #[must_use]
+    pub fn linear() -> Self {
+        Self {
+            max_attempts: 6,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_mins(5),
+            backoff: Backoff::Linear {
+                increment: Duration::from_secs(1),
+            },
+            jitter: JitterStrategy::None,
+            retry_if: None,
+        }
+    }
+
+    /// The JS `noRetry` preset: one attempt, so the first failure is final.
+    ///
+    /// Every field is set: 1 attempt, 5 second initial delay, 5 minute
+    /// maximum delay, [`Backoff::Exponential`] with rate 2,
+    /// [`JitterStrategy::Full`], and no error filter. Only the attempt
+    /// count takes effect.
     ///
     /// # Examples
     ///
     /// ```
     /// use aws_durable_execution_sdk::builders::RetryStrategyConfig;
     ///
-    /// let config = RetryStrategyConfig::builder()
-    ///     .backoff_rate(1.5)
-    ///     .build();
-    /// assert!((config.backoff_rate() - 1.5).abs() < f64::EPSILON);
+    /// assert_eq!(RetryStrategyConfig::no_retry().max_attempts(), 1);
     /// ```
-    pub fn builder() -> RetryStrategyConfigBuilder {
-        RetryStrategyConfigBuilder::default()
+    #[must_use]
+    pub fn no_retry() -> Self {
+        Self {
+            max_attempts: 1,
+            initial_delay: Duration::from_secs(5),
+            max_delay: Duration::from_mins(5),
+            backoff: Backoff::Exponential { rate: 2.0 },
+            jitter: JitterStrategy::Full,
+            retry_if: None,
+        }
     }
 
     /// Returns the total number of attempts (initial attempt plus retries).
@@ -347,10 +487,9 @@ impl RetryStrategyConfig {
         self.max_delay
     }
 
-    /// Returns the multiplier applied to the delay after each failed
-    /// attempt.
-    pub fn backoff_rate(&self) -> f64 {
-        self.backoff_rate
+    /// Returns how the delay grows after each failed attempt.
+    pub fn backoff(&self) -> Backoff {
+        self.backoff
     }
 
     /// Returns the jitter applied to each computed delay.
@@ -367,8 +506,33 @@ impl RetryStrategyConfig {
 /// Builder for [`RetryStrategyConfig`].
 ///
 /// Follows the Rust API Guidelines C-BUILDER pattern. All methods consume
-/// and return `self` for chaining. Values left unset keep the
-/// [`RetryStrategyConfig::default`] value.
+/// and return `self` for chaining.
+///
+/// The [`Backoff`] sets the base delay before attempt `n + 1`:
+///
+/// - [`Backoff::Exponential`]: `initial_delay * rate^(n - 1)`.
+/// - [`Backoff::Linear`]: `initial_delay + increment * (n - 1)`.
+///
+/// [`build`](Self::build) fills each field left unset from the backoff the
+/// builder holds when `build` runs, not from [`RetryStrategyConfig::default`]:
+///
+/// - With an unset or [`Backoff::Exponential`] backoff: 3 attempts, 5
+///   second initial delay, 5 minute maximum delay, backoff rate 2, full
+///   jitter, as JS `createRetryStrategy` does.
+/// - With [`Backoff::Linear`]: 6 attempts, 1 second initial delay, 5 minute
+///   maximum delay, full jitter, as JS `createLinearRetryStrategy` does.
+///
+/// An unset error filter stays unset.
+///
+/// The JS presets need no builder:
+///
+/// - [`RetryStrategyConfig::default`] is the JS `default` preset: 6
+///   attempts, 5 second initial delay, 60 second maximum delay, backoff
+///   rate 2, full jitter.
+/// - [`RetryStrategyConfig::linear`] is the JS `linear` preset: 6 attempts,
+///   delays of 1, 2, 3, 4 and 5 seconds, no jitter.
+/// - [`RetryStrategyConfig::no_retry`] is the JS `noRetry` preset: one
+///   attempt.
 ///
 /// # Examples
 ///
@@ -393,7 +557,7 @@ pub struct RetryStrategyConfigBuilder {
     max_attempts: Option<u32>,
     initial_delay: Option<Duration>,
     max_delay: Option<Duration>,
-    backoff_rate: Option<f64>,
+    backoff: Option<Backoff>,
     jitter: Option<JitterStrategy>,
     retry_if: Option<RetryPredicate>,
 }
@@ -404,7 +568,7 @@ impl fmt::Debug for RetryStrategyConfigBuilder {
             .field("max_attempts", &self.max_attempts)
             .field("initial_delay", &self.initial_delay)
             .field("max_delay", &self.max_delay)
-            .field("backoff_rate", &self.backoff_rate)
+            .field("backoff", &self.backoff)
             .field("jitter", &self.jitter)
             .field("retry_if", &self.retry_if.is_some())
             .finish()
@@ -433,9 +597,21 @@ impl RetryStrategyConfigBuilder {
         self
     }
 
-    /// Sets the multiplier applied to the delay after each failed attempt.
-    pub fn backoff_rate(mut self, rate: f64) -> Self {
-        self.backoff_rate = Some(rate);
+    /// Sets an exponential backoff with `rate`: shorthand for
+    /// `backoff(Backoff::Exponential { rate })`.
+    ///
+    /// This setter and [`backoff`](Self::backoff) write the same field, so
+    /// the last call wins.
+    pub fn backoff_rate(self, rate: f64) -> Self {
+        self.backoff(Backoff::Exponential { rate })
+    }
+
+    /// Sets how the delay grows after each failed attempt.
+    ///
+    /// This setter and [`backoff_rate`](Self::backoff_rate) write the same
+    /// field, so the last call wins.
+    pub fn backoff(mut self, backoff: Backoff) -> Self {
+        self.backoff = Some(backoff);
         self
     }
 
@@ -533,17 +709,24 @@ impl RetryStrategyConfigBuilder {
         self
     }
 
-    /// Builds the [`RetryStrategyConfig`], filling unset values from
-    /// [`RetryStrategyConfig::default`].
+    /// Builds the [`RetryStrategyConfig`], filling each unset field from
+    /// the backoff the builder holds: the JS `createRetryStrategy` values
+    /// for an unset or exponential backoff, and the JS
+    /// `createLinearRetryStrategy` values for a linear one (see the type
+    /// documentation).
     #[must_use]
     pub fn build(self) -> RetryStrategyConfig {
-        let defaults = RetryStrategyConfig::default();
+        let backoff = self.backoff.unwrap_or(Backoff::Exponential { rate: 2.0 });
+        let (max_attempts, initial_delay) = match backoff {
+            Backoff::Exponential { .. } => (3, Duration::from_secs(5)),
+            Backoff::Linear { .. } => (6, Duration::from_secs(1)),
+        };
         RetryStrategyConfig {
-            max_attempts: self.max_attempts.unwrap_or(defaults.max_attempts),
-            initial_delay: self.initial_delay.unwrap_or(defaults.initial_delay),
-            max_delay: self.max_delay.unwrap_or(defaults.max_delay),
-            backoff_rate: self.backoff_rate.unwrap_or(defaults.backoff_rate),
-            jitter: self.jitter.unwrap_or(defaults.jitter),
+            max_attempts: self.max_attempts.unwrap_or(max_attempts),
+            initial_delay: self.initial_delay.unwrap_or(initial_delay),
+            max_delay: self.max_delay.unwrap_or(Duration::from_mins(5)),
+            backoff,
+            jitter: self.jitter.unwrap_or(JitterStrategy::Full),
             retry_if: self.retry_if,
         }
     }
@@ -907,7 +1090,7 @@ mod tests {
     }
 
     /// The `RetryStrategyConfig` builder round-trips every knob through the
-    /// accessors, and unset knobs keep their `Default` value.
+    /// accessors, and unset knobs take the JS `createRetryStrategy` fill.
     #[test]
     fn retry_strategy_config_builder_round_trips() {
         let config = RetryStrategyConfig::builder()
@@ -921,17 +1104,112 @@ mod tests {
         assert_eq!(config.max_attempts(), 4);
         assert_eq!(config.initial_delay(), Duration::from_millis(500));
         assert_eq!(config.max_delay(), Duration::from_secs(10));
-        assert!((config.backoff_rate() - 3.0).abs() < f64::EPSILON);
+        assert_eq!(config.backoff(), Backoff::Exponential { rate: 3.0 });
         assert_eq!(config.jitter(), JitterStrategy::Half);
 
-        // Unset values fall back to the defaults.
+        // Unset values take the JS `createRetryStrategy` fill.
         let partial = RetryStrategyConfig::builder().max_attempts(2).build();
-        let defaults = RetryStrategyConfig::default();
         assert_eq!(partial.max_attempts(), 2);
-        assert_eq!(partial.initial_delay(), defaults.initial_delay());
-        assert_eq!(partial.max_delay(), defaults.max_delay());
-        assert!((partial.backoff_rate() - defaults.backoff_rate()).abs() < f64::EPSILON);
-        assert_eq!(partial.jitter(), defaults.jitter());
+        assert_eq!(partial.initial_delay(), Duration::from_secs(5));
+        assert_eq!(partial.max_delay(), Duration::from_mins(5));
+        assert_eq!(partial.backoff(), Backoff::Exponential { rate: 2.0 });
+        assert_eq!(partial.jitter(), JitterStrategy::Full);
+        assert!(partial.retry_predicate().is_none());
+
+        // A linear builder round-trips its backoff and keeps the set
+        // fields.
+        let linear = RetryStrategyConfig::builder()
+            .backoff(Backoff::Linear {
+                increment: Duration::from_secs(3),
+            })
+            .max_attempts(4)
+            .initial_delay(Duration::from_secs(2))
+            .max_delay(Duration::from_secs(9))
+            .jitter(JitterStrategy::Half)
+            .build();
+        assert_eq!(linear.max_attempts(), 4);
+        assert_eq!(linear.initial_delay(), Duration::from_secs(2));
+        assert_eq!(linear.max_delay(), Duration::from_secs(9));
+        assert_eq!(
+            linear.backoff(),
+            Backoff::Linear {
+                increment: Duration::from_secs(3)
+            }
+        );
+        assert_eq!(linear.jitter(), JitterStrategy::Half);
+    }
+
+    /// `linear()` and `no_retry()` set every field to the JS preset values.
+    #[test]
+    fn retry_presets_match_js_values() {
+        let linear = RetryStrategyConfig::linear();
+        assert_eq!(linear.max_attempts(), 6);
+        assert_eq!(linear.initial_delay(), Duration::from_secs(1));
+        assert_eq!(
+            linear.backoff(),
+            Backoff::Linear {
+                increment: Duration::from_secs(1)
+            }
+        );
+        assert_eq!(linear.max_delay(), Duration::from_mins(5));
+        assert_eq!(linear.jitter(), JitterStrategy::None);
+        assert!(linear.retry_predicate().is_none());
+
+        let no_retry = RetryStrategyConfig::no_retry();
+        assert_eq!(no_retry.max_attempts(), 1);
+        assert_eq!(no_retry.initial_delay(), Duration::from_secs(5));
+        assert_eq!(no_retry.max_delay(), Duration::from_mins(5));
+        assert_eq!(no_retry.backoff(), Backoff::Exponential { rate: 2.0 });
+        assert_eq!(no_retry.jitter(), JitterStrategy::Full);
+        assert!(no_retry.retry_predicate().is_none());
+    }
+
+    /// `backoff` and `backoff_rate` write the same field: the last call
+    /// wins.
+    #[test]
+    fn backoff_setters_last_call_wins() {
+        let linear = Backoff::Linear {
+            increment: Duration::from_secs(1),
+        };
+        let rate_last = RetryStrategyConfig::builder()
+            .backoff(linear)
+            .backoff_rate(3.0)
+            .build();
+        assert_eq!(rate_last.backoff(), Backoff::Exponential { rate: 3.0 });
+
+        let linear_last = RetryStrategyConfig::builder()
+            .backoff_rate(3.0)
+            .backoff(linear)
+            .build();
+        assert_eq!(linear_last.backoff(), linear);
+    }
+
+    /// The builder fill follows the backoff it holds at `build`: the JS
+    /// `createLinearRetryStrategy` values for a linear backoff, and the JS
+    /// `createRetryStrategy` values once a later `backoff_rate` replaces it.
+    #[test]
+    fn retry_strategy_config_builder_fill_follows_backoff() {
+        let linear = RetryStrategyConfig::builder()
+            .backoff(Backoff::Linear {
+                increment: Duration::from_secs(2),
+            })
+            .build();
+        assert_eq!(linear.max_attempts(), 6);
+        assert_eq!(linear.initial_delay(), Duration::from_secs(1));
+        assert_eq!(linear.max_delay(), Duration::from_mins(5));
+        assert_eq!(linear.jitter(), JitterStrategy::Full);
+        assert!(linear.retry_predicate().is_none());
+
+        let replaced = RetryStrategyConfig::builder()
+            .backoff(Backoff::Linear {
+                increment: Duration::from_secs(2),
+            })
+            .backoff_rate(3.0)
+            .build();
+        assert_eq!(replaced.max_attempts(), 3);
+        assert_eq!(replaced.initial_delay(), Duration::from_secs(5));
+        assert_eq!(replaced.max_delay(), Duration::from_mins(5));
+        assert_eq!(replaced.jitter(), JitterStrategy::Full);
     }
 
     /// `Debug` prints every knob and whether a `retry_if` predicate is set,
@@ -948,7 +1226,7 @@ mod tests {
             "max_attempts: 6",
             "initial_delay: 5s",
             "max_delay: 60s",
-            "backoff_rate: 2.0",
+            "backoff: Exponential { rate: 2.0 }",
             "jitter: Full",
         ] {
             assert!(default.contains(field), "{field} missing from {default}");
@@ -958,9 +1236,20 @@ mod tests {
         let unset = format!("{builder:?}");
         assert!(unset.contains("retry_if: false"), "{unset}");
         assert!(unset.contains("max_attempts: None"), "{unset}");
+        assert!(unset.contains("backoff: None"), "{unset}");
         let builder = builder.max_attempts(3).retry_if(|_| false);
         let set = format!("{builder:?}");
         assert!(set.contains("retry_if: true"), "{set}");
+        let linear = format!(
+            "{:?}",
+            builder.clone().backoff(Backoff::Linear {
+                increment: Duration::from_secs(1)
+            })
+        );
+        assert!(
+            linear.contains("backoff: Some(Linear { increment: 1s })"),
+            "{linear}"
+        );
         assert!(set.contains("max_attempts: Some(3)"), "{set}");
 
         let config = builder
@@ -1006,8 +1295,9 @@ mod tests {
         assert_eq!(config.max_attempts(), 6);
         assert_eq!(config.initial_delay(), Duration::from_secs(5));
         assert_eq!(config.max_delay(), Duration::from_mins(1));
-        assert!((config.backoff_rate() - 2.0).abs() < f64::EPSILON);
+        assert_eq!(config.backoff(), Backoff::Exponential { rate: 2.0 });
         assert_eq!(config.jitter(), JitterStrategy::Full);
+        assert!(config.retry_predicate().is_none());
     }
 
     /// Constructs all fourteen builders and finalizes each through

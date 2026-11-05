@@ -711,7 +711,9 @@ let receipt = ctx
 `.retry_strategy_config(...)` accepts a `RetryStrategyConfig` instead of a
 closure, and without either the step default applies (6 total attempts with
 exponential backoff). When retries exhaust, the operation fails with the
-attempt count and the last attempt's error.
+attempt count and the last attempt's error. `RetryStrategyConfig::linear()` retries
+with delays of 1 to 5 seconds and `RetryStrategyConfig::no_retry()` makes
+the first failure final, as the JS `linear` and `noRetry` presets do.
 
 The wait after failed attempt `N` is named `{name}-backoff-N` when the
 block has a non-empty name, as in the JS SDK. The waits of an unnamed block
