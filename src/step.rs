@@ -37,15 +37,27 @@ pub(crate) fn default_retry_strategy() -> RetryStrategy {
 }
 
 impl RetryStrategyConfig {
-    /// Computes the retry decision for a 1-based failed attempt number.
+    /// Computes the retry decision for `err` at a 1-based failed attempt
+    /// number.
+    ///
+    /// The checks run in the JS order: the attempt cap first (the error
+    /// filter is not called once `attempt` reaches `max_attempts`), then
+    /// the error filter set with
+    /// [`retry_if`](crate::builders::RetryStrategyConfigBuilder::retry_if),
+    /// then the delay schedule.
     ///
     /// Exponential backoff: `initial_delay * backoff_rate^(attempt - 1)`,
     /// capped at `max_delay`, jittered per the configured
     /// [`JitterStrategy`], and rounded to the nearest whole second with a
     /// one-second minimum for every jitter mode (see [`quantize_delay`]).
     /// Stops once `attempt` reaches `max_attempts`.
-    pub(crate) fn decide(&self, attempt: u32) -> RetryDecision {
+    pub(crate) fn decide(&self, err: &StepError, attempt: u32) -> RetryDecision {
         if attempt >= self.max_attempts() {
+            return RetryDecision::Stop;
+        }
+        if let Some(predicate) = self.retry_predicate()
+            && !predicate(err)
+        {
             return RetryDecision::Stop;
         }
 
@@ -69,10 +81,10 @@ impl RetryStrategyConfig {
     }
 
     /// Converts this configuration into the boxed retry-strategy closure
-    /// the step engine consumes. The decision ignores the error value:
-    /// delay shaping depends only on the attempt number.
+    /// the step engine consumes. The error reaches only the error filter;
+    /// the delay depends only on the attempt number.
     pub(crate) fn into_retry_strategy(self) -> RetryStrategy {
-        Box::new(move |_err: &StepError, attempt: u32| self.decide(attempt))
+        Box::new(move |err: &StepError, attempt: u32| self.decide(err, attempt))
     }
 }
 
@@ -2772,13 +2784,13 @@ mod tests {
         let expected = [5u64, 10, 20, 40, 60];
         for (attempt, expected_secs) in (1u32..).zip(expected) {
             assert_eq!(
-                retry_secs(&config.decide(attempt)),
+                retry_secs(&config.decide(&sample_error(), attempt)),
                 expected_secs,
                 "attempt {attempt}"
             );
         }
-        assert_eq!(config.decide(6), RetryDecision::Stop);
-        assert_eq!(config.decide(7), RetryDecision::Stop);
+        assert_eq!(config.decide(&sample_error(), 6), RetryDecision::Stop);
+        assert_eq!(config.decide(&sample_error(), 7), RetryDecision::Stop);
     }
 
     /// `default_retry_strategy` agrees with `RetryStrategyConfig::default`
@@ -2795,7 +2807,7 @@ mod tests {
 
         for attempt in 1u32..=5 {
             // Sample repeatedly: full jitter randomizes within [1, base].
-            let base = retry_secs(&no_jitter.decide(attempt));
+            let base = retry_secs(&no_jitter.decide(&sample_error(), attempt));
             for _ in 0..50 {
                 let secs = retry_secs(&strategy(&err, attempt));
                 assert!(
@@ -2806,7 +2818,7 @@ mod tests {
         }
         // Both stop at the same attempt boundary (6 total attempts).
         assert_eq!(strategy(&err, 6), RetryDecision::Stop);
-        assert_eq!(no_jitter.decide(6), RetryDecision::Stop);
+        assert_eq!(no_jitter.decide(&sample_error(), 6), RetryDecision::Stop);
         assert_eq!(strategy(&err, 7), RetryDecision::Stop);
     }
 
@@ -2824,7 +2836,7 @@ mod tests {
             // base: 8, 16, 32: half-jitter bounds [4, 8], [8, 16], [16, 32].
             let base = 8u64 << (attempt - 1);
             for _ in 0..100 {
-                let secs = retry_secs(&config.decide(attempt));
+                let secs = retry_secs(&config.decide(&sample_error(), attempt));
                 assert!(
                     (base / 2..=base).contains(&secs),
                     "attempt {attempt}: delay {secs}s outside half-jitter bounds \
@@ -2844,7 +2856,7 @@ mod tests {
             .initial_delay(Duration::from_millis(1))
             .jitter(JitterStrategy::None)
             .build();
-        assert_eq!(retry_secs(&tiny.decide(1)), 1);
+        assert_eq!(retry_secs(&tiny.decide(&sample_error(), 1)), 1);
 
         // A huge backoff rate hits the cap immediately.
         let capped = RetryStrategyConfig::builder()
@@ -2853,8 +2865,8 @@ mod tests {
             .backoff_rate(100.0)
             .jitter(JitterStrategy::None)
             .build();
-        assert_eq!(retry_secs(&capped.decide(1)), 30);
-        assert_eq!(retry_secs(&capped.decide(2)), 45);
+        assert_eq!(retry_secs(&capped.decide(&sample_error(), 1)), 30);
+        assert_eq!(retry_secs(&capped.decide(&sample_error(), 2)), 45);
     }
 
     /// `max_attempts(1)` never retries: the first failure already reaches
@@ -2862,7 +2874,7 @@ mod tests {
     #[test]
     fn max_attempts_one_never_retries() {
         let config = RetryStrategyConfig::builder().max_attempts(1).build();
-        assert_eq!(config.decide(1), RetryDecision::Stop);
+        assert_eq!(config.decide(&sample_error(), 1), RetryDecision::Stop);
     }
 
     /// Every row of the `quantize_delay` case table: round to nearest,
@@ -2899,9 +2911,9 @@ mod tests {
             .initial_delay(Duration::from_millis(1100))
             .jitter(JitterStrategy::None)
             .build();
-        assert_eq!(retry_secs(&config.decide(1)), 1);
+        assert_eq!(retry_secs(&config.decide(&sample_error(), 1)), 1);
         // 1.1 * 2 = 2.2 s.
-        assert_eq!(retry_secs(&config.decide(2)), 2);
+        assert_eq!(retry_secs(&config.decide(&sample_error(), 2)), 2);
 
         // 1 * 1.5^2 = 2.25 s.
         let slow = RetryStrategyConfig::builder()
@@ -2909,13 +2921,136 @@ mod tests {
             .backoff_rate(1.5)
             .jitter(JitterStrategy::None)
             .build();
-        assert_eq!(retry_secs(&slow.decide(3)), 2);
+        assert_eq!(retry_secs(&slow.decide(&sample_error(), 3)), 2);
 
         let half = RetryStrategyConfig::builder()
             .initial_delay(Duration::from_millis(2500))
             .jitter(JitterStrategy::None)
             .build();
-        assert_eq!(retry_secs(&half.decide(1)), 3);
+        assert_eq!(retry_secs(&half.decide(&sample_error(), 1)), 3);
+    }
+
+    /// A test error type for the `retry_if` case table.
+    #[derive(Debug)]
+    struct Transient;
+
+    impl std::fmt::Display for Transient {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("transient")
+        }
+    }
+
+    impl std::error::Error for Transient {}
+
+    fn is_transient(err: &StepError) -> bool {
+        std::error::Error::source(err)
+            .and_then(|e| e.downcast_ref::<Transient>())
+            .is_some()
+    }
+
+    fn mentions_timeout(err: &StepError) -> bool {
+        std::error::Error::source(err)
+            .map(ToString::to_string)
+            .is_some_and(|message| message.contains("timeout"))
+    }
+
+    fn body_error(source: crate::error::Source) -> StepError {
+        StepError::new(StepErrorKind::ExecutionFailed, Some(source))
+    }
+
+    /// Every row of the `retry_if` case table: the cap is checked first
+    /// (the predicate is not called at the cap), then the predicate, then
+    /// the unchanged delay schedule. Matching on the source's type
+    /// (`instanceof` in JS), on its message (`includes` in JS), and on
+    /// both with `||` (the OR of the two JS lists).
+    #[test]
+    fn retry_if_filter_cases() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        type Predicate = fn(&StepError) -> bool;
+        /// (case, predicate, error, attempt, expected delay secs, predicate called)
+        type Case = (
+            &'static str,
+            Option<Predicate>,
+            StepError,
+            u32,
+            Option<u64>,
+            bool,
+        );
+        let either: Predicate = |err| is_transient(err) || mentions_timeout(err);
+        let boom = || body_error("boom".into());
+        let transient = || body_error(Box::new(Transient));
+        let timeout = || body_error("read timeout".into());
+
+        let cases: Vec<Case> = vec![
+            ("A", None, boom(), 1, Some(1), false),
+            ("B", Some(|_| false), boom(), 1, None, true),
+            ("C", Some(|_| true), boom(), 2, Some(2), true),
+            ("D", Some(|_| true), boom(), 3, None, false),
+            ("E", Some(is_transient), transient(), 1, Some(1), true),
+            ("F", Some(is_transient), boom(), 1, None, true),
+            ("G", Some(mentions_timeout), timeout(), 1, Some(1), true),
+            ("H", Some(either), boom(), 1, None, true),
+            ("I", Some(either), timeout(), 1, Some(1), true),
+        ];
+
+        for (case, predicate, err, attempt, expected, called) in cases {
+            let calls = Arc::new(AtomicU32::new(0));
+            let mut builder = RetryStrategyConfig::builder()
+                .max_attempts(3)
+                .initial_delay(Duration::from_secs(1))
+                .jitter(JitterStrategy::None);
+            if let Some(predicate) = predicate {
+                let calls = Arc::clone(&calls);
+                builder = builder.retry_if(move |err| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    predicate(err)
+                });
+            }
+            let config = builder.build();
+
+            let decision = config.decide(&err, attempt);
+            let expected = expected.map_or(RetryDecision::Stop, |secs| RetryDecision::Retry {
+                delay: Duration::from_secs(secs),
+            });
+            assert_eq!(decision, expected, "case {case}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                u32::from(called),
+                "case {case}: predicate calls"
+            );
+        }
+    }
+
+    /// The predicate sees the strategy's error kind, so a filter can tell
+    /// an interrupted at-most-once attempt from a body error.
+    #[test]
+    fn retry_if_sees_the_error_kind() {
+        let config = RetryStrategyConfig::builder()
+            .max_attempts(3)
+            .initial_delay(Duration::from_secs(1))
+            .jitter(JitterStrategy::None)
+            .retry_if(|err| matches!(err.kind(), StepErrorKind::ExecutionFailed))
+            .build();
+        let interrupted = StepError::new(StepErrorKind::Interrupted, None);
+        assert_eq!(config.decide(&interrupted, 1), RetryDecision::Stop);
+        assert_eq!(
+            config.decide(&sample_error(), 1),
+            RetryDecision::Retry {
+                delay: Duration::from_secs(1)
+            }
+        );
+    }
+
+    /// `into_retry_strategy` passes the error to the filter.
+    #[test]
+    fn into_retry_strategy_applies_retry_if() {
+        let strategy = RetryStrategyConfig::builder()
+            .retry_if(|_| false)
+            .build()
+            .into_retry_strategy();
+        assert_eq!(strategy(&sample_error(), 1), RetryDecision::Stop);
     }
 }
 

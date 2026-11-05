@@ -30,7 +30,10 @@
 //! methods (for example [`DurableContext::step`](crate::DurableContext::step)),
 //! never directly.
 
+use std::fmt;
 use std::time::Duration;
+
+use crate::StepError;
 
 /// Eagerly validates the builder's claimed replay identity right after the
 /// builder claims its operation ID.
@@ -210,12 +213,18 @@ pub enum JitterStrategy {
 /// The common retry customization is shaping delays, how many attempts,
 /// how the delay grows, where it caps, and how it is jittered, without
 /// hand-writing a closure over `(error, attempt)`. `RetryStrategyConfig`
-/// captures exactly those knobs. Pass it to
-/// [`StepBuilder::retry_strategy_config`] or
-/// [`WaitForCallbackBuilder::submitter_retry_config`]; the closure setters
+/// captures exactly those knobs, plus an optional error filter set with
+/// [`RetryStrategyConfigBuilder::retry_if`] that limits the retries to the
+/// errors it accepts. Pass it to [`StepBuilder::retry_strategy_config`],
+/// [`WaitForCallbackBuilder::submitter_retry_config`] or
+/// [`WithRetryBuilder::retry_strategy_config`]. The closure setters
 /// ([`StepBuilder::retry_strategy`],
-/// [`WaitForCallbackBuilder::submitter_retry`]) remain the escape hatch for
-/// decisions a delay schedule cannot express, such as inspecting the error.
+/// [`WaitForCallbackBuilder::submitter_retry`] and
+/// [`WithRetryBuilder::retry_strategy`]) remain for retry rules the config
+/// cannot express, such as a delay that depends on the error.
+///
+/// The strategy checks the attempt cap first, then the filter, then the
+/// delay schedule, as the JS SDK does.
 ///
 /// The configured schedule stops once the failing attempt number reaches
 /// `max_attempts`, so `max_attempts` is the total number of executions
@@ -250,7 +259,7 @@ pub enum JitterStrategy {
 /// // Unset values keep the default.
 /// assert_eq!(config.max_delay(), RetryStrategyConfig::default().max_delay());
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 // Fields are private so the struct can grow without breaking callers;
 // see the Rust API Guidelines on structs with private fields:
@@ -267,6 +276,25 @@ pub struct RetryStrategyConfig {
     backoff_rate: f64,
     /// Jitter applied to each computed delay.
     jitter: JitterStrategy,
+    /// Error filter: when set, only the errors for which it returns `true`
+    /// are retried.
+    retry_if: Option<RetryPredicate>,
+}
+
+/// The error filter that [`RetryStrategyConfigBuilder::retry_if`] stores.
+pub(crate) type RetryPredicate = std::sync::Arc<dyn Fn(&StepError) -> bool + Send + Sync>;
+
+impl fmt::Debug for RetryStrategyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetryStrategyConfig")
+            .field("max_attempts", &self.max_attempts)
+            .field("initial_delay", &self.initial_delay)
+            .field("max_delay", &self.max_delay)
+            .field("backoff_rate", &self.backoff_rate)
+            .field("jitter", &self.jitter)
+            .field("retry_if", &self.retry_if.is_some())
+            .finish()
+    }
 }
 
 impl Default for RetryStrategyConfig {
@@ -280,6 +308,7 @@ impl Default for RetryStrategyConfig {
             max_delay: Duration::from_mins(1),
             backoff_rate: 2.0,
             jitter: JitterStrategy::Full,
+            retry_if: None,
         }
     }
 }
@@ -328,6 +357,11 @@ impl RetryStrategyConfig {
     pub fn jitter(&self) -> JitterStrategy {
         self.jitter
     }
+
+    /// Returns the error filter, if one is set (internal).
+    pub(crate) fn retry_predicate(&self) -> Option<&RetryPredicate> {
+        self.retry_if.as_ref()
+    }
 }
 
 /// Builder for [`RetryStrategyConfig`].
@@ -352,7 +386,7 @@ impl RetryStrategyConfig {
 /// assert_eq!(config.max_delay(), Duration::from_secs(10));
 /// assert_eq!(config.jitter(), JitterStrategy::Half);
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[must_use = "builders do nothing unless .build() is called"]
 #[non_exhaustive]
 pub struct RetryStrategyConfigBuilder {
@@ -361,6 +395,20 @@ pub struct RetryStrategyConfigBuilder {
     max_delay: Option<Duration>,
     backoff_rate: Option<f64>,
     jitter: Option<JitterStrategy>,
+    retry_if: Option<RetryPredicate>,
+}
+
+impl fmt::Debug for RetryStrategyConfigBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetryStrategyConfigBuilder")
+            .field("max_attempts", &self.max_attempts)
+            .field("initial_delay", &self.initial_delay)
+            .field("max_delay", &self.max_delay)
+            .field("backoff_rate", &self.backoff_rate)
+            .field("jitter", &self.jitter)
+            .field("retry_if", &self.retry_if.is_some())
+            .finish()
+    }
 }
 
 impl RetryStrategyConfigBuilder {
@@ -397,6 +445,94 @@ impl RetryStrategyConfigBuilder {
         self
     }
 
+    /// Retries only the errors for which `predicate` returns `true`.
+    ///
+    /// The strategy checks the attempt cap first: once the failing attempt
+    /// reaches `max_attempts` it stops without calling `predicate`. Before
+    /// that, an error the predicate rejects stops the retries, and an error
+    /// it accepts gets the configured delay. Without a predicate every
+    /// error is retried. A second call replaces the first predicate.
+    ///
+    /// A stop that the predicate causes is handled like every other stop:
+    /// the operation fails with the attempt's error.
+    ///
+    /// The predicate must be a deterministic function of the error, because
+    /// replay can ask it again about an error it already judged.
+    ///
+    /// The predicate receives the [`StepError`] the strategy receives.
+    /// [`StepError::kind`] tells a body error
+    /// ([`StepErrorKind::ExecutionFailed`](crate::StepErrorKind::ExecutionFailed))
+    /// apart from an interrupted at-most-once attempt
+    /// ([`StepErrorKind::Interrupted`](crate::StepErrorKind::Interrupted)).
+    /// `err.to_string()` names only the kind. Match the body's message
+    /// with `err.source().map(ToString::to_string)`, and the body's type
+    /// with `err.source().and_then(|e| e.downcast_ref::<T>())`. Combine
+    /// several conditions with `||`.
+    ///
+    /// With [`WithRetryBuilder::retry_strategy_config`], the source is the
+    /// attempt's [`OperationError`](crate::OperationError), and an attempt
+    /// that replays has no live source error, only its record. Match the
+    /// record through [`OperationError::wire`](crate::OperationError::wire)
+    /// ([`WireError::error_type`](crate::WireError::error_type) or
+    /// [`WireError::error_message`](crate::WireError::error_message))
+    /// there, not with a downcast.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::error::Error as _;
+    /// use std::fmt;
+    ///
+    /// use aws_durable_execution_sdk::builders::RetryStrategyConfig;
+    /// use aws_durable_execution_sdk::{OperationError, StepError};
+    ///
+    /// #[derive(Debug)]
+    /// struct Throttled;
+    ///
+    /// impl fmt::Display for Throttled {
+    ///     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    ///         f.write_str("throttled")
+    ///     }
+    /// }
+    ///
+    /// impl std::error::Error for Throttled {}
+    ///
+    /// // A step: retry a `Throttled` body error or any body error whose
+    /// // message mentions a timeout.
+    /// let step_config = RetryStrategyConfig::builder()
+    ///     .max_attempts(4)
+    ///     .retry_if(|err: &StepError| {
+    ///         err.source().and_then(|e| e.downcast_ref::<Throttled>()).is_some()
+    ///             || err
+    ///                 .source()
+    ///                 .map(ToString::to_string)
+    ///                 .is_some_and(|message| message.contains("timeout"))
+    ///     })
+    ///     .build();
+    ///
+    /// // A `with_retry` block: match the attempt's record, which reads the
+    /// // same live and on replay.
+    /// let block_config = RetryStrategyConfig::builder()
+    ///     .retry_if(|err: &StepError| {
+    ///         err.source()
+    ///             .and_then(|e| e.downcast_ref::<OperationError>())
+    ///             .and_then(OperationError::wire)
+    ///             .and_then(|wire| wire.error_message())
+    ///             .is_some_and(|message| message.contains("timeout"))
+    ///     })
+    ///     .build();
+    ///
+    /// assert!(format!("{step_config:?}").contains("retry_if: true"));
+    /// assert!(format!("{block_config:?}").contains("retry_if: true"));
+    /// ```
+    pub fn retry_if<P>(mut self, predicate: P) -> Self
+    where
+        P: Fn(&StepError) -> bool + Send + Sync + 'static,
+    {
+        self.retry_if = Some(std::sync::Arc::new(predicate));
+        self
+    }
+
     /// Builds the [`RetryStrategyConfig`], filling unset values from
     /// [`RetryStrategyConfig::default`].
     #[must_use]
@@ -408,6 +544,7 @@ impl RetryStrategyConfigBuilder {
             max_delay: self.max_delay.unwrap_or(defaults.max_delay),
             backoff_rate: self.backoff_rate.unwrap_or(defaults.backoff_rate),
             jitter: self.jitter.unwrap_or(defaults.jitter),
+            retry_if: self.retry_if,
         }
     }
 }
@@ -795,6 +932,70 @@ mod tests {
         assert_eq!(partial.max_delay(), defaults.max_delay());
         assert!((partial.backoff_rate() - defaults.backoff_rate()).abs() < f64::EPSILON);
         assert_eq!(partial.jitter(), defaults.jitter());
+    }
+
+    /// `Debug` prints every knob and whether a `retry_if` predicate is set,
+    /// on the config and on its builder, and a cloned config keeps the
+    /// predicate (case B of the `retry_if` table holds on the clone).
+    #[test]
+    fn retry_strategy_config_debug_shows_retry_if() {
+        use crate::RetryDecision;
+        use crate::error::StepErrorKind;
+
+        let default = format!("{:?}", RetryStrategyConfig::default());
+        assert!(default.contains("retry_if: false"), "{default}");
+        for field in [
+            "max_attempts: 6",
+            "initial_delay: 5s",
+            "max_delay: 60s",
+            "backoff_rate: 2.0",
+            "jitter: Full",
+        ] {
+            assert!(default.contains(field), "{field} missing from {default}");
+        }
+
+        let builder = RetryStrategyConfig::builder();
+        let unset = format!("{builder:?}");
+        assert!(unset.contains("retry_if: false"), "{unset}");
+        assert!(unset.contains("max_attempts: None"), "{unset}");
+        let builder = builder.max_attempts(3).retry_if(|_| false);
+        let set = format!("{builder:?}");
+        assert!(set.contains("retry_if: true"), "{set}");
+        assert!(set.contains("max_attempts: Some(3)"), "{set}");
+
+        let config = builder
+            .initial_delay(Duration::from_secs(1))
+            .jitter(JitterStrategy::None)
+            .build();
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("retry_if: true"), "{rendered}");
+
+        let clone = config.clone();
+        assert!(format!("{clone:?}").contains("retry_if: true"));
+        let err = StepError::new(StepErrorKind::ExecutionFailed, Some("boom".into()));
+        assert_eq!(clone.decide(&err, 1), RetryDecision::Stop);
+    }
+
+    /// A second `retry_if` call replaces the first predicate.
+    #[test]
+    fn retry_if_second_call_replaces_first() {
+        use crate::RetryDecision;
+        use crate::error::StepErrorKind;
+
+        let config = RetryStrategyConfig::builder()
+            .max_attempts(3)
+            .initial_delay(Duration::from_secs(1))
+            .jitter(JitterStrategy::None)
+            .retry_if(|_| false)
+            .retry_if(|_| true)
+            .build();
+        let err = StepError::new(StepErrorKind::ExecutionFailed, Some("boom".into()));
+        assert_eq!(
+            config.decide(&err, 1),
+            RetryDecision::Retry {
+                delay: Duration::from_secs(1)
+            }
+        );
     }
 
     /// `RetryStrategyConfig::default` carries the documented SDK constants:

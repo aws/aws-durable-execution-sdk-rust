@@ -5575,6 +5575,265 @@ mod tests {
         assert!(result.operations().iter().any(TestOperation::failed));
     }
 
+    /// A test error type the `retry_if` `LocalRunner` tests match by type.
+    #[derive(Debug)]
+    struct Transient(u32);
+
+    impl std::fmt::Display for Transient {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "transient on attempt {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Transient {}
+
+    /// Describes an awaited step error: `Step(ExecutionFailed)` plus the
+    /// source's message, or the error itself for any other shape.
+    fn describe_step_failure(err: &crate::OperationError) -> String {
+        match err.kind() {
+            crate::OperationErrorKind::Step(step) => match step.kind() {
+                crate::StepErrorKind::ExecutionFailed => format!(
+                    "ExecutionFailed: {}",
+                    std::error::Error::source(step).map_or_else(String::new, ToString::to_string)
+                ),
+                other => format!("other step kind: {other}"),
+            },
+            _ => format!("not a step error: {err:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn step_retry_if_false_fails_after_one_attempt() {
+        // A predicate that rejects every error stops at the first failure,
+        // although max_attempts(3) would allow two retries.
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_seen = Arc::clone(&attempts);
+
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let attempts_seen = Arc::clone(&attempts_seen);
+                    async move {
+                        let config = crate::builders::RetryStrategyConfig::builder()
+                            .max_attempts(3)
+                            .retry_if(|_| false)
+                            .build();
+                        let outcome = ctx
+                            .step(move |_| {
+                                let attempts_seen = Arc::clone(&attempts_seen);
+                                async move {
+                                    attempts_seen.fetch_add(1, Ordering::SeqCst);
+                                    Err::<i32, BoxError>("always fails".into())
+                                }
+                            })
+                            .name("filtered")
+                            .retry_strategy_config(config)
+                            .await;
+                        let err = outcome.expect_err("the step fails");
+                        Ok::<_, BoxError>(describe_step_failure(&err))
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(
+            result.output().map(String::as_str),
+            Some("ExecutionFailed: always fails")
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let op = result.operation("filtered").expect("the step is recorded");
+        assert_eq!(op.status(), OperationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn step_retry_if_retries_matching_error_until_cap() {
+        // A predicate that accepts `Transient` retries it until the cap,
+        // and the awaited error carries the third attempt's `Transient`.
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_seen = Arc::clone(&attempts);
+
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let attempts_seen = Arc::clone(&attempts_seen);
+                    async move {
+                        let config = crate::builders::RetryStrategyConfig::builder()
+                            .max_attempts(3)
+                            .initial_delay(std::time::Duration::from_secs(1))
+                            .jitter(crate::builders::JitterStrategy::None)
+                            .retry_if(|err| {
+                                std::error::Error::source(err)
+                                    .and_then(|e| e.downcast_ref::<Transient>())
+                                    .is_some()
+                            })
+                            .build();
+                        let outcome = ctx
+                            .step(move |sc| {
+                                let attempts_seen = Arc::clone(&attempts_seen);
+                                async move {
+                                    attempts_seen.fetch_add(1, Ordering::SeqCst);
+                                    Err::<i32, BoxError>(Box::new(Transient(sc.attempt())))
+                                }
+                            })
+                            .name("transient")
+                            .retry_strategy_config(config)
+                            .await;
+                        let err = outcome.expect_err("the step fails");
+                        // On the live path the source is the third
+                        // attempt's own `Transient`.
+                        let third = match err.kind() {
+                            crate::OperationErrorKind::Step(step) => {
+                                std::error::Error::source(step)
+                                    .and_then(|e| e.downcast_ref::<Transient>())
+                                    .map(|t| t.0)
+                            }
+                            _ => None,
+                        };
+                        Ok::<_, BoxError>((describe_step_failure(&err), third))
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            result.output(),
+            Some(&(
+                "ExecutionFailed: transient on attempt 3".to_owned(),
+                Some(3)
+            ))
+        );
+        let op = result.operation("transient").expect("the step is recorded");
+        assert_eq!(op.status(), OperationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn wait_for_callback_submitter_retry_if() {
+        // A submitter that fails with "boom" and a predicate that rejects
+        // it: the submitter runs once and the operation fails.
+        let submits = Arc::new(AtomicU32::new(0));
+        let submits_seen = Arc::clone(&submits);
+
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let submits_seen = Arc::clone(&submits_seen);
+                    async move {
+                        let config = crate::builders::RetryStrategyConfig::builder()
+                            .max_attempts(3)
+                            .initial_delay(std::time::Duration::from_secs(1))
+                            .jitter(crate::builders::JitterStrategy::None)
+                            .retry_if(|_| false)
+                            .build();
+                        let outcome = ctx
+                            .wait_for_callback::<u32, _, _>(move |_step_ctx, _callback_id| {
+                                let submits_seen = Arc::clone(&submits_seen);
+                                async move {
+                                    if submits_seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                                        Err::<(), BoxError>("boom".into())
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                            })
+                            .name("approval")
+                            .submitter_retry_config(config)
+                            .await;
+                        Ok::<_, BoxError>(outcome.is_err())
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&true), "the operation fails");
+        assert_eq!(submits.load(Ordering::SeqCst), 1);
+        let op = result
+            .operation("approval")
+            .expect("the operation is recorded");
+        assert_eq!(op.status(), OperationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn with_retry_retry_if_matches_recorded_message() {
+        // Attempt 1 fails with "transient" and attempt 2 succeeds. The
+        // predicate reads the attempt's record through `wire()`, so it
+        // answers the same live and when replay asks it again about
+        // attempt 1 after the backoff suspension.
+        let block_runs = Arc::new(AtomicU32::new(0));
+        let block_runs_seen = Arc::clone(&block_runs);
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        let answers_seen = Arc::clone(&answers);
+
+        let result = LocalRunner::new()
+            .run(
+                move |(), ctx: DurableContext| {
+                    let block_runs_seen = Arc::clone(&block_runs_seen);
+                    let answers_seen = Arc::clone(&answers_seen);
+                    async move {
+                        let config = crate::builders::RetryStrategyConfig::builder()
+                            .max_attempts(3)
+                            .initial_delay(std::time::Duration::from_secs(1))
+                            .jitter(crate::builders::JitterStrategy::None)
+                            .retry_if(move |err| {
+                                let matched = std::error::Error::source(err)
+                                    .and_then(|e| e.downcast_ref::<crate::OperationError>())
+                                    .and_then(crate::OperationError::wire)
+                                    .and_then(crate::WireError::error_message)
+                                    .is_some_and(|message| message.contains("transient"));
+                                answers_seen.lock().expect("answers").push(matched);
+                                matched
+                            })
+                            .build();
+                        let value = ctx
+                            .with_retry(move |_child| {
+                                let block_runs_seen = Arc::clone(&block_runs_seen);
+                                async move {
+                                    if block_runs_seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                                        Err::<u32, BoxError>("transient".into())
+                                    } else {
+                                        Ok(9)
+                                    }
+                                }
+                            })
+                            .name("block")
+                            .retry_strategy_config(config)
+                            .await?;
+                        Ok::<_, BoxError>(value)
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+
+        assert!(result.is_success(), "{:?}", result.error_message());
+        assert_eq!(result.output(), Some(&9));
+        assert_eq!(block_runs.load(Ordering::SeqCst), 2, "two attempts ran");
+        assert!(result.operation("attempt-1").expect("attempt 1").failed());
+        assert!(
+            result
+                .operation("attempt-2")
+                .expect("attempt 2")
+                .succeeded()
+        );
+        assert!(result.invocation_count() >= 2, "the backoff suspended");
+        let answers = answers.lock().expect("answers").clone();
+        assert!(
+            answers.len() >= 2,
+            "the predicate is asked live and again on replay: {answers:?}"
+        );
+        assert!(answers.iter().all(|matched| *matched), "{answers:?}");
+    }
+
     // 1. step retry (retry strategy honored)
 
     #[tokio::test]

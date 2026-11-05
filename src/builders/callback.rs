@@ -419,10 +419,12 @@ where
     /// [`RetryStrategyConfig`](crate::builders::RetryStrategyConfig).
     ///
     /// Use this for the common case, shaping retry delays (attempt count,
-    /// initial delay, cap, backoff rate, jitter), without hand-writing a
-    /// closure. For decisions a delay schedule cannot express, such as
-    /// inspecting the error, use [`submitter_retry`](Self::submitter_retry)
-    /// instead.
+    /// initial delay, cap, backoff rate, jitter) and limiting the retries
+    /// to some errors with
+    /// [`retry_if`](crate::builders::RetryStrategyConfigBuilder::retry_if),
+    /// without hand-writing a closure. The closure setter
+    /// [`submitter_retry`](Self::submitter_retry) remains for retry rules the config
+    /// cannot express, such as a delay that depends on the error.
     ///
     /// # Examples
     ///

@@ -476,6 +476,10 @@ let result = ctx
     .await?;
 ```
 
+`.retry_strategy_config(...)` takes a `RetryStrategyConfig` with the default
+backoff instead of a closure, and its builder's `retry_if(predicate)` retries
+only the errors for which the predicate returns `true`.
+
 `StepSemantics::AtLeastOncePerRetry` is the default: the SDK re-executes the
 body on resume if the previous attempt started but recorded no outcome.
 The body starts without waiting for the `START` checkpoint. The outcome is
