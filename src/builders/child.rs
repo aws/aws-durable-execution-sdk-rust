@@ -50,6 +50,9 @@ pub struct ChildBuilder<O, F, Fut, S = JsonSerdes> {
     sub_type: Option<OperationSubType>,
     serdes: S,
     closure: F,
+    /// Whether the body is a user function. Only `with_retry` clears it,
+    /// for its attempt children.
+    user_function: crate::child::UserFunctionPolicy,
     _marker: PhantomData<fn() -> (O, Fut)>,
 }
 
@@ -77,6 +80,7 @@ where
             sub_type: None,
             serdes: JsonSerdes,
             closure,
+            user_function: crate::child::UserFunctionPolicy::Hooks,
             _marker: PhantomData,
         }
     }
@@ -88,6 +92,14 @@ where
     F: FnOnce(DurableContext) -> Fut + Send + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
 {
+    /// Marks the body as no user function: no frame and no user-function
+    /// hooks. `with_retry` sets it for its attempt children, whose outer
+    /// block is the user function, as JS wraps only that block.
+    pub(crate) fn without_user_function(mut self) -> Self {
+        self.user_function = crate::child::UserFunctionPolicy::None;
+        self
+    }
+
     /// Sets a human-readable name for this operation.
     ///
     /// Names appear in logs, traces, and the execution history for
@@ -158,6 +170,7 @@ where
             sub_type: self.sub_type,
             serdes,
             closure: self.closure,
+            user_function: self.user_function,
             _marker: PhantomData,
         }
     }
@@ -279,6 +292,7 @@ where
                 .unwrap_or(OperationSubType::RUN_IN_CHILD_CONTEXT),
             serdes: self.serdes,
             closure: self.closure,
+            user_function: self.user_function,
             _marker: PhantomData,
         };
 

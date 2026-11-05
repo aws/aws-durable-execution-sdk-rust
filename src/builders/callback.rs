@@ -241,7 +241,7 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     {
         match self.execution() {
             Ok(execution) => DurableFuture::for_started_operation(execution.execute_started()),
-            Err(future) => future,
+            Err(future) => *future,
         }
     }
 
@@ -249,7 +249,8 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
     /// preflight.
     fn execution(
         self,
-    ) -> Result<crate::callback::CreateCallbackExecution<O, S>, DurableFuture<Callback<O>>> {
+    ) -> Result<crate::callback::CreateCallbackExecution<O, S>, Box<DurableFuture<Callback<O>>>>
+    {
         if let Err(err) = self.ctx.preflight_replay_identity(
             &self.op_id,
             "Callback",
@@ -260,7 +261,7 @@ impl<O: Send + 'static, S> CreateCallbackBuilder<O, S> {
             ),
             self.name.as_deref(),
         ) {
-            return Err(DurableFuture::from_async(async move { Err(err) }));
+            return Err(Box::new(DurableFuture::from_async(async move { Err(err) })));
         }
         Ok(crate::callback::CreateCallbackExecution {
             ctx: self.ctx,
@@ -287,7 +288,7 @@ where
     fn into_future(self) -> Self::IntoFuture {
         match self.execution() {
             Ok(execution) => DurableFuture::for_start_step(move || execution.execute_started()),
-            Err(future) => future,
+            Err(future) => *future,
         }
     }
 }
@@ -635,7 +636,7 @@ where
     fn started_future(self) -> DurableFuture<O> {
         match self.execution() {
             Ok(execution) => DurableFuture::for_started_operation(execution.execute_started()),
-            Err(future) => future,
+            Err(future) => *future,
         }
     }
 
@@ -643,14 +644,14 @@ where
     /// preflight.
     fn execution(
         self,
-    ) -> Result<crate::callback::WaitForCallbackExecution<O, F, S>, DurableFuture<O>> {
+    ) -> Result<crate::callback::WaitForCallbackExecution<O, F, S>, Box<DurableFuture<O>>> {
         if let Err(err) = self.ctx.preflight_replay_identity(
             &self.op_id,
             "Context",
             Some(crate::callback::WFCB_SUB_TYPE),
             self.name.as_deref(),
         ) {
-            return Err(DurableFuture::from_async(async move { Err(err) }));
+            return Err(Box::new(DurableFuture::from_async(async move { Err(err) })));
         }
         Ok(crate::callback::WaitForCallbackExecution {
             ctx: self.ctx,
@@ -679,7 +680,7 @@ where
     fn into_future(self) -> Self::IntoFuture {
         match self.execution() {
             Ok(execution) => DurableFuture::for_start_step(move || execution.execute_started()),
-            Err(future) => future,
+            Err(future) => *future,
         }
     }
 }

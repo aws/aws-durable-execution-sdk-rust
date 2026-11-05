@@ -378,13 +378,13 @@ where
         let execution = self.execution();
         match execution {
             Ok(execution) => DurableFuture::for_started_operation(execution.execute_started()),
-            Err(future) => future,
+            Err(future) => *future,
         }
     }
 
     /// The step's execution, or the error future of a failed identity
     /// preflight.
-    fn execution(self) -> Result<crate::step::StepExecution<O, F, S>, DurableFuture<O>> {
+    fn execution(self) -> Result<crate::step::StepExecution<O, F, S>, Box<DurableFuture<O>>> {
         if let Err(err) = self.ctx.preflight_replay_identity(
             &self.op_id,
             "Step",
@@ -395,7 +395,7 @@ where
             ),
             self.name.as_deref(),
         ) {
-            return Err(DurableFuture::from_async(async move { Err(err) }));
+            return Err(Box::new(DurableFuture::from_async(async move { Err(err) })));
         }
         Ok(crate::step::StepExecution {
             ctx: self.ctx,
@@ -425,7 +425,7 @@ where
     fn into_future(self) -> Self::IntoFuture {
         match self.execution() {
             Ok(execution) => DurableFuture::for_start_step(move || execution.execute_started()),
-            Err(future) => future,
+            Err(future) => *future,
         }
     }
 }

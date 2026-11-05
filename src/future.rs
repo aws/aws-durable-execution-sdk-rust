@@ -91,6 +91,10 @@ pub struct DurableFuture<O> {
     /// ID yet. `None` for every other future, and once the claim ran. While
     /// it is `Some`, `inner` is a placeholder that is never polled.
     claim: Option<PendingClaim<O>>,
+    /// The task context captured when the operation was created: the
+    /// frames of its context and the span current at the call. A task that
+    /// runs this future runs inside it, whoever starts the task.
+    task_cx: crate::task::TaskContext,
     /// The start step of a lazy operation whose execution begins with one
     /// (see [`crate::start`]): it runs the start step and returns the rest
     /// of the operation. `None` for every other future, and once it ran.
@@ -153,8 +157,65 @@ impl<O: Send + 'static> DurableFuture<O> {
             inner: Box::pin(fut),
             awaited: None,
             claim: None,
+            task_cx: crate::task::TaskContext::none(),
             begin: None,
             first_poll_start: false,
+        }
+    }
+
+    /// Maps the output and keeps the task context, so a
+    /// task that later runs the mapped future runs it inside the frames
+    /// and span of the operation's creation, as for the unmapped future.
+    pub(crate) fn map_output<T, M>(self, map: M) -> DurableFuture<T>
+    where
+        T: Send + 'static,
+        M: FnOnce(Result<O, OperationError>) -> Result<T, OperationError> + Send + 'static,
+    {
+        let Self {
+            inner,
+            awaited,
+            claim,
+            task_cx,
+            begin,
+            first_poll_start,
+        } = self;
+        match claim {
+            // An unclaimed combinator stays unclaimed: the mapped future
+            // keeps a pending claim that claims the ID and maps the claimed
+            // future, so `claim_now` takes the claimed future's context.
+            Some(claim) => {
+                let PendingClaim {
+                    method,
+                    context,
+                    run,
+                } = claim;
+                DurableFuture::deferred(PendingClaim::new(method, context, move || {
+                    run().map_output(map)
+                }))
+            }
+            // A lazy operation stays lazy: the mapped future keeps the
+            // start step, and maps the remainder the start step returns.
+            None => match begin {
+                Some(begin) => DurableFuture {
+                    inner: Box::pin(std::future::pending()),
+                    awaited,
+                    claim: None,
+                    task_cx,
+                    begin: Some(Box::new(move || {
+                        let rest = begin();
+                        Box::pin(async move { map(rest.await) })
+                    })),
+                    first_poll_start,
+                },
+                None => DurableFuture {
+                    inner: Box::pin(async move { map(inner.await) }),
+                    awaited,
+                    claim: None,
+                    task_cx,
+                    begin: None,
+                    first_poll_start,
+                },
+            },
         }
     }
 
@@ -166,6 +227,7 @@ impl<O: Send + 'static> DurableFuture<O> {
             inner: Box::pin(std::future::pending()),
             awaited: None,
             claim: Some(claim),
+            task_cx: crate::task::TaskContext::none(),
             begin: None,
             first_poll_start: false,
         }
@@ -181,6 +243,7 @@ impl<O: Send + 'static> DurableFuture<O> {
         if let Some(claim) = self.claim.take() {
             let claimed = (claim.run)();
             self.inner = claimed.inner;
+            self.task_cx = claimed.task_cx;
         }
     }
 
@@ -219,21 +282,33 @@ impl<O: Send + 'static> DurableFuture<O> {
         F: Future<Output = Result<O, OperationError>> + Send + 'static,
     {
         let gate = ctx.clone();
-        Self::from_async(async move {
+        let mut future = Self::from_async(async move {
             gate.admit_operation().await;
             drop(gate);
             fut.await
-        })
+        });
+        future.task_cx = crate::task::TaskContext::current();
+        future
+    }
+
+    /// The task context captured when the operation was created.
+    pub(crate) fn task_context(&self) -> crate::task::TaskContext {
+        self.task_cx.clone()
     }
 
     /// Creates the future of one operation whose start step already ran on
     /// the caller's task (see [`crate::start`]): `fut` is the rest of the
     /// operation.
+    ///
+    /// It captures the task context current at the call, as
+    /// [`Self::for_operation`] does.
     pub(crate) fn for_started_operation<F>(fut: F) -> Self
     where
         F: Future<Output = Result<O, OperationError>> + Send + 'static,
     {
-        Self::from_async(fut)
+        let mut future = Self::from_async(fut);
+        future.task_cx = crate::task::TaskContext::current();
+        future
     }
 
     /// Creates the lazy future of one operation whose execution begins with
@@ -242,8 +317,9 @@ impl<O: Send + 'static> DurableFuture<O> {
     /// `create_callback` or a `wait_for_callback`.
     ///
     /// `begin` runs the start step and returns the rest of the operation.
-    /// It runs on the first poll, or earlier when a combinator begins the
-    /// future as an input ([`Self::begin_now`]). The start step checks
+    /// It runs on the first poll, in the poller's context, or earlier when a
+    /// combinator begins the future as an input, in the creator's context
+    /// ([`Self::begin_in_creator_context`]). The start step checks
     /// admission itself before it queues anything, so this adds no
     /// admission gate of its own, unlike [`Self::for_operation`].
     pub(crate) fn for_start_step<F>(begin: impl FnOnce() -> F + Send + 'static) -> Self
@@ -257,16 +333,35 @@ impl<O: Send + 'static> DurableFuture<O> {
             claim: None,
             begin: Some(Box::new(move || Box::pin(begin()))),
             first_poll_start: false,
+            task_cx: crate::task::TaskContext::current(),
         }
     }
 
-    /// Runs the start step of a lazy operation now, on the calling task.
+    /// Runs the start step of a lazy operation now, on the calling task,
+    /// in the caller's context: the first poll calls this, so an operation
+    /// awaited directly runs both its start step and its body in its
+    /// awaiter's frames and span (#126 rule 5.2).
     ///
-    /// The first poll and a combinator that begins its inputs call this. It
-    /// runs the start step once, and does nothing for a future without one.
-    pub(crate) fn begin_now(&mut self) {
+    /// It runs the start step once, and does nothing for a future without
+    /// one.
+    fn begin_now(&mut self) {
         if let Some(begin) = self.begin.take() {
             self.inner = begin();
+        }
+    }
+
+    /// Runs the start step of a lazy combinator input now, on the calling
+    /// task, inside the task context captured at the operation's creation:
+    /// its frames and its span. So `on_operation_start` and the start step
+    /// see the creator's context when a combinator created elsewhere begins
+    /// the input, as the input's remainder does on the task the combinator
+    /// spawns with that context (#126 rule 5.2).
+    ///
+    /// Only a combinator that begins its inputs calls this. It runs the
+    /// start step once, and does nothing for a future without one.
+    pub(crate) fn begin_in_creator_context(&mut self) {
+        if let Some(begin) = self.begin.take() {
+            self.inner = self.task_cx.enter(begin);
         }
     }
 
@@ -315,13 +410,19 @@ impl<O: Send + 'static> DurableFuture<O> {
         awaited: Option<Arc<AtomicBool>>,
     ) -> Self {
         let coordinator = ctx.coordinator();
-        match crate::task::spawn_tracked(coordinator, ctx.task_ownership(), future) {
+        let task_cx = future.task_context();
+        match crate::task::spawn_tracked(task_cx.clone(), coordinator, ctx.task_ownership(), future)
+        {
             Ok(task) => {
                 if let Some(abort) = task.abort_handle() {
                     ctx.admission().register_task(ctx.owners(), abort);
                 }
                 let mut handle = Self::from_async(async move { task.await.into_value() });
                 handle.awaited = awaited.map(|flag| (flag, Arc::clone(coordinator)));
+                // The handle keeps the operation's context. A combinator
+                // that takes it spawns its input task with that context, so
+                // the input runs inside the creator's frames and span.
+                handle.task_cx = task_cx;
                 handle
             }
             // No Tokio runtime is running on this thread: the operation
@@ -798,6 +899,10 @@ impl<O: Send + 'static> Callback<O> {
             } => {
                 let flag = Arc::new(AtomicBool::new(false));
                 let waiting = ctx.with_awaited(Arc::clone(&flag));
+                // `pending_result` builds the future through `for_operation`,
+                // so the task gets the creating context's frames and the span
+                // current here. The capture point is this call, as for
+                // `.spawn()`: it is where the user starts the waiting task.
                 let future = Self::pending_result(waiting, wire_id, identity, resolver);
                 DurableFuture::spawn_blessed(future, &ctx, Some(flag))
             }
@@ -1235,12 +1340,240 @@ mod tests {
     fn test_ctx_with_client() -> DurableContext {
         let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
         DurableContext::new_root_with_client(
-            "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+            "test-function-arn".to_owned(),
             lambda_runtime::Context::default(),
             Arc::new(CheckpointLog::empty()),
             client,
             "token0".to_owned(),
         )
+    }
+
+    use std::future::IntoFuture as _;
+
+    thread_local! {
+        /// The wraps of [`Tag`] plugins entered on this thread, outermost
+        /// first.
+        static TAGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// Each user-function wrap entered on this thread: its tag and the
+        /// tags entered around it.
+        static ENTERED: std::cell::RefCell<Vec<(String, Vec<String>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn current_tags() -> Vec<String> {
+        TAGS.with(|tags| tags.borrow().clone())
+    }
+
+    /// A plugin whose wraps record `inv`, or the user function's name (its
+    /// ID without one), while they are entered.
+    struct Tag;
+
+    impl Tag {
+        fn wrap(site: &str, next: &mut dyn FnMut()) {
+            TAGS.with(|tags| tags.borrow_mut().push(site.to_owned()));
+            next();
+            TAGS.with(|tags| tags.borrow_mut().pop());
+        }
+    }
+
+    impl crate::plugin::Plugin for Tag {
+        fn wrap_invocation(&self, _info: &crate::plugin::InvocationInfo, next: &mut dyn FnMut()) {
+            Self::wrap("inv", next);
+        }
+
+        fn wrap_user_function(&self, info: &crate::plugin::OperationInfo, next: &mut dyn FnMut()) {
+            let site = info.name().unwrap_or(info.id());
+            ENTERED.with(|entered| {
+                entered.borrow_mut().push((site.to_owned(), current_tags()));
+            });
+            Self::wrap(site, next);
+        }
+    }
+
+    impl crate::plugin::PluginFactory for Tag {
+        fn create_plugin(
+            &self,
+            _info: &crate::plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn crate::plugin::Plugin>>, BoxError> {
+            Ok(Some(Box::new(Tag)))
+        }
+    }
+
+    /// A root context over the in-memory transport whose one plugin is a
+    /// [`Tag`], and its invocation frames.
+    fn tagged_ctx() -> (DurableContext, crate::plugin::Frames) {
+        let factory: Arc<dyn crate::plugin::PluginFactory> = Arc::new(Tag);
+        let plugins = crate::plugin::create_plugins(
+            &[("Tag", factory)],
+            None,
+            crate::plugin::tests_support_info,
+        )
+        .expect("a factory was given");
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "test-function-arn".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new())),
+            "token0".to_owned(),
+            None,
+            Some(Arc::clone(&plugins)),
+        );
+        (ctx, crate::plugin::Frames::invocation(Some(plugins)))
+    }
+
+    /// What a step body saw: its name and the wraps entered at its call.
+    type Seen = Arc<std::sync::Mutex<Vec<(&'static str, Vec<String>)>>>;
+
+    /// A step body that records what it saw in `seen`, then returns
+    /// `value`.
+    fn recording(
+        seen: &Seen,
+        name: &'static str,
+        value: u32,
+    ) -> impl FnOnce(crate::StepContext) -> std::future::Ready<Result<u32, BoxError>>
+    + Clone
+    + Send
+    + 'static {
+        let seen = Arc::clone(seen);
+        move |_| {
+            seen.lock().unwrap().push((name, current_tags()));
+            std::future::ready(Ok(value))
+        }
+    }
+
+    /// Rule 5.4: in A (child `a`, span `A`) a step future is made and
+    /// mapped, and so is an unclaimed `try_join_all` of two steps. The
+    /// mapped step keeps A. Mapping claims no ID; the combinator claims the
+    /// next positional ID in B (child `b`, span `B`), by its first poll, then
+    /// by what `.spawn()` does; and its task context is B's. Each path
+    /// yields its inputs' mapped result; the join runs in `[I, b, join]`,
+    /// and each input's body in the frames it captured in A.
+    #[test]
+    fn map_output_keeps_task_context_and_pending_claim() {
+        let subscriber = lambda_runtime::tracing::subscriber::registry();
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            let _guard = runtime.enter();
+            let span_a = tracing::info_span!("A");
+            let span_b = tracing::info_span!("B");
+            assert!(span_a.id().is_some() && span_b.id().is_some());
+            for spawned in [false, true] {
+                let (ctx, inv) = tagged_ctx();
+                let frames_a =
+                    inv.with_user_function(Arc::new(crate::plugin::OperationInfo::for_test("a")));
+                let frames_b =
+                    inv.with_user_function(Arc::new(crate::plugin::OperationInfo::for_test("b")));
+                let seen: Seen = Arc::default();
+                let (step, mut join) = span_a.in_scope(|| {
+                    frames_a.enter(|| {
+                        let step = ctx
+                            .step(recording(&seen, "solo", 1))
+                            .name("solo")
+                            .future()
+                            .map_output(|r| r.map(|v| v + 1));
+                        let s1 = ctx.step(recording(&seen, "s1", 1)).name("s1").future();
+                        let s2 = ctx.step(recording(&seen, "s2", 2)).name("s2").future();
+                        let join = ctx
+                            .try_join_all([s1, s2])
+                            .name("join")
+                            .into_future()
+                            .map_output(|r| r.map(|v| v.iter().sum::<u32>() * 10));
+                        (step, join)
+                    })
+                });
+                // The mapped step keeps A.
+                assert_eq!(
+                    step.task_context().frames().enter(current_tags),
+                    ["inv", "a"],
+                    "spawned: {spawned}"
+                );
+                assert_eq!(step.task_context().span().id(), span_a.id());
+                // The claim is kept, and mapping claimed nothing: the steps
+                // took 1 to 3, so the probe takes 4.
+                assert!(join.is_unclaimed_combinator(), "spawned: {spawned}");
+                assert_eq!(ctx.mint_id().positional(), "4", "spawned: {spawned}");
+                span_b.in_scope(|| {
+                    frames_b.enter(|| {
+                        if spawned {
+                            // What `.spawn()` does: claim, then start the task.
+                            join.claim_now();
+                        } else {
+                            // The first poll claims.
+                            let waker = std::task::Waker::noop();
+                            let mut cx = Context::from_waker(waker);
+                            drop(Pin::new(&mut join).poll(&mut cx));
+                        }
+                    });
+                });
+                assert!(!join.is_unclaimed_combinator(), "spawned: {spawned}");
+                // The combinator claimed 5, the ID after the probe's 4.
+                assert_eq!(ctx.mint_id().positional(), "6", "spawned: {spawned}");
+                assert_eq!(
+                    join.task_context().frames().enter(current_tags),
+                    ["inv", "b"],
+                    "the claim captured B's frames; spawned: {spawned}"
+                );
+                assert_eq!(join.task_context().span().id(), span_b.id());
+                let step = DurableFuture::spawn_blessed(step, &ctx, None);
+                assert_eq!(runtime.block_on(step).expect("the step succeeds"), 2);
+                let join = DurableFuture::spawn_blessed(join, &ctx, None);
+                assert_eq!(runtime.block_on(join).expect("the join succeeds"), 30);
+                let mut seen = std::mem::take(&mut *seen.lock().unwrap());
+                seen.sort_by_key(|(name, _)| *name);
+                let tags = |list: &[&str]| -> Vec<String> {
+                    list.iter().map(|tag| (*tag).to_owned()).collect()
+                };
+                // Each input's body runs on its own task, in the frames it
+                // captured in A.
+                assert_eq!(
+                    seen,
+                    [
+                        ("s1", tags(&["inv", "a", "s1"])),
+                        ("s2", tags(&["inv", "a", "s2"])),
+                        ("solo", tags(&["inv", "a", "solo"])),
+                    ],
+                    "spawned: {spawned}"
+                );
+                // The join's node sits above B: its wrap is entered inside
+                // B's frames, so the join runs in `[I, b, join]`.
+                let entered = ENTERED.with(|entered| std::mem::take(&mut *entered.borrow_mut()));
+                let joins: Vec<_> = entered.iter().filter(|(site, _)| site == "join").collect();
+                assert!(!joins.is_empty(), "the join ran as a user function");
+                assert!(
+                    joins
+                        .iter()
+                        .all(|(_, around)| *around == tags(&["inv", "b"])),
+                    "{entered:?}; spawned: {spawned}"
+                );
+            }
+        });
+    }
+
+    /// r7 item 5: a `parallel_mixed` future keeps the task context of its
+    /// batch, so a task that runs it runs inside the span and frames of its
+    /// creation.
+    #[test]
+    fn parallel_mixed_keeps_the_task_context_of_its_creation() {
+        let subscriber = lambda_runtime::tracing::subscriber::registry();
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            let _guard = runtime.enter();
+            let ctx = test_ctx_with_client();
+            let span = tracing::info_span!("creation");
+            let mixed = span.in_scope(|| {
+                let mut set = BranchSet::new();
+                let _handle = set.add("b", |_c| async { Ok(1_u32) });
+                ctx.parallel_mixed(set).into_future()
+            });
+            assert!(span.id().is_some());
+            assert_eq!(mixed.task_context().span().id(), span.id());
+            let plain = span.in_scope(|| ctx.step(|_| async { Ok(1_u32) }).future());
+            let mapped = plain.map_output(|r| r.map(|v| v + 1));
+            assert_eq!(mapped.task_context().span().id(), span.id());
+        });
     }
 
     /// Test 16: a combinator future claims one ID however often

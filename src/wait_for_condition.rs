@@ -24,14 +24,14 @@ use std::future::Future;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
-use tracing::Instrument as _;
 
-use crate::context::{ActiveBody, DurableContext, StepContext, SubmittedWrite, run_body};
+use crate::context::{DurableContext, StepContext, SubmittedWrite};
 use crate::engine::CheckpointStatus;
 use crate::engine::OperationId;
 use crate::error::{
     OperationError, OperationErrorKind, WaitForConditionError, WaitForConditionErrorKind,
 };
+use crate::plugin::UserBody;
 use crate::serdes::SerdesContext;
 use crate::{BoxError, Serdes};
 
@@ -166,12 +166,12 @@ where
                     attempt,
                     state,
                     start,
+                    info,
                 } => {
-                    // Execute the check function. The check runs as a
-                    // `Step` body: an operation claimed inside it fails the
-                    // execution with a context usage error. It holds an
-                    // activity permit while it runs.
-                    let body = ActiveBody::Step(core.op_id.positional().to_owned());
+                    // The check runs as a `Step` body: an operation claimed
+                    // inside it fails the execution with a context usage
+                    // error. It holds an activity permit while it runs.
+                    let body = UserBody::Step(core.op_id.positional().to_owned());
                     let step_ctx = StepContext::new(attempt);
                     // The check runs inside a `durable_operation` span, as a
                     // live step body does. A live check is never replay.
@@ -184,15 +184,25 @@ where
                         attempt,
                         false,
                     );
-                    let check_result = core
+                    // The check is a user function: its hooks and wrap run
+                    // through the runner; the permit stays here. The wire
+                    // the end hooks see is the one the FAIL records and the
+                    // returned error carries: the type a `TypedError` names,
+                    // else `Error`, as #135 records a check failure.
+                    let check = &check;
+                    let ran = core
                         .ctx
-                        .hold_activity(
-                            run_body(body, async { (check)(step_ctx, state).await })
-                                .instrument(span),
-                        )
+                        .hold_activity(crate::plugin::run_user_function(
+                            core.ctx.shared_plugins(),
+                            info,
+                            body,
+                            span,
+                            move || (check)(step_ctx, state),
+                            |error: &BoxError| crate::error::wire_error_for(&**error, "Error"),
+                        ))
                         .await;
                     core.await_start(start).await?;
-                    match core.settle(attempt, check_result).await? {
+                    match core.settle(attempt, ran).await? {
                         WfcSettled::Done(value) => return Ok(value),
                         WfcSettled::Retry => {}
                     }
@@ -244,6 +254,8 @@ enum WfcPrelude<S> {
         /// before the outcome is written. `None` when START is already
         /// recorded. A check that panics drops it, and the write continues.
         start: Option<SubmittedWrite>,
+        /// The check's info, as `on_attempt_start` saw it.
+        info: std::sync::Arc<crate::plugin::OperationInfo>,
     },
 }
 
@@ -418,11 +430,14 @@ where
         // `crate::start`). The check runs while START is in flight; the
         // write is awaited after the check returns and before the outcome
         // write (see `WfcPrelude::Run`).
-        let start = if already_started {
-            if let Some(plugins) = self.ctx.plugins() {
-                crate::plugin::attempt_started(plugins, self.info(), attempt, true);
-            }
-            None
+        let (start, info) = if already_started {
+            let info = match self.ctx.plugins() {
+                Some(plugins) => {
+                    crate::plugin::attempt_started(plugins, self.info(), attempt, true)
+                }
+                None => std::sync::Arc::new(self.info()),
+            };
+            (None, info)
         } else {
             let start_update = build_wfc_update(
                 &wire_id,
@@ -442,16 +457,20 @@ where
                 crate::plugin::operation_started(plugins, &info);
             }
             let start = reserved.release();
-            if let Some(plugins) = plugins {
-                crate::plugin::attempt_start_only(plugins, self.info(), attempt);
-            }
-            Some(start)
+            // The attempt's info, as `on_attempt_start` saw it, is the one
+            // the user-function hooks and wraps of the check receive.
+            let info = match plugins {
+                Some(plugins) => crate::plugin::attempt_start_only(plugins, self.info(), attempt),
+                None => std::sync::Arc::new(self.info()),
+            };
+            (Some(start), info)
         };
 
         Ok(WfcPrelude::Run {
             attempt,
             state: current_state,
             start,
+            info,
         })
     }
 
@@ -479,11 +498,11 @@ where
     async fn settle(
         &self,
         attempt: u32,
-        check_result: Result<S, BoxError>,
+        ran: crate::plugin::Ran<S>,
     ) -> Result<WfcSettled<S>, OperationError> {
         let wire_id = self.op_id.wire();
         let serdes_ctx = SerdesContext::new(wire_id, self.ctx.execution_arn());
-        match check_result {
+        match ran.into_parts() {
             Ok(new_state) => {
                 // Serialize the new state (ownership transfers to the
                 // serdes; the round trip below reconstructs it).
@@ -644,13 +663,13 @@ where
                     }
                 }
             }
-            Err(check_err) => {
+            Err((check_err, wire)) => {
                 // Check function error: checkpoint FAIL immediately (no retry
                 // for check errors).
-                // The wire record is derived from the check error itself: a
-                // `TypedError` in its chain names the type, and an untyped
-                // error records `Error`, as JS and a step do.
-                let wire = crate::error::wire_error_for(&*check_err, "Error");
+                // The runner derived the wire record from the check error
+                // once, and the end hooks saw it: a `TypedError` in its
+                // chain names the type, and an untyped error records
+                // `Error`, as JS and a step do.
                 let update = build_wfc_fail_update(
                     wire_id,
                     self.name.as_deref(),
@@ -1466,20 +1485,65 @@ mod tests {
         }
     }
 
-    /// The in-memory client returns no record, so the end infos of a
-    /// failed check carry the error the SDK wrote.
-    #[tokio::test]
-    async fn failed_check_end_infos_carry_the_written_error() {
-        let hooks = crate::plugin::test_support::OpHooks::default();
+    /// A root context over `records` whose transport is a fresh in-memory
+    /// client, with the recorder's `p0` and `p1` as the invocation's
+    /// plugins and no checkpoint buffer window.
+    fn uf_ctx(
+        hooks: &crate::plugin::recorder::UfHooks,
+        records: Vec<(String, CheckpointRecord)>,
+    ) -> (DurableContext, Arc<InMemoryExecutionClient>) {
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
         let ctx = DurableContext::new_root_with_client_and_defaults(
             "arn:test".to_owned(),
             lambda_runtime::Context::default(),
-            Arc::new(CheckpointLog::empty()),
-            Arc::new(InMemoryExecutionClient::new(Vec::new())),
+            Arc::new(CheckpointLog::from_records(records)),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
             None,
             Some(hooks.plugins()),
         );
+        (ctx, client)
+    }
+
+    /// The error object of the `FAIL` update `client` recorded, as
+    /// `(type, message)`.
+    fn recorded_fail(client: &InMemoryExecutionClient) -> (Option<String>, Option<String>) {
+        let updates = client.recorded_updates();
+        let fail = updates
+            .iter()
+            .find(|u| u.action() == &OperationAction::Fail)
+            .expect("a FAIL update");
+        let error = fail.error().expect("the FAIL carries an error");
+        (
+            error.error_type().map(str::to_owned),
+            error.error_message().map(str::to_owned),
+        )
+    }
+
+    /// The user-function records of one live check, in `p0`'s order.
+    const LIVE_CHECK: [&str; 6] = [
+        "attempt_start",
+        "uf_start",
+        "wrap_enter",
+        "wrap_exit",
+        "uf_end",
+        "attempt_end",
+    ];
+
+    /// Rule 11's check row. A check that returns `Err` ends with the wire
+    /// the FAIL stores. A check
+    /// exhausted by `max_attempts(2)` ends `Ok` at both checks, and the
+    /// FAIL records `WaitForCondition.MaxChecksExceeded`. The in-memory
+    /// client returns no record, so the end infos carry what the SDK
+    /// wrote.
+    #[tokio::test]
+    async fn condition_check_error_and_exhaustion() {
+        use crate::builders::wait_for_condition::WaitStrategy;
+        use crate::plugin::recorder::UfHooks;
+
+        // Run 1: the check returns `Err`.
+        let hooks = UfHooks::default();
+        let (ctx, client) = uf_ctx(&hooks, Vec::new());
         let err = ctx
             .wait_for_condition(
                 |_ctx, _state: u32| async { Err::<u32, BoxError>("bad".into()) },
@@ -1489,29 +1553,165 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.wire().is_some());
-        let records = hooks.records();
-        let shapes: Vec<_> = records
-            .iter()
-            .map(crate::plugin::test_support::OpRecord::shape)
-            .collect();
+        let mut expected = vec!["start"];
+        expected.extend(LIVE_CHECK);
+        expected.push("end");
+        assert_eq!(hooks.hooks_of("cond"), expected);
+        let end = hooks.find("cond", "uf_end");
+        assert_eq!(end.ok, Some(false));
+        let wire = end.wire.expect("an Err outcome");
+        // The check's wire is the one the FAIL records and the returned
+        // error carries: `wire_error_for(err, "Error")`, the record #135
+        // set, so an untyped error records `Error`.
+        assert_eq!(wire.error_type(), Some("Error"));
+        assert_eq!(wire.error_message(), Some("bad"));
+        assert_eq!(err.wire(), Some(&wire));
         assert_eq!(
-            shapes,
-            [
-                ("start", false, None, None),
-                ("attempt_start", false, Some(1), None),
-                (
-                    "attempt_end",
-                    false,
-                    Some(1),
-                    Some(crate::plugin::AttemptOutcome::Failed)
-                ),
-                ("end", false, None, None),
-            ]
+            recorded_fail(&client),
+            (
+                wire.error_type().map(str::to_owned),
+                wire.error_message().map(str::to_owned)
+            )
         );
-        let attempt_end = records.get(2).expect("an attempt end");
-        assert_eq!(attempt_end.error.as_deref(), Some("bad"));
+        let attempt_end = hooks.find("cond", "attempt_end");
+        assert_eq!(
+            attempt_end
+                .wire
+                .as_ref()
+                .and_then(crate::error::WireError::error_message),
+            Some("bad")
+        );
         assert_eq!(attempt_end.status, Some(crate::OperationStatus::Failed));
         assert_eq!(attempt_end.result, None);
+
+        // Run 2: `max_attempts(2)`, never done. Check 1 ends `Ok` and
+        // retries; check 2, in the next invocation, ends `Ok` and exhausts.
+        let strategy = || {
+            WaitStrategy::builder(|_state: &u32| false)
+                .max_attempts(2)
+                .build()
+        };
+        let hooks = UfHooks::default();
+        let (ctx, client) = uf_ctx(&hooks, Vec::new());
+        let cond = ctx
+            .wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0_u32)
+            .wait_strategy(strategy())
+            .name("cond");
+        let signal = Arc::clone(ctx.coordinator());
+        let ownership = Arc::clone(ctx.task_ownership());
+        let outcome =
+            crate::driver::test_support::outcome_of(ctx.clone(), ownership, signal, cond).await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+        let mut expected = vec!["start"];
+        expected.extend(LIVE_CHECK);
+        assert_eq!(hooks.hooks_of("cond"), expected);
+        assert_eq!(hooks.find("cond", "uf_end").ok, Some(true));
+        assert!(
+            client
+                .recorded_updates()
+                .iter()
+                .any(|u| u.action() == &OperationAction::Retry)
+        );
+
+        let hooks = UfHooks::default();
+        let record = wfc_record(CheckpointStatus::Ready, Some("1"), None, 1);
+        let (ctx, client) = uf_ctx(&hooks, vec![record]);
+        let err = ctx
+            .wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0_u32)
+            .wait_strategy(strategy())
+            .name("cond")
+            .await
+            .unwrap_err();
+        assert!(err.wire().is_some());
+        let mut expected = vec!["start"];
+        expected.extend(LIVE_CHECK);
+        expected.push("end");
+        assert_eq!(hooks.hooks_of("cond"), expected);
+        let end = hooks.find("cond", "uf_end");
+        assert_eq!((end.ok, end.info_attempt), (Some(true), Some(2)));
+        let (error_type, _) = recorded_fail(&client);
+        assert_eq!(
+            error_type.as_deref(),
+            Some(crate::error::WFC_EXHAUSTED_ERROR_TYPE)
+        );
+    }
+
+    /// Rule 11's check row with a `TypedError`: the type it names is the one
+    /// the end hook, the FAIL and the returned error all carry.
+    #[tokio::test]
+    async fn condition_check_typed_error_reaches_the_end_hook() {
+        use crate::plugin::recorder::UfHooks;
+
+        let hooks = UfHooks::default();
+        let (ctx, client) = uf_ctx(&hooks, Vec::new());
+        let err = ctx
+            .wait_for_condition(
+                |_ctx, _state: u32| async {
+                    Err::<u32, BoxError>(Box::new(crate::TypedError::with_type(
+                        "Throttled",
+                        "slow down",
+                    )))
+                },
+                0_u32,
+            )
+            .name("cond")
+            .await
+            .unwrap_err();
+        let wire = hooks.find("cond", "uf_end").wire.expect("an Err outcome");
+        assert_eq!(wire.error_type(), Some("Throttled"));
+        assert_eq!(err.wire(), Some(&wire));
+        assert_eq!(
+            recorded_fail(&client),
+            (
+                Some("Throttled".to_owned()),
+                wire.error_message().map(str::to_owned)
+            )
+        );
+    }
+
+    /// A check is a user function: one start hook and one end hook, for
+    /// attempt 1 with `Ok`, before the SUCCEED is written.
+    #[tokio::test]
+    async fn condition_check_is_a_user_function() {
+        let client_cell: Arc<std::sync::OnceLock<Arc<InMemoryExecutionClient>>> = Arc::default();
+        let probe_client = Arc::clone(&client_cell);
+        let hooks = crate::plugin::recorder::UfHooks::probing(move || {
+            let succeeded = probe_client.get().is_some_and(|client| {
+                client
+                    .recorded_updates()
+                    .iter()
+                    .any(|u| u.action() == &OperationAction::Succeed)
+            });
+            succeeded.to_string()
+        });
+        let (ctx, client) = uf_ctx(&hooks, Vec::new());
+        client_cell.set(Arc::clone(&client)).expect("set once");
+        let state = ctx
+            .wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0_u32)
+            .wait_strategy_fn(|state: u32, _attempt| {
+                if state >= 1 {
+                    WaitDecision::complete()
+                } else {
+                    WaitDecision::continue_with(Duration::from_secs(1))
+                }
+            })
+            .name("cond")
+            .await
+            .unwrap();
+        assert_eq!(state, 1);
+        let records = hooks.of("cond");
+        let starts: Vec<_> = records.iter().filter(|r| r.hook == "uf_start").collect();
+        let ends: Vec<_> = records.iter().filter(|r| r.hook == "uf_end").collect();
+        assert_eq!((starts.len(), ends.len()), (1, 1), "{records:?}");
+        let end = ends.first().expect("one end");
+        assert_eq!((end.info_attempt, end.ok), (Some(1), Some(true)));
+        assert_eq!(end.probe, "false", "the end hook ran before the SUCCEED");
+        assert!(
+            client
+                .recorded_updates()
+                .iter()
+                .any(|u| u.action() == &OperationAction::Succeed)
+        );
     }
 
     /// Test: check function error immediately fails the operation.
@@ -2267,6 +2467,11 @@ mod coordinator_tests {
                 ("end", false, None, None),
             ]
         );
+        // `on_operation_start` keeps main's info, the record's attempt;
+        // only the attempt's info carries the current attempt.
+        let starts = records.iter().filter(|r| r.hook.ends_with("start"));
+        let info_attempts: Vec<_> = starts.map(|r| r.info_attempt).collect();
+        assert_eq!(info_attempts, [None, Some(1), Some(1), Some(2)]);
         // The record carries the state 1; the SDK wrote 2.
         let results: Vec<_> = records.iter().map(|r| r.result.as_deref()).collect();
         assert_eq!(results.get(5..), Some(&[Some("2"), Some("2")][..]));

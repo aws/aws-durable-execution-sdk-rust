@@ -15,13 +15,14 @@ use std::future::Future;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
-use tracing::Instrument as _;
 
 use crate::BoxError;
+use crate::checkpoint_coalescer::ScopeClose;
 use crate::context::{DurableContext, StepContext, SubmittedWrite};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{CallbackError, CallbackErrorKind, OperationError, OperationErrorKind};
 use crate::future::Callback;
+use crate::plugin::UserBody;
 use crate::serdes::{PassthroughSerdes, PayloadOrigin, Serdes, SerdesContext};
 use crate::start::StartStep;
 
@@ -561,28 +562,45 @@ where
             WfcbPrelude::Run {
                 child_ctx,
                 start,
+                info,
                 after,
             } => {
                 // Run inner body: create_callback + submitter step + await
-                // result. Instrumented with the child namespace's
-                // replay-aware span so a resumed body's log lines are
-                // suppressed while its nested operations replay.
+                // result. The body is a user function: its hooks and wraps
+                // run through the runner, and only the body carries the
+                // child namespace's replay-aware span, so a resumed body's
+                // log lines are suppressed while its nested operations
+                // replay. It runs as the child context's own body.
                 let child_span = child_ctx.replay_span();
-                let body_result = run_wfcb_body(
-                    child_ctx,
-                    plugin_names,
-                    timeout,
-                    heartbeat,
-                    submitter,
-                    submitter_retry,
+                let active = UserBody::Context(child_ctx.prefix().to_owned());
+                // The body's scope closes when the body returns, inside the
+                // runner, so it is closed before the end hooks, as a
+                // `run_in_child_context` child's is (see `Admission`). It
+                // also closes when this future is dropped first. The
+                // terminal update below goes through the parent context, so
+                // it is admitted.
+                let scope = ScopeClose::new(after.ctx.admission(), &after.wire_id);
+                let body_result = crate::plugin::run_user_function(
+                    after.ctx.shared_plugins(),
+                    info,
+                    active,
+                    child_span,
+                    move || async move {
+                        let result = run_wfcb_body(
+                            child_ctx,
+                            plugin_names,
+                            timeout,
+                            heartbeat,
+                            submitter,
+                            submitter_retry,
+                        )
+                        .await;
+                        drop(scope);
+                        result
+                    },
+                    extract_wire_error,
                 )
-                .instrument(child_span)
                 .await;
-                // The body returned, so the child is finished: abandon it,
-                // as a `run_in_child_context` child is (see `Admission`).
-                // The terminal update below goes through the parent
-                // context, so it is admitted.
-                after.ctx.admission().abandon([after.wire_id.as_str()]);
                 after
                     .settle(start, body_result)
                     .await
@@ -675,6 +693,10 @@ enum WfcbPrelude {
         /// The `START` write of this invocation, still in flight. The
         /// outcome write waits for it. `None` when the record existed.
         start: Option<SubmittedWrite>,
+        /// The info `on_operation_start` received, with the replay flag
+        /// set to the child context's `is_replaying()` when the body
+        /// starts; the user-function hooks receive this value.
+        info: std::sync::Arc<crate::plugin::OperationInfo>,
         /// The post-body half that checkpoints the outcome.
         after: WfcbAfter,
     },
@@ -786,9 +808,21 @@ impl WfcbCore {
         // 4. Create child context with chained prefix.
         let child_ctx = ctx.new_child(&positional_id, name.as_deref());
 
+        // The info the start step gave `on_operation_start`: a fresh START
+        // is live, a resumed record a replay. The user-function hooks see
+        // the child context's replay state at the body's start instead: a
+        // resumed body with no inner record yet starts live.
+        let info = wfcb_info(&ctx, &wire_id, name.as_deref());
+        let info = if start.is_some() {
+            info.with_status(crate::OperationStatus::Started)
+        } else {
+            info
+        };
+        let info = std::sync::Arc::new(info.with_replay(child_ctx.is_replaying()));
         Ok(WfcbPrelude::Run {
             child_ctx,
             start,
+            info,
             after: WfcbAfter { ctx, wire_id, name },
         })
     }
@@ -805,10 +839,10 @@ impl WfcbAfter {
     async fn settle(
         self,
         start: Option<SubmittedWrite>,
-        body_result: Result<String, OperationError>,
+        body_result: crate::plugin::Ran<String, OperationError>,
     ) -> Result<String, OperationError> {
         let Self { ctx, wire_id, name } = self;
-        match body_result {
+        match body_result.into_parts() {
             Ok(raw) => {
                 // Success: checkpoint ContextSucceeded with the raw payload.
                 let mut builder = OperationUpdate::builder()
@@ -851,9 +885,9 @@ impl WfcbAfter {
                 }
                 Ok(raw)
             }
-            Err(err) => {
-                // Failure: checkpoint ContextFailed.
-                let wire = extract_wire_error(&err);
+            Err((err, wire)) => {
+                // Failure: checkpoint ContextFailed with the wire the
+                // runner derived once and the end hooks saw.
                 let mut builder = OperationUpdate::builder()
                     .id(wire_id.clone())
                     .r#type(OperationType::Context)
@@ -3300,7 +3334,10 @@ mod tests {
             name: None,
         };
         let live = after
-            .settle(None, Err(err))
+            .settle(
+                None,
+                crate::plugin::Ran::from_result(Err(err), extract_wire_error),
+            )
             .await
             .expect_err("a failed body fails the operation");
         let fail = client
@@ -3790,6 +3827,209 @@ mod coordinator_tests {
             )
             .build()
             .expect("all required fields set")
+    }
+
+    /// A client that answers a callback START with its ID, and carries
+    /// `completed` for the callback on the call that carries a step's
+    /// SUCCEED: the submitter's.
+    fn submitter_completing(
+        completed: impl Fn(&OperationUpdate) -> Operation + Send + Sync + 'static,
+    ) -> ScriptedClient {
+        ScriptedClient::new(move |updates, history| {
+            let mut ops = Vec::new();
+            for update in updates {
+                if update.r#type() == &OperationType::Callback
+                    && update.action() == &OperationAction::Start
+                {
+                    ops.push(started(update));
+                }
+            }
+            let submitted = updates.iter().any(|u| {
+                u.r#type() == &OperationType::Step && u.action() == &OperationAction::Succeed
+            });
+            if submitted
+                && let Some(start) = history.iter().find(|u| {
+                    u.r#type() == &OperationType::Callback && u.action() == &OperationAction::Start
+                })
+            {
+                ops.push(completed(start));
+            }
+            ops
+        })
+    }
+
+    /// The active body that a closure saw, in `Debug` form.
+    type Seen = Arc<std::sync::Mutex<Option<String>>>;
+
+    /// Records the current active body into `seen`.
+    fn see_active_body(seen: &Seen) {
+        *seen.lock().expect("lock") = Some(format!("{:?}", crate::context::current_body()));
+    }
+
+    /// Rule 11: the body of a `wait_for_callback` is a user function with
+    /// the sub-type `WaitForCallback`, and so is its submitter step, named
+    /// `<name>-submitter`, at attempt 1, which the body polls. The
+    /// submitter runs as its own `Step` body.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_callback_body_and_submitter() {
+        use crate::plugin::recorder::{UfHooks, context_over};
+        let hooks = UfHooks::default();
+        let client = Arc::new(submitter_completing(succeeded));
+        let ctx = context_over(
+            &hooks,
+            Vec::new(),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+        );
+        let seen = Seen::default();
+        let submitter_seen = Arc::clone(&seen);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            ctx.wait_for_callback::<String, _, _>(move |_step, _callback_id| {
+                let seen = Arc::clone(&submitter_seen);
+                async move {
+                    see_active_body(&seen);
+                    Ok(())
+                }
+            })
+            .name("approve")
+            .await
+            .map_err(wire_err)
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("ok".to_owned()));
+
+        let body = hooks.user_function_of("approve", true);
+        assert!(
+            body.iter()
+                .all(|r| r.sub_type.as_deref() == Some(super::WFCB_SUB_TYPE)),
+            "{body:?}"
+        );
+        assert_eq!(hooks.find("approve", "uf_end").ok, Some(true));
+
+        let submitter = hooks.user_function_of("approve-submitter", true);
+        assert!(
+            submitter
+                .iter()
+                .all(|r| r.sub_type.as_deref() == Some("Step") && r.info_attempt == Some(1)),
+            "{submitter:?}"
+        );
+        assert_eq!(
+            hooks.find("approve-submitter", "attempt_start").attempt,
+            Some(1)
+        );
+        assert_eq!(hooks.find("approve-submitter", "uf_end").ok, Some(true));
+        // The submitter's start hook runs inside the body: after the
+        // body's start hook, before its end hook.
+        let order: Vec<_> = hooks
+            .records()
+            .into_iter()
+            .filter(|r| r.plugin == "p0" && matches!(r.hook, "uf_start" | "uf_end"))
+            .map(|r| (r.hook, r.name.unwrap_or_default()))
+            .collect();
+        let at = |hook: &str, name: &str| order.iter().position(|(h, n)| *h == hook && n == name);
+        assert!(
+            at("uf_start", "approve") < at("uf_start", "approve-submitter")
+                && at("uf_end", "approve-submitter") < at("uf_end", "approve"),
+            "{order:?}"
+        );
+        // The submitter runs as the `Step` body of its positional ID.
+        assert_eq!(
+            seen.lock().expect("lock").as_deref(),
+            Some(r#"Step("1-2")"#)
+        );
+    }
+
+    /// `(type, message)` of the FAIL of `update`.
+    fn fail_error(update: &OperationUpdate) -> (Option<String>, Option<String>) {
+        crate::plugin::recorder::update_error(update)
+    }
+
+    /// Rule 11's submitter and body rows: a submitter that fails and is
+    /// stopped ends with the wire its FAIL stores, and the body ends with
+    /// the wire of the `wait_for_callback`'s FAIL; so does the body when the
+    /// callback completes with a failure. The retry strategy runs on the
+    /// body's own active body, `Context("1")`.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_callback_failure_outcomes() {
+        use crate::plugin::recorder::{UfHooks, context_over, type_and_message, update_of};
+
+        // Run 1: the submitter returns `Err`, and the strategy stops.
+        let hooks = UfHooks::default();
+        let client = Arc::new(submitter_completing(succeeded));
+        let ctx = context_over(
+            &hooks,
+            Vec::new(),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+        );
+        let seen = Seen::default();
+        let strategy_seen = Arc::clone(&seen);
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            ctx.wait_for_callback::<String, _, _>(|_step, _callback_id| async {
+                Err("cannot submit".into())
+            })
+            .name("approve")
+            .submitter_retry(move |_err, _attempt| {
+                see_active_body(&strategy_seen);
+                crate::RetryDecision::Stop
+            })
+            .await
+            .map_err(wire_err)
+        })
+        .await
+        .expect("no panic");
+        assert!(
+            matches!(outcome, InvocationOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        let updates = client.updates();
+        let submitter_end = hooks.find("approve-submitter", "uf_end");
+        let submitter_end = type_and_message(submitter_end.wire.as_ref().expect("an Err outcome"));
+        assert_eq!(
+            submitter_end,
+            (Some("Error".to_owned()), Some("cannot submit".to_owned()))
+        );
+        let submitter_fail = updates
+            .iter()
+            .find(|u| u.r#type() == &OperationType::Step && u.action() == &OperationAction::Fail)
+            .expect("the submitter's FAIL");
+        assert_eq!(fail_error(submitter_fail), submitter_end);
+        let body_end = hooks.find("approve", "uf_end");
+        let body_end = type_and_message(body_end.wire.as_ref().expect("an Err outcome"));
+        let body_fail =
+            update_of(&updates, "approve", &OperationAction::Fail).expect("the body's FAIL");
+        assert_eq!(fail_error(&body_fail), body_end);
+        assert_eq!(
+            seen.lock().expect("lock").as_deref(),
+            Some(r#"Context("1")"#)
+        );
+
+        // Run 2: the callback completes with a failure.
+        let hooks = UfHooks::default();
+        let client = Arc::new(submitter_completing(declined));
+        let ctx = context_over(
+            &hooks,
+            Vec::new(),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+        );
+        let outcome = drive_handler(ctx, None, |ctx| async move {
+            ctx.wait_for_callback::<String, _, _>(|_step, _callback_id| async { Ok(()) })
+                .name("approve")
+                .await
+                .map_err(wire_err)
+        })
+        .await
+        .expect("no panic");
+        assert!(
+            matches!(outcome, InvocationOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(hooks.find("approve-submitter", "uf_end").ok, Some(true));
+        let body_end = hooks.find("approve", "uf_end");
+        let body_end = type_and_message(body_end.wire.as_ref().expect("an Err outcome"));
+        assert_eq!(body_end.1.as_deref(), Some("no"));
+        let body_fail = update_of(&client.updates(), "approve", &OperationAction::Fail)
+            .expect("the body's FAIL");
+        assert_eq!(fail_error(&body_fail), body_end);
     }
 
     /// Runs the callback scenario against `client` and returns the
@@ -4304,7 +4544,7 @@ mod start_order_tests {
         };
         let settle = after.settle(
             Some(crate::context::SubmittedWrite::from_receiver(receiver)),
-            body_result,
+            crate::plugin::Ran::from_result(body_result, crate::callback::extract_wire_error),
         );
         let outcomes = |submissions: &[Submission]| {
             submissions

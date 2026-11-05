@@ -81,4 +81,11 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # required them left the graph when aws-config and aws-sdk-lambda dropped
 # their default features. Any new entry needs a comment naming the
 # advisory and the reason.
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0441: `pin-utils` is unmaintained (archived upstream).
+    # It reaches the graph only through `aws-smithy-http`, which
+    # aws-config and aws-sdk-lambda require, and the advisory lists no
+    # safe upgrade. The SDK itself does not use `pin-utils`. Remove this
+    # entry when the AWS SDK crates drop the dependency.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained transitive dependency of aws-smithy-http; no safe upgrade" },
+]

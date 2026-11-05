@@ -2779,19 +2779,37 @@ async fn resumed_child_starts_with_replay() {
     assert_none_virtual(&tree);
 }
 
+/// A child whose 300 KB result `ReplayChildren` keeps out of its record
+/// fires its operation hooks and S, W and E in the first invocation. The
+/// second invocation reruns the body to rebuild the value, and fires no
+/// hook of either kind (rule 7.8).
 #[tokio::test]
-async fn replay_children_reconstruction_fires_nothing() {
+async fn replay_children_reconstruction_fires_no_hook() {
     let tree = Tree::default();
-    let result = tree
-        .runner()
+    let uf = Uf::default();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let handler_runs = Arc::clone(&runs);
+    let result = LocalRunner::new()
+        .options(
+            uf.options()
+                .plugin(tree.clone())
+                .build()
+                .expect("valid options"),
+        )
         .run(
-            |_e: (), ctx: DurableContext| async move {
-                let big = ctx
-                    .run_in_child_context(|_child| async { Ok("x".repeat(300 * 1024)) })
-                    .name("parent")
-                    .await?;
-                ctx.wait(Duration::from_secs(1)).name("pause").await?;
-                Ok::<_, BoxError>(big.len())
+            move |_e: (), ctx: DurableContext| {
+                let runs = Arc::clone(&handler_runs);
+                async move {
+                    let big = ctx
+                        .run_in_child_context(move |_child| async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok("x".repeat(300 * 1024))
+                        })
+                        .name("parent")
+                        .await?;
+                    ctx.wait(Duration::from_secs(1)).name("pause").await?;
+                    Ok::<_, BoxError>(big.len())
+                }
             },
             (),
         )
@@ -2799,6 +2817,12 @@ async fn replay_children_reconstruction_fires_nothing() {
         .expect("runner");
     assert_eq!(result.output(), Some(&(300 * 1024)));
     assert_eq!(result.invocation_count(), 2);
+    assert!(replay_children(&result, "parent"));
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        2,
+        "the second run rebuilds the value"
+    );
     let end = tree.find(1, "end", "parent");
     assert_eq!(end.info().status(), SUCCEEDED);
     assert!(!end.info().is_replay());
@@ -2809,6 +2833,8 @@ async fn replay_children_reconstruction_fires_nothing() {
         tree.of("parent")
     );
     assert_none_virtual(&tree);
+    uf.assert_full(1, "parent");
+    assert_eq!(uf.lines(2), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -3877,4 +3903,1107 @@ async fn detached_operation_hooks_finish_and_drain() {
     };
     assert!(at("start done") < at("invocation end"), "{events:?}");
     assert!(at("end done") < at("invocation end"), "{events:?}");
+}
+
+// The user-function hooks and wraps (#126).
+
+thread_local! {
+    /// Set while a wrap of this thread's plugin is inside its `next()`.
+    static FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The frames `p0` entered on this thread: `I` for the invocation, then
+    /// the name of each user function, outermost first.
+    static FRAMES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The frames current on this thread, as [`FRAMES`] holds them.
+fn frames() -> Vec<String> {
+    FRAMES.with(|f| f.borrow().clone())
+}
+
+/// The name of an operation, or its ID when it has none.
+fn label(info: &OperationInfo) -> String {
+    info.name()
+        .map_or_else(|| info.id().to_owned(), str::to_owned)
+}
+
+/// One call that [`Uf`] recorded.
+#[derive(Debug, Clone)]
+struct UfRec {
+    /// The invocation, counted from 1.
+    inv: usize,
+    plugin: &'static str,
+    /// `start`, `enter`, `exit` or `end` for the user-function hooks and
+    /// wraps; `op-start` or `op-end` for the operation hooks.
+    hook: &'static str,
+    op: String,
+    info: OperationInfo,
+    /// The end hook's error, for an `end` that received one.
+    wire: Option<WireError>,
+}
+
+impl UfRec {
+    /// The record as the issue's fixture writes it.
+    fn line(&self) -> String {
+        let (plugin, op) = (self.plugin, &self.op);
+        match self.hook {
+            "start" => format!("{plugin}.start({op})"),
+            "enter" => format!("{plugin}.wrap({op}) enter"),
+            "exit" => format!("{plugin}.wrap({op}) exit"),
+            "end" if self.wire.is_none() => format!("{plugin}.end({op}, Ok)"),
+            "end" => format!("{plugin}.end({op}, Err)"),
+            other => format!("{plugin}.{other}({op})"),
+        }
+    }
+
+    fn is_user_function(&self) -> bool {
+        matches!(self.hook, "start" | "enter" | "exit" | "end")
+    }
+}
+
+/// The recording plugins `p0` and `p1`. Each logs its user-function hooks
+/// and wraps (S, W and E) and its operation hooks. `p0` also pushes `I` in
+/// `wrap_invocation` and the user function's name in `wrap_user_function`
+/// onto [`FRAMES`]. With `lock`, every hook and wrap takes the lock with
+/// `try_lock` and releases it before it returns or calls `next()`, and
+/// counts a contended lock in `contended`.
+#[derive(Clone, Default)]
+struct Uf {
+    recs: Arc<Mutex<Vec<UfRec>>>,
+    lock: Option<Arc<Mutex<()>>>,
+    contended: Arc<AtomicUsize>,
+}
+
+struct UfFactory {
+    uf: Uf,
+    plugin: &'static str,
+    count: Arc<AtomicUsize>,
+}
+
+struct UfPlugin {
+    uf: Uf,
+    plugin: &'static str,
+    inv: usize,
+}
+
+impl Uf {
+    fn factories(&self) -> [UfFactory; 2] {
+        ["p0", "p1"].map(|plugin| UfFactory {
+            uf: self.clone(),
+            plugin,
+            count: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn options(&self) -> durable::OptionsBuilder {
+        let [p0, p1] = self.factories();
+        Options::builder().plugin(p0).plugin(p1)
+    }
+
+    fn runner(&self) -> LocalRunner {
+        LocalRunner::new().options(self.options().build().expect("valid options"))
+    }
+
+    fn recs(&self) -> Vec<UfRec> {
+        self.recs.lock().unwrap().clone()
+    }
+
+    /// The user-function records, in order.
+    fn uf_recs(&self) -> Vec<UfRec> {
+        self.recs()
+            .into_iter()
+            .filter(UfRec::is_user_function)
+            .collect()
+    }
+
+    /// The user-function lines of invocation `inv`.
+    fn lines(&self, inv: usize) -> Vec<String> {
+        self.uf_recs()
+            .iter()
+            .filter(|r| r.inv == inv)
+            .map(UfRec::line)
+            .collect()
+    }
+
+    /// The user-function records of `op`.
+    fn of(&self, op: &str) -> Vec<UfRec> {
+        self.uf_recs().into_iter().filter(|r| r.op == op).collect()
+    }
+
+    /// Asserts that each plugin logged S, W (enter and exit) and E for
+    /// `op` in invocation `inv`.
+    fn assert_full(&self, inv: usize, op: &str) {
+        let lines: Vec<String> = self
+            .of(op)
+            .iter()
+            .filter(|r| r.inv == inv)
+            .map(UfRec::line)
+            .collect();
+        for plugin in ["p0", "p1"] {
+            for hook in ["start(OP)", "wrap(OP) enter", "wrap(OP) exit", "end(OP, "] {
+                let want = format!("{plugin}.{}", hook.replace("OP", op));
+                assert!(
+                    lines.iter().any(|l| l.starts_with(&want)),
+                    "{want} in invocation {inv}: {lines:?}"
+                );
+            }
+        }
+    }
+
+    fn hold(&self) {
+        if let Some(lock) = &self.lock {
+            match lock.try_lock() {
+                Ok(guard) => drop(guard),
+                Err(_) => {
+                    self.contended.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+}
+
+impl PluginFactory for UfFactory {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        let inv = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(Some(Box::new(UfPlugin {
+            uf: self.uf.clone(),
+            plugin: self.plugin,
+            inv,
+        })))
+    }
+}
+
+impl UfPlugin {
+    fn push(&self, hook: &'static str, info: &OperationInfo, wire: Option<&WireError>) {
+        self.uf.recs.lock().unwrap().push(UfRec {
+            inv: self.inv,
+            plugin: self.plugin,
+            hook,
+            op: label(info),
+            info: info.clone(),
+            wire: wire.cloned(),
+        });
+    }
+
+    fn is_p0(&self) -> bool {
+        self.plugin == "p0"
+    }
+}
+
+impl Plugin for UfPlugin {
+    fn name(&self) -> &'static str {
+        self.plugin
+    }
+
+    fn wrap_invocation(&self, _info: &InvocationInfo, next: &mut dyn FnMut()) {
+        if self.is_p0() {
+            FRAMES.with(|f| f.borrow_mut().push("I".to_owned()));
+            next();
+            FRAMES.with(|f| f.borrow_mut().pop());
+        } else {
+            next();
+        }
+    }
+
+    fn wrap_user_function(&self, info: &OperationInfo, next: &mut dyn FnMut()) {
+        self.uf.hold();
+        self.push("enter", info, None);
+        if self.is_p0() {
+            FRAMES.with(|f| f.borrow_mut().push(label(info)));
+            next();
+            FRAMES.with(|f| f.borrow_mut().pop());
+        } else {
+            next();
+        }
+        self.uf.hold();
+        self.push("exit", info, None);
+    }
+
+    fn on_user_function_start(&self, info: &OperationInfo) -> HookWork {
+        self.uf.hold();
+        self.push("start", info, None);
+        Ok(None)
+    }
+
+    fn on_user_function_end(
+        &self,
+        info: &OperationInfo,
+        outcome: Result<(), &WireError>,
+    ) -> HookWork {
+        self.uf.hold();
+        self.push("end", info, outcome.err());
+        Ok(None)
+    }
+
+    fn on_operation_start(&self, info: &OperationInfo) -> HookWork {
+        self.push("op-start", info, None);
+        Ok(None)
+    }
+
+    fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
+        self.push("op-end", info, None);
+        Ok(None)
+    }
+}
+
+/// Whether the context operation `name` closed with `ReplayChildren`.
+fn replay_children<O>(result: &durable::test_util::TestResult<O>, name: &str) -> bool {
+    use durable::test_util::TestOperationDetails;
+    result.operation(name).is_some_and(
+        |op| matches!(op.details(), TestOperationDetails::Context(d) if d.replay_children()),
+    )
+}
+
+/// Asserts that a run failed with the context usage error that names
+/// plugin code.
+fn assert_plugin_code_usage_error<O>(result: &durable::test_util::TestResult<O>) {
+    assert!(result.is_failure(), "the execution fails");
+    let message = result.error_message().unwrap_or_default();
+    assert!(message.contains("inside plugin code"), "{message}");
+}
+
+/// The text of a panic payload.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
+}
+
+/// One step's start and end hooks return futures that wait on test-held
+/// gates. The gates open once the step's SUCCEED was written; the
+/// invocation-end drain finishes both futures before `on_invocation_end`.
+#[derive(Clone, Default)]
+struct Gated {
+    start_gate: Arc<tokio::sync::Notify>,
+    end_gate: Arc<tokio::sync::Notify>,
+    started: Arc<AtomicBool>,
+    ended: Arc<AtomicBool>,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Gated {
+    fn gated(gate: &Arc<tokio::sync::Notify>, flag: &Arc<AtomicBool>) -> HookFuture<'static> {
+        let (gate, flag) = (Arc::clone(gate), Arc::clone(flag));
+        Box::pin(async move {
+            gate.notified().await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    fn flags(&self) -> (bool, bool) {
+        (
+            self.started.load(Ordering::SeqCst),
+            self.ended.load(Ordering::SeqCst),
+        )
+    }
+}
+
+impl Plugin for Gated {
+    fn on_user_function_start(&self, info: &OperationInfo) -> HookWork {
+        if info.name() != Some("s") {
+            return Ok(None);
+        }
+        Ok(Some(Self::gated(&self.start_gate, &self.started)))
+    }
+
+    fn on_user_function_end(
+        &self,
+        info: &OperationInfo,
+        _outcome: Result<(), &WireError>,
+    ) -> HookWork {
+        if info.name() != Some("s") {
+            return Ok(None);
+        }
+        Ok(Some(Self::gated(&self.end_gate, &self.ended)))
+    }
+
+    fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
+        if info.name() == Some("s") && info.status() == SUCCEEDED {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("succeed {:?}", self.flags()));
+            self.start_gate.notify_one();
+            self.end_gate.notify_one();
+        }
+        Ok(None)
+    }
+
+    fn on_invocation_end<'a>(&'a self, _info: &'a InvocationEndInfo) -> HookFuture<'a> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("invocation end {:?}", self.flags()));
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+impl PluginFactory for Gated {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        Ok(Some(Box::new(self.clone())))
+    }
+}
+
+#[tokio::test]
+async fn hook_futures_drained_at_invocation_end() {
+    let gated = Gated::default();
+    let runner = LocalRunner::new().options(
+        Options::builder()
+            .plugin(gated.clone())
+            .build()
+            .expect("valid options"),
+    );
+    let run = runner.run(
+        |_e: (), ctx: DurableContext| async move {
+            Ok::<_, BoxError>(ctx.step(|_| async { Ok(1_u32) }).name("s").await?)
+        },
+        (),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("the run finishes within 5 s")
+        .expect("runner");
+    assert_eq!(result.output(), Some(&1));
+    assert_eq!(
+        *gated.log.lock().unwrap(),
+        ["succeed (false, false)", "invocation end (true, true)"]
+    );
+}
+
+/// Sets [`FLAG`] around `next()` in `wrap_invocation`, and records the
+/// value `on_invocation_end` reads in its synchronous call.
+#[derive(Clone, Default)]
+struct FlagProbe(Arc<Mutex<Vec<bool>>>);
+
+impl Plugin for FlagProbe {
+    fn wrap_invocation(&self, _info: &InvocationInfo, next: &mut dyn FnMut()) {
+        let outer = FLAG.with(|flag| flag.replace(true));
+        next();
+        FLAG.with(|flag| flag.set(outer));
+    }
+
+    fn on_invocation_end<'a>(&'a self, _info: &'a InvocationEndInfo) -> HookFuture<'a> {
+        self.0.lock().unwrap().push(FLAG.with(std::cell::Cell::get));
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+impl PluginFactory for FlagProbe {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        Ok(Some(Box::new(self.clone())))
+    }
+}
+
+#[tokio::test]
+async fn invocation_wrap_active_during_end_hook() {
+    let probe = FlagProbe::default();
+    let result = LocalRunner::new()
+        .options(
+            Options::builder()
+                .plugin(probe.clone())
+                .build()
+                .expect("valid options"),
+        )
+        .run(two_steps, ())
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(*probe.0.lock().unwrap(), [true]);
+    assert!(
+        !FLAG.with(std::cell::Cell::get),
+        "the test is outside every wrap"
+    );
+}
+
+/// A plugin whose wrap (`wrap_invocation` or `wrap_user_function`, by
+/// `user_function`) calls `wait` on the context the handler put in `slot`.
+struct ClaimsInWrap {
+    slot: Arc<Mutex<Option<DurableContext>>>,
+    user_function: bool,
+}
+
+impl ClaimsInWrap {
+    fn claim(&self) {
+        let ctx = self.slot.lock().unwrap().clone();
+        if let Some(ctx) = ctx {
+            drop(ctx.wait(Duration::from_secs(1)));
+        }
+    }
+}
+
+impl Plugin for ClaimsInWrap {
+    fn wrap_invocation(&self, _info: &InvocationInfo, next: &mut dyn FnMut()) {
+        if !self.user_function {
+            self.claim();
+        }
+        next();
+    }
+
+    fn wrap_user_function(&self, _info: &OperationInfo, next: &mut dyn FnMut()) {
+        if self.user_function {
+            self.claim();
+        }
+        next();
+    }
+}
+
+struct ClaimsInWrapFactory {
+    slot: Arc<Mutex<Option<DurableContext>>>,
+    user_function: bool,
+}
+
+impl PluginFactory for ClaimsInWrapFactory {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        Ok(Some(Box::new(ClaimsInWrap {
+            slot: Arc::clone(&self.slot),
+            user_function: self.user_function,
+        })))
+    }
+}
+
+/// A `wrap_user_function` and a `wrap_invocation` that call `wait` while
+/// the handler runs each fail the execution with the context usage error
+/// that names plugin code.
+#[tokio::test]
+async fn claim_while_handler_runs_fails_the_execution() {
+    for user_function in [true, false] {
+        let slot = Arc::new(Mutex::new(None));
+        let handler_slot = Arc::clone(&slot);
+        let result = LocalRunner::new()
+            .options(
+                Options::builder()
+                    .plugin(ClaimsInWrapFactory {
+                        slot: Arc::clone(&slot),
+                        user_function,
+                    })
+                    .build()
+                    .expect("valid options"),
+            )
+            .run(
+                move |_e: (), ctx: DurableContext| {
+                    let slot = Arc::clone(&handler_slot);
+                    async move {
+                        *slot.lock().unwrap() = Some(ctx.clone());
+                        let value = ctx.step(|_| async { Ok(1_u32) }).name("s").await?;
+                        Ok::<_, BoxError>(value)
+                    }
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        // The context must not outlive the run.
+        slot.lock().unwrap().take();
+        assert_plugin_code_usage_error(&result);
+    }
+}
+
+/// Logs `inv exit` after each `wrap_invocation`, the [`FLAG`] value
+/// `on_invocation_end` reads, and `drop` when the plugin is dropped.
+struct DriveProbe(Arc<Mutex<Vec<String>>>);
+
+impl Plugin for DriveProbe {
+    fn wrap_invocation(&self, _info: &InvocationInfo, next: &mut dyn FnMut()) {
+        let outer = FLAG.with(|flag| flag.replace(true));
+        next();
+        FLAG.with(|flag| flag.set(outer));
+        self.0.lock().unwrap().push("inv exit".to_owned());
+    }
+
+    fn on_invocation_end<'a>(&'a self, _info: &'a InvocationEndInfo) -> HookFuture<'a> {
+        let flag = FLAG.with(std::cell::Cell::get);
+        self.0.lock().unwrap().push(format!("end FLAG={flag}"));
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+impl Drop for DriveProbe {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().push("drop".to_owned());
+    }
+}
+
+struct DriveProbeFactory(Arc<Mutex<Vec<String>>>);
+
+impl PluginFactory for DriveProbeFactory {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        Ok(Some(Box::new(DriveProbe(Arc::clone(&self.0)))))
+    }
+}
+
+/// A step body's panic leaves the drive, runs `on_invocation_end` inside
+/// `wrap_invocation`, and resumes only after the wrap returned and the
+/// plugin was dropped.
+#[tokio::test]
+async fn drive_panic_resumes_after_plugins_dropped() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let runner = LocalRunner::new().options(
+        Options::builder()
+            .plugin(DriveProbeFactory(Arc::clone(&log)))
+            .build()
+            .expect("valid options"),
+    );
+    let task_log = Arc::clone(&log);
+    #[expect(clippy::disallowed_methods)]
+    // reason: the test observes the panic through a JoinHandle
+    let handle = tokio::spawn(async move {
+        let result = runner
+            .run(
+                |_e: (), ctx: DurableContext| async move {
+                    #[expect(clippy::panic)] // reason: the step panic under test
+                    let value: u32 = ctx.step(|_| async { panic!("kaboom") }).name("s").await?;
+                    Ok::<_, BoxError>(value)
+                },
+                (),
+            )
+            .await;
+        task_log.lock().unwrap().push("after drive".to_owned());
+        result.map(|_| ())
+    });
+    let err = handle.await.expect_err("the run panics");
+    assert!(err.is_panic());
+    assert!(panic_text(&*err.into_panic()).contains("kaboom"));
+    let log = log.lock().unwrap().clone();
+    let ends: Vec<&String> = log.iter().filter(|l| l.starts_with("end ")).collect();
+    assert!(!ends.is_empty(), "{log:?}");
+    assert!(ends.iter().all(|l| *l == "end FLAG=true"), "{log:?}");
+    assert!(!log.iter().any(|l| l == "after drive"), "{log:?}");
+    assert!(
+        log.ends_with(&["inv exit".to_owned(), "drop".to_owned()]),
+        "{log:?}"
+    );
+}
+
+/// Step `a`, child `c`, `wait_for_condition` `w` done at its first check
+/// and `wait_for_callback` `cb` run their user functions live; once each
+/// is terminal, its replay fires no user-function hook (rule 7.8).
+#[tokio::test]
+async fn terminal_replay_fires_no_user_function_hook() {
+    use durable::builders::wait_for_condition::WaitDecision;
+
+    let uf = Uf::default();
+    let result = uf
+        .runner()
+        .callback_for(
+            "cb",
+            durable::test_util::CallbackReply::success(&"yes").expect("encodes"),
+        )
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                ctx.step(|_| async { Ok(1_u32) }).name("a").await?;
+                ctx.run_in_child_context(|_child| async { Ok(2_u32) })
+                    .name("c")
+                    .await?;
+                ctx.wait_for_condition(|_ctx, state: u32| async move { Ok(state + 1) }, 0_u32)
+                    .wait_strategy_fn(|state: u32, _attempt| {
+                        if state >= 1 {
+                            WaitDecision::complete()
+                        } else {
+                            WaitDecision::continue_with(Duration::from_secs(1))
+                        }
+                    })
+                    .name("w")
+                    .await?;
+                let approval: String = ctx
+                    .wait_for_callback::<String, _, _>(|_step, _id| async { Ok(()) })
+                    .name("cb")
+                    .await?;
+                ctx.wait(Duration::from_secs(1)).name("pause").await?;
+                Ok::<_, BoxError>(approval)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output().map(String::as_str), Some("yes"));
+    // The callback suspends the first invocation, its completion resumes
+    // the `wait_for_callback` body in the second, and `pause` makes a third
+    // that replays every record.
+    let last = result.invocation_count();
+    assert_eq!(last, 3);
+    for op in ["a", "c", "w", "cb-submitter"] {
+        uf.assert_full(1, op);
+        let later: Vec<UfRec> = uf.of(op).into_iter().filter(|r| r.inv > 1).collect();
+        assert!(later.is_empty(), "{op}: {later:?}");
+    }
+    uf.assert_full(2, "cb");
+    assert_eq!(uf.lines(last), Vec::<String>::new());
+}
+
+/// Runs `with_retry` `r`, retried once after 1 s, whose block calls
+/// `outcome` with the attempt number (from 1) and records the frames
+/// current in it.
+async fn run_with_retry(
+    uf: &Uf,
+    outcome: fn(usize) -> Result<u32, BoxError>,
+) -> (durable::test_util::TestResult<u32>, Vec<Vec<String>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (handler_seen, handler_calls) = (Arc::clone(&seen), Arc::clone(&calls));
+    let result = uf
+        .runner()
+        .run(
+            move |_e: (), ctx: DurableContext| {
+                let (seen, calls) = (Arc::clone(&handler_seen), Arc::clone(&handler_calls));
+                async move {
+                    Ok::<_, BoxError>(
+                        ctx.with_retry(move |_child| {
+                            let (seen, calls) = (Arc::clone(&seen), Arc::clone(&calls));
+                            async move {
+                                seen.lock().unwrap().push(frames());
+                                outcome(calls.fetch_add(1, Ordering::SeqCst) + 1)
+                            }
+                        })
+                        .name("r")
+                        .retry_strategy(retry_once)
+                        .await?,
+                    )
+                }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    let seen = seen.lock().unwrap().clone();
+    (result, seen)
+}
+
+/// The user-function hooks and wraps of `with_retry` `r` run for the outer
+/// block, once per invocation that runs it; its `attempt-1` and
+/// `attempt-2` children keep their operation hooks and are no user
+/// function (rule 7.7), and their bodies run inside `r`'s frame.
+#[tokio::test]
+async fn with_retry_wraps_outer_block_not_attempts() {
+    let uf = Uf::default();
+    let (result, seen) = run_with_retry(&uf, |attempt| {
+        if attempt == 1 {
+            Err("transient".into())
+        } else {
+            Ok(4)
+        }
+    })
+    .await;
+    assert_eq!(result.output(), Some(&4));
+    assert_eq!(result.invocation_count(), 2);
+    let starts: Vec<(usize, &str, bool)> = uf
+        .of("r")
+        .iter()
+        .filter(|r| r.hook == "start")
+        .map(|r| (r.inv, r.plugin, r.info.is_replay()))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            (1, "p0", false),
+            (1, "p1", false),
+            (2, "p0", true),
+            (2, "p1", true)
+        ]
+    );
+    let ends: Vec<(usize, &str, bool)> = uf
+        .of("r")
+        .iter()
+        .filter(|r| r.hook == "end")
+        .map(|r| (r.inv, r.plugin, r.wire.is_none()))
+        .collect();
+    assert_eq!(ends, [(2, "p1", true), (2, "p0", true)]);
+    for (inv, attempt) in [(1, "attempt-1"), (2, "attempt-2")] {
+        assert!(uf.of(attempt).is_empty(), "{:?}", uf.of(attempt));
+        let op_start = uf
+            .recs()
+            .into_iter()
+            .filter(|r| r.hook == "op-start" && r.op == attempt && r.inv == inv)
+            .count();
+        assert_eq!(op_start, 2, "both plugins' operation start for {attempt}");
+    }
+    assert_eq!(seen, [["I", "r"], ["I", "r"]]);
+}
+
+/// Both attempts of `with_retry` `r` fail, and the strategy stops: the end
+/// hooks receive the exhaustion error's wire, which `r`'s FAIL records.
+#[tokio::test]
+async fn with_retry_exhaustion_end_hook() {
+    let uf = Uf::default();
+    let (result, _) = run_with_retry(&uf, |attempt| Err(format!("nope {attempt}").into())).await;
+    assert!(result.is_failure());
+    let recorded = result
+        .operation("r")
+        .and_then(durable::test_util::TestOperation::error)
+        .expect("r failed")
+        .clone();
+    let ends: Vec<UfRec> = uf.of("r").into_iter().filter(|r| r.hook == "end").collect();
+    assert_eq!(ends.len(), 2, "{ends:?}");
+    for end in ends {
+        assert_eq!(end.inv, 2);
+        let wire = end.wire.expect("the end hook received the error");
+        assert_eq!(wire.error_type(), recorded.error_type());
+        assert_eq!(wire.error_message(), recorded.error_message());
+        assert_eq!(wire.error_data(), recorded.error_data());
+        assert!(
+            wire.error_message().is_some_and(|m| m.contains("nope 2")),
+            "{wire:?}"
+        );
+    }
+}
+
+/// A `parallel` `p` with one branch `b` running a step `s`: each hook and
+/// wrap takes a `std::sync::Mutex` only while it runs, so none is ever
+/// contended. Every user-function hook runs in the wraps of the frames
+/// around it, `p` outermost, and each end hook runs right after its
+/// plugin's wrap returned (rules 3.2 to 3.4).
+#[tokio::test]
+async fn step_in_parallel_branch_reenters() {
+    let uf = Uf {
+        lock: Some(Arc::new(Mutex::new(()))),
+        ..Uf::default()
+    };
+    let runner = uf.runner();
+    let run = runner.run(
+        |_e: (), ctx: DurableContext| async move {
+            let branches = vec![durable::Branch::new(
+                "b",
+                |child: DurableContext| async move {
+                    Ok(child.step(|_| async { Ok(1_u32) }).name("s").await?)
+                },
+            )];
+            Ok::<_, BoxError>(ctx.parallel(branches).name("p").await?)
+        },
+        (),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .expect("no deadlock within 1 s")
+        .expect("runner");
+    assert_eq!(result.output(), Some(&vec![1]));
+    assert_eq!(uf.contended.load(Ordering::SeqCst), 0);
+    // The stack of wraps entered when each record was made.
+    let mut stack: Vec<String> = Vec::new();
+    let mut at: Vec<(String, Vec<String>)> = Vec::new();
+    let recs = uf.uf_recs();
+    for (i, rec) in recs.iter().enumerate() {
+        let me = format!("{}:{}", rec.plugin, rec.op);
+        match rec.hook {
+            "enter" => stack.push(me),
+            "exit" => assert_eq!(stack.pop(), Some(me), "{recs:?}"),
+            "start" => {
+                at.push((rec.line(), stack.clone()));
+                let next = recs.get(i + 1).map(UfRec::line);
+                let want = format!("{}.wrap({}) enter", rec.plugin, rec.op);
+                assert_eq!(next.as_deref(), Some(want.as_str()), "{recs:?}");
+            }
+            _ => {
+                at.push((rec.line(), stack.clone()));
+                let previous = i.checked_sub(1).and_then(|i| recs.get(i)).map(UfRec::line);
+                let want = format!("{}.wrap({}) exit", rec.plugin, rec.op);
+                assert_eq!(previous.as_deref(), Some(want.as_str()), "{recs:?}");
+            }
+        }
+    }
+    assert!(stack.is_empty(), "{recs:?}");
+    let around = |line: &str| -> Vec<String> {
+        at.iter().find(|(l, _)| l == line).map_or_else(
+            || unreachable!("no {line} in {recs:?}"),
+            |(_, stack)| stack.clone(),
+        )
+    };
+    let s = |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_owned()).collect() };
+    let pp = ["p0:p", "p1:p"];
+    let ppbb = ["p0:p", "p1:p", "p0:b", "p1:b"];
+    assert_eq!(around("p0.start(p)"), s(&[]));
+    assert_eq!(around("p1.start(p)"), s(&["p0:p"]));
+    assert_eq!(around("p0.start(b)"), s(&pp));
+    assert_eq!(around("p1.start(b)"), s(&["p0:p", "p1:p", "p0:b"]));
+    assert_eq!(around("p0.start(s)"), s(&ppbb));
+    assert_eq!(
+        around("p1.start(s)"),
+        s(&["p0:p", "p1:p", "p0:b", "p1:b", "p0:s"])
+    );
+    assert_eq!(
+        around("p1.end(s, Ok)"),
+        s(&["p0:p", "p1:p", "p0:b", "p1:b", "p0:s"])
+    );
+    assert_eq!(around("p0.end(s, Ok)"), s(&ppbb));
+    assert_eq!(around("p1.end(b, Ok)"), s(&["p0:p", "p1:p", "p0:b"]));
+    assert_eq!(around("p0.end(b, Ok)"), s(&pp));
+    assert_eq!(around("p1.end(p, Ok)"), s(&["p0:p"]));
+    assert_eq!(around("p0.end(p, Ok)"), s(&[]));
+}
+
+/// A `map` over `[1]` whose item waits 1 s: the item's start hook has
+/// `is_replay` false in the first invocation and true in the second, in
+/// both modes; a flat item's info is virtual.
+#[tokio::test]
+async fn map_item_info_replay_flag_both_modes() {
+    use durable::builders::map_parallel::NestingMode;
+
+    for nesting in [NestingMode::Normal, NestingMode::Flat] {
+        let uf = Uf::default();
+        let result = uf
+            .runner()
+            .run(
+                move |_e: (), ctx: DurableContext| async move {
+                    Ok::<_, BoxError>(
+                        ctx.map(vec![1_u32], |child, item, _idx| async move {
+                            child.wait(Duration::from_secs(1)).name("w").await?;
+                            Ok(item)
+                        })
+                        .name("m")
+                        .item_namer(|_item, idx| format!("item-{idx}"))
+                        .nesting(nesting)
+                        .await?,
+                    )
+                },
+                (),
+            )
+            .await
+            .expect("runner");
+        assert_eq!(result.output(), Some(&vec![1]), "{nesting:?}");
+        assert_eq!(result.invocation_count(), 2, "{nesting:?}");
+        let flat = matches!(nesting, NestingMode::Flat);
+        let starts: Vec<(usize, &str, bool, bool)> = uf
+            .of("item-0")
+            .iter()
+            .filter(|r| r.hook == "start")
+            .map(|r| (r.inv, r.plugin, r.info.is_replay(), r.info.is_virtual()))
+            .collect();
+        assert_eq!(
+            starts,
+            [
+                (1, "p0", false, flat),
+                (1, "p1", false, flat),
+                (2, "p0", true, flat),
+                (2, "p1", true, flat),
+            ],
+            "{nesting:?}"
+        );
+    }
+}
+
+/// Counts the runs of each named body.
+#[derive(Clone, Default)]
+struct Runs(Arc<Mutex<std::collections::BTreeMap<String, usize>>>);
+
+impl Runs {
+    fn hit(&self, name: &str) {
+        *self.0.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+    }
+
+    fn of(&self, name: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// A child input named `name` that returns `len` copies of `fill`, or
+/// fails when `len` is 0, counting its body's runs.
+fn sized_child(
+    ctx: &DurableContext,
+    runs: &Runs,
+    name: &'static str,
+    fill: char,
+    len: usize,
+) -> durable::DurableFuture<String> {
+    let runs = runs.clone();
+    ctx.run_in_child_context(move |_child| async move {
+        runs.hit(name);
+        if len == 0 {
+            return Err::<String, BoxError>(format!("{name} fails").into());
+        }
+        Ok(fill.to_string().repeat(len))
+    })
+    .name(name)
+    .future()
+}
+
+/// The handler of [`batch_and_combinator_replay_routing`]. It returns the
+/// total length of every result.
+async fn routed(ctx: DurableContext, runs: Runs) -> Result<usize, BoxError> {
+    const KIB: usize = 1024;
+    let mut total = 0;
+    // Small batches and a small join.
+    total += ctx
+        .map(vec![1_u32, 2], |_child, item, _idx| async move { Ok(item) })
+        .name("m1")
+        .item_namer(|_item, idx| format!("m1-{idx}"))
+        .await?
+        .len();
+    let branches: Vec<durable::Branch<u32>> = vec![
+        durable::Branch::new("p1-a", |_child| async { Ok(1_u32) }),
+        durable::Branch::new("p1-b", |_child| async { Ok(2_u32) }),
+    ];
+    total += ctx.parallel(branches).name("p1").await?.len();
+    let mut set = durable::BranchSet::new();
+    let text = set.add("pm1-a", |_child| async { Ok("text".to_owned()) });
+    let number = set.add("pm1-b", |_child| async { Ok(3_u32) });
+    ctx.parallel_mixed(set).name("pm1").await?;
+    total += text.into_result()?.len() + usize::try_from(number.into_result()?)?;
+    let a = ctx.step(|_| async { Ok(1_u32) }).name("j1-a").future();
+    let b = ctx.step(|_| async { Ok(2_u32) }).name("j1-b").future();
+    total += ctx.try_join_all([a, b]).name("j1").await?.len();
+    // Batches and joins whose results exceed 256 KiB.
+    let map_runs = runs.clone();
+    total += ctx
+        .map(vec![0_u32, 1], move |_child, _item, idx| {
+            let runs = map_runs.clone();
+            async move {
+                runs.hit(&format!("m2-{idx}"));
+                Ok("m".repeat(150 * KIB))
+            }
+        })
+        .name("m2")
+        .item_namer(|_item, idx| format!("m2-{idx}"))
+        .await?
+        .iter()
+        .map(String::len)
+        .sum::<usize>();
+    let inputs = [
+        sized_child(&ctx, &runs, "j2-a", 'a', 150 * KIB),
+        sized_child(&ctx, &runs, "j2-b", 'b', 150 * KIB),
+    ];
+    total += ctx
+        .try_join_all(inputs)
+        .name("j2")
+        .await?
+        .iter()
+        .map(String::len)
+        .sum::<usize>();
+    let inputs = [
+        sized_child(&ctx, &runs, "j3-a", 'a', 150 * KIB),
+        sized_child(&ctx, &runs, "j3-b", 'b', 150 * KIB),
+    ];
+    for outcome in ctx.join_all(inputs).name("j3").await? {
+        total += outcome?.len();
+    }
+    let inputs = [
+        sized_child(&ctx, &runs, "so-a", 'a', 0),
+        sized_child(&ctx, &runs, "so-b", 'b', 300 * KIB),
+    ];
+    total += ctx.select_ok(inputs).name("so").await?.len();
+    let inputs = [
+        sized_child(&ctx, &runs, "r-a", 'a', 300 * KIB),
+        sized_child(&ctx, &runs, "r-b", 'b', 300 * KIB),
+    ];
+    let winner = ctx.race(inputs).name("r").await?;
+    runs.hit(if winner.starts_with('a') {
+        "r won by a"
+    } else {
+        "r won by b"
+    });
+    total += winner.len();
+    ctx.wait(Duration::from_secs(1)).name("pause").await?;
+    Ok(total)
+}
+
+/// Every container, item, join and input runs its user function in the
+/// first invocation. The second replays them all and fires no
+/// user-function hook (rule 7.8): the large `map` rebuilds its result from
+/// its items' records, `try_join_all` and `join_all` from every input's
+/// record, and `select_ok` and `race` rerun only the winner, whose own
+/// record also carries `ReplayChildren`. No terminal record is written
+/// again.
+#[tokio::test]
+async fn batch_and_combinator_replay_routing() {
+    let uf = Uf::default();
+    let runs = Runs::default();
+    let handler_runs = runs.clone();
+    let result = uf
+        .runner()
+        .run(
+            move |_e: (), ctx: DurableContext| routed(ctx, handler_runs.clone()),
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    assert_eq!(result.invocation_count(), 2);
+    for op in [
+        "m1", "m1-0", "m1-1", "p1", "p1-a", "p1-b", "pm1", "pm1-a", "pm1-b", "j1", "j1-a", "j1-b",
+        "m2", "m2-0", "m2-1", "j2", "j2-a", "j2-b", "j3", "j3-a", "j3-b", "so", "so-a", "so-b",
+        "r", "r-a", "r-b",
+    ] {
+        uf.assert_full(1, op);
+    }
+    for op in ["m2", "j2", "j3", "so", "r"] {
+        assert!(replay_children(&result, op), "{op} carries ReplayChildren");
+    }
+    assert_eq!(uf.lines(2), Vec::<String>::new());
+    // Only the winners' bodies run again.
+    for op in ["m2-0", "m2-1", "j2-a", "j2-b", "j3-a", "j3-b", "so-a"] {
+        assert_eq!(runs.of(op), 1, "{op}");
+    }
+    assert_eq!(runs.of("so-b"), 2);
+    let (winner, loser) = if runs.of("r won by a") > 0 {
+        ("r-a", "r-b")
+    } else {
+        ("r-b", "r-a")
+    };
+    assert_eq!(runs.of(winner), 2, "{winner}");
+    assert_eq!(runs.of(loser), 1, "{loser}");
+    // No operation of the second invocation writes a terminal record,
+    // except the wait it resumes.
+    let ends: Vec<String> = uf
+        .recs()
+        .into_iter()
+        .filter(|r| r.inv == 2 && r.hook == "op-end" && r.op != "pause")
+        .map(|r| r.op)
+        .collect();
+    assert_eq!(ends, Vec::<String>::new());
+}
+
+/// A `map` over `[]`, a `parallel` and a `parallel_mixed` with no branch
+/// each run their container body: S, W and E with `Ok`, and no item hook.
+#[tokio::test]
+async fn empty_containers_fire_container_hooks() {
+    let uf = Uf::default();
+    let result = uf
+        .runner()
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                let items = ctx
+                    .map(Vec::<u32>::new(), |_child, item: u32, _idx| async move {
+                        Ok(item)
+                    })
+                    .name("em")
+                    .await?;
+                let branches = ctx
+                    .parallel(Vec::<durable::Branch<u32>>::new())
+                    .name("ep")
+                    .await?;
+                ctx.parallel_mixed(durable::BranchSet::new())
+                    .name("epm")
+                    .await?;
+                Ok::<_, BoxError>(items.len() + branches.len())
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&0));
+    for op in ["em", "ep", "epm"] {
+        assert_eq!(
+            uf.of(op).iter().map(UfRec::line).collect::<Vec<_>>(),
+            [
+                format!("p0.start({op})"),
+                format!("p0.wrap({op}) enter"),
+                format!("p1.start({op})"),
+                format!("p1.wrap({op}) enter"),
+                format!("p1.wrap({op}) exit"),
+                format!("p1.end({op}, Ok)"),
+                format!("p0.wrap({op}) exit"),
+                format!("p0.end({op}, Ok)"),
+            ]
+        );
+    }
+    let ops: Vec<String> = uf.uf_recs().into_iter().map(|r| r.op).collect();
+    assert!(
+        ops.iter()
+            .all(|op| matches!(op.as_str(), "em" | "ep" | "epm")),
+        "{ops:?}"
+    );
 }

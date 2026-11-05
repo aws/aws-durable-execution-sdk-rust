@@ -350,7 +350,10 @@ impl Drop for TeardownGuard {
 ///    not change that; its record can stay `STARTED`.
 ///
 /// The outcome is decided once, after the cleanup below, from the fatal
-/// error and the panic the coordinator keeps, read together:
+/// error and the panic the coordinator keeps, read one after the other.
+/// Only a fatal error present when `fatal_error()` is read wins; untracked
+/// plugin hook work can record one after that read, and the outcome
+/// ignores it:
 ///
 /// 1. A fatal error was recorded: the fatal outcome. A kept panic is
 ///    dropped through [`crate::task::discard_panic`].
@@ -388,17 +391,26 @@ impl Drop for TeardownGuard {
 /// [`PanicOwnershipGuard`]), and another ends the invocation and aborts
 /// every tracked operation task, including one started after the drop (see
 /// [`TeardownGuard`]).
+///
+/// Beside the outcome it returns whether a fatal error won this
+/// arbitration (`true` only for the outcome of a recorded fatal error).
+/// The caller uses that value, not the coordinator's fatal slot, which
+/// code after the drive can still fill.
 pub(crate) async fn drive_invocation<F>(
     handler_future: F,
     task_ownership: Arc<TaskOwnership>,
     coordinator: Arc<InvocationCoordinator>,
     root: crate::DurableContext,
     remaining: Option<Duration>,
-) -> Result<InvocationOutcome, Box<dyn std::any::Any + Send + 'static>>
+) -> Result<(InvocationOutcome, bool), Box<dyn std::any::Any + Send + 'static>>
 where
     F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
 {
+    // The handler runs inside the root context's frames (the invocation)
+    // and the span current when the invocation started.
+    let root_cx = crate::task::TaskContext::current();
     drive_with_scheduler(
+        root_cx,
         handler_future,
         task_ownership,
         coordinator,
@@ -411,12 +423,13 @@ where
 /// [`drive_invocation`] with `scheduler` polled in place of the refresh
 /// scheduler. Tests pass a scheduler of their own.
 async fn drive_with_scheduler<F, S>(
+    root_cx: crate::task::TaskContext,
     handler_future: F,
     task_ownership: Arc<TaskOwnership>,
     coordinator: Arc<InvocationCoordinator>,
     scheduler: S,
     remaining: Option<Duration>,
-) -> Result<InvocationOutcome, Box<dyn std::any::Any + Send + 'static>>
+) -> Result<(InvocationOutcome, bool), Box<dyn std::any::Any + Send + 'static>>
 where
     F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
     S: Future<Output = ()>,
@@ -447,7 +460,7 @@ where
     // reason: this function awaits Tokio timers and tasks itself, so it is
     // always polled inside a Tokio runtime.
     let (mut root, root_join) =
-        crate::task::spawn_root(&task_ownership, &coordinator, handler_future)
+        crate::task::spawn_root(root_cx, &task_ownership, &coordinator, handler_future)
             .expect("the invocation driver runs inside a Tokio runtime");
 
     let mut deadline = remaining.map(|d| Box::pin(tokio::time::sleep(d)));
@@ -516,26 +529,68 @@ where
     tasks.wait_idle().await;
     tasks.claim_unread_panics(&coordinator);
 
-    // The arbitration. Every task has stopped, so nothing records after
-    // this point. `take_panic` closes panic ownership, so a later record
-    // is returned to its caller.
+    // The arbitration. Every SDK task has stopped. Plugin hook work is
+    // untracked, so it can record a fatal error concurrently with the
+    // `fatal_error()` read below: a record that lands before that read is
+    // used, and one that lands after it is not read. `take_panic` closes
+    // panic ownership, so a later panic record is returned to its caller.
     let fatal = coordinator.fatal_error();
     let panic = coordinator.take_panic();
     drop(ownership_guard);
+    #[cfg(test)]
+    test_hooks::after_arbitration(&coordinator);
     if let Some(fatal) = fatal {
         if let Some(payload) = panic {
             crate::task::discard_panic(payload);
         }
-        return Ok(fatal.into_outcome());
+        return Ok((fatal.into_outcome(), true));
     }
     if let Some(payload) = panic {
         return Err(payload);
     }
-    Ok(match ended {
+    let outcome = match ended {
         DriveEnd::Completed(Ok(result)) => InvocationOutcome::Complete(result),
         DriveEnd::Completed(Err(err)) => InvocationOutcome::Failed { error: err },
         DriveEnd::Interrupted => InvocationOutcome::Pending,
-    })
+    };
+    Ok((outcome, false))
+}
+
+/// [`drive_invocation`] without the fatal-arbitration flag, for callers
+/// that need only the outcome.
+#[cfg(test)]
+pub(crate) async fn drive_outcome<F>(
+    handler_future: F,
+    task_ownership: Arc<TaskOwnership>,
+    coordinator: Arc<InvocationCoordinator>,
+    root: crate::DurableContext,
+    remaining: Option<Duration>,
+) -> Result<InvocationOutcome, Box<dyn std::any::Any + Send + 'static>>
+where
+    F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
+{
+    drive_invocation(handler_future, task_ownership, coordinator, root, remaining)
+        .await
+        .map(|(outcome, _)| outcome)
+}
+
+/// Test-only hooks of the driver.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    tokio::task_local! {
+        /// When set, `drive_invocation` calls it with the coordinator after
+        /// its arbitration and before it returns, as hook work that records
+        /// at that point would.
+        pub(crate) static AFTER_ARBITRATION: std::sync::Arc<
+            dyn Fn(&super::InvocationCoordinator) + Send + Sync,
+        >;
+    }
+
+    pub(crate) fn after_arbitration(coordinator: &super::InvocationCoordinator) {
+        if let Ok(hook) = AFTER_ARBITRATION.try_with(std::sync::Arc::clone) {
+            hook(coordinator);
+        }
+    }
 }
 
 /// Refreshes waiting operations on the schedule of [`crate::coordinator`],
@@ -602,7 +657,7 @@ async fn refresh_scheduler(root: crate::DurableContext) {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{InvocationOutcome, TaskOwnership, drive_invocation};
+    use super::{InvocationOutcome, TaskOwnership, drive_outcome};
     use crate::client::{CheckpointOutput, ExecutionClient, ExecutionClientError, GetStateOutput};
     use crate::coordinator::InvocationCoordinator;
     use aws_sdk_lambda::types::{Operation, OperationStatus, OperationUpdate};
@@ -622,7 +677,7 @@ pub(crate) mod test_support {
     where
         F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
     {
-        match drive_invocation(fut, ownership, coordinator, root, None).await {
+        match drive_outcome(fut, ownership, coordinator, root, None).await {
             Ok(outcome) => outcome,
             Err(payload) => std::panic::resume_unwind(payload),
         }
@@ -657,7 +712,7 @@ pub(crate) mod test_support {
             let _ = fut.await;
             Ok::<_, crate::error::WireError>("ok".to_owned())
         });
-        match drive_invocation(fut, ownership, coordinator, root, None).await {
+        match drive_outcome(fut, ownership, coordinator, root, None).await {
             Ok(outcome) => outcome,
             Err(payload) => std::panic::resume_unwind(payload),
         }
@@ -1140,7 +1195,7 @@ pub(crate) mod test_support {
         let coordinator = Arc::clone(ctx.coordinator());
         let root = ctx.clone();
         let handler = Box::pin(handler(ctx));
-        drive_invocation(handler, ownership, coordinator, root, remaining).await
+        drive_outcome(handler, ownership, coordinator, root, remaining).await
     }
 
     /// Records the level and message of every event while installed as
@@ -3026,7 +3081,7 @@ mod spawn_scope_regressions {
 #[cfg(test)]
 #[expect(clippy::panic)] // reason: the handler panics under test and test assertions
 mod task_gateway {
-    use super::{InvocationOutcome, drive_invocation};
+    use super::{InvocationOutcome, drive_outcome};
     use crate::client::{ExecutionClient, InMemoryExecutionClient};
     use crate::context::DurableContext;
     use crate::engine::CheckpointLog;
@@ -3086,7 +3141,7 @@ mod task_gateway {
         let root = ctx.clone();
         let dropped = Arc::new(AtomicBool::new(false));
         let handler_dropped = Arc::clone(&dropped);
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let _wait = ctx.wait(Duration::from_secs(10)).name("timer").spawn();
                 let _step = spawn_holding_step(&ctx, &handler_dropped);
@@ -3118,7 +3173,7 @@ mod task_gateway {
         let tasks = Arc::clone(signal.tasks());
         let dropped = Arc::new(AtomicBool::new(false));
         let handler_dropped = Arc::clone(&dropped);
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let _step = spawn_holding_step(&ctx, &handler_dropped);
                 yield_three_times().await;
@@ -3151,7 +3206,7 @@ mod task_gateway {
         let handler_dropped = Arc::clone(&dropped);
         let escaped: Arc<Mutex<Option<DurableFuture<()>>>> = Arc::new(Mutex::new(None));
         let handler_escaped = Arc::clone(&escaped);
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let step = spawn_holding_step(&ctx, &handler_dropped);
                 *handler_escaped.lock().expect("lock") = Some(step);
@@ -3183,7 +3238,7 @@ mod task_gateway {
         let root = ctx.clone();
         let tasks = Arc::clone(signal.tasks());
         let parked_signal = Arc::clone(&signal);
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let _wait = ctx.wait(Duration::from_secs(10)).name("timer").spawn();
                 // Held activity keeps the handler runnable while it waits
@@ -3223,7 +3278,7 @@ mod task_gateway {
         let root = ctx.clone();
         let tasks = Arc::clone(signal.tasks());
         let handler_signal = Arc::clone(&signal);
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let _ctx = ctx;
                 let _registration =
@@ -3251,7 +3306,7 @@ mod task_gateway {
         let signal = Arc::clone(ctx.coordinator());
         let root = ctx.clone();
         let handler_signal = Arc::clone(&signal);
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let _ctx = ctx;
                 handler_signal.record_fatal("Fatal".to_owned(), "mismatch".to_owned());
@@ -3322,7 +3377,7 @@ mod task_gateway {
         let escaped: Arc<Mutex<Option<DurableFuture<()>>>> = Arc::new(Mutex::new(None));
         let handler_escaped = Arc::clone(&escaped);
         let check_signal = Arc::clone(&signal);
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let step = ctx
                     .step(move |_| {
@@ -3392,7 +3447,7 @@ mod task_gateway {
         let body_signal = Arc::clone(&signal);
         let escaped: Arc<Mutex<Option<DurableFuture<()>>>> = Arc::new(Mutex::new(None));
         let handler_escaped = Arc::clone(&escaped);
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let step = ctx
                     .step(move |_| {
@@ -3444,7 +3499,7 @@ mod task_gateway {
         let signal = Arc::clone(ctx.coordinator());
         let root = ctx.clone();
         let handler_signal = Arc::clone(&signal);
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let _ctx = ctx;
                 let _registration =
@@ -3469,7 +3524,7 @@ mod task_gateway {
         let ownership = Arc::clone(ctx.task_ownership());
         let signal = Arc::clone(ctx.coordinator());
         let root = ctx.clone();
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let on_task = tokio::task::try_id().is_some();
                 let value = ctx
@@ -3501,7 +3556,7 @@ mod task_gateway {
         let signal = Arc::clone(ctx.coordinator());
         let root = ctx.clone();
         let tasks = Arc::clone(signal.tasks());
-        let outcome = drive_invocation(
+        let outcome = drive_outcome(
             async move {
                 let step = ctx.step(|_| async { Ok(1_i32) }).name("quick").spawn();
                 let _ = step.await;
@@ -5674,7 +5729,7 @@ mod panic_owner {
     //! The invocation coordinator owns every invocation-failing panic, and
     //! the driver resumes the first one after its cleanup.
 
-    use super::{InvocationOutcome, drive_invocation, drive_with_scheduler};
+    use super::{InvocationOutcome, drive_outcome, drive_with_scheduler};
     use crate::client::{
         CheckpointOutput, ExecutionClient, ExecutionClientError, GetStateOutput,
         InMemoryExecutionClient,
@@ -5787,7 +5842,7 @@ mod panic_owner {
         let coordinator = Arc::clone(ctx.coordinator());
         let tasks = Arc::clone(coordinator.tasks());
         let root = ctx.clone();
-        let driven = drive_invocation(handler(ctx), ownership, coordinator, root, None).await;
+        let driven = drive_outcome(handler(ctx), ownership, coordinator, root, None).await;
         (driven, tasks.live())
     }
 
@@ -5894,8 +5949,12 @@ mod panic_owner {
         let (driven, live) = drive(live_ctx(), |ctx| async move {
             let drops = counter();
             let mut set = TrackedJoinSet::<()>::new(Arc::clone(ctx.coordinator()));
-            set.spawn(ctx.task_ownership(), async move { panic_tagged(9, &drops) })
-                .expect("runtime");
+            set.spawn(
+                crate::task::TaskContext::none(),
+                ctx.task_ownership(),
+                async move { panic_tagged(9, &drops) },
+            )
+            .expect("runtime");
             let tasks = Arc::clone(ctx.coordinator().tasks());
             until(&ctx, || tasks.live() == 0).await;
             drop(set);
@@ -5930,6 +5989,7 @@ mod panic_owner {
             let started = Arc::new(AtomicBool::new(false));
             let mut set = TrackedJoinSet::<()>::new(Arc::clone(ctx.coordinator()));
             set.spawn(
+                crate::task::TaskContext::none(),
                 ctx.task_ownership(),
                 PendingThenDropPanics {
                     started: Arc::clone(&started),
@@ -6123,7 +6183,16 @@ mod panic_owner {
             until(&ctx, || started.load(Ordering::SeqCst)).await;
             Ok("done".to_owned())
         };
-        let driven = drive_with_scheduler(handler, ownership, coordinator, scheduler, None).await;
+        let driven = drive_with_scheduler(
+            crate::task::TaskContext::none(),
+            handler,
+            ownership,
+            coordinator,
+            scheduler,
+            None,
+        )
+        .await
+        .map(|(outcome, _)| outcome);
         (driven, tasks.live(), dropped.load(Ordering::SeqCst))
     }
 
@@ -6229,7 +6298,7 @@ mod panic_owner {
                 }
                 std::future::pending::<Result<String, crate::error::WireError>>().await
             };
-            let mut drive = Box::pin(drive_invocation(
+            let mut drive = Box::pin(drive_outcome(
                 handler,
                 ownership,
                 Arc::clone(&coordinator),
@@ -6463,7 +6532,16 @@ mod panic_owner {
                 handler_polled.store(true, Ordering::SeqCst);
                 std::future::pending::<Result<String, crate::error::WireError>>().await
             };
-            drive_with_scheduler(handler, ownership, coordinator, scheduler, None).await
+            drive_with_scheduler(
+                crate::task::TaskContext::none(),
+                handler,
+                ownership,
+                coordinator,
+                scheduler,
+                None,
+            )
+            .await
+            .map(|(outcome, _)| outcome)
         });
         assert!(probe_ran.load(Ordering::SeqCst), "the probe ran");
         assert!(

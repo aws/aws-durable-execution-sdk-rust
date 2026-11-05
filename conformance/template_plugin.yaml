@@ -19,6 +19,8 @@ Resources:
       NotImplemented:
         - id: "10-19"
           reason: "InvocationEndInfo carries no first-invocation flag, as in the JS reference"
+        - id: "10-23"
+          reason: "OperationInfo passed to on_user_function_start has no children-replay indicator"
     Metadata:
       BuildMethod: makefile
     Properties:
@@ -280,6 +282,21 @@ Resources:
       CodeUri: publish/plugin_nested_parent_linkage/
       Handler: bootstrap
       Description: 'Conformance 10-11: Plugin operation end hook reports the parent ID of a step nested in a child context'
+      Role: !Ref ExecutionRoleArn
+      DurableConfig:
+        RetentionPeriodInDays: 7
+        ExecutionTimeout: 300
+
+  PluginParallelBranchHooks:
+    Type: AWS::Serverless::Function
+    TestingMetadata:
+      TestDescription: ["10-12"]
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: publish/plugin_parallel_branch_hooks/
+      Handler: bootstrap
+      Description: 'Conformance 10-12: Plugin user-function hooks fire per parallel branch with parent linkage'
       Role: !Ref ExecutionRoleArn
       DurableConfig:
         RetentionPeriodInDays: 7

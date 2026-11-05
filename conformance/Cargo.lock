@@ -2846,6 +2846,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin_parallel_branch_hooks"
+version = "0.0.0"
+dependencies = [
+ "aws-durable-execution-sdk",
+ "conformance",
+ "lambda_runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "plugin_replay_flags"
 version = "0.0.0"
 dependencies = [

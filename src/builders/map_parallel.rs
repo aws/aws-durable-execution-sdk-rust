@@ -549,10 +549,10 @@ where
         IS: Serdes<O>,
         RS: Serdes<String>,
     {
-        let batch = self.started_batch_future();
-        DurableFuture::from_async(
-            async move { crate::map_parallel::collect_successful(batch.await?) },
-        )
+        // `map_output` keeps the batch's task context, so a combinator that
+        // receives the handle runs it in the frames of its creation.
+        self.started_batch_future()
+            .map_output(|outcome| crate::map_parallel::collect_successful(outcome?))
     }
 }
 
@@ -1068,10 +1068,10 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
         IS: Serdes<O>,
         RS: Serdes<String>,
     {
-        let batch = self.started_batch_future();
-        DurableFuture::from_async(
-            async move { crate::map_parallel::collect_successful(batch.await?) },
-        )
+        // `map_output` keeps the batch's task context, so a combinator that
+        // receives the handle runs it in the frames of its creation.
+        self.started_batch_future()
+            .map_output(|outcome| crate::map_parallel::collect_successful(outcome?))
     }
 }
 
@@ -1329,7 +1329,9 @@ impl<RS> ParallelMixedBuilder<RS> {
 
         let decoders = Arc::clone(&self.decoders);
         let spawned = spawn_terminal!(self, started_batch);
-        DurableFuture::from_async(async move { publish_outcome(spawned.await, &decoders) })
+        // `map_output` keeps the handle's task context, so a combinator that
+        // takes it runs it inside the creator's frames.
+        spawned.map_output(move |outcome| publish_outcome(outcome, &decoders))
     }
 
     /// The lazy terminal of the full [`BatchResult`], shared by `.await`
@@ -1401,7 +1403,10 @@ where
 
         let decoders = Arc::clone(&self.decoders);
         let batch = self.batch_future();
-        DurableFuture::from_async(async move { publish_outcome(batch.await, &decoders) })
+        // `map_output` keeps the batch's task context, so a
+        // combinator that starts it runs the branches inside the frames of
+        // the batch's creation.
+        batch.map_output(move |outcome| publish_outcome(outcome, &decoders))
     }
 }
 

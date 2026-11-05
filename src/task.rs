@@ -78,6 +78,7 @@ use tokio::task::{AbortHandle, Id, JoinSet};
 use crate::coordinator::{InvocationCoordinator, Permit, PermitKind, Phase};
 use crate::driver::TaskOwnership;
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
+use crate::plugin::Frames;
 
 /// A captured panic payload.
 type Payload = Box<dyn Any + Send + 'static>;
@@ -438,7 +439,7 @@ pub(crate) fn drop_recorded<T>(coordinator: &InvocationCoordinator, value: T) {
 /// Drops `value` after the gateway chose an earlier panic as the task's
 /// outcome. A panic from its destructor is that task's second panic, so
 /// it goes to [`discard_panic`].
-fn drop_after_first_panic<T>(value: T) {
+pub(crate) fn drop_after_first_panic<T>(value: T) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(value))) {
         discard_panic(payload);
     }
@@ -826,6 +827,58 @@ enum Gate {
     Detached,
 }
 
+/// What a tracked task runs inside: the plugin frames of the context that
+/// created its operation, and the `tracing` span that was current when it
+/// was created.
+///
+/// A [`DurableFuture`](crate::DurableFuture) captures one when it is
+/// created. The gateway enters the frames around every poll and the drop
+/// of the task's future, and instruments the future with the span inside
+/// its own `catch_unwind`. So a task runs with the context of the code that
+/// created it, as JS's `AsyncLocalStorage` gives a promise the context it
+/// was created in.
+#[derive(Debug, Clone)]
+pub(crate) struct TaskContext {
+    frames: Frames,
+    span: tracing::Span,
+}
+
+impl TaskContext {
+    /// The context `frames` and `span`.
+    pub(crate) fn new(frames: Frames, span: tracing::Span) -> Self {
+        Self { frames, span }
+    }
+
+    /// The frames and the span current on this thread: what a task
+    /// created now runs inside.
+    pub(crate) fn current() -> Self {
+        Self::new(Frames::current(), tracing::Span::current())
+    }
+
+    /// No frames and no span.
+    pub(crate) fn none() -> Self {
+        Self::new(Frames::none(), tracing::Span::none())
+    }
+
+    /// Runs `f` on this thread inside these frames and this span.
+    pub(crate) fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _span = self.span.enter();
+        self.frames.enter(f)
+    }
+
+    /// The frames, for tests that check what a task runs inside.
+    #[cfg(test)]
+    pub(crate) fn frames(&self) -> &Frames {
+        &self.frames
+    }
+
+    /// The span, for tests that check what a task runs inside.
+    #[cfg(test)]
+    pub(crate) fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+}
+
 /// The future of every gateway task: polls the inner future under
 /// `catch_unwind`, blesses the task before the first poll, and hands the
 /// outcome to the consumer before it releases its permits.
@@ -834,8 +887,12 @@ enum Gate {
 /// the inner future and closed the schedule, the bless guard drops before
 /// the task count.
 struct Wrapped<F: Future> {
-    /// The inner future. `None` once it finished or was dropped.
-    inner: Option<Pin<Box<F>>>,
+    /// The inner future, instrumented with its creator's span, so the span
+    /// is entered inside the catch around each poll and while it drops.
+    /// `None` once it finished or was dropped.
+    inner: Option<Pin<Box<tracing::instrument::Instrumented<F>>>>,
+    /// The frames every poll and the drop of `inner` run inside.
+    frames: Frames,
     /// Present from the first poll of an operation task until it exits.
     bless: Option<BlessGuard>,
     /// The ownership handle to bless the task in, taken at the first poll.
@@ -851,6 +908,7 @@ struct Wrapped<F: Future> {
 
 impl<F: Future> Wrapped<F> {
     fn new(
+        task_cx: TaskContext,
         future: F,
         ownership: Option<Arc<TaskOwnership>>,
         coordinator: Arc<InvocationCoordinator>,
@@ -859,7 +917,11 @@ impl<F: Future> Wrapped<F> {
         permit: Option<TaskPermit>,
     ) -> Self {
         Self {
-            inner: Some(Box::pin(future)),
+            inner: Some(Box::pin(tracing::Instrument::instrument(
+                future,
+                task_cx.span,
+            ))),
+            frames: task_cx.frames,
             bless: None,
             ownership,
             coordinator,
@@ -909,15 +971,25 @@ where
             .inner
             .as_mut()
             .expect("tokio does not poll a finished task");
+        // The frames' wraps are entered outside the catch, which stays
+        // innermost: a panic of the task's future, or of its span's enter
+        // and exit, is caught here and never unwinds through a plugin frame.
+        // `Frames::enter` lets nothing else unwind.
+        let frames = &this.frames;
+        let coordinator = &this.coordinator;
         let polled = match &this.gate {
             Gate::Scheduled { waker, .. } => {
                 let mut inner_cx = Context::from_waker(waker);
-                CURRENT_COORDINATOR.sync_scope(Arc::clone(&this.coordinator), || {
-                    catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(&mut inner_cx)))
+                frames.enter(|| {
+                    CURRENT_COORDINATOR.sync_scope(Arc::clone(coordinator), || {
+                        catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(&mut inner_cx)))
+                    })
                 })
             }
-            Gate::Detached => CURRENT_COORDINATOR.sync_scope(Arc::clone(&this.coordinator), || {
-                catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx)))
+            Gate::Detached => frames.enter(|| {
+                CURRENT_COORDINATOR.sync_scope(Arc::clone(coordinator), || {
+                    catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx)))
+                })
             }),
         };
         let outcome = match polled {
@@ -937,7 +1009,10 @@ where
             }
             Ok(Poll::Ready(value)) => {
                 let inner = this.inner.take();
-                match catch_unwind(AssertUnwindSafe(move || drop(inner))) {
+                let dropped = this
+                    .frames
+                    .enter(|| catch_unwind(AssertUnwindSafe(move || drop(inner))));
+                match dropped {
                     Ok(()) => TaskOutcome::Value(value),
                     Err(payload) => {
                         // The destructor's panic is the outcome. A panic
@@ -951,7 +1026,8 @@ where
             Err(payload) => {
                 // The poll's panic is the outcome. A destructor panic after
                 // it is the task's second panic, so it is discarded.
-                drop_after_first_panic(this.inner.take());
+                let inner = this.inner.take();
+                this.frames.enter(move || drop_after_first_panic(inner));
                 TaskOutcome::Panicked(payload)
             }
         };
@@ -978,7 +1054,8 @@ impl<F: Future> Drop for Wrapped<F> {
         // nobody reads an outcome. A panic from the future's destructor is
         // invocation-failing, so it is recorded.
         if let Some(inner) = self.inner.take() {
-            drop_recorded(&self.coordinator, inner);
+            let coordinator = &self.coordinator;
+            self.frames.enter(move || drop_recorded(coordinator, inner));
         }
         // A waker that outlives the task takes no permit from now on.
         if let Gate::Scheduled { schedule, .. } = &self.gate {
@@ -1096,6 +1173,7 @@ impl<T> Drop for TrackedTask<T> {
 /// an activity permit for the task on the calling task. When the phase is
 /// not `Running`, starts nothing and returns a handle that never resolves.
 pub(crate) fn spawn_tracked<F>(
+    task_cx: TaskContext,
     coordinator: &Arc<InvocationCoordinator>,
     ownership: &Arc<TaskOwnership>,
     future: F,
@@ -1112,6 +1190,7 @@ where
     let permit = tasks.acquire();
     let slot = Arc::new(Slot::new(Some(Arc::clone(coordinator))));
     let handle = raw::spawn(Wrapped::new(
+        task_cx,
         future,
         Some(Arc::clone(ownership)),
         Arc::clone(coordinator),
@@ -1135,6 +1214,7 @@ where
 /// it aborts the other tasks. When the handler resolves or panics, its
 /// wrapper sets the phase to `Finished` before it releases its permit.
 pub(crate) fn spawn_root<F>(
+    task_cx: TaskContext,
     ownership: &Arc<TaskOwnership>,
     coordinator: &Arc<InvocationCoordinator>,
     future: F,
@@ -1150,6 +1230,7 @@ where
         .unwrap_or_else(|| Schedule::with_state(coordinator, ScheduleState::Idle));
     let slot = Arc::new(Slot::new(Some(Arc::clone(coordinator))));
     let handle = raw::spawn(Wrapped::new(
+        task_cx,
         future,
         Some(Arc::clone(ownership)),
         Arc::clone(coordinator),
@@ -1188,6 +1269,7 @@ where
     ensure_runtime()?;
     let permit = coordinator.tasks().acquire();
     drop(raw::spawn(Wrapped::new(
+        TaskContext::none(),
         future,
         None,
         Arc::clone(coordinator),
@@ -1201,7 +1283,7 @@ where
 /// Runs plugin hook work on its own task: a raw `tokio::spawn`.
 ///
 /// The task is not counted, takes no permit, is not polled by the
-/// permit-aware wrapper, blesses nothing and runs no `wrap_task` hook. So
+/// permit-aware wrapper, blesses nothing and enters no plugin frame. So
 /// it holds neither the task cleanup nor the suspension decision. The
 /// plugins' invocation-end drain joins it, and aborts it at the drain
 /// deadline. `future` catches its own panics.
@@ -1259,6 +1341,7 @@ impl<T: Send + 'static> TrackedJoinSet<T> {
     /// never yields another outcome.
     pub(crate) fn spawn<F>(
         &mut self,
+        task_cx: TaskContext,
         ownership: &Arc<TaskOwnership>,
         future: F,
     ) -> Result<Option<Id>, NoRuntime>
@@ -1277,6 +1360,7 @@ impl<T: Send + 'static> TrackedJoinSet<T> {
         let abort = raw::join_set_spawn(
             &mut self.tasks,
             Wrapped::new(
+                task_cx,
                 future,
                 Some(Arc::clone(ownership)),
                 Arc::clone(&self.coordinator),
@@ -1669,7 +1753,10 @@ mod tests {
     async fn tracked_task_returns_value_with_permit() {
         let coord = coordinator();
         let tasks = Arc::clone(coord.tasks());
-        let task = spawn_tracked(&coord, &ownership(), async { 7 }).expect("runtime");
+        let task = spawn_tracked(super::TaskContext::none(), &coord, &ownership(), async {
+            7
+        })
+        .expect("runtime");
         let outcome = task.await;
         assert_eq!(tasks.live(), 0, "the task released its permit on exit");
         assert!(matches!(outcome, TaskOutcome::Value(7)));
@@ -1678,7 +1765,7 @@ mod tests {
     #[tokio::test]
     async fn tracked_task_catches_panic() {
         let coord = coordinator();
-        let task = spawn_tracked(&coord, &ownership(), async {
+        let task = spawn_tracked(super::TaskContext::none(), &coord, &ownership(), async {
             panic!("boom");
         })
         .expect("runtime");
@@ -1692,10 +1779,15 @@ mod tests {
         let tasks = Arc::clone(coord.tasks());
         let dropped = Arc::new(AtomicBool::new(false));
         let guard = DropFlag(Arc::clone(&dropped));
-        let task = spawn_tracked(&coord, &ownership(), async move {
-            let _guard = guard;
-            std::future::pending::<()>().await;
-        })
+        let task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &ownership(),
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            },
+        )
         .expect("runtime");
         tokio::task::yield_now().await;
         task.abort();
@@ -1717,9 +1809,14 @@ mod tests {
         let coord = coordinator();
         let tasks = Arc::clone(coord.tasks());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let task = spawn_tracked(&coord, &ownership(), async move {
-            assert!(tx.send(()).is_ok(), "the test waits for the signal");
-        })
+        let task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &ownership(),
+            async move {
+                assert!(tx.send(()).is_ok(), "the test waits for the signal");
+            },
+        )
         .expect("runtime");
         drop(task);
         assert!(rx.await.is_ok(), "the task ran after its handle dropped");
@@ -1733,10 +1830,15 @@ mod tests {
         let coord = coordinator();
         let dropped = Arc::new(AtomicBool::new(false));
         let guard = DropFlag(Arc::clone(&dropped));
-        let (root, join) = spawn_root(&ownership(), &coord, async move {
-            let _guard = guard;
-            std::future::pending::<()>().await;
-        })
+        let (root, join) = spawn_root(
+            super::TaskContext::none(),
+            &ownership(),
+            &coord,
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            },
+        )
         .expect("runtime");
         tokio::task::yield_now().await;
         drop(root);
@@ -1825,14 +1927,14 @@ mod tests {
         let detached_done = Arc::new(AtomicBool::new(false));
 
         let guard = DropFlag(Arc::clone(&tracked_dropped));
-        let _task = spawn_tracked(&coord, &own, async move {
+        let _task = spawn_tracked(super::TaskContext::none(), &coord, &own, async move {
             let _guard = guard;
             std::future::pending::<()>().await;
         })
         .expect("runtime");
         let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         let guard = DropFlag(Arc::clone(&joined_dropped));
-        set.spawn(&own, async move {
+        set.spawn(super::TaskContext::none(), &own, async move {
             let _guard = guard;
             std::future::pending::<()>().await;
         })
@@ -1867,13 +1969,19 @@ mod tests {
         let tasks = Arc::clone(coord.tasks());
         let own = ownership();
         // A live task, as during teardown: the parent of the late tasks.
-        let parent = spawn_tracked(&coord, &own, std::future::pending::<()>()).expect("runtime");
+        let parent = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &own,
+            std::future::pending::<()>(),
+        )
+        .expect("runtime");
         tokio::task::yield_now().await;
         tasks.abort_all();
 
         let tracked_dropped = Arc::new(AtomicBool::new(false));
         let guard = DropFlag(Arc::clone(&tracked_dropped));
-        let late_task = spawn_tracked(&coord, &own, async move {
+        let late_task = spawn_tracked(super::TaskContext::none(), &coord, &own, async move {
             let _guard = guard;
             std::future::pending::<()>().await;
         })
@@ -1881,7 +1989,7 @@ mod tests {
         let joined_dropped = Arc::new(AtomicBool::new(false));
         let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         let guard = DropFlag(Arc::clone(&joined_dropped));
-        set.spawn(&own, async move {
+        set.spawn(super::TaskContext::none(), &own, async move {
             let _guard = guard;
             std::future::pending::<()>().await;
         })
@@ -1897,7 +2005,8 @@ mod tests {
         // The handles are still held, so only `abort_all` aborted the tasks.
         drop((parent, late_task, set));
 
-        let task = spawn_tracked(&coord, &own, async { 7 }).expect("runtime");
+        let task =
+            spawn_tracked(super::TaskContext::none(), &coord, &own, async { 7 }).expect("runtime");
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .expect("an idle tracker no longer aborts new tasks");
@@ -1911,7 +2020,10 @@ mod tests {
         let coord = coordinator();
         let tasks = Arc::clone(coord.tasks());
         tasks.abort_all();
-        let task = spawn_tracked(&coord, &ownership(), async { 7 }).expect("runtime");
+        let task = spawn_tracked(super::TaskContext::none(), &coord, &ownership(), async {
+            7
+        })
+        .expect("runtime");
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .expect("the task was not aborted");
@@ -1929,7 +2041,7 @@ mod tests {
         let own = ownership();
         let live_dropped = Arc::new(AtomicBool::new(false));
         let guard = DropFlag(Arc::clone(&live_dropped));
-        let live = spawn_tracked(&coord, &own, async move {
+        let live = spawn_tracked(super::TaskContext::none(), &coord, &own, async move {
             let _guard = guard;
             std::future::pending::<()>().await;
         })
@@ -1948,7 +2060,7 @@ mod tests {
         for _ in 0..2 {
             let tracked_dropped = Arc::new(AtomicBool::new(false));
             let guard = DropFlag(Arc::clone(&tracked_dropped));
-            let late_task = spawn_tracked(&coord, &own, async move {
+            let late_task = spawn_tracked(super::TaskContext::none(), &coord, &own, async move {
                 let _guard = guard;
                 std::future::pending::<()>().await;
             })
@@ -1956,7 +2068,7 @@ mod tests {
             let joined_dropped = Arc::new(AtomicBool::new(false));
             let mut set = TrackedJoinSet::new(Arc::clone(&coord));
             let guard = DropFlag(Arc::clone(&joined_dropped));
-            set.spawn(&own, async move {
+            set.spawn(super::TaskContext::none(), &own, async move {
                 let _guard = guard;
                 std::future::pending::<()>().await;
             })
@@ -1989,15 +2101,25 @@ mod tests {
                 let own = Arc::clone(&own);
                 let escaped = Arc::clone(&escaped);
                 let started = Arc::clone(&started);
-                spawn_tracked(&coord.clone(), &own.clone(), async move {
-                    loop {
-                        let nested = spawn_tracked(&coord, &own, std::future::pending::<()>())
+                spawn_tracked(
+                    super::TaskContext::none(),
+                    &coord.clone(),
+                    &own.clone(),
+                    async move {
+                        loop {
+                            let nested = spawn_tracked(
+                                super::TaskContext::none(),
+                                &coord,
+                                &own,
+                                std::future::pending::<()>(),
+                            )
                             .expect("runtime");
-                        escaped.lock().expect("lock").push(nested);
-                        started.notify_one();
-                        tokio::task::yield_now().await;
-                    }
-                })
+                            escaped.lock().expect("lock").push(nested);
+                            started.notify_one();
+                            tokio::task::yield_now().await;
+                        }
+                    },
+                )
                 .expect("runtime")
             };
             started.notified().await;
@@ -2020,10 +2142,13 @@ mod tests {
         let thread_ran = Arc::clone(&ran);
         let polled = poll_once_without_runtime(move || {
             let own = ownership();
-            let tracked = spawn_tracked(&thread_coord, &own, async {}).map(drop);
+            let tracked =
+                spawn_tracked(super::TaskContext::none(), &thread_coord, &own, async {}).map(drop);
             let detached = spawn_detached(&thread_coord, async {});
             let mut set = TrackedJoinSet::<()>::new(Arc::clone(&thread_coord));
-            let joined = set.spawn(&own, async {}).map(drop);
+            let joined = set
+                .spawn(super::TaskContext::none(), &own, async {})
+                .map(drop);
             let blocking = run_blocking(move || thread_ran.store(true, Ordering::SeqCst));
             async move {
                 let blocking = blocking.await.map(drop);
@@ -2051,12 +2176,16 @@ mod tests {
         let coord = coordinator();
         let own = ownership();
         let task_own = Arc::clone(&own);
-        let tracked = spawn_tracked(&coord, &own, async move { task_own.check_current_task() })
-            .expect("runtime");
+        let tracked = spawn_tracked(super::TaskContext::none(), &coord, &own, async move {
+            task_own.check_current_task()
+        })
+        .expect("runtime");
         let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         let set_own = Arc::clone(&own);
-        set.spawn(&own, async move { set_own.check_current_task() })
-            .expect("runtime");
+        set.spawn(super::TaskContext::none(), &own, async move {
+            set_own.check_current_task()
+        })
+        .expect("runtime");
 
         assert!(matches!(tracked.await, TaskOutcome::Value(Ok(()))));
         let (_, joined) = set.join_next_with_id().await.expect("one task");
@@ -2085,8 +2214,10 @@ mod tests {
         let mut set = TrackedJoinSet::new(Arc::clone(&coord));
         for _ in 0..100 {
             let task_own = Arc::clone(&own);
-            set.spawn(&own, async move { task_own.check_current_task() })
-                .expect("runtime");
+            set.spawn(super::TaskContext::none(), &own, async move {
+                task_own.check_current_task()
+            })
+            .expect("runtime");
         }
         let mut joined = 0;
         while let Some((_, outcome)) = set.join_next_with_id().await {
@@ -2103,7 +2234,7 @@ mod tests {
         let tasks = Arc::clone(coord.tasks());
         let own = ownership();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let task = spawn_tracked(&coord, &own, async move {
+        let task = spawn_tracked(super::TaskContext::none(), &coord, &own, async move {
             let _ = tx.send(());
             std::future::pending::<()>().await;
         })
@@ -2120,7 +2251,10 @@ mod tests {
     async fn finished_task_with_escaped_handle_does_not_block_idle() {
         let coord = coordinator();
         let tasks = Arc::clone(coord.tasks());
-        let task = spawn_tracked(&coord, &ownership(), async { 1 }).expect("runtime");
+        let task = spawn_tracked(super::TaskContext::none(), &coord, &ownership(), async {
+            1
+        })
+        .expect("runtime");
         let held = Arc::new(Mutex::new(Some(task)));
         for _ in 0..100 {
             if tasks.live() == 0 {
@@ -2140,10 +2274,17 @@ mod tests {
         let coord = coordinator();
         let tasks = Arc::clone(coord.tasks());
         let own = ownership();
-        let task = spawn_tracked(&coord, &own, ReadyThenDropPanics).expect("runtime");
+        let task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &own,
+            ReadyThenDropPanics,
+        )
+        .expect("runtime");
         assert_eq!(panicked_with(task.await), Some("drop boom"));
         let mut set = TrackedJoinSet::new(Arc::clone(&coord));
-        set.spawn(&own, ReadyThenDropPanics).expect("runtime");
+        set.spawn(super::TaskContext::none(), &own, ReadyThenDropPanics)
+            .expect("runtime");
         let (_, joined) = set.join_next_with_id().await.expect("one task");
         assert_eq!(panicked_with(joined), Some("drop boom"));
         tasks.wait_idle().await;
@@ -2183,7 +2324,13 @@ mod tests {
     async fn value_drop_panic_after_drop_panic_is_discarded() {
         let coord = coordinator();
         let tasks = Arc::clone(coord.tasks());
-        let task = spawn_tracked(&coord, &ownership(), ReadyValueThenDropPanics).expect("runtime");
+        let task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &ownership(),
+            ReadyValueThenDropPanics,
+        )
+        .expect("runtime");
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .expect("the outcome is delivered");
@@ -2198,9 +2345,11 @@ mod tests {
         let coord = coordinator();
         let tasks = Arc::clone(coord.tasks());
         let own = ownership();
-        let task = spawn_tracked(&coord, &own, async {}).expect("runtime");
+        let task =
+            spawn_tracked(super::TaskContext::none(), &coord, &own, async {}).expect("runtime");
         let mut set = TrackedJoinSet::new(Arc::clone(&coord));
-        set.spawn(&own, async {}).expect("runtime");
+        set.spawn(super::TaskContext::none(), &own, async {})
+            .expect("runtime");
         assert_eq!(tasks.abortable_count(), 2);
         let _ = task.await;
         let _ = set.join_next_with_id().await;
@@ -2212,10 +2361,17 @@ mod tests {
     async fn poll_panic_wins_over_drop_panic() {
         let coord = coordinator();
         let own = ownership();
-        let task = spawn_tracked(&coord, &own, PollPanicsThenDropPanics).expect("runtime");
+        let task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &own,
+            PollPanicsThenDropPanics,
+        )
+        .expect("runtime");
         assert_eq!(panicked_with(task.await), Some("poll boom"));
         let mut set = TrackedJoinSet::new(Arc::clone(&coord));
-        set.spawn(&own, PollPanicsThenDropPanics).expect("runtime");
+        set.spawn(super::TaskContext::none(), &own, PollPanicsThenDropPanics)
+            .expect("runtime");
         let (_, joined) = set.join_next_with_id().await.expect("one task");
         assert_eq!(panicked_with(joined), Some("poll boom"));
     }
@@ -2239,6 +2395,7 @@ mod tests {
         let own = ownership();
         let waker_slot = Arc::new(Mutex::new(None));
         let task = spawn_tracked(
+            super::TaskContext::none(),
             &coord,
             &own,
             StoresWakerThenDropPanics(Arc::clone(&waker_slot)),
@@ -2382,7 +2539,13 @@ mod tests {
 
         // Tracked slot, (a): the task stores the value, then the handle drops.
         let coord = coordinator();
-        let task = spawn_tracked(&coord, &own, ReadyPanicsWith("tracked a")).expect("runtime");
+        let task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &own,
+            ReadyPanicsWith("tracked a"),
+        )
+        .expect("runtime");
         coord.tasks().wait_idle().await;
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(task))).is_ok());
         assert_recorded(&coord, "tracked a");
@@ -2406,7 +2569,7 @@ mod tests {
         // Join-set queue, (a): the item stores the value, then the set drops.
         let coord = coordinator();
         let mut set = TrackedJoinSet::new(Arc::clone(&coord));
-        set.spawn(&own, ReadyPanicsWith("queue a"))
+        set.spawn(super::TaskContext::none(), &own, ReadyPanicsWith("queue a"))
             .expect("runtime");
         coord.tasks().wait_idle().await;
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(set))).is_ok());
@@ -2509,8 +2672,13 @@ mod tests {
         let own = ownership();
 
         let b_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let task = spawn_tracked(&coord, &own, PollPanicsADropPanicsB(Arc::clone(&b_drops)))
-            .expect("runtime");
+        let task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &own,
+            PollPanicsADropPanicsB(Arc::clone(&b_drops)),
+        )
+        .expect("runtime");
         let TaskOutcome::Panicked(payload) = task.await else {
             panic!("expected the poll's panic");
         };
@@ -2518,8 +2686,13 @@ mod tests {
         assert_eq!(b_drops.load(Ordering::SeqCst), 1, "B was dropped");
 
         let b_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let task =
-            spawn_tracked(&coord, &own, ReadyDropPanicsA(Arc::clone(&b_drops))).expect("runtime");
+        let task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &own,
+            ReadyDropPanicsA(Arc::clone(&b_drops)),
+        )
+        .expect("runtime");
         let TaskOutcome::Panicked(payload) = task.await else {
             panic!("expected the destructor's panic");
         };
@@ -2535,13 +2708,19 @@ mod tests {
     async fn claim_unread_panics_records_only_unread_panics() {
         let coord = coordinator();
         let own = ownership();
-        let read = spawn_tracked(&coord, &own, async { panic!("read") }).expect("runtime");
+        let read = spawn_tracked(super::TaskContext::none(), &coord, &own, async {
+            panic!("read")
+        })
+        .expect("runtime");
         assert_eq!(panicked_with(read.await), Some("read"));
         let gone = Arc::new(super::Slot::<()>::new(Some(Arc::clone(&coord))));
         gone.deliver(TaskOutcome::Panicked(Box::new("gone")));
         drop(gone);
         let unread: super::TrackedTask<()> =
-            spawn_tracked(&coord, &own, async { panic!("unread") }).expect("runtime");
+            spawn_tracked(super::TaskContext::none(), &coord, &own, async {
+                panic!("unread")
+            })
+            .expect("runtime");
         coord.tasks().wait_idle().await;
         assert!(!coord.has_panic());
         coord.tasks().claim_unread_panics(&coord);
@@ -2560,7 +2739,8 @@ mod tests {
     async fn claim_unread_panics_keeps_an_unread_value() {
         let coord = coordinator();
         let own = ownership();
-        let task = spawn_tracked(&coord, &own, async { 7_u32 }).expect("runtime");
+        let task = spawn_tracked(super::TaskContext::none(), &coord, &own, async { 7_u32 })
+            .expect("runtime");
         coord.tasks().wait_idle().await;
         coord.tasks().claim_unread_panics(&coord);
         assert!(coord.take_panic().is_none(), "a value is not recorded");
@@ -2669,9 +2849,14 @@ mod tests {
 
         let ran = Arc::new(AtomicBool::new(false));
         let task_ran = Arc::clone(&ran);
-        let mut task = spawn_tracked(&coord, &ownership(), async move {
-            task_ran.store(true, Ordering::SeqCst);
-        })
+        let mut task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &ownership(),
+            async move {
+                task_ran.store(true, Ordering::SeqCst);
+            },
+        )
         .expect("runtime");
         let polled = Pin::new(&mut task).poll(&mut Context::from_waker(Waker::noop()));
         assert!(polled.is_pending());
@@ -2680,7 +2865,9 @@ mod tests {
         assert_eq!(coord.tasks().live(), 0);
 
         let mut set = TrackedJoinSet::<()>::new(Arc::clone(&coord));
-        let id = set.spawn(&ownership(), async {}).expect("runtime");
+        let id = set
+            .spawn(super::TaskContext::none(), &ownership(), async {})
+            .expect("runtime");
         assert!(id.is_none(), "the join set started nothing");
         let joined = tokio::time::timeout(
             std::time::Duration::from_millis(100),
@@ -2715,8 +2902,13 @@ mod tests {
     async fn woken_task_counts_until_polled() {
         let coord = coordinator();
         let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
-        let task = spawn_tracked(&coord, &ownership(), async move { rx.await.unwrap_or(0) })
-            .expect("runtime");
+        let task = spawn_tracked(
+            super::TaskContext::none(),
+            &coord,
+            &ownership(),
+            async move { rx.await.unwrap_or(0) },
+        )
+        .expect("runtime");
         assert_eq!(
             coord.permits(PermitKind::Activity),
             1,
@@ -2754,7 +2946,10 @@ mod tests {
         let _wait = coord
             .register_test_wait("op", Waker::noop())
             .expect("running");
-        let (root, join) = spawn_root(&ownership(), &coord, async { 3 }).expect("runtime");
+        let (root, join) = spawn_root(super::TaskContext::none(), &ownership(), &coord, async {
+            3
+        })
+        .expect("runtime");
         assert!(matches!(root.await, TaskOutcome::Value(3)));
         drop(join.await);
         assert_eq!(coord.phase(), Phase::Finished);
@@ -2799,9 +2994,14 @@ mod tests {
         coord.finish();
         let ran = Arc::new(AtomicBool::new(false));
         let root_ran = Arc::clone(&ran);
-        let (root, join) = spawn_root(&ownership(), &coord, async move {
-            root_ran.store(true, Ordering::SeqCst);
-        })
+        let (root, join) = spawn_root(
+            super::TaskContext::none(),
+            &ownership(),
+            &coord,
+            async move {
+                root_ran.store(true, Ordering::SeqCst);
+            },
+        )
         .expect("runtime");
         let waited = tokio::time::timeout(std::time::Duration::from_millis(100), root).await;
         assert!(waited.is_err(), "the root never resolves");

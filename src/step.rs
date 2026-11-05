@@ -13,14 +13,12 @@ use std::future::Future;
 use std::time::Duration;
 
 use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
-use tracing::Instrument;
 
 use crate::builders::{Backoff, JitterStrategy, RetryStrategyConfig};
-use crate::context::{
-    ActiveBody, DurableContext, StepContext, SubmittedWrite, run_body, run_body_sync,
-};
+use crate::context::{DurableContext, StepContext, SubmittedWrite};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{OperationError, OperationErrorKind, StepError, StepErrorKind};
+use crate::plugin::UserBody;
 use crate::serdes::SerdesContext;
 use crate::start::StartStep;
 use crate::tracing_layer;
@@ -284,7 +282,7 @@ where
     /// step when it already ran; `None` runs it in the first cycle.
     async fn run(
         core: StepCore<O, S>,
-        closure: F,
+        mut closure: F,
         mut first: Option<Result<StartStep, OperationError>>,
     ) -> Result<O, OperationError> {
         // True once the step has waited for its record in this invocation.
@@ -299,26 +297,44 @@ where
                     attempt,
                     span,
                     start,
+                    info,
                 } => {
                     // The step body runs as a `Step` body: an operation
                     // claimed inside it fails the execution with a context
                     // usage error. It holds an activity permit from its call
                     // until it returns, so the invocation does not suspend
                     // while it runs.
-                    let body = ActiveBody::Step(core.op_id.positional().to_owned());
+                    let body = UserBody::Step(core.op_id.positional().to_owned());
                     let step_ctx = StepContext::new(attempt);
-                    // The clone runs the captures' `Clone` implementations,
-                    // which are user code, so it runs under the same body.
-                    let attempt_closure = run_body_sync(body.clone(), || closure.clone());
-                    let result = core
+                    // `F` is `Send` but maybe not `Sync`, so the attempt
+                    // borrows it mutably: `&mut F` is `Send`. The borrow
+                    // ends when this attempt's await returns.
+                    let closure = &mut closure;
+                    // The attempt is a user function: its hooks and wrap
+                    // run through the runner; the permit stays here. The
+                    // clone runs the captures' `Clone` implementations,
+                    // which are user code, so the runner calls it inside
+                    // the wraps, the active body and the step's span.
+                    let ran = core
                         .ctx
-                        .hold_activity(
-                            run_body(body, async move { (attempt_closure)(step_ctx).await })
-                                .instrument(span),
-                        )
+                        .hold_activity(crate::plugin::run_user_function(
+                            core.ctx.shared_plugins(),
+                            info,
+                            body,
+                            span,
+                            move || {
+                                let attempt_closure = (*closure).clone();
+                                attempt_closure(step_ctx)
+                            },
+                            |error: &BoxError| {
+                                crate::error::wire_error_for(&**error, STEP_FALLBACK_ERROR_TYPE)
+                            },
+                        ))
                         .await;
+                    // The failure keeps the runner's wire: the error's
+                    // `Display` runs once, in the runner.
                     core.await_start(start).await?;
-                    match core.settle(attempt, result).await? {
+                    match core.settle(attempt, ran).await? {
                         StepSettled::Done(value) => return Ok(value),
                         StepSettled::Retry => {}
                     }
@@ -380,6 +396,8 @@ enum StepPrelude<O> {
         /// when START was awaited before the body, or was already recorded.
         /// A body that panics drops it, and the write continues.
         start: Option<SubmittedWrite>,
+        /// The attempt's info, as `on_attempt_start` saw it.
+        info: std::sync::Arc<crate::plugin::OperationInfo>,
     },
 }
 
@@ -535,12 +553,13 @@ where
             is_replay,
         );
 
-        self.attempt_started(attempt);
+        let info = self.attempt_started(attempt);
 
         Ok(StepPrelude::Run {
             attempt,
             span,
             start,
+            info,
         })
     }
 
@@ -596,7 +615,7 @@ where
                     self.plugin_name.as_deref(),
                     self.retry_strategy.as_ref(),
                     StepErrorKind::Interrupted,
-                    STEP_INTERRUPTED_MESSAGE.into(),
+                    interrupted_failure(),
                     attempt,
                 )
                 .await?;
@@ -643,19 +662,20 @@ where
     /// Fires `on_attempt_start` of the live attempt `attempt`, after
     /// `on_operation_start` fired: in the start step for an at-least-once
     /// attempt, or after the START response for an at-most-once one.
-    fn attempt_started(&self, attempt: u32) {
-        if let Some(plugins) = self.ctx.plugins() {
-            crate::plugin::attempt_start_only(
-                plugins,
-                step_info(
-                    &self.ctx,
-                    self.op_id.wire(),
-                    self.sub_type.as_str(),
-                    self.name.as_deref(),
-                    self.plugin_name.as_deref(),
-                ),
-                attempt,
-            );
+    ///
+    /// It returns the attempt's info, which the runner passes to the
+    /// user-function hooks and wraps. Without plugins nothing reads it.
+    fn attempt_started(&self, attempt: u32) -> std::sync::Arc<crate::plugin::OperationInfo> {
+        let info = step_info(
+            &self.ctx,
+            self.op_id.wire(),
+            self.sub_type.as_str(),
+            self.name.as_deref(),
+            self.plugin_name.as_deref(),
+        );
+        match self.ctx.plugins() {
+            Some(plugins) => crate::plugin::attempt_start_only(plugins, info, attempt),
+            None => std::sync::Arc::new(info),
         }
     }
 
@@ -682,10 +702,10 @@ where
     async fn settle(
         &self,
         attempt: u32,
-        result: Result<O, BoxError>,
+        ran: crate::plugin::Ran<O>,
     ) -> Result<StepSettled<O>, OperationError> {
         let wire_id = self.op_id.wire();
-        match result {
+        match ran.into_parts() {
             Ok(value) => handle_success(
                 &self.ctx,
                 wire_id,
@@ -698,7 +718,7 @@ where
             )
             .await
             .map(StepSettled::Done),
-            Err(err) => {
+            Err(failure) => {
                 handle_failure(
                     &self.ctx,
                     wire_id,
@@ -707,7 +727,7 @@ where
                     self.plugin_name.as_deref(),
                     self.retry_strategy.as_ref(),
                     StepErrorKind::ExecutionFailed,
-                    err,
+                    failure,
                     attempt,
                 )
                 .await?;
@@ -873,20 +893,12 @@ async fn handle_failure(
     plugin_name: Option<&str>,
     retry_strategy: Option<&RetryStrategy>,
     kind: StepErrorKind,
-    err: BoxError,
+    (err, wire): (BoxError, crate::error::WireError),
     attempt: u32,
 ) -> Result<(), OperationError> {
-    // Derive the wire failure record from the escaping error before it is
-    // moved into the step error: message flattening, `error_type`
-    // pass-through, and the `error_data` chain walk all happen here, at
-    // the single wire-derivation site. An interrupted attempt has no
-    // typed error, so its fallback type is the one the JS SDK records.
-    let fallback = if matches!(kind, StepErrorKind::Interrupted) {
-        STEP_INTERRUPTED_ERROR_TYPE
-    } else {
-        STEP_FALLBACK_ERROR_TYPE
-    };
-    let wire = crate::error::wire_error_for(&*err, fallback);
+    // `wire` is the failure record derived once for `err`: by the runner
+    // for a live attempt, by `interrupted_failure` for an interrupted one.
+    // The RETRY or FAIL record and the attempt-end hooks all use it.
     // A plugin sees no hook for an interrupted attempt, as JS: no hook saw
     // that attempt start in this invocation.
     let plugins = ctx
@@ -980,6 +992,14 @@ async fn handle_failure(
             )
         }
     }
+}
+
+/// The error and wire of an interrupted attempt. No body ran, so this
+/// path derives its own wire, with the type the JS SDK records.
+fn interrupted_failure() -> (BoxError, crate::error::WireError) {
+    let err: BoxError = STEP_INTERRUPTED_MESSAGE.into();
+    let wire = crate::error::wire_error_for(&*err, STEP_INTERRUPTED_ERROR_TYPE);
+    (err, wire)
 }
 
 // Update builders
@@ -1240,6 +1260,7 @@ mod tests {
     use super::*;
     use crate::context::DurableContext;
     use crate::engine::CheckpointLog;
+    use crate::plugin::recorder::UfHooks;
     use std::sync::Arc;
 
     // Replay tests
@@ -1856,6 +1877,421 @@ mod tests {
         let attempt_end = ends.first().expect("an attempt end");
         assert_eq!(attempt_end.error.as_deref(), Some("boom"));
         assert_eq!(attempt_end.status, Some(crate::OperationStatus::Failed));
+    }
+
+    /// A root context on the in-memory client over `records`, with the
+    /// recorder's `p0` and `p1` as the invocation's plugins and no
+    /// checkpoint buffer window.
+    fn uf_context(
+        hooks: &UfHooks,
+        records: Vec<(String, crate::engine::CheckpointRecord)>,
+    ) -> (DurableContext, Arc<crate::client::InMemoryExecutionClient>) {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(records)),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        (ctx, client)
+    }
+
+    /// Drives `fut` on `ctx`'s invocation driver to its outcome.
+    async fn drive<F>(ctx: &DurableContext, fut: F) -> crate::driver::InvocationOutcome
+    where
+        F: IntoFuture + Send + 'static,
+        F::IntoFuture: Send + 'static,
+    {
+        let signal = Arc::clone(ctx.coordinator());
+        let ownership = Arc::clone(ctx.task_ownership());
+        crate::driver::test_support::outcome_of(ctx.clone(), ownership, signal, fut).await
+    }
+
+    /// The first update `client` recorded for `name` with `action`.
+    fn update_of(
+        client: &crate::client::InMemoryExecutionClient,
+        name: &str,
+        action: &OperationAction,
+    ) -> Option<OperationUpdate> {
+        client
+            .recorded_updates()
+            .into_iter()
+            .find(|u| u.name() == Some(name) && u.action() == action)
+    }
+
+    /// `(type, message)` of a wire error.
+    fn type_and_message(wire: &crate::error::WireError) -> (Option<String>, Option<String>) {
+        (
+            wire.error_type().map(str::to_owned),
+            wire.error_message().map(str::to_owned),
+        )
+    }
+
+    /// `(type, message)` of the error object of `update`.
+    fn update_error(update: &OperationUpdate) -> (Option<String>, Option<String>) {
+        let error = update.error().expect("the update carries an error object");
+        (
+            error.error_type().map(str::to_owned),
+            error.error_message().map(str::to_owned),
+        )
+    }
+
+    /// The user-function records of one live attempt, in `p0`'s order.
+    const LIVE_ATTEMPT: [&str; 6] = [
+        "attempt_start",
+        "uf_start",
+        "wrap_enter",
+        "wrap_exit",
+        "uf_end",
+        "attempt_end",
+    ];
+
+    /// Rule 7.8: an interrupted `AtMostOncePerRetry` attempt runs no
+    /// body and fires no user-function hook; it records a RETRY. The next
+    /// attempt is a user function.
+    #[tokio::test]
+    async fn interrupted_attempt_fires_no_user_function_hook() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let runs = Arc::new(AtomicU32::new(0));
+        let step = |ctx: &DurableContext, runs: &Arc<AtomicU32>| {
+            let runs = Arc::clone(runs);
+            ctx.step(move |_| async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(42_u32)
+            })
+            .name("s")
+            .semantics(StepSemantics::AtMostOncePerRetry)
+            .retry_strategy(|_err, _attempt| RetryDecision::Retry {
+                delay: Duration::from_secs(1),
+            })
+        };
+
+        // Invocation 1: attempt 1 is STARTED.
+        let hooks = UfHooks::default();
+        let (ctx, client) = uf_context(
+            &hooks,
+            vec![step_record(CheckpointStatus::Started, 0, None)],
+        );
+        let outcome = drive(&ctx, step(&ctx, &runs)).await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the body did not run");
+        let retry = recorded_error_for(&client, &OperationAction::Retry);
+        assert_eq!(retry.error_type(), Some(STEP_INTERRUPTED_ERROR_TYPE));
+        assert!(!hooks.any_user_function_record(), "{:?}", hooks.records());
+
+        // Invocation 2: the retry timer fired, so attempt 2 runs.
+        let hooks = UfHooks::default();
+        let (ctx, _client) =
+            uf_context(&hooks, vec![step_record(CheckpointStatus::Ready, 1, None)]);
+        assert_eq!(step(&ctx, &runs).await.unwrap(), 42);
+        let mut expected = vec!["start"];
+        expected.extend(LIVE_ATTEMPT);
+        expected.push("end");
+        assert_eq!(hooks.hooks_of("s"), expected);
+        assert_eq!(hooks.find("s", "uf_start").info_attempt, Some(2));
+        assert_eq!(hooks.find("s", "uf_end").ok, Some(true));
+    }
+
+    /// Rule 7.8: a step in its retry delay runs no body, builds no node
+    /// and fires no user-function hook.
+    #[tokio::test]
+    async fn retry_wait_fires_no_user_function_hook() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let runs = Arc::new(AtomicU32::new(0));
+        let step = |ctx: &DurableContext, runs: &Arc<AtomicU32>| {
+            let runs = Arc::clone(runs);
+            ctx.step(move |_| async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Err::<u32, BoxError>("transient".into())
+            })
+            .name("s")
+            .retry_strategy(|_err, _attempt| RetryDecision::Retry {
+                delay: Duration::from_secs(10),
+            })
+        };
+
+        // Invocation 1: attempt 1 fails and schedules a 10 s retry.
+        let hooks = UfHooks::default();
+        let (ctx, client) = uf_context(&hooks, Vec::new());
+        let outcome = drive(&ctx, step(&ctx, &runs)).await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let mut expected = vec!["start"];
+        expected.extend(LIVE_ATTEMPT);
+        assert_eq!(hooks.hooks_of("s"), expected);
+        assert_eq!(hooks.find("s", "uf_end").ok, Some(false));
+        assert!(update_of(&client, "s", &OperationAction::Retry).is_some());
+
+        // Invocation 2 starts within the delay: the record is PENDING.
+        let hooks = UfHooks::default();
+        let (wire_key, mut record) = step_record(CheckpointStatus::Pending, 1, None);
+        record.due_at = Some(std::time::SystemTime::now() + Duration::from_secs(10));
+        let (ctx, client) = uf_context(&hooks, vec![(wire_key, record)]);
+        let outcome = drive(&ctx, step(&ctx, &runs)).await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "no body ran in invocation 2"
+        );
+        assert!(!hooks.any_user_function_record(), "{:?}", hooks.records());
+        assert!(
+            client.recorded_updates().is_empty(),
+            "the step stays PENDING: {:?}",
+            client.recorded_updates()
+        );
+    }
+
+    /// The end hook runs before the outcome is checkpointed: the START is
+    /// recorded, the SUCCEED is not.
+    #[tokio::test]
+    async fn end_hook_before_outcome_record() {
+        let client_cell: Arc<std::sync::OnceLock<Arc<crate::client::InMemoryExecutionClient>>> =
+            Arc::default();
+        let probe_client = Arc::clone(&client_cell);
+        let hooks = UfHooks::probing(move || {
+            let actions: Vec<String> = probe_client
+                .get()
+                .map(|client| client.recorded_updates())
+                .unwrap_or_default()
+                .iter()
+                .map(|u| format!("{:?}", u.action()))
+                .collect();
+            actions.join(",")
+        });
+        let (ctx, client) = uf_context(&hooks, Vec::new());
+        client_cell.set(Arc::clone(&client)).expect("set once");
+        // The body starts before its START is written, so it returns once
+        // the client has the START: the end hook then sees it.
+        let body_client = Arc::clone(&client);
+        let value = ctx
+            .step(move |_| async move {
+                for _ in 0..1000 {
+                    if update_of(&body_client, "s", &OperationAction::Start).is_some() {
+                        return Ok(1_u32);
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err("the START was never written".into())
+            })
+            .name("s")
+            .await
+            .unwrap();
+        assert_eq!(value, 1);
+        assert_eq!(hooks.find("s", "uf_end").probe, "Start");
+        assert!(update_of(&client, "s", &OperationAction::Succeed).is_some());
+    }
+
+    /// A failed body's wire is derived once, in the runner: the error's
+    /// `Display` runs once, and the end hook's wire is the wire of
+    /// `on_attempt_end`, where it fires, and of the FAIL or flat
+    /// `BatchItem`.
+    #[tokio::test]
+    async fn failed_body_wire_derived_once() {
+        use crate::plugin::recorder::Counted;
+
+        // A step that the retry strategy stops.
+        let hooks = UfHooks::default();
+        let (ctx, client) = uf_context(&hooks, Vec::new());
+        let dc = Counted::new();
+        let body_dc = dc.clone();
+        let err = ctx
+            .step(move |_| async move { Err::<u32, BoxError>(body_dc.boxed()) })
+            .name("step")
+            .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+            .await
+            .unwrap_err();
+        drop(err);
+        assert_eq!(dc.calls(), 1, "step");
+        let end = hooks.find("step", "uf_end").wire.expect("an Err outcome");
+        let attempt_end = hooks.find("step", "attempt_end").wire.expect("an error");
+        assert_eq!(type_and_message(&end), type_and_message(&attempt_end));
+        let fail = update_of(&client, "step", &OperationAction::Fail).expect("a FAIL");
+        assert_eq!(type_and_message(&end), update_error(&fail));
+        assert_eq!(end.error_message(), Some("counted"));
+
+        // A child whose body returns `Err`.
+        let hooks = UfHooks::default();
+        let (ctx, client) = uf_context(&hooks, Vec::new());
+        let dc = Counted::new();
+        let body_dc = dc.clone();
+        let err = ctx
+            .run_in_child_context(
+                move |_child| async move { Err::<u32, BoxError>(body_dc.boxed()) },
+            )
+            .name("child")
+            .await
+            .unwrap_err();
+        drop(err);
+        assert_eq!(dc.calls(), 1, "child");
+        let end = hooks.find("child", "uf_end").wire.expect("an Err outcome");
+        let fail = update_of(&client, "child", &OperationAction::Fail).expect("a FAIL");
+        assert_eq!(type_and_message(&end), update_error(&fail));
+
+        // A `wait_for_callback` submitter that the retry strategy stops.
+        // The probe reads the count when each hook runs.
+        let dc = Counted::new();
+        let probe_dc = dc.clone();
+        let hooks = UfHooks::probing(move || probe_dc.calls().to_string());
+        let (ctx, client) = uf_context(&hooks, Vec::new());
+        let body_dc = dc.clone();
+        let err = ctx
+            .wait_for_callback::<String, _, _>(move |_step_ctx, _callback_id| async move {
+                Err(body_dc.boxed())
+            })
+            .name("cb")
+            .submitter_retry(|_err, _attempt| RetryDecision::Stop)
+            .await
+            .unwrap_err();
+        drop(err);
+        // The submitter's wire is derived once: one call by its end hooks.
+        assert_eq!(hooks.find("cb-submitter", "uf_end").probe, "1");
+        assert_eq!(hooks.find("cb-submitter", "end").probe, "1");
+        // The body's own wire (rule 11's `wait_for_callback` body row,
+        // `extract_wire_error`) is the chain of the submitter's error, so
+        // it formats the error once more.
+        assert_eq!(dc.calls(), 2, "submitter, then the body");
+        assert_eq!(hooks.find("cb", "uf_end").probe, "2");
+        let end = hooks
+            .find("cb-submitter", "uf_end")
+            .wire
+            .expect("an Err outcome");
+        let attempt_end = hooks
+            .find("cb-submitter", "attempt_end")
+            .wire
+            .expect("an error");
+        assert_eq!(type_and_message(&end), type_and_message(&attempt_end));
+        // The submitter step's record carries no name.
+        let fail = client
+            .recorded_updates()
+            .into_iter()
+            .find(|u| u.r#type() == &OperationType::Step && u.action() == &OperationAction::Fail)
+            .expect("the submitter's FAIL");
+        assert_eq!(type_and_message(&end), update_error(&fail));
+
+        // A `map` item, in both modes.
+        map_item_wire_derived_once().await;
+    }
+
+    /// The `map` item case of [`failed_body_wire_derived_once`], in
+    /// both modes.
+    async fn map_item_wire_derived_once() {
+        use crate::builders::map_parallel::CompletionConfig;
+        use crate::map_parallel::NestingMode;
+        use crate::plugin::recorder::Counted;
+
+        for mode in [NestingMode::Normal, NestingMode::Flat] {
+            let hooks = UfHooks::default();
+            let (ctx, client) = uf_context(&hooks, Vec::new());
+            let dc = Counted::new();
+            let body_dc = dc.clone();
+            let batch = ctx
+                .map(vec![1_u32], move |_child, _item, _idx| {
+                    let dc = body_dc.clone();
+                    async move { Err::<u32, BoxError>(dc.boxed()) }
+                })
+                .name("m")
+                .nesting(mode)
+                .completion(CompletionConfig::with_tolerated_failure_count(1))
+                .await_batch()
+                .await
+                .unwrap();
+            assert_eq!(dc.calls(), 1, "{mode:?}");
+            let end = hooks
+                .find("map-item-0", "uf_end")
+                .wire
+                .expect("an Err outcome");
+            let errors = batch.errors();
+            let item = errors.first().expect("the item failed");
+            assert_eq!(
+                type_and_message(&end),
+                (
+                    item.error_type.map(str::to_owned),
+                    Some(item.message.to_owned())
+                ),
+                "{mode:?}"
+            );
+            let fail = update_of(&client, "map-item-0", &OperationAction::Fail);
+            match mode {
+                NestingMode::Normal => {
+                    assert_eq!(type_and_message(&end), update_error(&fail.expect("a FAIL")));
+                }
+                NestingMode::Flat => assert!(fail.is_none(), "a flat item writes no record"),
+            }
+        }
+    }
+
+    /// Rule 8.2: the wire is derived under `ActiveBody::Outcome`, so an
+    /// operation the error's `Display` claims fails the execution with a
+    /// context usage error naming the step.
+    #[tokio::test]
+    async fn failing_step_display_calls_durable_op() {
+        use crate::plugin::recorder::Counted;
+        let hooks = UfHooks::default();
+        let (ctx, _client) = uf_context(&hooks, Vec::new());
+        let claim_ctx = ctx.clone();
+        let dc = Counted::calling(move || drop(claim_ctx.wait(Duration::from_secs(1))));
+        let body_dc = dc.clone();
+        let err = ctx
+            .step(move |_| async move { Err::<u32, BoxError>(body_dc.boxed()) })
+            .name("s")
+            .retry_strategy(|_err, _attempt| RetryDecision::Stop)
+            .await
+            .unwrap_err();
+        drop(err);
+        assert_eq!(dc.calls(), 1);
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert!(
+            fatal
+                .error_message
+                .contains("while the SDK records the outcome of operation \"1\""),
+            "{}",
+            fatal.error_message
+        );
+    }
+
+    /// A serdes that fails every serialization with a permanent error.
+    struct FailingSerializer;
+
+    impl<T: Send + 'static> Serdes<T> for FailingSerializer {
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(&self, _value: T, _context: SerdesContext) -> Result<String, BoxError> {
+            Err("cannot encode".into())
+        }
+
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(&self, _wire: String, _context: SerdesContext) -> Result<T, BoxError> {
+            Err("cannot decode".into())
+        }
+    }
+
+    /// Rule 11's step row: a body that succeeds ends `Ok`; the
+    /// serialization failure after it records its own wire.
+    #[tokio::test]
+    async fn serialization_failure_keeps_its_own_wire() {
+        let hooks = UfHooks::default();
+        let (ctx, client) = uf_context(&hooks, Vec::new());
+        let err = ctx
+            .step(|_| async { Ok(1_u32) })
+            .name("s")
+            .serdes(FailingSerializer)
+            .await
+            .unwrap_err();
+        drop(err);
+        let end = hooks.find("s", "uf_end");
+        assert_eq!(end.ok, Some(true));
+        assert_eq!(end.wire, None);
+        let fail = update_of(&client, "s", &OperationAction::Fail).expect("a FAIL");
+        let (error_type, _) = update_error(&fail);
+        assert_eq!(
+            error_type.as_deref(),
+            Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE)
+        );
     }
 
     /// Builds a step record for the first operation of a root context.
@@ -3348,6 +3784,87 @@ mod coordinator_tests {
                 Some(crate::OperationStatus::Succeeded),
             ]
         );
+    }
+
+    /// Rule 7.3: `on_attempt_start`, the user-function hooks and the
+    /// wrap of attempt 2 share one info: `Started`, attempt 2, not a
+    /// replay, with the attempt's start timestamp. `on_operation_start`
+    /// of attempt 2 is a replay.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_info_shared_by_hooks() {
+        let client = Arc::new(retry_client("flaky"));
+        let hooks = crate::plugin::recorder::UfHooks::default();
+        let ctx = crate::DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(crate::engine::CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "t0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        let outcome = drive_handler(ctx, None, move |ctx| async move {
+            let mut flaky = std::pin::pin!(
+                ctx.step(|step_ctx| async move {
+                    if step_ctx.attempt() < 2 {
+                        return Err::<u32, crate::BoxError>("transient".into());
+                    }
+                    Ok(7)
+                })
+                .name("flaky")
+                .retry_strategy(retry_once)
+                .spawn()
+            );
+            poll_once(flaky.as_mut()).await;
+            sleeping_step(&ctx).await?;
+            let value = flaky.await.map_err(wire_err)?;
+            Ok(value.to_string())
+        })
+        .await
+        .expect("no panic");
+        assert_eq!(outcome, InvocationOutcome::Complete("7".to_owned()));
+        let records = hooks.of("flaky");
+        let starts: Vec<_> = records.iter().filter(|r| r.hook == "start").collect();
+        assert_eq!(starts.len(), 2, "{records:?}");
+        assert!(starts.get(1).is_some_and(|r| r.replay), "{starts:?}");
+        let second = records
+            .iter()
+            .position(|r| r.hook == "attempt_start" && r.attempt == Some(2))
+            .expect("attempt 2 started");
+        let shared: Vec<_> = records
+            .get(second..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.hook,
+                    "attempt_start" | "uf_start" | "wrap_enter" | "wrap_exit" | "uf_end"
+                )
+            })
+            .collect();
+        let hook_names: Vec<_> = shared.iter().map(|r| r.hook).collect();
+        assert_eq!(
+            hook_names,
+            [
+                "attempt_start",
+                "uf_start",
+                "wrap_enter",
+                "wrap_exit",
+                "uf_end"
+            ]
+        );
+        let first = shared.first().expect("attempt_start");
+        for record in &shared {
+            assert_eq!(
+                record.info_addr, first.info_addr,
+                "{} shares the info",
+                record.hook
+            );
+            assert_eq!(record.status, Some(crate::OperationStatus::Started));
+            assert_eq!(record.info_attempt, Some(2));
+            assert!(!record.replay, "{}", record.hook);
+            assert!(record.has_start_timestamp, "{}", record.hook);
+        }
     }
 
     #[tokio::test(start_paused = true)]

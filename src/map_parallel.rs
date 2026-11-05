@@ -32,11 +32,12 @@ use crate::BoxError;
 use crate::Serdes;
 use crate::checkpoint_coalescer::ScopeClose;
 use crate::child::CHECKPOINT_SIZE_LIMIT_BYTES;
-use crate::context::{ActiveBody, DurableContext, SubmittedWrite, run_body};
+use crate::context::{DurableContext, SubmittedWrite, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     ChildContextError, ChildContextErrorKind, ChildFnError, OperationError, OperationErrorKind,
 };
+use crate::plugin::UserBody;
 use crate::serdes::SerdesContext;
 use crate::start::StartStep;
 use crate::task::{NoRuntime, TaskOutcome, TrackedJoinSet};
@@ -1274,6 +1275,10 @@ struct ItemRequest<IS> {
     child_sub_type: String,
     item_name: String,
     nesting: NestingMode,
+    /// The info the item's `on_operation_start` received; a live body's
+    /// user-function hooks receive it with the item context's replay flag
+    /// (`user_function_info`).
+    start_info: Arc<crate::plugin::OperationInfo>,
     /// The item serdes, shared across items behind one `Arc` (the
     /// forwarding `impl Serdes for Arc<S>` makes the handle itself a
     /// serdes).
@@ -1376,13 +1381,21 @@ where
 #[expect(clippy::too_many_lines)] // reason: FLAT/NORMAL outcome checkpointing reads better in one flow
 async fn item_after<O, IS>(
     req: &ItemRequest<IS>,
-    outcome: Result<O, ChildFnError>,
+    outcome: ItemBody<O>,
     replaying: bool,
 ) -> Result<ItemOutcome<O>, OperationError>
 where
     O: Send + 'static,
     IS: Serdes<O>,
 {
+    // A live run's failure keeps the one wire its end hooks saw.
+    let outcome = match outcome {
+        ItemBody::Ran(ran) => ran.into_parts(),
+        ItemBody::Unhooked(result) => result.map_err(|error| {
+            let wire = error.failure_wire();
+            (error, wire)
+        }),
+    };
     let child_wire = req.child_op_id.wire().to_owned();
     let serdes_ctx = SerdesContext::new(child_wire.clone(), req.ctx.execution_arn());
     let serdes = &req.serdes;
@@ -1442,11 +1455,10 @@ where
                     }
                 }
             }
-            Err(child_err) => {
+            Err((_error, wire)) => {
                 // The wire record is derived from the error the body
                 // returned: its recorded type, and its flattened chain as
                 // the message.
-                let wire = child_err.failure_wire();
                 Ok((
                     BatchItem::failed_from_wire(req.index, req.item_name.clone(), &wire),
                     None,
@@ -1624,12 +1636,11 @@ where
                 Some(serialized),
             ))
         }
-        Err(child_err) => {
+        Err((_error, wire)) => {
             // Checkpoint failure. The wire record is derived from the
             // error the body returned, so the type is the body error's
             // recorded type, the message is its flattened chain, and
             // `error_data`/`stack_trace` pass through the boundary.
-            let wire = child_err.failure_wire();
             let builder = OperationUpdate::builder()
                 .id(child_wire.clone())
                 .r#type(OperationType::Context)
@@ -1680,6 +1691,14 @@ where
     }
 }
 
+/// The body result [`item_after`] writes: a live run through the
+/// user-function runner, or a result that ran no hook (a `ReplayChildren`
+/// rebuild, or a branch body that could not be taken).
+enum ItemBody<O> {
+    Ran(crate::plugin::Ran<O, ChildFnError>),
+    Unhooked(Result<O, ChildFnError>),
+}
+
 /// Thin generic wrapper around one map item: the ONLY code monomorphized
 /// per map call site. Everything before and after the user closure is the
 /// non-generic [`item_before`] / [`item_after`] pair; this wrapper just
@@ -1706,15 +1725,61 @@ where
             // The active-body scope encloses the closure call, so code the
             // closure runs before it returns its future is checked too. A
             // wait inside the body keeps this task pending in the join set.
-            let body = ActiveBody::Context(child_ctx.prefix().to_owned());
+            let body = UserBody::Context(child_ctx.prefix().to_owned());
             let item_ctx = child_ctx.clone();
+            // The item's scope closes when the body returns, and also when
+            // this future is dropped before that (see `item_scope`).
             let scope = item_scope(&req);
-            let outcome = run_body(body, async move { run_item(child_ctx, index).await })
-                .instrument(span)
-                .await;
-            drop(scope);
+            let outcome = if req.is_terminal {
+                // A terminal item re-runs only to rebuild a `ReplayChildren`
+                // result: no frame and no user-function hook.
+                let outcome =
+                    run_body(body.into(), async move { run_item(child_ctx, index).await })
+                        .instrument(span)
+                        .await;
+                drop(scope);
+                ItemBody::Unhooked(outcome)
+            } else {
+                let info = user_function_info(&req, &item_ctx);
+                ItemBody::Ran(
+                    // Only the body carries the span: the hooks and wraps
+                    // run outside it, the body inside them. The scope
+                    // closes inside the body future, so it is closed
+                    // before the end hooks, as for a child context.
+                    crate::plugin::run_user_function(
+                        item_ctx.shared_plugins(),
+                        info,
+                        body,
+                        span,
+                        move || async move {
+                            let outcome = run_item(child_ctx, index).await;
+                            drop(scope);
+                            outcome
+                        },
+                        ChildFnError::failure_wire,
+                    )
+                    .await,
+                )
+            };
             item_after(&req, outcome, item_ctx.is_replaying()).await
         }
+    }
+}
+
+/// The info a map item's or parallel branch's user-function hooks receive:
+/// the value `on_operation_start` received, with the replay flag set to the
+/// item context's `is_replaying()` when the body starts, as JS sets
+/// `isReplay: childReplayMode !== ExecutionMode`. The start hook keeps its
+/// record-based flag.
+fn user_function_info<IS>(
+    req: &ItemRequest<IS>,
+    item_ctx: &DurableContext,
+) -> Arc<crate::plugin::OperationInfo> {
+    let is_replay = item_ctx.is_replaying();
+    if req.start_info.is_replay() == is_replay {
+        Arc::clone(&req.start_info)
+    } else {
+        Arc::new((*req.start_info).clone().with_replay(is_replay))
     }
 }
 
@@ -1742,14 +1807,43 @@ where
                     // like a map item's body. The factory closure runs
                     // inside the erased future, so wrapping the future
                     // encloses the closure call.
-                    let active = ActiveBody::Context(child_ctx.prefix().to_owned());
-                    run_body(active, body.start(child_ctx))
-                        .instrument(span)
-                        .await
+                    let active = UserBody::Context(child_ctx.prefix().to_owned());
+                    if req.is_terminal {
+                        // Rebuilding a `ReplayChildren` result: no frame
+                        // and no user-function hook.
+                        let outcome = run_body(active.into(), body.start(child_ctx))
+                            .instrument(span)
+                            .await;
+                        drop(scope);
+                        ItemBody::Unhooked(outcome)
+                    } else {
+                        let info = user_function_info(&req, &item_ctx);
+                        ItemBody::Ran(
+                            // Only the body carries the span, as for a
+                            // map item. The scope closes inside the body
+                            // future, so it is closed before the end
+                            // hooks, as for a map item.
+                            crate::plugin::run_user_function(
+                                item_ctx.shared_plugins(),
+                                info,
+                                active,
+                                span,
+                                move || async move {
+                                    let outcome = body.start(child_ctx).await;
+                                    drop(scope);
+                                    outcome
+                                },
+                                ChildFnError::failure_wire,
+                            )
+                            .await,
+                        )
+                    }
                 }
-                Err(err) => Err(err),
+                Err(err) => {
+                    drop(scope);
+                    ItemBody::Unhooked(Err(err))
+                }
             };
-            drop(scope);
             item_after(&req, outcome, item_ctx.is_replaying()).await
         }
     }
@@ -1818,10 +1912,15 @@ where
     ) -> Result<Option<tokio::task::Id>, NoRuntime> {
         let run_item = Arc::clone(&self.run_item);
         let ownership = Arc::clone(req.ctx.task_ownership());
-        set.spawn(&ownership, async move {
-            let index = req.index;
-            (index, run_single_item(req, run_item).await)
-        })
+        // The item runs inside the batch context's frames.
+        set.spawn(
+            crate::task::TaskContext::current(),
+            &ownership,
+            async move {
+                let index = req.index;
+                (index, run_single_item(req, run_item).await)
+            },
+        )
     }
 }
 
@@ -1844,10 +1943,15 @@ where
     ) -> Result<Option<tokio::task::Id>, NoRuntime> {
         let slots = Arc::clone(&self.slots);
         let ownership = Arc::clone(req.ctx.task_ownership());
-        set.spawn(&ownership, async move {
-            let index = req.index;
-            (index, run_branch_item(req, slots).await)
-        })
+        // The branch runs inside the batch context's frames.
+        set.spawn(
+            crate::task::TaskContext::current(),
+            &ownership,
+            async move {
+                let index = req.index;
+                (index, run_branch_item(req, slots).await)
+            },
+        )
     }
 }
 
@@ -2007,6 +2111,13 @@ where
                     child_sub_type: self.child_sub_type.to_owned(),
                     item_name: item_name.to_owned(),
                     nesting: self.nesting,
+                    // A reconstruction fires no hook, so nothing reads it.
+                    start_info: Arc::new(item_info(
+                        self.ctx,
+                        op_id.wire(),
+                        self.child_sub_type,
+                        item_name,
+                    )),
                     serdes: Arc::clone(self.serdes),
                     start: std::sync::Mutex::new(None),
                 };
@@ -2080,6 +2191,8 @@ where
         StartStep::Recorded(view) => (Some(view), None),
         StartStep::Queued(write) => (None, Some(write)),
     };
+    // A fresh `START` is a live start; a record resumes the batch.
+    let resumed = recorded.is_some();
 
     // The caller computed both name lists once per input item, before the
     // items moved. `user_names` holds the name the caller gave, which only
@@ -2246,47 +2359,197 @@ where
 
     let completion_cfg = completion.unwrap_or_default();
 
-    // 4. Empty collection: checkpoint success immediately. As in JS, a
+    // Validate completion config. A zero-item batch reads no threshold, so
+    // it succeeds whatever the config holds.
+    if total_items > 0
+        && let Err(msg) = completion_cfg.validate()
+    {
+        return Err(batch_error(&msg));
+    }
+
+    // 4 to 10: the batch-producing section, from the zero-item result or
+    // the first record read to the batch and its completion reason. On a
+    // live or resumed batch it is the container's user function: its hooks
+    // and wraps run through the runner, under the batch child context's
+    // body and span, and its end hooks always see `Ok`, because every item
+    // failure is in the batch. A rebuild under a decision record polls it
+    // with no frame and no user-function hook.
+    let rebuild = replay_plan.is_some();
+    let active = UserBody::Context(batch_ctx.prefix().to_owned());
+    let span = batch_ctx.replay_span();
+    let produce = || {
+        produce_batch(BatchSection {
+            ctx: &ctx,
+            batch_ctx: &batch_ctx,
+            max_concurrency,
+            completion_cfg: &completion_cfg,
+            serdes: &serdes,
+            nesting,
+            user_names,
+            item_name_of: &item_name_of,
+            total_items,
+            child_sub_type,
+            dispatch,
+            item_ids,
+            parent_wire: &parent_wire,
+            replay_plan,
+        })
+    };
+    let produced = if rebuild {
+        run_body(active.into(), produce()).instrument(span).await
+    } else {
+        // The info `on_operation_start` received: a fresh `START` is live,
+        // a resumed record a replay. The user-function hooks see the
+        // batch child context's replay state when the body starts.
+        let info = container_info(&ctx, &parent_wire, parent_sub_type, parent_name.as_deref());
+        let info = if resumed {
+            info
+        } else {
+            info.with_status(crate::OperationStatus::Started)
+        };
+        let info = Arc::new(info.with_replay(batch_ctx.is_replaying()));
+        match crate::plugin::run_user_function(
+            ctx.shared_plugins(),
+            info,
+            active,
+            span,
+            move || async move { Ok::<_, std::convert::Infallible>(produce().await) },
+            crate::plugin::never_fails,
+        )
+        .await
+        .into_parts()
+        {
+            Ok(produced) => produced,
+            Err((never, _)) => match never {},
+        }
+    };
+    let Produced {
+        result: batch_result,
+        wires: final_wires,
+    } = produced?;
+    // 8b. Under a replay plan, the batch outcome is already durably
+    // recorded: NOTHING is re-checkpointed.
+    if rebuild {
+        return Ok(batch_result);
+    }
+
+    // 11. Build the batch record text from the item wire strings (no
+    // serdes call), then pass it through the SAME `serialize_value` helper
+    // as every other path. `result_serdes` receives the record's JSON text
+    // and returns the payload to store.
+    let payload = from_batch_result(&batch_result, &final_wires, &encoding);
+    // The serialization runs after the container's body ended `Ok`, so its
+    // failure keeps its own wire (#126 rule 7.6): the returned error
+    // carries `serialization_failure_wire`, as a step's or a child's does.
+    // The container writes no outcome record for it.
+    let serialized_payload = serialize_value(
+        &ctx,
+        parent_name.as_deref(),
+        payload,
+        &result_serdes,
+        SerdesContext::new(&parent_wire, ctx.execution_arn()),
+    )
+    .await
+    .map_err(|err| {
+        let wire = crate::error::serialization_failure_wire(&err);
+        err.with_wire(wire)
+    })?;
+
+    // The JS summary travels alongside the payload: when the payload is
+    // too large to checkpoint inline, the summary is written in its place
+    // so replay can obey the recorded outcome instead of re-deriving it.
+    let summary_json = oversized_batch_summary(&batch_result, parent_sub_type);
+
+    // 12. Checkpoint the parent SUCCEED.
+    checkpoint_batch_success_serialized(
+        &ctx,
+        &parent_wire,
+        parent_name.as_deref(),
+        parent_sub_type,
+        &serialized_payload,
+        &summary_json,
+        parent_start,
+    )
+    .await?;
+
+    Ok(batch_result)
+}
+
+/// The output of a batch's producing section: the batch, and the wire
+/// string each reported item's child produced, in the same order, for the
+/// batch record.
+struct Produced<O> {
+    result: BatchResult<O>,
+    wires: Vec<Option<String>>,
+}
+
+/// The inputs of [`produce_batch`].
+struct BatchSection<'a, O, IS> {
+    ctx: &'a DurableContext,
+    batch_ctx: &'a DurableContext,
+    max_concurrency: Option<usize>,
+    completion_cfg: &'a crate::builders::map_parallel::CompletionConfig,
+    serdes: &'a Arc<IS>,
+    nesting: NestingMode,
+    user_names: Vec<Option<String>>,
+    item_name_of: &'a (dyn Fn(usize) -> String + Send + Sync),
+    total_items: usize,
+    child_sub_type: &'a str,
+    dispatch: &'a dyn ItemDispatch<O, IS>,
+    item_ids: &'a ItemIds,
+    parent_wire: &'a str,
+    replay_plan: Option<ReplayPlan>,
+}
+
+/// The batch-producing section of [`execute_batch`], steps 4 to 10: the
+/// zero-item result, or every item's record read, the items' dispatch and
+/// settlement, and the batch with its completion reason. It returns `Ok`
+/// with every item failure in the batch. The batch's scope closes inside
+/// it, when dispatch ends.
+#[expect(clippy::too_many_lines)]
+// reason: batch coordination has distinct phases (read, schedule, collect) that read better as one flow
+async fn produce_batch<O, IS>(
+    section: BatchSection<'_, O, IS>,
+) -> Result<Produced<O>, OperationError>
+where
+    O: Send + 'static,
+    IS: Serdes<O>,
+{
+    let BatchSection {
+        ctx,
+        batch_ctx,
+        max_concurrency,
+        completion_cfg,
+        serdes,
+        nesting,
+        user_names,
+        item_name_of,
+        total_items,
+        child_sub_type,
+        dispatch,
+        item_ids,
+        parent_wire,
+        replay_plan,
+    } = section;
+
+    // 4. Empty collection: the batch succeeds at once. As in JS, a
     // zero-item batch asks the predicate once, on an empty view; without a
     // predicate the decision is `Continue`, which records `AllCompleted`.
     if total_items == 0 {
         let reason =
             custom_reason(completion_cfg.predicate_decision(&BatchStats::from_counts(0, 0, &[])))
                 .unwrap_or(CompletionReason::AllCompleted);
-        let result = BatchResult {
-            items: Vec::new(),
-            reason,
-        };
-        let payload = from_batch_result(&result, &[], &encoding);
-        let serialized_payload = serialize_value(
-            &ctx,
-            parent_name.as_deref(),
-            payload,
-            &result_serdes,
-            SerdesContext::new(&parent_wire, ctx.execution_arn()),
-        )
-        .await?;
-        let summary_json = oversized_batch_summary(&result, parent_sub_type);
-        checkpoint_batch_success_serialized(
-            &ctx,
-            &parent_wire,
-            parent_name.as_deref(),
-            parent_sub_type,
-            &serialized_payload,
-            &summary_json,
-            parent_start,
-        )
-        .await?;
-        return Ok(result);
+        return Ok(Produced {
+            result: BatchResult {
+                items: Vec::new(),
+                reason,
+            },
+            wires: Vec::new(),
+        });
     }
 
     // 5. Determine effective concurrency.
     let concurrency = max_concurrency.unwrap_or(total_items).max(1);
-
-    // Validate completion config.
-    if let Err(msg) = completion_cfg.validate() {
-        return Err(batch_error(&msg));
-    }
 
     // 6. Read every item's record up front (concurrent path). Each item's
     // ID comes from `item_ids`, so it depends on its index alone. Reading
@@ -2370,7 +2633,7 @@ where
     // The batch's scope: every item context runs inside it. It closes at
     // early completion, before the running items are aborted, and when
     // this future ends or is dropped (see `Admission`).
-    let batch_scope = ScopeClose::new(ctx.admission(), &parent_wire);
+    let mut batch_scope = Some(ScopeClose::new(ctx.admission(), parent_wire));
     let mut next_index: usize = 0;
 
     // A child holding ANY checkpoint record was admitted by a prior
@@ -2384,14 +2647,14 @@ where
     }
 
     let env = BatchEnv {
-        ctx: &batch_ctx,
+        ctx: batch_ctx,
         dispatch,
-        completion_cfg: &completion_cfg,
+        completion_cfg,
         total_items,
         nesting,
-        parent_wire: &parent_wire,
+        parent_wire,
         child_sub_type: &child_sub_type_owned,
-        serdes: &serdes,
+        serdes,
     };
 
     // 7b. Replay pass (concurrent mode): resolve every recorded-terminal
@@ -2549,7 +2812,7 @@ where
             // runs, the loop below ends the batch at once, and otherwise
             // the next settle ends it through early completion. Under a
             // replay plan the recorded reason is reproduced instead.
-            if replay_plan.is_none() && progress.tracker.dispatch_gate(&completion_cfg) {
+            if replay_plan.is_none() && progress.tracker.dispatch_gate(completion_cfg) {
                 break;
             }
 
@@ -2584,24 +2847,24 @@ where
                     &branch_wire,
                     &item_name,
                     &child_sub_type_owned,
-                    &parent_wire,
+                    parent_wire,
                     OperationAction::Start,
                 )])
             });
+            let info = item_info(batch_ctx, &branch_wire, &child_sub_type_owned, &item_name);
+            let info = if nesting == NestingMode::Flat {
+                // A flat item writes no record: it reports as a virtual
+                // child, with the replay state its context will start
+                // with.
+                info.with_virtual(true)
+                    .with_replay(batch_ctx.namespace_is_replaying(pc.op_id.positional()))
+            } else if pc.has_record {
+                info.with_replay(true)
+            } else {
+                info.with_status(crate::OperationStatus::Started)
+                    .with_replay(false)
+            };
             if let Some(plugins) = ctx.plugins() {
-                let info = item_info(&batch_ctx, &branch_wire, &child_sub_type_owned, &item_name);
-                let info = if nesting == NestingMode::Flat {
-                    // A flat item writes no record: it reports as a virtual
-                    // child, with the replay state its context will start
-                    // with.
-                    info.with_virtual(true)
-                        .with_replay(batch_ctx.namespace_is_replaying(pc.op_id.positional()))
-                } else if pc.has_record {
-                    info.with_replay(true)
-                } else {
-                    info.with_status(crate::OperationStatus::Started)
-                        .with_replay(false)
-                };
                 crate::plugin::operation_started(plugins, &info);
             }
             let start = reserved.map(crate::context::ReservedWrite::release);
@@ -2611,11 +2874,12 @@ where
                 child_op_id: pc.op_id,
                 index: branch_index,
                 is_terminal: pc.is_terminal,
-                parent_wire: parent_wire.clone(),
+                parent_wire: parent_wire.to_owned(),
                 child_sub_type: child_sub_type_owned.clone(),
                 item_name: item_name.clone(),
                 nesting,
-                serdes: Arc::clone(&serdes),
+                start_info: Arc::new(info),
+                serdes: Arc::clone(serdes),
                 start: std::sync::Mutex::new(start),
             };
             dispatch
@@ -2648,11 +2912,17 @@ where
         // Under a replay plan the recorded outcome is reproduced instead,
         // so nothing is abandoned.
         if replay_plan.is_none() && progress.tracker.stop_reason.is_some() {
-            drop(batch_scope);
+            drop(batch_scope.take());
             join_set.abort_all();
             break;
         }
     }
+
+    // Dispatch ended: the batch's scope closes here, inside the body, so it
+    // is closed before the end hooks. At early completion it closed
+    // before the running items were stopped.
+    drop(batch_scope);
+    drop(join_set);
 
     let BatchProgress {
         tracker,
@@ -2697,9 +2967,12 @@ where
     // terminal state. `final_items` holds the recorded admission set's
     // reconstructed outcomes.
     if let Some(plan) = replay_plan {
-        return Ok(BatchResult {
-            items: final_items,
-            reason: plan.reason,
+        return Ok(Produced {
+            result: BatchResult {
+                items: final_items,
+                reason: plan.reason,
+            },
+            wires: final_wires,
         });
     }
 
@@ -2717,43 +2990,13 @@ where
     // STARTED). So `batch_result.items` is that prefix, and its length is
     // the `totalCount` the oversized summary carries: the number of items
     // ever started, NOT the input length.
-    let batch_result = BatchResult {
-        items: final_items,
-        reason,
-    };
-
-    // 11. Build the batch record text from the item wire strings (no
-    // serdes call), then pass it through the SAME `serialize_value` helper
-    // as every other path. `result_serdes` receives the record's JSON text
-    // and returns the payload to store.
-    let payload = from_batch_result(&batch_result, &final_wires, &encoding);
-    let serialized_payload = serialize_value(
-        &ctx,
-        parent_name.as_deref(),
-        payload,
-        &result_serdes,
-        SerdesContext::new(&parent_wire, ctx.execution_arn()),
-    )
-    .await?;
-
-    // The JS summary travels alongside the payload: when the payload is
-    // too large to checkpoint inline, the summary is written in its place
-    // so replay can obey the recorded outcome instead of re-deriving it.
-    let summary_json = oversized_batch_summary(&batch_result, parent_sub_type);
-
-    // 12. Checkpoint the parent SUCCEED.
-    checkpoint_batch_success_serialized(
-        &ctx,
-        &parent_wire,
-        parent_name.as_deref(),
-        parent_sub_type,
-        &serialized_payload,
-        &summary_json,
-        parent_start,
-    )
-    .await?;
-
-    Ok(batch_result)
+    Ok(Produced {
+        result: BatchResult {
+            items: final_items,
+            reason,
+        },
+        wires: final_wires,
+    })
 }
 
 /// The start step of a batch parent (see [`crate::start`]).
@@ -4453,6 +4696,406 @@ mod tests {
         );
     }
 
+    /// A record of the operation at `positional_id` with `status` and no
+    /// payload.
+    fn record_at(positional_id: &str, status: CheckpointStatus) -> (String, CheckpointRecord) {
+        let (wire_id, mut record) = succeeded_record(positional_id, "null");
+        record.status = status;
+        record.result = None;
+        (wire_id, record)
+    }
+
+    /// Rule 7.3: a STARTED `Normal` item with no inner record reports a
+    /// replay to `on_operation_start` and none to its user-function hooks
+    /// and wraps. So does a resumed container whose batch child context
+    /// has no inner record.
+    #[tokio::test]
+    async fn normal_item_without_inner_record_replay_flags() {
+        use crate::plugin::recorder::{UfHooks, context};
+        let map = |ctx: &DurableContext| {
+            ctx.map(vec![1_u32], |_child, item, _idx| async move { Ok(item) })
+                .name("m")
+        };
+
+        // Run 1: the map and its item 0 are STARTED.
+        let hooks = UfHooks::default();
+        let (ctx, _client) = context(
+            &hooks,
+            vec![
+                record_at("1", CheckpointStatus::Started),
+                record_at("1-1", CheckpointStatus::Started),
+            ],
+        );
+        assert_eq!(map(&ctx).await.unwrap(), [1]);
+        assert!(hooks.find("map-item-0", "start").replay);
+        let item = hooks.user_function_of("map-item-0", true);
+        assert!(item.iter().all(|r| !r.replay), "{item:?}");
+
+        // Run 2: only the map is STARTED.
+        let hooks = UfHooks::default();
+        let (ctx, _client) = context(&hooks, vec![record_at("1", CheckpointStatus::Started)]);
+        assert_eq!(map(&ctx).await.unwrap(), [1]);
+        assert!(hooks.find("m", "start").replay);
+        let container = hooks.user_function_of("m", true);
+        assert!(container.iter().all(|r| !r.replay), "{container:?}");
+    }
+
+    /// Rule 11: each `parallel_mixed` branch and the container are user
+    /// functions, in both modes. A branch has the sub-type `ParallelBranch`
+    /// and the container as its parent; a flat branch is virtual.
+    #[tokio::test]
+    async fn parallel_mixed_branches_and_container_both_modes() {
+        use crate::plugin::recorder::{UfHooks, context};
+        for mode in [NestingMode::Normal, NestingMode::Flat] {
+            let hooks = UfHooks::default();
+            let (ctx, _client) = context(&hooks, Vec::new());
+            let mut set = crate::BranchSet::new();
+            let text = set.add("s", |_child| async { Ok("text".to_owned()) });
+            let number = set.add("n", |_child| async { Ok(7_u32) });
+            ctx.parallel_mixed(set)
+                .name("pm")
+                .nesting(mode)
+                .await
+                .unwrap();
+            assert_eq!(text.into_result().unwrap(), "text", "{mode:?}");
+            assert_eq!(number.into_result().unwrap(), 7, "{mode:?}");
+
+            let container_wire = crate::engine::compute_wire_id_public("1");
+            let container = hooks.user_function_of("pm", true);
+            assert!(
+                container
+                    .iter()
+                    .all(|r| { r.sub_type.as_deref() == Some(PARALLEL_SUB_TYPE) && !r.is_virtual }),
+                "{mode:?}: {container:?}"
+            );
+            for name in ["s", "n"] {
+                let branch = hooks.user_function_of(name, true);
+                assert!(
+                    branch.iter().all(|r| {
+                        r.sub_type.as_deref() == Some(PARALLEL_BRANCH_SUB_TYPE)
+                            && r.parent_id.as_deref() == Some(container_wire.as_str())
+                            && r.is_virtual == (mode == NestingMode::Flat)
+                    }),
+                    "{mode:?} {name}: {branch:?}"
+                );
+                assert_eq!(hooks.find(name, "uf_end").ok, Some(true), "{mode:?}");
+            }
+            assert_eq!(hooks.find("pm", "uf_end").ok, Some(true), "{mode:?}");
+        }
+    }
+
+    /// The batch operation [`failing_branches_report_stored_wire`] runs.
+    #[derive(Clone, Copy, Debug)]
+    enum FailingBatch {
+        Map,
+        Parallel,
+        ParallelMixed,
+    }
+
+    /// Rule 11's item and container rows: in a `map`, a `parallel` and a
+    /// `parallel_mixed` that tolerate one failure, the failing item's end
+    /// hook gets the item's failure wire. A `Normal` item stores it in its
+    /// FAIL, a `Flat` item in its `BatchItem`. The container ends `Ok` and
+    /// records its SUCCEED.
+    #[tokio::test]
+    async fn failing_branches_report_stored_wire() {
+        use crate::builders::map_parallel::CompletionConfig;
+        use crate::plugin::recorder::{
+            UfHooks, context, type_and_message, update_error, update_of,
+        };
+        let tolerate = || CompletionConfig::with_tolerated_failure_count(1);
+        let fail = || Err::<u32, BoxError>("boom".into());
+        for kind in [
+            FailingBatch::Map,
+            FailingBatch::Parallel,
+            FailingBatch::ParallelMixed,
+        ] {
+            for mode in [NestingMode::Normal, NestingMode::Flat] {
+                let case = format!("{kind:?} {mode:?}");
+                let hooks = UfHooks::default();
+                let (ctx, client) = context(&hooks, Vec::new());
+                // The failing item's name, and the wire the batch keeps
+                // for it.
+                let (failing, kept) = match kind {
+                    FailingBatch::Map => {
+                        let batch = ctx
+                            .map(vec![0_u32, 1], move |_child, item, _idx| async move {
+                                if item == 1 { fail() } else { Ok(item) }
+                            })
+                            .name("c")
+                            .nesting(mode)
+                            .completion(tolerate())
+                            .await_batch()
+                            .await
+                            .unwrap();
+                        let errors = batch.errors();
+                        let error = errors.first().expect("item 1 failed");
+                        (
+                            "map-item-1",
+                            (
+                                error.error_type.map(str::to_owned),
+                                Some(error.message.to_owned()),
+                            ),
+                        )
+                    }
+                    FailingBatch::Parallel => {
+                        let batch = ctx
+                            .parallel(vec![
+                                crate::Branch::new("ok", |_child| async { Ok(0_u32) }),
+                                crate::Branch::new("bad", move |_child| async move { fail() }),
+                            ])
+                            .name("c")
+                            .nesting(mode)
+                            .completion(tolerate())
+                            .await_batch()
+                            .await
+                            .unwrap();
+                        let errors = batch.errors();
+                        let error = errors.first().expect("branch 1 failed");
+                        (
+                            "bad",
+                            (
+                                error.error_type.map(str::to_owned),
+                                Some(error.message.to_owned()),
+                            ),
+                        )
+                    }
+                    FailingBatch::ParallelMixed => {
+                        let mut set = crate::BranchSet::new();
+                        let _ok = set.add("ok", |_child| async { Ok(0_u32) });
+                        let bad = set.add("bad", move |_child| async move { fail() });
+                        ctx.parallel_mixed(set)
+                            .name("c")
+                            .nesting(mode)
+                            .completion(tolerate())
+                            .await
+                            .unwrap();
+                        let err = bad.into_result().expect_err("branch 1 failed");
+                        ("bad", type_and_message(err.wire().expect("a wire record")))
+                    }
+                };
+                let end = hooks.find(failing, "uf_end");
+                assert_eq!(end.ok, Some(false), "{case}");
+                let end = type_and_message(end.wire.as_ref().expect("an Err outcome"));
+                assert_eq!(end.1.as_deref(), Some("boom"), "{case}");
+                assert_eq!(end, kept, "{case}: the batch keeps the end hook's wire");
+                let updates = client.recorded_updates();
+                let item_fail = update_of(&updates, failing, &OperationAction::Fail);
+                match mode {
+                    NestingMode::Normal => assert_eq!(
+                        update_error(&item_fail.expect("the item's FAIL")),
+                        end,
+                        "{case}: the FAIL stores the end hook's wire"
+                    ),
+                    NestingMode::Flat => assert!(item_fail.is_none(), "{case}"),
+                }
+                assert_eq!(hooks.find("c", "uf_end").ok, Some(true), "{case}");
+                assert!(
+                    update_of(&updates, "c", &OperationAction::Succeed).is_some(),
+                    "{case}: the container's SUCCEED"
+                );
+            }
+        }
+    }
+
+    /// A result serdes that fails every serialization with a permanent
+    /// error.
+    struct FailingResultSerdes;
+
+    impl Serdes<String> for FailingResultSerdes {
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            _value: String,
+            _context: SerdesContext,
+        ) -> Result<String, BoxError> {
+            Err("cannot encode".into())
+        }
+
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            _wire: String,
+            _context: SerdesContext,
+        ) -> Result<String, BoxError> {
+            Err("cannot decode".into())
+        }
+    }
+
+    /// An in-memory client that permanently rejects the `SUCCEED` of the
+    /// root's first operation.
+    #[derive(Debug)]
+    struct RejectsParentSucceed(Arc<crate::client::InMemoryExecutionClient>);
+
+    impl crate::client::ExecutionClient for RejectsParentSucceed {
+        fn checkpoint(
+            &self,
+            arn: &str,
+            token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::client::CheckpointOutput,
+                            crate::client::ExecutionClientError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            let parent = crate::engine::compute_wire_id_public("1");
+            if updates
+                .iter()
+                .any(|u| u.id == parent && u.action() == &OperationAction::Succeed)
+            {
+                return Box::pin(async {
+                    Err(crate::client::ExecutionClientError::new_non_retryable(
+                        "rejected",
+                    ))
+                });
+            }
+            self.0.checkpoint(arn, token, updates)
+        }
+
+        fn get_state(
+            &self,
+            arn: &str,
+            token: &str,
+            marker: Option<&str>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::client::GetStateOutput,
+                            crate::client::ExecutionClientError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.0.get_state(arn, token, marker)
+        }
+    }
+
+    /// Rule 7.6: a container's body ends `Ok` when its batch is produced. A
+    /// failure after it keeps its own wire: a result serdes failure is the
+    /// handler's error with `serialization_failure_wire`, and a rejected
+    /// `SUCCEED` records a terminal FAIL with `checkpoint_failure_wire`.
+    #[tokio::test]
+    async fn container_post_body_failures_keep_own_wire() {
+        use crate::plugin::recorder::{UfHooks, context, context_over, update_error, update_of};
+
+        // Run 1: the result serdes fails.
+        let hooks = UfHooks::default();
+        let (ctx, client) = context(&hooks, Vec::new());
+        let err = ctx
+            .map(vec![1_u32], |_child, item, _idx| async move { Ok(item) })
+            .name("m")
+            .result_serdes(FailingResultSerdes)
+            .await
+            .expect_err("the batch record cannot be serialized");
+        let end = hooks.find("m", "uf_end");
+        assert_eq!((end.ok, end.wire), (Some(true), None));
+        // The serialization failure is the handler's error, and it keeps
+        // its own wire, `serialization_failure_wire`. As on main, a
+        // container writes no outcome record for it: the next invocation
+        // produces the batch again from its items' records.
+        assert_eq!(
+            err.wire(),
+            Some(&crate::error::WireError::new(
+                Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE),
+                Some(
+                    "operation error: child_context: internal error: serialize result: cannot encode"
+                ),
+            ))
+        );
+        let updates = client.recorded_updates();
+        assert!(
+            update_of(&updates, "m", &OperationAction::Succeed).is_none()
+                && update_of(&updates, "m", &OperationAction::Fail).is_none(),
+            "{updates:?}"
+        );
+
+        // Run 2: the client rejects the container's SUCCEED.
+        let hooks = UfHooks::default();
+        let inner = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = context_over(
+            &hooks,
+            Vec::new(),
+            Arc::new(RejectsParentSucceed(Arc::clone(&inner))),
+        );
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::driver::test_support::drive_handler(ctx, None, |ctx| async move {
+                ctx.map(vec![1_u32], |_child, item, _idx| async move { Ok(item) })
+                    .name("m")
+                    .await
+                    .map_err(crate::driver::test_support::wire_err)?;
+                Ok("done".to_owned())
+            }),
+        )
+        .await
+        .expect("the invocation ends within 5 s")
+        .expect("no panic");
+        assert!(
+            matches!(outcome, crate::driver::InvocationOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        let end = hooks.find("m", "uf_end");
+        assert_eq!((end.ok, end.wire), (Some(true), None));
+        let fail = update_of(&inner.recorded_updates(), "m", &OperationAction::Fail)
+            .expect("the container's terminal FAIL");
+        let expected = crate::error::checkpoint_failure_wire(
+            &crate::client::ExecutionClientError::new_non_retryable("rejected"),
+        );
+        assert_eq!(
+            update_error(&fail),
+            (
+                expected.error_type().map(str::to_owned),
+                expected.error_message().map(str::to_owned)
+            )
+        );
+    }
+
+    /// Rule 3.4: a branch the batch abandons at its early completion, while
+    /// its body runs, gets a start hook and no end hook. The branch that
+    /// completed the batch gets both.
+    #[tokio::test]
+    async fn abandoned_branch_gets_no_end_hook() {
+        use crate::builders::map_parallel::CompletionConfig;
+        use crate::plugin::recorder::{UfHooks, context};
+        let hooks = UfHooks::default();
+        let (ctx, _client) = context(&hooks, Vec::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let waits = Arc::clone(&started);
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.parallel(vec![
+                crate::Branch::new("done", move |_child| async move {
+                    waits.notified().await;
+                    Ok(0_u32)
+                }),
+                crate::Branch::new("abandoned", move |_child| async move {
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                    Ok(1_u32)
+                }),
+            ])
+            .name("p")
+            .completion(CompletionConfig::with_min_successful(1))
+            .await_batch(),
+        )
+        .await
+        .expect("the batch completes within 5 s")
+        .unwrap();
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        hooks.user_function_of("abandoned", false);
+        hooks.user_function_of("done", true);
+    }
+
     /// Builds the request of item 0 of a map named `m` on a root context
     /// that carries the plugin `hooks`, without running the map.
     fn item_request(
@@ -4478,6 +5121,7 @@ mod tests {
             child_sub_type: "MapIteration".to_owned(),
             item_name: "map-item-0".to_owned(),
             nesting,
+            start_info: Arc::new(crate::plugin::OperationInfo::for_test("1-1")),
             serdes: Arc::new(crate::serdes::JsonSerdes),
             start: std::sync::Mutex::new(None),
         }
@@ -4493,11 +5137,11 @@ mod tests {
         for replaying in [true, false] {
             let hooks = crate::plugin::test_support::OpHooks::default();
             let req = item_request(&hooks, NestingMode::Flat);
-            item_after(&req, Ok(1_u32), replaying)
+            item_after(&req, ItemBody::Unhooked(Ok(1_u32)), replaying)
                 .await
                 .expect("a flat success settles");
             let failed: Result<u32, ChildFnError> = Err(ChildFnError::from(BoxError::from("bad")));
-            item_after(&req, failed, replaying)
+            item_after(&req, ItemBody::Unhooked(failed), replaying)
                 .await
                 .expect("a flat failure settles");
             let ends: Vec<_> = hooks
@@ -6154,6 +6798,32 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    /// An invalid percentage that skipped the builder's validation fails a
+    /// non-empty batch before any item runs, and a zero-item batch, which
+    /// reads no threshold, succeeds.
+    #[tokio::test]
+    async fn invalid_percentage_fails_only_a_non_empty_batch() {
+        let body = |_child: DurableContext, item: u32, _idx: usize| async move { Ok(item) };
+        let invalid = || Config::with_tolerated_failure_percentage(150.0);
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let err = ctx
+            .map(vec![1_u32], body)
+            .completion(invalid())
+            .await
+            .expect_err("an invalid percentage fails the batch");
+        assert!(
+            crate::error::chain_string(&err).contains("tolerated_failure_percentage must be 0-100"),
+            "{err}"
+        );
+        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
+        let empty = ctx
+            .map(Vec::<u32>::new(), body)
+            .completion(invalid())
+            .await
+            .expect("a zero-item batch succeeds");
+        assert_eq!(empty, Vec::<u32>::new());
     }
 
     /// The statuses of a predicate's view, as `(name, status)` pairs.
@@ -8131,7 +8801,7 @@ mod tests {
         let signal = Arc::clone(ctx.coordinator());
         let root = ctx.clone();
         let handler = run(ctx);
-        let outcome = crate::driver::drive_invocation(
+        let outcome = crate::driver::drive_outcome(
             async move {
                 handler.await;
                 Ok::<_, crate::error::WireError>("done".to_owned())
@@ -10009,7 +10679,7 @@ mod tests {
         };
         let outcome = tokio::time::timeout(
             EARLY_BOUND,
-            crate::driver::drive_invocation(handler, ownership, signal, root, None),
+            crate::driver::drive_outcome(handler, ownership, signal, root, None),
         )
         .await
         .expect("the invocation does not wait for the abandoned item");

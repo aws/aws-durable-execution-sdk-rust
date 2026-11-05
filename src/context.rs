@@ -417,6 +417,28 @@ pub(crate) enum ActiveBody {
     /// A body that may not call durable operations: a step body or a
     /// `wait_for_condition` check. Holds the operation's positional ID.
     Step(String),
+    /// Plugin code: a wrap, or a start or end hook and its future. A
+    /// plugin observes operations, so a durable operation it called would
+    /// claim an ID that the handler's code did not create, and replay
+    /// would diverge.
+    Plugin,
+    /// The SDK derives the recorded error of a user function's outcome:
+    /// the error's `Display` and `source` run, which are user code. Holds
+    /// the operation's positional ID. An operation called there would
+    /// claim an ID on a live run only, since replay returns the recorded
+    /// error without deriving it again.
+    Outcome(String),
+    /// No body is active: the check does nothing. A plugin wrap's `next`
+    /// sets it when the code around the wrap had no value, so the code
+    /// inside sees exactly what it saw without the wrap.
+    Unset,
+}
+
+/// The body active now, or [`ActiveBody::Unset`] when none is.
+pub(crate) fn current_body() -> ActiveBody {
+    ACTIVE_BODY
+        .try_with(ActiveBody::clone)
+        .unwrap_or(ActiveBody::Unset)
 }
 
 tokio::task_local! {
@@ -958,9 +980,14 @@ impl DurableContext {
     /// - A step body or a `wait_for_condition` check is active: the
     ///   execution fails with a context usage error that names the
     ///   operation.
+    /// - Plugin code is active: the SDK records a context usage error.
     ///
-    /// The failure is recorded as an execution-fatal error, so the
-    /// invocation answers `FAILED` on the first invocation. Without the
+    /// The failure is recorded as an execution-fatal error. When it is
+    /// recorded before the driver's arbitration, the invocation answers
+    /// `FAILED` on the first invocation. Only plugin code can record it
+    /// after the arbitration, either before `drive_invocation` returns or
+    /// after; such a record changes neither the response nor the
+    /// late-panic policy. Without the
     /// check, the misuse surfaces one invocation later as a
     /// non-determinism error that does not name the cause. The ID is
     /// claimed in every case, so the caller builds its builder as usual.
@@ -987,6 +1014,16 @@ impl DurableContext {
                      cannot call durable operations; use run_in_child_context to group \
                      operations."
                 )),
+                ActiveBody::Plugin => Some(format!(
+                    "context usage error in \"{method}\": the operation was called inside \
+                     plugin code. Plugin code cannot call durable operations."
+                )),
+                ActiveBody::Outcome(id) => Some(format!(
+                    "context usage error in \"{method}\": the operation was called while the \
+                     SDK records the outcome of operation \"{id}\". An error's Display and \
+                     source cannot call durable operations."
+                )),
+                ActiveBody::Unset => None,
             })
             .ok()
             .flatten();
@@ -1202,6 +1239,12 @@ impl DurableContext {
     /// the root. `None` without a registered plugin factory.
     pub(crate) fn plugins(&self) -> Option<&crate::plugin::InvocationPlugins> {
         self.inner.plugins.as_deref()
+    }
+
+    /// [`Self::plugins`], shared: a user-function runner's own frame node
+    /// holds them.
+    pub(crate) fn shared_plugins(&self) -> Option<Arc<crate::plugin::InvocationPlugins>> {
+        self.inner.plugins.clone()
     }
 
     /// Returns the invocation coordinator, shared by every context of the

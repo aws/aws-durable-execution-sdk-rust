@@ -422,6 +422,7 @@ where
                 .sub_type
                 .unwrap_or(OperationSubType::RUN_IN_CHILD_CONTEXT),
             serdes,
+            user_function: crate::child::UserFunctionPolicy::Hooks,
             // A concrete closure returning the concrete retry-loop future:
             // no erasure here: the one box is the DurableFuture below.
             closure: move |outer_ctx| {
@@ -492,6 +493,7 @@ mod tests {
                 name: Some("block".to_owned()),
                 sub_type: OperationSubType::RUN_IN_CHILD_CONTEXT,
                 serdes: Arc::new(JsonSerdes),
+                user_function: crate::child::UserFunctionPolicy::Hooks,
                 closure: move |outer_ctx: DurableContext| async move {
                     let handle = outer_ctx
                         .step(move |_| async move {

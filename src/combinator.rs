@@ -260,48 +260,56 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> TryJoinAllExecution<O> {
         )
         .await?;
 
-        let mut first_error: Option<(usize, OperationError)> = None;
-        while let Some((_, joined)) = join_set.join_next_with_id().await {
-            // A panicked input resumes its panic here.
-            match joined.into_value() {
-                (idx, Ok(value)) => {
-                    if let Some(slot) = results.get_mut(idx) {
-                        *slot = Some(value);
+        // The join: wait for every input, and on the first failure stop the
+        // inputs still running (fail-fast + loser-drop).
+        let join = async move {
+            while let Some((_, joined)) = join_set.join_next_with_id().await {
+                // A panicked input resumes its panic here.
+                match joined.into_value() {
+                    (idx, Ok(value)) => {
+                        if let Some(slot) = results.get_mut(idx) {
+                            *slot = Some(value);
+                        }
+                    }
+                    (idx, Err(op_err)) => {
+                        join_set.abort_all();
+                        return Err((idx, op_err));
                     }
                 }
-                (idx, Err(op_err)) => {
-                    first_error = Some((idx, op_err));
-                    // Abort remaining tasks (fail-fast + loser-drop).
-                    join_set.abort_all();
-                    break;
+            }
+            Ok(results)
+        };
+        let joined = run_join(
+            &self.ctx,
+            &positional_id,
+            &wire_id,
+            self.name.as_deref(),
+            run,
+            join,
+            join_failed_wire,
+        )
+        .await;
+        let results = match joined {
+            Ok(results) => results,
+            Err(((failed_index, op_err), wire)) => {
+                // Checkpoint FAIL with the wire the end hooks saw.
+                if !reconstruct {
+                    checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire)
+                        .await?;
                 }
+                // The loser is preserved as an error, reachable via source().
+                return Err(OperationError::from_kind(OperationErrorKind::Combinator(
+                    CombinatorError::new(
+                        CombinatorErrorKind::JoinFailed(crate::error::JoinFailed::new(
+                            failed_index,
+                        )),
+                        vec![Box::new(op_err)],
+                    ),
+                ))
+                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
+                .with_wire(wire));
             }
-        }
-
-        if let Some((failed_index, op_err)) = first_error {
-            // Checkpoint FAIL. The wire `error_type` carries the JoinFailed
-            // discriminator with the failed input's index appended, so
-            // replay reconstructs the same variant and index; the message,
-            // `error_data`, and `stack_trace` derive from the loser itself
-            // (pass-through; a chain that recorded no frames records
-            // none).
-            let wire = crate::error::wire_error_with_type(
-                &op_err,
-                &format!("{JOIN_FAILED_ERROR_TYPE_PREFIX}{failed_index}"),
-            );
-            if !reconstruct {
-                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire).await?;
-            }
-            // The loser is preserved as an error, reachable via source().
-            return Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                CombinatorError::new(
-                    CombinatorErrorKind::JoinFailed(crate::error::JoinFailed::new(failed_index)),
-                    vec![Box::new(op_err)],
-                ),
-            ))
-            .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
-            .with_wire(wire));
-        }
+        };
 
         // All succeeded: collect results in order.
         let mut collected: Vec<O> = Vec::with_capacity(count);
@@ -462,13 +470,31 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> JoinAllExecution<O> {
         )
         .await?;
 
-        while let Some((_, joined)) = join_set.join_next_with_id().await {
-            // A panicked input resumes its panic here.
-            let (idx, outcome) = joined.into_value();
-            if let Some(slot) = outcomes.get_mut(idx) {
-                *slot = Some(outcome);
+        // The join: wait for every input; it never short-circuits.
+        let join = async move {
+            while let Some((_, joined)) = join_set.join_next_with_id().await {
+                // A panicked input resumes its panic here.
+                let (idx, outcome) = joined.into_value();
+                if let Some(slot) = outcomes.get_mut(idx) {
+                    *slot = Some(outcome);
+                }
             }
-        }
+            Ok(outcomes)
+        };
+        let outcomes = match run_join(
+            &self.ctx,
+            &positional_id,
+            &wire_id,
+            self.name.as_deref(),
+            run,
+            join,
+            crate::plugin::never_fails,
+        )
+        .await
+        {
+            Ok(outcomes) => outcomes,
+            Err((never, _)) => match never {},
+        };
 
         // Collect in order.
         let collected: Vec<Result<O, OperationError>> = outcomes
@@ -547,7 +573,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
     /// a cancelled input stops at its next `.await`.
     /// Replay path: returns the frozen winner, or, for a record with
     /// `ReplayChildren`, drives only the recorded winner again.
-    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         self.ctx.enforce_task_ownership()?;
 
@@ -618,113 +643,95 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> SelectOkExecution<O> {
         )
         .await?;
 
-        // Empty input: there is no future that could succeed. Fail
-        // explicitly with `EmptyInput` (matching `race`) rather than an
-        // `AllFailed` carrying zero errors.
-        if empty {
-            let wire = crate::error::WireError::new(
-                Some(EMPTY_INPUT_ERROR_TYPE),
-                Some("select_ok called with no futures"),
-            );
-            checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire).await?;
-            // Attach the checkpointed context so the live error matches
-            // what a replay of this record reconstructs.
-            return Err(combinator_empty_input_error()
-                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
-                .with_wire(wire));
-        }
-
-        // Live path: race all futures, keep going until one succeeds or all
-        // fail.
-
-        let mut errors: Vec<(usize, crate::error::Source)> = Vec::new();
-
-        while let Some((_, joined)) = join_set.join_next_with_id().await {
-            // A panicked input resumes its panic here.
-            match joined.into_value() {
-                (idx, Ok(value)) => {
-                    // First success: cancel losers (drop via abort_all). A
-                    // waiting loser does not block recording the winner.
-                    join_set.abort_all();
-
-                    // Checkpoint SUCCESS with the winner.
-                    let serialized = serialize_result(&value)?;
-                    checkpoint_winner_succeed(
-                        &self.ctx,
-                        &wire_id,
-                        self.name.as_deref(),
-                        start,
-                        idx,
-                        &serialized,
-                    )
-                    .await?;
-                    drop(value);
-                    // Return the winner decoded from the payload just
-                    // written, so the first run returns what replay returns.
-                    return replay_single_success::<O>(Some(&serialized));
-                }
-                (idx, Err(op_err)) => {
-                    errors.push((idx, Box::new(op_err)));
+        // The join: race all inputs, and keep going until one succeeds or
+        // all fail. On the first success it stops the inputs still
+        // running (loser-drop), so a waiting loser does not block
+        // recording the winner. An empty input list has no input that
+        // could succeed: it fails with `EmptyInput` (matching `race`)
+        // rather than an `AllFailed` carrying zero errors.
+        let join = async move {
+            if empty {
+                return Err(FirstFailure::Empty("select_ok called with no futures"));
+            }
+            let mut errors: Vec<(usize, crate::error::Source)> = Vec::new();
+            while let Some((_, joined)) = join_set.join_next_with_id().await {
+                // A panicked input resumes its panic here.
+                match joined.into_value() {
+                    (idx, Ok(value)) => {
+                        join_set.abort_all();
+                        return Ok((idx, value));
+                    }
+                    (idx, Err(op_err)) => {
+                        errors.push((idx, Box::new(op_err)));
+                    }
                 }
             }
+            // Every input failed: keep every loser, in input order, as an
+            // error rather than a flattened string.
+            errors.sort_by_key(|(idx, _)| *idx);
+            Err(FirstFailure::AllFailed(
+                errors.into_iter().map(|(_, err)| err).collect(),
+            ))
+        };
+        let joined = run_join(
+            &self.ctx,
+            &positional_id,
+            &wire_id,
+            self.name.as_deref(),
+            run,
+            join,
+            first_failure_wire,
+        )
+        .await;
+        settle_first(&self.ctx, &wire_id, self.name.as_deref(), start, joined).await
+    }
+}
+
+/// Writes the outcome of a live `select_ok` or `race` join: the winner's
+/// SUCCEED, or the FAIL with the wire the end hooks saw, and returns the
+/// value a replay of that record returns.
+async fn settle_first<O: Serialize + DeserializeOwned + Send + 'static>(
+    ctx: &DurableContext,
+    wire_id: &str,
+    name: Option<&str>,
+    start: Option<SubmittedWrite>,
+    joined: Result<(usize, O), (FirstFailure, crate::error::WireError)>,
+) -> Result<O, OperationError> {
+    match joined {
+        Ok((idx, value)) => {
+            // Checkpoint SUCCESS with the winner.
+            let serialized = serialize_result(&value)?;
+            checkpoint_winner_succeed(ctx, wire_id, name, start, idx, &serialized).await?;
+            drop(value);
+            // Return the winner decoded from the payload just written, so
+            // the first run returns what replay returns.
+            replay_single_success::<O>(Some(&serialized))
         }
-
-        // All failed: build the aggregate error keeping every loser (in
-        // input order) as an error rather than a flattened string. The wire
-        // `error_type` carries the AllFailed discriminator so replay
-        // reconstructs the same variant, the recorded message names each
-        // loser's flattened chain in input order, and the record's
-        // `error_data` persists each loser's COMPLETE wire failure record
-        // (a JSON array of [`SerializedLoser`]), so replay rebuilds one
-        // loser per input with the same `error_type`, message,
-        // `error_data`, and `stack_trace` the live failures carried.
-        errors.sort_by_key(|(idx, _)| *idx);
-        let losers: Vec<crate::error::Source> = errors.into_iter().map(|(_, err)| err).collect();
-        let loser_summary = losers
-            .iter()
-            .enumerate()
-            .map(|(idx, err)| format!("[{idx}] {}", crate::error::chain_string(&**err)))
-            .collect::<Vec<_>>()
-            .join("; ");
-        // Pass each loser's own recorded wire record through verbatim when
-        // it carries one (the normal case: a failed constituent operation
-        // attaches its terminal wire record); derive one only for a
-        // wire-less error (e.g. an internal join failure).
-        let serialized_losers: Vec<SerializedLoser> = losers
-            .iter()
-            .map(|err| {
-                let wire = err
-                    .downcast_ref::<OperationError>()
-                    .and_then(|op| op.wire().cloned())
-                    .unwrap_or_else(|| crate::error::wire_error_for(&**err, COMBINATOR_ERROR_TYPE));
-                SerializedLoser::from_wire(&wire)
-            })
-            .collect();
-        // `SerializedLoser` holds only strings, options of strings and a
-        // vector of strings. JSON serialization of those types cannot fail,
-        // so this `expect` never fires.
-        #[expect(clippy::expect_used)]
-        let losers_json = serde_json::to_string(&serialized_losers)
-            .expect("a SerializedLoser always serializes to JSON");
-        let wire = crate::error::WireError::new(
-            Some(ALL_FAILED_ERROR_TYPE),
-            Some(format!(
-                "all {} futures failed: {loser_summary}",
-                losers.len()
-            )),
-        )
-        .with_error_data(Some(losers_json));
-
-        checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire).await?;
-
-        Err(
-            OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
-                CombinatorErrorKind::AllFailed,
-                losers,
-            )))
-            .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
-            .with_wire(wire),
-        )
+        Err((failure, wire)) => {
+            checkpoint_fail(ctx, wire_id, name, start, &wire).await?;
+            // Attach the checkpointed context so the live error matches
+            // what a replay of this record reconstructs.
+            let error = match failure {
+                FirstFailure::Empty(_) => combinator_empty_input_error(),
+                FirstFailure::AllFailed(losers) => {
+                    OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
+                        CombinatorErrorKind::AllFailed,
+                        losers,
+                    )))
+                }
+                // The losing error is preserved as the combinator error's
+                // source.
+                FirstFailure::Settled(op_err) => {
+                    OperationError::from_kind(OperationErrorKind::Combinator(CombinatorError::new(
+                        CombinatorErrorKind::FirstSettledFailed,
+                        vec![Box::new(op_err)],
+                    )))
+                }
+            };
+            Err(error
+                .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
+                .with_wire(wire))
+        }
     }
 }
 
@@ -744,7 +751,6 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
     /// cancelled input stops at its next `.await`.
     /// Replay path: returns the frozen result, or, for a record with
     /// `ReplayChildren`, drives only the recorded winner again.
-    #[expect(clippy::too_many_lines)] // reason: replay/live paths and per-status replay events read better as one flow
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
         self.ctx.enforce_task_ownership()?;
 
@@ -815,81 +821,44 @@ impl<O: Serialize + DeserializeOwned + Send + 'static> RaceExecution<O> {
         )
         .await?;
 
-        // Empty input: there is no future that could settle. Fail
-        // explicitly with `EmptyInput` (matching `select_ok`).
-        if empty {
-            let wire = crate::error::WireError::new(
-                Some(EMPTY_INPUT_ERROR_TYPE),
-                Some("race called with no futures"),
-            );
-            checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire).await?;
-            // Attach the checkpointed context so the live error matches
-            // what a replay of this record reconstructs.
-            return Err(combinator_empty_input_error()
-                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
-                .with_wire(wire));
-        }
-
-        // Live path: race all futures, first settled wins. A losing input
-        // that waits stays pending and never suspends the invocation once
-        // the winner settled (issue #49): the winner is recorded, and the
-        // losers are aborted.
-
-        // Wait for the first SETTLED task. When every input waits, the race
-        // stays pending here.
-        #[expect(clippy::expect_used)]
-        // reason: the input list is not empty here, and the set yields one
-        // outcome per input it started (a refused start never yields), so
-        // the join never reports an empty set.
-        let (_, joined) = join_set
-            .join_next_with_id()
-            .await
-            .expect("a non-empty race joins an input");
-        // A panicked input resumes its panic here.
-        let (idx, settled_result) = joined.into_value();
-
-        // Cancel all remaining losers.
-        join_set.abort_all();
-
-        match settled_result {
-            Ok(value) => {
-                // Winner is a success.
-                let serialized = serialize_result(&value)?;
-                checkpoint_winner_succeed(
-                    &self.ctx,
-                    &wire_id,
-                    self.name.as_deref(),
-                    start,
-                    idx,
-                    &serialized,
-                )
-                .await?;
-                drop(value);
-                // Return the winner decoded from the payload just written,
-                // so the first run returns what replay returns.
-                replay_single_success::<O>(Some(&serialized))
+        // The join: race all inputs, first settled wins, and stop the
+        // inputs still running. A losing input that waits stays pending and
+        // never suspends the invocation once the winner settled (issue
+        // #49): the winner is recorded, and the losers are stopped. An
+        // empty input list has no input that could settle: it fails with
+        // `EmptyInput` (matching `select_ok`).
+        let join = async move {
+            if empty {
+                return Err(FirstFailure::Empty("race called with no futures"));
             }
-            Err(op_err) => {
-                // Winner is a failure: race propagates it. The losing
-                // error is preserved as the combinator error's source;
-                // the wire `error_type` carries the discriminator so
-                // replay reproduces the same variant, while the message,
-                // `error_data`, and `stack_trace` derive from the loser
-                // itself (pass-through; a chain that recorded no frames
-                // records none).
-                let wire =
-                    crate::error::wire_error_with_type(&op_err, FIRST_SETTLED_FAILED_ERROR_TYPE);
-                checkpoint_fail(&self.ctx, &wire_id, self.name.as_deref(), start, &wire).await?;
-                Err(OperationError::from_kind(OperationErrorKind::Combinator(
-                    CombinatorError::new(
-                        CombinatorErrorKind::FirstSettledFailed,
-                        vec![Box::new(op_err)],
-                    ),
-                ))
-                .with_operation(&wire_id, CheckpointStatus::Failed.wire_str())
-                .with_wire(wire))
-            }
-        }
+            // Wait for the first SETTLED task. When every input waits, the
+            // race stays pending here.
+            #[expect(clippy::expect_used)]
+            // reason: the input list is not empty here, and the set yields
+            // one outcome per input it started (a refused start never
+            // yields), so the join never reports an empty set.
+            let (_, joined) = join_set
+                .join_next_with_id()
+                .await
+                .expect("a non-empty race joins an input");
+            // A panicked input resumes its panic here.
+            let (idx, settled_result) = joined.into_value();
+            join_set.abort_all();
+            settled_result
+                .map(|value| (idx, value))
+                .map_err(FirstFailure::Settled)
+        };
+        let joined = run_join(
+            &self.ctx,
+            &positional_id,
+            &wire_id,
+            self.name.as_deref(),
+            run,
+            join,
+            first_failure_wire,
+        )
+        .await;
+        settle_first(&self.ctx, &wire_id, self.name.as_deref(), start, joined).await
     }
 }
 
@@ -927,8 +896,12 @@ fn spawn_constituent<O: Send + 'static>(
     idx: usize,
     future: DurableFuture<O>,
 ) -> Result<(), OperationError> {
+    // The input runs in the context that created it, not the combinator's,
+    // as a JS input promise exists before the combinator.
     join_set
-        .spawn(ctx.task_ownership(), async move { (idx, future.await) })
+        .spawn(future.task_context(), ctx.task_ownership(), async move {
+            (idx, future.await)
+        })
         .map(drop)
         .map_err(NoRuntime::operation_error)
 }
@@ -996,7 +969,7 @@ struct Running<O> {
 ///    invocation instead, so its failure wins. No input begins.
 /// 2. Each input's start phase begins, in input order. A lazy operation
 ///    whose execution begins with the start step runs it now, on this
-///    task (see [`DurableFuture::begin_now`]). A lazy invoke or
+///    task (see [`DurableFuture::begin_in_creator_context`]). A lazy invoke or
 ///    `wait_for_condition` is spawned unchanged, and this waits until it
 ///    has been polled once, but not for its `START`. Every other input,
 ///    such as a handle that `.spawn()` returned, is left as it is.
@@ -1030,18 +1003,25 @@ async fn start_inputs<O: Send + 'static>(
     for (idx, mut future) in futures.into_iter().enumerate() {
         if future.starts_on_first_poll() {
             let (polled, acknowledged) = tokio::sync::oneshot::channel();
+            // The input's first poll runs in the context that created it,
+            // as its remainder does (see `spawn_constituent`).
+            let task_cx = future.task_context();
             let future = FirstPoll {
                 future,
                 polled: Some(polled),
             };
             join_set
-                .spawn(ctx.task_ownership(), async move { (idx, future.await) })
+                .spawn(
+                    task_cx,
+                    ctx.task_ownership(),
+                    async move { (idx, future.await) },
+                )
                 .map_err(NoRuntime::operation_error)?;
             // A dropped sender means the task stopped before its first
             // poll: there is nothing to wait for.
             let _polled = acknowledged.await;
         } else {
-            future.begin_now();
+            future.begin_in_creator_context();
             remainders.push((idx, future));
         }
     }
@@ -1176,6 +1156,128 @@ fn combinator_info(
         COMBINATOR_SUB_TYPE,
         name,
     )
+}
+
+/// Runs a combinator's join `body`, and derives the wire of its error.
+///
+/// On a live or resumed cycle the join is a user function: it runs
+/// through the runner, under its caller's active body, with no scope, and
+/// its info is the one `on_operation_start` received. A reconstruction
+/// (`ReplayChildren`) runs the body directly, with no frame and no
+/// user-function hook.
+async fn run_join<T, E, B>(
+    ctx: &DurableContext,
+    positional_id: &str,
+    wire_id: &str,
+    name: Option<&str>,
+    run: Run,
+    body: B,
+    wire: fn(&E) -> crate::error::WireError,
+) -> Result<T, (E, crate::error::WireError)>
+where
+    B: Future<Output = Result<T, E>>,
+{
+    if run == Run::Reconstruct {
+        return body.await.map_err(|error| {
+            let derived = wire(&error);
+            (error, derived)
+        });
+    }
+    let info = combinator_info(ctx, wire_id, name);
+    let info = if run == Run::Live {
+        info.with_status(crate::OperationStatus::Started)
+            .with_replay(false)
+    } else {
+        info.with_replay(true)
+    };
+    crate::plugin::run_user_function_at(
+        ctx.shared_plugins(),
+        Arc::new(info),
+        crate::context::current_body(),
+        positional_id.to_owned(),
+        tracing::Span::current(),
+        move || body,
+        wire,
+    )
+    .await
+    .into_parts()
+}
+
+/// The wire of a failed `try_join_all`: the `JoinFailed` discriminator
+/// with the failed input's index appended, so replay reconstructs the
+/// same variant and index; the message, `error_data` and `stack_trace`
+/// derive from the loser itself (pass-through; a chain that recorded no
+/// frames records none).
+fn join_failed_wire((index, error): &(usize, OperationError)) -> crate::error::WireError {
+    crate::error::wire_error_with_type(error, &format!("{JOIN_FAILED_ERROR_TYPE_PREFIX}{index}"))
+}
+
+/// Why a `select_ok` or `race` join failed.
+enum FirstFailure {
+    /// The input list was empty.
+    Empty(&'static str),
+    /// `select_ok`: every input failed, in input order.
+    AllFailed(Vec<crate::error::Source>),
+    /// `race`: the first input to settle failed.
+    Settled(OperationError),
+}
+
+/// The wire of a failed `select_ok` or `race` join.
+fn first_failure_wire(failure: &FirstFailure) -> crate::error::WireError {
+    match failure {
+        FirstFailure::Empty(message) => {
+            crate::error::WireError::new(Some(EMPTY_INPUT_ERROR_TYPE), Some(*message))
+        }
+        FirstFailure::AllFailed(losers) => all_failed_wire(losers),
+        // The discriminator lets replay reproduce the same variant, while
+        // the message, `error_data` and `stack_trace` derive from the
+        // loser itself.
+        FirstFailure::Settled(error) => {
+            crate::error::wire_error_with_type(error, FIRST_SETTLED_FAILED_ERROR_TYPE)
+        }
+    }
+}
+
+/// The wire of an `AllFailed` `select_ok`: the discriminator, a message
+/// naming each loser's flattened chain in input order, and, as
+/// `error_data`, each loser's complete wire failure record (a JSON array
+/// of [`SerializedLoser`]), so replay rebuilds one loser per input with
+/// the same fields the live failures carried.
+fn all_failed_wire(losers: &[crate::error::Source]) -> crate::error::WireError {
+    let loser_summary = losers
+        .iter()
+        .enumerate()
+        .map(|(idx, err)| format!("[{idx}] {}", crate::error::chain_string(&**err)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    // Pass each loser's own recorded wire record through verbatim when it
+    // carries one (the normal case: a failed constituent operation
+    // attaches its terminal wire record); derive one only for a wire-less
+    // error (e.g. an internal join failure).
+    let serialized_losers: Vec<SerializedLoser> = losers
+        .iter()
+        .map(|err| {
+            let wire = err
+                .downcast_ref::<OperationError>()
+                .and_then(|op| op.wire().cloned())
+                .unwrap_or_else(|| crate::error::wire_error_for(&**err, COMBINATOR_ERROR_TYPE));
+            SerializedLoser::from_wire(&wire)
+        })
+        .collect();
+    // `SerializedLoser` holds only strings, options of strings and a
+    // vector of strings. JSON serialization of those types cannot fail,
+    // so this `expect` never fires.
+    #[expect(clippy::expect_used)]
+    let losers_json = serde_json::to_string(&serialized_losers)
+        .expect("a SerializedLoser always serializes to JSON");
+    crate::error::WireError::new(
+        Some(ALL_FAILED_ERROR_TYPE),
+        Some(format!(
+            "all {} futures failed: {loser_summary}",
+            losers.len()
+        )),
+    )
+    .with_error_data(Some(losers_json))
 }
 
 /// Fires `on_operation_start` with `is_replay` `true` for a combinator
@@ -1860,7 +1962,7 @@ mod tests {
         let signal = Arc::clone(ctx.coordinator());
         let root = ctx.clone();
         let handler = run(ctx);
-        let outcome = crate::driver::drive_invocation(
+        let outcome = crate::driver::drive_outcome(
             async move {
                 handler.await;
                 Ok::<_, crate::error::WireError>("done".to_owned())
@@ -3986,6 +4088,212 @@ mod tests {
         record.sub_type = Some(sub_type.to_owned());
         record.op_name = Some(name.to_owned());
         (wire_id, record)
+    }
+
+    /// Rule 7.3's join row: a combinator's join gets the info its
+    /// `on_operation_start` received, unchanged: no replay when fresh, a
+    /// replay when it resumes an earlier invocation's STARTED record.
+    #[tokio::test]
+    async fn live_join_info_is_the_combinator_info() {
+        use crate::plugin::recorder::{UfHooks, context};
+        let join = |ctx: &DurableContext| {
+            let a = ctx.step(|_| async { Ok(1_u32) }).name("a").future();
+            let b = ctx.step(|_| async { Ok(2_u32) }).name("b").future();
+            ctx.try_join_all([a, b]).name("all")
+        };
+        for (run, records) in [
+            (1, Vec::new()),
+            (
+                2,
+                vec![record_of(
+                    "3",
+                    CheckpointStatus::Started,
+                    "Context",
+                    COMBINATOR_SUB_TYPE,
+                    "all",
+                )],
+            ),
+        ] {
+            let hooks = UfHooks::default();
+            let (ctx, _client) = context(&hooks, records);
+            assert_eq!(join(&ctx).await.unwrap(), [1, 2], "run {run}");
+            let start = hooks.find("all", "start");
+            assert_eq!(start.replay, run == 2, "run {run}");
+            assert_eq!(start.id, crate::engine::compute_wire_id_public("3"));
+            let join = hooks.user_function_of("all", true);
+            for record in &join {
+                assert_eq!(record.replay, run == 2, "run {run}: {}", record.hook);
+                assert_eq!(
+                    record.info, start.info,
+                    "run {run}: {} gets the combinator's info",
+                    record.hook
+                );
+            }
+        }
+    }
+
+    /// `(type, message)` of an error.
+    type TypeAndMessage = (Option<String>, Option<String>);
+
+    /// The end hook's wire of the join `name`, and the error object of its
+    /// FAIL, when the join failed.
+    fn join_end(
+        hooks: &crate::plugin::recorder::UfHooks,
+        client: &InMemoryExecutionClient,
+        name: &str,
+    ) -> Option<(TypeAndMessage, TypeAndMessage)> {
+        use crate::plugin::recorder::{type_and_message, update_error, update_of};
+        let end = hooks.find(name, "uf_end");
+        let wire = end.wire.as_ref()?;
+        let fail = update_of(
+            &client.recorded_updates(),
+            name,
+            &aws_sdk_lambda::types::OperationAction::Fail,
+        )
+        .expect("the join's FAIL");
+        Some((type_and_message(wire), update_error(&fail)))
+    }
+
+    /// Rule 11's join rows. Each join fails on one failing input, except
+    /// `join_all`, which ends `Ok`; empty `select_ok` and `race` fail with
+    /// `EmptyInput`. Each failing join's FAIL stores its end hook's wire.
+    /// A `race`'s started loser gets a start hook and no end hook.
+    #[tokio::test]
+    async fn combinator_join_outcomes() {
+        use crate::plugin::recorder::{UfHooks, context, update_of};
+        let ok = |ctx: &DurableContext| ctx.step(|_| async { Ok(1_u32) }).name("ok").future();
+        let bad = |ctx: &DurableContext| {
+            ctx.step(|_| async { Err::<u32, crate::BoxError>("boom".into()) })
+                .name("bad")
+                .retry_strategy(|_err, _attempt| crate::RetryDecision::Stop)
+                .future()
+        };
+        // Each join ends with `expected` as its end hook's error type.
+        let failing = |expected: &str, hooks: &UfHooks, client: &InMemoryExecutionClient| {
+            hooks.user_function_of("j", true);
+            let (end, stored) = join_end(hooks, client, "j").expect("an Err outcome");
+            assert_eq!(end.0.as_deref(), Some(expected), "{end:?}");
+            assert_eq!(
+                end, stored,
+                "{expected}: the FAIL stores the end hook's wire"
+            );
+        };
+
+        let hooks = UfHooks::default();
+        let (ctx, client) = context(&hooks, Vec::new());
+        let inputs = [ok(&ctx), bad(&ctx)];
+        drop(ctx.try_join_all(inputs).name("j").await.unwrap_err());
+        failing("CombinatorError.JoinFailed.1", &hooks, &client);
+
+        let hooks = UfHooks::default();
+        let (ctx, client) = context(&hooks, Vec::new());
+        let inputs = [ok(&ctx), bad(&ctx)];
+        let outcomes = ctx.join_all(inputs).name("j").await.unwrap();
+        assert!(outcomes.first().is_some_and(Result::is_ok));
+        // The item's recorded wire is `wire_error_for(err,
+        // "CombinatorError")` of the failed input: the step's recorded
+        // type, which takes precedence over that fallback, and its message.
+        // The returned item is decoded from that record.
+        let item = outcomes
+            .get(1)
+            .and_then(|o| o.as_ref().err())
+            .expect("input 1 failed");
+        let item = crate::plugin::recorder::type_and_message(item.wire().expect("a wire"));
+        assert_eq!(item, (Some("Error".to_owned()), Some("boom".to_owned())));
+        hooks.user_function_of("j", true);
+        assert_eq!(hooks.find("j", "uf_end").ok, Some(true));
+        let succeed = update_of(
+            &client.recorded_updates(),
+            "j",
+            &aws_sdk_lambda::types::OperationAction::Succeed,
+        );
+        assert!(succeed.is_some(), "join_all records a SUCCEED");
+
+        let hooks = UfHooks::default();
+        let (ctx, client) = context(&hooks, Vec::new());
+        let inputs = [bad(&ctx)];
+        drop(ctx.select_ok(inputs).name("j").await.unwrap_err());
+        failing(ALL_FAILED_ERROR_TYPE, &hooks, &client);
+
+        let hooks = UfHooks::default();
+        let (ctx, client) = context(&hooks, Vec::new());
+        let inputs = [bad(&ctx)];
+        drop(ctx.race(inputs).name("j").await.unwrap_err());
+        failing(FIRST_SETTLED_FAILED_ERROR_TYPE, &hooks, &client);
+
+        let hooks = UfHooks::default();
+        let (ctx, client) = context(&hooks, Vec::new());
+        let none: [DurableFuture<u32>; 0] = [];
+        drop(ctx.select_ok(none).name("j").await.unwrap_err());
+        failing(EMPTY_INPUT_ERROR_TYPE, &hooks, &client);
+
+        let hooks = UfHooks::default();
+        let (ctx, client) = context(&hooks, Vec::new());
+        let none: [DurableFuture<u32>; 0] = [];
+        drop(ctx.race(none).name("j").await.unwrap_err());
+        failing(EMPTY_INPUT_ERROR_TYPE, &hooks, &client);
+
+        // A race whose started loser pends: the winner settles once the
+        // loser's body runs.
+        let hooks = UfHooks::default();
+        let (ctx, _client) = context(&hooks, Vec::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let waits = Arc::clone(&started);
+        let winner = ctx
+            .step(move |_| async move {
+                waits.notified().await;
+                Ok(1_u32)
+            })
+            .name("winner")
+            .future();
+        let loser = ctx
+            .step(move |_| async move {
+                started.notify_one();
+                std::future::pending::<()>().await;
+                Ok(2_u32)
+            })
+            .name("loser")
+            .future();
+        let value = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.race([winner, loser]).name("j").into_future(),
+        )
+        .await
+        .expect("the race ends within 5 s")
+        .unwrap();
+        assert_eq!(value, 1);
+        hooks.user_function_of("loser", false);
+        hooks.user_function_of("winner", true);
+        hooks.user_function_of("j", true);
+        assert_eq!(hooks.find("j", "uf_end").ok, Some(true));
+    }
+
+    /// Rule 11: an empty `try_join_all` and `join_all` run their join as a
+    /// user function, which ends `Ok`, and record a SUCCEED with `[]`.
+    #[tokio::test]
+    async fn empty_collection_joins_fire_join_hooks() {
+        use crate::plugin::recorder::{UfHooks, context, update_of};
+        let hooks = UfHooks::default();
+        let (ctx, client) = context(&hooks, Vec::new());
+        let none: [DurableFuture<u32>; 0] = [];
+        assert_eq!(
+            ctx.try_join_all(none).name("t").await.unwrap(),
+            Vec::<u32>::new()
+        );
+        let none: [DurableFuture<u32>; 0] = [];
+        assert!(ctx.join_all(none).name("j").await.unwrap().is_empty());
+        let updates = client.recorded_updates();
+        for name in ["t", "j"] {
+            hooks.user_function_of(name, true);
+            assert_eq!(hooks.find(name, "uf_end").ok, Some(true), "{name}");
+            let succeed = update_of(
+                &updates,
+                name,
+                &aws_sdk_lambda::types::OperationAction::Succeed,
+            )
+            .expect("the join's SUCCEED");
+            assert_eq!(succeed.payload(), Some("[]"), "{name}");
+        }
     }
 
     /// A root context over `log` with an in-memory client, the coalescer

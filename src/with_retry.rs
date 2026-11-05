@@ -80,6 +80,7 @@ where
         let f = Arc::clone(&closure);
         let result: Result<O, crate::error::OperationError> = outer
             .run_in_child_context(move |attempt_ctx| f(attempt_ctx))
+            .without_user_function()
             .name(format!("attempt-{attempt}"))
             .serdes(Arc::clone(&serdes))
             .await;

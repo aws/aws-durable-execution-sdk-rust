@@ -19,11 +19,12 @@ use tracing::Instrument as _;
 
 use crate::Serdes;
 use crate::checkpoint_coalescer::ScopeClose;
-use crate::context::{ActiveBody, DurableContext, SubmittedWrite, run_body};
+use crate::context::{DurableContext, SubmittedWrite, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{
     ChildContextError, ChildContextErrorKind, ChildFnError, OperationError, OperationErrorKind,
 };
+use crate::plugin::UserBody;
 use crate::serdes::SerdesContext;
 use crate::start::StartStep;
 
@@ -52,7 +53,19 @@ pub(crate) struct ChildExecution<O, F, S> {
     pub(crate) sub_type: crate::OperationSubType,
     pub(crate) serdes: S,
     pub(crate) closure: F,
+    pub(crate) user_function: UserFunctionPolicy,
     pub(crate) _marker: std::marker::PhantomData<fn() -> O>,
+}
+
+/// Whether a child's body is a user function. Set by the caller, never
+/// inferred from the child's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UserFunctionPolicy {
+    /// A frame, wraps and user-function hooks.
+    Hooks,
+    /// None of them: a `with_retry` attempt, whose outer block is the user
+    /// function.
+    None,
 }
 
 impl<O, F, Fut, E, S> ChildExecution<O, F, S>
@@ -76,9 +89,9 @@ where
     /// step form (see [`crate::future::DurableFuture::for_start_step`]).
     #[cfg(test)]
     pub(crate) async fn execute(self) -> Result<O, OperationError> {
-        let (core, closure) = self.split();
+        let (core, closure, user_function) = self.split();
         let started = core.start();
-        Self::run(core, closure, started).await
+        Self::run(core, closure, user_function, started).await
     }
 
     /// Runs the child's start step now, on the caller's task, and returns
@@ -86,13 +99,13 @@ where
     pub(crate) fn execute_started(
         self,
     ) -> impl Future<Output = Result<O, OperationError>> + Send + 'static {
-        let (core, closure) = self.split();
+        let (core, closure, user_function) = self.split();
         let started = core.start();
-        Self::run(core, closure, started)
+        Self::run(core, closure, user_function, started)
     }
 
     /// Splits the execution into its non-generic core and the closure.
-    fn split(self) -> (ChildCore<O, S>, F) {
+    fn split(self) -> (ChildCore<O, S>, F, UserFunctionPolicy) {
         let Self {
             ctx,
             op_id,
@@ -100,6 +113,7 @@ where
             sub_type,
             serdes,
             closure,
+            user_function,
             _marker,
         } = self;
         let core = ChildCore {
@@ -110,13 +124,14 @@ where
             serdes,
             _marker: std::marker::PhantomData,
         };
-        (core, closure)
+        (core, closure, user_function)
     }
 
     /// The rest of the operation after its start step `started`.
     async fn run(
         core: ChildCore<O, S>,
         closure: F,
+        user_function: UserFunctionPolicy,
         started: Result<StartStep, OperationError>,
     ) -> Result<O, OperationError> {
         match core.before(started?).await? {
@@ -124,6 +139,7 @@ where
             ChildPrelude::Run {
                 child_ctx,
                 mode,
+                info,
                 start,
                 after,
             } => {
@@ -137,22 +153,48 @@ where
                 // The scope encloses the closure call, so code the closure
                 // runs before it returns its future is checked too.
                 let child_span = child_ctx.replay_span();
-                let body = ActiveBody::Context(child_ctx.prefix().to_owned());
+                let body = UserBody::Context(child_ctx.prefix().to_owned());
                 // The child's scope closes when the body returns, and also
                 // when this future is dropped before that, because the
-                // operation that owns the child was stopped.
-                let scope = ScopeClose::new(after.ctx.admission(), &after.wire_id);
-                let result = run_body(body, async move { (closure)(child_ctx).await })
-                    .instrument(child_span)
-                    .await
-                    .map_err(Into::into);
-                // The body returned, so the child is finished. An operation
-                // it started and did not await writes no further checkpoint,
-                // and its task stops (see `Admission`). The child's own
-                // terminal update below is written through the parent
+                // operation that owns the child was stopped. An operation
+                // the child started and did not await then writes no further
+                // checkpoint, and its task stops (see `Admission`). The
+                // child's own terminal update is written through the parent
                 // context, whose owners do not include this child, so it is
                 // admitted.
-                drop(scope);
+                let scope = ScopeClose::new(after.ctx.admission(), &after.wire_id);
+                let result = if mode == ChildRunMode::Live
+                    && user_function == UserFunctionPolicy::Hooks
+                {
+                    // A live body is a user function. Only the body
+                    // carries the span: the hooks and wraps run outside it.
+                    // The scope closes inside the body future, so it is
+                    // closed before the wire and the end hooks.
+                    crate::plugin::run_user_function(
+                        after.ctx.shared_plugins(),
+                        info,
+                        body,
+                        child_span,
+                        move || async move {
+                            let result = (closure)(child_ctx).await.map_err(Into::into);
+                            drop(scope);
+                            result
+                        },
+                        ChildFnError::failure_wire,
+                    )
+                    .await
+                    .into_parts()
+                    .map_err(|(error, wire)| (error, Some(wire)))
+                } else {
+                    // A reconstruction, or a `with_retry` attempt: no frame
+                    // and no user-function hook.
+                    let result = run_body(body.into(), async move { (closure)(child_ctx).await })
+                        .instrument(child_span)
+                        .await
+                        .map_err(|error| (error.into(), None));
+                    drop(scope);
+                    result
+                };
                 after.settle(mode, start, result).await
             }
         }
@@ -175,6 +217,7 @@ struct ChildCore<O, S> {
 
 /// Why the child body must run: a fresh live execution, or a re-execution
 /// reconstructing a result too large to checkpoint (`ReplayChildren`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildRunMode {
     /// Live path: checkpoint the outcome afterwards.
     Live,
@@ -195,6 +238,11 @@ enum ChildPrelude<O, S> {
         child_ctx: DurableContext,
         /// Live execution vs `ReplayChildren` reconstruction.
         mode: ChildRunMode,
+        /// The info `on_operation_start` received, with the replay flag
+        /// set to the child context's `is_replaying()` when the body
+        /// starts (JS: `isReplay: childReplayMode !== ExecutionMode`); the
+        /// user-function hooks receive this value.
+        info: std::sync::Arc<crate::plugin::OperationInfo>,
         /// The `START` write of this cycle, still in flight. The outcome
         /// write waits for it. `None` when the record already existed.
         start: Option<SubmittedWrite>,
@@ -282,6 +330,9 @@ where
         let serdes_ctx = SerdesContext::new(&wire_id, self.ctx.execution_arn());
 
         let mut mode = ChildRunMode::Live;
+        // The info `on_operation_start` received, when it fired: the start
+        // step built it from the same fields (see `ChildCore::start`).
+        let mut start_info = None;
         let start = match started {
             StartStep::Refused => return std::future::pending().await,
             StartStep::Queued(write) => Some(write),
@@ -307,9 +358,34 @@ where
                 }
                 // Started/Pending/Ready: re-enter child body (resume path).
                 // The start step fired the replay start hook.
-                _ => None,
+                _ => {
+                    start_info = Some(
+                        child_info(
+                            &self.ctx,
+                            &wire_id,
+                            self.sub_type.as_str(),
+                            self.name.as_deref(),
+                        )
+                        .with_replay(true),
+                    );
+                    None
+                }
             },
         };
+        if start.is_some() {
+            // No record: the start step queued `START` and fired the live
+            // start hook.
+            start_info = Some(
+                child_info(
+                    &self.ctx,
+                    &wire_id,
+                    self.sub_type.as_str(),
+                    self.name.as_deref(),
+                )
+                .with_status(crate::OperationStatus::Started)
+                .with_replay(false),
+            );
+        }
 
         // 4. Create child context with chained prefix.
         let Self {
@@ -321,9 +397,18 @@ where
         } = self;
         let child_ctx = ctx.new_child(&positional_id, name.as_deref());
 
+        // A reconstruction fires no start hook; its info is never read,
+        // because only a live body reaches the runner.
+        let info = start_info
+            .unwrap_or_else(|| child_info(&ctx, &wire_id, sub_type.as_str(), name.as_deref()));
+        // The user-function hooks see the child context's replay state at
+        // the body's start, not the record-based flag of the start hook: a
+        // resumed child with no inner record yet starts live.
+        let info = info.with_replay(child_ctx.is_replaying());
         Ok(ChildPrelude::Run {
             child_ctx,
             mode,
+            info: std::sync::Arc::new(info),
             start,
             after: ChildAfter {
                 ctx,
@@ -413,7 +498,7 @@ where
         self,
         mode: ChildRunMode,
         start: Option<SubmittedWrite>,
-        result: Result<O, ChildFnError>,
+        result: Result<O, (ChildFnError, Option<crate::error::WireError>)>,
     ) -> Result<O, OperationError> {
         let Self {
             ctx,
@@ -434,7 +519,7 @@ where
                         .await?;
                 deserialize_value(&ctx, name.as_deref(), serialized, &serdes, serdes_ctx).await
             }
-            (ChildRunMode::Reconstruct, Err(child_err)) => Err(OperationError::from_kind(
+            (ChildRunMode::Reconstruct, Err((child_err, _))) => Err(OperationError::from_kind(
                 OperationErrorKind::ChildContext(ChildContextError::new(
                     ChildContextErrorKind::ChildFailed,
                     Some(child_err.into_source()),
@@ -528,14 +613,20 @@ where
                 // Round-trip deserialize for consistency (first-run == replay).
                 deserialize_value(&ctx, name.as_deref(), serialized, &serdes, serdes_ctx).await
             }
-            (ChildRunMode::Live, Err(child_err)) => {
-                // Failure: checkpoint FAIL with error details.
+            (ChildRunMode::Live, Err((child_err, wire))) => {
+                // Failure: checkpoint FAIL with error details. A runner's
+                // wire is the one its end hooks saw.
                 ctx.await_retained_start(&wire_id, start, OperationAction::Fail)
                     .await?;
-                Err(
-                    checkpoint_live_failure(&ctx, name.as_deref(), sub_type, &wire_id, child_err)
-                        .await,
+                Err(checkpoint_live_failure(
+                    &ctx,
+                    name.as_deref(),
+                    sub_type,
+                    &wire_id,
+                    child_err,
+                    wire,
                 )
+                .await)
             }
         }
     }
@@ -654,12 +745,14 @@ async fn checkpoint_live_failure(
     sub_type: &str,
     wire_id: &str,
     child_err: ChildFnError,
+    wire: Option<crate::error::WireError>,
 ) -> OperationError {
     // Derive the wire failure from the error the body returned: the type
     // is the body error's recorded type, the message is its flattened
     // chain, and `error_data`/`stack_trace` pass through from its cause
     // chain, so an inner failure's payload survives this boundary.
-    let wire = child_err.failure_wire();
+    // A body without a runner (a `with_retry` attempt) has no wire yet.
+    let wire = wire.unwrap_or_else(|| child_err.failure_wire());
     let update = build_child_fail_update(wire_id, name, sub_type, ctx, &wire);
 
     // A rejected FAIL write routes unrecoverable: discarding it would
@@ -820,6 +913,7 @@ mod tests {
     use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
     use std::future::IntoFuture;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn child_failure_keeps_typed_error_data() {
@@ -970,6 +1064,312 @@ mod tests {
         assert_eq!(
             msg.as_deref(),
             Some("operation error: callback: external failure: denied")
+        );
+    }
+
+    /// A root context over `records` whose transport is a fresh in-memory
+    /// client, with the recorder's `p0` and `p1` as the invocation's
+    /// plugins and no checkpoint buffer window.
+    fn uf_ctx(
+        hooks: &crate::plugin::recorder::UfHooks,
+        records: Vec<(String, CheckpointRecord)>,
+    ) -> (DurableContext, Arc<crate::client::InMemoryExecutionClient>) {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::from_records(records)),
+            Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
+            "token0".to_owned(),
+            None,
+            Some(hooks.plugins()),
+        );
+        (ctx, client)
+    }
+
+    /// A record of the operation at `positional_id` with `status` and no
+    /// payload.
+    fn record_at(positional_id: &str, status: CheckpointStatus) -> (String, CheckpointRecord) {
+        let (wire_id, mut record) = succeeded_record(positional_id, "null");
+        record.status = status;
+        record.result = None;
+        (wire_id, record)
+    }
+
+    /// The fatal error message `ctx`'s invocation recorded.
+    fn fatal_message(ctx: &DurableContext) -> String {
+        ctx.coordinator()
+            .fatal_error()
+            .expect("fatal recorded")
+            .error_message
+    }
+
+    /// Rule 8.2: a failing child, `map` item and `parallel` branch derive
+    /// their wire under `ActiveBody::Outcome`, so a wait that the error's
+    /// `Display` calls on the captured child context fails the execution
+    /// with a context usage error naming the operation. The `Display`
+    /// runs once.
+    #[tokio::test]
+    async fn failing_child_item_branch_display_calls_its_context() {
+        use crate::builders::map_parallel::CompletionConfig;
+        use crate::plugin::recorder::{Counted, UfHooks};
+        let claims_wait = |dc: &Counted, child: DurableContext| -> crate::BoxError {
+            dc.sharing(move || drop(child.wait(Duration::from_secs(1))))
+                .boxed()
+        };
+
+        // A child.
+        let (ctx, _client) = uf_ctx(&UfHooks::default(), Vec::new());
+        let dc = Counted::new();
+        let body_dc = dc.clone();
+        let err = ctx
+            .run_in_child_context(move |child| async move {
+                Err::<u32, crate::BoxError>(claims_wait(&body_dc, child))
+            })
+            .name("c")
+            .await
+            .unwrap_err();
+        drop(err);
+        assert_eq!(dc.calls(), 1, "child");
+        let message = fatal_message(&ctx);
+        assert!(
+            message.contains("while the SDK records the outcome of operation \"1\""),
+            "{message}"
+        );
+
+        // A `map` item.
+        let (ctx, _client) = uf_ctx(&UfHooks::default(), Vec::new());
+        let dc = Counted::new();
+        let body_dc = dc.clone();
+        let batch = ctx
+            .map(vec![1_u32], move |child, _item, _idx| {
+                let error = claims_wait(&body_dc, child);
+                async move { Err::<u32, crate::BoxError>(error) }
+            })
+            .name("m")
+            .completion(CompletionConfig::with_tolerated_failure_count(1))
+            .await_batch()
+            .await;
+        drop(batch);
+        assert_eq!(dc.calls(), 1, "map item");
+        let message = fatal_message(&ctx);
+        assert!(
+            message.contains("while the SDK records the outcome of operation \"1-1\""),
+            "{message}"
+        );
+
+        // A `parallel` branch.
+        let (ctx, _client) = uf_ctx(&UfHooks::default(), Vec::new());
+        let dc = Counted::new();
+        let body_dc = dc.clone();
+        let branch = crate::Branch::new("b", move |child| async move {
+            Err::<u32, crate::BoxError>(claims_wait(&body_dc, child))
+        });
+        let batch = ctx
+            .parallel(vec![branch])
+            .name("p")
+            .completion(CompletionConfig::with_tolerated_failure_count(1))
+            .await_batch()
+            .await;
+        drop(batch);
+        assert_eq!(dc.calls(), 1, "parallel branch");
+        let message = fatal_message(&ctx);
+        assert!(
+            message.contains("while the SDK records the outcome of operation \"1-1\""),
+            "{message}"
+        );
+    }
+
+    /// Rule 7.3: the user-function hooks and wraps of a child get the
+    /// child context's replay flag when the body starts: false in the
+    /// invocation that starts it, true in the one that resumes it over
+    /// its inner wait. The wraps and the end hook get the start hook's
+    /// info.
+    #[tokio::test]
+    async fn child_body_info_has_child_replay_flag() {
+        use crate::plugin::recorder::UfHooks;
+        let child = |ctx: &DurableContext| {
+            ctx.run_in_child_context(|child| async move {
+                child.wait(Duration::from_secs(1)).name("w").await?;
+                Ok(5_u32)
+            })
+            .name("c")
+        };
+
+        // Invocation 1: the child suspends at its wait.
+        let hooks = UfHooks::default();
+        let (ctx, _client) = uf_ctx(&hooks, Vec::new());
+        let signal = Arc::clone(ctx.coordinator());
+        let ownership = Arc::clone(ctx.task_ownership());
+        let outcome =
+            crate::driver::test_support::outcome_of(ctx.clone(), ownership, signal, child(&ctx))
+                .await;
+        assert_eq!(outcome, crate::driver::InvocationOutcome::Pending);
+        let start = hooks.find("c", "uf_start");
+        assert!(!start.replay);
+        assert!(!hooks.hooks_of("c").contains(&"uf_end"));
+
+        // Invocation 2: the child is STARTED and its wait succeeded.
+        let hooks = UfHooks::default();
+        let records = vec![
+            record_at("1", CheckpointStatus::Started),
+            record_at("1-1", CheckpointStatus::Succeeded),
+        ];
+        let (ctx, _client) = uf_ctx(&hooks, records);
+        assert_eq!(child(&ctx).await.unwrap(), 5);
+        let start = hooks.find("c", "uf_start");
+        assert!(start.replay);
+        let records = hooks.of("c");
+        let later: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.hook, "wrap_enter" | "wrap_exit" | "uf_end"))
+            .collect();
+        assert!(later.iter().any(|r| r.hook == "uf_end"), "{records:?}");
+        for record in &later {
+            assert_eq!(
+                record.info, start.info,
+                "{} gets the start hook's info",
+                record.hook
+            );
+        }
+        assert_eq!(hooks.find("c", "uf_end").ok, Some(true));
+    }
+
+    /// Rule 7.3: a STARTED child with no inner record reports a replay to
+    /// `on_operation_start` and none to its user-function hooks and wraps.
+    #[tokio::test]
+    async fn started_child_without_inner_record_replay_flags() {
+        use crate::plugin::recorder::UfHooks;
+        let hooks = UfHooks::default();
+        let (ctx, _client) = uf_ctx(&hooks, vec![record_at("1", CheckpointStatus::Started)]);
+        let value = ctx
+            .run_in_child_context(|child| async move {
+                Ok(child.step(|_| async { Ok(3_u32) }).name("s").await?)
+            })
+            .name("c")
+            .await
+            .unwrap();
+        assert_eq!(value, 3);
+        assert!(hooks.find("c", "start").replay);
+        let records = hooks.of("c");
+        let user_function: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.hook, "uf_start" | "wrap_enter" | "wrap_exit" | "uf_end"))
+            .collect();
+        // One start, a wrap per poll, one end.
+        let hook_names: Vec<_> = user_function.iter().map(|r| r.hook).collect();
+        let wraps = hook_names
+            .get(1..hook_names.len().saturating_sub(1))
+            .unwrap_or_default();
+        assert_eq!(hook_names.first(), Some(&"uf_start"), "{hook_names:?}");
+        assert_eq!(hook_names.last(), Some(&"uf_end"), "{hook_names:?}");
+        assert!(
+            !wraps.is_empty()
+                && wraps
+                    .chunks(2)
+                    .all(|pair| pair == ["wrap_enter", "wrap_exit"]),
+            "{hook_names:?}"
+        );
+        assert!(user_function.iter().all(|r| !r.replay), "{user_function:?}");
+    }
+
+    /// Rule 7.9: a child's scope closes before its end hooks. At the end
+    /// hook the scope admits nothing and the step the body spawned and did
+    /// not await is aborted; the child records the body's result.
+    #[tokio::test]
+    async fn child_scope_closed_before_end_hooks() {
+        use crate::plugin::recorder::UfHooks;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Sets its flag when dropped.
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let child_wire = crate::engine::compute_wire_id_public("1");
+        let admission: Arc<std::sync::OnceLock<Arc<crate::checkpoint_coalescer::Admission>>> =
+            Arc::default();
+        let probe_admission = Arc::clone(&admission);
+        let probe_wire = child_wire.clone();
+        let hooks = UfHooks::probing(move || {
+            let Some(admission) = probe_admission.get() else {
+                return String::new();
+            };
+            format!(
+                "admits={} task={}",
+                admission.admits(std::slice::from_ref(&probe_wire)),
+                admission.has_task_in(&probe_wire)
+            )
+        });
+        let (ctx, client) = uf_ctx(&hooks, Vec::new());
+        admission
+            .set(Arc::clone(ctx.admission()))
+            .expect("set once");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard_flag = Arc::clone(&dropped);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::driver::test_support::drive_handler(ctx, None, move |ctx| async move {
+                let value = ctx
+                    .run_in_child_context(move |child| async move {
+                        // The step task holds the only references.
+                        let guard = Arc::new(Dropped(guard_flag));
+                        let pending = child
+                            .step(move |_| async move {
+                                let _guard = guard;
+                                std::future::pending::<()>().await;
+                                Ok(0_u32)
+                            })
+                            .name("pending")
+                            .spawn();
+                        drop(pending);
+                        Ok(5_u32)
+                    })
+                    .name("c")
+                    .await
+                    .map_err(crate::driver::test_support::wire_err)?;
+                Ok(value.to_string())
+            }),
+        )
+        .await
+        .expect("the invocation ends within 5 s")
+        .expect("no panic");
+        assert_eq!(
+            outcome,
+            crate::driver::InvocationOutcome::Complete("5".to_owned())
+        );
+        assert_eq!(hooks.find("c", "uf_start").probe, "admits=true task=false");
+        assert_eq!(
+            hooks.find("c", "wrap_enter").probe,
+            "admits=true task=false"
+        );
+        assert_eq!(
+            hooks.find("c", "wrap_exit").probe,
+            "admits=false task=false"
+        );
+        assert_eq!(hooks.find("c", "uf_end").probe, "admits=false task=false");
+        let succeed = client
+            .recorded_updates()
+            .into_iter()
+            .find(|u| u.name() == Some("c") && u.action() == &OperationAction::Succeed)
+            .expect("the child's SUCCEED");
+        assert_eq!(succeed.payload(), Some("5"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the step's task stopped");
+        assert!(
+            client
+                .recorded_updates()
+                .iter()
+                .all(|u| u.name() != Some("pending") || u.action() == &OperationAction::Start),
+            "the stopped step records no outcome"
         );
     }
 
@@ -1478,7 +1878,7 @@ mod tests {
             .spawn();
 
         // The child body should have started BEFORE we await the handle.
-        let signal = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
+        let signal = tokio::time::timeout(Duration::from_secs(2), rx).await;
         assert_eq!(
             signal.ok().and_then(Result::ok),
             Some(()),

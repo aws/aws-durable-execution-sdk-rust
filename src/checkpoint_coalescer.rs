@@ -178,6 +178,15 @@ impl Admission {
         !owners.iter().any(|owner| state.abandoned.contains(owner))
     }
 
+    /// Whether a task started inside `owner` is registered and not aborted.
+    #[cfg(test)]
+    pub(crate) fn has_task_in(&self, owner: &str) -> bool {
+        self.lock()
+            .tasks
+            .iter()
+            .any(|(owners, _)| owners.iter().any(|o| o == owner))
+    }
+
     /// Registers an operation task started inside `owners`, so the close
     /// of any of them aborts it. Aborts it at once when one of them is
     /// already closed. Forgets the registered tasks that have finished.

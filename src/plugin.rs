@@ -13,8 +13,9 @@
 //!   X-Ray trace header;
 //! - lifecycle hooks for the invocation, each operation, each attempt, and
 //!   each change the service reports;
-//! - wrap hooks that run around the invocation, a step attempt or
-//!   condition check, a child context body, and each SDK operation task;
+//! - wrap hooks that make the plugin's context current around each poll of
+//!   the invocation and of each user function, also on the SDK tasks they
+//!   start, and start and end hooks around each user function;
 //! - a propagation hook that supplies the X-Ray header of a chained invoke.
 //!
 //! Every [`Plugin`] method has a no-op default, so a plugin implements only
@@ -82,6 +83,14 @@ use tokio::task::JoinHandle;
 use crate::coordinator::InvocationCoordinator;
 use crate::engine::{CheckpointLog, CheckpointRecord, CheckpointStatus};
 use crate::{BoxError, InvocationStatus, OperationKind, OperationStatus, WireError};
+
+#[cfg(test)]
+pub(crate) mod recorder;
+mod scope;
+
+pub(crate) use scope::{
+    Frames, Ran, UserBody, never_fails, run_user_function, run_user_function_at,
+};
 
 /// The `tracing` target of every warning the SDK logs for a plugin.
 pub(crate) const TARGET: &str = "aws_durable_execution_sdk::plugin";
@@ -156,8 +165,7 @@ pub trait PluginFactory: Send + Sync + 'static {
 /// hook.
 ///
 /// No hook future may block a thread, in `poll` or in `Drop`. The futures
-/// of [`wrap_task`](Self::wrap_task) and of the operation hooks are
-/// `'static`; a plugin that needs its own state there clones an owned
+/// of the operation hooks are `'static`; a plugin that needs its own state there clones an owned
 /// handle, such as an `Arc` field, into the future.
 ///
 /// # Errors and panics
@@ -180,69 +188,18 @@ pub trait PluginFactory: Send + Sync + 'static {
 /// `factory = "<factory type> (plugins[<i>])"` instead. `<i>` is the
 /// 0-based registration index of the factory.
 ///
-/// # Wrap hooks
+/// # User functions
 ///
+/// A **user function** is one run of code that the SDK owns and polls for
+/// an operation, such as a step attempt or a child context body.
 /// [`wrap_invocation`](Self::wrap_invocation),
-/// [`wrap_attempt`](Self::wrap_attempt),
-/// [`wrap_child_context`](Self::wrap_child_context) and
-/// [`wrap_task`](Self::wrap_task) receive a [`Next`] that runs the inner
-/// work: the inner wrappers and the body. If a wrapper returns, returns
-/// `Err`, panics or drops `next`, the body runs once and its value is the
-/// operation's result. A wrapper that stays pending delays the body (before
-/// `next`) or the outcome checkpoint (after `next`) until it finishes, as in
-/// JS; the SDK sets no time limit.
-///
-/// 1. The first registered plugin's wrapper is outermost. The SDK calls a
-///    wrapper's method when its link is first polled, so an outer wrapper's
-///    code before `next` runs before an inner wrapper is called.
-/// 2. `next.await` runs the inner wrappers and the body. It returns
-///    `Ok(())` when the body succeeded, or `Err` with the [`WireError`] the
-///    SDK records for the body's error. The operation's result is always
-///    the body's. A wrapper cannot inspect the typed successful value.
-///    [`on_operation_end`](Self::on_operation_end) can inspect the
-///    serialized checkpoint payload through [`OperationInfo::result`] when
-///    the terminal update carries one; it is `None` when that update
-///    carries no payload. An object-safe `Plugin` cannot expose a method
-///    generic over each operation's output type; keeping typed inline
-///    observation would need another erased-value hook. The SDK provides
-///    the smaller API.
-/// 3. The SDK calls the user closure inside the body future. So the
-///    closure's synchronous part runs at the first poll of `next`, inside
-///    every wrapper that awaits it.
-/// 4. A wrapper that ends without leaving the body to finish inside it is
-///    contained: it returns `Err`, panics (in the method or in its future),
-///    drops `next`, or returns `Ok` without awaiting `next`. The SDK then
-///    polls the rest of the chain itself: the inner wrappers keep running,
-///    and the body runs to its end. `Err` and panics are logged. Returning
-///    `Ok` without awaiting `next` is legal and logs nothing.
-/// 5. A wrapper that stays pending is not contained. Pending before it
-///    polls `next`, it delays the inner wrappers and the body. Pending
-///    after `next` completed, it delays the outcome checkpoint. The delay
-///    lasts as long as the wrapper stays pending, as in JS. The SDK sets no
-///    time limit. [`WireError`] does not implement `std::error::Error`, so
-///    `next.await?` does not compile in a hook future: match on
-///    `next.await`, or ignore it with `let _ = next.await;`.
-/// 6. The operation continues after every wrapper has finished. A
-///    wrapper's work after `next` runs before the SDK serializes the result
-///    or writes the outcome checkpoint.
-/// 7. A body panic is never visible to a wrapper. `next` stays pending, the
-///    SDK drops every wrapper future, and then resumes the original
-///    payload.
-/// 8. Dropping the operation (suspension, early completion) drops every
-///    wrapper and the body. No wrapper code runs after that, and no
-///    reference cycle keeps the body alive.
-/// 9. [`wrap_task`](Self::wrap_task) runs on the task that starts a tracked
-///    SDK operation task (`.spawn()`, a map item, a parallel branch, a
-///    combinator input), before the new task runs. Its future runs on the
-///    new task around all of the task's work, outside that task's own
-///    wrappers. It is never called for the SDK's detached work (the
-///    checkpoint flusher, detached writes) or for hook work. The SDK
-///    carries plugin context only onto the tracked operation tasks it
-///    starts. A task the user starts is outside SDK propagation and must
-///    use the relevant explicit carrier: `tracing` instrumentation,
-///    capturing the OpenTelemetry `Context::current()` and calling
-///    `.with_context(captured)` on the future, or the plugin's own
-///    mechanism.
+/// [`wrap_user_function`](Self::wrap_user_function),
+/// [`on_user_function_start`](Self::on_user_function_start) and
+/// [`on_user_function_end`](Self::on_user_function_end) observe the
+/// invocation and each user function. The documentation of
+/// `wrap_user_function` lists the user functions and gives the contract of
+/// the four methods. Its section on durable operations in plugin code
+/// applies to every method of this trait.
 pub trait Plugin: Send + Sync {
     /// The name the SDK uses for this plugin in its warnings. The default
     /// is the implementing type's path.
@@ -288,6 +245,10 @@ pub trait Plugin: Send + Sync {
     ///    completion.
     /// 5. An `Err` or a panic is logged at WARN with the plugin's name and
     ///    registration index, and changes nothing else.
+    /// 6. An operation that claims an operation ID here records a context
+    ///    usage error, as anywhere in plugin code. No operation of the
+    ///    invocation follows this hook, so the claim shifts no ID the
+    ///    execution uses, and the response is the one built before it.
     fn on_invocation_end<'a>(&'a self, _info: &'a InvocationEndInfo) -> HookFuture<'a> {
         Box::pin(std::future::ready(Ok(())))
     }
@@ -298,8 +259,12 @@ pub trait Plugin: Send + Sync {
     ///
     /// - an operation replayed from a terminal record fires no hook;
     /// - every live attempt fires `on_operation_start`, then
-    ///   `on_attempt_start`. `is_replay` is `true` from the second attempt
-    ///   on, and when the attempt re-enters a `STARTED` record;
+    ///   `on_attempt_start`. `on_operation_start`'s `is_replay` is `true`
+    ///   from the second attempt on, and when the attempt re-enters a
+    ///   `STARTED` record. The attempt's own metadata,
+    ///   [`AttemptInfo::operation`]`().is_replay()`, which the attempt end
+    ///   and the user-function hooks and wrap also receive, is `false`, as
+    ///   in JS;
     /// - an attempt that schedules a retry fires only `on_attempt_end`;
     /// - the attempt that ends the operation fires `on_attempt_end`, then
     ///   `on_operation_end`.
@@ -447,8 +412,12 @@ pub trait Plugin: Send + Sync {
     ///
     /// - an operation replayed from a terminal record fires no hook;
     /// - every live attempt fires `on_operation_start`, then
-    ///   `on_attempt_start`. `is_replay` is `true` from the second attempt
-    ///   on, and when the attempt re-enters a `STARTED` record;
+    ///   `on_attempt_start`. `on_operation_start`'s `is_replay` is `true`
+    ///   from the second attempt on, and when the attempt re-enters a
+    ///   `STARTED` record. The attempt's own metadata,
+    ///   [`AttemptInfo::operation`]`().is_replay()`, which the attempt end
+    ///   and the user-function hooks and wrap also receive, is `false`, as
+    ///   in JS;
     /// - an attempt that schedules a retry fires only `on_attempt_end`;
     /// - the attempt that ends the operation fires `on_attempt_end`, then
     ///   `on_operation_end`.
@@ -584,8 +553,12 @@ pub trait Plugin: Send + Sync {
     ///
     /// - an operation replayed from a terminal record fires no hook;
     /// - every live attempt fires `on_operation_start`, then
-    ///   `on_attempt_start`. `is_replay` is `true` from the second attempt
-    ///   on, and when the attempt re-enters a `STARTED` record;
+    ///   `on_attempt_start`. `on_operation_start`'s `is_replay` is `true`
+    ///   from the second attempt on, and when the attempt re-enters a
+    ///   `STARTED` record. The attempt's own metadata,
+    ///   [`AttemptInfo::operation`]`().is_replay()`, which the attempt end
+    ///   and the user-function hooks and wrap also receive, is `false`, as
+    ///   in JS;
     /// - an attempt that schedules a retry fires only `on_attempt_end`;
     /// - the attempt that ends the operation fires `on_attempt_end`, then
     ///   `on_operation_end`.
@@ -615,8 +588,12 @@ pub trait Plugin: Send + Sync {
     ///
     /// - an operation replayed from a terminal record fires no hook;
     /// - every live attempt fires `on_operation_start`, then
-    ///   `on_attempt_start`. `is_replay` is `true` from the second attempt
-    ///   on, and when the attempt re-enters a `STARTED` record;
+    ///   `on_attempt_start`. `on_operation_start`'s `is_replay` is `true`
+    ///   from the second attempt on, and when the attempt re-enters a
+    ///   `STARTED` record. The attempt's own metadata,
+    ///   [`AttemptInfo::operation`]`().is_replay()`, which the attempt end
+    ///   and the user-function hooks and wrap also receive, is `false`, as
+    ///   in JS;
     /// - an attempt that schedules a retry fires only `on_attempt_end`;
     /// - the attempt that ends the operation fires `on_attempt_end`, then
     ///   `on_operation_end`.
@@ -644,44 +621,597 @@ pub trait Plugin: Send + Sync {
         Ok(None)
     }
 
-    /// Wraps the whole invocation: the handler and everything it awaits.
-    /// See the wrap hooks section of [`Plugin`].
-    fn wrap_invocation<'a>(&'a self, _info: &'a InvocationInfo, next: Next<'a>) -> HookFuture<'a> {
-        Box::pin(async move {
-            let _ = next.await;
-            Ok(())
-        })
+    /// Makes this plugin's context current around each poll of the
+    /// invocation.
+    ///
+    /// The SDK awaits [`on_invocation_start`](Self::on_invocation_start)
+    /// first. Then every poll of the rest of the invocation runs inside the
+    /// `wrap_invocation` of every plugin, the first registered plugin's
+    /// outermost: the handler, every SDK task that runs an operation, the
+    /// end-of-invocation flush, the drain of the hook work and
+    /// [`on_invocation_end`](Self::on_invocation_end). A wrap that calls
+    /// `next()` inside its context, for example with a `tracing` span's
+    /// `in_scope`, makes the context current in all of that code. The
+    /// invocation is no user function, so no start or end hook fires for it;
+    /// the wraps of each user function run inside these wraps, as
+    /// [`wrap_user_function`](Self::wrap_user_function) describes.
+    ///
+    /// `next()` follows the rules of `wrap_user_function`: it runs the rest
+    /// of the chain once, the SDK calls it right after the wrap when the
+    /// wrap returns or panics without calling it, and a second call does
+    /// nothing. A wrap runs on whichever thread polls, as often as the SDK
+    /// polls, so it must be cheap and must not block. This wrap's `next()`
+    /// runs every hook and wrap of the invocation, this plugin's included,
+    /// so do not hold across it a non-reentrant lock that any hook or wrap
+    /// of this plugin can take.
+    ///
+    /// The SDK drops the rest of the invocation inside these wraps. When the
+    /// handler panics, or another panic fails the invocation, the panic
+    /// continues after `on_invocation_end` ran and after every plugin was
+    /// dropped. Code of this wrap after `next()` in the last poll runs after
+    /// the SDK decided the invocation's outcome: a durable operation it
+    /// calls is recorded as a context usage error and changes nothing, as
+    /// the section on durable operations of `wrap_user_function` says.
+    ///
+    /// A panic in this wrap is logged at WARN, with the field
+    /// `hook = "wrap_invocation"`, and changes nothing else.
+    fn wrap_invocation(&self, _info: &InvocationInfo, next: &mut dyn FnMut()) {
+        next();
     }
 
-    /// Wraps one step attempt or condition check. See the wrap hooks
-    /// section of [`Plugin`].
-    fn wrap_attempt<'a>(&'a self, _info: &'a AttemptInfo, next: Next<'a>) -> HookFuture<'a> {
-        Box::pin(async move {
-            let _ = next.await;
-            Ok(())
-        })
+    /// Makes this plugin's context current around each poll of a user
+    /// function.
+    ///
+    /// A **user function** is one run of code that the SDK owns and polls
+    /// for an operation:
+    ///
+    /// - a step attempt, including the submitter step of a
+    ///   `wait_for_callback` named `<name>-submitter`;
+    /// - a `wait_for_condition` check;
+    /// - a `run_in_child_context` body, the block of a `with_retry`, and the
+    ///   body of a `wait_for_callback`;
+    /// - each item of a `map` and each branch of a `parallel` or
+    ///   `parallel_mixed`, and the container of each of those three, whose
+    ///   user function produces the batch from the items;
+    /// - the join of each combinator: `try_join_all`, `join_all`,
+    ///   `select_ok` and `race`.
+    ///
+    /// # Order
+    ///
+    /// For one user function and two plugins `p0` and `p1`, registered in
+    /// that order, all of the following runs on the task that polls the
+    /// user function.
+    ///
+    /// 1. [`on_operation_start`](Self::on_operation_start) and, for a step
+    ///    attempt or a check, [`on_attempt_start`](Self::on_attempt_start)
+    ///    run first, as for any operation.
+    /// 2. At the first poll, `p0.on_user_function_start` runs. When it
+    ///    started `p0`, `p0.wrap_user_function` runs, and inside its
+    ///    `next()` the same happens for `p1`. Inside `p1`'s `next()` the SDK
+    ///    polls the user function. A start hook whose synchronous call
+    ///    returns `Err` or panics did not start its plugin: that plugin gets
+    ///    no wrap and no end hook for this user function, and the SDK logs a
+    ///    warning. A start hook that returns `Ok(Some(future))` started its
+    ///    plugin, and a later failure of that future is only logged.
+    /// 3. At every poll, the wraps of the started plugins run, then the SDK
+    ///    enters the operation's `tracing` span, then it polls the user
+    ///    function. The SDK calls the user's closure at the first poll,
+    ///    inside the wraps and the span. Later polls run no start hook.
+    /// 4. In the poll in which the user function returns, the SDK derives
+    ///    the error it records, once, when the user function failed. The
+    ///    wraps then unwind with no await between them: `p1`'s wrap returns,
+    ///    `p1.on_user_function_end` runs inside `p0`'s wrap, `p0`'s wrap
+    ///    returns, and `p0.on_user_function_end` runs. So the start hooks
+    ///    run in registration order and the end hooks in reverse.
+    /// 5. Then the SDK serializes the value, writes the outcome checkpoint,
+    ///    and fires [`on_attempt_end`](Self::on_attempt_end) for a step
+    ///    attempt or a check, and
+    ///    [`on_operation_end`](Self::on_operation_end). So an end hook runs
+    ///    before the outcome is recorded.
+    ///
+    /// # Nesting and `next()`
+    ///
+    /// The wraps nest by user function. The invocation's wraps
+    /// ([`wrap_invocation`](Self::wrap_invocation)) are outermost, then the
+    /// wraps of each enclosing user function, outermost first, then the
+    /// wraps of the user function itself. Within one of them, the first
+    /// registered plugin's wrap is outermost. Each poll runs each wrap once.
+    ///
+    /// `next()` runs the rest of the chain once. When a wrap returns or
+    /// panics without calling `next()`, the SDK calls it right after that
+    /// wrap exited, so the rest of the chain, the later plugins' start and
+    /// end hooks included, runs outside that wrap. A second call to
+    /// `next()` does nothing. So the user function always runs, and its
+    /// value is the operation's result: a plugin cannot skip a user
+    /// function or replace its result. `next` cannot be stored, sent to
+    /// another thread or awaited; the examples at the end show each case
+    /// failing to compile.
+    ///
+    /// The wraps also run around every poll of an SDK task that runs an
+    /// operation started inside the user function: an operation started
+    /// with `.spawn()`, a map item, a parallel branch, a combinator input.
+    /// An operation started with `.spawn()`, and a `.future()` that a
+    /// combinator starts, keep the wraps and the `tracing` span of the code
+    /// that made them. An operation awaited directly runs in the wraps and
+    /// the span of the code that awaits it.
+    ///
+    /// Inside a wrap, the current `tracing` span is the poller's. The SDK
+    /// enters the operation's span inside the innermost `next()`, so the
+    /// user function runs in it, and so does the synchronous code of a map
+    /// item's closure. The start hooks, and the formatting of the error
+    /// that the SDK records, run outside the operation's span.
+    ///
+    /// A wrap runs on whichever thread polls, as often as the SDK polls, and
+    /// the synchronous part of each start and end hook runs on the
+    /// operation's path. All of them must be cheap and must not block; put
+    /// slow work in the future a hook returns.
+    ///
+    /// `next()` runs the later plugins' hooks and wraps, and the hooks and
+    /// wraps of every user function polled inside this one, this plugin's
+    /// own included. So do not hold across `next()` a non-reentrant lock,
+    /// such as a `std::sync::Mutex` guard or a `RefCell` borrow, that any
+    /// hook or wrap of this plugin can take: it deadlocks or panics. Copy
+    /// what the wrap needs out of the lock, release it, then call `next()`,
+    /// as the first example does.
+    ///
+    /// # End hooks and hook work
+    ///
+    /// [`on_user_function_end`](Self::on_user_function_end) receives
+    /// `Ok(())` when the user function returned `Ok`, and otherwise the
+    /// [`WireError`] the SDK records for its error. It never receives the
+    /// value.
+    ///
+    /// The SDK calls each start and end hook synchronously, catching a
+    /// panic, as it calls `on_operation_start`. A future a hook returns runs
+    /// on its own task. The SDK never awaits it on the operation's path, and
+    /// it does not keep the invocation from suspending. The SDK waits for it
+    /// only in the drain before `on_invocation_end`, until 500 ms before the
+    /// invocation deadline, and aborts it then. Hook futures complete in no
+    /// defined order.
+    ///
+    /// # When no hook fires
+    ///
+    /// A user function that panics gets no end hook; its panic continues
+    /// after every wrap returned. A user function that the SDK drops before
+    /// it returns gets no end hook either: its scope closed, a combinator
+    /// stopped it as a loser, its batch completed early, or the invocation
+    /// ended. The SDK drops it inside its wraps, so a destructor in it runs
+    /// in the plugins' context. A container whose item `START` write fails
+    /// fails the invocation and never returns, so it gets no end hook.
+    ///
+    /// These run no user function and fire no start hook, no wrap and no
+    /// end hook:
+    ///
+    /// - an operation replayed from a terminal record;
+    /// - a child context run again to rebuild a result that its record did
+    ///   not store (`ReplayChildren`);
+    /// - a step attempt interrupted under
+    ///   [`StepSemantics::AtMostOncePerRetry`](crate::StepSemantics::AtMostOncePerRetry),
+    ///   which the SDK records as failed;
+    /// - a step waiting for its retry delay;
+    /// - the `attempt-N` child contexts of a `with_retry` block. The block is
+    ///   the user function, and its attempts run inside its wraps; the
+    ///   attempts still fire their operation hooks;
+    /// - the join of a combinator that fails because an input was not
+    ///   claimed, after its own `START` and `on_operation_start`.
+    ///
+    /// # Durable operations in plugin code
+    ///
+    /// A plugin receives no [`DurableContext`](crate::DurableContext), so it
+    /// can reach an operation only through a value the handler gave it. When
+    /// plugin code that the SDK runs creates a durable operation, the
+    /// operation's builder is built as usual and takes its operation ID,
+    /// and the SDK records a context usage error that names plugin code, as
+    /// it does for an operation created in a step body. Plugin code is
+    /// every hook, wrap and factory, [`name`](Self::name), each poll and
+    /// drop of a future a hook returns, the `Display` and destructor of an
+    /// error a hook returns, the destructor of a plugin's panic payload, and
+    /// a `tracing` subscriber that the SDK calls for a warning about a
+    /// plugin. Like the step-body check, the check runs where an operation
+    /// takes its ID. Most builders take it when the operation is created; a
+    /// combinator takes it when it is first polled or spawned. The check does
+    /// not follow a builder or future that other code created and that took
+    /// its ID, a later poll of it, a handle returned by `.spawn()`, or code
+    /// on a task or thread that the plugin starts itself.
+    ///
+    /// A context usage error recorded before the SDK decides the
+    /// invocation's outcome fails the execution. One recorded later, by a
+    /// hook's future during the drain, by `on_invocation_end`, or by
+    /// [`wrap_invocation`](Self::wrap_invocation)'s code after `next()` in
+    /// the last poll, is recorded but changes neither the response nor
+    /// whether a later panic fails the invocation.
+    ///
+    /// [`PluginFactory::exclusive_group`] is not plugin code here:
+    /// [`OptionsBuilder::build`](crate::OptionsBuilder::build) calls it
+    /// once, on its caller's stack, before any invocation, outside the
+    /// check.
+    ///
+    /// A plugin destructor that runs after the SDK returned the response,
+    /// for example of a value the plugin kept beyond the invocation, is
+    /// outside every guarantee here.
+    ///
+    /// # The operation metadata and its replay flag
+    ///
+    /// The start hook, the wrap and the end hook of one user function
+    /// receive the same `info`.
+    ///
+    /// - For a step attempt or a check, it is the value
+    ///   [`AttemptInfo::operation`] returns to `on_attempt_start`: its
+    ///   status is `Started`, [`attempt()`](OperationInfo::attempt) is the
+    ///   attempt number, and [`is_replay()`](OperationInfo::is_replay) is
+    ///   `false`. `on_operation_start` can report `is_replay` `true` for the
+    ///   same attempt, from the second attempt on or on a `STARTED` record.
+    /// - For a child context body, a map item, a parallel branch or a
+    ///   container, it is `on_operation_start`'s value with `is_replay` set
+    ///   to whether the child context replays when the body starts. So a
+    ///   resumed child with no record inside it reports `true` to
+    ///   `on_operation_start` and `false` here. A `NestingMode::Flat` item
+    ///   or branch has [`is_virtual()`](OperationInfo::is_virtual) `true`.
+    /// - For a combinator's join, it is `on_operation_start`'s value
+    ///   unchanged: `is_replay` is `false` when the combinator is new and
+    ///   `true` when it resumes a `STARTED` record of an earlier invocation.
+    ///
+    /// # Tasks the handler starts
+    ///
+    /// The wraps run around the handler's task and the SDK tasks that run
+    /// operations. A task the SDK starts for other work, such as the future
+    /// a hook returns, and a task the handler starts itself, with
+    /// `tokio::spawn` or a thread, carry no plugin context. To carry the
+    /// context into the handler's own task, wrap the task's future in a
+    /// carrier: `tracing`'s `.instrument(tracing::Span::current())`,
+    /// OpenTelemetry's `.with_current_context()`, or `LocalKey::scope` for
+    /// a task-local value.
+    ///
+    /// # Examples
+    ///
+    /// A plugin in the shape of OpenTelemetry stores a context for each user
+    /// function in its start hook and attaches it around `next()`. The
+    /// `Context` type below stands in for `opentelemetry::Context`, so the
+    /// example has no dependency; with OpenTelemetry, `Context::attach` and
+    /// its guard do the same. The wrap clones the context out of the lock
+    /// and releases the lock before it calls `next()`.
+    ///
+    /// ```
+    /// use std::cell::RefCell;
+    /// use std::collections::HashMap;
+    /// use std::sync::Mutex;
+    ///
+    /// use aws_durable_execution_sdk::WireError;
+    /// use aws_durable_execution_sdk::plugin::{HookWork, OperationInfo, Plugin};
+    ///
+    /// /// Stands in for `opentelemetry::Context`.
+    /// #[derive(Clone)]
+    /// struct Context {
+    ///     operation_id: String,
+    /// }
+    ///
+    /// thread_local! {
+    ///     static CURRENT: RefCell<Option<Context>> = const { RefCell::new(None) };
+    /// }
+    ///
+    /// /// Stands in for `opentelemetry::ContextGuard`: restores the previous
+    /// /// context when dropped.
+    /// struct ContextGuard {
+    ///     previous: Option<Context>,
+    /// }
+    ///
+    /// impl Context {
+    ///     /// Stands in for `opentelemetry::Context::attach`.
+    ///     fn attach(self) -> ContextGuard {
+    ///         let previous = CURRENT.with(|current| current.replace(Some(self)));
+    ///         ContextGuard { previous }
+    ///     }
+    /// }
+    ///
+    /// impl Drop for ContextGuard {
+    ///     fn drop(&mut self) {
+    ///         CURRENT.with(|current| *current.borrow_mut() = self.previous.take());
+    ///     }
+    /// }
+    ///
+    /// #[derive(Default)]
+    /// struct Otel {
+    ///     contexts: Mutex<HashMap<String, Context>>,
+    /// }
+    ///
+    /// impl Plugin for Otel {
+    ///     fn on_user_function_start(&self, info: &OperationInfo) -> HookWork {
+    ///         let context = Context {
+    ///             operation_id: info.id().to_owned(),
+    ///         };
+    ///         self.contexts
+    ///             .lock()
+    ///             .map_err(|_| "context map poisoned")?
+    ///             .insert(info.id().to_owned(), context);
+    ///         Ok(None)
+    ///     }
+    ///
+    ///     fn wrap_user_function(&self, info: &OperationInfo, next: &mut dyn FnMut()) {
+    ///         // Clone under the lock; the guard drops at the end of the statement.
+    ///         let context = self
+    ///             .contexts
+    ///             .lock()
+    ///             .ok()
+    ///             .and_then(|contexts| contexts.get(info.id()).cloned());
+    ///         let _attached = context.map(Context::attach);
+    ///         next();
+    ///     }
+    ///
+    ///     fn on_user_function_end(
+    ///         &self,
+    ///         info: &OperationInfo,
+    ///         _outcome: Result<(), &WireError>,
+    ///     ) -> HookWork {
+    ///         self.contexts
+    ///             .lock()
+    ///             .map_err(|_| "context map poisoned")?
+    ///             .remove(info.id());
+    ///         Ok(None)
+    ///     }
+    /// }
+    ///
+    /// // The guard makes the context current until it drops.
+    /// {
+    ///     let _attached = Context { operation_id: "op".to_owned() }.attach();
+    ///     let current = CURRENT.with(|current| current.borrow().clone());
+    ///     assert_eq!(current.map(|c| c.operation_id), Some("op".to_owned()));
+    /// }
+    /// assert!(CURRENT.with(|current| current.borrow().is_none()));
+    /// # drop(Otel::default());
+    /// ```
+    ///
+    /// A `tracing` plugin enters a span for the user function around
+    /// `next()`:
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::plugin::{OperationInfo, Plugin};
+    ///
+    /// struct Traced;
+    ///
+    /// impl Traced {
+    ///     fn span_for(&self, info: &OperationInfo) -> tracing::Span {
+    ///         tracing::info_span!(
+    ///             "user_function",
+    ///             operation_id = info.id(),
+    ///             attempt = info.attempt(),
+    ///         )
+    ///     }
+    /// }
+    ///
+    /// impl Plugin for Traced {
+    ///     fn wrap_user_function(&self, info: &OperationInfo, next: &mut dyn FnMut()) {
+    ///         self.span_for(info).in_scope(next);
+    ///     }
+    /// }
+    /// # drop(Traced);
+    /// ```
+    ///
+    /// A plugin that records the start and end of each parallel branch,
+    /// with the parallel operation as the parent, as the conformance test
+    /// for parallel branch hooks requires. Its hooks record in their
+    /// synchronous call and return no work.
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// use aws_durable_execution_sdk as durable;
+    /// use durable::plugin::{HookWork, InvocationInfo, OperationInfo, Plugin, PluginFactory};
+    /// use durable::{BoxError, Branch, DurableContext, Options, WireError};
+    ///
+    /// /// The sub-type of a parallel branch's child context.
+    /// const PARALLEL_BRANCH: &str = "ParallelBranch";
+    ///
+    /// struct Recorder {
+    ///     records: Arc<Mutex<Vec<String>>>,
+    /// }
+    ///
+    /// impl Recorder {
+    ///     fn record(&self, record: String) {
+    ///         if let Ok(mut records) = self.records.lock() {
+    ///             records.push(record);
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// impl Plugin for Recorder {
+    ///     fn on_user_function_start(&self, info: &OperationInfo) -> HookWork {
+    ///         if info.sub_type() == Some(PARALLEL_BRANCH) {
+    ///             let parent = info.parent_id().unwrap_or("NONE");
+    ///             self.record(format!("CONFPLUGIN fn-start op={} parent={parent}", info.id()));
+    ///         }
+    ///         Ok(None)
+    ///     }
+    ///
+    ///     fn on_user_function_end(
+    ///         &self,
+    ///         info: &OperationInfo,
+    ///         outcome: Result<(), &WireError>,
+    ///     ) -> HookWork {
+    ///         if info.sub_type() == Some(PARALLEL_BRANCH) {
+    ///             let parent = info.parent_id().unwrap_or("NONE");
+    ///             let outcome = if outcome.is_ok() { "SUCCEEDED" } else { "FAILED" };
+    ///             self.record(format!(
+    ///                 "CONFPLUGIN fn-end op={} parent={parent} outcome={outcome}",
+    ///                 info.id(),
+    ///             ));
+    ///         }
+    ///         Ok(None)
+    ///     }
+    /// }
+    ///
+    /// #[derive(Default)]
+    /// struct Factory {
+    ///     records: Arc<Mutex<Vec<String>>>,
+    /// }
+    ///
+    /// impl PluginFactory for Factory {
+    ///     fn create_plugin(
+    ///         &self,
+    ///         _info: &InvocationInfo,
+    ///     ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+    ///         Ok(Some(Box::new(Recorder {
+    ///             records: Arc::clone(&self.records),
+    ///         })))
+    ///     }
+    /// }
+    ///
+    /// /// Two branches that run one at a time. The records are, in order:
+    /// /// fn-start and fn-end of branch 0, then of branch 1.
+    /// async fn handler(
+    ///     _event: serde_json::Value,
+    ///     ctx: DurableContext,
+    /// ) -> Result<Vec<String>, BoxError> {
+    ///     let branches: Vec<Branch<String>> = vec![
+    ///         Branch::new("0", |_: DurableContext| async { Ok("task-1".to_owned()) }),
+    ///         Branch::new("1", |_: DurableContext| async { Ok("task-2".to_owned()) }),
+    ///     ];
+    ///     Ok(ctx
+    ///         .parallel(branches)
+    ///         .name("parallel")
+    ///         .max_concurrency(1)
+    ///         .await?)
+    /// }
+    ///
+    /// let options = Options::builder()
+    ///     .plugin(Factory::default())
+    ///     .build()
+    ///     .expect("valid options");
+    /// let service = durable::wrap(handler, options);
+    /// # drop(service);
+    /// ```
+    ///
+    /// A wrap cannot keep `next` after it returns:
+    ///
+    /// ```compile_fail,E0521
+    /// # // next_cannot_be_stored
+    /// use std::cell::RefCell;
+    ///
+    /// use aws_durable_execution_sdk::plugin::{OperationInfo, Plugin};
+    ///
+    /// thread_local! {
+    ///     static KEPT: RefCell<Option<&'static mut dyn FnMut()>> = RefCell::new(None);
+    /// }
+    ///
+    /// struct Keeps;
+    ///
+    /// impl Plugin for Keeps {
+    ///     fn wrap_user_function(&self, _info: &OperationInfo, next: &mut dyn FnMut()) {
+    ///         KEPT.with(|kept| *kept.borrow_mut() = Some(next));
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// A wrap cannot run `next` on another thread:
+    ///
+    /// ```compile_fail,E0277
+    /// # // next_cannot_be_sent
+    /// use aws_durable_execution_sdk::plugin::{OperationInfo, Plugin};
+    ///
+    /// struct Moves;
+    ///
+    /// impl Plugin for Moves {
+    ///     fn wrap_user_function(&self, _info: &OperationInfo, next: &mut dyn FnMut()) {
+    ///         drop(std::thread::spawn(move || next()));
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// A wrap cannot await `next`, so it cannot hold the user function
+    /// across an await:
+    ///
+    /// ```compile_fail,E0277
+    /// # // next_cannot_be_awaited
+    /// use aws_durable_execution_sdk::plugin::{OperationInfo, Plugin};
+    ///
+    /// struct Awaits;
+    ///
+    /// impl Plugin for Awaits {
+    ///     fn wrap_user_function(&self, _info: &OperationInfo, next: &mut dyn FnMut()) {
+    ///         drop(async move { next.await });
+    ///     }
+    /// }
+    /// ```
+    fn wrap_user_function(&self, _info: &OperationInfo, next: &mut dyn FnMut()) {
+        next();
     }
 
-    /// Wraps one child context body. See the wrap hooks section of
-    /// [`Plugin`].
-    fn wrap_child_context<'a>(
-        &'a self,
-        _info: &'a OperationInfo,
-        next: Next<'a>,
-    ) -> HookFuture<'a> {
-        Box::pin(async move {
-            let _ = next.await;
-            Ok(())
-        })
+    /// Runs at a user function's first poll, before the SDK calls its
+    /// closure.
+    ///
+    /// It runs after `on_operation_start` and, for a step attempt or a
+    /// check, `on_attempt_start`. It runs inside the wraps of the enclosing
+    /// user functions and of the plugins registered before this one, and
+    /// before this plugin's [`wrap_user_function`](Self::wrap_user_function).
+    /// It runs outside the operation's `tracing` span. `info` is described
+    /// in the section on operation metadata of `wrap_user_function`, which
+    /// also gives the order of every hook and wrap and the cases that fire
+    /// no hook.
+    ///
+    /// The SDK calls it synchronously, as it calls `on_operation_start`, so
+    /// it must be cheap and must not block. A returned future runs on its
+    /// own task. The SDK never awaits it on the operation's path, and it
+    /// does not keep the invocation from suspending; the drain before
+    /// `on_invocation_end` waits for it until 500 ms before the invocation
+    /// deadline, then aborts it.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` returned by this call, or a panic in it, is logged at WARN
+    /// and means this plugin did not start: it gets no wrap and no end hook
+    /// for this user function. The other plugins and the user function are
+    /// unchanged. A returned future that fails later is logged and changes
+    /// nothing.
+    fn on_user_function_start(&self, _info: &OperationInfo) -> HookWork {
+        Ok(None)
     }
 
-    /// Wraps all the work of one tracked SDK operation task. See the wrap
-    /// hooks section of [`Plugin`], item 9.
-    fn wrap_task(&self, next: Next<'static>) -> HookFuture<'static> {
-        Box::pin(async move {
-            let _ = next.await;
-            Ok(())
-        })
+    /// Runs in the poll in which a user function returned, after this
+    /// plugin's wrap returned and before the SDK serializes the value or
+    /// writes the outcome.
+    ///
+    /// Only a plugin whose start hook started it gets this hook. It runs
+    /// inside the wraps of the enclosing user functions and of the plugins
+    /// registered before this one, so the end hooks run in reverse
+    /// registration order. A user function that panics, or that the SDK
+    /// drops before it returns, gets no end hook; the section on when no
+    /// hook fires of [`wrap_user_function`](Self::wrap_user_function) lists
+    /// every case.
+    ///
+    /// `outcome` is `Ok(())` when the user function returned `Ok`, and
+    /// otherwise the [`WireError`] that the SDK records for its error. The
+    /// hook never sees the value. By user function, an error is:
+    ///
+    /// | User function | `outcome` on error |
+    /// | --- | --- |
+    /// | step attempt, `wait_for_callback` submitter step | the step's error, with the type `Error` unless the error names one, as a `TypedError` does |
+    /// | `wait_for_condition` check | the check's error, with the type `Error` unless the error names one, as a `TypedError` does |
+    /// | `run_in_child_context` body, map item, parallel or `parallel_mixed` branch | the body's error, as the child context records it |
+    /// | `with_retry` block | the error that ends the retries |
+    /// | `wait_for_callback` body | the error the operation records, such as `Callback.ExternalFailure` |
+    /// | `map`, `parallel` or `parallel_mixed` container | never: the batch holds the item failures |
+    /// | `try_join_all` | `CombinatorError.JoinFailed.<i>` for input `i` |
+    /// | `join_all` | never: each input's error is in the result |
+    /// | `select_ok` | `CombinatorError.AllFailed`, or `CombinatorError.EmptyInput` for no input |
+    /// | `race` | `CombinatorError.FirstSettledFailed`, or `CombinatorError.EmptyInput` for no input |
+    ///
+    /// A failure after the user function returned `Ok`, such as a value
+    /// that does not serialize or a rejected checkpoint, keeps its own
+    /// error in the record, after an `Ok` end hook.
+    ///
+    /// The SDK calls this hook synchronously, as it calls
+    /// `on_operation_start`, so it must be cheap and must not block. A
+    /// returned future runs on its own task, as for
+    /// [`on_user_function_start`](Self::on_user_function_start).
+    ///
+    /// # Errors
+    ///
+    /// An error or a panic is logged at WARN and changes nothing else.
+    fn on_user_function_end(
+        &self,
+        _info: &OperationInfo,
+        _outcome: Result<(), &WireError>,
+    ) -> HookWork {
+        Ok(None)
     }
 
     /// Returns the X-Ray trace header the SDK puts on a chained invoke's
@@ -709,49 +1239,6 @@ pub trait Plugin: Send + Sync {
     /// is used.
     fn propagation_trace_id(&self, _input: &PropagationInput) -> Result<Option<String>, BoxError> {
         Ok(None)
-    }
-}
-
-/// The wrap chain behind a [`Next`]. The wrap engine of the issue "Call the
-/// plugin wrap hooks around the invocation, step attempts, child bodies and
-/// SDK tasks" fills it in.
-struct Chain<'a> {
-    _lifetime: std::marker::PhantomData<&'a ()>,
-}
-
-/// The rest of a wrap chain: the inner wrappers and the body.
-///
-/// Await it in a wrapper to run the inner work. It resolves with `Ok(())`
-/// when the body succeeded, or with the [`WireError`] the SDK records for
-/// the body's error. See the wrap hooks section of [`Plugin`].
-#[must_use = "futures do nothing unless awaited"]
-#[non_exhaustive]
-pub struct Next<'a> {
-    #[expect(
-        dead_code,
-        reason = "read by the wrap engine of the issue that calls the wrap hooks"
-    )]
-    chain: Weak<Chain<'a>>,
-    #[expect(
-        dead_code,
-        reason = "read by the wrap engine of the issue that calls the wrap hooks"
-    )]
-    link: usize,
-}
-
-impl Future for Next<'_> {
-    type Output = Result<(), WireError>;
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // No `Next` exists before the wrap engine builds one, so this body
-        // is never reached. The wrap engine replaces it.
-        Poll::Pending
-    }
-}
-
-impl fmt::Debug for Next<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Next")
     }
 }
 
@@ -1141,7 +1628,9 @@ impl OperationInfo {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct AttemptInfo {
-    operation: OperationInfo,
+    /// Shared with the attempt's runner, so the user-function hooks and
+    /// wraps receive this very value.
+    operation: Arc<OperationInfo>,
     attempt: u32,
 }
 
@@ -1279,6 +1768,12 @@ impl OperationInfo {
         self
     }
 
+    /// Replaces the attempt number.
+    pub(crate) fn with_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
     /// Replaces the start timestamp.
     pub(crate) fn with_start_timestamp(mut self, at: SystemTime) -> Self {
         self.start_timestamp = Some(at);
@@ -1293,7 +1788,7 @@ impl OperationInfo {
 }
 
 impl AttemptInfo {
-    pub(crate) fn new(operation: OperationInfo, attempt: u32) -> Self {
+    pub(crate) fn new(operation: Arc<OperationInfo>, attempt: u32) -> Self {
         Self { operation, attempt }
     }
 }
@@ -1335,16 +1830,21 @@ pub(crate) fn with_observed_end(info: OperationInfo) -> OperationInfo {
 /// with `is_replay`, then `on_attempt_start` with the attempt's start time.
 ///
 /// `operation` is the info [`OperationInfo::for_operation`] built; both
-/// hooks see it with the status `Started`.
+/// hooks see it with the status `Started`. The start hook's copy keeps the
+/// record's `attempt` and carries `is_replay`, as on main and in JS; the
+/// attempt's copy has `attempt` set and `is_replay` false. It
+/// returns the attempt's info exactly as `on_attempt_start` saw it, so the
+/// user-function hooks and wraps of the attempt see the same value, as JS
+/// passes `attemptInfo` to both.
 pub(crate) fn attempt_started(
     plugins: &InvocationPlugins,
     operation: OperationInfo,
     attempt: u32,
     is_replay: bool,
-) {
+) -> Arc<OperationInfo> {
     let started = operation.with_status(OperationStatus::Started);
     operation_started(plugins, &started.clone().with_replay(is_replay));
-    attempt_start_only(plugins, started, attempt);
+    attempt_start_only(plugins, started, attempt)
 }
 
 /// Fires only `on_attempt_start` of a live attempt that starts, with the
@@ -1353,17 +1853,21 @@ pub(crate) fn attempt_started(
 /// `onOperationAttemptStart` after `onOperationStart`.
 ///
 /// `operation` is the info [`OperationInfo::for_operation`] built; the hook
-/// sees it with the status `Started`.
+/// sees it with the status `Started` and `attempt` set. It returns the
+/// attempt's info exactly as `on_attempt_start` saw it, as
+/// [`attempt_started`] does.
 pub(crate) fn attempt_start_only(
     plugins: &InvocationPlugins,
     operation: OperationInfo,
     attempt: u32,
-) {
+) -> Arc<OperationInfo> {
     let started = operation
         .with_status(OperationStatus::Started)
+        .with_attempt(attempt)
         .with_start_timestamp(SystemTime::now());
-    let info = AttemptInfo::new(started, attempt);
+    let info = AttemptInfo::new(Arc::new(started), attempt);
     plugins.dispatch_work("on_attempt_start", |plugin| plugin.on_attempt_start(&info));
+    Arc::clone(&info.operation)
 }
 
 /// Fires the hooks of an attempt that ended, right after the checkpoint
@@ -1650,7 +2154,7 @@ impl Undelivered {
                 Self::Attached { coordinator, .. } => Arc::clone(coordinator),
                 Self::Discarding => {
                     drop(state);
-                    crate::task::discard_panic(payload);
+                    discard_plugin_panic(payload);
                     return;
                 }
             }
@@ -1681,7 +2185,7 @@ impl Undelivered {
             // `Kept` never follows `Attached`, so this is `Discarding`.
             payload
         };
-        crate::task::discard_panic(rejected);
+        discard_plugin_panic(rejected);
     }
 
     /// Enters `Discarding`, and drops every panic kept so far.
@@ -1694,7 +2198,7 @@ impl Undelivered {
         );
         if let Self::Kept(left) | Self::Attached { late: left, .. } = state {
             for payload in left {
-                crate::task::discard_panic(payload);
+                discard_plugin_panic(payload);
             }
         }
     }
@@ -1731,6 +2235,21 @@ pub(crate) struct InvocationPlugins {
 }
 
 impl InvocationPlugins {
+    /// The plugin at `index`.
+    ///
+    /// Every index the SDK passes comes from `0..self.plugins.len()`, or
+    /// from a list built from that range, and the plugin vector never
+    /// changes after [`create_plugins`] built it. So `index` is in range.
+    #[expect(
+        clippy::expect_used,
+        reason = "every index comes from the range of the immutable plugin vector"
+    )]
+    pub(crate) fn slot(&self, index: usize) -> &PluginSlot {
+        self.plugins
+            .get(index)
+            .expect("a plugin index comes from the plugin vector's range")
+    }
+
     /// The info every plugin of this invocation was created with.
     pub(crate) fn info(&self) -> &InvocationInfo {
         &self.info
@@ -1761,7 +2280,9 @@ impl InvocationPlugins {
 
     /// Hands the invocation's coordinator to the plugins. The destructor
     /// panics kept so far are recorded on it, which ends the drive, and
-    /// every later one is recorded on it at once.
+    /// every later one is recorded on it at once. A kept panic the
+    /// coordinator rejects is plugin code, so it is dropped through
+    /// [`discard_plugin_panic`].
     pub(crate) fn attach(&self, coordinator: &Arc<InvocationCoordinator>) {
         let kept = std::mem::replace(
             &mut *self
@@ -1775,7 +2296,9 @@ impl InvocationPlugins {
         );
         if let Undelivered::Kept(kept) = kept {
             for payload in kept {
-                crate::task::record_or_discard(coordinator, payload);
+                if let Some(rejected) = coordinator.record_panic(payload) {
+                    discard_plugin_panic(rejected);
+                }
             }
         }
     }
@@ -1856,17 +2379,19 @@ impl InvocationPlugins {
             plugin.on_invocation_end(&info)
         }));
         if !wait_until(by(PLUGIN_END_RESERVE), hooks).await {
-            tracing::warn!(
-                target: TARGET,
-                "plugin on_invocation_end hooks did not finish before the invocation deadline; \
-                 the response returns without them"
-            );
+            warn_contained(|| {
+                tracing::warn!(
+                    target: TARGET,
+                    "plugin on_invocation_end hooks did not finish before the invocation deadline; \
+                     the response returns without them"
+                );
+            });
         }
         let ended = self.take_late_panic(late);
         match (drained, ended) {
             (Some(first), later) => {
                 if let Some(later) = later {
-                    crate::task::discard_panic(later);
+                    discard_plugin_panic(later);
                 }
                 Some(first)
             }
@@ -1892,7 +2417,7 @@ impl InvocationPlugins {
             LatePanics::Discard => None,
         };
         for payload in late {
-            crate::task::discard_panic(payload);
+            discard_plugin_panic(payload);
         }
         first
     }
@@ -1944,11 +2469,13 @@ impl InvocationPlugins {
                     let _ = handle.await;
                 }
                 if abandoned > 0 {
-                    tracing::warn!(
-                        target: TARGET,
-                        abandoned,
-                        "plugin hook work did not finish before the drain deadline; it is aborted"
-                    );
+                    warn_contained(|| {
+                        tracing::warn!(
+                            target: TARGET,
+                            abandoned,
+                            "plugin hook work did not finish before the drain deadline; it is aborted"
+                        );
+                    });
                 }
                 return;
             }
@@ -1968,16 +2495,35 @@ impl InvocationPlugins {
     ///    [`crate::task::discard_panic`]: a plugin panic does not fail the
     ///    invocation.
     pub(crate) fn dispatch_work(&self, hook: &'static str, call: impl Fn(&dyn Plugin) -> HookWork) {
-        for (index, slot) in self.plugins.iter().enumerate() {
-            match catch_unwind(AssertUnwindSafe(|| call(slot.plugin.as_ref()))) {
-                Ok(Ok(None)) => {}
-                Ok(Ok(Some(work))) => self.start_work(index, hook, work),
+        self.dispatch_to(hook, 0..self.plugins.len(), call);
+    }
+
+    /// [`Self::dispatch_work`] for the plugins at `indices`, in that
+    /// order. It returns the indices whose call returned `Ok`, in order:
+    /// the user-function runner pairs a start with a wrap and an end only
+    /// for those.
+    pub(crate) fn dispatch_to(
+        &self,
+        hook: &'static str,
+        indices: impl IntoIterator<Item = usize>,
+        call: impl Fn(&dyn Plugin) -> HookWork,
+    ) -> Vec<usize> {
+        let mut ok = Vec::new();
+        for index in indices {
+            let slot = self.slot(index);
+            match call_plugin(|| call(slot.plugin.as_ref())) {
+                Ok(Ok(None)) => ok.push(index),
+                Ok(Ok(Some(work))) => {
+                    ok.push(index);
+                    self.start_work(index, hook, work);
+                }
                 Ok(Err(error)) => {
                     report_hook_error(&slot.identity, hook, &self.undelivered, error);
                 }
                 Err(payload) => log_hook_panic(&slot.identity, hook, payload),
             }
         }
+        ok
     }
 
     /// Asks every plugin, in registration order, for the X-Ray trace header
@@ -2001,24 +2547,25 @@ impl InvocationPlugins {
         let mut kept: Option<(String, &str)> = None;
         let mut conflict_count: u64 = 0;
         for slot in &self.plugins {
-            let value =
-                match catch_unwind(AssertUnwindSafe(|| slot.plugin.propagation_trace_id(input))) {
-                    Ok(Ok(Some(value))) => value,
-                    Ok(Ok(None)) => continue,
-                    Ok(Err(error)) => {
-                        report_propagation_error(&slot.identity, &self.undelivered, error);
-                        continue;
-                    }
-                    Err(payload) => {
+            let value = match call_plugin(|| slot.plugin.propagation_trace_id(input)) {
+                Ok(Ok(Some(value))) => value,
+                Ok(Ok(None)) => continue,
+                Ok(Err(error)) => {
+                    report_propagation_error(&slot.identity, &self.undelivered, error);
+                    continue;
+                }
+                Err(payload) => {
+                    warn_contained(|| {
                         tracing::warn!(
                             target: TARGET,
                             plugin = %slot.identity,
                             "plugin propagation_trace_id panicked; the value is ignored"
                         );
-                        crate::task::discard_panic(payload);
-                        continue;
-                    }
-                };
+                    });
+                    discard_plugin_panic(payload);
+                    continue;
+                }
+            };
             if value.trim().is_empty() {
                 continue;
             }
@@ -2027,14 +2574,16 @@ impl InvocationPlugins {
                 Some((first, _)) if *first == value => {}
                 Some((_, first_identity)) => {
                     conflict_count = conflict_count.saturating_add(1);
-                    tracing::warn!(
-                        target: TARGET,
-                        field = "x_amzn_trace_id",
-                        first_plugin = %first_identity,
-                        later_plugin = %slot.identity,
-                        conflict_count,
-                        "conflicting propagation trace ids; keeping the first value"
-                    );
+                    warn_contained(|| {
+                        tracing::warn!(
+                            target: TARGET,
+                            field = "x_amzn_trace_id",
+                            first_plugin = %first_identity,
+                            later_plugin = %slot.identity,
+                            conflict_count,
+                            "conflicting propagation trace ids; keeping the first value"
+                        );
+                    });
                 }
             }
         }
@@ -2061,12 +2610,14 @@ impl InvocationPlugins {
         let WorkState::Open(list) = &mut *state else {
             drop(state);
             drop_hook_future(identity, hook, work);
-            tracing::warn!(
-                target: TARGET,
-                plugin = %identity,
-                hook,
-                "plugin hook work started after the drain closed; it is dropped"
-            );
+            warn_contained(|| {
+                tracing::warn!(
+                    target: TARGET,
+                    plugin = %identity,
+                    hook,
+                    "plugin hook work started after the drain closed; it is dropped"
+                );
+            });
             return;
         };
         list.retain(|handle| !handle.is_finished());
@@ -2080,12 +2631,14 @@ impl InvocationPlugins {
             list.push(handle);
         } else {
             drop(state);
-            tracing::warn!(
-                target: TARGET,
-                plugin = %identity,
-                hook,
-                "plugin hook work could not be spawned; it is dropped"
-            );
+            warn_contained(|| {
+                tracing::warn!(
+                    target: TARGET,
+                    plugin = %identity,
+                    hook,
+                    "plugin hook work could not be spawned; it is dropped"
+                );
+            });
         }
     }
 
@@ -2119,7 +2672,7 @@ impl InvocationPlugins {
         self.plugins
             .iter()
             .map(|slot| {
-                let future = match catch_unwind(AssertUnwindSafe(|| call(slot.plugin.as_ref()))) {
+                let future = match call_plugin(|| call(slot.plugin.as_ref())) {
                     Ok(future) => Some(future),
                     Err(payload) => {
                         log_hook_panic(&slot.identity, hook, payload);
@@ -2180,21 +2733,69 @@ async fn wait_until(
     }
 }
 
+/// Runs plugin code synchronously: with [`ActiveBody::Plugin`] active and
+/// inside a catch. Every synchronous call into a plugin goes through it:
+/// the factory and `name`, every hook, every wrap, every poll and drop of
+/// a hook future, and the drop of a plugin or of an error it returned. So
+/// a durable operation called there records a context usage error, which
+/// fails the execution when it is recorded before the driver's
+/// arbitration (a later record changes neither the response nor the
+/// late-panic policy), and a panic comes back as a value.
+///
+/// [`ActiveBody::Plugin`]: crate::context::ActiveBody::Plugin
+pub(crate) fn call_plugin<R>(f: impl FnOnce() -> R) -> Result<R, Payload> {
+    crate::context::run_body_sync(crate::context::ActiveBody::Plugin, || {
+        catch_unwind(AssertUnwindSafe(f))
+    })
+}
+
+/// Emits one SDK diagnostic about a plugin. It runs the user's `tracing`
+/// subscriber, so a panic there is discarded: a log call never unwinds out
+/// of plugin handling. Callers dispose of payloads after it returns.
+///
+/// It runs under [`ActiveBody::Plugin`](crate::context::ActiveBody::Plugin),
+/// with the disposal of a subscriber panic: a durable operation the
+/// subscriber calls while it reports a plugin records a context usage
+/// error, which fails the execution when it is recorded before the
+/// driver's arbitration; a later record changes neither the response nor
+/// the late-panic policy.
+pub(crate) fn warn_contained(emit: impl FnOnce()) {
+    crate::context::run_body_sync(crate::context::ActiveBody::Plugin, || {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(emit)) {
+            crate::task::discard_panic(payload);
+        }
+    });
+}
+
+/// Drops a panic payload a plugin raised, or a plugin error's destructor
+/// raised. Its destructor is plugin code, so it runs under
+/// [`ActiveBody::Plugin`](crate::context::ActiveBody::Plugin): a durable
+/// operation it calls records a context usage error, which fails the
+/// execution when it is recorded before the driver's arbitration; a later
+/// record changes neither the response nor the late-panic policy.
+pub(crate) fn discard_plugin_panic(payload: Payload) {
+    crate::context::run_body_sync(crate::context::ActiveBody::Plugin, || {
+        crate::task::discard_panic(payload);
+    });
+}
+
 /// Logs a caught hook panic, and drops its payload.
-fn log_hook_panic(identity: &str, hook: &'static str, payload: Payload) {
-    tracing::warn!(
-        target: TARGET,
-        plugin = %identity,
-        hook,
-        "plugin hook panicked; the panic is ignored"
-    );
-    crate::task::discard_panic(payload);
+pub(crate) fn log_hook_panic(identity: &str, hook: &'static str, payload: Payload) {
+    warn_contained(|| {
+        tracing::warn!(
+            target: TARGET,
+            plugin = %identity,
+            hook,
+            "plugin hook panicked; the panic is ignored"
+        );
+    });
+    discard_plugin_panic(payload);
 }
 
 /// Drops a hook future inside a catch. Its destructor is plugin code, so a
 /// panic there is logged as the hook's panic.
 fn drop_hook_future(identity: &str, hook: &'static str, future: HookFuture<'_>) {
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(future))) {
+    if let Err(payload) = call_plugin(move || drop(future)) {
         log_hook_panic(identity, hook, payload);
     }
 }
@@ -2226,26 +2827,30 @@ fn report_hook_error(
     undelivered: &Mutex<Undelivered>,
     error: BoxError,
 ) {
-    match catch_unwind(AssertUnwindSafe(|| error.to_string())) {
-        Ok(message) => tracing::warn!(
-            target: TARGET,
-            plugin = %identity,
-            hook,
-            error = %message,
-            "plugin hook failed; the error is ignored"
-        ),
-        Err(payload) => {
+    match call_plugin(|| error.to_string()) {
+        Ok(message) => warn_contained(|| {
             tracing::warn!(
                 target: TARGET,
                 plugin = %identity,
                 hook,
-                "plugin hook failed, and its error panicked while it was formatted; \
-                 the error is ignored"
+                error = %message,
+                "plugin hook failed; the error is ignored"
             );
-            crate::task::discard_panic(payload);
+        }),
+        Err(payload) => {
+            warn_contained(|| {
+                tracing::warn!(
+                    target: TARGET,
+                    plugin = %identity,
+                    hook,
+                    "plugin hook failed, and its error panicked while it was formatted; \
+                     the error is ignored"
+                );
+            });
+            discard_plugin_panic(payload);
         }
     }
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(error))) {
+    if let Err(payload) = call_plugin(move || drop(error)) {
         Undelivered::record(undelivered, payload);
     }
 }
@@ -2259,24 +2864,28 @@ fn report_hook_error(
 /// second catch. A panic from its destructor fails the invocation, so it is
 /// recorded on the coordinator through `undelivered`.
 fn report_propagation_error(identity: &str, undelivered: &Mutex<Undelivered>, error: BoxError) {
-    match catch_unwind(AssertUnwindSafe(|| error.to_string())) {
-        Ok(message) => tracing::warn!(
-            target: TARGET,
-            plugin = %identity,
-            error = %message,
-            "plugin propagation_trace_id failed; the value is ignored"
-        ),
-        Err(payload) => {
+    match call_plugin(|| error.to_string()) {
+        Ok(message) => warn_contained(|| {
             tracing::warn!(
                 target: TARGET,
                 plugin = %identity,
-                "plugin propagation_trace_id failed, and its error panicked while it was \
-                 formatted; the value is ignored"
+                error = %message,
+                "plugin propagation_trace_id failed; the value is ignored"
             );
-            crate::task::discard_panic(payload);
+        }),
+        Err(payload) => {
+            warn_contained(|| {
+                tracing::warn!(
+                    target: TARGET,
+                    plugin = %identity,
+                    "plugin propagation_trace_id failed, and its error panicked while it was \
+                     formatted; the value is ignored"
+                );
+            });
+            discard_plugin_panic(payload);
         }
     }
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(error))) {
+    if let Err(payload) = call_plugin(move || drop(error)) {
         Undelivered::record(undelivered, payload);
     }
 }
@@ -2289,7 +2898,7 @@ impl Future for HookRun<'_> {
         let Some(future) = this.future.as_mut() else {
             return Poll::Ready(());
         };
-        let polled = catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)));
+        let polled = call_plugin(|| future.as_mut().poll(cx));
         if matches!(polled, Ok(Poll::Pending)) {
             return Poll::Pending;
         }
@@ -2301,7 +2910,7 @@ impl Future for HookRun<'_> {
                 report_hook_error(&this.identity, this.hook, &this.undelivered, error);
             }
             Err(payload) => log_hook_panic(&this.identity, this.hook, payload),
-            Ok(_) => {}
+            Ok(Poll::Ready(Ok(())) | Poll::Pending) => {}
         }
         Poll::Ready(())
     }
@@ -2357,14 +2966,16 @@ impl Drop for InvocationPlugins {
     fn drop(&mut self) {
         self.shut_down();
         for PluginSlot { plugin, identity } in std::mem::take(&mut self.plugins) {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(plugin))) {
-                tracing::warn!(
-                    target: TARGET,
-                    plugin = %identity,
-                    hook = "drop",
-                    "plugin panicked while it was dropped; the panic is ignored"
-                );
-                crate::task::discard_panic(payload);
+            if let Err(payload) = call_plugin(move || drop(plugin)) {
+                warn_contained(|| {
+                    tracing::warn!(
+                        target: TARGET,
+                        plugin = %identity,
+                        hook = "drop",
+                        "plugin panicked while it was dropped; the panic is ignored"
+                    );
+                });
+                discard_plugin_panic(payload);
             }
         }
     }
@@ -2430,7 +3041,8 @@ pub(crate) fn create_plugins(
 /// Each factory call runs inside `catch_unwind`.
 ///
 /// - `Ok(Some(plugin))` is kept. `plugin.name()` runs inside its own catch,
-///   and a panic there gives the identity `plugins[<i>]`.
+///   and a panic there is logged as the hook `name` of `plugins[<i>]`,
+///   which is then the plugin's identity.
 /// - `Ok(None)` is skipped silently.
 /// - `Err` is skipped and logged by [`log_factory_error`].
 /// - A panic is skipped and logged.
@@ -2447,14 +3059,15 @@ fn create_slots(
     let mut slots = Vec::new();
     for (index, (type_name, factory)) in factories.iter().enumerate() {
         let factory_identity = format!("{type_name} (plugins[{index}])");
-        match catch_unwind(AssertUnwindSafe(|| factory.create_plugin(info))) {
+        match call_plugin(|| factory.create_plugin(info)) {
             Ok(Ok(Some(plugin))) => {
                 let plugin: Arc<dyn Plugin> = Arc::from(plugin);
-                let identity = match catch_unwind(AssertUnwindSafe(|| plugin.name())) {
+                let identity = match call_plugin(|| plugin.name()) {
                     Ok(name) => format!("{name} (plugins[{index}])"),
                     Err(payload) => {
-                        crate::task::discard_panic(payload);
-                        format!("plugins[{index}]")
+                        let identity = format!("plugins[{index}]");
+                        log_hook_panic(&identity, "name", payload);
+                        identity
                     }
                 };
                 slots.push(PluginSlot { plugin, identity });
@@ -2462,12 +3075,14 @@ fn create_slots(
             Ok(Ok(None)) => {}
             Ok(Err(error)) => log_factory_error(&factory_identity, error, error_drop_panics),
             Err(payload) => {
-                tracing::warn!(
-                    target: TARGET,
-                    factory = %factory_identity,
-                    "plugin factory panicked; the plugin is skipped for this invocation"
-                );
-                crate::task::discard_panic(payload);
+                warn_contained(|| {
+                    tracing::warn!(
+                        target: TARGET,
+                        factory = %factory_identity,
+                        "plugin factory panicked; the plugin is skipped for this invocation"
+                    );
+                });
+                discard_plugin_panic(payload);
             }
         }
     }
@@ -2491,30 +3106,73 @@ fn log_factory_error(
     error: BoxError,
     error_drop_panics: &mut Vec<Payload>,
 ) {
-    match catch_unwind(AssertUnwindSafe(|| error.to_string())) {
-        Ok(message) => tracing::warn!(
-            target: TARGET,
-            factory = %factory_identity,
-            error = %message,
-            "plugin factory failed; the plugin is skipped for this invocation"
-        ),
-        Err(payload) => {
+    match call_plugin(|| error.to_string()) {
+        Ok(message) => warn_contained(|| {
             tracing::warn!(
                 target: TARGET,
                 factory = %factory_identity,
-                "plugin factory failed, and its error panicked while it was formatted; \
-                 the plugin is skipped for this invocation"
+                error = %message,
+                "plugin factory failed; the plugin is skipped for this invocation"
             );
-            crate::task::discard_panic(payload);
+        }),
+        Err(payload) => {
+            warn_contained(|| {
+                tracing::warn!(
+                    target: TARGET,
+                    factory = %factory_identity,
+                    "plugin factory failed, and its error panicked while it was formatted; \
+                     the plugin is skipped for this invocation"
+                );
+            });
+            discard_plugin_panic(payload);
         }
     }
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(error))) {
+    if let Err(payload) = call_plugin(move || drop(error)) {
         error_drop_panics.push(payload);
     }
 }
 
 /// Plugins built from closures, and a `wrap` service that runs them, for
 /// the hook tests of this module and of `lib.rs`.
+/// The info of a first invocation with no operations, for tests.
+#[cfg(test)]
+pub(crate) fn tests_support_info() -> InvocationInfo {
+    InvocationInfo::new(
+        "r".to_owned(),
+        "arn".to_owned(),
+        "{}".to_owned(),
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        true,
+        None,
+    )
+}
+
+#[cfg(test)]
+impl OperationInfo {
+    /// An info that holds only the ID `id`, for tests.
+    pub(crate) fn for_test(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: None,
+            kind: None,
+            type_str: None,
+            sub_type: None,
+            parent_id: None,
+            status: None,
+            status_str: None,
+            start_timestamp: None,
+            end_timestamp: None,
+            result: None,
+            error: None,
+            attempt: None,
+            is_replay: false,
+            is_virtual: false,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::future::Future;
@@ -2609,6 +3267,8 @@ pub(crate) mod test_support {
         pub(crate) status: Option<crate::OperationStatus>,
         /// For an attempt hook, its attempt number.
         pub(crate) attempt: Option<u32>,
+        /// The operation info's `attempt()`.
+        pub(crate) info_attempt: Option<u32>,
         /// For an attempt-end hook, its outcome.
         pub(crate) outcome: Option<super::AttemptOutcome>,
         pub(crate) result: Option<String>,
@@ -2677,6 +3337,7 @@ pub(crate) mod test_support {
                 replay: info.is_replay(),
                 is_virtual: info.is_virtual(),
                 status: info.status(),
+                info_attempt: info.attempt(),
                 attempt,
                 outcome: end.map(super::AttemptEndInfo::outcome),
                 result: info.result().map(str::to_owned),
@@ -2882,12 +3543,37 @@ pub(crate) mod test_support {
         F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<serde_json::Value, BoxError>> + Send,
     {
-        let mut builder = Options::builder().execution_client(Arc::new(
+        service_configured(
+            move |mut builder| {
+                for plugin in plugins {
+                    builder = builder.plugin(plugin);
+                }
+                builder
+            },
+            deadline,
+            recorded,
+            handler,
+        )
+    }
+
+    /// [`service_with`], whose plugins `configure` registers on the
+    /// builder.
+    pub(crate) fn service_configured<F, Fut>(
+        configure: impl FnOnce(crate::options::OptionsBuilder) -> crate::options::OptionsBuilder,
+        deadline: u64,
+        recorded: Vec<serde_json::Value>,
+        handler: F,
+    ) -> (
+        impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> crate::BoxedInvocationFuture,
+        lambda_runtime::LambdaEvent<InvocationPayload>,
+    )
+    where
+        F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, BoxError>> + Send,
+    {
+        let builder = configure(Options::builder().execution_client(Arc::new(
             crate::client::InMemoryExecutionClient::new(Vec::new()),
-        ));
-        for plugin in plugins {
-            builder = builder.plugin(plugin);
-        }
+        )));
         let mut operations = vec![serde_json::json!({
             "Id": "exec-1",
             "Type": "EXECUTION",
@@ -2977,6 +3663,273 @@ mod tests {
     /// The info of a started step record with no timestamps.
     fn bare_info() -> OperationInfo {
         OperationInfo::from_record("a", &record("STEP", CheckpointStatus::Started))
+    }
+
+    /// A plugin whose `name()` panics is kept under the identity
+    /// `plugins[<i>]`, the panic is logged as one contained WARN, and the
+    /// plugin's hooks still run. The scenario retries, as the other capture
+    /// tests do, because a concurrent subscriber change can drop a warning.
+    #[test]
+    #[expect(clippy::panic)] // reason: reports that no attempt captured the warning
+    fn name_panic_is_logged() {
+        struct BadName(Arc<AtomicUsize>);
+        impl Plugin for BadName {
+            #[expect(clippy::panic, reason = "the test plugin's name panics")]
+            fn name(&self) -> &'static str {
+                panic!("name panicked")
+            }
+            fn on_user_function_start(&self, _info: &OperationInfo) -> HookWork {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+        }
+        struct Factory(Arc<AtomicUsize>);
+        impl PluginFactory for Factory {
+            fn create_plugin(
+                &self,
+                _info: &InvocationInfo,
+            ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+                Ok(Some(Box::new(BadName(Arc::clone(&self.0)))))
+            }
+        }
+        for _attempt in 0..5 {
+            let (buffer, guard) = capture();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let factory: Arc<dyn PluginFactory> = Arc::new(Factory(Arc::clone(&calls)));
+            let plugins = create_plugins(&[("Factory", factory)], None, tests_support_info)
+                .expect("factories were given");
+            assert_eq!(
+                plugins.plugins.first().map(|s| s.identity.as_str()),
+                Some("plugins[0]")
+            );
+            let started = plugins.dispatch_to("on_user_function_start", [0], |plugin| {
+                plugin.on_user_function_start(&OperationInfo::for_test("s"))
+            });
+            assert_eq!(started, [0], "the start hook still runs and succeeds");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            drop(guard);
+            let warnings = warnings(&buffer);
+            let [warning] = warnings.as_slice() else {
+                continue;
+            };
+            assert_eq!(field(warning, "plugin"), "plugins[0]");
+            assert_eq!(field(warning, "hook"), "name");
+            assert_eq!(
+                field(warning, "message"),
+                "plugin hook panicked; the panic is ignored"
+            );
+            return;
+        }
+        panic!("no attempt captured exactly one name() warning");
+    }
+
+    /// A hook error whose `Display` calls a durable operation on a captured
+    /// context records a context usage error: the `Display` is plugin code.
+    #[test]
+    fn a_hook_errors_display_calling_an_operation_fails_the_execution() {
+        #[derive(Debug)]
+        struct Calls(DurableContext);
+        impl fmt::Display for Calls {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                drop(self.0.claim_operation_id("wait"));
+                f.write_str("calls")
+            }
+        }
+        impl std::error::Error for Calls {}
+        struct Failing(DurableContext);
+        impl Plugin for Failing {
+            fn on_operation_start(&self, _info: &OperationInfo) -> HookWork {
+                Err(Box::new(Calls(self.0.clone())))
+            }
+        }
+        struct Factory(DurableContext);
+        impl PluginFactory for Factory {
+            fn create_plugin(
+                &self,
+                _info: &InvocationInfo,
+            ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+                Ok(Some(Box::new(Failing(self.0.clone()))))
+            }
+        }
+        let ctx = DurableContext::test_context();
+        let factory: Arc<dyn PluginFactory> = Arc::new(Factory(ctx.clone()));
+        let plugins = create_plugins(&[("Factory", factory)], None, tests_support_info)
+            .expect("factories were given");
+        plugins.dispatch_work("on_operation_start", |plugin| {
+            plugin.on_operation_start(&OperationInfo::for_test("s"))
+        });
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert!(
+            fatal.error_message.contains("inside plugin code"),
+            "{}",
+            fatal.error_message
+        );
+    }
+
+    /// A hook's panic payload whose destructor calls a durable operation on
+    /// a captured context records a context usage error: the payload is
+    /// plugin code, so the SDK disposes of it as a plugin body.
+    #[test]
+    fn a_panic_payloads_destructor_calling_an_operation_fails_the_execution() {
+        struct Calls(DurableContext);
+        impl Drop for Calls {
+            fn drop(&mut self) {
+                drop(self.0.claim_operation_id("wait"));
+            }
+        }
+        struct Panicking(DurableContext);
+        impl Plugin for Panicking {
+            #[expect(clippy::panic, reason = "the test hook panics with a payload")]
+            fn on_operation_start(&self, _info: &OperationInfo) -> HookWork {
+                std::panic::panic_any(Calls(self.0.clone()))
+            }
+        }
+        struct Factory(DurableContext);
+        impl PluginFactory for Factory {
+            fn create_plugin(
+                &self,
+                _info: &InvocationInfo,
+            ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+                Ok(Some(Box::new(Panicking(self.0.clone()))))
+            }
+        }
+        let ctx = DurableContext::test_context();
+        let factory: Arc<dyn PluginFactory> = Arc::new(Factory(ctx.clone()));
+        let plugins = create_plugins(&[("Factory", factory)], None, tests_support_info)
+            .expect("factories were given");
+        plugins.dispatch_work("on_operation_start", |plugin| {
+            plugin.on_operation_start(&OperationInfo::for_test("s"))
+        });
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert!(
+            fatal.error_message.contains("inside plugin code"),
+            "{}",
+            fatal.error_message
+        );
+    }
+
+    /// Two factory errors whose destructors panic before the coordinator
+    /// is attached: the coordinator keeps the first payload and rejects
+    /// the second. The rejected payload is plugin code, so its destructor
+    /// runs under `ActiveBody::Plugin`, and the durable operation it calls
+    /// records the context usage error that names plugin code.
+    #[test]
+    fn a_rejected_kept_payloads_destructor_calling_an_operation_fails_the_execution() {
+        struct Calls(DurableContext);
+        impl Drop for Calls {
+            fn drop(&mut self) {
+                drop(self.0.claim_operation_id("wait"));
+            }
+        }
+        #[derive(Debug)]
+        struct DropPanics(Option<DurableContext>);
+        impl fmt::Display for DropPanics {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("factory failed")
+            }
+        }
+        impl std::error::Error for DropPanics {}
+        impl Drop for DropPanics {
+            #[expect(clippy::panic, reason = "the destructor panic under test")]
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(ctx) => std::panic::panic_any(Calls(ctx)),
+                    None => panic!("first error drop"),
+                }
+            }
+        }
+        struct Factory(Option<DurableContext>);
+        impl PluginFactory for Factory {
+            fn create_plugin(
+                &self,
+                _info: &InvocationInfo,
+            ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+                Err(Box::new(DropPanics(self.0.clone())))
+            }
+        }
+        let ctx = DurableContext::test_context();
+        let first: Arc<dyn PluginFactory> = Arc::new(Factory(None));
+        let second: Arc<dyn PluginFactory> = Arc::new(Factory(Some(ctx.clone())));
+        let plugins = create_plugins(
+            &[("First", first), ("Second", second)],
+            None,
+            tests_support_info,
+        )
+        .expect("factories were given");
+        assert!(ctx.coordinator().fatal_error().is_none());
+        plugins.attach(ctx.coordinator());
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert!(
+            fatal.error_message.contains("inside plugin code"),
+            "{}",
+            fatal.error_message
+        );
+    }
+
+    /// A `tracing` subscriber that calls `ctx.step(..)` on each event of
+    /// the plugin target runs under `ActiveBody::Plugin` while the SDK logs
+    /// a failed start hook, so the call records the context usage error
+    /// and the execution fails with it. The scenario retries when the
+    /// warning was dropped by a concurrent subscriber change.
+    #[tokio::test]
+    #[expect(clippy::panic)] // reason: reports that no attempt reached the subscriber
+    async fn subscriber_in_plugin_warning_calls_durable_op() {
+        type Slot = Arc<Mutex<Option<DurableContext>>>;
+        struct Calling(Slot);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Calling {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == TARGET
+                    && let Some(ctx) = self.0.lock().unwrap().clone()
+                {
+                    drop(ctx.step(|_| async { Ok::<u32, BoxError>(1) }));
+                }
+            }
+        }
+        struct FailingStart;
+        impl Plugin for FailingStart {
+            fn on_user_function_start(&self, _info: &OperationInfo) -> HookWork {
+                Err("start failed".into())
+            }
+        }
+        impl PluginFactory for FailingStart {
+            fn create_plugin(
+                &self,
+                _info: &InvocationInfo,
+            ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+                Ok(Some(Box::new(FailingStart)))
+            }
+        }
+        use tracing_subscriber::layer::SubscriberExt as _;
+        for _attempt in 0..5 {
+            let slot: Slot = Arc::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(Calling(Arc::clone(&slot))),
+            );
+            let (service, event) = test_support::service_configured(
+                |builder| builder.plugin(FailingStart),
+                0,
+                Vec::new(),
+                move |_e, ctx| {
+                    *slot.lock().unwrap() = Some(ctx.clone());
+                    async move {
+                        let value = ctx.step(|_| async { Ok(7_u32) }).name("s").await?;
+                        Ok(serde_json::json!(value))
+                    }
+                },
+            );
+            let json = service(event).await.unwrap().0;
+            if json.get("Status") == Some(&serde_json::json!("SUCCEEDED")) {
+                continue;
+            }
+            assert_eq!(json.get("Status"), Some(&serde_json::json!("FAILED")));
+            assert!(json.to_string().contains("inside plugin code"), "{json}");
+            return;
+        }
+        panic!("no attempt delivered the warning to the subscriber");
     }
 
     #[test]
@@ -3868,6 +4821,76 @@ mod tests {
         assert_eq!(AttemptOutcome::Failed.to_string(), "Failed");
     }
 
+    /// Keeps a clone of the `AttemptInfo` its `on_attempt_start` receives.
+    #[derive(Clone, Default)]
+    struct AttemptCapture(Arc<Mutex<Option<AttemptInfo>>>);
+
+    impl Plugin for AttemptCapture {
+        fn on_attempt_start(&self, info: &AttemptInfo) -> HookWork {
+            *self.0.lock().unwrap() = Some(info.clone());
+            Ok(None)
+        }
+    }
+
+    impl PluginFactory for AttemptCapture {
+        fn create_plugin(
+            &self,
+            _info: &InvocationInfo,
+        ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// r7 item 6: the runner receives the very `OperationInfo` that
+    /// `on_attempt_start` saw, not a copy.
+    #[test]
+    fn attempt_started_returns_the_attempt_infos_own_operation() {
+        let capture = AttemptCapture::default();
+        let factories: Vec<(&'static str, Arc<dyn PluginFactory>)> =
+            vec![("test::AttemptCapture", Arc::new(capture.clone()))];
+        let plugins = create_plugins(&factories, None, empty_info).expect("registered");
+        let operation = OperationInfo::from_record("a", &record("STEP", CheckpointStatus::Started));
+        let returned = attempt_started(&plugins, operation, 1, false);
+        let seen = capture.0.lock().unwrap().take().expect("the hook ran");
+        assert!(std::ptr::eq(seen.operation(), Arc::as_ptr(&returned)));
+    }
+
+    /// A STARTED step record resumed as attempt 3: `on_operation_start`
+    /// gets the record's attempt with `is_replay` true, as main and JS do;
+    /// `on_attempt_start` gets attempt 3, `Started` and `is_replay` false,
+    /// in the info `attempt_started` returns for the runner (rule 7.3).
+    #[test]
+    fn attempt_started_keeps_the_records_attempt_in_the_start_hook() {
+        let hooks = test_support::OpHooks::default();
+        let plugins = hooks.plugins();
+        let mut started = record("STEP", CheckpointStatus::Started);
+        started.attempt = 2;
+        let operation = OperationInfo::from_record("a", &started);
+        assert_eq!(operation.attempt(), Some(2));
+        let returned = attempt_started(&plugins, operation, 3, true);
+        let seen: Vec<_> = hooks
+            .records()
+            .iter()
+            .map(|r| (r.hook, r.info_attempt, r.replay, r.status))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("start", Some(2), true, Some(OperationStatus::Started)),
+                (
+                    "attempt_start",
+                    Some(3),
+                    false,
+                    Some(OperationStatus::Started)
+                ),
+            ]
+        );
+        assert_eq!(returned.attempt(), Some(3));
+        assert!(!returned.is_replay());
+        assert_eq!(returned.status(), Some(OperationStatus::Started));
+        assert!(returned.start_timestamp().is_some());
+    }
+
     /// Every hook that is not a wrap hook has a no-op default: the async
     /// hooks resolve with `Ok(())`, the operation hooks return no work, and
     /// the propagation hook returns no header. A factory has no group by
@@ -3876,7 +4899,7 @@ mod tests {
     async fn default_hooks_do_nothing() {
         let operation = OperationInfo::from_record("a", &record("STEP", CheckpointStatus::Started));
         let attempt = AttemptInfo {
-            operation: operation.clone(),
+            operation: Arc::new(operation.clone()),
             attempt: 1,
         };
         let attempt_end = AttemptEndInfo {
@@ -3916,34 +4939,6 @@ mod tests {
         assert!(Probe.on_operation_change(&change).unwrap().is_none());
         assert_eq!(Probe.propagation_trace_id(&propagation).unwrap(), None);
         assert_eq!(ProbeFactory(true).exclusive_group(), None);
-    }
-
-    /// The declared `Next` has no chain to run yet, so it stays pending,
-    /// and a default wrap hook that awaits it stays pending too.
-    #[test]
-    fn next_without_chain_stays_pending() {
-        let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        let mut next = Next {
-            chain: Weak::new(),
-            link: 0,
-        };
-        assert!(Pin::new(&mut next).poll(&mut cx).is_pending());
-        let mut wrapped = Probe.wrap_task(Next {
-            chain: Weak::new(),
-            link: 0,
-        });
-        assert!(wrapped.as_mut().poll(&mut cx).is_pending());
-    }
-
-    /// `Next` prints as `Next`.
-    #[test]
-    fn next_debug_writes_next() {
-        let next = Next {
-            chain: Weak::new(),
-            link: 0,
-        };
-        assert_eq!(format!("{next:?}"), "Next");
     }
 
     // Hook work. The operation hooks that return work are called by later
@@ -4467,6 +5462,371 @@ mod tests {
             return;
         }
         panic!("no attempt captured the warning");
+    }
+
+    // User-function hooks: the plugin guard, warnings and dispatch.
+
+    /// A user-function plugin whose start hook and wrap are closures.
+    #[derive(Clone, Default)]
+    struct UfPlugin {
+        start: Option<Arc<dyn Fn() -> HookWork + Send + Sync>>,
+        /// Runs in `wrap_user_function` after `next()`.
+        after_next: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    impl UfPlugin {
+        fn starting(start: impl Fn() -> HookWork + Send + Sync + 'static) -> Self {
+            Self {
+                start: Some(Arc::new(start)),
+                ..Self::default()
+            }
+        }
+
+        fn after_next(after: impl Fn() + Send + Sync + 'static) -> Self {
+            Self {
+                after_next: Some(Arc::new(after)),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl Plugin for UfPlugin {
+        fn name(&self) -> &'static str {
+            "UfPlugin"
+        }
+
+        fn on_user_function_start(&self, _info: &OperationInfo) -> HookWork {
+            self.start.as_ref().map_or(Ok(None), |start| start())
+        }
+
+        fn wrap_user_function(&self, _info: &OperationInfo, next: &mut dyn FnMut()) {
+            next();
+            if let Some(after) = &self.after_next {
+                after();
+            }
+        }
+    }
+
+    impl PluginFactory for UfPlugin {
+        fn create_plugin(
+            &self,
+            _info: &InvocationInfo,
+        ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// Polls once a runner of the step `s` over `plugins` whose body
+    /// returns `Ok(7)`, and returns the body's value.
+    fn run_step_once(plugins: &Arc<InvocationPlugins>) -> Option<u32> {
+        let mut run = std::pin::pin!(run_user_function(
+            Some(Arc::clone(plugins)),
+            Arc::new(OperationInfo::for_test("s")),
+            UserBody::Step("s".to_owned()),
+            tracing::Span::none(),
+            || async { Ok::<u32, BoxError>(7) },
+            |e: &BoxError| WireError::new(Some("Error".to_owned()), Some(e.to_string())),
+        ));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match run.as_mut().poll(&mut cx) {
+            Poll::Ready(ran) => ran.into_parts().ok(),
+            Poll::Pending => None,
+        }
+    }
+
+    /// A pending hook future that its `HookRun` holds, dropped directly,
+    /// with no drain and no deadline, is dropped under the plugin guard:
+    /// the `wait` its destructor calls records the context usage error.
+    #[tokio::test]
+    async fn hook_future_drop_calls_wait_records_context_usage() {
+        let ctx = DurableContext::test_context();
+        let plugins = test_support::plugins_of(Hooks::default());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = OnDrop::new({
+            let ctx = ctx.clone();
+            let dropped = Arc::clone(&dropped);
+            move || {
+                drop(ctx.wait(Duration::from_secs(1)));
+                dropped.store(true, Ordering::SeqCst);
+            }
+        });
+        let mut run = HookRun {
+            identity: "Hooks (plugins[0])".into(),
+            hook: "on_user_function_start",
+            future: Some(Box::pin(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                Ok(())
+            })),
+            undelivered: Arc::clone(&plugins.undelivered),
+        };
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(Pin::new(&mut run).poll(&mut cx).is_pending());
+        assert!(ctx.coordinator().fatal_error().is_none());
+        drop(run);
+        assert!(dropped.load(Ordering::SeqCst), "the destructor ran");
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert!(
+            fatal.error_message.contains("inside plugin code"),
+            "{}",
+            fatal.error_message
+        );
+    }
+
+    /// A start hook future that waits on a gate the test holds does not
+    /// delay the suspension: the handler's `wait(1 s)` suspends the
+    /// invocation with the future pending, and the invocation-end drain
+    /// waits for it. Once the gate opens, the drain ends, and the response
+    /// is `PENDING`.
+    #[tokio::test]
+    async fn pending_hook_work_does_not_delay_suspension() {
+        #[derive(Clone)]
+        struct Gated {
+            gate: Arc<tokio::sync::Notify>,
+            polled: Arc<AtomicBool>,
+            done: Arc<AtomicBool>,
+        }
+        impl Plugin for Gated {
+            fn on_user_function_start(&self, _info: &OperationInfo) -> HookWork {
+                let (gate, polled, done) = (
+                    Arc::clone(&self.gate),
+                    Arc::clone(&self.polled),
+                    Arc::clone(&self.done),
+                );
+                Ok(Some(Box::pin(async move {
+                    polled.store(true, Ordering::SeqCst);
+                    gate.notified().await;
+                    done.store(true, Ordering::SeqCst);
+                    Ok(())
+                })))
+            }
+        }
+        impl PluginFactory for Gated {
+            fn create_plugin(
+                &self,
+                _info: &InvocationInfo,
+            ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+                Ok(Some(Box::new(self.clone())))
+            }
+        }
+        let gated = Gated {
+            gate: Arc::new(tokio::sync::Notify::new()),
+            polled: Arc::default(),
+            done: Arc::default(),
+        };
+        let suspended = Arc::new(AtomicBool::new(false));
+        let (service, event) = test_support::service_configured(
+            {
+                let gated = gated.clone();
+                move |builder| builder.plugin(gated)
+            },
+            0,
+            Vec::new(),
+            {
+                let suspended = Arc::clone(&suspended);
+                move |_e, ctx| {
+                    let suspended = Arc::clone(&suspended);
+                    async move {
+                        ctx.step(|_| async { Ok(1_u32) }).name("s").await?;
+                        // Dropped when the suspension drops the handler.
+                        let _guard = OnDrop::new(move || suspended.store(true, Ordering::SeqCst));
+                        ctx.wait(Duration::from_secs(1)).name("w").await?;
+                        Ok(serde_json::json!("done"))
+                    }
+                }
+            },
+        );
+        let mut invocation = std::pin::pin!(service(event));
+        let early = tokio::time::timeout(Duration::from_millis(200), invocation.as_mut()).await;
+        assert!(early.is_err(), "the drain waits for the hook future");
+        assert!(suspended.load(Ordering::SeqCst), "the invocation suspended");
+        assert!(gated.polled.load(Ordering::SeqCst), "the hook future ran");
+        assert!(
+            !gated.done.load(Ordering::SeqCst),
+            "the hook future is pending"
+        );
+        gated.gate.notify_one();
+        let json = tokio::time::timeout(Duration::from_secs(5), invocation)
+            .await
+            .expect("the drain ends once the gate opens")
+            .unwrap()
+            .0;
+        assert_eq!(
+            json.get("Status"),
+            Some(&serde_json::json!("PENDING")),
+            "{json}"
+        );
+        assert!(gated.done.load(Ordering::SeqCst));
+    }
+
+    /// An error whose `Display` counts its calls, and panics when `panics`
+    /// is set.
+    #[derive(Debug)]
+    struct CountingDisplay {
+        calls: Arc<AtomicUsize>,
+        panics: bool,
+    }
+
+    impl fmt::Display for CountingDisplay {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panics, "display boom");
+            f.write_str("counted")
+        }
+    }
+
+    impl std::error::Error for CountingDisplay {}
+
+    /// A start hook error is formatted once, for its one WARN with the
+    /// `error` field. When its `Display` panics, the formatting-panic WARN
+    /// is logged instead. Either way the body's result returns.
+    #[test]
+    #[expect(clippy::panic)] // reason: reports that no attempt captured the warnings
+    fn error_display_counted_once_and_formatting_panic_logged() {
+        'attempt: for _attempt in 0..5 {
+            for panics in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let plugins = test_support::plugins_of(UfPlugin::starting({
+                    let calls = Arc::clone(&calls);
+                    move || {
+                        Err(Box::new(CountingDisplay {
+                            calls: Arc::clone(&calls),
+                            panics,
+                        }) as BoxError)
+                    }
+                }));
+                let (buffer, guard) = capture();
+                let result = run_step_once(&plugins);
+                drop(guard);
+                assert_eq!(result, Some(7), "panics: {panics}");
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "panics: {panics}");
+                let warnings = warnings(&buffer);
+                let [warning] = warnings.as_slice() else {
+                    continue 'attempt;
+                };
+                assert_eq!(field(warning, "hook"), "on_user_function_start");
+                assert_eq!(field(warning, "plugin"), "UfPlugin (plugins[0])");
+                if panics {
+                    assert_eq!(
+                        field(warning, "message"),
+                        "plugin hook failed, and its error panicked while it was formatted; \
+                         the error is ignored"
+                    );
+                    assert!(warning.get("error").is_none(), "{warning}");
+                } else {
+                    assert_eq!(
+                        field(warning, "message"),
+                        "plugin hook failed; the error is ignored"
+                    );
+                    assert_eq!(field(warning, "error"), "counted");
+                }
+            }
+            return;
+        }
+        panic!("no attempt captured exactly one warning per run");
+    }
+
+    /// A start hook error whose destructor panics: the error is logged in
+    /// one WARN, and the destructor's panic fails the invocation.
+    #[tokio::test]
+    #[expect(clippy::panic)] // reason: reports that no attempt captured the warning
+    async fn error_destructor_panic_fails_the_invocation() {
+        for _attempt in 0..5 {
+            let (buffer, guard) = capture();
+            let (service, event) = test_support::service_configured(
+                |builder| {
+                    builder.plugin(UfPlugin::starting(|| {
+                        Err(Box::new(DropPanicError) as BoxError)
+                    }))
+                },
+                0,
+                Vec::new(),
+                |_e, ctx| async move {
+                    let value = ctx.step(|_| async { Ok(7_u32) }).name("s").await?;
+                    Ok(serde_json::json!(value))
+                },
+            );
+            let payload = panic_of(service(event)).await;
+            drop(guard);
+            assert_eq!(payload.downcast_ref::<&str>(), Some(&"error drop"));
+            let warnings = warnings(&buffer);
+            let [warning] = warnings.as_slice() else {
+                continue;
+            };
+            assert_eq!(
+                field(warning, "message"),
+                "plugin hook failed; the error is ignored"
+            );
+            assert_eq!(field(warning, "hook"), "on_user_function_start");
+            assert_eq!(field(warning, "error"), "drop err");
+            return;
+        }
+        panic!("no attempt captured exactly one warning");
+    }
+
+    /// A wrap that panics after `next()` with a payload whose destructor
+    /// panics: the wrap panic is logged, the payload's destructor panic is
+    /// discarded, and the body's result returns.
+    #[test]
+    #[expect(clippy::panic)] // reason: reports that no attempt captured the warning
+    fn panic_payload_destructor_panic_is_discarded() {
+        for _attempt in 0..5 {
+            #[expect(clippy::panic, reason = "the wrap panics with a payload")]
+            fn panic_with_payload() {
+                std::panic::panic_any(PanickingPayload)
+            }
+            let plugins = test_support::plugins_of(UfPlugin::after_next(panic_with_payload));
+            let (buffer, guard) = capture();
+            let result = run_step_once(&plugins);
+            drop(guard);
+            assert_eq!(result, Some(7));
+            let warnings = warnings(&buffer);
+            let [warning] = warnings.as_slice() else {
+                continue;
+            };
+            assert_eq!(
+                field(warning, "message"),
+                "plugin hook panicked; the panic is ignored"
+            );
+            assert_eq!(field(warning, "hook"), "wrap_user_function");
+            return;
+        }
+        panic!("no attempt captured exactly one warning");
+    }
+
+    /// A subscriber that panics on every event, while the SDK logs a wrap
+    /// panic: the subscriber's panic is discarded, and the body's result
+    /// returns.
+    #[test]
+    fn subscriber_panic_while_logging_is_discarded() {
+        struct Panicking(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Panicking {
+            #[expect(clippy::panic, reason = "the subscriber panics on every event")]
+            fn on_event(
+                &self,
+                _event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                panic!("subscriber boom");
+            }
+        }
+        #[expect(clippy::panic, reason = "the wrap panics after next()")]
+        fn wrap_boom() {
+            panic!("wrap boom")
+        }
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let events = Arc::new(AtomicUsize::new(0));
+        let plugins = test_support::plugins_of(UfPlugin::after_next(wrap_boom));
+        let subscriber = tracing_subscriber::registry().with(Panicking(Arc::clone(&events)));
+        let result = tracing::subscriber::with_default(subscriber, || run_step_once(&plugins));
+        assert_eq!(result, Some(7));
+        assert!(
+            events.load(Ordering::SeqCst) >= 1,
+            "the wrap panic was logged"
+        );
     }
 
     /// Work started after the drain closed is dropped unpolled, with a
@@ -5371,6 +6731,25 @@ mod tests {
             unreachable!("one record: {warnings:?}");
         };
         assert_eq!(field(unformatted, "plugin"), "TraceHook (plugins[0])");
+    }
+
+    /// `propagation_trace_id` is plugin code: a durable operation it calls
+    /// records the context usage error that names plugin code.
+    #[test]
+    fn trace_id_hook_calling_an_operation_fails_the_execution() {
+        let ctx = DurableContext::test_context();
+        let captured = ctx.clone();
+        let plugins = trace_plugins(&[TraceHook::new(move |_| {
+            drop(captured.claim_operation_id("wait"));
+            Ok(None)
+        })]);
+        assert_eq!(plugins.propagation_trace_id(&trace_input()), None);
+        let fatal = ctx.coordinator().fatal_error().expect("fatal recorded");
+        assert!(
+            fatal.error_message.contains("inside plugin code"),
+            "{}",
+            fatal.error_message
+        );
     }
 
     /// The SDK drops an error it delivers to nobody inside a catch, and

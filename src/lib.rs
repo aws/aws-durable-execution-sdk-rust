@@ -1314,152 +1314,321 @@ where
             // checkpoint client, or of any task the SDK started) returns
             // here only after the driver cleaned up every task, and leaves
             // the SDK with its original payload. When several panic, the
-            // first one recorded is resumed. A recorded fatal error takes
-            // precedence over a panic, so the driver then returns the fatal
-            // outcome instead. Between the cleanup and the resume, only the
+            // first one recorded is resumed. A fatal error that the driver's
+            // arbitration reads takes precedence over a panic, so the driver
+            // then returns the fatal outcome instead. Between the cleanup and the resume, only the
             // plugins' drain and end hooks run, with `Retrying`.
-            let outcome = match driver::drive_invocation(
-                root,
-                task_ownership,
-                coordinator,
-                flush_ctx.clone(),
-                remaining,
-            )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(payload) => {
-                    let end = InvocationEnd::panicked(&*payload);
-                    // A late panic never replaces this one: without a
-                    // response, `end_invocation` discards every late panic
-                    // and returns none.
-                    end_invocation(plugins.as_deref(), &end_log, &flush_ctx, end, None)
-                        .await
-                        .into_iter()
-                        .for_each(task::discard_panic);
-                    // The plugins are dropped before the panic resumes, so
-                    // no plugin destructor runs while it unwinds. The
-                    // contexts hold them too.
-                    drop(flush_ctx);
-                    drop(plugins);
-                    std::panic::resume_unwind(payload)
-                }
-            };
-
-            // Unconditional flush point of the checkpoint buffering
-            // contract (`checkpoint_delay` / `checkpoint_batching`):
-            // whatever the outcome, suspension (PENDING), completion
-            // (SUCCEEDED), or failure (FAILED), every buffered checkpoint
-            // is written, and every in-flight batched write is awaited,
-            // BEFORE the envelope reports the invocation's state to the
-            // service, so buffering can never hold a checkpoint past the
-            // end of the invocation. A no-op without configured buffering.
             //
-            // Checkpoint-failure interplay (issue #43): a `Fault` outcome
-            // skips the flush of pending writes: the write channel
-            // already failed retryably; a follow-up write would fail the
-            // same way, and the contract is "fails the invocation with no
-            // further writes". But failures already RETAINED by detached
-            // batch flushes (every contributor dropped: a lost
-            // `race`/`select_ok` branch) are still drained: a retained
-            // NON-retryable failure is deterministic, so dropping it here
-            // would leave its operations `Started` and re-executing on
-            // every future invocation, exactly the loop the flush point
-            // exists to end. Such a failure routes through the same
-            // terminalize-then-fail-the-execution path as a non-retryable
-            // flush failure; retryable-only retained failures are dropped
-            // with the invocation (the service re-invokes and the affected
-            // operations re-run under the interruption contract). Every
-            // other outcome flushes, and a flush failure routes through
-            // the same classification as any other checkpoint write
-            // failure (see `flush_failure_response`): retryable fails the
-            // invocation, non-retryable persists terminal `FAIL` records
-            // for the affected operations and fails the execution.
-            if matches!(outcome, driver::InvocationOutcome::Fault { .. }) {
-                // No flush of pending writes on a failed channel, but
-                // classify retained failures (see above).
-                if let Some(retained) = flush_ctx.take_retained_flush_failures().await
-                    && retained.any_non_retryable()
-                {
-                    let (response, end) =
-                        flush_failure_response(&retained, outcome, &flush_ctx).await;
-                    let late = end_invocation(
-                        plugins.as_deref(),
-                        &end_log,
-                        &flush_ctx,
-                        end,
-                        Some(&response),
-                    )
-                    .await;
-                    return respond(response, late, flush_ctx, plugins);
-                }
-            } else if let Err(flush) = flush_ctx.flush_pending_checkpoints().await {
-                let (response, end) = flush_failure_response(&flush, outcome, &flush_ctx).await;
-                let late = end_invocation(
+            // Everything from here to the response runs inside every
+            // plugin's `wrap_invocation`, so the wraps are active while the
+            // end hooks run. The future returns its outcome as a value and
+            // never resumes a panic itself. So it finishes, and is dropped
+            // inside the wraps, before the contexts and plugins are dropped
+            // and before any panic resumes.
+            let frames = plugin::Frames::invocation(plugins.clone());
+            let finished = plugin::Frames::instrument(
+                &frames,
+                CatchFinished::new(finish_invocation(
+                    root,
+                    task_ownership,
+                    coordinator,
+                    &flush_ctx,
+                    remaining,
                     plugins.as_deref(),
                     &end_log,
-                    &flush_ctx,
-                    end,
-                    Some(&response),
-                )
-                .await;
-                return respond(response, late, flush_ctx, plugins);
-            }
-
-            // Convert outcome to the durable response envelope.
-            //
-            // ENVELOPE CONTRACT: do not "fix" the `Ok` below. Every outcome,
-            // including a handler failure, is reported inside a *successful*
-            // Lambda invocation response: the durable execution service reads
-            // the `Status` field of this envelope to record the execution
-            // result, and it can only do that when the invocation itself
-            // succeeds. Returning `Err` here would make the service treat the
-            // invocation as a runtime fault and retry it, rather than marking
-            // the execution FAILED with the handler's error.
-            //
-            // The one deliberate exception is `Fault`, a retryable
-            // checkpoint failure, where retry-as-a-runtime-fault is
-            // exactly the intended recovery, so it maps to `Err` inside
-            // `outcome_envelope`.
-            //
-            // The observable consequence, which is intentional: a handler
-            // failure does not increment the Lambda `Errors` metric, does not
-            // route to a DLQ or OnFailure destination, and does not mark the
-            // X-Ray trace as an error. Operators must monitor the durable
-            // execution status (`GetDurableExecution` /
-            // `ListDurableExecutionsByFunction`) instead. See the rustdoc on
-            // [`run`] and [`wrap`].
-            let (response, end) = outcome_envelope(outcome, &flush_ctx);
-            let late = end_invocation(
-                plugins.as_deref(),
-                &end_log,
-                &flush_ctx,
-                end,
-                Some(&response),
+                )),
             )
             .await;
-            respond(response, late, flush_ctx, plugins)
+            // The frames hold the plugins too. They are dropped before
+            // `respond` can resume a panic, so no plugin destructor runs
+            // while it unwinds.
+            drop(frames);
+            respond(finished, flush_ctx, plugins)
         })
     }
 }
 
-/// Returns `response`, unless a late panic fails the invocation: then the
+/// Test-only hooks into `finish_invocation`.
+#[cfg(test)]
+mod test_hooks {
+    tokio::task_local! {
+        /// When set, `finish_invocation` returns `Pending` once right after
+        /// `drive_invocation` returns, and sets the flag at that poll, so a
+        /// wrap's code after `next()` runs in a post-drive poll.
+        pub(crate) static PENDING_AFTER_DRIVE:
+            std::sync::Arc<std::sync::atomic::AtomicBool>;
+    }
+
+    pub(crate) async fn pending_once_after_drive() {
+        let Ok(flag) = PENDING_AFTER_DRIVE.try_with(std::sync::Arc::clone) else {
+            return;
+        };
+        let mut pending = true;
+        std::future::poll_fn(|cx| {
+            if std::mem::take(&mut pending) {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        })
+        .await;
+    }
+
+    /// What `pending_holding_guard` holds and reports.
+    pub(crate) struct HeldGuard {
+        /// Set at the poll that returns `Pending`.
+        pub(crate) reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Makes the value the pending future holds.
+        pub(crate) make: Box<dyn Fn() -> Box<dyn Send> + Send + Sync>,
+    }
+
+    tokio::task_local! {
+        /// When set, `finish_invocation` returns `Pending` once right after
+        /// `drive_invocation` returns, while it holds a value that `make`
+        /// built, and sets `reached` at that poll. A test drops the
+        /// post-start future there, with the value still held.
+        pub(crate) static PENDING_HOLDING_GUARD: std::sync::Arc<HeldGuard>;
+    }
+
+    pub(crate) async fn pending_holding_guard() {
+        let Ok(held) = PENDING_HOLDING_GUARD.try_with(std::sync::Arc::clone) else {
+            return;
+        };
+        let guard = (held.make)();
+        let mut pending = true;
+        std::future::poll_fn(|cx| {
+            if std::mem::take(&mut pending) {
+                held.reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        })
+        .await;
+        drop(guard);
+    }
+}
+
+/// How the part of an invocation after its start hooks finished.
+enum Finished {
+    /// The response, and a late panic that fails the invocation instead.
+    Respond(
+        Result<InvocationResponse, lambda_runtime::Error>,
+        Option<Box<dyn std::any::Any + Send + 'static>>,
+    ),
+    /// The drive ended with an invocation-failing panic.
+    Panicked(Box<dyn std::any::Any + Send + 'static>),
+}
+
+/// Drives the handler, flushes, runs the end hooks and builds the
+/// response. It returns a panic as a value, so its caller resumes it only
+/// after this future was dropped inside the plugins' wraps.
+async fn finish_invocation<R>(
+    root: R,
+    task_ownership: std::sync::Arc<driver::TaskOwnership>,
+    coordinator: std::sync::Arc<coordinator::InvocationCoordinator>,
+    flush_ctx: &DurableContext,
+    remaining: Option<Duration>,
+    plugins: Option<&plugin::InvocationPlugins>,
+    end_log: &engine::CheckpointLog,
+) -> Finished
+where
+    R: Future<Output = Result<String, WireError>> + Send + 'static,
+{
+    let (outcome, fatal_won) = match driver::drive_invocation(
+        root,
+        task_ownership,
+        coordinator,
+        flush_ctx.clone(),
+        remaining,
+    )
+    .await
+    {
+        Ok(driven) => driven,
+        Err(payload) => {
+            let end = InvocationEnd::panicked(&*payload);
+            // A late panic never replaces this one: without a
+            // response, `end_invocation` discards every late panic
+            // and returns none.
+            end_invocation(plugins, end_log, flush_ctx, end, None, false)
+                .await
+                .into_iter()
+                .for_each(task::discard_panic);
+            return Finished::Panicked(payload);
+        }
+    };
+    // `fatal_won` says whether a fatal error won the drive's own
+    // arbitration, as `drive_invocation` decided it. The late-panic policy
+    // uses it and never reads the coordinator's fatal slot, which code
+    // after the arbitration can still fill: a plugin claim during the flush
+    // (a wrap's code after `next()`) or in an end hook records a context
+    // usage error there. Such a claim cannot shift an operation ID the
+    // execution uses: a claim that can shift a used ID happens before a
+    // later operation of the same drive mints its ID, so it is recorded
+    // before the arbitration. A claim after it comes after the last
+    // operation of this invocation, and the next invocation replays from
+    // scratch.
+    #[cfg(test)]
+    test_hooks::pending_once_after_drive().await;
+    #[cfg(test)]
+    test_hooks::pending_holding_guard().await;
+
+    // Unconditional flush point of the checkpoint buffering
+    // contract (`checkpoint_delay` / `checkpoint_batching`):
+    // whatever the outcome, suspension (PENDING), completion
+    // (SUCCEEDED), or failure (FAILED), every buffered checkpoint
+    // is written, and every in-flight batched write is awaited,
+    // BEFORE the envelope reports the invocation's state to the
+    // service, so buffering can never hold a checkpoint past the
+    // end of the invocation. A no-op without configured buffering.
+    //
+    // Checkpoint-failure interplay (issue #43): a `Fault` outcome
+    // skips the flush of pending writes: the write channel
+    // already failed retryably; a follow-up write would fail the
+    // same way, and the contract is "fails the invocation with no
+    // further writes". But failures already RETAINED by detached
+    // batch flushes (every contributor dropped: a lost
+    // `race`/`select_ok` branch) are still drained: a retained
+    // NON-retryable failure is deterministic, so dropping it here
+    // would leave its operations `Started` and re-executing on
+    // every future invocation, exactly the loop the flush point
+    // exists to end. Such a failure routes through the same
+    // terminalize-then-fail-the-execution path as a non-retryable
+    // flush failure; retryable-only retained failures are dropped
+    // with the invocation (the service re-invokes and the affected
+    // operations re-run under the interruption contract). Every
+    // other outcome flushes, and a flush failure routes through
+    // the same classification as any other checkpoint write
+    // failure (see `flush_failure_response`): retryable fails the
+    // invocation, non-retryable persists terminal `FAIL` records
+    // for the affected operations and fails the execution.
+    if matches!(outcome, driver::InvocationOutcome::Fault { .. }) {
+        // No flush of pending writes on a failed channel, but
+        // classify retained failures (see above).
+        if let Some(retained) = flush_ctx.take_retained_flush_failures().await
+            && retained.any_non_retryable()
+        {
+            let (response, end) = flush_failure_response(&retained, outcome, flush_ctx).await;
+            let late =
+                end_invocation(plugins, end_log, flush_ctx, end, Some(&response), fatal_won).await;
+            return Finished::Respond(response, late);
+        }
+    } else if let Err(flush) = flush_ctx.flush_pending_checkpoints().await {
+        let (response, end) = flush_failure_response(&flush, outcome, flush_ctx).await;
+        let late =
+            end_invocation(plugins, end_log, flush_ctx, end, Some(&response), fatal_won).await;
+        return Finished::Respond(response, late);
+    }
+
+    // Convert outcome to the durable response envelope.
+    //
+    // ENVELOPE CONTRACT: do not "fix" the `Ok` below. Every outcome,
+    // including a handler failure, is reported inside a *successful*
+    // Lambda invocation response: the durable execution service reads
+    // the `Status` field of this envelope to record the execution
+    // result, and it can only do that when the invocation itself
+    // succeeds. Returning `Err` here would make the service treat the
+    // invocation as a runtime fault and retry it, rather than marking
+    // the execution FAILED with the handler's error.
+    //
+    // The one deliberate exception is `Fault`, a retryable
+    // checkpoint failure, where retry-as-a-runtime-fault is
+    // exactly the intended recovery, so it maps to `Err` inside
+    // `outcome_envelope`.
+    //
+    // The observable consequence, which is intentional: a handler
+    // failure does not increment the Lambda `Errors` metric, does not
+    // route to a DLQ or OnFailure destination, and does not mark the
+    // X-Ray trace as an error. Operators must monitor the durable
+    // execution status (`GetDurableExecution` /
+    // `ListDurableExecutionsByFunction`) instead. See the rustdoc on
+    // [`run`] and [`wrap`].
+    let (response, end) = outcome_envelope(outcome, flush_ctx);
+    let late = end_invocation(plugins, end_log, flush_ctx, end, Some(&response), fatal_won).await;
+    Finished::Respond(response, late)
+}
+
+/// Returns the response, unless a panic fails the invocation: then the
 /// panic resumes instead. The plugins are dropped before it resumes, so no
 /// plugin destructor runs while it unwinds. The contexts hold them too, so
 /// `ctx` is dropped as well.
 fn respond(
-    response: Result<InvocationResponse, lambda_runtime::Error>,
-    late: Option<Box<dyn std::any::Any + Send + 'static>>,
+    finished: Finished,
     ctx: DurableContext,
     plugins: Option<std::sync::Arc<plugin::InvocationPlugins>>,
 ) -> Result<InvocationResponse, lambda_runtime::Error> {
-    if let Some(payload) = late {
-        drop(response);
-        drop(ctx);
-        drop(plugins);
-        std::panic::resume_unwind(payload);
+    let payload = match finished {
+        Finished::Respond(response, None) => return response,
+        Finished::Respond(response, Some(payload)) => {
+            drop_contained(response);
+            payload
+        }
+        Finished::Panicked(payload) => payload,
+    };
+    // The first panic wins. A destructor that panics while it is dropped
+    // here is a second panic, so it is discarded.
+    drop_contained(ctx);
+    drop_contained(plugins);
+    std::panic::resume_unwind(payload)
+}
+
+/// Drops `value` inside a catch, and discards a panic of its destructor.
+fn drop_contained<T>(value: T) {
+    if let Err(payload) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(value)))
+    {
+        task::discard_panic(payload);
     }
-    response
+}
+
+/// The post-start invocation future, polled inside a catch. Any panic of a
+/// poll, from SDK code or from a subscriber, becomes
+/// [`Finished::Panicked`], so the explicit drop order in [`respond`] holds
+/// on every path.
+struct CatchFinished<F> {
+    /// `None` once it finished or panicked.
+    inner: Option<std::pin::Pin<Box<F>>>,
+}
+
+impl<F> CatchFinished<F> {
+    fn new(inner: F) -> Self {
+        Self {
+            inner: Some(Box::pin(inner)),
+        }
+    }
+}
+
+impl<F: Future<Output = Finished>> Future for CatchFinished<F> {
+    type Output = Finished;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Finished> {
+        let this = self.get_mut();
+        let Some(inner) = this.inner.as_mut() else {
+            return std::task::Poll::Pending;
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(finished)) => {
+                this.inner = None;
+                std::task::Poll::Ready(finished)
+            }
+            Err(payload) => {
+                // The future is torn down now, inside the caller's wraps.
+                // A second panic from its destructor is discarded.
+                if let Some(inner) = this.inner.take() {
+                    drop_contained(inner);
+                }
+                std::task::Poll::Ready(Finished::Panicked(payload))
+            }
+        }
+    }
 }
 
 /// How an invocation ended, for the plugins' end hooks. It is set where
@@ -1516,28 +1685,37 @@ pub(crate) fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String
 /// (see [`plugin::LatePanics`]). `response` is `None` when a panic already
 /// ends the invocation. A late panic is discarded when the invocation
 /// already fails: with that panic, with a Lambda error, or with a fatal
-/// error, which the drive keeps over a panic too.
+/// error that won the drive's arbitration (`fatal_won`, the snapshot taken
+/// during the arbitration and returned by the drive), which the drive keeps
+/// over a panic too.
 async fn end_invocation(
     plugins: Option<&plugin::InvocationPlugins>,
     log: &engine::CheckpointLog,
     ctx: &DurableContext,
     end: InvocationEnd,
     response: Option<&Result<InvocationResponse, lambda_runtime::Error>>,
+    fatal_won: bool,
 ) -> Option<Box<dyn std::any::Any + Send + 'static>> {
     let plugins = plugins?;
     plugins
-        .invocation_end(log, end, ctx.remaining_time(), late_panics(response, ctx))
+        .invocation_end(
+            log,
+            end,
+            ctx.remaining_time(),
+            late_panics(response, fatal_won),
+        )
         .await
 }
 
 /// What a late panic does at the end of an invocation that returns
-/// `response` (see [`end_invocation`]).
+/// `response`, given whether a fatal error won the drive's arbitration
+/// (see [`end_invocation`]).
 fn late_panics(
     response: Option<&Result<InvocationResponse, lambda_runtime::Error>>,
-    ctx: &DurableContext,
+    fatal_won: bool,
 ) -> plugin::LatePanics {
     match response {
-        Some(Ok(_)) if ctx.coordinator().fatal_error().is_none() => plugin::LatePanics::Fail,
+        Some(Ok(_)) if !fatal_won => plugin::LatePanics::Fail,
         _ => plugin::LatePanics::Discard,
     }
 }
@@ -3448,20 +3626,17 @@ mod tests {
     }
 
     /// A late panic fails only an invocation that returns a response and
-    /// has no fatal error. A Lambda error, a fatal error and a panic each
-    /// already fail the invocation.
+    /// where no fatal error won the drive. A Lambda error, a fatal error and
+    /// a panic each already fail the invocation.
     #[test]
     fn late_panics_fail_only_a_response_without_a_fatal_error() {
         use crate::plugin::LatePanics;
-        let ctx = DurableContext::test_context();
         let ok = Ok(InvocationResponse(serde_json::Value::Null));
         let err = Err(lambda_runtime::Error::from("fault"));
-        assert_eq!(late_panics(Some(&ok), &ctx), LatePanics::Fail);
-        assert_eq!(late_panics(Some(&err), &ctx), LatePanics::Discard);
-        assert_eq!(late_panics(None, &ctx), LatePanics::Discard);
-        ctx.coordinator()
-            .record_fatal("Error".to_owned(), "fatal".to_owned());
-        assert_eq!(late_panics(Some(&ok), &ctx), LatePanics::Discard);
+        assert_eq!(late_panics(Some(&ok), false), LatePanics::Fail);
+        assert_eq!(late_panics(Some(&err), false), LatePanics::Discard);
+        assert_eq!(late_panics(None, false), LatePanics::Discard);
+        assert_eq!(late_panics(Some(&ok), true), LatePanics::Discard);
     }
 
     #[tokio::test]
@@ -3674,6 +3849,450 @@ mod tests {
             return;
         }
         panic!("no attempt captured the warning");
+    }
+
+    /// The plugin of the post-drive claim tests. `AfterNext` claims once,
+    /// in the code `wrap_invocation` runs after `next()`, in the first poll
+    /// after the drive ended (the coordinator's phase is no longer
+    /// `Running`). `OperationStart` claims in `on_operation_start`, while
+    /// the handler runs.
+    #[derive(Clone, Copy, PartialEq)]
+    enum ClaimAt {
+        AfterNext,
+        OperationStart,
+    }
+
+    type ContextSlot = std::sync::Arc<std::sync::Mutex<Option<DurableContext>>>;
+
+    #[derive(Clone)]
+    struct ClaimPlugin {
+        at: ClaimAt,
+        slot: ContextSlot,
+        claims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Set by `test_hooks::pending_once_after_drive` in the poll it
+        /// makes return `Pending`; `AfterNext` claims only after that.
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ClaimPlugin {
+        fn new(at: ClaimAt) -> Self {
+            Self {
+                at,
+                slot: std::sync::Arc::default(),
+                claims: std::sync::Arc::default(),
+                armed: std::sync::Arc::default(),
+            }
+        }
+
+        fn claims(&self) -> usize {
+            self.claims.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn claim_once(&self, ctx: &DurableContext) {
+            if self
+                .claims
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                drop(ctx.wait(Duration::from_secs(1)));
+            }
+        }
+    }
+
+    impl plugin::Plugin for ClaimPlugin {
+        fn on_operation_start(&self, _info: &plugin::OperationInfo) -> plugin::HookWork {
+            if self.at == ClaimAt::OperationStart
+                && let Some(ctx) = self.slot.lock().unwrap().clone()
+            {
+                self.claim_once(&ctx);
+            }
+            Ok(None)
+        }
+
+        fn wrap_invocation(&self, _info: &plugin::InvocationInfo, next: &mut dyn FnMut()) {
+            next();
+            let ctx = self.slot.lock().unwrap().clone();
+            if self.at == ClaimAt::AfterNext
+                && let Some(ctx) = ctx
+                && ctx.coordinator().phase() != coordinator::Phase::Running
+                && self.armed.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.claim_once(&ctx);
+            }
+        }
+    }
+
+    impl plugin::PluginFactory for ClaimPlugin {
+        fn create_plugin(
+            &self,
+            _info: &plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn plugin::Plugin>>, BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// An end hook error whose destructor panics with "late drop".
+    #[derive(Debug)]
+    struct LateDropError;
+
+    impl std::fmt::Display for LateDropError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("late drop error")
+        }
+    }
+
+    impl std::error::Error for LateDropError {}
+
+    impl Drop for LateDropError {
+        #[expect(clippy::panic)] // reason: the destructor panic under test
+        fn drop(&mut self) {
+            panic!("late drop");
+        }
+    }
+
+    /// The first execution's event, with only the `EXECUTION` operation.
+    fn first_invocation_event() -> lambda_runtime::LambdaEvent<InvocationPayload> {
+        lambda_runtime::LambdaEvent::new(
+            InvocationPayload(envelope_with(&serde_json::json!([{
+                "Id": "exec-1",
+                "Type": "EXECUTION",
+                "Status": "STARTED",
+                "ExecutionDetails": { "InputPayload": "{}" }
+            }]))),
+            lambda_runtime::Context::default(),
+        )
+    }
+
+    /// A claim after the drive cannot change the late-panic policy, which
+    /// uses the value of whether a fatal error won the drive's arbitration.
+    /// The crate-private pending point makes `finish_invocation` return
+    /// `Pending` once right after the drive returns, and `wrap_invocation`
+    /// calls `wait` after `next()` in that poll, before the end hooks run.
+    /// The claim records the context usage error, but the end hook's error,
+    /// whose destructor panics, still fails the invocation with that late
+    /// panic. The only WARN is the end hook's error.
+    #[tokio::test]
+    // reason: the test calls the service on its own task so the panic is
+    // observable as that task's `JoinError`.
+    #[expect(clippy::disallowed_methods)]
+    async fn late_panic_after_post_drive_claim_fails_the_invocation() {
+        let (buffer, _guard) = hooks::capture();
+        let claimer = ClaimPlugin::new(ClaimAt::AfterNext);
+        let claims_at_end = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let failing = {
+            let claimer = claimer.clone();
+            let claims_at_end = std::sync::Arc::clone(&claims_at_end);
+            Hooks::default().on_end(move |_| {
+                *claims_at_end.lock().unwrap() = Some(claimer.claims());
+                Box::pin(async { Err(Box::new(LateDropError) as BoxError) })
+            })
+        };
+        let options = Options::builder()
+            .execution_client(std::sync::Arc::new(client::InMemoryExecutionClient::new(
+                Vec::new(),
+            )))
+            .plugin(claimer.clone())
+            .plugin(failing)
+            .build()
+            .unwrap();
+        let slot = std::sync::Arc::clone(&claimer.slot);
+        let service = wrap(
+            move |_e: serde_json::Value, ctx: DurableContext| {
+                *slot.lock().unwrap() = Some(ctx);
+                async { Ok::<_, BoxError>(serde_json::json!("done")) }
+            },
+            options,
+        );
+        // The pending point arms the claim only in the poll it makes return
+        // `Pending` after `drive_invocation` returned.
+        let joined = tokio::spawn(test_hooks::PENDING_AFTER_DRIVE.scope(
+            std::sync::Arc::clone(&claimer.armed),
+            service(first_invocation_event()),
+        ))
+        .await;
+        let payload = match joined {
+            Ok(response) => unreachable!(
+                "the late panic must fail the invocation: {:?}",
+                response.map(|r| r.0)
+            ),
+            Err(join_err) => join_err.into_panic(),
+        };
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"late drop"));
+        assert_eq!(
+            *claims_at_end.lock().unwrap(),
+            Some(1),
+            "the claim ran after next() in the post-drive pending poll, before the end hooks"
+        );
+        let ctx = claimer
+            .slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the handler ran");
+        let fatal = ctx
+            .coordinator()
+            .fatal_error()
+            .map(|fatal| fatal.error_message);
+        assert!(
+            fatal
+                .as_deref()
+                .is_some_and(|m| m.contains("inside plugin code")),
+            "the claim records the context usage error: {fatal:?}"
+        );
+        // Exactly one plugin WARN: the end hook's error. The claim logs
+        // nothing.
+        let warnings = hooks::warnings(&buffer);
+        assert_eq!(
+            hooks::with_message(&warnings, "plugin hook failed; the error is ignored").len(),
+            1,
+            "{warnings:?}"
+        );
+        assert_eq!(warnings.len(), 1, "no claim WARN: {warnings:?}");
+    }
+
+    /// Hook work that calls `wait` after the driver's arbitration and
+    /// before `drive_invocation` returns (the crate-private hook) records
+    /// the context usage error, and does not change the late-panic policy:
+    /// the policy uses the value the arbitration returned, so the end
+    /// hook's error, whose destructor panics, still fails the invocation
+    /// with that late panic.
+    #[tokio::test]
+    // reason: the test calls the service on its own task so the panic is
+    // observable as that task's `JoinError`.
+    #[expect(clippy::disallowed_methods)]
+    async fn fatal_after_driver_arbitration_keeps_the_late_panic() {
+        let failing = Hooks::default()
+            .on_end(|_| Box::pin(async { Err(Box::new(LateDropError) as BoxError) }));
+        let options = Options::builder()
+            .execution_client(std::sync::Arc::new(client::InMemoryExecutionClient::new(
+                Vec::new(),
+            )))
+            .plugin(failing)
+            .build()
+            .unwrap();
+        let slot: ContextSlot = std::sync::Arc::default();
+        let service = {
+            let slot = std::sync::Arc::clone(&slot);
+            wrap(
+                move |_e: serde_json::Value, ctx: DurableContext| {
+                    *slot.lock().unwrap() = Some(ctx);
+                    async { Ok::<_, BoxError>(serde_json::json!("done")) }
+                },
+                options,
+            )
+        };
+        let hook: std::sync::Arc<dyn Fn(&coordinator::InvocationCoordinator) + Send + Sync> = {
+            let slot = std::sync::Arc::clone(&slot);
+            std::sync::Arc::new(move |_coordinator| {
+                let ctx = slot.lock().unwrap().clone().expect("the handler ran");
+                // What hook work does: plugin code that calls `wait`.
+                plugin::call_plugin(|| drop(ctx.wait(Duration::from_secs(1))))
+                    .expect("the claim does not panic");
+            })
+        };
+        let joined = tokio::spawn(
+            driver::test_hooks::AFTER_ARBITRATION.scope(hook, service(first_invocation_event())),
+        )
+        .await;
+        let payload = match joined {
+            Ok(response) => unreachable!(
+                "the late panic must fail the invocation: {:?}",
+                response.map(|r| r.0)
+            ),
+            Err(join_err) => join_err.into_panic(),
+        };
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"late drop"));
+        let ctx = slot.lock().unwrap().take().expect("the handler ran");
+        let fatal = ctx
+            .coordinator()
+            .fatal_error()
+            .map(|fatal| fatal.error_message);
+        assert!(
+            fatal
+                .as_deref()
+                .is_some_and(|m| m.contains("inside plugin code")),
+            "the claim after the arbitration records the context usage error: {fatal:?}"
+        );
+    }
+
+    /// `on_invocation_end` calling `wait` on a context the handler
+    /// captured records the context usage error, and the response stays
+    /// `SUCCEEDED` with `"done"`: the response was built before the end
+    /// hooks, and no operation of the invocation follows them.
+    #[tokio::test]
+    async fn claim_in_end_hook_leaves_response_unchanged() {
+        let slot: ContextSlot = std::sync::Arc::default();
+        let kept: ContextSlot = std::sync::Arc::default();
+        let plugin = {
+            let slot = std::sync::Arc::clone(&slot);
+            Hooks::default().on_end(move |_| {
+                if let Some(ctx) = slot.lock().unwrap().as_ref() {
+                    drop(ctx.wait(Duration::from_secs(1)));
+                }
+                Box::pin(std::future::ready(Ok(())))
+            })
+        };
+        let handler_slot = std::sync::Arc::clone(&slot);
+        let handler_kept = std::sync::Arc::clone(&kept);
+        let (service, event) = hooks::service(vec![plugin], 0, move |_e, ctx| {
+            *handler_slot.lock().unwrap() = Some(ctx.clone());
+            *handler_kept.lock().unwrap() = Some(ctx);
+            async move { Ok(serde_json::json!("done")) }
+        });
+        let json = service(event).await.unwrap().0;
+        let ctx = kept.lock().unwrap().take().expect("the handler ran");
+        drop(slot.lock().unwrap().take());
+        let fatal = ctx
+            .coordinator()
+            .fatal_error()
+            .map(|fatal| fatal.error_message);
+        assert!(
+            fatal
+                .as_deref()
+                .is_some_and(|m| m.contains("inside plugin code")),
+            "the end-hook claim records the context usage error: {fatal:?}"
+        );
+        assert_eq!(
+            json.get("Status"),
+            Some(&serde_json::json!("SUCCEEDED")),
+            "{json}"
+        );
+        assert_eq!(
+            json.get("Result"),
+            Some(&serde_json::json!("\"done\"")),
+            "{json}"
+        );
+    }
+
+    /// An operation that plugin code claims while the handler runs (here
+    /// in `on_operation_start`) fails the execution with the context usage
+    /// error.
+    #[tokio::test]
+    async fn a_claim_while_the_handler_runs_fails_the_execution() {
+        let claimer = ClaimPlugin::new(ClaimAt::OperationStart);
+        let options = Options::builder()
+            .execution_client(std::sync::Arc::new(client::InMemoryExecutionClient::new(
+                Vec::new(),
+            )))
+            .plugin(claimer.clone())
+            .build()
+            .unwrap();
+        let slot = std::sync::Arc::clone(&claimer.slot);
+        let service = wrap(
+            move |_e: serde_json::Value, ctx: DurableContext| {
+                *slot.lock().unwrap() = Some(ctx.clone());
+                async move {
+                    let value = ctx.step(|_| async { Ok(1_u32) }).name("s").await?;
+                    Ok::<_, BoxError>(serde_json::json!(value))
+                }
+            },
+            options,
+        );
+        let json = service(first_invocation_event()).await.unwrap().0;
+        drop(claimer.slot.lock().unwrap().take());
+        assert_eq!(claimer.claims(), 1, "on_operation_start claimed once");
+        assert_eq!(
+            json.get("Status"),
+            Some(&serde_json::json!("FAILED")),
+            "{json}"
+        );
+        assert!(json.to_string().contains("inside plugin code"), "{json}");
+    }
+
+    type Log = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// Logs `inv enter` and `inv exit` around each `wrap_invocation`.
+    struct InvocationWrapLog(Log);
+
+    impl plugin::Plugin for InvocationWrapLog {
+        fn wrap_invocation(&self, _info: &plugin::InvocationInfo, next: &mut dyn FnMut()) {
+            self.0.lock().unwrap().push("inv enter".to_owned());
+            next();
+            self.0.lock().unwrap().push("inv exit".to_owned());
+        }
+    }
+
+    impl plugin::PluginFactory for InvocationWrapLog {
+        fn create_plugin(
+            &self,
+            _info: &plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn plugin::Plugin>>, BoxError> {
+            Ok(Some(Box::new(Self(std::sync::Arc::clone(&self.0)))))
+        }
+    }
+
+    /// A guard whose destructor logs `guard drop` and panics.
+    struct PanicsOnDrop(Log);
+
+    impl Drop for PanicsOnDrop {
+        #[expect(clippy::panic)] // reason: the destructor panic under test
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("guard drop".to_owned());
+            panic!("guard drop");
+        }
+    }
+
+    /// The post-start future, pending right after the drive (the
+    /// crate-private pending point) while it holds a guard whose `Drop`
+    /// panics, is dropped. The drop runs inside `wrap_invocation`, the
+    /// panic is caught there, and it propagates from the drop after the
+    /// wrap returned (rule 10.6).
+    #[tokio::test]
+    async fn pending_invocation_future_destructor_panic() {
+        let log: Log = std::sync::Arc::default();
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = std::sync::Arc::new(test_hooks::HeldGuard {
+            reached: std::sync::Arc::clone(&reached),
+            make: Box::new({
+                let log = std::sync::Arc::clone(&log);
+                move || Box::new(PanicsOnDrop(std::sync::Arc::clone(&log))) as Box<dyn Send>
+            }),
+        });
+        let options = Options::builder()
+            .execution_client(std::sync::Arc::new(client::InMemoryExecutionClient::new(
+                Vec::new(),
+            )))
+            .plugin(InvocationWrapLog(std::sync::Arc::clone(&log)))
+            .build()
+            .unwrap();
+        let service = wrap(
+            |_e: serde_json::Value, _ctx: DurableContext| async {
+                Ok::<_, BoxError>(serde_json::json!("done"))
+            },
+            options,
+        );
+        let mut invocation = Box::pin(
+            test_hooks::PENDING_HOLDING_GUARD.scope(held, service(first_invocation_event())),
+        );
+        // Poll until the pending point holds the guard, and no further: the
+        // next poll would resume past it.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                assert!(
+                    invocation.as_mut().poll(cx).is_pending(),
+                    "the invocation stays pending at the pending point"
+                );
+                if reached.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("the post-start future reaches the pending point within 5 s");
+        log.lock().unwrap().push("dropping".to_owned());
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(invocation)));
+        let payload = dropped.expect_err("the destructor panic propagates");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"guard drop"));
+        let log = log.lock().unwrap().clone();
+        let at = log.iter().position(|l| l == "dropping").expect("logged");
+        assert_eq!(
+            log.get(at..).expect("in range"),
+            ["dropping", "inv enter", "guard drop", "inv exit"],
+            "{log:?}"
+        );
     }
 
     /// An invocation that fails before the plugins are created calls no
