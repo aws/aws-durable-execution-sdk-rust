@@ -68,6 +68,34 @@
 //!     .expect("valid options");
 //! # drop(options);
 //! ```
+//!
+//! # Hook order
+//!
+//! - The [`PluginFactory::create_plugin`] of every factory runs first.
+//! - [`Plugin::on_invocation_start`] runs before
+//!   [`Plugin::wrap_invocation`].
+//! - The handler and [`Plugin::on_invocation_end`] run inside
+//!   [`Plugin::wrap_invocation`].
+//! - [`Plugin::on_operation_start`], [`Plugin::on_attempt_start`],
+//!   [`Plugin::on_attempt_end`] and [`Plugin::on_operation_end`] run in
+//!   lifecycle order: a parent's start before a child's, and a child's end
+//!   before the parent's.
+//! - For one user function, [`Plugin::on_user_function_start`] runs after
+//!   [`Plugin::on_attempt_start`] (or the child's
+//!   [`Plugin::on_operation_start`]), each plugin's start inside the wraps
+//!   of the plugins before it. Every poll of the body runs inside
+//!   [`Plugin::wrap_user_function`], and each plugin's
+//!   [`Plugin::on_user_function_end`] runs inside those wraps after its own
+//!   wrap returned, before the outcome checkpoint and the end hooks that
+//!   follow it.
+//! - [`Plugin::on_operation_change`] calls, then the drain of [`HookWork`],
+//!   run before [`Plugin::on_invocation_end`].
+//! - [`Plugin::on_invocation_end`] runs last.
+//!
+//! The README section
+//! [Instrumentation plugins](https://github.com/aws/aws-durable-execution-sdk-rust#instrumentation-plugins)
+//! gives the firing table of every operation kind, the propagation rules
+//! and the isolation rules.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -2948,6 +2976,7 @@ impl InvocationPlugins {
                         tracing::warn!(
                             target: TARGET,
                             plugin = %slot.identity,
+                            hook = "propagation_trace_id",
                             "plugin propagation_trace_id panicked; the value is ignored"
                         );
                     });
@@ -3258,6 +3287,7 @@ fn report_propagation_error(identity: &str, undelivered: &Mutex<Undelivered>, er
             tracing::warn!(
                 target: TARGET,
                 plugin = %identity,
+                hook = "propagation_trace_id",
                 error = %message,
                 "plugin propagation_trace_id failed; the value is ignored"
             );
@@ -3267,6 +3297,7 @@ fn report_propagation_error(identity: &str, undelivered: &Mutex<Undelivered>, er
                 tracing::warn!(
                     target: TARGET,
                     plugin = %identity,
+                    hook = "propagation_trace_id",
                     "plugin propagation_trace_id failed, and its error panicked while it was \
                      formatted; the value is ignored"
                 );
@@ -7543,6 +7574,7 @@ mod tests {
             field(panicked, "plugin").ends_with("(plugins[0])"),
             "{panicked}"
         );
+        assert_eq!(field(panicked, "hook"), "propagation_trace_id");
     }
 
     #[test]
@@ -7563,6 +7595,7 @@ mod tests {
             "{failed}"
         );
         assert_eq!(field(failed, "error"), "x");
+        assert_eq!(field(failed, "hook"), "propagation_trace_id");
     }
 
     /// An error whose `Display` panics is logged without its text, and the
@@ -7585,6 +7618,7 @@ mod tests {
             unreachable!("one record: {warnings:?}");
         };
         assert_eq!(field(unformatted, "plugin"), "TraceHook (plugins[0])");
+        assert_eq!(field(unformatted, "hook"), "propagation_trace_id");
     }
 
     /// `propagation_trace_id` is plugin code: a durable operation it calls

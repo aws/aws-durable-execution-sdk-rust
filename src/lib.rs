@@ -90,6 +90,13 @@
 //! start/resume/suspend. The span names, event names, and field names are a
 //! documented, stable contract, including how to bridge it to
 //! OpenTelemetry, in the [`observability`] module.
+//!
+//! # Instrumentation plugins
+//!
+//! A plugin observes each invocation through hooks for the invocation, each
+//! operation and each user function; register its factory with
+//! [`Options::builder().plugin(..)`](OptionsBuilder::plugin). The [`plugin`]
+//! module documents the hooks and the order in which they run.
 
 // Test code asserts with `unwrap`/`expect` pervasively; hoisting the
 // override here keeps the panic-policy lints (deny in workspace lints)

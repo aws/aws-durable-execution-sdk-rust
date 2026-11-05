@@ -1274,6 +1274,360 @@ let serdes = FileSystemSerdes::with_config(
 // {"__aws_durable_serdes":{...},"file":"...","preview":{"orderId":"o-1","email":"***"}}
 ```
 
+## Instrumentation plugins
+
+A plugin observes an execution for tracing and telemetry without changing
+it. `Options::builder().plugin(..)` takes a `PluginFactory`, which the SDK
+calls once per invocation and which holds the state shared across
+invocations. The plugin the factory returns serves only that invocation.
+The SDK releases it when the invocation returns; a `DurableContext` clone
+that outlives the invocation keeps it alive until that clone drops. Every
+hook of the `Plugin` trait defaults to a no-op, so a plugin implements only
+the hooks it needs. The `plugin` module's rustdoc gives each hook's full
+contract.
+
+Example 1 counts the `on_operation_end` calls of each invocation and adds
+them to a total that the factory keeps across invocations.
+
+```rust no_run
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use aws_durable_execution_sdk as durable;
+use durable::Options;
+use durable::plugin::{
+    HookFuture, HookWork, InvocationEndInfo, InvocationInfo, OperationInfo, Plugin,
+    PluginFactory,
+};
+
+/// Keeps the total across invocations. `PluginFactory` has no `Debug`
+/// bound, so the factory needs none.
+#[derive(Default)]
+struct CountingFactory {
+    total: Arc<AtomicU64>,
+}
+
+impl PluginFactory for CountingFactory {
+    fn create_plugin(
+        &self,
+        _info: &InvocationInfo,
+    ) -> Result<Option<Box<dyn Plugin>>, durable::BoxError> {
+        Ok(Some(Box::new(CountingPlugin {
+            ends: AtomicU64::new(0),
+            total: Arc::clone(&self.total),
+        })))
+    }
+}
+
+/// Counts the `on_operation_end` calls of one invocation.
+struct CountingPlugin {
+    ends: AtomicU64,
+    total: Arc<AtomicU64>,
+}
+
+impl Plugin for CountingPlugin {
+    fn on_operation_end(&self, _info: &OperationInfo) -> HookWork {
+        self.ends.fetch_add(1, Ordering::Relaxed);
+        Ok(None)
+    }
+
+    fn on_invocation_end<'a>(&'a self, info: &'a InvocationEndInfo) -> HookFuture<'a> {
+        let ends = self.ends.load(Ordering::Relaxed);
+        self.total.fetch_add(ends, Ordering::Relaxed);
+        tracing::info!(status = ?info.status(), ends, "invocation ended");
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+async fn handler(
+    _event: serde_json::Value,
+    ctx: durable::DurableContext,
+) -> Result<String, durable::BoxError> {
+    let greeting = ctx
+        .step(|_| async { Ok("hello".to_owned()) })
+        .name("greet")
+        .await?;
+    Ok(greeting)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), lambda_runtime::Error> {
+    durable::init_default_subscriber()?;
+    let options = Options::builder()
+        .plugin(CountingFactory::default())
+        .build()?;
+    durable::run_with_options(handler, options).await
+}
+```
+
+### Invocation hooks
+
+`on_invocation_start` and `on_invocation_end` are async. The SDK awaits
+`on_invocation_start` before the handler runs. It awaits `on_invocation_end`
+once, after every checkpoint of the invocation is written, with the status
+`Succeeded`, `Failed`, `Pending` or `Retrying`, so that hook is the place to
+flush an exporter. The SDK cuts `on_invocation_end` off 50 ms before the
+invocation deadline, and waits for it to finish when the context has no
+deadline, as under `LocalRunner`. When a panic ends the invocation,
+`on_invocation_end` runs with `Retrying` after the SDK has stopped every
+task it started, and the panic then continues. With `panic = "abort"` the
+process exits at the panic, and no hook runs. All plugins' hooks run
+concurrently.
+
+### Operation hooks
+
+`on_operation_start`, `on_operation_end`, `on_attempt_start`,
+`on_attempt_end` and `on_operation_change` are synchronous, and no hook's
+synchronous part may block. Each runs on the task that reaches its hook
+site, and none runs while the SDK holds a checkpoint lock.
+`on_attempt_start` and `on_attempt_end` run on the operation's own task.
+`on_operation_start` and `on_operation_end` usually run there too, but the
+start hook of an operation that `.spawn()` starts can run on the caller's
+task before `.spawn()` returns. `on_operation_change` can run on any task:
+an operation's task, a task that sent a refresh, or the invocation's own
+task, not necessarily the task of the operation that changed. When a hook
+is caused by a checkpoint response in this invocation, that checkpoint
+call has returned before the hook runs; replay hooks can instead describe
+state supplied at invocation bootstrap. A hook that needs async work
+returns it as `HookWork`. The SDK runs that work on its own task, outside
+the operation, and waits for it before `on_invocation_end` until 500 ms
+before the invocation deadline. Work still
+running then is aborted, and the SDK waits for each aborted task to end, so
+no hook work runs after `on_invocation_end` starts. Work started after that
+point is dropped with a WARN.
+
+### Wrap and user-function hooks
+
+`wrap_invocation` brackets each synchronous section of the invocation,
+`on_invocation_end` included: every poll of the handler, of each SDK task
+that runs an operation, of the end-of-invocation flush and of the drain of
+hook work. `wrap_user_function` brackets each poll and each drop of a user
+function: a live step attempt or condition check, a child body (including
+the `with_retry` outer block, but not its `attempt-N` contexts), the
+`wait_for_callback` body, each map item, parallel branch and
+`parallel_mixed` branch, each map, parallel and `parallel_mixed` container,
+and each combinator join. It covers map items, parallel branches and
+`parallel_mixed` branches in both nesting modes. Each wrap receives
+`next: &mut dyn FnMut()`, and `next()` runs the rest of the chain once,
+even if a wrap skips it: the SDK calls it right after a wrap that returns
+or panics without calling it, and a second call does nothing. A wrap
+returns `()`, so neither wrap can replace the user function's value or the
+invocation's output.
+
+`on_user_function_start` runs on a user function's first poll, and
+`on_user_function_end` in the poll in which it returns, with
+`Result<(), &WireError>`. The `WireError` that `on_user_function_end`
+receives is the one the SDK records. Starts run in registration order, each
+inside the earlier plugins' wraps, and ends run in reverse. The hooks are
+interleaved into the wrap chain: a plugin's start runs before its own wrap,
+and its end runs inside the earlier plugins' wraps after its own wrap
+returned. That order of starts and ends applies to the earlier plugins
+whose wraps called `next()`. After a wrap returns or panics before
+`next()`, the rest of the chain runs outside it.
+
+A start call that returns `Err` or panics skips that plugin's wrap and end
+hook for the user function. This concerns the synchronous start call: after
+it, the chain continues with the other plugins, and a future that the start
+call returned and that fails later changes nothing. A user function that
+panics, or that the SDK drops before it returns, gets no end hook, and an
+operation replayed from its record fires neither hook. A future that a
+start or end hook returns runs on its own task. The SDK never waits for it
+on the operation's path; only the invocation-end drain waits for it.
+
+Plugin code that claims an operation ID before the outcome is decided fails
+the execution with a context usage error. The rule covers plugin code that
+is active during an invocation, on the SDK's stack or on a hook task, and
+the error names plugin code, as the error for a claim in a step body does.
+For that rule, the outcome counts as decided at the driver's arbitration. A
+builder claims its ID at the call, and a deferred combinator at its first
+poll or `.spawn()`. The plugin guard itself refuses nothing; admission and
+task-ownership checks still apply, and the guard does not follow a builder
+or future that the handler created, claimed and handed to the plugin. A
+claim after the drive, in `on_invocation_end` or after `wrap_invocation`'s
+`next()` during the end-of-invocation flush, records the error too. It
+cannot shift an ID the execution uses, and it changes neither the response,
+which comes from the drive's outcome, nor the late-panic precedence, which
+comes from the driver's own arbitration result.
+
+The user-function info of a child body takes `is_replay()` from the child
+context when the body starts, so it can be `false` where
+`on_operation_start` said `true`. A `ReplayChildren` reconstruction fires no
+user-function hook.
+
+No wrap may block, and the synchronous part of every hook must be cheap: a
+wrap runs on whichever thread polls, as often as the SDK polls. A wrap
+holds no lock across `next()` that its hooks take. That covers any
+non-reentrant lock, such as a `std::sync::Mutex` guard or a `RefCell`
+borrow, that one of the plugin's own hooks or wraps can take, because
+`next()` runs nested user functions' hooks.
+
+The end hook cannot inspect the typed successful value. `on_operation_end`
+can inspect the serialized checkpoint payload through
+`OperationInfo::result()` when the terminal update carries one; it is
+`None` when that update carries no payload. An object-safe `Plugin` cannot
+expose a method generic over each operation's `O`.
+
+Example 2 puts a trace ID on every log event of a user function:
+`wrap_user_function` calls `span.in_scope(next)`, so the events the user
+function emits are parented to the span and carry its `trace_id` field.
+
+```rust no_run
+use aws_durable_execution_sdk as durable;
+use durable::plugin::{InvocationInfo, OperationInfo, Plugin, PluginFactory};
+
+struct TraceIdFactory;
+
+impl PluginFactory for TraceIdFactory {
+    fn create_plugin(
+        &self,
+        info: &InvocationInfo,
+    ) -> Result<Option<Box<dyn Plugin>>, durable::BoxError> {
+        let root = info.x_ray_trace_id().unwrap_or("no-trace").to_owned();
+        Ok(Some(Box::new(TraceIdPlugin { root })))
+    }
+}
+
+/// Holds the invocation's X-Ray trace header.
+struct TraceIdPlugin {
+    root: String,
+}
+
+impl Plugin for TraceIdPlugin {
+    fn wrap_user_function(&self, info: &OperationInfo, next: &mut dyn FnMut()) {
+        let id = format!("{}/{}", self.root, info.id());
+        let span = tracing::info_span!("plugin_user_function", trace_id = %id);
+        span.in_scope(next);
+    }
+}
+```
+
+### Context propagation
+
+The SDK runs every task it starts for an operation (`.spawn()`, map items,
+parallel and `parallel_mixed` branches, combinator inputs) inside the wraps
+and the `tracing` span that were current when that operation's builder
+became its future (`.await`, `.spawn()` or `.future()`), or, for a map item
+or branch, when the container dispatched it, around every poll and every
+drop. The handler's root task runs inside the invocation's wraps, captured
+when it is dispatched. An operation awaited directly runs inside the wraps
+of the code that awaits it, plus its own.
+
+A user-started task is outside SDK propagation and must use the relevant
+explicit carrier: tracing instrumentation, capture `Context::current()` and
+call `.with_context(captured)` on the future for direct OpenTelemetry, or
+the plugin's own mechanism.
+
+With `tracing`, instrument the task's future with the current span:
+
+```rust ignore
+use tracing::Instrument as _;
+
+tokio::spawn(work.instrument(tracing::Span::current()));
+```
+
+With OpenTelemetry used directly, capture the current OpenTelemetry context
+and attach it to the task's future:
+
+```rust ignore
+use opentelemetry::context::FutureExt;
+
+let captured = opentelemetry::Context::current();
+tokio::spawn(work.with_context(captured));
+```
+
+With a plugin that keeps its context in an `Arc`, clone the `Arc` into the
+spawned future and enter it through the function the plugin documents:
+
+```rust ignore
+let context = Arc::clone(&my_plugin::current_context());
+tokio::spawn(async move { my_plugin::in_context(context, work).await });
+```
+
+### Log context
+
+To add fields such as a trace ID to log events, enter a span that carries
+the fields around `next()` in `wrap_invocation` or `wrap_user_function`.
+Events emitted inside are parented to that span, and the application's
+`tracing` subscriber or layer can render the span's fields. The SDK enters
+the wraps on every task it starts for an operation.
+
+### When each operation hook fires
+
+"Start" is `on_operation_start`, "end" is `on_operation_end`, and "attempt
+start" and "attempt end" are `on_attempt_start` and `on_attempt_end`. A
+value in parentheses is the info's `is_replay`.
+
+| Operation | No record (live) | Running record on replay | Live completion | Terminal record on replay |
+| --- | --- | --- | --- | --- |
+| `step` | start (`is_replay` false), attempt start | `STARTED`: start (`true`), attempt start. `READY`: start (`is_replay` = attempt > 1), attempt start. `PENDING`: nothing | success: attempt end, end. Retry: attempt end only. Final failure: attempt end, end | nothing |
+| `wait_for_condition` | as `step` | as `step` | complete: attempt end, end. Continue: attempt end (`Succeeded`) only. Failure: attempt end, end | nothing |
+| `wait` | start (`false`) | start (`true`) | end (`false`), when it succeeds while it waits in the invocation | `SUCCEEDED`: end, `is_replay` = not listed in `updated_operations`; any other status: nothing |
+| `invoke` | start (`false`) | start (`true`) | end (`false`), when it reaches `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED` while it waits in the invocation | `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED` or `CANCELLED`: end, `is_replay` = not listed in `updated_operations`; unknown status: nothing |
+| `create_callback` | start (`false`) | start (`true`) | end (`false`), when `result()` reads `SUCCEEDED`, `FAILED` or `TIMED_OUT` after waiting in the invocation | `SUCCEEDED`, `FAILED` or `TIMED_OUT`: end, `is_replay` = not listed in `updated_operations` |
+| `run_in_child_context`, `with_retry`, `map`, `parallel`, `parallel_mixed`, each map item, parallel branch and `parallel_mixed` branch, `wait_for_callback`, the combinators | start (`false`) before the body | start (`true`) before the body | end (`false`) after the terminal write | nothing, including a `ReplayChildren` reconstruction |
+
+A step retry or a `wait_for_condition` check that continues in the same
+invocation after its delay fires the `READY` cell of its row: start
+(`true`), then attempt start. An item that a `map` or `parallel` abandons
+because the batch completed early fires no end hook, nor do the unfinished
+operations inside it. Each `NestingMode::Flat` map item, parallel branch or
+`parallel_mixed` branch fires start and end hooks with `is_virtual` true and
+the container as parent. It writes no record, and after abandonment, drop
+or panic it fires no end hook. The inner callback and step of a named
+`wait_for_callback` report the names `<name>-callback` and
+`<name>-submitter`.
+
+### Info fields
+
+`is_replay` is `false` when the SDK observed the event in this invocation,
+and `true` on a step's second and later attempts, on re-entry of an
+operation found running, and on the end hook of a wait, invoke or callback
+replayed from a record the service did not change since the previous
+invocation. `is_virtual` is `true` for a `NestingMode::Flat` map item or
+parallel branch, which records no operation of its own, and `false` for
+every other operation and every entry of `operations()`. `operations()`
+holds every operation the service reports for this execution, including
+the `EXECUTION` operation, keyed by wire ID.
+
+`on_operation_change` is called once per checkpoint response that changed
+at least one status, including the responses to the SDK's state refreshes
+while operations wait, in response order, before `on_invocation_end`. Its
+`updated_operations` is a subset of `operations`.
+
+`propagation_trace_id` supplies the trace header of a chained invoke. The
+first non-blank value across plugins becomes the `X-Amzn-Trace-Id` of a new
+chained invoke; a replayed invoke does not ask.
+
+`Options::builder().plugin_child_operations_depth(..)` keeps finished
+children visible to plugins. By default the service drops the children of
+a finished context from later invocations' state, so
+`InvocationInfo::operations()` lists top-level operations only. The setting
+keeps them to the given depth, at the replay cost its rustdoc states. A
+preserved `wait_for_callback` re-runs its body on replay: its callback
+fires its replay end hook, and its submitter step fires nothing.
+
+### Isolation
+
+A failing factory, hook, `name()`, wrap or hook work is logged as a WARN on
+the target `aws_durable_execution_sdk::plugin` and changes nothing else. An
+`Err` or a panic counts as a failure. The WARN sets `hook` to the method
+name and names the plugin as `<Plugin::name()> (plugins[<i>])`, where
+`<i>` is the 0-based registration index, or as `plugins[<i>]` with
+`hook = "name"` when `name()` panicked. A factory's WARN carries
+`factory = "<type_name::<F>()> (plugins[<i>])"` instead of `plugin` and
+`hook`, plus `error` for a formatted `Err`. The one exception is a panic in
+the destructor of an error that a hook or factory returned: it follows the
+undelivered-panic path, as a panic in the SDK's own code does, so it fails
+the invocation and the service invokes the function again. A binary built
+with `panic = "abort"` aborts on a panicking hook.
+
+### Plugins and `tracing`
+
+Plugins and the `observability` module's spans and events are independent.
+A plugin does not need a subscriber, and a subscriber does not need a
+plugin. A plugin that wants the SDK's log records installs its own
+`tracing` layer.
+
 ## Testing a handler locally
 
 Enable the `test-util` feature to get `LocalRunner`, which drives a handler

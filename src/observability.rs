@@ -8,6 +8,19 @@
 //! subscriber, filter, or exporter can match on them without hard-coding
 //! strings.
 //!
+//! # Relation to plugins
+//!
+//! The [`crate::plugin`] hooks, such as
+//! [`Plugin::on_operation_start`](crate::plugin::Plugin::on_operation_start)
+//! and [`Plugin::wrap_user_function`](crate::plugin::Plugin::wrap_user_function),
+//! are independent of this module's spans and events: a plugin works without
+//! a `tracing` subscriber, and a subscriber works without a plugin. The
+//! plugin hooks receive structured operation info that the events do not
+//! carry, such as the operations map
+//! ([`InvocationInfo::operations`](crate::plugin::InvocationInfo::operations))
+//! and the changed operations
+//! ([`OperationChangeInfo::updated_operations`](crate::plugin::OperationChangeInfo::updated_operations)).
+//!
 //! # Stability
 //!
 //! Everything named in this module is a public, semver-meaningful contract:
