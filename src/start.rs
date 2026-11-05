@@ -226,6 +226,7 @@ mod tests {
             client,
             "token-0".to_owned(),
             window,
+            0,
             hooks.map(OpHooks::plugins),
         )
     }

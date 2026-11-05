@@ -1400,6 +1400,7 @@ pub(crate) mod test_support {
             Arc::clone(client) as Arc<dyn ExecutionClient>,
             "t0".to_owned(),
             buffer_window,
+            0,
             None,
         )
     }

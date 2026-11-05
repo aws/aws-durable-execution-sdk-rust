@@ -18,13 +18,14 @@ use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
 
 use crate::BoxError;
 use crate::checkpoint_coalescer::ScopeClose;
-use crate::context::{DurableContext, StepContext, SubmittedWrite};
+use crate::context::{DurableContext, StepContext, SubmittedWrite, run_body};
 use crate::engine::{CheckpointStatus, OperationId};
 use crate::error::{CallbackError, CallbackErrorKind, OperationError, OperationErrorKind};
 use crate::future::Callback;
 use crate::plugin::UserBody;
 use crate::serdes::{PassthroughSerdes, PayloadOrigin, Serdes, SerdesContext};
 use crate::start::StartStep;
+use tracing::Instrument as _;
 
 /// Wire sub-type for callback operations.
 pub(crate) const CALLBACK_SUB_TYPE: &str = "Callback";
@@ -553,12 +554,40 @@ where
             submitter,
             submitter_retry,
         } = rest;
+        let core_admission = std::sync::Arc::clone(core.ctx.admission());
+        let core_wire_id = core.op_id.wire().to_owned();
         match core.before(started?).await? {
             WfcbPrelude::Failed(err) => Err(err),
             WfcbPrelude::Replayed { payload, attempt } => Ok(WfcbRaw {
                 payload,
                 replayed_attempt: Some(attempt),
             }),
+            WfcbPrelude::Reconstruct { child_ctx } => {
+                // A reconstruction: no frame and no user-function hook, as
+                // a preserved child context's. The body's scope closes when
+                // the body returns.
+                let child_span = child_ctx.replay_span();
+                let active = UserBody::Context(child_ctx.prefix().to_owned());
+                let scope = ScopeClose::new(&core_admission, &core_wire_id);
+                let payload = run_body(
+                    active.into(),
+                    run_wfcb_body(
+                        child_ctx,
+                        plugin_names,
+                        timeout,
+                        heartbeat,
+                        submitter,
+                        submitter_retry,
+                    ),
+                )
+                .instrument(child_span)
+                .await;
+                drop(scope);
+                payload.map(|payload| WfcbRaw {
+                    payload,
+                    replayed_attempt: None,
+                })
+            }
             WfcbPrelude::Run {
                 child_ctx,
                 start,
@@ -686,6 +715,13 @@ enum WfcbPrelude {
     /// recorded attempt. Its `operation_replayed` event waits until the
     /// user serdes decoded the payload.
     Replayed { payload: String, attempt: u32 },
+    /// A recorded success with `ReplayChildren`: the body runs again in
+    /// `child_ctx`, its callback and submitter step replay their records,
+    /// and nothing is written. No hook fires for the outer context.
+    Reconstruct {
+        /// The child context (chained prefix) the body runs in.
+        child_ctx: DurableContext,
+    },
     /// The body must run in `child_ctx`; `after` settles the outcome.
     Run {
         /// The fresh child context (chained prefix) the body runs in.
@@ -768,6 +804,13 @@ impl WfcbCore {
             StartStep::Refused => return std::future::pending().await,
             StartStep::Queued(write) => Some(write),
             StartStep::Recorded(view) => match view.status {
+                CheckpointStatus::Succeeded if view.replay_children => {
+                    // A record within the plugin child operations depth:
+                    // run the body again against its children's records,
+                    // as a preserved child context does.
+                    let child_ctx = ctx.new_child(&positional_id, name.as_deref());
+                    return Ok(WfcbPrelude::Reconstruct { child_ctx });
+                }
                 CheckpointStatus::Succeeded => {
                     // WaitForCallback context completed: return the recorded
                     // raw payload. The user serdes decodes it after the
@@ -857,6 +900,11 @@ impl WfcbAfter {
                 if let Some(parent_wire) = ctx.parent_wire_id() {
                     builder = builder.parent_id(parent_wire);
                 }
+                // Within the plugin child operations depth, the record
+                // keeps its children for later invocations.
+                if ctx.preserves_children(1) {
+                    builder = builder.context_options(replay_children_options());
+                }
                 #[expect(clippy::expect_used)] // reason: all required fields set above
                 let update = builder
                     .build()
@@ -900,6 +948,11 @@ impl WfcbAfter {
                     builder = builder.parent_id(parent_wire);
                 }
                 builder = builder.error(wire.to_error_object());
+                // Within the plugin child operations depth, the record
+                // keeps its children for later invocations.
+                if ctx.preserves_children(1) {
+                    builder = builder.context_options(replay_children_options());
+                }
                 #[expect(clippy::expect_used)] // reason: all required fields set above
                 let update = builder
                     .build()
@@ -1078,10 +1131,22 @@ fn build_wfcb_fail_update(
     if let Some(parent_wire) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire);
     }
+    // Within the plugin child operations depth, the record keeps its
+    // children for later invocations.
+    if ctx.preserves_children(1) {
+        builder = builder.context_options(replay_children_options());
+    }
     #[expect(clippy::expect_used)] // reason: all required fields set above
     builder
         .build()
         .expect("all required OperationUpdate fields set")
+}
+
+/// The `ContextOptions` of a record that keeps its children.
+fn replay_children_options() -> aws_sdk_lambda::types::ContextOptions {
+    aws_sdk_lambda::types::ContextOptions::builder()
+        .replay_children(true)
+        .build()
 }
 
 /// The `ErrorType` the outer `wait_for_callback` FAIL record carries for an
@@ -1646,6 +1711,7 @@ mod tests {
             Arc::new(InMemoryExecutionClient::new(vec![])),
             "token-1".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         )
     }
@@ -1713,6 +1779,7 @@ mod tests {
             client,
             "token-1".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         );
         let wire = crate::engine::compute_wire_id_public("1");
@@ -3732,6 +3799,52 @@ mod tests {
 
     /// A callback's own FAILED record keeps the external classification,
     /// even when the external caller used a type the outer record uses.
+    /// Within the depth, the `FAIL` of a `wait_for_callback` carries
+    /// `ReplayChildren`; at depth 0 it carries no `ContextOptions`.
+    #[tokio::test]
+    async fn preserved_wait_for_callback_failure_has_flag() {
+        for (depth, flag) in [(1, Some(true)), (0, None)] {
+            let (ctx, client) = DurableContext::test_context_with_depth(depth);
+            let result = ctx
+                .wait_for_callback::<String, _, _>(|_step, _callback_id| async {
+                    Err("cannot submit".into())
+                })
+                .name("approve")
+                .submitter_retry(|_err, _attempt| crate::RetryDecision::Stop)
+                .await;
+            assert!(result.is_err());
+            let fail = client
+                .recorded_updates()
+                .into_iter()
+                .find(|u| u.name() == Some("approve") && u.action() == &OperationAction::Fail)
+                .expect("the FAIL of the wait_for_callback");
+            assert_eq!(
+                fail.context_options()
+                    .and_then(aws_sdk_lambda::types::ContextOptions::replay_children),
+                flag,
+                "depth {depth}"
+            );
+        }
+    }
+
+    /// The replacement `FAIL` of a rejected outcome write carries the flag
+    /// within the depth of the caller's context.
+    #[test]
+    fn wait_for_callback_replacement_fail_has_flag_within_depth() {
+        let wire = crate::error::WireError::default();
+        let (ctx, _client) = DurableContext::test_context_with_depth(1);
+        let update = build_wfcb_fail_update("w", Some("approve"), &ctx, &wire);
+        assert_eq!(
+            update
+                .context_options()
+                .and_then(aws_sdk_lambda::types::ContextOptions::replay_children),
+            Some(true)
+        );
+        let (ctx, _client) = DurableContext::test_context_with_depth(0);
+        let update = build_wfcb_fail_update("w", Some("approve"), &ctx, &wire);
+        assert!(update.context_options().is_none());
+    }
+
     #[tokio::test]
     async fn callback_own_record_keeps_external_classification() {
         // C23.
@@ -4354,6 +4467,7 @@ mod coordinator_tests {
             Arc::new(client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         );
         let seen = Arc::new(std::sync::Mutex::new(None));
@@ -4504,6 +4618,7 @@ mod start_order_tests {
             client,
             "token-0".to_owned(),
             None,
+            0,
             hooks.map(crate::plugin::test_support::OpHooks::plugins),
         );
         let recorded = Arc::clone(submissions);

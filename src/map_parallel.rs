@@ -1523,6 +1523,7 @@ where
                         &req.child_sub_type,
                         &req.parent_wire,
                         &wire,
+                        req.ctx.preserves_children(1),
                     );
                     if let Err(client_err) = writer.checkpoint_updates(vec![update]).await {
                         // Audit (#43): batch child FAIL (serialization):
@@ -1536,6 +1537,7 @@ where
                             &req.child_sub_type,
                             &req.parent_wire,
                             &cwire,
+                            req.ctx.preserves_children(1),
                         );
                         return writer
                             .checkpoint_failure_unrecoverable(
@@ -1574,6 +1576,15 @@ where
                 );
             } else {
                 builder = builder.payload(serialized.clone());
+                // Within the plugin child operations depth, the item
+                // record keeps its children for later invocations.
+                if req.ctx.preserves_children(1) {
+                    builder = builder.context_options(
+                        aws_sdk_lambda::types::ContextOptions::builder()
+                            .replay_children(true)
+                            .build(),
+                    );
+                }
             }
 
             #[expect(clippy::expect_used)] // reason: all required fields are set above
@@ -1599,6 +1610,7 @@ where
                     &req.child_sub_type,
                     &req.parent_wire,
                     &cwire,
+                    req.ctx.preserves_children(1),
                 );
                 return writer
                     .checkpoint_failure_unrecoverable(&child_wire, err, Some(terminal))
@@ -1641,7 +1653,7 @@ where
             // error the body returned, so the type is the body error's
             // recorded type, the message is its flattened chain, and
             // `error_data`/`stack_trace` pass through the boundary.
-            let builder = OperationUpdate::builder()
+            let mut builder = OperationUpdate::builder()
                 .id(child_wire.clone())
                 .r#type(OperationType::Context)
                 .sub_type(req.child_sub_type.clone())
@@ -1649,6 +1661,15 @@ where
                 .parent_id(req.parent_wire.clone())
                 .name(req.item_name.clone())
                 .error(wire.to_error_object());
+            // Within the plugin child operations depth, the item record
+            // keeps its children for later invocations.
+            if req.ctx.preserves_children(1) {
+                builder = builder.context_options(
+                    aws_sdk_lambda::types::ContextOptions::builder()
+                        .replay_children(true)
+                        .build(),
+                );
+            }
 
             #[expect(clippy::expect_used)] // reason: all required fields are set above
             let update = builder
@@ -1670,6 +1691,7 @@ where
                     &req.child_sub_type,
                     &req.parent_wire,
                     &cwire,
+                    req.ctx.preserves_children(1),
                 );
                 return writer
                     .checkpoint_failure_unrecoverable(&child_wire, client_err, Some(terminal))
@@ -2246,9 +2268,23 @@ where
         // decision record (`totalCount`, `completionReason`, index set)
         // instead of its payload. A payload that fails to parse is
         // corrupt and fails the replay.
+        // A batch within the plugin child operations depth recorded its
+        // own result instead, and its plan is read from that result.
         let decision =
             if matches!(snapshot.status, CheckpointStatus::Succeeded) && snapshot.replay_children {
-                Some(parse_replay_children_payload(snapshot.result.as_deref())?)
+                match parse_replay_children_payload(snapshot.result.as_deref())? {
+                    Some(record) => Some(record),
+                    None => Some(
+                        full_result_decision(
+                            &ctx,
+                            parent_name.as_deref(),
+                            snapshot.result.clone().unwrap_or_default(),
+                            &result_serdes,
+                            &serdes_ctx,
+                        )
+                        .await?,
+                    ),
+                }
             } else {
                 None
             };
@@ -3230,26 +3266,36 @@ struct BatchDecisionRecord {
     completed_indexes: Option<Vec<usize>>,
 }
 
-/// Reads the payload of a terminal `replay_children` batch parent. An
-/// absent payload reads as the empty string. Then, in this order:
+/// Reads the payload of a terminal `replay_children` batch parent, in this
+/// order:
 ///
-/// 1. A JSON object with the key `itemStatuses` is the JS summary. Its
+/// 1. An absent or empty payload is corrupt bookkeeping, and replay fails
+///    rather than re-executing items the recorded batch may never have
+///    started.
+/// 2. A JSON object with the key `itemStatuses` is the JS summary. Its
 ///    `itemStatuses` must be a non-empty string of `S`, `F` and `-`; the
 ///    started prefix is its length, the terminal indexes are its `S` and
 ///    `F` positions, and the reason is `completionReason`. As in JS,
 ///    `itemStatuses` is the only per-item field replay reads.
-/// 2. A JSON object with `totalCount` and `startedIndexes` or
+/// 3. A JSON object with `totalCount` and `startedIndexes` or
 ///    `completedIndexes` is the decision record the Python SDK writes
 ///    (see [`parse_decision_record`]).
-/// 3. Any other payload, including an absent or empty one, is corrupt
-///    bookkeeping, and replay fails rather than re-executing items the
-///    recorded batch may never have started.
+/// 4. Any other payload is the batch's own result, which a batch within
+///    the plugin child operations depth records with `ReplayChildren`.
+///    It returns `None`, and the caller reads the plan from that result
+///    (see [`full_result_decision`]).
 fn parse_replay_children_payload(
     payload: Option<&str>,
-) -> Result<BatchDecisionRecord, OperationError> {
+) -> Result<Option<BatchDecisionRecord>, OperationError> {
     let payload = payload.unwrap_or_default().trim();
-    let value: serde_json::Value = serde_json::from_str(payload)
-        .map_err(|e| batch_error(&format!("malformed batch decision record: {e}")))?;
+    if payload.is_empty() {
+        return Err(batch_error(
+            "malformed batch decision record: the payload is empty",
+        ));
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return Ok(None);
+    };
     if let Some(statuses) = value.get("itemStatuses") {
         let statuses = statuses
             .as_str()
@@ -3265,7 +3311,7 @@ fn parse_replay_children_payload(
             .enumerate()
             .filter_map(|(i, c)| (c != '-').then_some(i))
             .collect();
-        return Ok(BatchDecisionRecord {
+        return Ok(Some(BatchDecisionRecord {
             total_count: statuses.chars().count(),
             completion_reason: value
                 .get("completionReason")
@@ -3274,17 +3320,64 @@ fn parse_replay_children_payload(
                 .to_owned(),
             started_indexes: None,
             completed_indexes: Some(completed),
-        });
+        }));
     }
     if value.get("totalCount").is_some()
         && (value.get("startedIndexes").is_some() || value.get("completedIndexes").is_some())
     {
-        return parse_decision_record(payload);
+        return parse_decision_record(payload).map(Some);
     }
-    Err(batch_error(
-        "malformed batch decision record: the payload is neither a batch summary \
-         nor a decision record",
-    ))
+    Ok(None)
+}
+
+/// Reads the replay plan of a preserved batch from its own result: the
+/// payload a batch within the plugin child operations depth records with
+/// `ReplayChildren`. The result serdes decodes `payload` to the batch
+/// record text. The plan admits the record's started prefix, marks its
+/// succeeded and failed items as completed, and keeps its completion
+/// reason, so the re-run items end as the recorded batch ended.
+async fn full_result_decision<RS>(
+    ctx: &DurableContext,
+    name: Option<&str>,
+    payload: String,
+    result_serdes: &RS,
+    serdes_ctx: &SerdesContext,
+) -> Result<BatchDecisionRecord, OperationError>
+where
+    RS: Serdes<String>,
+{
+    let record_text: String =
+        deserialize_value(ctx, name, payload, result_serdes, serdes_ctx.clone()).await?;
+    let record = parse_batch_record(&record_text).map_err(|message| batch_error(&message))?;
+    check_record_indexes(&record)?;
+    let mut completed = Vec::with_capacity(record.all.len());
+    for item in &record.all {
+        if parse_item_status(&item.status)? != BatchItemStatus::Started {
+            completed.push(item.index);
+        }
+    }
+    Ok(BatchDecisionRecord {
+        total_count: record.all.len(),
+        completion_reason: record.completion_reason,
+        started_indexes: None,
+        completed_indexes: Some(completed),
+    })
+}
+
+/// Checks that a batch record's `all` holds the started prefix in index
+/// order: the item at position `k` has index `k`. A custom `result_serdes`
+/// or a corrupt checkpoint can produce a sparse, duplicate or reordered
+/// index, which would name the wrong item, so such a record is an error.
+fn check_record_indexes(record: &JsBatchRecord) -> Result<(), OperationError> {
+    for (position, item) in record.all.iter().enumerate() {
+        if item.index != position {
+            return Err(batch_error(&format!(
+                "batch record item at position {position} has index {}",
+                item.index
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Parses a terminal batch's `replay_children` payload as the decision
@@ -3509,6 +3602,15 @@ async fn checkpoint_batch_success_serialized(
             .payload(summary_json.to_owned());
     } else {
         builder = builder.payload(serialized_payload.to_owned());
+        // Within the plugin child operations depth of the caller's
+        // context, the batch record keeps its items for later invocations.
+        if ctx.preserves_children(1) {
+            builder = builder.context_options(
+                aws_sdk_lambda::types::ContextOptions::builder()
+                    .replay_children(true)
+                    .build(),
+            );
+        }
     }
 
     #[expect(clippy::expect_used)] // reason: all required fields are set above
@@ -3663,17 +3765,21 @@ fn build_child_update(
 
 /// Builds a child-level `FAIL` update carrying `wire` as its error: the
 /// terminal record persisted when the child's own outcome write was
-/// permanently rejected (issue #43).
+/// permanently rejected (issue #43), or the `FAIL` of an item whose result
+/// fails to serialize. `preserve` adds `ReplayChildren`: the batch's own
+/// context keeps the item's children within its plugin child operations
+/// depth.
 fn build_child_fail_update(
     child_wire: &str,
     child_name: &str,
     child_sub_type: &str,
     parent_wire: &str,
     wire: &crate::error::WireError,
+    preserve: bool,
 ) -> OperationUpdate {
     // The recorded name is never empty: a missing or empty caller name
     // defaults to `map-item-{i}` or `parallel-branch-{i}`.
-    let builder = OperationUpdate::builder()
+    let mut builder = OperationUpdate::builder()
         .id(child_wire.to_owned())
         .r#type(OperationType::Context)
         .sub_type(child_sub_type.to_owned())
@@ -3681,6 +3787,13 @@ fn build_child_fail_update(
         .parent_id(parent_wire.to_owned())
         .error(wire.to_error_object())
         .name(child_name.to_owned());
+    if preserve {
+        builder = builder.context_options(
+            aws_sdk_lambda::types::ContextOptions::builder()
+                .replay_children(true)
+                .build(),
+        );
+    }
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
         .build()
@@ -3708,6 +3821,15 @@ fn build_parent_fail_update(
     }
     if let Some(parent_wire) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire);
+    }
+    // Within the plugin child operations depth of the caller's context,
+    // the batch record keeps its items for later invocations.
+    if ctx.preserves_children(1) {
+        builder = builder.context_options(
+            aws_sdk_lambda::types::ContextOptions::builder()
+                .replay_children(true)
+                .build(),
+        );
     }
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
@@ -4422,14 +4544,7 @@ where
             record.all.len()
         )));
     }
-    for (position, item) in record.all.iter().enumerate() {
-        if item.index != position {
-            return Err(batch_error(&format!(
-                "batch record item at position {position} has index {}",
-                item.index
-            )));
-        }
-    }
+    check_record_indexes(&record)?;
     let reason = CompletionReason::from_wire(&record.completion_reason);
     let mut items = Vec::with_capacity(record.all.len());
     for item in record.all {
@@ -4673,6 +4788,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         );
         let values = ctx
@@ -5110,6 +5226,7 @@ mod tests {
             client as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         );
         ItemRequest {
@@ -10146,10 +10263,12 @@ mod tests {
         let Err(err) = result else {
             unreachable!("replay of a corrupt decision record must fail")
         };
+        // A payload that is neither a summary nor a decision record is
+        // read as the batch's own result, which must be a batch record.
         let display = crate::error::chain_string(&err);
         assert!(
-            display.contains("malformed batch decision record"),
-            "expected the malformed-record error, got: {display}"
+            display.contains("batch record is not valid"),
+            "expected the corrupt-record error, got: {display}"
         );
     }
 
@@ -12207,6 +12326,326 @@ mod tests {
         assert_eq!(started_middle_rows(&batch), started_middle_expected());
     }
 
+    /// `ContextOptions.replay_children` of `update`.
+    fn depth_flag(update: &OperationUpdate) -> Option<bool> {
+        update
+            .context_options()
+            .and_then(aws_sdk_lambda::types::ContextOptions::replay_children)
+    }
+
+    /// The update of the operation named `name` with `action`.
+    fn depth_update(
+        client: &crate::client::InMemoryExecutionClient,
+        name: &str,
+        action: &OperationAction,
+    ) -> OperationUpdate {
+        client
+            .recorded_updates()
+            .into_iter()
+            .find(|u| u.name() == Some(name) && u.action() == action)
+            .unwrap_or_else(|| unreachable!("no {action:?} update for {name}"))
+    }
+
+    /// Runs a map named `m` over `[1, 2]` whose items return ten times
+    /// their input, on a root with the plugin child operations depth
+    /// `depth`.
+    async fn depth_map(depth: u32) -> Arc<crate::client::InMemoryExecutionClient> {
+        let (ctx, client) = DurableContext::test_context_with_depth(depth);
+        let out: Vec<u32> = ctx
+            .map(
+                vec![1_u32, 2],
+                |_child, item, _idx| async move { Ok(item * 10) },
+            )
+            .name("m")
+            .await
+            .expect("map succeeds");
+        assert_eq!(out, vec![10, 20]);
+        client
+    }
+
+    /// Depth 1 flags the container's SUCCEED and keeps the payload a run
+    /// without the depth writes; the item records are not flagged.
+    #[tokio::test]
+    async fn preserved_container_records_result_payload() {
+        let plain_client = depth_map(0).await;
+        let plain = depth_update(&plain_client, "m", &OperationAction::Succeed);
+        let client = depth_map(1).await;
+        let container = depth_update(&client, "m", &OperationAction::Succeed);
+        assert_eq!(depth_flag(&container), Some(true));
+        assert_eq!(depth_flag(&plain), None);
+        assert_eq!(container.payload(), plain.payload());
+        for item in ["map-item-0", "map-item-1"] {
+            let update = depth_update(&client, item, &OperationAction::Succeed);
+            assert_eq!(depth_flag(&update), None, "{item}");
+        }
+    }
+
+    /// Depth 2 also flags each item's SUCCEED, which keeps its payload.
+    #[tokio::test]
+    async fn depth_two_flags_items() {
+        let client = depth_map(2).await;
+        for (item, payload) in [("map-item-0", "10"), ("map-item-1", "20")] {
+            let update = depth_update(&client, item, &OperationAction::Succeed);
+            assert_eq!(depth_flag(&update), Some(true), "{item}");
+            assert_eq!(update.payload(), Some(payload), "{item}");
+        }
+    }
+
+    /// Within the depth, a failed item's FAIL carries the flag, and so does
+    /// the FAIL of an item whose result fails to serialize.
+    #[tokio::test]
+    async fn preserved_item_failures_have_flag() {
+        for (depth, flag) in [(2, Some(true)), (1, None)] {
+            let (ctx, client) = DurableContext::test_context_with_depth(depth);
+            let batch = ctx
+                .map(vec![0_u32], |_child, _item, _idx| async move {
+                    Err::<u32, BoxError>("boom".into())
+                })
+                .name("m")
+                .completion(
+                    crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(
+                        1,
+                    ),
+                )
+                .await_batch()
+                .await
+                .expect("the batch tolerates the failure");
+            assert_eq!(batch.items[0].status, BatchItemStatus::Failed);
+            let fail = depth_update(&client, "map-item-0", &OperationAction::Fail);
+            assert_eq!(depth_flag(&fail), flag, "body failure at depth {depth}");
+
+            let (ctx, client) = DurableContext::test_context_with_depth(depth);
+            let batch = ctx
+                .map(vec![0_u32], |_child, _item, _idx| async move {
+                    Ok("x".to_owned())
+                })
+                .name("m")
+                .serdes(FailingResultSerdes)
+                .completion(
+                    crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(
+                        1,
+                    ),
+                )
+                .await_batch()
+                .await
+                .expect("the batch tolerates the failure");
+            assert_eq!(batch.items[0].status, BatchItemStatus::Failed);
+            let fail = depth_update(&client, "map-item-0", &OperationAction::Fail);
+            assert_eq!(
+                depth_flag(&fail),
+                flag,
+                "serialization failure at depth {depth}"
+            );
+        }
+    }
+
+    /// A client that permanently rejects the first update `rejects`
+    /// matches, and records every other update in the in-memory client.
+    #[derive(Debug)]
+    struct RejectsFirstMatch {
+        inner: Arc<crate::client::InMemoryExecutionClient>,
+        rejects: fn(&OperationUpdate) -> bool,
+        done: AtomicBool,
+    }
+
+    impl crate::client::ExecutionClient for RejectsFirstMatch {
+        fn checkpoint(
+            &self,
+            arn: &str,
+            token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::client::CheckpointOutput,
+                            crate::client::ExecutionClientError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            if updates.iter().any(|u| (self.rejects)(u)) && !self.done.swap(true, Ordering::SeqCst)
+            {
+                return Box::pin(async {
+                    Err(crate::client::ExecutionClientError::new_non_retryable(
+                        "rejected",
+                    ))
+                });
+            }
+            self.inner.checkpoint(arn, token, updates)
+        }
+
+        fn get_state(
+            &self,
+            arn: &str,
+            token: &str,
+            marker: Option<&str>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::client::GetStateOutput,
+                            crate::client::ExecutionClientError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.inner.get_state(arn, token, marker)
+        }
+    }
+
+    /// When an item's outcome write is rejected, the terminal FAIL that
+    /// replaces it carries the flag within the depth: after a rejected
+    /// SUCCEED, a rejected FAIL, and a rejected FAIL of a result that fails
+    /// to serialize.
+    #[tokio::test]
+    async fn preserved_item_replacement_fail_has_flag() {
+        fn item_outcome(u: &OperationUpdate) -> bool {
+            u.name() == Some("map-item-0")
+                && matches!(u.action(), OperationAction::Succeed | OperationAction::Fail)
+        }
+        for case in ["succeed", "fail", "serialize"] {
+            for (depth, flag) in [(2, Some(true)), (1, None)] {
+                let inner = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+                let client = Arc::new(RejectsFirstMatch {
+                    inner: Arc::clone(&inner),
+                    rejects: item_outcome,
+                    done: AtomicBool::new(false),
+                });
+                let ctx = DurableContext::test_context_with_depth_and_client(depth, client);
+                let outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::driver::test_support::drive_handler(ctx, None, move |ctx| async move {
+                        let builder = ctx.map(vec![0_u32], move |_child, _item, _idx| async move {
+                            if case == "fail" {
+                                Err::<String, BoxError>("boom".into())
+                            } else {
+                                Ok("x".to_owned())
+                            }
+                        });
+                        let result = if case == "serialize" {
+                            builder.name("m").serdes(FailingResultSerdes).await
+                        } else {
+                            builder.name("m").await
+                        };
+                        result.map_err(crate::driver::test_support::wire_err)?;
+                        Ok("done".to_owned())
+                    }),
+                )
+                .await
+                .expect("the invocation ends within 5 s")
+                .expect("no panic");
+                assert!(
+                    matches!(outcome, crate::driver::InvocationOutcome::Failed { .. }),
+                    "{case}: {outcome:?}"
+                );
+                let fails: Vec<_> = inner
+                    .recorded_updates()
+                    .into_iter()
+                    .filter(|u| {
+                        u.name() == Some("map-item-0") && u.action() == &OperationAction::Fail
+                    })
+                    .collect();
+                assert_eq!(fails.len(), 1, "{case}: one replacement FAIL");
+                assert_eq!(depth_flag(&fails[0]), flag, "{case} at depth {depth}");
+            }
+        }
+    }
+
+    /// The container's replacement FAIL carries the flag within the depth
+    /// of the caller's context.
+    #[test]
+    fn container_replacement_fail_has_flag_within_depth() {
+        let wire = crate::error::WireError::default();
+        let (ctx, _client) = DurableContext::test_context_with_depth(1);
+        let update = build_parent_fail_update("w", Some("m"), MAP_SUB_TYPE, &ctx, &wire);
+        assert_eq!(depth_flag(&update), Some(true));
+        let (ctx, _client) = DurableContext::test_context_with_depth(0);
+        let update = build_parent_fail_update("w", Some("m"), MAP_SUB_TYPE, &ctx, &wire);
+        assert!(update.context_options().is_none());
+    }
+
+    /// A preserved batch's own result replays as the decision record does:
+    /// its started item stays `Started`, and no item body runs.
+    #[tokio::test]
+    async fn preserved_full_result_replays_like_the_decision_record() {
+        let batch = replay_started_middle(started_middle_log(
+            r#"{"all":[{"index":0,"status":"SUCCEEDED","name":"map-item-0","result":"a"},{"index":1,"status":"STARTED","name":"map-item-1"},{"index":2,"status":"SUCCEEDED","name":"map-item-2","result":"c"}],"completionReason":"MIN_SUCCESSFUL_REACHED"}"#,
+        ))
+        .await;
+        assert_eq!(batch.reason, CompletionReason::MinSuccessfulReached);
+        assert_eq!(started_middle_rows(&batch), started_middle_expected());
+    }
+
+    /// A preserved batch result with an unknown item status fails the
+    /// replay, and no item body runs.
+    #[tokio::test]
+    async fn preserved_full_result_rejects_unknown_item_status() {
+        let log = started_middle_log(
+            r#"{"all":[{"index":0,"status":"DONE","name":"map-item-0"}],"completionReason":"ALL_COMPLETED"}"#,
+        );
+        let result: Result<Vec<String>, _> = test_ctx(log)
+            .map(vec![0_usize, 1, 2, 3], |_child, _item, _idx| async move {
+                unreachable!("a corrupt record must not re-run any item")
+            })
+            .await;
+        let err = result.expect_err("an unknown status is corrupt");
+        assert!(
+            crate::error::chain_string(&err).contains("DONE"),
+            "{}",
+            crate::error::chain_string(&err)
+        );
+    }
+
+    /// A preserved batch result whose items are not the started prefix in
+    /// index order fails the replay, as an ordinary batch record does, and
+    /// no item body runs.
+    #[tokio::test]
+    async fn preserved_full_result_rejects_misplaced_indexes() {
+        for all in [
+            // A duplicate index.
+            r#"[{"index":0,"status":"SUCCEEDED","name":"map-item-0","result":"a"},{"index":0,"status":"STARTED","name":"map-item-0"}]"#,
+            // Reordered indexes.
+            r#"[{"index":1,"status":"STARTED","name":"map-item-1"},{"index":0,"status":"SUCCEEDED","name":"map-item-0","result":"a"}]"#,
+        ] {
+            let log = started_middle_log(&format!(
+                r#"{{"all":{all},"completionReason":"MIN_SUCCESSFUL_REACHED"}}"#
+            ));
+            let result: Result<Vec<String>, _> = test_ctx(log)
+                .map(vec![0_usize, 1, 2, 3], |_child, _item, _idx| async move {
+                    unreachable!("a corrupt record must not re-run any item")
+                })
+                .await;
+            let err = result.expect_err("a misplaced index is corrupt");
+            assert!(
+                crate::error::chain_string(&err).contains("at position"),
+                "{all}: {}",
+                crate::error::chain_string(&err)
+            );
+        }
+    }
+
+    /// A preserved batch result that the result serdes cannot decode fails
+    /// the replay with the serdes error.
+    #[tokio::test]
+    async fn preserved_full_result_decode_failure_fails_replay() {
+        let log = started_middle_log(r#"{"all":[],"completionReason":"ALL_COMPLETED"}"#);
+        let result: Result<Vec<String>, _> = test_ctx(log)
+            .map(vec![0_usize, 1, 2, 3], |_child, _item, _idx| async move {
+                unreachable!("a payload that fails to decode must not re-run any item")
+            })
+            .result_serdes(FailingResultSerdes)
+            .await;
+        let err = result.expect_err("the decode fails");
+        assert!(
+            crate::error::chain_string(&err).contains("cannot decode"),
+            "{}",
+            crate::error::chain_string(&err)
+        );
+    }
+
     /// The JS summary replays to the same result as the Python decision
     /// record.
     #[tokio::test]
@@ -12225,7 +12664,8 @@ mod tests {
         let record = parse_replay_children_payload(Some(
             r#"{"itemStatuses":"S-F","completionReason":"ALL_COMPLETED","totalCount":99}"#,
         ))
-        .expect("a JS summary parses");
+        .expect("a JS summary parses")
+        .expect("a JS summary is a decision");
         assert_eq!(record.total_count, 3, "the length of itemStatuses wins");
         assert_eq!(record.completed_indexes, Some(vec![0, 2]));
         assert_eq!(record.started_indexes, None);
@@ -12243,35 +12683,47 @@ mod tests {
         }
 
         // Without a completion reason, the plan rejects the record.
-        let record =
-            parse_replay_children_payload(Some(r#"{"itemStatuses":"S"}"#)).expect("parses");
+        let record = parse_replay_children_payload(Some(r#"{"itemStatuses":"S"}"#))
+            .expect("parses")
+            .expect("a JS summary is a decision");
         let err = ReplayPlan::from_record(&record, 1).expect_err("no reason");
         assert!(crate::error::chain_string(&err).contains("unknown completionReason"));
 
         let record = parse_replay_children_payload(Some(
             r#"{"totalCount":2,"completionReason":"ALL_COMPLETED","completedIndexes":[0]}"#,
         ))
-        .expect("a decision record parses");
+        .expect("a decision record parses")
+        .expect("a decision record is a decision");
         assert_eq!(record.completed_indexes, Some(vec![0]));
         let record = parse_replay_children_payload(Some(
             r#"{"totalCount":2,"completionReason":"ALL_COMPLETED","startedIndexes":[1]}"#,
         ))
-        .expect("a decision record parses");
+        .expect("a decision record parses")
+        .expect("a decision record is a decision");
         assert_eq!(record.started_indexes, Some(vec![1]));
 
-        for corrupt in [
+        // An absent or empty payload is corrupt.
+        for corrupt in [None, Some(""), Some("  ")] {
+            let err = parse_replay_children_payload(corrupt)
+                .expect_err("an absent or empty payload is corrupt");
+            assert!(
+                crate::error::chain_string(&err).contains("malformed batch decision record"),
+                "{corrupt:?}"
+            );
+        }
+
+        // Every other non-empty payload is the batch's own result, whose
+        // items re-run.
+        for result in [
             "not json",
             r#"{"unrelated":true}"#,
             r#"{"totalCount":2,"completionReason":"ALL_COMPLETED"}"#,
             r#"{"startedIndexes":[]}"#,
             "[1]",
+            r#"{"all":[],"completionReason":"ALL_COMPLETED"}"#,
         ] {
-            let err = parse_replay_children_payload(Some(corrupt))
-                .expect_err("an unrecognized payload is corrupt");
-            assert!(
-                crate::error::chain_string(&err).contains("malformed batch decision record"),
-                "{corrupt}"
-            );
+            let parsed = parse_replay_children_payload(Some(result)).expect("not corrupt");
+            assert!(parsed.is_none(), "{result}");
         }
     }
 

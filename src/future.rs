@@ -1528,6 +1528,7 @@ mod tests {
             Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new())),
             "token0".to_owned(),
             None,
+            0,
             Some(Arc::clone(&plugins)),
         );
         (ctx, crate::plugin::Frames::invocation(Some(plugins)))

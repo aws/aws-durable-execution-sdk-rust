@@ -651,6 +651,14 @@ struct Inner {
     /// invocation holds them, and every context derived from it shares
     /// the same `Arc`. `None` without a registered plugin factory.
     plugins: Option<Arc<crate::plugin::InvocationPlugins>>,
+    /// How many context levels this context sits below the root: 0 at the
+    /// root, plus 1 for each [`DurableContext::new_child`]. A Flat batch
+    /// item's context keeps the batch's level.
+    nesting_level: u32,
+    /// The invocation's
+    /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth),
+    /// copied into every derived context.
+    preserve_child_depth: u32,
 }
 
 impl std::fmt::Debug for Inner {
@@ -800,6 +808,8 @@ impl DurableContext {
                 owners: Arc::from(Vec::new()),
                 replay_span,
                 plugins: None,
+                nesting_level: 0,
+                preserve_child_depth: 0,
             }),
             awaited: None,
         }
@@ -838,6 +848,8 @@ impl DurableContext {
                 owners: Arc::from(Vec::new()),
                 replay_span,
                 plugins: None,
+                nesting_level: 0,
+                preserve_child_depth: 0,
             }),
             awaited: None,
         }
@@ -876,6 +888,8 @@ impl DurableContext {
                 owners: Arc::from(Vec::new()),
                 replay_span,
                 plugins: None,
+                nesting_level: 0,
+                preserve_child_depth: 0,
             }),
             awaited: None,
         }
@@ -889,6 +903,10 @@ impl DurableContext {
     /// lock), `Some(window)` for a `checkpoint_delay` coalescing window,
     /// and `None` for immediate writes, which need
     /// `checkpoint_batching(false)` without a delay.
+    /// `preserve_child_depth` is the
+    /// [`plugin_child_operations_depth`](crate::OptionsBuilder::plugin_child_operations_depth)
+    /// of the invocation.
+    #[expect(clippy::too_many_arguments, reason = "one argument per root setting")]
     pub(crate) fn new_root_with_client_and_defaults(
         execution_arn: String,
         lambda_context: lambda_runtime::Context,
@@ -896,6 +914,7 @@ impl DurableContext {
         client: Arc<dyn ExecutionClient>,
         checkpoint_token: String,
         checkpoint_buffer_window: Option<Duration>,
+        preserve_child_depth: u32,
         plugins: Option<Arc<crate::plugin::InvocationPlugins>>,
     ) -> Self {
         let engine = Arc::new(EngineState::new_root(checkpoint_log));
@@ -921,9 +940,45 @@ impl DurableContext {
                 owners: Arc::from(Vec::new()),
                 replay_span,
                 plugins,
+                nesting_level: 0,
+                preserve_child_depth,
             }),
             awaited: None,
         }
+    }
+
+    /// Test-only root with an empty log, an in-memory client and the
+    /// plugin child operations depth `depth`, built through
+    /// [`Self::new_root_with_client_and_defaults`]. Returns the client, whose
+    /// recorded updates a test reads.
+    #[cfg(test)]
+    pub(crate) fn test_context_with_depth(
+        depth: u32,
+    ) -> (Self, Arc<crate::client::InMemoryExecutionClient>) {
+        let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = Self::test_context_with_depth_and_client(
+            depth,
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+        );
+        (ctx, client)
+    }
+
+    /// [`Self::test_context_with_depth`] with a caller-supplied client.
+    #[cfg(test)]
+    pub(crate) fn test_context_with_depth_and_client(
+        depth: u32,
+        client: Arc<dyn ExecutionClient>,
+    ) -> Self {
+        Self::new_root_with_client_and_defaults(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            client,
+            "token0".to_owned(),
+            None,
+            depth,
+            None,
+        )
     }
 
     /// Test-only root constructor that accepts an explicit
@@ -961,6 +1016,8 @@ impl DurableContext {
                 owners: Arc::from(Vec::new()),
                 replay_span,
                 plugins: None,
+                nesting_level: 0,
+                preserve_child_depth: 0,
             }),
             awaited: None,
         }
@@ -1004,6 +1061,8 @@ impl DurableContext {
                 owners: self.owners_with(parent_positional_id),
                 replay_span,
                 plugins: self.inner.plugins.clone(),
+                nesting_level: self.inner.nesting_level.saturating_add(1),
+                preserve_child_depth: self.inner.preserve_child_depth,
             }),
             awaited: None,
         }
@@ -1019,6 +1078,13 @@ impl DurableContext {
             Arc::clone(&self.inner.engine.checkpoint_log),
         )
         .is_replaying()
+    }
+
+    /// Whether a context-backed record created on this context at `levels_below`
+    /// levels under it records `ReplayChildren` on its terminal update.
+    pub(crate) fn preserves_children(&self, levels_below: u32) -> bool {
+        let level = self.inner.nesting_level.saturating_add(levels_below);
+        level <= self.inner.preserve_child_depth
     }
 
     /// Mints the next operation ID (internal engine concern).
@@ -1196,6 +1262,8 @@ impl DurableContext {
                 owners: self.owners_with(child_positional_id),
                 replay_span,
                 plugins: self.inner.plugins.clone(),
+                nesting_level: self.inner.nesting_level,
+                preserve_child_depth: self.inner.preserve_child_depth,
             }),
             awaited: None,
         }
@@ -4378,6 +4446,88 @@ mod tests {
     use aws_sdk_lambda::types::Operation;
     use std::sync::Arc;
 
+    /// The batch context, its Normal item context and its Flat item
+    /// context take their levels from the constructors: `new_child` adds 1
+    /// and `new_flat_child` keeps the level.
+    #[test]
+    fn nesting_levels_follow_constructors() {
+        let (root, _client) = DurableContext::test_context_with_depth(5);
+        let level = |ctx: &DurableContext| ctx.inner.nesting_level;
+        assert_eq!(level(&root), 0);
+        assert_eq!(root.inner.preserve_child_depth, 5);
+
+        let batch = root.new_child("1", None);
+        let normal = batch.new_child("1-1", None);
+        let flat = batch.new_flat_child("1-2", "parent", None);
+        assert_eq!((level(&batch), level(&normal), level(&flat)), (1, 2, 1));
+
+        let child = root.new_child("2", None);
+        let batch = child.new_child("2-1", None);
+        let normal = batch.new_child("2-1-1", None);
+        let flat = batch.new_flat_child("2-1-2", "parent", None);
+        assert_eq!((level(&batch), level(&normal), level(&flat)), (2, 3, 2));
+        for ctx in [&child, &batch, &normal, &flat] {
+            assert_eq!(
+                ctx.inner.preserve_child_depth, 5,
+                "every constructor copies the depth"
+            );
+        }
+
+        for ctx in [
+            DurableContext::test_context(),
+            DurableContext::new_root(
+                "arn".to_owned(),
+                lambda_runtime::Context::default(),
+                Arc::new(CheckpointLog::empty()),
+            ),
+        ] {
+            assert_eq!((level(&ctx), ctx.inner.preserve_child_depth), (0, 0));
+        }
+    }
+
+    /// Each row of the issue's table: the context that creates the record,
+    /// asked with `levels_below` 1, against depths 0, 1, 2 and `u32::MAX`.
+    #[test]
+    fn preserves_children_table() {
+        let depths = [0, 1, 2, u32::MAX];
+        let row = |make: &dyn Fn(&DurableContext) -> DurableContext| -> Vec<bool> {
+            depths
+                .iter()
+                .map(|&depth| {
+                    let (root, _client) = DurableContext::test_context_with_depth(depth);
+                    make(&root).preserves_children(1)
+                })
+                .collect()
+        };
+        // A top-level child, map or parallel container: level 1.
+        assert_eq!(row(&|root| root.clone()), [false, true, true, true]);
+        // An item of a top-level map, Normal nesting: level 2.
+        assert_eq!(
+            row(&|root| root.new_child("1", None)),
+            [false, false, true, true]
+        );
+        // A child inside a Normal item: level 3.
+        assert_eq!(
+            row(&|root| root.new_child("1", None).new_child("1-1", None)),
+            [false, false, false, true]
+        );
+        // A child inside a Flat item of a top-level map: level 2.
+        assert_eq!(
+            row(&|root| root
+                .new_child("1", None)
+                .new_flat_child("1-1", "parent", None)),
+            [false, false, true, true]
+        );
+        // A child inside a top-level child: level 2.
+        assert_eq!(
+            row(&|root| root.new_child("1", None)),
+            [false, false, true, true]
+        );
+        // Additions saturate instead of overflowing.
+        let (root, _client) = DurableContext::test_context_with_depth(u32::MAX);
+        assert!(root.new_child("1", None).preserves_children(u32::MAX));
+    }
+
     /// Test 19: each combinator method collects the operations its
     /// iterator creates, which claim their IDs, and claims no ID itself.
     #[test]
@@ -5820,6 +5970,7 @@ mod tests {
             Arc::new(InMemoryExecutionClient::new(Vec::new())),
             "token-0".to_owned(),
             None,
+            0,
             Some(Arc::clone(&plugins)),
         );
         let same = |ctx: &DurableContext| {
@@ -5855,6 +6006,7 @@ mod tests {
             client,
             "token-0".to_owned(),
             Some(delay),
+            0,
             None,
         )
     }
@@ -6817,6 +6969,7 @@ mod tests {
             Arc::clone(client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             window,
+            0,
             None,
         )
     }
@@ -7013,6 +7166,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             None,
+            0,
             None,
         );
         let item = root.new_child("1", None);
@@ -7117,6 +7271,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             Some(Duration::ZERO),
+            0,
             None,
         );
         let item = root.new_child("1", None);
@@ -7179,6 +7334,7 @@ mod tests {
                 Arc::clone(&client) as Arc<dyn ExecutionClient>,
                 "token-0".to_owned(),
                 Some(Duration::ZERO),
+                0,
                 None,
             );
             (client, root)
@@ -7260,6 +7416,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             Some(Duration::ZERO),
+            0,
             None,
         );
         // The control: an owner that is not abandoned replays the callback.
@@ -7398,6 +7555,7 @@ mod tests {
                 thread_client as Arc<dyn ExecutionClient>,
                 "token-0".to_owned(),
                 None,
+                0,
                 None,
             );
             let signal = Arc::clone(ctx.coordinator());
@@ -7463,6 +7621,7 @@ mod tests {
             client,
             "token-0".to_owned(),
             None,
+            0,
             None,
         );
         let coordinator = Arc::clone(root.coordinator());
@@ -7567,6 +7726,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             None,
+            0,
             None,
         );
         let coordinator = Arc::clone(root.coordinator());
@@ -8279,6 +8439,7 @@ mod write_order_tests {
             Arc::clone(client) as Arc<dyn ExecutionClient>,
             "token-0".to_owned(),
             window,
+            0,
             None,
         )
     }
@@ -8524,6 +8685,7 @@ mod change_hook_tests {
             client,
             "t0".to_owned(),
             window,
+            0,
             Some(plugins),
         )
     }
@@ -8871,6 +9033,7 @@ mod change_hook_tests {
             echo_client(),
             "t0".to_owned(),
             Some(Duration::ZERO),
+            0,
             plugins,
         );
         let projections = crate::engine::projections();

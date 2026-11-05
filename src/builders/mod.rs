@@ -757,6 +757,7 @@ mod tests {
             client.clone(),
             "token-0".to_owned(),
             window,
+            0,
             None,
         );
         (ctx, client)
@@ -970,6 +971,7 @@ mod tests {
             client.clone(),
             "token-0".to_owned(),
             Some(Duration::ZERO),
+            0,
             None,
         );
         (ctx, client)

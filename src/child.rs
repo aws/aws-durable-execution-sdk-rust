@@ -701,6 +701,8 @@ fn build_update(
 /// travels inline, while a larger one switches the operation to
 /// `ReplayChildren` mode (no payload; the backend preserves the child
 /// operations and the body re-executes on replay to reconstruct it).
+/// Within the plugin child operations depth of `ctx`, an inline result
+/// also carries `ReplayChildren`.
 fn build_succeed_update(
     wire_id: &str,
     name: Option<&str>,
@@ -729,6 +731,15 @@ fn build_succeed_update(
         // Don't include the payload: backend preserves child ops.
     } else {
         succeed_builder = succeed_builder.payload(serialized.to_owned());
+        // Within the plugin child operations depth, the record keeps its
+        // children for later invocations.
+        if ctx.preserves_children(1) {
+            succeed_builder = succeed_builder.context_options(
+                aws_sdk_lambda::types::ContextOptions::builder()
+                    .replay_children(true)
+                    .build(),
+            );
+        }
     }
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     succeed_builder
@@ -779,6 +790,8 @@ async fn checkpoint_live_failure(
 }
 
 /// Builds a child-context `FAIL` update carrying `wire` as its error.
+/// `ctx` is the context the child record belongs to; within its plugin
+/// child operations depth, the update carries `ReplayChildren`.
 fn build_child_fail_update(
     wire_id: &str,
     name: Option<&str>,
@@ -797,6 +810,15 @@ fn build_child_fail_update(
     }
     if let Some(parent_wire) = ctx.parent_wire_id() {
         fail_builder = fail_builder.parent_id(parent_wire);
+    }
+    // Within the plugin child operations depth, the record keeps its
+    // children for later invocations.
+    if ctx.preserves_children(1) {
+        fail_builder = fail_builder.context_options(
+            aws_sdk_lambda::types::ContextOptions::builder()
+                .replay_children(true)
+                .build(),
+        );
     }
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     fail_builder
@@ -1082,6 +1104,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         );
         (ctx, client)
@@ -1543,6 +1566,97 @@ mod tests {
             checkout_actions(&updates, "serdes-fails"),
             [OperationAction::Start, OperationAction::Fail]
         );
+    }
+
+    /// Whether `update` carries `ContextOptions` with `ReplayChildren`.
+    fn has_replay_children(update: &OperationUpdate) -> Option<bool> {
+        update
+            .context_options()
+            .and_then(aws_sdk_lambda::types::ContextOptions::replay_children)
+    }
+
+    /// The update of the operation named `name` with `action`.
+    fn named_update(
+        updates: &[OperationUpdate],
+        name: &str,
+        action: &OperationAction,
+    ) -> OperationUpdate {
+        updates
+            .iter()
+            .find(|u| u.name() == Some(name) && u.action() == action)
+            .cloned()
+            .unwrap_or_else(|| unreachable!("no {action:?} update for {name}"))
+    }
+
+    /// Within the depth, a child's SUCCEED keeps its payload and carries
+    /// `ReplayChildren`.
+    #[tokio::test]
+    async fn preserved_child_keeps_payload_and_flag() {
+        let (ctx, client) = DurableContext::test_context_with_depth(1);
+        let value: String = ctx
+            .run_in_child_context(|_child| async { Ok("x".to_owned()) })
+            .name("c")
+            .await
+            .expect("child succeeds");
+        assert_eq!(value, "x");
+        let succeed = named_update(&client.recorded_updates(), "c", &OperationAction::Succeed);
+        assert_eq!(has_replay_children(&succeed), Some(true));
+        assert_eq!(succeed.payload(), Some("\"x\""));
+    }
+
+    /// Within the depth, a child's FAIL carries `ReplayChildren`; at depth 0
+    /// it carries no `ContextOptions`.
+    #[tokio::test]
+    async fn preserved_child_failure_has_flag() {
+        for (depth, flag) in [(1, Some(true)), (0, None)] {
+            let (ctx, client) = DurableContext::test_context_with_depth(depth);
+            let result: Result<u32, OperationError> = ctx
+                .run_in_child_context(|_child| async { Err("declined".into()) })
+                .name("c")
+                .await;
+            assert!(result.is_err());
+            let fail = named_update(&client.recorded_updates(), "c", &OperationAction::Fail);
+            assert_eq!(has_replay_children(&fail), flag, "depth {depth}");
+        }
+    }
+
+    /// A child inside a top-level child sits at level 2: depth 1 flags only
+    /// the outer record.
+    #[tokio::test]
+    async fn nested_child_is_flagged_only_within_depth() {
+        let (ctx, client) = DurableContext::test_context_with_depth(1);
+        let value: u32 = ctx
+            .run_in_child_context(|child| async move {
+                Ok(child
+                    .run_in_child_context(|_inner| async { Ok(7_u32) })
+                    .name("inner")
+                    .await?)
+            })
+            .name("outer")
+            .await
+            .expect("children succeed");
+        assert_eq!(value, 7);
+        let updates = client.recorded_updates();
+        let outer = named_update(&updates, "outer", &OperationAction::Succeed);
+        let inner = named_update(&updates, "inner", &OperationAction::Succeed);
+        assert_eq!(has_replay_children(&outer), Some(true));
+        assert_eq!(has_replay_children(&inner), None);
+        assert_eq!(inner.payload(), Some("7"));
+    }
+
+    /// A child whose result fails to serialize writes its FAIL through the
+    /// same builder, so it carries the flag within the depth.
+    #[tokio::test]
+    async fn preserved_child_serialization_failure_has_flag() {
+        let (ctx, client) = DurableContext::test_context_with_depth(1);
+        let result: Result<u32, OperationError> = ctx
+            .run_in_child_context(|_child| async { Ok(3_u32) })
+            .name("c")
+            .serdes(PlainSerializeFailure)
+            .await;
+        assert!(result.is_err());
+        let fail = named_update(&client.recorded_updates(), "c", &OperationAction::Fail);
+        assert_eq!(has_replay_children(&fail), Some(true));
     }
 
     /// A result too large to checkpoint writes a `ReplayChildren` SUCCEED

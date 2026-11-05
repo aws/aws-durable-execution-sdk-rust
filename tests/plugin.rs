@@ -5469,3 +5469,491 @@ async fn no_plugin_no_change_work() {
         "the plugin run reported changes"
     );
 }
+
+// `plugin_child_operations_depth`: which finished children later
+// invocations see, and how a preserved record replays.
+
+/// `(inv, hook, kind, name, is_replay, status)` of one hook call that
+/// [`DepthRec`] recorded. `hook` is `start`, `end` or `uf_start`.
+type DepthHook = (
+    usize,
+    &'static str,
+    Option<OperationKind>,
+    String,
+    bool,
+    Option<OperationStatus>,
+);
+
+/// `(name, kind, status)` of one operation an invocation received.
+type DepthOp = (String, Option<OperationKind>, Option<OperationStatus>);
+
+/// `(hook, name, kind, is_replay, status)` of one hook record of a
+/// combinator test.
+type GatherHook = (
+    &'static str,
+    String,
+    Option<OperationKind>,
+    bool,
+    Option<OperationStatus>,
+);
+
+/// Records `InvocationInfo::operations()` of each invocation as
+/// `(name, kind, status)`, and every operation hook and user-function start
+/// hook.
+#[derive(Clone, Default)]
+struct DepthRec {
+    operations: Arc<Mutex<Vec<Vec<DepthOp>>>>,
+    hooks: Arc<Mutex<Vec<DepthHook>>>,
+    count: Arc<AtomicUsize>,
+}
+
+struct DepthRecPlugin {
+    inv: usize,
+    rec: DepthRec,
+}
+
+impl DepthRec {
+    fn runner(&self, depth: u32) -> LocalRunner {
+        LocalRunner::new().options(
+            Options::builder()
+                .plugin(self.clone())
+                .plugin_child_operations_depth(depth)
+                .build()
+                .expect("valid options"),
+        )
+    }
+
+    /// The `(name, kind)` of every operation but the execution that
+    /// invocation `inv` received, sorted.
+    fn operations_of(&self, inv: usize) -> Vec<(String, Option<OperationKind>)> {
+        let all = self.operations.lock().unwrap();
+        let mut ops: Vec<_> = all
+            .get(inv - 1)
+            .expect("the invocation ran")
+            .iter()
+            .filter(|(_, kind, _)| *kind != Some(OperationKind::Execution))
+            .map(|(name, kind, _)| (name.clone(), *kind))
+            .collect();
+        ops.sort_by(|x, y| {
+            x.0.cmp(&y.0)
+                .then_with(|| format!("{:?}", x.1).cmp(&format!("{:?}", y.1)))
+        });
+        ops
+    }
+
+    fn status_of(&self, inv: usize, name: &str) -> Option<OperationStatus> {
+        self.operations
+            .lock()
+            .unwrap()
+            .get(inv - 1)
+            .expect("the invocation ran")
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .and_then(|(_, _, status)| *status)
+    }
+
+    fn hooks_of(&self, inv: usize) -> Vec<DepthHook> {
+        self.hooks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.0 == inv)
+            .cloned()
+            .collect()
+    }
+}
+
+impl PluginFactory for DepthRec {
+    fn create_plugin(&self, info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        let inv = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        let ops = info
+            .operations()
+            .values()
+            .map(|op| {
+                (
+                    op.name().unwrap_or_default().to_owned(),
+                    op.kind(),
+                    op.status(),
+                )
+            })
+            .collect();
+        self.operations.lock().unwrap().push(ops);
+        Ok(Some(Box::new(DepthRecPlugin {
+            inv,
+            rec: self.clone(),
+        })))
+    }
+}
+
+impl DepthRecPlugin {
+    fn push(&self, hook: &'static str, info: &OperationInfo) {
+        self.rec.hooks.lock().unwrap().push((
+            self.inv,
+            hook,
+            info.kind(),
+            info.name().unwrap_or_default().to_owned(),
+            info.is_replay(),
+            info.status(),
+        ));
+    }
+}
+
+impl Plugin for DepthRecPlugin {
+    fn on_operation_start(&self, info: &OperationInfo) -> HookWork {
+        self.push("start", info);
+        Ok(None)
+    }
+
+    fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
+        self.push("end", info);
+        Ok(None)
+    }
+
+    fn on_user_function_start(&self, info: &OperationInfo) -> HookWork {
+        self.push("uf_start", info);
+        Ok(None)
+    }
+}
+
+fn op(name: &str, kind: OperationKind) -> (String, Option<OperationKind>) {
+    (name.to_owned(), Some(kind))
+}
+
+/// `map` named `m` over `[1, 2]`, each item a step `s` returning its input
+/// times 2, then `wait(1 s)` named `w`. `runs` counts the step bodies.
+async fn depth_map_handler(
+    ctx: DurableContext,
+    nesting: durable::builders::map_parallel::NestingMode,
+    runs: Arc<AtomicUsize>,
+) -> Result<Vec<u32>, BoxError> {
+    let out = ctx
+        .map(vec![1_u32, 2], move |child, item, _idx| {
+            let runs = Arc::clone(&runs);
+            async move {
+                Ok(child
+                    .step(move |_| async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        Ok(item * 2)
+                    })
+                    .name("s")
+                    .await?)
+            }
+        })
+        .name("m")
+        .nesting(nesting)
+        .await?;
+    ctx.wait(Duration::from_secs(1)).name("w").await?;
+    Ok(out)
+}
+
+/// Runs [`depth_map_handler`] at `depth` and returns the recorder, the
+/// step-body count and the invocation count.
+async fn run_depth_map(
+    depth: u32,
+    nesting: durable::builders::map_parallel::NestingMode,
+) -> (DepthRec, usize, usize) {
+    let rec = DepthRec::default();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let handler_runs = Arc::clone(&runs);
+    let result = rec
+        .runner(depth)
+        .run(
+            move |_event: (), ctx: DurableContext| {
+                let runs = Arc::clone(&handler_runs);
+                async move { depth_map_handler(ctx, nesting, runs).await }
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&vec![2, 4]));
+    (rec, runs.load(Ordering::SeqCst), result.invocations().len())
+}
+
+const NORMAL: durable::builders::map_parallel::NestingMode =
+    durable::builders::map_parallel::NestingMode::Normal;
+
+#[tokio::test]
+async fn depth_zero_prunes_children() {
+    let (rec, _, _) = run_depth_map(0, NORMAL).await;
+    assert_eq!(
+        rec.operations_of(2),
+        [
+            op("m", OperationKind::Context),
+            op("w", OperationKind::Wait)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn depth_one_keeps_items() {
+    let (rec, _, _) = run_depth_map(1, NORMAL).await;
+    assert_eq!(
+        rec.operations_of(2),
+        [
+            op("m", OperationKind::Context),
+            op("map-item-0", OperationKind::Context),
+            op("map-item-1", OperationKind::Context),
+            op("w", OperationKind::Wait),
+        ]
+    );
+}
+
+fn depth_two_tree() -> Vec<(String, Option<OperationKind>)> {
+    vec![
+        op("m", OperationKind::Context),
+        op("map-item-0", OperationKind::Context),
+        op("map-item-1", OperationKind::Context),
+        op("s", OperationKind::Step),
+        op("s", OperationKind::Step),
+        op("w", OperationKind::Wait),
+    ]
+}
+
+#[tokio::test]
+async fn depth_two_keeps_item_steps() {
+    let (rec, _, _) = run_depth_map(2, NORMAL).await;
+    assert_eq!(rec.operations_of(2), depth_two_tree());
+}
+
+#[tokio::test]
+async fn full_depth_keeps_tree() {
+    let (rec, _, _) = run_depth_map(u32::MAX, NORMAL).await;
+    assert_eq!(rec.operations_of(2), depth_two_tree());
+}
+
+#[tokio::test]
+async fn flat_items_add_no_level() {
+    let (rec, _, _) = run_depth_map(1, durable::builders::map_parallel::NestingMode::Flat).await;
+    assert_eq!(
+        rec.operations_of(2),
+        [
+            op("m", OperationKind::Context),
+            op("s", OperationKind::Step),
+            op("s", OperationKind::Step),
+            op("w", OperationKind::Wait),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn preserved_failed_child_keeps_children() {
+    let rec = DepthRec::default();
+    let result = rec
+        .runner(1)
+        .run(
+            |_event: (), ctx: DurableContext| async move {
+                let caught = ctx
+                    .run_in_child_context(|child| async move {
+                        child
+                            .step(|_| async { Err::<u32, BoxError>("declined".into()) })
+                            .name("s")
+                            .retry_strategy(|_, _| RetryDecision::Stop)
+                            .await?;
+                        Ok(0_u32)
+                    })
+                    .name("c")
+                    .await
+                    .is_err();
+                ctx.wait(Duration::from_secs(1)).name("w").await?;
+                Ok::<_, BoxError>(caught)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&true));
+    let ops = rec.operations_of(2);
+    assert!(ops.contains(&op("c", OperationKind::Context)), "{ops:?}");
+    assert!(ops.contains(&op("s", OperationKind::Step)), "{ops:?}");
+    assert_eq!(rec.status_of(2, "c"), Some(OperationStatus::Failed));
+}
+
+#[tokio::test]
+async fn preserved_container_replays_items() {
+    let (rec, runs, invocations) = run_depth_map(1, NORMAL).await;
+    assert_eq!(invocations, 2);
+    assert_eq!(runs, 2, "no step body ran in invocation 2");
+    let replayed: Vec<DepthHook> = rec
+        .hooks_of(2)
+        .into_iter()
+        .filter(|h| (h.1 == "start" || h.1 == "end") && h.3 != "m" && h.3 != "w")
+        .collect();
+    assert_eq!(replayed, [], "no item or step hook in invocation 2");
+}
+
+#[tokio::test]
+async fn preserved_replay_runs_no_step_body() {
+    let (rec, runs, invocations) = run_depth_map(2, NORMAL).await;
+    assert_eq!(rec.operations_of(2), depth_two_tree());
+    assert_eq!(invocations, 2);
+    assert_eq!(runs, 2, "each step body ran once");
+}
+
+#[tokio::test]
+#[expect(clippy::expect_used, reason = "the test value always encodes")]
+async fn preserved_wait_for_callback_has_flag() {
+    let rec = DepthRec::default();
+    let result = rec
+        .runner(1)
+        .callback_for(
+            "approve",
+            durable::test_util::CallbackReply::success(&"yes").expect("encodes"),
+        )
+        .run(
+            |_event: (), ctx: DurableContext| async move {
+                let value: String = ctx
+                    .wait_for_callback::<String, _, _>(|_step, _id| async { Ok(()) })
+                    .name("approve")
+                    .await?;
+                ctx.wait(Duration::from_secs(1)).name("w").await?;
+                ctx.wait(Duration::from_secs(1)).name("x").await?;
+                Ok::<_, BoxError>(value)
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output().map(String::as_str), Some("yes"));
+    let approve = result.operation("approve").expect("the wait_for_callback");
+    let durable::test_util::TestOperationDetails::Context(details) = approve.details() else {
+        unreachable!("a context record")
+    };
+    assert!(details.replay_children());
+    assert_eq!(approve.result(), Some("\"yes\""));
+
+    // The invocation that wrote the SUCCEED fired the live end hook.
+    let hooks = rec.hooks.lock().unwrap().clone();
+    let wrote = hooks
+        .iter()
+        .find(|h| h.1 == "end" && h.3 == "approve" && !h.4)
+        .map(|h| h.0)
+        .expect("the live end hook of approve");
+    let next = rec.hooks_of(wrote + 1);
+    let callback_ends: Vec<_> = next
+        .iter()
+        .filter(|h| h.3 == "approve-callback")
+        .cloned()
+        .collect();
+    let [(_, hook, _, _, is_replay, _)] = callback_ends.as_slice() else {
+        unreachable!("one hook of the callback: {next:?}")
+    };
+    assert_eq!(*hook, "end");
+    assert!(*is_replay, "the callback's end hook replays");
+    assert!(
+        next.iter().all(|h| h.3 != "approve-submitter"),
+        "the submitter fires no hook: {next:?}"
+    );
+    assert!(
+        next.iter()
+            .all(|h| !(h.1 == "uf_start" && h.3 == "approve")),
+        "no user-function start names approve: {next:?}"
+    );
+}
+
+/// Which combinator `gather` is.
+#[derive(Clone, Copy)]
+enum Gather {
+    TryJoinAll,
+    JoinAll,
+    Race,
+}
+
+/// A combinator `gather` over `wait(1 s)` named `a` and `b`, then
+/// `wait(1 s)` named `w`. Returns the recorder and the `gather` record's
+/// `(replay_children, result)`.
+async fn run_gather(depth: u32, gather: Gather) -> (DepthRec, bool, Option<String>) {
+    let rec = DepthRec::default();
+    let result = rec
+        .runner(depth)
+        .run(
+            move |_event: (), ctx: DurableContext| async move {
+                let a = ctx.wait(Duration::from_secs(1)).name("a").future();
+                let b = ctx.wait(Duration::from_secs(1)).name("b").future();
+                match gather {
+                    Gather::TryJoinAll => {
+                        ctx.try_join_all([a, b]).name("gather").await?;
+                    }
+                    Gather::JoinAll => {
+                        ctx.join_all([a, b]).name("gather").await?;
+                    }
+                    Gather::Race => {
+                        ctx.race([a, b]).name("gather").await?;
+                    }
+                }
+                ctx.wait(Duration::from_secs(1)).name("w").await?;
+                Ok::<_, BoxError>(())
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.output(), Some(&()));
+    assert_eq!(result.invocations().len(), 3);
+    let gather = result.operation("gather").expect("the combinator");
+    let durable::test_util::TestOperationDetails::Context(details) = gather.details() else {
+        unreachable!("a context record")
+    };
+    (
+        rec,
+        details.replay_children(),
+        gather.result().map(str::to_owned),
+    )
+}
+
+/// Invocation 3's hook records of `a`, `b` and `gather`, as
+/// `(hook, name, kind, is_replay, status)`.
+fn gather_hooks(rec: &DepthRec) -> Vec<GatherHook> {
+    rec.hooks_of(3)
+        .into_iter()
+        .filter(|h| ["a", "b", "gather"].contains(&h.3.as_str()))
+        .map(|(_, hook, kind, name, replay, status)| (hook, name, kind, replay, status))
+        .collect()
+}
+
+fn redriven_inputs() -> Vec<GatherHook> {
+    ["a", "b"]
+        .map(|name| {
+            (
+                "end",
+                name.to_owned(),
+                Some(OperationKind::Wait),
+                true,
+                Some(OperationStatus::Succeeded),
+            )
+        })
+        .to_vec()
+}
+
+#[tokio::test]
+async fn preserved_try_join_all_redrives_inputs() {
+    let (rec, flag, result) = run_gather(1, Gather::TryJoinAll).await;
+    assert!(flag);
+    assert_eq!(result.as_deref(), Some("[null,null]"));
+    assert_eq!(gather_hooks(&rec), redriven_inputs());
+}
+
+#[tokio::test]
+async fn preserved_join_all_redrives_inputs() {
+    let (_, _, plain) = run_gather(0, Gather::JoinAll).await;
+    let (rec, flag, result) = run_gather(1, Gather::JoinAll).await;
+    assert!(flag);
+    assert_eq!(result, plain);
+    assert_eq!(gather_hooks(&rec), redriven_inputs());
+}
+
+#[tokio::test]
+async fn depth_zero_try_join_all_drops_inputs() {
+    let (rec, flag, result) = run_gather(0, Gather::TryJoinAll).await;
+    assert!(!flag);
+    assert_eq!(result.as_deref(), Some("[null,null]"));
+    assert_eq!(gather_hooks(&rec), []);
+}
+
+#[tokio::test]
+async fn preserved_race_drops_inputs() {
+    let (rec, flag, result) = run_gather(1, Gather::Race).await;
+    assert!(!flag);
+    assert_eq!(result.as_deref(), Some("null"));
+    assert_eq!(gather_hooks(&rec), []);
+}

@@ -522,6 +522,7 @@ mod tests {
                 Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new())),
                 "token0".to_owned(),
                 None,
+                0,
                 Some(hooks.plugins()),
             );
             let signal = Arc::clone(ctx.coordinator());
@@ -579,6 +580,7 @@ mod tests {
             Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new())),
             "token0".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         );
         let err = ctx
@@ -1497,6 +1499,7 @@ mod tests {
             Arc::clone(client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
             None,
+            0,
             plugins,
         )
     }
@@ -1800,6 +1803,7 @@ mod refresh_tests {
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         );
         let outcome = drive_handler(ctx, None, |ctx| async move {

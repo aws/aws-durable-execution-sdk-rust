@@ -1117,6 +1117,7 @@ where
         checkpoint_delay,
         checkpoint_batching,
         plugins,
+        plugin_child_operations_depth,
     } = options;
     // The checkpoint buffer window: a configured delay is the coalescing
     // window; batching without a delay buffers with a zero window (writes
@@ -1137,6 +1138,7 @@ where
         handler,
         ClientProvider::new(preset_client),
         checkpoint_buffer_window,
+        plugin_child_operations_depth,
         plugins.into(),
     )
 }
@@ -1151,6 +1153,7 @@ fn wrap_with_provider<F, E, Fut, O>(
     handler: F,
     provider: ClientProvider,
     checkpoint_buffer_window: Option<Duration>,
+    plugin_child_operations_depth: u32,
     plugin_factories: std::sync::Arc<plugin::Factories>,
 ) -> impl Fn(lambda_runtime::LambdaEvent<InvocationPayload>) -> BoxedInvocationFuture + Send + Sync
 where
@@ -1260,6 +1263,7 @@ where
                 exec_client,
                 checkpoint_token,
                 checkpoint_buffer_window,
+                plugin_child_operations_depth,
                 plugins.clone(),
             );
 
@@ -2280,6 +2284,7 @@ mod tests {
             |_event: serde_json::Value, _ctx: DurableContext| async move { boom() },
             ClientProvider::new(Some(client)),
             None,
+            0,
             std::sync::Arc::from(Vec::new()),
         );
         let payload = serde_json::json!({

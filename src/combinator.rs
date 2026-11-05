@@ -1306,7 +1306,8 @@ fn serialize_result<T: Serialize + ?Sized>(value: &T) -> Result<String, Operatio
 /// [`CHECKPOINT_SIZE_LIMIT_BYTES`] bytes does not fit in the record. So the
 /// record stores the payload `""` and carries `ReplayChildren`, as JS and the
 /// Rust child context do, and replay drives the inputs again. A smaller
-/// result is stored inline.
+/// result is stored inline, and carries `ReplayChildren` within the plugin
+/// child operations depth of `ctx`, the caller's context.
 async fn checkpoint_collection_succeed(
     ctx: &DurableContext,
     wire_id: &str,
@@ -1317,7 +1318,8 @@ async fn checkpoint_collection_succeed(
     if serialized.len() > CHECKPOINT_SIZE_LIMIT_BYTES {
         checkpoint_succeed(ctx, wire_id, name, start, "", true).await
     } else {
-        checkpoint_succeed(ctx, wire_id, name, start, serialized, false).await
+        let preserve = ctx.preserves_children(1);
+        checkpoint_succeed(ctx, wire_id, name, start, serialized, preserve).await
     }
 }
 
@@ -1492,6 +1494,15 @@ async fn checkpoint_fail(
     if let Some(parent_wire) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire);
     }
+    // Within the plugin child operations depth, a failure record carries
+    // `ReplayChildren`, as JS writes it.
+    if ctx.preserves_children(1) {
+        builder = builder.context_options(
+            aws_sdk_lambda::types::ContextOptions::builder()
+                .replay_children(true)
+                .build(),
+        );
+    }
 
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     let update = builder
@@ -1540,6 +1551,15 @@ fn build_combinator_fail_update(
     }
     if let Some(parent_wire) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire);
+    }
+    // Within the plugin child operations depth, a failure record carries
+    // `ReplayChildren`, as JS writes it.
+    if ctx.preserves_children(1) {
+        builder = builder.context_options(
+            aws_sdk_lambda::types::ContextOptions::builder()
+                .replay_children(true)
+                .build(),
+        );
     }
     #[expect(clippy::expect_used)] // reason: all required fields are set above
     builder
@@ -3378,6 +3398,183 @@ mod tests {
         })
     }
 
+    /// The single update with `action` the client recorded.
+    fn depth_update(
+        client: &InMemoryExecutionClient,
+        action: &aws_sdk_lambda::types::OperationAction,
+    ) -> aws_sdk_lambda::types::OperationUpdate {
+        let found: Vec<_> = client
+            .recorded_updates()
+            .into_iter()
+            .filter(|u| u.action() == action)
+            .collect();
+        assert_eq!(found.len(), 1, "one {action:?} update: {found:?}");
+        found[0].clone()
+    }
+
+    /// Runs one combinator execution on a root with depth `depth`, and
+    /// returns the client.
+    async fn depth_run<T>(
+        depth: u32,
+        run: impl FnOnce(DurableContext, OperationId) -> T,
+    ) -> Arc<InMemoryExecutionClient>
+    where
+        T: std::future::Future<Output = ()>,
+    {
+        let (ctx, client) = DurableContext::test_context_with_depth(depth);
+        let op_id = ctx.mint_id();
+        run(ctx, op_id).await;
+        client
+    }
+
+    #[tokio::test]
+    async fn preserved_try_join_all_success_has_flag() {
+        let client = depth_run(1, |ctx, op_id| async move {
+            let value = TryJoinAllExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![ready(1), ready(2)],
+            }
+            .execute()
+            .await
+            .unwrap();
+            assert_eq!(value, vec![1, 2]);
+        })
+        .await;
+        let update = succeed_update(&client);
+        assert_eq!(replay_children_of(&update), Some(true));
+        assert_eq!(update.payload(), Some("[1,2]"));
+    }
+
+    #[tokio::test]
+    async fn preserved_join_all_success_has_flag() {
+        let run = |depth| {
+            depth_run(depth, |ctx, op_id| async move {
+                let outcomes = JoinAllExecution {
+                    ctx,
+                    op_id,
+                    name: None,
+                    futures: vec![ready(1), failing_input::<i32>()],
+                }
+                .execute()
+                .await
+                .unwrap();
+                assert_eq!(outcomes.len(), 2);
+            })
+        };
+        let plain = succeed_update(&*run(0).await);
+        let update = succeed_update(&*run(1).await);
+        assert_eq!(replay_children_of(&plain), None);
+        assert_eq!(replay_children_of(&update), Some(true));
+        assert_eq!(update.payload(), plain.payload());
+    }
+
+    #[tokio::test]
+    async fn preserved_race_success_has_no_flag() {
+        let client = depth_run(1, |ctx, op_id| async move {
+            let value = RaceExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![never(), ready(20)],
+            }
+            .execute()
+            .await
+            .unwrap();
+            assert_eq!(value, 20);
+        })
+        .await;
+        let update = succeed_update(&client);
+        assert_eq!(update.payload(), Some("20"));
+        assert!(update.context_options().is_none());
+    }
+
+    #[tokio::test]
+    async fn preserved_select_ok_success_has_no_flag() {
+        let client = depth_run(1, |ctx, op_id| async move {
+            let value = SelectOkExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![never(), ready(20)],
+            }
+            .execute()
+            .await
+            .unwrap();
+            assert_eq!(value, 20);
+        })
+        .await;
+        let update = succeed_update(&client);
+        assert_eq!(update.payload(), Some("20"));
+        assert!(update.context_options().is_none());
+    }
+
+    #[tokio::test]
+    async fn preserved_try_join_all_failure_has_flag() {
+        let client = depth_run(1, |ctx, op_id| async move {
+            let result = TryJoinAllExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![failing_input::<i32>()],
+            }
+            .execute()
+            .await;
+            assert!(result.is_err());
+        })
+        .await;
+        let update = depth_update(&client, &aws_sdk_lambda::types::OperationAction::Fail);
+        assert_eq!(replay_children_of(&update), Some(true));
+    }
+
+    #[tokio::test]
+    async fn preserved_race_failure_has_flag() {
+        let client = depth_run(1, |ctx, op_id| async move {
+            let result = RaceExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![never(), failing_input::<i32>()],
+            }
+            .execute()
+            .await;
+            assert!(result.is_err());
+        })
+        .await;
+        let update = depth_update(&client, &aws_sdk_lambda::types::OperationAction::Fail);
+        assert_eq!(replay_children_of(&update), Some(true));
+    }
+
+    #[tokio::test]
+    async fn preserved_select_ok_failure_has_flag() {
+        let client = depth_run(1, |ctx, op_id| async move {
+            let result = SelectOkExecution {
+                ctx,
+                op_id,
+                name: None,
+                futures: vec![failing_input::<i32>(), failing_input::<i32>()],
+            }
+            .execute()
+            .await;
+            assert!(result.is_err());
+        })
+        .await;
+        let update = depth_update(&client, &aws_sdk_lambda::types::OperationAction::Fail);
+        assert_eq!(replay_children_of(&update), Some(true));
+    }
+
+    #[test]
+    fn combinator_replacement_fail_has_flag_within_depth() {
+        let wire = crate::error::WireError::default();
+        let (ctx, _client) = DurableContext::test_context_with_depth(1);
+        let update = build_combinator_fail_update(&ctx, "w", Some("g"), &wire);
+        assert_eq!(replay_children_of(&update), Some(true));
+        let (ctx, _client) = DurableContext::test_context_with_depth(0);
+        let update = build_combinator_fail_update(&ctx, "w", Some("g"), &wire);
+        assert!(update.context_options().is_none());
+    }
+
     /// A recording context whose log holds a SUCCEEDED combinator record
     /// at positional ID "1" with `ReplayChildren` and `payload`.
     fn replay_children_ctx(
@@ -4313,6 +4510,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "token-1".to_owned(),
             window,
+            0,
             Some(plugins),
         );
         (ctx, client)

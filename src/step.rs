@@ -1515,6 +1515,7 @@ mod tests {
             client.clone(),
             "token0".to_owned(),
             None,
+            0,
             None,
         );
         let op_id = ctx.mint_id();
@@ -1754,6 +1755,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
             window,
+            0,
             Some(hooks.plugins()),
         );
         (ctx, client)
@@ -1894,6 +1896,7 @@ mod tests {
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "token0".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         );
         (ctx, client)
@@ -3726,6 +3729,7 @@ mod coordinator_tests {
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         );
         let outcome = drive_handler(ctx, None, move |ctx| async move {
@@ -3801,6 +3805,7 @@ mod coordinator_tests {
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
             "t0".to_owned(),
             None,
+            0,
             Some(hooks.plugins()),
         );
         let outcome = drive_handler(ctx, None, move |ctx| async move {

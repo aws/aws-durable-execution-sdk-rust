@@ -101,6 +101,9 @@ pub struct Options {
     /// The plugin factories, in registration order, each with the type
     /// name it was registered under. Empty by default.
     pub(crate) plugins: PluginFactories,
+    /// How many levels of finished child contexts keep their children
+    /// visible to later invocations. 0 (the default) keeps none.
+    pub(crate) plugin_child_operations_depth: u32,
 }
 
 impl Default for Options {
@@ -122,6 +125,7 @@ impl Default for Options {
             checkpoint_delay: None,
             checkpoint_batching: true,
             plugins: Vec::new(),
+            plugin_child_operations_depth: 0,
         }
     }
 }
@@ -153,6 +157,10 @@ impl std::fmt::Debug for Options {
             .field("checkpoint_delay", &self.checkpoint_delay)
             .field("checkpoint_batching", &self.checkpoint_batching)
             .field("plugins", &self.plugins.len())
+            .field(
+                "plugin_child_operations_depth",
+                &self.plugin_child_operations_depth,
+            )
             .finish()
     }
 }
@@ -199,6 +207,7 @@ pub struct OptionsBuilder {
     checkpoint_delay: Option<Duration>,
     checkpoint_batching: Option<bool>,
     plugins: PluginFactories,
+    plugin_child_operations_depth: u32,
 }
 
 // Written by hand: `Arc<dyn ExecutionClient>` and `Arc<dyn PluginFactory>`
@@ -215,6 +224,10 @@ impl std::fmt::Debug for OptionsBuilder {
             .field("checkpoint_delay", &self.checkpoint_delay)
             .field("checkpoint_batching", &self.checkpoint_batching)
             .field("plugins", &self.plugins.len())
+            .field(
+                "plugin_child_operations_depth",
+                &self.plugin_child_operations_depth,
+            )
             .finish()
     }
 }
@@ -490,6 +503,59 @@ impl OptionsBuilder {
         self
     }
 
+    /// Keeps the children of finished child contexts visible to plugins
+    /// in later invocations, up to `depth` levels. The default is 0.
+    ///
+    /// When a child context, a `map` or a `parallel` finishes, the service
+    /// stops sending its child operations to later invocations, so
+    /// [`InvocationInfo::operations`](crate::plugin::InvocationInfo::operations)
+    /// holds only the operations above it. Within the depth, the context's
+    /// terminal record carries `ReplayChildren`, and the service keeps
+    /// sending its children.
+    ///
+    /// The depth counts context levels below the root. `1` keeps the
+    /// children of top-level contexts: the operations of a top-level child
+    /// context, and the items and branches of a top-level `map` or
+    /// `parallel`. `2` also keeps their children, such as the operations
+    /// inside each item. `u32::MAX` keeps the whole tree, and `0` changes
+    /// no record. A map item or parallel branch with
+    /// [`NestingMode::Flat`](crate::builders::map_parallel::NestingMode::Flat) adds no level. The
+    /// setting covers succeeded and failed contexts alike, and it also
+    /// flags the record of a `wait_for_callback`, the success of a
+    /// `try_join_all` or `join_all`, and every combinator failure. It
+    /// applies whether or not a plugin is registered.
+    ///
+    /// The cost is that a preserved context runs again on every later
+    /// replay:
+    ///
+    /// - A preserved child context, map item or parallel branch re-runs
+    ///   its body on each later replay, and its children return recorded
+    ///   results.
+    /// - A preserved `map` or `parallel` re-runs its items on each later
+    ///   replay, and their children return recorded results.
+    /// - A preserved `wait_for_callback` re-runs its body the same way.
+    /// - A preserved `try_join_all` or `join_all` drives its inputs again
+    ///   on each later replay, and each input replays its own record.
+    ///
+    /// A record whose result is above the size limit does not change: it
+    /// already carries `ReplayChildren`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::Options;
+    ///
+    /// let opts = Options::builder()
+    ///     .plugin_child_operations_depth(1)
+    ///     .build()
+    ///     .expect("valid config");
+    /// # drop(opts);
+    /// ```
+    pub fn plugin_child_operations_depth(mut self, depth: u32) -> Self {
+        self.plugin_child_operations_depth = depth;
+        self
+    }
+
     /// Builds the [`Options`] from the configured values.
     ///
     /// # Errors
@@ -545,6 +611,7 @@ impl OptionsBuilder {
             checkpoint_delay: self.checkpoint_delay,
             checkpoint_batching: self.checkpoint_batching.unwrap_or(true),
             plugins: self.plugins,
+            plugin_child_operations_depth: self.plugin_child_operations_depth,
         })
     }
 }
@@ -589,6 +656,26 @@ mod tests {
             .region(aws_sdk_lambda::config::Region::new("us-east-1"))
             .build();
         aws_sdk_lambda::Client::from_conf(conf)
+    }
+
+    #[test]
+    fn plugin_child_operations_depth_defaults_to_zero() {
+        assert_eq!(Options::default().plugin_child_operations_depth, 0);
+        let built = Options::builder().build().expect("valid config");
+        assert_eq!(built.plugin_child_operations_depth, 0);
+        let builder = Options::builder().plugin_child_operations_depth(3);
+        let builder_debug = format!("{builder:?}");
+        let options = builder.build().expect("valid config");
+        assert_eq!(options.plugin_child_operations_depth, 3);
+        assert!(
+            builder_debug.contains("plugin_child_operations_depth: 3"),
+            "{builder_debug}"
+        );
+        let options_debug = format!("{options:?}");
+        assert!(
+            options_debug.contains("plugin_child_operations_depth: 3"),
+            "{options_debug}"
+        );
     }
 
     #[test]

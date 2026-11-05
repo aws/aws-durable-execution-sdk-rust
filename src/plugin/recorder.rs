@@ -93,6 +93,7 @@ pub(crate) fn context_over(
         client,
         "token0".to_owned(),
         None,
+        0,
         Some(hooks.plugins()),
     )
 }
