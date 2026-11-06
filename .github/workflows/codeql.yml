@@ -16,9 +16,23 @@ permissions:
 jobs:
   analyze:
     name: Analyze Rust
-    runs-on: ubuntu-latest
+    # Same routing as ci.yml: pushes, the weekly schedule and
+    # same-repository pull requests run on the CodeBuild-hosted runner (the
+    # CodeBuild project github-actions-runner, 60-minute build limit; the
+    # label must match the project name). Fork and Dependabot pull requests
+    # run on ubuntu-latest, so a dependency update's build scripts and
+    # procedural macros do not run in the CodeBuild account before a
+    # maintainer reviews them. This is routing, not a trust boundary: for
+    # forks, the boundary is the repository's approval setting for fork
+    # pull request workflows.
+    runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    # Below the 60-minute build limit, so GitHub ends a stuck job and
+    # reports it, rather than CodeBuild stopping the runner.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
