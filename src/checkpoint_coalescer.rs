@@ -11,7 +11,7 @@
 //! write immediately, and batching emerges from accumulation while an
 //! earlier write is in flight. This module owns the buffer, the batch
 //! handshake, the single-writer lock, and the size-capped batch splitting;
-//! the actual API call stays in `DurableContext::checkpoint_updates_direct`,
+//! the actual API call stays in `DurableContext::write_batched_updates`,
 //! which the flusher invokes with the drained buffer.
 //!
 //! # Invariants
@@ -28,20 +28,23 @@
 //! - A batch is flushed by whoever gets to it first: a contributor whose
 //!   delay window elapsed, an urgent contributor (callback creation), or an
 //!   unconditional flush point (suspension / end of invocation). The
-//!   [`CheckpointCoalescer::take_batch`] pointer check makes a stale flusher
+//!   [`CheckpointCoalescer::take_batch_unheld`] pointer check makes a stale flusher
 //!   a no-op instead of letting it steal a newer batch.
 //! - A sealed batch is split into one or more requests by
 //!   [`split_into_requests`], each within [`BatchLimits`] (operation count
 //!   and estimated payload bytes), preserving join order across the splits.
-//! - Once any buffered write fails, the **failure latch** is set (under
-//!   the writer lock, by the failing flusher) and no buffered write
-//!   reaches the backend again for the rest of the invocation: every
-//!   flusher, spawned or flush-point, checks the latch under the writer
-//!   lock before writing, and on a hit publishes the latched error to its
-//!   contributors and retains its updates as unwritten (issue #43,
-//!   "retryable exhaustion fails the invocation with no further writes").
-//!   The terminal `FAIL` writes of the non-retryable classification are
-//!   unaffected: they go through the direct (uncoalesced) path.
+//! - Once any checkpoint write fails, the SDK sends nothing more this
+//!   invocation (see `InvocationCoordinator::fail_write`). The failure
+//!   drops the open batch unpublished with its permits, as a withdrawal
+//!   does, a later join is rejected, and a flusher that already claimed a
+//!   batch sends nothing when it reaches the checkpoint-token lock and
+//!   publishes nothing. So the contributors of a failed or dropped batch
+//!   never resolve. Every step that adds to the buffer or claims a batch
+//!   for a caller-visible result reads the failure under the buffer lock,
+//!   and the failure sets it before it drops the open batch under that
+//!   lock, so each step happens wholly before or wholly after the failure
+//!   (see [`CheckpointCoalescer::join_owned`] and
+//!   [`CheckpointCoalescer::claim_unspawned`]).
 //! - When a checkpoint response has no token, the SDK sends nothing more
 //!   this invocation (see `InvocationCoordinator::withdraw`). The
 //!   withdrawal drops the open batch unpublished with its permits (see
@@ -57,7 +60,7 @@
 //!   chunk's events immediately after the chunk's write succeeds. Telemetry
 //!   for a persisted transition therefore cannot be lost to a dropped
 //!   contributor, and a chunk persisted before a later chunk fails still
-//!   emits its events even though the batch as a whole publishes the error.
+//!   emits its events even though the batch as a whole publishes nothing.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -384,36 +387,6 @@ struct CoalescerState {
     permits: Vec<Permit>,
     /// The batch the pending updates belong to, if one is open.
     batch: Option<Arc<CheckpointBatch>>,
-    /// Write failures observed by flushers, retained for the
-    /// end-of-invocation flush point (issue #43).
-    ///
-    /// A spawned batch flush publishes its error only to the batch's
-    /// contributors, and every contributor may already be dropped (a
-    /// lost `race`/`select_ok` branch, a dropped `DurableFuture`). Without
-    /// this retention such a failure would be fully discarded, leaving
-    /// the affected operations' records claiming less than what executed.
-    /// The flush point drains these via
-    /// [`CheckpointCoalescer::take_failed_flushes`] and applies the #43
-    /// classification (retryable fails the invocation; non-retryable
-    /// persists terminal `FAIL` records, then fails the execution).
-    failed: Vec<FailedFlush>,
-    /// The FIRST write failure this invocation's buffered channel
-    /// suffered: the failure latch (issue #43).
-    ///
-    /// Once set, no buffered write may reach the backend again this
-    /// invocation: "retryable exhaustion fails the invocation with no
-    /// further writes", and a write queued behind the failure would
-    /// otherwise persist replay-visible transitions after the invocation
-    /// is already doomed. Every flusher checks the latch under the
-    /// [`CheckpointCoalescer::writer_lock`] before writing (the latch is
-    /// always set by the failing flusher while it still holds that lock,
-    /// so a queued flusher cannot race past it); on a hit it publishes
-    /// the latched error to its contributors and retains its updates as
-    /// unwritten instead of calling the backend. Deliberately sticky:
-    /// [`CheckpointCoalescer::take_failed_flushes`] drains the retained
-    /// failures but never clears the latch: the coalescer lives for one
-    /// invocation, and its write channel does not come back within it.
-    latched: Option<ExecutionClientError>,
     /// The reservations that hold the open batch (see
     /// [`CheckpointCoalescer::join_owned`] with `reserve`). A held batch is
     /// not claimed for a flush.
@@ -439,31 +412,16 @@ impl BatchPermits {
     }
 }
 
-/// One checkpoint write failure retained by the coalescer: the error plus
-/// the updates the write did not persist (issue #43).
-#[derive(Debug)]
-pub(crate) struct FailedFlush {
-    /// The client error the write failed with.
-    pub(crate) error: ExecutionClientError,
-    /// The updates that were NOT persisted by the failed write: the
-    /// rejected chunk and everything after it, never a chunk that already
-    /// succeeded (a terminal `FAIL` must not be written over a persisted
-    /// outcome).
-    pub(crate) unwritten: Vec<OperationUpdate>,
-}
-
 /// The rendezvous for one coalesced checkpoint call: contributors await its
 /// published result, and exactly one flusher publishes it.
 #[derive(Debug, Default)]
 pub(crate) struct CheckpointBatch {
     notify: Notify,
     result: Mutex<Option<Result<CheckpointOutput, ExecutionClientError>>>,
-    /// The wire IDs whose classification a failed write of this batch
-    /// records. A refresh joins with its first due registration's wire ID,
-    /// because the driver can drop the refresh's caller before the batch
-    /// is written. The publisher records the failure for each ID, so the
-    /// failure decides the invocation's outcome with or without a reader.
-    failure_owners: Mutex<Vec<String>>,
+    /// The wire ID of the first refresh that joined the batch: a refresh
+    /// sends no update, so a failure of a request with no update is
+    /// recorded for it (see [`CheckpointCoalescer::join_owned`]).
+    refresh_id: Mutex<Option<String>>,
 }
 
 impl CheckpointBatch {
@@ -482,15 +440,13 @@ impl CheckpointBatch {
         self.notify.notify_waiters();
     }
 
-    /// Takes the wire IDs whose classification a failed write of this
-    /// batch records (see [`CheckpointCoalescer::join_owned`]).
-    pub(crate) fn take_failure_owners(&self) -> Vec<String> {
-        std::mem::take(
-            &mut *self
-                .failure_owners
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        )
+    /// The wire ID of the first refresh that joined the batch (see
+    /// [`CheckpointCoalescer::join_owned`]).
+    pub(crate) fn refresh_id(&self) -> Option<String> {
+        self.refresh_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Returns a future that resolves when the batch result is published.
@@ -538,7 +494,7 @@ impl CheckpointCoalescer {
         &self.writer
     }
 
-    /// [`Self::join_owned`] without a failure owner. Tests use it.
+    /// [`Self::join_owned`] without a refresh. Tests use it.
     #[cfg(test)]
     pub(crate) fn join(
         &self,
@@ -566,10 +522,10 @@ impl CheckpointCoalescer {
     /// buffered before its owner is abandoned, and written before any update
     /// buffered later, or it is rejected.
     ///
-    /// With `failure_owner` set, the join adds it to the batch's failure
-    /// owners under the buffer lock. A batch is claimed under the same
-    /// lock, so the owner is in place before the batch can be written and
-    /// its result published.
+    /// A refresh joins with `refresh_id`, the wire ID of its first due
+    /// registration, and the batch keeps the first one under the buffer
+    /// lock. A batch is claimed under the same lock, so the ID is in place
+    /// before the batch can be written.
     ///
     /// With `reserve`, the join also holds the batch: no flusher claims it
     /// until [`Self::release_hold`] is called once for this join.
@@ -579,9 +535,13 @@ impl CheckpointCoalescer {
         coordinator: &Arc<InvocationCoordinator>,
         owners: &[String],
         updates: Vec<TrackedUpdate>,
-        failure_owner: Option<&str>,
+        refresh_id: Option<&str>,
         reserve: bool,
     ) -> Option<(Arc<CheckpointBatch>, bool)> {
+        #[cfg(test)]
+        crate::coordinator::race_points::reach(
+            crate::coordinator::race_points::RacePoint::BufferLock,
+        );
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if !admission.admits(owners) {
             return None;
@@ -594,12 +554,12 @@ impl CheckpointCoalescer {
         }
         let opened = state.batch.is_none();
         let batch = Arc::clone(state.batch.get_or_insert_with(Arc::default));
-        if let Some(owner) = failure_owner {
+        if let Some(refresh_id) = refresh_id {
             batch
-                .failure_owners
+                .refresh_id
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(owner.to_owned());
+                .get_or_insert_with(|| refresh_id.to_owned());
         }
         Some((batch, opened))
     }
@@ -647,7 +607,30 @@ impl CheckpointCoalescer {
         self.when_unheld(|state| take_target(state, target)).await
     }
 
-    /// [`Self::take_batch_unheld`] without the wait for holds. Tests use it.
+    /// [`Self::take_batch_unheld`] without the wait for holds, for a
+    /// flusher that cannot be spawned. Returns `None` when another flusher
+    /// already claimed `target`, or when a checkpoint write failed.
+    ///
+    /// The write-failure latch is read under the buffer lock. A failed
+    /// write sets the latch before it drops the open batch under the same
+    /// lock (see `InvocationCoordinator::fail_write`). So either the
+    /// failure comes first, this claims nothing, and the batch's
+    /// contributors never resolve, or this claim comes first and the
+    /// failure finds no batch.
+    pub(crate) fn claim_unspawned(
+        &self,
+        target: &Arc<CheckpointBatch>,
+        coordinator: &InvocationCoordinator,
+    ) -> Option<(Vec<TrackedUpdate>, BatchPermits)> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if coordinator.write_failed() {
+            return None;
+        }
+        take_target(&mut state, target)
+    }
+
+    /// [`Self::take_batch_unheld`] without the wait for holds. Tests use
+    /// it.
     #[cfg(test)]
     pub(crate) fn take_batch(
         &self,
@@ -677,8 +660,9 @@ impl CheckpointCoalescer {
     }
 
     /// Drops the open batch without publishing it, with its updates and
-    /// its permits. The withdrawal of the checkpoint token calls it (see
-    /// `InvocationCoordinator::withdraw`), so the batch's contributors
+    /// its permits. The withdrawal of the checkpoint token and a failed
+    /// write call it (see `InvocationCoordinator::withdraw` and
+    /// `InvocationCoordinator::fail_write`), so the batch's contributors
     /// never resolve. A hold on the batch stays counted until its
     /// reservation is released, as every reservation is when it drops; a
     /// flusher waiting for the holds then finds no batch. Returns the
@@ -692,31 +676,11 @@ impl CheckpointCoalescer {
         }
     }
 
-    /// Retains a checkpoint write failure for the end-of-invocation flush
-    /// point (issue #43): `unwritten` are the updates the failed write did
-    /// not persist. Also latches the failure (first error wins) so no
-    /// later buffered write reaches the backend this invocation: see
-    /// [`CoalescerState::latched`].
-    pub(crate) fn record_failed_flush(
-        &self,
-        error: ExecutionClientError,
-        unwritten: Vec<OperationUpdate>,
-    ) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.latched.is_none() {
-            state.latched = Some(error.clone());
-        }
-        state.failed.push(FailedFlush { error, unwritten });
-    }
-
-    /// The first write failure this invocation's buffered channel
-    /// suffered, if any: the failure latch (issue #43). A flusher that
-    /// observes it (under the writer lock) must not call the backend: it
-    /// publishes this error to its contributors and retains its updates
-    /// via [`Self::record_failed_flush`] instead.
-    pub(crate) fn latched_failure(&self) -> Option<ExecutionClientError> {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.latched.clone()
+    /// Holds the buffer lock until the returned guard drops. Tests use it
+    /// to order a join against a failed write.
+    #[cfg(test)]
+    pub(crate) fn hold_buffer_lock(&self) -> impl Sized + '_ {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The number of buffered updates. Tests use it to wait until an
@@ -740,15 +704,6 @@ impl CheckpointCoalescer {
             .iter()
             .map(|tracked| tracked.update.id().to_owned())
             .collect()
-    }
-
-    /// Drains the retained write failures, in occurrence order. The
-    /// failure latch is deliberately NOT cleared (see
-    /// [`CoalescerState::latched`]): the write channel stays poisoned for
-    /// the rest of the invocation.
-    pub(crate) fn take_failed_flushes(&self) -> Vec<FailedFlush> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        std::mem::take(&mut state.failed)
     }
 }
 
@@ -1186,43 +1141,25 @@ mod tests {
         );
     }
 
-    /// The failure latch (issue #43): the FIRST recorded failure latches
-    /// and stays latched: later failures do not replace it, and draining
-    /// the retained failures does not clear it, because the buffered
-    /// write channel does not come back within an invocation.
+    /// A batch keeps the wire ID of the first refresh that joined it, and
+    /// a join without a refresh leaves it in place.
     #[test]
-    fn failure_latch_is_first_error_and_sticky() {
+    fn batch_keeps_the_first_refresh_id() {
+        let coordinator = InvocationCoordinator::new();
         let coalescer = CheckpointCoalescer::new(Duration::ZERO);
-        assert!(
-            coalescer.latched_failure().is_none(),
-            "no latch before any failure"
-        );
-
-        coalescer.record_failed_flush(
-            ExecutionClientError::from_retryable("first failure".to_owned()),
-            vec![dummy_update("a")],
-        );
-        coalescer.record_failed_flush(
-            ExecutionClientError::new_non_retryable("second failure"),
-            vec![dummy_update("b")],
-        );
-
-        let latched = coalescer.latched_failure().expect("latch is set");
-        assert!(
-            latched.to_string().contains("first failure"),
-            "the first failure wins the latch: {latched}"
-        );
-
-        let drained = coalescer.take_failed_flushes();
-        assert_eq!(drained.len(), 2, "both failures retained in order");
-        assert!(
-            coalescer.take_failed_flushes().is_empty(),
-            "retained failures drain once"
-        );
-        assert!(
-            coalescer.latched_failure().is_some(),
-            "the latch survives the drain — the channel stays poisoned"
-        );
+        let admission = Admission::new();
+        let join = |refresh_id: Option<&str>| {
+            coalescer
+                .join_owned(&admission, &coordinator, &[], Vec::new(), refresh_id, false)
+                .expect("admitted")
+                .0
+        };
+        let batch = join(None);
+        assert_eq!(batch.refresh_id(), None);
+        join(Some("first"));
+        join(Some("second"));
+        join(None);
+        assert_eq!(batch.refresh_id().as_deref(), Some("first"));
     }
 
     #[test]

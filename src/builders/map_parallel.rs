@@ -320,10 +320,12 @@ where
     /// # Errors
     ///
     /// Returns an error if the batch execution encounters an infrastructure
-    /// failure (checkpoint client error, task-ownership violation) or an
-    /// invalid completion configuration, such as a failure percentage outside
+    /// failure (a task-ownership violation) or an invalid completion
+    /// configuration, such as a failure percentage outside
     /// `0.0..=100.0`. `max_concurrency(0)` returns no error: it fails the
-    /// execution, and the handler cannot catch it. Item-level failures are
+    /// execution, and the handler cannot catch it. A failed checkpoint
+    /// write returns no error either: it ends the invocation, and the batch
+    /// does not resolve. Item-level failures are
     /// NOT errors: they appear as
     /// `BatchItemStatus::Failed` entries in the result, and the batch's
     /// [`CompletionReason`] records why the batch ended.
@@ -884,10 +886,12 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// # Errors
     ///
     /// Returns an error if the batch execution encounters an infrastructure
-    /// failure (checkpoint client error, task-ownership violation) or an
-    /// invalid completion configuration, such as a failure percentage outside
+    /// failure (a task-ownership violation) or an invalid completion
+    /// configuration, such as a failure percentage outside
     /// `0.0..=100.0`. `max_concurrency(0)` returns no error: it fails the
-    /// execution, and the handler cannot catch it. Branch-level failures are
+    /// execution, and the handler cannot catch it. A failed checkpoint
+    /// write returns no error either: it ends the invocation, and the batch
+    /// does not resolve. Branch-level failures are
     /// NOT errors: they appear as
     /// `BatchItemStatus::Failed` entries in the result, and the batch's
     /// [`CompletionReason`] records why the batch ended.

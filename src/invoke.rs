@@ -111,14 +111,7 @@ where
             x_amzn_trace_id.as_deref(),
         );
         if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-            // Audit (#43): chained-invoke START: no user code ran (the
-            // input was serialized, but nothing external happened), so
-            // there is no side effect needing a recorded outcome. No
-            // terminal FAIL: re-invocation reconverges on the same write.
-            return self
-                .ctx
-                .checkpoint_failure_unrecoverable(&wire_id, err, None)
-                .await;
+            return self.ctx.checkpoint_failure_unrecoverable(err).await;
         }
 
         if let Some(plugins) = self.ctx.plugins() {

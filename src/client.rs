@@ -126,7 +126,7 @@ impl ExecutionClientError {
 
     /// Whether this error fails only the invocation: `true` exactly for
     /// [`ExecutionClientErrorScope::Invocation`]. `false` means a permanent
-    /// rejection: the terminal-`FAIL`-then-fail-the-execution path.
+    /// rejection, which fails the execution.
     pub(crate) fn is_retryable(&self) -> bool {
         self.scope == ExecutionClientErrorScope::Invocation
     }
@@ -312,12 +312,12 @@ impl GetStateOutput {
 ///    - [`Invocation`](ExecutionClientErrorScope::Invocation) fails the
 ///      invocation; the service re-invokes and replay resumes.
 ///    - [`Execution`](ExecutionClientErrorScope::Execution) from
-///      `checkpoint` records a terminal `FAIL` for the operation and fails
-///      the execution. The operation's terminal `FAIL` has `ErrorType`
-///      `CheckpointFailedError`, the record that replay reads if the
-///      invocation runs again. The execution's `FAILED` record has
-///      `ErrorType` `CheckpointUnrecoverableExecutionError` and
-///      `ErrorMessage` `[Unrecoverable Execution] Checkpoint failed: {m}`.
+///      `checkpoint` fails the execution. The SDK sends no further
+///      checkpoint in the invocation and writes no further update for the
+///      operation, so its record stays at the last update the service
+///      accepted. The execution's `FAILED` record has `ErrorType`
+///      `CheckpointUnrecoverableExecutionError` and `ErrorMessage`
+///      `[Unrecoverable Execution] Checkpoint failed: {m}`.
 ///      `{m}` is the AWS error's message when the Lambda transport supplied
 ///      one, and the error's own message otherwise.
 ///    - `Execution` from the bootstrap `get_state` returns a `FAILED`
@@ -585,8 +585,7 @@ const STALE_TOKEN_MESSAGE_PREFIX: &str = "Invalid checkpoint token";
 /// - **Non-retryable**: the service permanently rejected this write (for
 ///   example an oversized payload, a KMS misconfiguration, or any other
 ///   4xx except 429). Re-invoking re-runs the body and hits
-///   the same rejection, so the caller persists a small terminal `FAIL`
-///   for the operation and fails the execution instead.
+///   the same rejection, so the SDK fails the execution instead.
 ///
 /// After the modeled variants, the classifier reads the HTTP status of the
 /// raw response, as JS reads `$metadata.httpStatusCode`. A status from 400
@@ -1735,8 +1734,8 @@ mod tests {
     /// A checkpoint call whose final outcome is a modeled parameter
     /// rejection, a deterministic client fault the SDK does not retry,
     /// classifies NON-retryable: re-invoking replays into the same
-    /// rejection, so the recovery is a terminal `FAIL` write followed by
-    /// failing the execution, not another lap.
+    /// rejection, so the recovery is failing the execution, not another
+    /// lap.
     #[tokio::test]
     async fn checkpoint_final_error_maps_to_non_retryable_client_error() {
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution).then_error(|| {
@@ -3148,8 +3147,7 @@ mod tests {
                 file: "src/types/_operation_action.rs",
                 enum_name: "OperationAction",
                 variants: &["Cancel", "Fail", "Retry", "Start", "Succeed", "Unknown"],
-                wildcard_sites: "terminalize_unwritten_outcomes (src/context.rs); \
-                                 PendingTransitionEvent::emit (src/tracing_layer.rs); \
+                wildcard_sites: "PendingTransitionEvent::emit (src/tracing_layer.rs); \
                                  BackendState::apply_update (src/test_util.rs); \
                                  child_starts_before_first_terminal \
                                  (src/map_parallel.rs tests)",

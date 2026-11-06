@@ -120,15 +120,7 @@ impl WaitExecution {
 
         // 3. Live path: await the WaitStarted response, then suspend.
         if let Err(err) = start.await {
-            // Audit (#43): wait START: no user code ran, so there is no
-            // side effect needing a recorded outcome. No terminal FAIL:
-            // the invocation dies, the service re-invokes, and replay
-            // reaches this point and attempts the same write, losing only
-            // one invocation.
-            return self
-                .ctx
-                .checkpoint_failure_unrecoverable(&wire_id, err, None)
-                .await;
+            return self.ctx.checkpoint_failure_unrecoverable(err).await;
         }
 
         self.started(&wire_id, |info| {

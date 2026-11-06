@@ -1506,46 +1506,20 @@ where
     // BEFORE the envelope reports the invocation's state to the
     // service, so buffering can never hold a checkpoint past the
     // end of the invocation. A no-op without configured buffering.
-    //
-    // Checkpoint-failure interplay (issue #43): a `Fault` outcome
-    // skips the flush of pending writes: the write channel
-    // already failed retryably; a follow-up write would fail the
-    // same way, and the contract is "fails the invocation with no
-    // further writes". But failures already RETAINED by detached
-    // batch flushes (every contributor dropped: a lost
-    // `race`/`select_ok` branch) are still drained: a retained
-    // NON-retryable failure is deterministic, so dropping it here
-    // would leave its operations `Started` and re-executing on
-    // every future invocation, exactly the loop the flush point
-    // exists to end. Such a failure routes through the same
-    // terminalize-then-fail-the-execution path as a non-retryable
-    // flush failure; retryable-only retained failures are dropped
-    // with the invocation (the service re-invokes and the affected
-    // operations re-run under the interruption contract). Every
-    // other outcome flushes, and a flush failure routes through
-    // the same classification as any other checkpoint write
-    // failure (see `flush_failure_response`): retryable fails the
-    // invocation, non-retryable persists terminal `FAIL` records
-    // for the affected operations and fails the execution.
-    if matches!(outcome, driver::InvocationOutcome::Fault { .. }) {
-        // No flush of pending writes on a failed channel, but
-        // classify retained failures (see above).
-        if let Some(retained) = flush_ctx.take_retained_flush_failures().await
-            && retained.any_non_retryable()
-        {
-            let (response, end) = flush_failure_response(&retained, outcome, flush_ctx).await;
-            let (response, end) = driver::withdrawal_answer(flush_ctx, response, end);
-            let late =
-                end_invocation(plugins, end_log, flush_ctx, end, Some(&response), fatal_won).await;
-            return Finished::Respond(response, late);
-        }
-    } else if let Err(flush) = flush_ctx.flush_pending_checkpoints().await {
-        let (response, end) = flush_failure_response(&flush, outcome, flush_ctx).await;
-        let (response, end) = driver::withdrawal_answer(flush_ctx, response, end);
-        let late =
-            end_invocation(plugins, end_log, flush_ctx, end, Some(&response), fatal_won).await;
-        return Finished::Respond(response, late);
+    // A `Fault` outcome skips the flush: the invocation fails, and the
+    // service invokes the function again. After a failed write the flush
+    // sends nothing (see `DurableContext::flush_pending_checkpoints`).
+    if !matches!(outcome, driver::InvocationOutcome::Fault { .. }) {
+        flush_ctx.flush_pending_checkpoints().await;
     }
+    // A checkpoint write that failed after the arbitration, in the flush,
+    // decides the outcome over the handler's result, as one recorded
+    // during the drive does. A fatal error that other code recorded after
+    // the arbitration does not.
+    let outcome = match flush_ctx.coordinator().write_failure() {
+        Some(failure) if !fatal_won => failure.into_outcome(),
+        _ => outcome,
+    };
 
     // Convert outcome to the durable response envelope.
     //
@@ -1775,66 +1749,6 @@ fn create_invocation_plugins(
             lambda_ctx.xray_trace_id.clone(),
         )
     })
-}
-
-/// Applies the issue #43 checkpoint-failure classification to a failed
-/// end-of-invocation flush of buffered checkpoints, or, on the `Fault`
-/// path, to failures retained by detached batch flushes (nothing is
-/// flushed there; see the flush point in [`wrap`]).
-///
-/// - **Retryable** (every failure transient): the invocation fails with no
-///   further writes: the channel is down, and the service re-invokes,
-///   which is the same recovery as an interruption. This applies whatever
-///   the driver outcome was: reporting SUCCEEDED or PENDING would claim
-///   records the service never received, and the re-invocation converges
-///   (dropped contributors' operations re-run under the documented
-///   `AtLeastOncePerRetry` interruption contract).
-/// - **Non-retryable** (any failure permanent): re-invoking would replay
-///   into the same deterministic rejection, an infinite loop. Instead, a
-///   small terminal `FAIL` is persisted for every operation whose buffered
-///   outcome was lost (see
-///   [`DurableContext::terminalize_unwritten_outcomes`]), and the
-///   execution fails. A handler outcome of SUCCEEDED or PENDING is
-///   overridden, completing while an operation record claims less than
-///   what executed would violate the #43 invariant, and a `Fault`
-///   outcome (the retained-failure drain path) likewise becomes an
-///   execution failure carrying the retained error, while a handler that
-///   already FAILED keeps its own error as the execution result (the
-///   execution dies either way, and the handler's failure is the more
-///   meaningful root cause).
-async fn flush_failure_response(
-    flush: &context::FlushFailure,
-    outcome: driver::InvocationOutcome,
-    ctx: &DurableContext,
-) -> (
-    Result<InvocationResponse, lambda_runtime::Error>,
-    InvocationEnd,
-) {
-    let error = flush.primary_error();
-    if !flush.any_non_retryable() {
-        let message = format!("failed to flush coalesced checkpoints at invocation end: {error}");
-        return (
-            Err(lambda_runtime::Error::from(message.clone())),
-            InvocationEnd::retrying(error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE, message),
-        );
-    }
-
-    tracing::error!(
-        error = %error,
-        "non-retryable failure flushing coalesced checkpoints; recording terminal \
-         FAILs for the affected operations and failing the execution"
-    );
-    // After a withdrawn checkpoint token this sends nothing, and the
-    // invocation answers `PENDING` (see `driver::withdrawal_answer`).
-    ctx.terminalize_unwritten_outcomes(flush).await;
-
-    let failed = match outcome {
-        driver::InvocationOutcome::Failed { .. } => outcome,
-        _ => driver::InvocationOutcome::Failed {
-            error: error::checkpoint_execution_failure_wire(error),
-        },
-    };
-    outcome_envelope(failed, ctx)
 }
 
 /// Converts the driver's invocation outcome into the durable response
@@ -3647,13 +3561,121 @@ mod tests {
         assert_eq!(one, three);
     }
 
-    fn flush_failure(scope: ExecutionClientErrorScope) -> context::FlushFailure {
-        context::FlushFailure {
-            failures: vec![checkpoint_coalescer::FailedFlush {
-                error: ExecutionClientError::new(scope, "flush down"),
-                unwritten: Vec::new(),
-            }],
-        }
+    /// The string at `pointer` in `json`.
+    fn json_str<'a>(json: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
+        json.pointer(pointer).and_then(serde_json::Value::as_str)
+    }
+
+    /// Runs `root` through `finish_invocation` on a context whose
+    /// coalescer holds an unflushed step `SUCCEED`, over a client that
+    /// rejects the first request non-retryably. Returns the response, the
+    /// end hook's info and the updates the client received.
+    async fn finish_with_failing_flush<R>(
+        root: impl FnOnce(DurableContext) -> R,
+    ) -> (
+        serde_json::Value,
+        plugin::InvocationEndInfo,
+        Vec<aws_sdk_lambda::types::OperationUpdate>,
+    )
+    where
+        R: Future<Output = Result<String, WireError>> + Send + 'static,
+    {
+        let client = std::sync::Arc::new(client::InMemoryExecutionClient::new(Vec::new()));
+        client.enqueue_checkpoint_response(client::TestResponse::NonRetryableError(
+            "flush down".to_owned(),
+        ));
+        let hook = Hooks::default();
+        let plugins = hooks::plugins_of(hook.clone());
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            std::sync::Arc::new(engine::CheckpointLog::empty()),
+            std::sync::Arc::clone(&client) as std::sync::Arc<dyn ExecutionClient>,
+            "t0".to_owned(),
+            Some(Duration::from_secs(60)),
+            0,
+            None,
+        );
+        let update = aws_sdk_lambda::types::OperationUpdate::builder()
+            .id("s")
+            .name("s")
+            .r#type(aws_sdk_lambda::types::OperationType::Step)
+            .action(aws_sdk_lambda::types::OperationAction::Succeed)
+            .payload("1")
+            .build()
+            .expect("all required fields set");
+        ctx.buffer_unflushed(vec![update]);
+        let end_log = engine::CheckpointLog::empty();
+        let finished = finish_invocation(
+            root(ctx.clone()),
+            std::sync::Arc::clone(ctx.task_ownership()),
+            std::sync::Arc::clone(ctx.coordinator()),
+            &ctx,
+            None,
+            Some(&plugins),
+            &end_log,
+        )
+        .await;
+        let Finished::Respond(response, _late) = finished else {
+            unreachable!("the invocation answers");
+        };
+        let ends = hook.ends();
+        let [end] = ends.as_slice() else {
+            unreachable!("one end hook, got {}", ends.len());
+        };
+        (
+            response.expect("an envelope").0,
+            end.clone(),
+            client.recorded_updates(),
+        )
+    }
+
+    /// A batch that fails in the end-of-invocation flush with an
+    /// execution-scoped error, after the handler returned `Err("boom")`,
+    /// decides the outcome: `FAILED` with
+    /// `CheckpointUnrecoverableExecutionError`, the end hook receives it,
+    /// and no `FAIL` is sent.
+    #[tokio::test]
+    async fn flush_failure_decides_over_handler_error() {
+        let (json, end, updates) = finish_with_failing_flush(|_ctx| async {
+            Err(WireError::new(Some("Error"), Some("boom")))
+        })
+        .await;
+        assert_eq!(json_str(&json, "/Status"), Some("FAILED"), "{json}");
+        assert_eq!(
+            json_str(&json, "/Error/ErrorType"),
+            Some(error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+        assert_eq!(end.status(), InvocationStatus::Failed);
+        assert_eq!(
+            end.execution_error().and_then(WireError::error_type),
+            Some(error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+        assert_eq!(updates.len(), 1, "only the flushed SUCCEED: {updates:?}");
+        assert!(
+            updates
+                .iter()
+                .all(|u| u.action() != &aws_sdk_lambda::types::OperationAction::Fail),
+            "{updates:?}"
+        );
+    }
+
+    /// A fatal error that won the drive's arbitration keeps the outcome
+    /// when the end-of-invocation flush then fails.
+    #[tokio::test]
+    async fn flush_failure_after_a_winning_fatal_keeps_the_fatal() {
+        let (json, end, _updates) = finish_with_failing_flush(|ctx| async move {
+            ctx.coordinator()
+                .record_fatal("UsageError".to_owned(), "misuse".to_owned());
+            std::future::pending().await
+        })
+        .await;
+        assert_eq!(json_str(&json, "/Status"), Some("FAILED"), "{json}");
+        assert_eq!(json_str(&json, "/Error/ErrorType"), Some("UsageError"));
+        assert_eq!(
+            end.execution_error().and_then(WireError::error_type),
+            Some("UsageError")
+        );
     }
 
     /// A late panic fails only an invocation that returns a response and
@@ -3668,39 +3690,6 @@ mod tests {
         assert_eq!(late_panics(Some(&err), false), LatePanics::Discard);
         assert_eq!(late_panics(None, false), LatePanics::Discard);
         assert_eq!(late_panics(Some(&ok), true), LatePanics::Discard);
-    }
-
-    #[tokio::test]
-    async fn flush_failure_response_reports_retrying() {
-        let ctx = DurableContext::test_context();
-        let (response, end) = flush_failure_response(
-            &flush_failure(ExecutionClientErrorScope::Invocation),
-            driver::InvocationOutcome::Pending,
-            &ctx,
-        )
-        .await;
-        let text = response
-            .expect_err("a retryable flush failure fails the invocation")
-            .to_string();
-        assert_eq!(end.status, InvocationStatus::Retrying);
-        assert_eq!(end.result, None);
-        let error = end.error.expect("a Retrying end carries the fault");
-        assert_eq!(
-            error.error_type(),
-            Some(error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE)
-        );
-        assert_eq!(error.error_message(), Some(text.as_str()));
-        assert!(text.contains("flush down"), "{text}");
-
-        let (response, end) = flush_failure_response(
-            &flush_failure(ExecutionClientErrorScope::Execution),
-            driver::InvocationOutcome::Pending,
-            &ctx,
-        )
-        .await;
-        assert!(response.is_ok());
-        assert_eq!(end.status, InvocationStatus::Failed);
-        assert!(end.error.is_some());
     }
 
     /// Runs `future` on its own task and returns its panic payload.

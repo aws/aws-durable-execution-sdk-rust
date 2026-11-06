@@ -191,7 +191,8 @@ impl<O: serde::Serialize + serde::de::DeserializeOwned + Send + 'static> IntoFut
 /// levels report different failures:
 ///
 /// - The outer `Err` means the combinator itself failed, for example
-///   replay nondeterminism or a checkpoint write failure.
+///   replay nondeterminism. A failed checkpoint write never reaches it:
+///   the write fails the invocation, and the combinator does not resolve.
 /// - An input that returns `Err` appears only as that input's inner `Err`,
 ///   and the outer result is `Ok`.
 /// - A panicking input ends the invocation, as a panic does everywhere else

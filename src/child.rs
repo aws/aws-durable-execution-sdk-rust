@@ -655,25 +655,7 @@ where
                             &wire,
                         );
                         if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-                            // Audit (#43): child FAIL (serialization): the
-                            // closure ran, so the failed FAIL write routes
-                            // unrecoverable with a minimal terminal FAIL
-                            // retry.
-                            let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                            let terminal = build_child_fail_update(
-                                &wire_id,
-                                name.as_deref(),
-                                sub_type,
-                                &ctx,
-                                &cwire,
-                            );
-                            return ctx
-                                .checkpoint_failure_unrecoverable(
-                                    &wire_id,
-                                    client_err,
-                                    Some(terminal),
-                                )
-                                .await;
+                            return ctx.checkpoint_failure_unrecoverable(client_err).await;
                         }
                         child_failed(&ctx, &wire_id, sub_type, name.as_deref(), &wire);
                         return Err(op_err
@@ -711,16 +693,7 @@ where
                 // summary, or `""`, for a `ReplayChildren` result.
                 let result = update.payload().map(str::to_owned);
                 if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43): child-context SUCCEED: the closure
-                    // ran, so its side effects need a recorded outcome. A
-                    // permanent rejection persists a small terminal FAIL
-                    // before the execution fails.
-                    let cwire = crate::error::checkpoint_failure_wire(&err);
-                    let terminal =
-                        build_child_fail_update(&wire_id, name.as_deref(), sub_type, &ctx, &cwire);
-                    return ctx
-                        .checkpoint_failure_unrecoverable(&wire_id, err, Some(terminal))
-                        .await;
+                    return ctx.checkpoint_failure_unrecoverable(err).await;
                 }
                 if let Some(plugins) = ctx.plugins() {
                     let info = child_info(&ctx, &wire_id, sub_type, name.as_deref())
@@ -866,9 +839,10 @@ fn build_succeed_update(
         .expect("all required OperationUpdate fields set")
 }
 
-/// Checkpoints a live child failure (best-effort) and returns the graded
-/// `ChildContextError`: even when the FAIL checkpoint cannot be written,
-/// the child error is reported (the next invocation re-executes).
+/// Checkpoints a live child failure and returns the graded
+/// `ChildContextError`. When the `FAIL` write fails, the failure is
+/// recorded where its response arrives, and this never returns (see
+/// [`DurableContext::checkpoint_failure_unrecoverable`]).
 async fn checkpoint_live_failure(
     ctx: &DurableContext,
     name: Option<&str>,
@@ -885,18 +859,10 @@ async fn checkpoint_live_failure(
     let wire = wire.unwrap_or_else(|| child_err.failure_wire());
     let update = build_child_fail_update(wire_id, name, sub_type, ctx, &wire);
 
-    // A rejected FAIL write routes unrecoverable: discarding it would
-    // leave the record claiming less than what executed (#43).
+    // A rejected FAIL write fails the invocation, and the child writes
+    // nothing more.
     if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43): child-context FAIL: the closure ran and failed;
-        // the failed FAIL write routes unrecoverable with a minimal
-        // terminal FAIL retry (the original carried the child error's
-        // payload).
-        let cwire = crate::error::checkpoint_failure_wire(&client_err);
-        let terminal = build_child_fail_update(wire_id, name, sub_type, ctx, &cwire);
-        return ctx
-            .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
-            .await;
+        return ctx.checkpoint_failure_unrecoverable(client_err).await;
     }
     child_failed(ctx, wire_id, sub_type, name, &wire);
 
@@ -1847,12 +1813,12 @@ mod tests {
         client.recorded_updates()
     }
 
-    /// The terminal FAIL the SDK writes after the service rejects a write
-    /// carries the custom subtype: after a rejected SUCCEED, after a
-    /// rejected FAIL of a body failure, and after a rejected FAIL of a
-    /// serialization failure.
+    /// The write the service rejects carries the custom subtype, and no
+    /// terminal FAIL follows it: a rejected SUCCEED, a rejected FAIL of a
+    /// body failure, and a rejected FAIL of a serialization failure. The
+    /// child's record stays at its accepted START.
     #[tokio::test]
-    async fn custom_sub_type_on_terminal_fail_after_rejected_write() {
+    async fn custom_sub_type_on_rejected_write_and_no_terminal_fail() {
         // A rejected SUCCEED.
         let (ctx, client) = live_ctx();
         let child = ctx
@@ -1862,11 +1828,7 @@ mod tests {
         let updates = reject_second_write(ctx, &client, child).await;
         assert_eq!(
             checkout_actions(&updates, "c"),
-            [
-                OperationAction::Start,
-                OperationAction::Succeed,
-                OperationAction::Fail
-            ]
+            [OperationAction::Start, OperationAction::Succeed]
         );
 
         // A rejected FAIL of a body failure.
@@ -1878,11 +1840,7 @@ mod tests {
         let updates = reject_second_write(ctx, &client, child).await;
         assert_eq!(
             checkout_actions(&updates, "c"),
-            [
-                OperationAction::Start,
-                OperationAction::Fail,
-                OperationAction::Fail
-            ]
+            [OperationAction::Start, OperationAction::Fail]
         );
 
         // A rejected FAIL of a serialization failure.
@@ -1895,11 +1853,7 @@ mod tests {
         let updates = reject_second_write(ctx, &client, child).await;
         assert_eq!(
             checkout_actions(&updates, "c"),
-            [
-                OperationAction::Start,
-                OperationAction::Fail,
-                OperationAction::Fail
-            ]
+            [OperationAction::Start, OperationAction::Fail]
         );
     }
 

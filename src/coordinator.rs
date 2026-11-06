@@ -245,11 +245,10 @@ struct State {
     /// The withdrawal latch: set when a checkpoint response had no token
     /// (see [`InvocationCoordinator::withdraw`]). It is never cleared.
     withdrawn: bool,
-    /// The checkpoint failures that a live caller has yet to record, by
-    /// registration order (see [`InvocationCoordinator::displaced_candidate`]).
-    candidates: BTreeMap<u64, FatalError>,
-    /// The ID of the next entry of `candidates`.
-    next_candidate: u64,
+    /// The write-failure latch: the classification of the first failed
+    /// checkpoint write (see [`InvocationCoordinator::fail_write`]). It is
+    /// never cleared.
+    write_failure: Option<FatalError>,
     /// The wire ID of each registration [`InvocationCoordinator::wake_operations`]
     /// woke, in the order it woke them.
     #[cfg(test)]
@@ -324,29 +323,6 @@ pub(crate) struct InvocationCoordinator {
     clock: (Instant, SystemTime),
 }
 
-/// A checkpoint failure that a live caller has yet to record (see
-/// [`InvocationCoordinator::displaced_candidate`]). Dropping it before the
-/// withdrawal latch is set removes the failure.
-#[must_use = "dropping the candidate releases it"]
-pub(crate) struct DisplacedCandidate {
-    coordinator: Arc<InvocationCoordinator>,
-    id: u64,
-    consumed: bool,
-}
-
-impl DisplacedCandidate {
-    /// Removes the failure whatever the latch: the caller took it over.
-    pub(crate) fn consume(mut self) {
-        self.consumed = true;
-    }
-}
-
-impl Drop for DisplacedCandidate {
-    fn drop(&mut self) {
-        self.coordinator.release_candidate(self.id, self.consumed);
-    }
-}
-
 impl InvocationCoordinator {
     /// Creates a coordinator in the `Running` phase with no permit and no
     /// registration.
@@ -365,8 +341,7 @@ impl InvocationCoordinator {
                 driver: None,
                 deadline: None,
                 withdrawn: false,
-                candidates: BTreeMap::new(),
-                next_candidate: 0,
+                write_failure: None,
                 #[cfg(test)]
                 wake_log: Vec::new(),
             }),
@@ -397,7 +372,11 @@ impl InvocationCoordinator {
     }
 
     /// Takes a permit of `kind`. Returns `None` once the phase is not
-    /// `Running`, or once the withdrawal latch is set.
+    /// `Running`, or once the withdrawal latch is set. A checkpoint permit
+    /// is also refused once the write-failure latch is set (see
+    /// [`Self::fail_write`]): the coalescer takes it under its buffer
+    /// lock, so a join either precedes the latch, and the failure drops
+    /// it, or is refused.
     pub(crate) fn acquire(self: &Arc<Self>, kind: PermitKind) -> Option<Permit> {
         let mut state = self.lock();
         if !state.admits() {
@@ -405,7 +384,12 @@ impl InvocationCoordinator {
         }
         match kind {
             PermitKind::Activity => state.activity += 1,
-            PermitKind::Checkpoint => state.checkpoint += 1,
+            PermitKind::Checkpoint => {
+                if state.write_failure.is_some() {
+                    return None;
+                }
+                state.checkpoint += 1;
+            }
             PermitKind::Scheduler => {
                 // A refresh starts only beside other local work. A lone
                 // wait suspends instead.
@@ -738,56 +722,53 @@ impl InvocationCoordinator {
         self.after_change((driver, true));
     }
 
-    /// Registers `fatal`, the classification of a checkpoint failure that
-    /// a live caller has yet to record, and returns the candidate that
-    /// tracks it.
+    /// Records a failed checkpoint write: the SDK sends no further
+    /// checkpoint in this invocation.
     ///
-    /// The caller records the failure after a step that a withdrawn token
-    /// can keep from completing: the terminal `FAIL` write, or the task of
-    /// the operation that receives a direct write's result. The candidate
-    /// leaves the set in three ways:
+    /// The checkpoint-token lock is held by the caller. This does, in
+    /// order:
     ///
-    /// - [`DisplacedCandidate::consume`]: the caller took the failure over,
-    ///   and records it or writes its terminal `FAIL` under a new
-    ///   candidate.
-    /// - The candidate is dropped before the latch is set: the caller was
-    ///   stopped, by its scope or by the drive's cleanup, so the failure
-    ///   would not have been recorded without withdrawal either.
+    /// 1. It sets the write-failure latch to `fatal`, the failure's
+    ///    classification. The first failure wins, and the latch is never
+    ///    cleared.
+    /// 2. It records `fatal` in the fatal slot, where the first record
+    ///    wins, so the failure decides the outcome of the drive.
+    /// 3. It calls `drop_queued`, which drops every queued write without
+    ///    resolving its caller.
+    /// 4. It wakes the driver.
     ///
-    /// A candidate dropped after the latch stays: the withdrawal ended the
-    /// invocation, or left the write unresolved, before the caller could
-    /// record the failure. The answer under withdrawal carries the first
-    /// such failure (see [`Self::displaced_fatal`]).
-    pub(crate) fn displaced_candidate(self: &Arc<Self>, fatal: FatalError) -> DisplacedCandidate {
-        let mut state = self.lock();
-        let id = state.next_candidate;
-        state.next_candidate = state.next_candidate.wrapping_add(1);
-        state.candidates.insert(id, fatal);
-        DisplacedCandidate {
-            coordinator: Arc::clone(self),
-            id,
-            consumed: false,
+    /// The latch is set before `drop_queued` takes the queue locks, and
+    /// every step that adds a write to a queue or hands a queued write a
+    /// result without sending it (a writer that cannot be spawned) reads
+    /// the latch under the queue's lock. So each such step happens wholly
+    /// before the failure, and the failure then drops what it queued, or
+    /// wholly after it, and it adds nothing and resolves nothing.
+    pub(crate) fn fail_write(&self, fatal: FatalError, drop_queued: impl FnOnce()) {
+        let driver = {
+            let mut state = self.lock();
+            if state.write_failure.is_none() {
+                state.write_failure = Some(fatal.clone());
+            }
+            if state.fatal.is_none() {
+                state.fatal = Some(fatal);
+            }
+            state.driver.clone()
+        };
+        drop_queued();
+        if let Some(driver) = driver {
+            driver.wake();
         }
     }
 
-    /// Removes candidate `id`: always when its caller consumed it, and
-    /// otherwise only before the latch is set.
-    fn release_candidate(&self, id: u64, consumed: bool) {
-        let mut state = self.lock();
-        if consumed || !state.withdrawn {
-            state.candidates.remove(&id);
-        }
+    /// Whether the write-failure latch is set (see [`Self::fail_write`]).
+    pub(crate) fn write_failed(&self) -> bool {
+        self.lock().write_failure.is_some()
     }
 
-    /// The first candidate still registered (see
-    /// [`Self::displaced_candidate`]) when no fatal error is recorded. A
-    /// recorded fatal error already decides the end.
-    pub(crate) fn displaced_fatal(&self) -> Option<FatalError> {
-        let state = self.lock();
-        if state.fatal.is_some() {
-            return None;
-        }
-        state.candidates.values().next().cloned()
+    /// The classification of the first failed checkpoint write, if any
+    /// (see [`Self::fail_write`]).
+    pub(crate) fn write_failure(&self) -> Option<FatalError> {
+        self.lock().write_failure.clone()
     }
 
     /// Whether the withdrawal latch is set (see [`Self::withdraw`]).
@@ -1030,6 +1011,55 @@ impl WaitRegistration {
 impl Drop for WaitRegistration {
     fn drop(&mut self) {
         self.coordinator.retire(&self.key);
+    }
+}
+
+/// Points in the checkpoint write path where a test runs code on the
+/// thread that reaches them, so it can order that thread against a
+/// failed write without sleeping.
+#[cfg(test)]
+pub(crate) mod race_points {
+    use std::cell::RefCell;
+
+    /// A point in the write path (see [`reach`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum RacePoint {
+        /// A direct write is about to take the direct queue's lock to
+        /// enter the queue.
+        DirectQueueLock,
+        /// A buffered join is about to take the buffer lock.
+        BufferLock,
+        /// The direct writer could not be spawned, and the write is about
+        /// to take the direct queue's lock to drain the queue.
+        DirectNoRuntimeDrain,
+        /// A batch flusher could not be spawned, and the write is about to
+        /// take the buffer lock to claim the batch.
+        BatchNoRuntimeClaim,
+    }
+
+    type Hook = Box<dyn FnMut(RacePoint)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `hook` each time this thread reaches a point.
+    pub(crate) fn set(hook: impl FnMut(RacePoint) + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Runs this thread's hook for `point`, if one is set.
+    pub(crate) fn reach(point: RacePoint) {
+        let hook = HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(point);
+            HOOK.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
     }
 }
 
@@ -1484,68 +1514,61 @@ mod tests {
         assert_eq!(coordinator.phase(), Phase::Finished);
     }
 
-    fn candidate_fatal(name: &str) -> FatalError {
+    fn write_fatal(name: &str, severity: FatalSeverity) -> FatalError {
         FatalError {
             error_type: name.to_owned(),
             error_message: name.to_lowercase(),
-            severity: FatalSeverity::FailExecution,
+            severity,
         }
     }
 
-    fn displaced_type(coordinator: &InvocationCoordinator) -> Option<String> {
-        coordinator.displaced_fatal().map(|fatal| fatal.error_type)
+    /// A failed write sets the latch, records its classification in the
+    /// fatal slot, drops the queued writes and wakes the driver. The first
+    /// failure keeps the latch.
+    #[test]
+    fn fail_write_latches_records_drops_and_wakes() {
+        let coordinator = InvocationCoordinator::new();
+        let (counter, waker) = counting_waker();
+        coordinator.register_driver_waker(&waker);
+        assert!(!coordinator.write_failed());
+        let drops = std::cell::Cell::new(0);
+        coordinator.fail_write(write_fatal("First", FatalSeverity::FailInvocation), || {
+            drops.set(drops.get() + 1);
+        });
+        assert!(coordinator.write_failed());
+        assert_eq!(drops.get(), 1);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            coordinator.fatal_error().expect("recorded").error_type,
+            "First"
+        );
+        coordinator.fail_write(write_fatal("Second", FatalSeverity::FailExecution), || {});
+        assert_eq!(
+            coordinator.write_failure().expect("latched").error_type,
+            "First",
+            "the first failure keeps the latch"
+        );
+        assert_eq!(
+            coordinator.fatal_error().expect("recorded").error_type,
+            "First"
+        );
     }
 
-    /// The first live candidate is displaced while no fatal error is
-    /// recorded.
+    /// A failed write after another fatal error keeps that error in the
+    /// fatal slot, and still sets the latch with its own classification.
     #[test]
-    fn first_candidate_is_displaced_until_a_fatal_is_recorded() {
+    fn fail_write_after_another_fatal_keeps_the_fatal_slot() {
         let coordinator = InvocationCoordinator::new();
-        assert!(coordinator.displaced_fatal().is_none());
-        let _first = coordinator.displaced_candidate(candidate_fatal("First"));
-        let _second = coordinator.displaced_candidate(candidate_fatal("Second"));
-        assert_eq!(displaced_type(&coordinator).as_deref(), Some("First"));
-        coordinator.record_fatal("Error".to_owned(), "recorded".to_owned());
-        assert!(coordinator.displaced_fatal().is_none());
-    }
-
-    /// A candidate dropped before the latch is released: its caller was
-    /// stopped, and the failure is not displaced.
-    #[test]
-    fn candidate_dropped_before_the_latch_is_released() {
-        let coordinator = InvocationCoordinator::new();
-        let first = coordinator.displaced_candidate(candidate_fatal("First"));
-        let _second = coordinator.displaced_candidate(candidate_fatal("Second"));
-        drop(first);
-        coordinator.withdraw("arn", "req", || {});
-        assert_eq!(displaced_type(&coordinator).as_deref(), Some("Second"));
-    }
-
-    /// A candidate dropped after the latch stays: the withdrawal kept its
-    /// caller from recording it.
-    #[test]
-    fn candidate_dropped_after_the_latch_stays() {
-        let coordinator = InvocationCoordinator::new();
-        let first = coordinator.displaced_candidate(candidate_fatal("First"));
-        coordinator.withdraw("arn", "req", || {});
-        drop(first);
-        assert_eq!(displaced_type(&coordinator).as_deref(), Some("First"));
-    }
-
-    /// A consumed candidate is released before and after the latch: its
-    /// caller took the failure over.
-    #[test]
-    fn consumed_candidate_is_released_whatever_the_latch() {
-        let coordinator = InvocationCoordinator::new();
-        coordinator
-            .displaced_candidate(candidate_fatal("Before"))
-            .consume();
-        assert!(coordinator.displaced_fatal().is_none());
-        coordinator.withdraw("arn", "req", || {});
-        coordinator
-            .displaced_candidate(candidate_fatal("After"))
-            .consume();
-        assert!(coordinator.displaced_fatal().is_none());
+        coordinator.record(write_fatal("Usage", FatalSeverity::FailExecution));
+        coordinator.fail_write(write_fatal("Write", FatalSeverity::FailExecution), || {});
+        assert_eq!(
+            coordinator.fatal_error().expect("recorded").error_type,
+            "Usage"
+        );
+        assert_eq!(
+            coordinator.write_failure().expect("latched").error_type,
+            "Write"
+        );
     }
 
     #[test]

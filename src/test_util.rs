@@ -1836,8 +1836,8 @@ pub struct LocalRunner {
     /// [`fail_checkpoints_after`](Self::fail_checkpoints_after)).
     checkpoint_failure_skip: usize,
     /// Whether the injected checkpoint failures are retryable (invocation
-    /// fault; the runner re-invokes) rather than non-retryable (terminal
-    /// `FAIL` then execution failure).
+    /// fault; the runner re-invokes) rather than non-retryable (execution
+    /// failure, with no further checkpoint).
     checkpoint_failures_retryable: bool,
     /// How long the backend waits before it applies and answers each
     /// checkpoint request (see
@@ -2004,12 +2004,11 @@ impl LocalRunner {
     /// calls with a non-retryable error, persisting nothing for them,
     /// exactly like a permanent service-side rejection.
     ///
-    /// Under the #43 model a non-retryable checkpoint failure never
-    /// reaches the handler: the SDK persists a small terminal `FAIL` for
-    /// the operation (when user code already ran) and fails the
-    /// execution. Use this to test that model, and to assert no
-    /// record-transition lifecycle event is emitted for the rejected
-    /// write (see [`crate::observability`]).
+    /// A non-retryable checkpoint failure never reaches the handler: the
+    /// SDK sends no further checkpoint and fails the execution. Use this
+    /// to test that model, and to assert no record-transition lifecycle
+    /// event is emitted for the rejected write (see
+    /// [`crate::observability`]).
     ///
     /// # Examples
     ///
@@ -2031,9 +2030,8 @@ impl LocalRunner {
     ///
     /// Use it to reject a specific write: a step's live path writes START
     /// first and its outcome second, so `fail_checkpoints_after(1, 1)`
-    /// rejects exactly the outcome write while the START (and everything
-    /// after the failure window, such as the SDK's terminal `FAIL`
-    /// record) persists.
+    /// rejects exactly the step's outcome write, while the `START` before
+    /// it persists.
     ///
     /// # Examples
     ///
@@ -2055,8 +2053,8 @@ impl LocalRunner {
     /// the injected failures are RETRYABLE: simulating a transient
     /// failure that exhausted the transport's own retries.
     ///
-    /// Under the #43 model a retryable checkpoint failure fails the
-    /// invocation with no further writes; the runner then re-invokes,
+    /// A retryable checkpoint failure fails the invocation, and the SDK
+    /// sends no further checkpoint in it; the runner then re-invokes,
     /// exactly as the durable service does, and replay resumes from the
     /// recorded state.
     ///
@@ -9906,26 +9904,15 @@ mod tests {
         );
     }
 
-    /// Review regression (issue #43): a failure RETAINED by a detached
-    /// batch flush, its only contributor was dropped before the rejection
-    /// published, must not be discarded, and the orphaned operation's
-    /// unwritten outcome must be terminalized. The retained rejection here
-    /// is NON-retryable (deterministic on every future invocation): were
-    /// it dropped, the orphaned operation would stay `Started` and
-    /// re-execute on every lap.
-    ///
-    /// With the coalescer's failure latch, the very next buffered write,
-    /// the later live step's START, never reaches the backend: its
-    /// flusher observes the latch under the writer lock, republishes the
-    /// retained non-retryable error, and the live contributor's
-    /// unrecoverable routing fails the execution. The end-of-invocation
-    /// flush point then classifies the retained failures and persists the
-    /// orphan's terminal FAIL. (The `Fault`-path retained-failure drain in
-    /// the wrapper remains as defense in depth: with the latch, a
-    /// non-retryable retained failure surfaces through the first
-    /// subsequent contributor as here, before any retryable fault can.)
+    /// A non-retryable failure of a detached batch flush whose only
+    /// contributor was dropped before the rejection arrived fails the
+    /// execution in this invocation. The failure is recorded where the
+    /// response arrives, so no reader is needed. The SDK sends nothing
+    /// after it: the later live step's START never reaches the backend,
+    /// and no terminal FAIL is written, so the orphan's record stays at its
+    /// accepted START.
     #[tokio::test]
-    async fn retained_nonretryable_failure_terminalizes_orphan_and_fails_execution() {
+    async fn nonretryable_failure_of_dropped_contributor_fails_execution() {
         let runner = LocalRunner::new().options(
             crate::Options::builder()
                 .checkpoint_batching(true)
@@ -9942,11 +9929,8 @@ mod tests {
         //   2. orphan SUCCEED (detached batch flush): held at the gate
         //      until the handler releases it, then rejected non-retryably.
         //      The handler drops the contributor while the write is held,
-        //      so the rejection publishes to nobody and is only RETAINED
-        //      (and latched).
-        // The live step's START never reaches the backend (failure
-        // latch), so the next real call is the orphan's terminal FAIL:
-        // it falls past the exhausted plan and persists.
+        //      so the rejection has no reader.
+        // Nothing is sent after the rejection.
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         backend.plan_checkpoint_calls(vec![
             PlannedCheckpoint::Pass,
@@ -9983,20 +9967,16 @@ mod tests {
                         // Wait until the orphan's SUCCEED write is IN
                         // FLIGHT (call 2 reached the backend, held at the
                         // gate), then drop the contributor and release the
-                        // gate: the rejection now publishes to nobody and
-                        // is only retained by the coalescer.
+                        // gate: the rejection has no reader.
                         while backend.checkpoint_call_count() < 2 {
                             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                         }
                         drop(orphan);
                         gate.add_permits(1);
 
-                        // A later LIVE operation: its START write hits the
-                        // failure latch, no backend call, and republishes
-                        // the retained non-retryable rejection, whose
-                        // unrecoverable routing fails the execution. Before
-                        // the retention + latch, the retained failure above
-                        // was silently discarded.
+                        // A later LIVE operation: its START write is never
+                        // sent, because the failure ends the drive and
+                        // stops every later write.
                         let live: String = ctx
                             .step(|_| async { Ok("live".to_owned()) })
                             .name("live")
@@ -10012,20 +9992,18 @@ mod tests {
         assert_eq!(
             body_runs.load(Ordering::SeqCst),
             1,
-            "the orphaned body must run exactly once — a discarded retained \
-             rejection would leave it `Started` and re-execute it"
+            "the orphaned body runs exactly once"
         );
         assert_eq!(
             result.invocation_count(),
             1,
-            "the retained non-retryable rejection is deterministic: the \
-             execution must die in this invocation, not re-invoke into the \
-             same rejection"
+            "the non-retryable rejection is deterministic: the execution \
+             must die in this invocation, not re-invoke into the same \
+             rejection"
         );
         assert!(
             result.is_failure(),
-            "the execution must fail — the orphaned operation's record \
-             would otherwise claim less than what executed; got {:?} / {:?}",
+            "the execution must fail; got {:?} / {:?}",
             result.error_type(),
             result.error_message()
         );
@@ -10034,18 +10012,19 @@ mod tests {
             Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
         );
 
-        // The terminal FAIL persisted for the orphaned operation.
+        // No terminal FAIL: the orphan's record stays at its accepted
+        // START, and nothing is sent after the rejection.
         let ops = result.operations();
         let orphan_op = ops
             .iter()
             .find(|op| op.name.as_deref() == Some("orphan"))
             .expect("the orphaned step's operation record exists");
-        assert_eq!(
-            orphan_op.status,
-            OperationStatus::Failed,
-            "a terminal FAIL must be recorded for the operation whose \
-             retained outcome rejection was classified at the flush point"
+        assert_eq!(orphan_op.status, OperationStatus::Started);
+        assert!(
+            ops.iter().all(|op| op.name.as_deref() != Some("live")),
+            "the live step's START is never sent"
         );
+        assert_eq!(backend.checkpoint_call_count(), 2);
     }
 
     /// The change of a write whose caller dropped it, and that no
@@ -10119,15 +10098,13 @@ mod tests {
         );
     }
 
-    /// An invocation fault, with a retained non-retryable failure of a
-    /// detached batch flush, fails the execution through the flush
-    /// failure. The plugins' end hook runs once, with `Failed`.
-    ///
-    /// The handler records the fault itself, after the rejection was
-    /// retained and before any later write, so no contributor republishes
-    /// the retained rejection first.
+    /// A non-retryable failure of a detached batch flush whose contributor
+    /// was dropped fails the execution, and the plugins' end hook runs
+    /// once, with `Failed`. The failure ends the drive before the handler
+    /// records an invocation fault, and no terminal FAIL is written, so
+    /// the orphan's record stays at its accepted START.
     #[tokio::test]
-    async fn end_hook_failed_after_a_fault_with_a_retained_failure() {
+    async fn end_hook_failed_after_a_dropped_contributor_failure() {
         let plugin = crate::plugin::test_support::Hooks::default();
         let runner = LocalRunner::new().options(
             crate::Options::builder()
@@ -10167,8 +10144,7 @@ mod tests {
                         }
                         drop(orphan);
                         gate.add_permits(1);
-                        // Let the detached flush receive the rejection and
-                        // retain it.
+                        // The rejection ends the drive while this sleeps.
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         ctx.coordinator().record_invocation_fault(
                             crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE,
@@ -10198,6 +10174,12 @@ mod tests {
             end.execution_error().and_then(crate::WireError::error_type),
             Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
         );
+        let orphan = result
+            .operations()
+            .iter()
+            .find(|op| op.name.as_deref() == Some("orphan"))
+            .map(|op| op.status);
+        assert_eq!(orphan, Some(OperationStatus::Started));
     }
 
     // Harness fidelity: production wire-error mapping

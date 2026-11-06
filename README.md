@@ -1107,7 +1107,8 @@ for outcome in &outcomes {
 
 The two levels of `Result` report different failures. The outer `Err`, which
 `?` propagates above, means the combinator itself failed, for example on
-replay nondeterminism or a failed checkpoint write. An input that returns
+replay nondeterminism. A failed checkpoint write never reaches it: the write
+fails the invocation, and the combinator does not resolve. An input that returns
 `Err` appears only as that input's inner `Err`, and the outer result is then
 `Ok`. A panicking input ends the invocation, as a panic does everywhere else
 in the SDK: the SDK resumes the original panic payload, and `join_all` writes

@@ -1534,26 +1534,7 @@ where
                         req.ctx.preserves_children(1),
                     );
                     if let Err(client_err) = writer.checkpoint_updates(vec![update]).await {
-                        // Audit (#43): batch child FAIL (serialization):
-                        // the item closure ran; the failed FAIL write
-                        // routes unrecoverable with a minimal terminal
-                        // FAIL retry.
-                        let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                        let terminal = build_child_fail_update(
-                            &child_wire,
-                            &req.item_name,
-                            &req.child_sub_type,
-                            &req.parent_wire,
-                            &cwire,
-                            req.ctx.preserves_children(1),
-                        );
-                        return writer
-                            .checkpoint_failure_unrecoverable(
-                                &child_wire,
-                                client_err,
-                                Some(terminal),
-                            )
-                            .await;
+                        return writer.checkpoint_failure_unrecoverable(client_err).await;
                     }
                     item_ended(
                         req,
@@ -1605,24 +1586,7 @@ where
 
             req.await_start(OperationAction::Succeed).await?;
             if let Err(err) = writer.checkpoint_updates(vec![update]).await {
-                // Audit (#43): batch child SUCCEED: the item closure
-                // ran, so its side effects need a recorded outcome. A
-                // permanent rejection persists a small terminal FAIL
-                // before the execution fails. Routing unrecoverable (not
-                // as an item failure) keeps a tolerant completion config
-                // from absorbing a checkpoint failure.
-                let cwire = crate::error::checkpoint_failure_wire(&err);
-                let terminal = build_child_fail_update(
-                    &child_wire,
-                    &req.item_name,
-                    &req.child_sub_type,
-                    &req.parent_wire,
-                    &cwire,
-                    req.ctx.preserves_children(1),
-                );
-                return writer
-                    .checkpoint_failure_unrecoverable(&child_wire, err, Some(terminal))
-                    .await;
+                return writer.checkpoint_failure_unrecoverable(err).await;
             }
             item_ended(
                 req,
@@ -1657,10 +1621,11 @@ where
             ))
         }
         Err((_error, wire)) => {
-            // Checkpoint failure. The wire record is derived from the
-            // error the body returned, so the type is the body error's
-            // recorded type, the message is its flattened chain, and
-            // `error_data`/`stack_trace` pass through the boundary.
+            // The item failed: checkpoint its failure. The wire record is
+            // derived from the error the body returned, so the type is the
+            // body error's recorded type, the message is its flattened
+            // chain, and `error_data`/`stack_trace` pass through the
+            // boundary.
             let mut builder = OperationUpdate::builder()
                 .id(child_wire.clone())
                 .r#type(OperationType::Context)
@@ -1686,24 +1651,7 @@ where
 
             req.await_start(OperationAction::Fail).await?;
             if let Err(client_err) = writer.checkpoint_updates(vec![update]).await {
-                // Audit (#43): batch child FAIL: the item closure ran
-                // and failed; the failed FAIL write routes unrecoverable
-                // with a minimal terminal FAIL retry (the original
-                // carried the item error's payload). Discarding it would
-                // let a tolerant batch continue on a record claiming less
-                // than what executed.
-                let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                let terminal = build_child_fail_update(
-                    &child_wire,
-                    &req.item_name,
-                    &req.child_sub_type,
-                    &req.parent_wire,
-                    &cwire,
-                    req.ctx.preserves_children(1),
-                );
-                return writer
-                    .checkpoint_failure_unrecoverable(&child_wire, client_err, Some(terminal))
-                    .await;
+                return writer.checkpoint_failure_unrecoverable(client_err).await;
             }
             item_ended(
                 req,
@@ -2069,8 +2017,10 @@ where
     IS: Serdes<O>,
 {
     /// Processes one joined branch task: its outcome feeds the progress
-    /// accounting, and a coordinator-level error (e.g. a failed checkpoint
-    /// call) is returned. A panic of the task resumes unwinding here, with
+    /// accounting, and an error of the task itself, not of its body (for
+    /// example the error `.spawn()` returns without a Tokio runtime), is
+    /// returned. A failed checkpoint write never reaches here: it fails
+    /// the invocation, and the task does not resolve. A panic of the task resumes unwinding here, with
     /// its original payload, and nothing is recorded for it: a panic fails
     /// the invocation, not the item.
     fn settle_joined(
@@ -2079,7 +2029,7 @@ where
         progress: &mut BatchProgress<O>,
     ) -> Result<(), OperationError> {
         let (index, outcome) = joined.into_value();
-        // A coordinator-level failure surfaces; the caller's join set drop
+        // An error of the task itself surfaces; the caller's join set drop
         // aborts the remaining branches.
         let item = outcome?;
         progress.settle_outcome(self.completion_cfg, self.total_items, index, item);
@@ -3643,16 +3593,7 @@ async fn checkpoint_batch_success_serialized(
     ctx.await_retained_start(parent_wire, start, OperationAction::Succeed)
         .await?;
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43): batch parent SUCCEED: the batch's items ran, so
-        // the batch outcome needs a recorded terminal. A permanent
-        // rejection persists a small terminal FAIL before the execution
-        // fails.
-        let cwire = crate::error::checkpoint_failure_wire(&err);
-        let terminal =
-            build_parent_fail_update(parent_wire, parent_name, parent_sub_type, ctx, &cwire);
-        return ctx
-            .checkpoint_failure_unrecoverable(parent_wire, err, Some(terminal))
-            .await;
+        return ctx.checkpoint_failure_unrecoverable(err).await;
     }
     if let Some(plugins) = ctx.plugins() {
         let info = container_info(ctx, parent_wire, parent_sub_type, parent_name)
@@ -3782,9 +3723,7 @@ fn build_child_update(
 }
 
 /// Builds a child-level `FAIL` update carrying `wire` as its error: the
-/// terminal record persisted when the child's own outcome write was
-/// permanently rejected (issue #43), or the `FAIL` of an item whose result
-/// fails to serialize. `preserve` adds `ReplayChildren`: the batch's own
+/// `FAIL` of an item whose result fails to serialize. `preserve` adds `ReplayChildren`: the batch's own
 /// context keeps the item's children within its plugin child operations
 /// depth.
 fn build_child_fail_update(
@@ -3806,43 +3745,6 @@ fn build_child_fail_update(
         .error(wire.to_error_object())
         .name(child_name.to_owned());
     if preserve {
-        builder = builder.context_options(
-            aws_sdk_lambda::types::ContextOptions::builder()
-                .replay_children(true)
-                .build(),
-        );
-    }
-    #[expect(clippy::expect_used)] // reason: all required fields are set above
-    builder
-        .build()
-        .expect("all required OperationUpdate fields set")
-}
-
-/// Builds a parent-level `FAIL` update carrying `wire` as its error: the
-/// terminal record persisted when the batch parent's own outcome write
-/// was permanently rejected (issue #43).
-fn build_parent_fail_update(
-    wire_id: &str,
-    name: Option<&str>,
-    sub_type: &str,
-    ctx: &DurableContext,
-    wire: &crate::error::WireError,
-) -> OperationUpdate {
-    let mut builder = OperationUpdate::builder()
-        .id(wire_id.to_owned())
-        .r#type(OperationType::Context)
-        .sub_type(sub_type.to_owned())
-        .action(OperationAction::Fail)
-        .error(wire.to_error_object());
-    if let Some(n) = name {
-        builder = builder.name(n.to_owned());
-    }
-    if let Some(parent_wire) = ctx.parent_wire_id() {
-        builder = builder.parent_id(parent_wire);
-    }
-    // Within the plugin child operations depth of the caller's context,
-    // the batch record keeps its items for later invocations.
-    if ctx.preserves_children(1) {
         builder = builder.context_options(
             aws_sdk_lambda::types::ContextOptions::builder()
                 .replay_children(true)
@@ -5133,11 +5035,12 @@ mod tests {
 
     /// Rule 7.6: a container's body ends `Ok` when its batch is produced. A
     /// failure after it keeps its own wire: a result serdes failure is the
-    /// handler's error with `serialization_failure_wire`, and a rejected
-    /// `SUCCEED` records a terminal FAIL with `checkpoint_failure_wire`.
+    /// handler's error with `serialization_failure_wire`. A rejected
+    /// `SUCCEED` fails the execution, and no `FAIL` is sent, so the
+    /// container's record stays at its accepted `START`.
     #[tokio::test]
     async fn container_post_body_failures_keep_own_wire() {
-        use crate::plugin::recorder::{UfHooks, context, context_over, update_error, update_of};
+        use crate::plugin::recorder::{UfHooks, context, context_over, update_of};
 
         // Run 1: the result serdes fails.
         let hooks = UfHooks::default();
@@ -5197,17 +5100,14 @@ mod tests {
         );
         let end = hooks.find("m", "uf_end");
         assert_eq!((end.ok, end.wire), (Some(true), None));
-        let fail = update_of(&inner.recorded_updates(), "m", &OperationAction::Fail)
-            .expect("the container's terminal FAIL");
-        let expected = crate::error::checkpoint_failure_wire(
-            &crate::client::ExecutionClientError::new_non_retryable("rejected"),
+        let updates = inner.recorded_updates();
+        assert!(
+            update_of(&updates, "m", &OperationAction::Fail).is_none(),
+            "no FAIL after the rejected SUCCEED: {updates:?}"
         );
-        assert_eq!(
-            update_error(&fail),
-            (
-                expected.error_type().map(str::to_owned),
-                expected.error_message().map(str::to_owned)
-            )
+        assert!(
+            update_of(&updates, "m", &OperationAction::Start).is_some(),
+            "the container's START is its last accepted update: {updates:?}"
         );
     }
 
@@ -12558,18 +12458,18 @@ mod tests {
         }
     }
 
-    /// When an item's outcome write is rejected, the terminal FAIL that
-    /// replaces it carries the flag within the depth: after a rejected
-    /// SUCCEED, a rejected FAIL, and a rejected FAIL of a result that fails
-    /// to serialize.
+    /// When an item's outcome write is rejected, within the depth or not,
+    /// no terminal FAIL replaces it, so the item's record stays at its
+    /// accepted START: after a rejected SUCCEED, a rejected FAIL, and a
+    /// rejected FAIL of a result that fails to serialize.
     #[tokio::test]
-    async fn preserved_item_replacement_fail_has_flag() {
+    async fn preserved_item_rejected_outcome_sends_no_replacement_fail() {
         fn item_outcome(u: &OperationUpdate) -> bool {
             u.name() == Some("map-item-0")
                 && matches!(u.action(), OperationAction::Succeed | OperationAction::Fail)
         }
         for case in ["succeed", "fail", "serialize"] {
-            for (depth, flag) in [(2, Some(true)), (1, None)] {
+            for depth in [2, 1] {
                 let inner = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
                 let client = Arc::new(RejectsFirstMatch {
                     inner: Arc::clone(&inner),
@@ -12603,30 +12503,19 @@ mod tests {
                     matches!(outcome, crate::driver::InvocationOutcome::Failed { .. }),
                     "{case}: {outcome:?}"
                 );
-                let fails: Vec<_> = inner
+                let accepted: Vec<OperationAction> = inner
                     .recorded_updates()
                     .into_iter()
-                    .filter(|u| {
-                        u.name() == Some("map-item-0") && u.action() == &OperationAction::Fail
-                    })
+                    .filter(|u| u.name() == Some("map-item-0"))
+                    .map(|u| u.action().clone())
                     .collect();
-                assert_eq!(fails.len(), 1, "{case}: one replacement FAIL");
-                assert_eq!(depth_flag(&fails[0]), flag, "{case} at depth {depth}");
+                assert_eq!(
+                    accepted,
+                    [OperationAction::Start],
+                    "{case} at depth {depth}: no replacement FAIL"
+                );
             }
         }
-    }
-
-    /// The container's replacement FAIL carries the flag within the depth
-    /// of the caller's context.
-    #[test]
-    fn container_replacement_fail_has_flag_within_depth() {
-        let wire = crate::error::WireError::default();
-        let (ctx, _client) = DurableContext::test_context_with_depth(1);
-        let update = build_parent_fail_update("w", Some("m"), MAP_SUB_TYPE, &ctx, &wire);
-        assert_eq!(depth_flag(&update), Some(true));
-        let (ctx, _client) = DurableContext::test_context_with_depth(0);
-        let update = build_parent_fail_update("w", Some("m"), MAP_SUB_TYPE, &ctx, &wire);
-        assert!(update.context_options().is_none());
     }
 
     /// A preserved batch's own result replays as the decision record does:

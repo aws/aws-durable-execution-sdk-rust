@@ -173,13 +173,7 @@ where
         // assigns the callback_id in this response, so the start step
         // queued the write as urgent.
         if let Err(err) = start.await {
-            // Audit (#43): callback-creation START: no user code ran (the
-            // callback ID does not exist yet), so no terminal FAIL is
-            // needed; re-invocation reconverges on the same write.
-            return self
-                .ctx
-                .checkpoint_failure_unrecoverable(&wire_id, err, None)
-                .await;
+            return self.ctx.checkpoint_failure_unrecoverable(err).await;
         }
 
         // After checkpointing START, the backend assigns a callback_id.
@@ -913,16 +907,7 @@ impl WfcbAfter {
                 ctx.await_retained_start(&wire_id, start, OperationAction::Succeed)
                     .await?;
                 if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43): wait-for-callback SUCCEED: the
-                    // submitter ran and the external system completed the
-                    // callback, so those side effects need a recorded
-                    // outcome. A permanent rejection persists a small
-                    // terminal FAIL before the execution fails.
-                    let cwire = crate::error::checkpoint_failure_wire(&err);
-                    let terminal = build_wfcb_fail_update(&wire_id, name.as_deref(), &ctx, &cwire);
-                    return ctx
-                        .checkpoint_failure_unrecoverable(&wire_id, err, Some(terminal))
-                        .await;
+                    return ctx.checkpoint_failure_unrecoverable(err).await;
                 }
                 if let Some(plugins) = ctx.plugins() {
                     let info = wfcb_info(&ctx, &wire_id, name.as_deref())
@@ -961,20 +946,12 @@ impl WfcbAfter {
                 // Checkpoint the failure so a replay of this record
                 // reconstructs the same error: operation id, status, and
                 // the wire record are present either way. A rejected
-                // write routes unrecoverable: discarding it would leave
-                // the record claiming less than what executed (#43).
+                // write fails the invocation, and this operation writes
+                // nothing more.
                 ctx.await_retained_start(&wire_id, start, OperationAction::Fail)
                     .await?;
                 if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43): wait-for-callback FAIL: the submitter
-                    // (and possibly the external system) ran; the failed
-                    // FAIL write routes unrecoverable with a minimal
-                    // terminal FAIL retry.
-                    let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                    let terminal = build_wfcb_fail_update(&wire_id, name.as_deref(), &ctx, &cwire);
-                    return ctx
-                        .checkpoint_failure_unrecoverable(&wire_id, client_err, Some(terminal))
-                        .await;
+                    return ctx.checkpoint_failure_unrecoverable(client_err).await;
                 }
                 if let Some(plugins) = ctx.plugins() {
                     let info = wfcb_info(&ctx, &wire_id, name.as_deref())
@@ -1104,37 +1081,6 @@ fn build_wfcb_update(
     }
     if let Some(parent_wire) = ctx.parent_wire_id() {
         builder = builder.parent_id(parent_wire);
-    }
-    #[expect(clippy::expect_used)] // reason: all required fields set above
-    builder
-        .build()
-        .expect("all required OperationUpdate fields set")
-}
-
-/// Builds the terminal `FAIL` update a wait-for-callback context persists
-/// when its own outcome write was permanently rejected (issue #43).
-fn build_wfcb_fail_update(
-    wire_id: &str,
-    name: Option<&str>,
-    ctx: &DurableContext,
-    wire: &crate::error::WireError,
-) -> OperationUpdate {
-    let mut builder = OperationUpdate::builder()
-        .id(wire_id.to_owned())
-        .r#type(OperationType::Context)
-        .sub_type(WFCB_SUB_TYPE.to_owned())
-        .action(OperationAction::Fail)
-        .error(wire.to_error_object());
-    if let Some(n) = name {
-        builder = builder.name(n.to_owned());
-    }
-    if let Some(parent_wire) = ctx.parent_wire_id() {
-        builder = builder.parent_id(parent_wire);
-    }
-    // Within the plugin child operations depth, the record keeps its
-    // children for later invocations.
-    if ctx.preserves_children(1) {
-        builder = builder.context_options(replay_children_options());
     }
     #[expect(clippy::expect_used)] // reason: all required fields set above
     builder
@@ -3827,24 +3773,6 @@ mod tests {
         }
     }
 
-    /// The replacement `FAIL` of a rejected outcome write carries the flag
-    /// within the depth of the caller's context.
-    #[test]
-    fn wait_for_callback_replacement_fail_has_flag_within_depth() {
-        let wire = crate::error::WireError::default();
-        let (ctx, _client) = DurableContext::test_context_with_depth(1);
-        let update = build_wfcb_fail_update("w", Some("approve"), &ctx, &wire);
-        assert_eq!(
-            update
-                .context_options()
-                .and_then(aws_sdk_lambda::types::ContextOptions::replay_children),
-            Some(true)
-        );
-        let (ctx, _client) = DurableContext::test_context_with_depth(0);
-        let update = build_wfcb_fail_update("w", Some("approve"), &ctx, &wire);
-        assert!(update.context_options().is_none());
-    }
-
     #[tokio::test]
     async fn callback_own_record_keeps_external_classification() {
         // C23.
@@ -4645,7 +4573,8 @@ mod start_order_tests {
     }
 
     /// Runs test 27: the `wait_for_callback` settler with a retained START
-    /// that fails, after a body that returned `body_result`.
+    /// that fails, after a body that returned `body_result`. The settler
+    /// never resolves and writes no outcome.
     async fn wfcb_outcome_waits_for_failed_start(
         body_result: Result<String, OperationError>,
         action: OperationAction,
@@ -4694,19 +4623,15 @@ mod start_order_tests {
                 crate::client::ExecutionClientErrorScope::Execution,
                 "START rejected",
             );
-            let wire = crate::error::checkpoint_execution_failure_wire(&rejection);
             sender.send(Err(rejection)).expect("the settler waits");
-            wait_until("the invocation's fatal error", || {
-                ctx.coordinator().fatal_error().is_some()
-            })
-            .await;
-            let fatal = ctx.coordinator().fatal_error().expect("checked above");
-            assert_eq!(fatal.error_type, "CheckpointUnrecoverableExecutionError");
-            assert_eq!(Some(fatal.error_message.as_str()), wire.error_message());
             for _ in 0..10 {
                 tokio::task::yield_now().await;
             }
             assert_eq!(outcomes(&submissions.lock().unwrap()), 0, "no outcome");
+            // The write path records a failed write where its response
+            // arrives; the operation that receives the error records
+            // nothing.
+            assert!(ctx.coordinator().fatal_error().is_none());
         };
         tokio::select! {
             _ = settle => panic!("the settler resolved after a failed START"),

@@ -89,11 +89,12 @@ pub(crate) enum InvocationOutcome {
 ///   ([`crate::context::DurableContext::validate_replay_identity`]): a
 ///   replay identity mismatch means no amount of re-invocation can make
 ///   progress: [`FatalSeverity::FailExecution`];
-/// - checkpoint write failures
-///   ([`crate::context::DurableContext::checkpoint_failure_unrecoverable`]):
-///   a retryable failure fails the invocation so the service re-invokes
-///   ([`FatalSeverity::FailInvocation`]); a permanent rejection fails the
-///   execution ([`FatalSeverity::FailExecution`]).
+/// - checkpoint write failures, recorded where the write's response
+///   arrives, under the checkpoint-token lock
+///   (`crate::context::DurableContext::record_write_failure`): an
+///   `Invocation`-scoped failure fails the invocation so the service
+///   re-invokes ([`FatalSeverity::FailInvocation`]); an `Execution`-scoped
+///   one fails the execution ([`FatalSeverity::FailExecution`]).
 /// - serdes faults ([`crate::context::DurableContext::serdes_fault`]): a
 ///   serdes error marked with
 ///   [`RetryableSerdesError`](crate::serdes::RetryableSerdesError) fails the
@@ -557,27 +558,17 @@ pub(crate) fn withdrawal_answer(
     if !ctx.coordinator().withdrawn() {
         return (response, end);
     }
-    // A checkpoint failure that the withdrawal kept from being recorded
-    // would have decided the outcome without withdrawal, so the end hook
-    // receives it. A failure whose caller was stopped or took it over
-    // before the latch is no longer a candidate (see
-    // `InvocationCoordinator::displaced_candidate`), so a completed
-    // handler's cleanup leaves the end with the handler's own error, or
-    // none.
-    let error = ctx
-        .coordinator()
-        .displaced_fatal()
-        .map(|fatal| {
-            crate::error::WireError::new(Some(fatal.error_type), Some(fatal.error_message))
-        })
-        .or(end.error);
+    // The end keeps the error the same path carries without withdrawal: a
+    // fatal error the arbitration read, else the handler's error, else
+    // none. A recorded checkpoint failure never meets a withdrawal,
+    // because either latch stops the next request.
     // A suspension already answers `PENDING`, and emitted its event.
     if end.status == crate::InvocationStatus::Pending {
-        return (response, crate::InvocationEnd { error, ..end });
+        return (response, end);
     }
     drop(response);
     let (pending, mut pending_end) = crate::outcome_envelope(InvocationOutcome::Pending, ctx);
-    pending_end.error = error;
+    pending_end.error = end.error;
     (pending, pending_end)
 }
 
@@ -628,11 +619,11 @@ pub(crate) mod test_hooks {
 /// through `root`, whose merge wakes every operation the response
 /// readied, and then schedules each due registration's next refresh. Only
 /// then does it release the permit. A refused permit stops the scheduler.
-/// A failed refresh is classified as a failed checkpoint write of the
-/// first due operation, and stops the scheduler. The classification is
-/// recorded where the response arrives, not here, so a refresh that is
-/// in flight when the handler returns still decides the outcome (see
-/// [`crate::DurableContext::checkpoint_refresh`]).
+/// A failed refresh is recorded as a failed checkpoint write of the
+/// first due operation, and never resolves, so the scheduler sends nothing
+/// more. The failure is recorded where the response arrives, not here, so
+/// a refresh that is in flight when the handler returns still decides the
+/// outcome (see [`crate::DurableContext::checkpoint_refresh`]).
 async fn refresh_scheduler(root: crate::DurableContext) {
     use crate::coordinator::{DueRefresh, PermitKind};
 
@@ -661,13 +652,7 @@ async fn refresh_scheduler(root: crate::DurableContext) {
         let Some(permit) = coordinator.acquire(PermitKind::Scheduler) else {
             return std::future::pending().await;
         };
-        if root.checkpoint_refresh(&first_wire_id).await.is_err() {
-            // `checkpoint_refresh` recorded the failure before it returned
-            // it, and the permit was held until then, so the invocation
-            // cannot suspend before it.
-            drop(permit);
-            return std::future::pending().await;
-        }
+        root.checkpoint_refresh(&first_wire_id).await;
         let records = keys
             .iter()
             .filter_map(|(wire_id, _)| {
@@ -4803,6 +4788,13 @@ mod refresh_scheduler {
             panic!("expected a fault, got {outcome:?}");
         };
         assert!(message.contains("throttled refresh"), "got {message}");
+        // The refresh sends no update, so the failure names the wire ID of
+        // its first due registration, the callback's.
+        let cb = crate::engine::compute_wire_id_public("1");
+        assert!(
+            message.contains(&format!("operation {cb}:")),
+            "got {message}"
+        );
         assert_eq!(client.empty_calls().len(), 1, "no refresh after a failure");
 
         // A non-retryable failure fails the execution.
@@ -4840,10 +4832,11 @@ mod refresh_scheduler {
         .expect("no panic")
     }
 
-    /// A refresh failure under checkpoint batching is recorded by the
-    /// detached flush task that publishes the batch, for the batch's
-    /// failure owner. No later write observes the failed batch, so without
-    /// that record the invocation would suspend on the callback instead.
+    /// A refresh failure under checkpoint batching is recorded where the
+    /// response arrives, on the detached flush task, for the refresh's
+    /// first due registration. No later write observes the failed batch,
+    /// so without that record the invocation would suspend on the callback
+    /// instead.
     #[tokio::test(start_paused = true)]
     async fn batched_refresh_failure_keeps_classification() {
         let batched_ctx = |client: &Arc<RefreshClient>| {
@@ -4871,6 +4864,11 @@ mod refresh_scheduler {
             panic!("expected a fault, got {outcome:?}");
         };
         assert!(message.contains("throttled refresh"), "got {message}");
+        let cb = crate::engine::compute_wire_id_public("1");
+        assert!(
+            message.contains(&format!("operation {cb}:")),
+            "got {message}"
+        );
 
         // A non-retryable failure fails the execution.
         let rejected = ExecutionClientError::new_non_retryable("rejected refresh");
@@ -6839,6 +6837,23 @@ mod withdrawal_tests {
         F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<u32, BoxError>> + Send,
     {
+        run_result(client, batching, factory, records, handler)
+            .await
+            .expect("the invocation answers a response")
+    }
+
+    /// [`run_on`] that returns a Lambda error instead of failing.
+    async fn run_result<F, Fut>(
+        client: &Arc<WithdrawingClient>,
+        batching: bool,
+        factory: &RecordingFactory,
+        records: &[serde_json::Value],
+        handler: F,
+    ) -> Result<serde_json::Value, lambda_runtime::Error>
+    where
+        F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<u32, BoxError>> + Send,
+    {
         let mut operations = vec![serde_json::json!({
             "Id": "root",
             "Type": "EXECUTION",
@@ -6866,8 +6881,63 @@ mod withdrawal_tests {
         tokio::time::timeout(Duration::from_secs(60), service(event))
             .await
             .expect("the invocation ends")
-            .expect("the invocation answers a response")
-            .0
+            .map(|response| response.0)
+    }
+
+    /// Asserts that the last request `client` received carries `name`'s
+    /// update with `action`: no request follows the failed one.
+    fn last_request_has(client: &WithdrawingClient, name: &str, action: &OperationAction) {
+        let calls = client.calls();
+        let last = calls.last().expect("a request was sent");
+        assert!(has(last, name, action), "{calls:?}");
+    }
+
+    /// Asserts the answer and the end of an invocation whose checkpoint
+    /// write failed with a transport error of `scope`: a Lambda error and
+    /// a `Retrying` end for `Invocation`, and `FAILED` with a `Failed` end
+    /// for `Execution`, each with the failure's error.
+    fn assert_failure_answer(
+        scope: ExecutionClientErrorScope,
+        response: Result<serde_json::Value, lambda_runtime::Error>,
+        factory: &RecordingFactory,
+    ) {
+        let (status, error) = factory.end();
+        let error = error.expect("the end carries the failure");
+        if scope == ExecutionClientErrorScope::Invocation {
+            let err = response.expect_err("the invocation fails");
+            assert_eq!(status, InvocationStatus::Retrying);
+            assert_eq!(
+                error.error_type(),
+                Some(crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE)
+            );
+            assert_eq!(error.error_message(), Some(err.to_string().as_str()));
+        } else {
+            let response = response.expect("an envelope");
+            assert_eq!(
+                response
+                    .pointer("/Status")
+                    .and_then(serde_json::Value::as_str),
+                Some("FAILED"),
+                "{response}"
+            );
+            assert_eq!(status, InvocationStatus::Failed);
+            assert_eq!(
+                error.error_type(),
+                Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+            );
+            assert_eq!(
+                response
+                    .pointer("/Error/ErrorType")
+                    .and_then(serde_json::Value::as_str),
+                Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+            );
+        }
+        assert!(
+            error
+                .error_message()
+                .is_some_and(|m| m.contains("scripted checkpoint failure")),
+            "{error:?}"
+        );
     }
 
     fn pending() -> serde_json::Value {
@@ -7175,12 +7245,15 @@ mod withdrawal_tests {
 
     /// Runs a handler that spawns steps `a` and `b` together, so both
     /// STARTs are queued before either is written. `a`'s START fails at
-    /// once with a transport error of `scope`, and `b`'s START, written
-    /// right after it on the same writer poll, is answered without a token
-    /// at once. `a`'s task has not recorded the failure yet.
+    /// once with a transport error of `scope`, and `b`'s START, queued
+    /// behind it, would be answered without a token.
     async fn queued_client_error(
         scope: ExecutionClientErrorScope,
-    ) -> (Arc<WithdrawingClient>, serde_json::Value, RecordingFactory) {
+    ) -> (
+        Arc<WithdrawingClient>,
+        Result<serde_json::Value, lambda_runtime::Error>,
+        RecordingFactory,
+    ) {
         let client = WithdrawingClient::new(move |_, updates| {
             if has(updates, "a", &OperationAction::Start) {
                 (Answer::Fail(scope), Duration::ZERO)
@@ -7191,7 +7264,7 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run_result(&client, false, &factory, &[], |_event, ctx| async move {
             let a = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
             let b = ctx.step(|_| async { Ok(2_u32) }).name("b").spawn();
             Ok(a.await? + b.await?)
@@ -7200,47 +7273,23 @@ mod withdrawal_tests {
         (client, response, factory)
     }
 
+    /// A failed write drops the write queued behind it: `b`'s START is
+    /// never sent, and the failure is the answer.
     #[tokio::test]
-    async fn pending_wins_over_queued_invocation_client_error() {
-        let (client, response, factory) =
-            queued_client_error(ExecutionClientErrorScope::Invocation).await;
-        assert_eq!(response, pending());
-        assert_eq!(client.calls().len(), 2, "a's START, then b's START");
-        let (status, error) = factory.end();
-        assert_eq!(status, InvocationStatus::Pending);
-        let error = error.expect("the displaced error");
-        assert_eq!(
-            error.error_type(),
-            Some(crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE)
-        );
-        assert!(
-            error
-                .error_message()
-                .is_some_and(|m| m.contains("scripted checkpoint failure")),
-            "{error:?}"
-        );
+    async fn queued_write_behind_invocation_client_error_is_not_sent() {
+        let scope = ExecutionClientErrorScope::Invocation;
+        let (client, response, factory) = queued_client_error(scope).await;
+        assert_eq!(client.calls().len(), 1, "only a's START");
+        assert_failure_answer(scope, response, &factory);
     }
 
     #[tokio::test]
-    async fn pending_wins_over_queued_execution_client_error() {
-        let (client, response, factory) =
-            queued_client_error(ExecutionClientErrorScope::Execution).await;
-        assert_eq!(response, pending());
-        assert_eq!(client.calls().len(), 2, "a's START, then b's START");
+    async fn queued_write_behind_execution_client_error_is_not_sent() {
+        let scope = ExecutionClientErrorScope::Execution;
+        let (client, response, factory) = queued_client_error(scope).await;
+        assert_eq!(client.calls().len(), 1, "only a's START");
         assert!(no_fail(&client), "no terminal FAIL is sent");
-        let (status, error) = factory.end();
-        assert_eq!(status, InvocationStatus::Pending);
-        let error = error.expect("the displaced error");
-        assert_eq!(
-            error.error_type(),
-            Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
-        );
-        assert!(
-            error
-                .error_message()
-                .is_some_and(|m| m.contains("scripted checkpoint failure")),
-            "{error:?}"
-        );
+        assert_failure_answer(scope, response, &factory);
     }
 
     /// Answers the request that holds `a`'s START after a second, without
@@ -7292,12 +7341,16 @@ mod withdrawal_tests {
 
     /// Runs `handler_err` (or a handler that returns `Ok(1)`) after it
     /// spawns steps `a` and `b` and drops both handles, without buffering.
-    /// `a`'s START fails with a transport error after a second, after the
-    /// handler returned and the cleanup stopped `a`'s task, and `b`'s
-    /// START, queued behind it, is answered without a token.
-    async fn failed_then_tokenless_after_handler(
+    /// `a`'s START fails with an invocation-scoped transport error after a
+    /// second, after the handler returned, and `b`'s START, queued behind
+    /// it, would be answered without a token.
+    async fn failed_after_handler(
         handler_err: bool,
-    ) -> (Arc<WithdrawingClient>, serde_json::Value, RecordingFactory) {
+    ) -> (
+        Arc<WithdrawingClient>,
+        Result<serde_json::Value, lambda_runtime::Error>,
+        RecordingFactory,
+    ) {
         let client = WithdrawingClient::new(|_, updates| {
             if has(updates, "a", &OperationAction::Start) {
                 (
@@ -7311,42 +7364,43 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, move |_event, ctx| async move {
-            drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
-            drop(ctx.step(|_| async { Ok(2_u32) }).name("b").spawn());
-            if handler_err {
-                return Err::<u32, BoxError>("boom".into());
-            }
-            Ok(1)
-        })
+        let response = run_result(
+            &client,
+            false,
+            &factory,
+            &[],
+            move |_event, ctx| async move {
+                drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
+                drop(ctx.step(|_| async { Ok(2_u32) }).name("b").spawn());
+                if handler_err {
+                    return Err::<u32, BoxError>("boom".into());
+                }
+                Ok(1)
+            },
+        )
         .await;
         (client, response, factory)
     }
 
     #[tokio::test(start_paused = true)]
-    async fn handler_ok_end_ignores_unread_queued_failure() {
-        let (client, response, factory) = failed_then_tokenless_after_handler(false).await;
-        assert_eq!(response, pending());
-        assert_eq!(client.calls().len(), 2, "a's START, then b's START");
-        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
+    async fn failure_after_handler_ok_decides_and_stops_later_writes() {
+        let (client, response, factory) = failed_after_handler(false).await;
+        assert_eq!(client.calls().len(), 1, "only a's START");
+        assert_failure_answer(ExecutionClientErrorScope::Invocation, response, &factory);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn handler_err_end_ignores_unread_queued_failure() {
-        let (client, response, factory) = failed_then_tokenless_after_handler(true).await;
-        assert_eq!(response, pending());
-        assert_eq!(client.calls().len(), 2, "a's START, then b's START");
-        let (status, error) = factory.end();
-        assert_eq!(status, InvocationStatus::Pending);
-        let error = error.expect("the handler's error");
-        assert_eq!(error.error_message(), Some("boom"), "{error:?}");
+    async fn failure_after_handler_err_decides_and_stops_later_writes() {
+        let (client, response, factory) = failed_after_handler(true).await;
+        assert_eq!(client.calls().len(), 1, "only a's START");
+        assert_failure_answer(ExecutionClientErrorScope::Invocation, response, &factory);
     }
 
-    /// A failure whose caller was stopped before the response came is not
-    /// the answer's error, also when the drive is interrupted: no task
-    /// would record it without withdrawal either.
+    /// The failure of a write whose caller was stopped before the response
+    /// came decides the outcome: the wait's START queued behind it is never
+    /// sent.
     #[tokio::test(start_paused = true)]
-    async fn pending_end_ignores_failure_of_stopped_caller() {
+    async fn failure_of_stopped_caller_decides_and_stops_later_writes() {
         let client = WithdrawingClient::new(|_, updates| {
             if has(updates, "a", &OperationAction::Start) {
                 (
@@ -7360,7 +7414,7 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run_result(&client, false, &factory, &[], |_event, ctx| async move {
             // The child's body returns while `a`'s START is in flight, so
             // its scope closes and stops `a` before the response.
             ctx.run_in_child_context(|child| async move {
@@ -7374,21 +7428,22 @@ mod withdrawal_tests {
             Ok(1)
         })
         .await;
-        assert_eq!(response, pending());
-        assert!(has(&client.updates(), "w", &OperationAction::Start));
-        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
+        assert!(!has(&client.updates(), "w", &OperationAction::Start));
+        last_request_has(&client, "a", &OperationAction::Start);
+        assert_failure_answer(ExecutionClientErrorScope::Invocation, response, &factory);
     }
 
     /// Runs a handler that spawns step `a`, drops its handle, waits 1.5 s
     /// and returns `Err("boom")` when `handler_err`, else `Ok(1)`, without
     /// buffering. `a`'s SUCCEED fails with an execution-scoped transport
-    /// error after a second, so `a`'s task registers the failure and writes
-    /// its terminal FAIL. The handler returns while that FAIL is in flight,
-    /// and the FAIL is answered without a token after the cleanup stopped
-    /// `a`'s task.
-    async fn fail_write_then_tokenless_after_handler(
+    /// error after a second.
+    async fn stopped_write_failure(
         handler_err: bool,
-    ) -> (Arc<WithdrawingClient>, serde_json::Value, RecordingFactory) {
+    ) -> (
+        Arc<WithdrawingClient>,
+        Result<serde_json::Value, lambda_runtime::Error>,
+        RecordingFactory,
+    ) {
         let client = WithdrawingClient::new(|_, updates| {
             if has(updates, "a", &OperationAction::Succeed) {
                 (
@@ -7402,49 +7457,51 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, move |_event, ctx| async move {
-            drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            if handler_err {
-                return Err::<u32, BoxError>("boom".into());
-            }
-            Ok(1)
-        })
+        let response = run_result(
+            &client,
+            false,
+            &factory,
+            &[],
+            move |_event, ctx| async move {
+                drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                if handler_err {
+                    return Err::<u32, BoxError>("boom".into());
+                }
+                Ok(1)
+            },
+        )
         .await;
         (client, response, factory)
     }
 
     #[tokio::test(start_paused = true)]
-    async fn handler_ok_end_ignores_failure_of_stopped_fail_write() {
-        let (client, response, factory) = fail_write_then_tokenless_after_handler(false).await;
-        assert_eq!(response, pending());
-        assert!(
-            has(&client.updates(), "a", &OperationAction::Fail),
-            "a's terminal FAIL was sent"
-        );
-        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
+    async fn failed_outcome_write_decides_over_handler_ok_and_sends_no_fail() {
+        let (client, response, factory) = stopped_write_failure(false).await;
+        assert!(no_fail(&client), "a's terminal FAIL is not sent");
+        last_request_has(&client, "a", &OperationAction::Succeed);
+        assert_failure_answer(ExecutionClientErrorScope::Execution, response, &factory);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn handler_err_end_ignores_failure_of_stopped_fail_write() {
-        let (client, response, factory) = fail_write_then_tokenless_after_handler(true).await;
-        assert_eq!(response, pending());
-        assert!(
-            has(&client.updates(), "a", &OperationAction::Fail),
-            "a's terminal FAIL was sent"
-        );
-        let (status, error) = factory.end();
-        assert_eq!(status, InvocationStatus::Pending);
-        let error = error.expect("the handler's error");
-        assert_eq!(error.error_message(), Some("boom"), "{error:?}");
+    async fn failed_outcome_write_decides_over_handler_err_and_sends_no_fail() {
+        let (client, response, factory) = stopped_write_failure(true).await;
+        assert!(no_fail(&client), "a's terminal FAIL is not sent");
+        last_request_has(&client, "a", &OperationAction::Succeed);
+        assert_failure_answer(ExecutionClientErrorScope::Execution, response, &factory);
     }
 
     /// Runs a handler whose step `a` SUCCEED fails with a transport error
     /// of `scope` after a second, while step `b`'s START waits behind it
-    /// and is answered without a token. Returns the client and the end.
+    /// and would be answered without a token. Returns the client, the
+    /// answer and the end.
     async fn earlier_client_error(
         scope: ExecutionClientErrorScope,
-    ) -> (Arc<WithdrawingClient>, serde_json::Value, RecordingFactory) {
+    ) -> (
+        Arc<WithdrawingClient>,
+        Result<serde_json::Value, lambda_runtime::Error>,
+        RecordingFactory,
+    ) {
         let client = WithdrawingClient::new(move |_, updates| {
             if has(updates, "a", &OperationAction::Succeed) {
                 (Answer::Fail(scope), Duration::from_secs(1))
@@ -7455,7 +7512,7 @@ mod withdrawal_tests {
             }
         });
         let factory = RecordingFactory::default();
-        let response = run(&client, false, &factory, |_event, ctx| async move {
+        let response = run_result(&client, false, &factory, &[], |_event, ctx| async move {
             let a = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
             tokio::time::sleep(Duration::from_millis(500)).await;
             let b = ctx.step(|_| async { Ok(2_u32) }).name("b").spawn();
@@ -7466,46 +7523,22 @@ mod withdrawal_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pending_wins_over_invocation_client_error() {
-        let (client, response, factory) =
-            earlier_client_error(ExecutionClientErrorScope::Invocation).await;
-        assert_eq!(response, pending());
-        assert!(has(&client.updates(), "b", &OperationAction::Start));
-        let (status, error) = factory.end();
-        assert_eq!(status, InvocationStatus::Pending);
-        let error = error.unwrap();
-        assert_eq!(
-            error.error_type(),
-            Some(crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE)
-        );
-        assert!(
-            error
-                .error_message()
-                .is_some_and(|m| m.contains("scripted checkpoint failure")),
-            "{error:?}"
-        );
+    async fn invocation_client_error_stops_the_write_waiting_behind_it() {
+        let scope = ExecutionClientErrorScope::Invocation;
+        let (client, response, factory) = earlier_client_error(scope).await;
+        assert!(!has(&client.updates(), "b", &OperationAction::Start));
+        last_request_has(&client, "a", &OperationAction::Succeed);
+        assert_failure_answer(scope, response, &factory);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pending_wins_over_execution_client_error() {
-        let (client, response, factory) =
-            earlier_client_error(ExecutionClientErrorScope::Execution).await;
-        assert_eq!(response, pending());
-        assert!(has(&client.updates(), "b", &OperationAction::Start));
+    async fn execution_client_error_stops_the_write_waiting_behind_it() {
+        let scope = ExecutionClientErrorScope::Execution;
+        let (client, response, factory) = earlier_client_error(scope).await;
+        assert!(!has(&client.updates(), "b", &OperationAction::Start));
+        last_request_has(&client, "a", &OperationAction::Succeed);
         assert!(no_fail(&client), "no terminal FAIL is sent");
-        let (status, error) = factory.end();
-        assert_eq!(status, InvocationStatus::Pending);
-        let error = error.unwrap();
-        assert_eq!(
-            error.error_type(),
-            Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
-        );
-        assert!(
-            error
-                .error_message()
-                .is_some_and(|m| m.contains("scripted checkpoint failure")),
-            "{error:?}"
-        );
+        assert_failure_answer(scope, response, &factory);
     }
 
     #[tokio::test(start_paused = true)]

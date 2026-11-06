@@ -523,15 +523,7 @@ where
             Some(start) if self.semantics == StepSemantics::AtLeastOncePerRetry => Some(start),
             Some(start) => {
                 if let Err(err) = start.await {
-                    // Audit (#43): step START: no user code has run for this
-                    // attempt, so there is no side effect needing a recorded
-                    // outcome. No terminal FAIL: the invocation dies, the
-                    // service re-invokes, and replay reaches this point and
-                    // attempts the same write, losing only one invocation.
-                    return self
-                        .ctx
-                        .checkpoint_failure_unrecoverable(wire_id, err, None)
-                        .await;
+                    return self.ctx.checkpoint_failure_unrecoverable(err).await;
                 }
                 if let Some(plugins) = self.ctx.plugins() {
                     self.operation_started(plugins, attempt > 1);
@@ -689,10 +681,7 @@ where
         if let Some(start) = start
             && let Err(err) = start.await
         {
-            return self
-                .ctx
-                .checkpoint_failure_unrecoverable(self.op_id.wire(), err, None)
-                .await;
+            return self.ctx.checkpoint_failure_unrecoverable(err).await;
         }
         Ok(())
     }
@@ -821,17 +810,7 @@ async fn handle_success<O, S: Serdes<O>>(
             let wire = crate::error::serialization_failure_wire(&op_err);
             let update = build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &wire);
             if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43): step FAIL (serialization): the body ran,
-                // so the failed FAIL write routes unrecoverable with a
-                // minimal retry: the record just attempted was already
-                // small, but a checkpoint-failure-derived one is the
-                // uniform terminal shape.
-                let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                let terminal =
-                    build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &cwire);
-                return ctx
-                    .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
-                    .await;
+                return ctx.checkpoint_failure_unrecoverable(client_err).await;
             }
             return Err(op_err
                 .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
@@ -842,18 +821,7 @@ async fn handle_success<O, S: Serdes<O>>(
     // Checkpoint SUCCEED with payload.
     let update = build_succeed_update(wire_id, name, sub_type, ctx.parent_wire_id(), &serialized);
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43): step SUCCEED: the body ran and its side effects
-        // need a recorded outcome, so a permanent rejection persists a
-        // small terminal FAIL (it goes through on a channel that rejected
-        // only the payload) before the execution fails. Yielding the
-        // failure instead would let the handler branch on a decision no
-        // checkpoint records, and re-invoking without a terminal record
-        // would re-run the body once per lap until the execution timeout.
-        let cwire = crate::error::checkpoint_failure_wire(&err);
-        let terminal = build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &cwire);
-        return ctx
-            .checkpoint_failure_unrecoverable(wire_id, err, Some(terminal))
-            .await;
+        return ctx.checkpoint_failure_unrecoverable(err).await;
     }
 
     if let Some(plugins) = ctx.plugins() {
@@ -949,17 +917,7 @@ async fn handle_failure(
                 delay_secs,
             );
             if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43): step RETRY: the body ran (and failed), so
-                // its side effects need a recorded outcome. A permanent
-                // rejection persists a small terminal FAIL before the
-                // execution fails; recorded retries replay, but a retry
-                // the service never recorded would not.
-                let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                let terminal =
-                    build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &cwire);
-                return ctx
-                    .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
-                    .await;
+                return ctx.checkpoint_failure_unrecoverable(client_err).await;
             }
             attempt_ended(crate::OperationStatus::Pending, false);
             Ok(())
@@ -968,17 +926,7 @@ async fn handle_failure(
             // Checkpoint FAIL (permanent).
             let update = build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &wire);
             if let Err(client_err) = ctx.checkpoint_updates(vec![update]).await {
-                // Audit (#43): step FAIL: the body ran, so the failed
-                // FAIL write routes unrecoverable with a minimal terminal
-                // FAIL retry (the original may have been rejected for its
-                // error payload's size; the checkpoint-failure-derived
-                // record is a few hundred bytes).
-                let cwire = crate::error::checkpoint_failure_wire(&client_err);
-                let terminal =
-                    build_fail_update(wire_id, name, sub_type, ctx.parent_wire_id(), &cwire);
-                return ctx
-                    .checkpoint_failure_unrecoverable(wire_id, client_err, Some(terminal))
-                    .await;
+                return ctx.checkpoint_failure_unrecoverable(client_err).await;
             }
             attempt_ended(crate::OperationStatus::Failed, true);
 
@@ -2449,10 +2397,11 @@ mod tests {
         }
     }
 
-    /// The terminal FAIL the SDK writes after the service rejects the
-    /// SUCCEED write carries the custom subtype.
+    /// The SUCCEED write the service rejects carries the custom subtype,
+    /// and no terminal FAIL follows it: the step's record stays at its
+    /// accepted START.
     #[tokio::test]
-    async fn custom_sub_type_on_terminal_fail_after_rejected_write() {
+    async fn custom_sub_type_on_rejected_write_and_no_terminal_fail() {
         use crate::client::TestResponse;
 
         let (ctx, client) = context_over(Vec::new());
@@ -2488,16 +2437,9 @@ mod tests {
 
         let updates = client.recorded_updates();
         let actions: Vec<OperationAction> = updates.iter().map(|u| u.action().clone()).collect();
-        assert_eq!(
-            actions,
-            [
-                OperationAction::Start,
-                OperationAction::Succeed,
-                OperationAction::Fail
-            ]
-        );
-        let terminal = updates.last().expect("the terminal FAIL is recorded");
-        assert_eq!(terminal.sub_type(), Some("Payment"));
+        assert_eq!(actions, [OperationAction::Start, OperationAction::Succeed]);
+        let rejected = updates.last().expect("the rejected SUCCEED is recorded");
+        assert_eq!(rejected.sub_type(), Some("Payment"));
     }
 
     /// A step body that fails with a typed error carrying error data.

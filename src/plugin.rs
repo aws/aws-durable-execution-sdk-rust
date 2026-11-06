@@ -256,6 +256,7 @@ pub trait Plugin: Send + Sync {
     ///    | completed the execution | `Succeeded` | the serialized result | `None` |
     ///    | failed the execution | `Failed` | `None` | the recorded error |
     ///    | suspended | `Pending` | `None` | `None` |
+    ///    | suspended after a checkpoint response without a token | `Pending` | `None` | the fatal error that decided the drive, else the handler's error, or `None` |
     ///    | failed itself after a retryable checkpoint or serdes failure | `Retrying` | `None` | the fault's type (`CheckpointUnrecoverableInvocationError` or `SerdesFailedError`) and message |
     ///    | panicked | `Retrying` | `None` | no type, and the panic's message |
     ///

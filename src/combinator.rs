@@ -991,9 +991,7 @@ async fn start_inputs<O: Send + 'static>(
         if let Some(start) = combinator_start(ctx, wire_id, name, run)
             && let Err(err) = start.await
         {
-            return ctx
-                .checkpoint_failure_unrecoverable(wire_id, err, None)
-                .await;
+            return ctx.checkpoint_failure_unrecoverable(err).await;
         }
         return Err(reject_unclaimed(ctx, &message));
     }
@@ -1442,15 +1440,7 @@ async fn checkpoint_succeed(
         .expect("all required OperationUpdate fields set");
 
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43): combinator SUCCEED: the winning branch(es) ran,
-        // so their side effects need a recorded outcome. A permanent
-        // rejection persists a small terminal FAIL before the execution
-        // fails.
-        let cwire = crate::error::checkpoint_failure_wire(&err);
-        let terminal = build_combinator_fail_update(ctx, wire_id, name, &cwire);
-        return ctx
-            .checkpoint_failure_unrecoverable(wire_id, err, Some(terminal))
-            .await;
+        return ctx.checkpoint_failure_unrecoverable(err).await;
     }
     if let Some(plugins) = ctx.plugins() {
         let info = combinator_info(ctx, wire_id, name)
@@ -1510,14 +1500,7 @@ async fn checkpoint_fail(
         .expect("all required OperationUpdate fields set");
 
     if let Err(err) = ctx.checkpoint_updates(vec![update]).await {
-        // Audit (#43): combinator FAIL: branch bodies ran; the failed
-        // FAIL write routes unrecoverable with a minimal terminal FAIL
-        // retry (the original carried the branch error's payload).
-        let cwire = crate::error::checkpoint_failure_wire(&err);
-        let terminal = build_combinator_fail_update(ctx, wire_id, name, &cwire);
-        return ctx
-            .checkpoint_failure_unrecoverable(wire_id, err, Some(terminal))
-            .await;
+        return ctx.checkpoint_failure_unrecoverable(err).await;
     }
     if let Some(plugins) = ctx.plugins() {
         let info = combinator_info(ctx, wire_id, name)
@@ -1527,44 +1510,6 @@ async fn checkpoint_fail(
         crate::plugin::operation_ended(plugins, &info);
     }
     Ok(())
-}
-
-/// Builds a combinator `FAIL` update carrying `wire` as its error: the
-/// terminal record persisted when the combinator's own outcome write was
-/// permanently rejected (issue #43).
-fn build_combinator_fail_update(
-    ctx: &DurableContext,
-    wire_id: &str,
-    name: Option<&str>,
-    wire: &crate::error::WireError,
-) -> aws_sdk_lambda::types::OperationUpdate {
-    use aws_sdk_lambda::types::{OperationAction, OperationType, OperationUpdate};
-
-    let mut builder = OperationUpdate::builder()
-        .id(wire_id.to_owned())
-        .r#type(OperationType::Context)
-        .sub_type(COMBINATOR_SUB_TYPE.to_owned())
-        .action(OperationAction::Fail)
-        .error(wire.to_error_object());
-    if let Some(n) = name {
-        builder = builder.name(n.to_owned());
-    }
-    if let Some(parent_wire) = ctx.parent_wire_id() {
-        builder = builder.parent_id(parent_wire);
-    }
-    // Within the plugin child operations depth, a failure record carries
-    // `ReplayChildren`, as JS writes it.
-    if ctx.preserves_children(1) {
-        builder = builder.context_options(
-            aws_sdk_lambda::types::ContextOptions::builder()
-                .replay_children(true)
-                .build(),
-        );
-    }
-    #[expect(clippy::expect_used)] // reason: all required fields are set above
-    builder
-        .build()
-        .expect("all required OperationUpdate fields set")
 }
 
 /// Creates a combinator internal `OperationError`; the message becomes
@@ -3562,17 +3507,6 @@ mod tests {
         .await;
         let update = depth_update(&client, &aws_sdk_lambda::types::OperationAction::Fail);
         assert_eq!(replay_children_of(&update), Some(true));
-    }
-
-    #[test]
-    fn combinator_replacement_fail_has_flag_within_depth() {
-        let wire = crate::error::WireError::default();
-        let (ctx, _client) = DurableContext::test_context_with_depth(1);
-        let update = build_combinator_fail_update(&ctx, "w", Some("g"), &wire);
-        assert_eq!(replay_children_of(&update), Some(true));
-        let (ctx, _client) = DurableContext::test_context_with_depth(0);
-        let update = build_combinator_fail_update(&ctx, "w", Some("g"), &wire);
-        assert!(update.context_options().is_none());
     }
 
     /// A recording context whose log holds a SUCCEEDED combinator record

@@ -22,16 +22,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
-use durable::Options;
 use durable::test_util::LocalRunner;
-
-/// The wire error type a checkpoint-write failure records: internal to
-/// the SDK, asserted here through the public `TestResult` surface.
-const CHECKPOINT_FAILED: &str = "CheckpointFailedError";
+use durable::{OperationStatus, Options};
 
 /// The wire `ErrorType` of the execution's `FAILED` record after a
-/// non-retryable checkpoint failure, as JS records it. The operation's
-/// terminal `FAIL` keeps [`CHECKPOINT_FAILED`].
+/// non-retryable checkpoint failure, as JS records it. The SDK writes no
+/// further update for any operation after the failure.
 const CHECKPOINT_EXECUTION_FAILED: &str = "CheckpointUnrecoverableExecutionError";
 
 /// Issue #43 acceptance test 1: a step whose result the service
@@ -42,8 +38,9 @@ const CHECKPOINT_EXECUTION_FAILED: &str = "CheckpointUnrecoverableExecutionError
 /// permanently rejects its SUCCEED write (the oversized-result shape). The
 /// old behavior looped: body runs, write rejected, invocation errors,
 /// re-invoke finds `Started`, body re-runs: until the execution timeout,
-/// side effects firing once per lap. Now the SDK persists a small terminal
-/// `FAIL` for the step and fails the execution in the same invocation.
+/// side effects firing once per lap. Now the SDK fails the execution in the
+/// same invocation and sends nothing more, so the step's record stays at
+/// its accepted `START`.
 #[tokio::test]
 async fn permanently_rejected_result_fails_execution_after_one_body_run() {
     let body_runs = Arc::new(AtomicU32::new(0));
@@ -92,21 +89,15 @@ async fn permanently_rejected_result_fails_execution_after_one_body_run() {
         "the FAILED envelope carries the unrecoverable-execution type"
     );
 
-    // The terminal FAIL persisted: the step's record claims exactly what
-    // executed (it ran, and its outcome could not be recorded), rather
-    // than a dangling `Started`.
+    // No terminal FAIL: the step's record stays at its last accepted
+    // update, the START, with no error.
     let step_op = result
         .operations()
         .iter()
         .find(|op| op.name() == Some("permanently-rejected"))
         .expect("the step's operation record exists");
-    assert!(
-        step_op.failed(),
-        "a terminal FAIL is recorded for the step whose result was \
-         rejected, ending the re-execution loop after one lap; got {}",
-        step_op.status()
-    );
-    assert_eq!(step_op.error_type(), Some(CHECKPOINT_FAILED));
+    assert_eq!(step_op.status(), OperationStatus::Started);
+    assert_eq!(step_op.error_type(), None);
 }
 
 /// Issue #43 acceptance test 2: a handler that wraps a step in a catch
@@ -824,11 +815,11 @@ async fn wfc_state_serialization_failure_persists_fail_and_replays_without_rerun
 /// Review finding 3, non-retryable half: a buffered outcome write whose
 /// contributor was dropped, the shape of a lost `race`/`select_ok` branch
 /// or any dropped `DurableFuture`, is rejected non-retryably. The SDK
-/// must write a terminal FAIL for the affected operation and fail the
-/// execution, instead of reporting completion while the operation's
-/// record claims less than what executed.
+/// fails the execution instead of reporting completion, and writes no
+/// further update, so the operation's record stays at its accepted
+/// `START`.
 #[tokio::test]
-async fn nonretryable_flush_failure_terminalizes_dropped_contributor_and_fails_execution() {
+async fn nonretryable_flush_failure_of_dropped_contributor_fails_execution() {
     let body_runs = Arc::new(AtomicU32::new(0));
     let body_runs_h = Arc::clone(&body_runs);
 
@@ -891,19 +882,13 @@ async fn nonretryable_flush_failure_terminalizes_dropped_contributor_and_fails_e
     );
     assert_eq!(result.error_type(), Some(CHECKPOINT_EXECUTION_FAILED));
 
-    // The terminal FAIL persisted for the orphaned operation.
+    // No terminal FAIL: the orphan's record stays at its accepted START.
     let orphan_op = result
         .operations()
         .iter()
         .find(|op| op.name() == Some("orphan"))
         .expect("the orphaned step's operation record exists");
-    assert!(
-        orphan_op.failed(),
-        "a terminal FAIL is recorded for the operation whose buffered \
-         outcome was rejected; got {}",
-        orphan_op.status()
-    );
-    assert_eq!(orphan_op.error_type(), Some(CHECKPOINT_FAILED));
+    assert_eq!(orphan_op.status(), OperationStatus::Started);
 }
 
 /// Review finding 3, retryable half: a buffered outcome write whose

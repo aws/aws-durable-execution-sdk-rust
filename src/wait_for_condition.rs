@@ -484,10 +484,7 @@ where
         if let Some(start) = start
             && let Err(err) = start.await
         {
-            return self
-                .ctx
-                .checkpoint_failure_unrecoverable(self.op_id.wire(), err, None)
-                .await;
+            return self.ctx.checkpoint_failure_unrecoverable(err).await;
         }
         Ok(())
     }
@@ -544,11 +541,7 @@ where
                             &wire,
                         );
                         if let Err(client_err) = self.ctx.checkpoint_updates(vec![update]).await {
-                            // Audit (#43): wfc FAIL (serialization): the
-                            // check ran; the failed FAIL write routes
-                            // unrecoverable with a minimal terminal FAIL
-                            // retry.
-                            return self.checkpoint_unrecoverable(client_err).await;
+                            return self.ctx.checkpoint_failure_unrecoverable(client_err).await;
                         }
                         return Err(op_err
                             .with_operation(wire_id, CheckpointStatus::Failed.wire_str())
@@ -578,11 +571,7 @@ where
                             None,
                         );
                         if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-                            // Audit (#43): wfc SUCCEED: the check ran, so
-                            // its side effects need a recorded outcome. A
-                            // permanent rejection persists a small
-                            // terminal FAIL before the execution fails.
-                            return self.checkpoint_unrecoverable(err).await;
+                            return self.ctx.checkpoint_failure_unrecoverable(err).await;
                         }
                         self.check_ended(
                             attempt,
@@ -608,12 +597,7 @@ where
                             Some(delay_secs),
                         );
                         if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-                            // Audit (#43): wfc RETRY: the check ran; a
-                            // retry the service never recorded would not
-                            // replay, so a permanent rejection persists a
-                            // small terminal FAIL before the execution
-                            // fails.
-                            return self.checkpoint_unrecoverable(err).await;
+                            return self.ctx.checkpoint_failure_unrecoverable(err).await;
                         }
                         self.check_ended(
                             attempt,
@@ -642,11 +626,7 @@ where
                             &wire,
                         );
                         if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-                            // Audit (#43): wfc FAIL (strategy exhausted):
-                            // the check ran; the failed FAIL write routes
-                            // unrecoverable with a minimal terminal FAIL
-                            // retry.
-                            return self.checkpoint_unrecoverable(err).await;
+                            return self.ctx.checkpoint_failure_unrecoverable(err).await;
                         }
                         self.check_ended(
                             attempt,
@@ -677,11 +657,7 @@ where
                     &wire,
                 );
                 if let Err(err) = self.ctx.checkpoint_updates(vec![update]).await {
-                    // Audit (#43): wfc FAIL (check error): the check ran
-                    // and failed; the failed FAIL write routes
-                    // unrecoverable with a minimal terminal FAIL retry
-                    // (the original carried the check error's payload).
-                    return self.checkpoint_unrecoverable(err).await;
+                    return self.ctx.checkpoint_failure_unrecoverable(err).await;
                 }
                 self.check_ended(attempt, crate::OperationStatus::Failed, None, Some(&wire));
 
@@ -737,27 +713,6 @@ where
                 ends_operation: status != crate::OperationStatus::Pending,
             },
         );
-    }
-
-    /// Routes a rejected outcome write through the unrecoverable path
-    /// (issue #43), never returning. The check ran at every settle site,
-    /// so each supplies a small checkpoint-failure-derived terminal `FAIL`:
-    /// the record persisted before the execution dies when the
-    /// rejection is permanent.
-    async fn checkpoint_unrecoverable<T: crate::context::NoRuntimeOutcome>(
-        &self,
-        err: crate::client::ExecutionClientError,
-    ) -> T {
-        let cwire = crate::error::checkpoint_failure_wire(&err);
-        let terminal = build_wfc_fail_update(
-            self.op_id.wire(),
-            self.name.as_deref(),
-            self.ctx.parent_wire_id(),
-            &cwire,
-        );
-        self.ctx
-            .checkpoint_failure_unrecoverable(self.op_id.wire(), err, Some(terminal))
-            .await
     }
 }
 

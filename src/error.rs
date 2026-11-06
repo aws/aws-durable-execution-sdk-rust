@@ -522,13 +522,6 @@ pub(crate) fn wire_error_with_type(err: &(dyn Error + 'static), error_type: &str
         .with_stack_trace(stack_trace)
 }
 
-/// The wire `ErrorType` recorded when a checkpoint write itself failed:
-/// on the terminal `FAIL` record a permanent rejection persists for the
-/// operation, and on the `FAILED` envelope that then ends the execution.
-/// A handler never observes this type: checkpoint failures unwind the
-/// handler through the unrecoverable path (issue #43).
-pub(crate) const CHECKPOINT_FAILED_ERROR_TYPE: &str = "CheckpointFailedError";
-
 /// The error type of the fault that a retryable checkpoint failure records.
 /// It ends the invocation, and the next invocation can recover. JS throws an
 /// error of this class in the same case.
@@ -586,24 +579,11 @@ pub(crate) fn serialization_failure_wire(err: &(dyn Error + 'static)) -> WireErr
 /// [`WaitDecision::Exhausted`]: crate::builders::wait_for_condition::WaitDecision::Exhausted
 pub(crate) const WFC_EXHAUSTED_ERROR_TYPE: &str = "WaitForCondition.MaxChecksExceeded";
 
-/// Builds the small wire record a terminal `FAIL` carries when the
-/// operation's own outcome write was permanently rejected (issue #43).
-///
-/// Deliberately derived from the *checkpoint failure*, not from the
-/// operation's payload: the whole point of this record is that it is a
-/// few hundred bytes and goes through on a channel that rejected only
-/// the payload, ending the re-execution loop after one lap.
-pub(crate) fn checkpoint_failure_wire(err: &impl fmt::Display) -> WireError {
-    WireError::new(
-        Some(CHECKPOINT_FAILED_ERROR_TYPE),
-        Some(format!("checkpoint write failed: {err}")),
-    )
-}
-
 /// The wire `ErrorType` of the execution's `FAILED` record after a
 /// non-retryable checkpoint failure. It is the type JS records for its
-/// `CheckpointUnrecoverableExecutionError`. The operation's own terminal
-/// `FAIL` keeps [`CHECKPOINT_FAILED_ERROR_TYPE`].
+/// `CheckpointUnrecoverableExecutionError`. The SDK writes no further
+/// update for any operation after the failure, so each operation's record
+/// stays at the last update the service accepted.
 pub(crate) const CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE: &str =
     "CheckpointUnrecoverableExecutionError";
 
