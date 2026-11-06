@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
 use durable::plugin::{HookWork, InvocationInfo, OperationInfo, Plugin, PluginFactory};
-use durable::test_util::{LocalRunner, TestResult};
-use durable::{BoxError, DurableContext, Options};
+use durable::test_util::{LocalRunner, TestOperation, TestResult};
+use durable::{BoxError, DurableContext, OperationStatus, Options};
 
 /// Runs `handler` with the unit event, under a 20 second limit.
 async fn run<F, Fut>(handler: F) -> TestResult<u32>
@@ -594,6 +594,12 @@ fn assert_refused_at_execute(result: &TestResult<u32>) {
     );
 }
 
+/// Asserts the operation named `name` was recorded and has no outcome.
+fn assert_no_outcome(result: &TestResult<u32>, name: &str) {
+    let status = result.operation(name).map(TestOperation::status);
+    assert_eq!(status, Some(OperationStatus::Started), "{name:?}\n{result}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handler_wait_resumed_on_raw_task_is_refused() {
     // The handler polls the wait until it suspends, so its execution entry
@@ -603,11 +609,17 @@ async fn handler_wait_resumed_on_raw_task_is_refused() {
     let result = run(|(), ctx: DurableContext| async move {
         let mut wait = Box::pin(ctx.wait(Duration::from_secs(60)).name("w").into_future());
         assert!(poll_once(&mut wait).await, "the wait suspends");
+        // Keep SDK activity live; invocation cleanup aborts this pending step.
+        let _hold = ctx
+            .step(|_| std::future::pending::<Result<u32, BoxError>>())
+            .name("hold")
+            .spawn();
         let _ = tokio::spawn(async move { poll_once(&mut wait).await }).await?;
         after(&ctx).await
     })
     .await;
     assert_refused_at_execute(&result);
+    assert_no_outcome(&result, "w");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -619,11 +631,17 @@ async fn handler_callback_result_resumed_on_raw_task_is_refused() {
         let cb = ctx.create_callback::<u32>().name("approval").await?;
         let mut pending = Box::pin(cb.result());
         assert!(poll_once(&mut pending).await, "the result suspends");
+        // Keep SDK activity live; invocation cleanup aborts this pending step.
+        let _hold = ctx
+            .step(|_| std::future::pending::<Result<u32, BoxError>>())
+            .name("hold")
+            .spawn();
         let _ = tokio::spawn(async move { poll_once(&mut pending).await }).await?;
         after(&ctx).await
     })
     .await;
     assert_refused_at_execute(&result);
+    assert_no_outcome(&result, "approval");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
