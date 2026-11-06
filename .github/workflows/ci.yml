@@ -22,10 +22,26 @@ jobs:
   # this job, the `dependencies` job and the `msrv` job.
   check:
     name: check (sdk)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Pushes and same-repository pull requests run on the CodeBuild-hosted
+    # runner: the CodeBuild project github-actions-runner, one fresh
+    # container per job, 60-minute build limit. The label must match the
+    # project name. Fork and Dependabot pull requests run on ubuntu-latest,
+    # so the build scripts and procedural macros of a dependency update do
+    # not run in the CodeBuild account before a maintainer reviews them.
+    # This is routing, not a trust boundary: for forks, the boundary is the
+    # repository's approval setting for fork pull request workflows.
+    #
+    # This job alone asks for the large instance (16 GiB, as ubuntu-latest
+    # has): one rustc compiling the SDK's unit tests peaks above 7 GiB, and
+    # on the project's default instance the kernel killed it.
+    runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}-large', github.run_id, github.run_attempt) }}
+    # Below the 60-minute build limit, so GitHub ends a stuck job and
+    # reports it, rather than CodeBuild stopping the runner.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: |
@@ -44,10 +60,13 @@ jobs:
   # would then be wrong rather than protective.
   msrv:
     name: check (msrv 1.94.1)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Same routing and timeout as the check job, on the default instance.
+    runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: |
@@ -64,10 +83,13 @@ jobs:
   # direct-dependency allowlist that keeps the production graph closed.
   dependencies:
     name: dependencies
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Same routing and timeout as the check job, on the default instance.
+    runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -90,10 +112,13 @@ jobs:
   # two together, here and in scripts/tools.sh.
   external-types:
     name: public API (external types)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Same routing and timeout as the check job, on the default instance.
+    runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: |
@@ -125,10 +150,13 @@ jobs:
   # build rather than assumed to (issue #39).
   feature-powerset:
     name: feature powerset
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Same routing and timeout as the check job, on the default instance.
+    runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -147,8 +175,9 @@ jobs:
   # CI still compiles both so a public API change cannot silently break them.
   workspaces:
     name: build (${{ matrix.workspace }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Same routing and timeout as the check job, on the default instance.
+    runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -158,10 +187,15 @@ jobs:
 
       # These workspaces' dependency graphs fill the default runner disk
       # (the examples build has died linking with "no space left"); reclaim
-      # the space taken by preinstalled toolchains we never use.
+      # the space taken by preinstalled toolchains we never use. Only the
+      # GitHub-hosted image is short on disk; the CodeBuild image has a
+      # large volume and a different package set.
       - uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        if: runner.environment == 'github-hosted'
         with:
           tool-cache: false
+
+      - uses: ./.github/actions/ensure-rustup
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
