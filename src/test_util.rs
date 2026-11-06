@@ -1640,6 +1640,10 @@ pub struct LocalRunner {
     /// checkpoint request (see
     /// [`checkpoint_latency`](Self::checkpoint_latency)). Zero by default.
     checkpoint_latency: std::time::Duration,
+    /// The number of checkpoint requests answered with a token before the
+    /// one answered without (see
+    /// [`withdraw_checkpoints_after`](Self::withdraw_checkpoints_after)).
+    withdraw_after: Option<usize>,
 }
 
 impl Default for LocalRunner {
@@ -1679,6 +1683,7 @@ impl LocalRunner {
             checkpoint_failure_skip: 0,
             checkpoint_failures_retryable: false,
             checkpoint_latency: std::time::Duration::ZERO,
+            withdraw_after: None,
         }
     }
 
@@ -1865,6 +1870,31 @@ impl LocalRunner {
         self.checkpoint_failure_skip = skip;
         self.checkpoint_failures = count;
         self.checkpoint_failures_retryable = true;
+        self
+    }
+
+    /// Answers checkpoint request number `n + 1` of the execution without a
+    /// token, once.
+    ///
+    /// The count is 1-based over the checkpoint requests the execution
+    /// receives, across invocations. The backend applies that request and
+    /// returns no `CheckpointToken`, as the service does when it accepts no
+    /// further checkpoints from an invocation. The SDK then sends nothing
+    /// more and answers `PENDING`. The runner invokes the function again at
+    /// once, as after an invocation fault, and the next invocation replays
+    /// the accepted updates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::test_util::LocalRunner;
+    ///
+    /// let runner = LocalRunner::new().withdraw_checkpoints_after(1);
+    /// # drop(runner);
+    /// ```
+    #[must_use]
+    pub fn withdraw_checkpoints_after(mut self, n: usize) -> Self {
+        self.withdraw_after = Some(n);
         self
     }
 
@@ -2113,6 +2143,7 @@ impl LocalRunner {
         nested.checkpoint_failures = defaults.checkpoint_failures;
         nested.checkpoint_failure_skip = defaults.checkpoint_failure_skip;
         nested.checkpoint_failures_retryable = defaults.checkpoint_failures_retryable;
+        nested.withdraw_after = defaults.withdraw_after;
         nested
     }
 
@@ -2201,6 +2232,7 @@ impl LocalRunner {
             std::sync::atomic::Ordering::SeqCst,
         );
         backend.checkpoint_latency = self.checkpoint_latency;
+        backend.withdraw_at = self.withdraw_after.map(|n| n.saturating_add(1));
         backend
     }
 
@@ -2387,6 +2419,11 @@ impl LocalRunner {
                 ),
                 Some("FAILED") => RawEnd::Failed(envelope_wire_error(&response)),
                 Some("PENDING") => {
+                    // A withdrawn checkpoint token ends the invocation as an
+                    // invocation fault does: the next one starts at once.
+                    if backend.take_withdrawal() {
+                        continue;
+                    }
                     // Pending invokes run before the clock moves. When one
                     // of them changed its record, the next invocation
                     // starts without an advance.
@@ -3614,6 +3651,12 @@ struct Backend {
     /// The names registered on the runner as invoke targets. A chained
     /// invoke `START` for any other name is rejected.
     registered_functions: BTreeSet<String>,
+    /// The 1-based number of the checkpoint request answered without a
+    /// token (see [`LocalRunner::withdraw_checkpoints_after`]).
+    withdraw_at: Option<usize>,
+    /// Set when a request was answered without a token, and taken by the
+    /// runner after the invocation answered `PENDING`.
+    withdrew: std::sync::atomic::AtomicBool,
     /// Per-call checkpoint plan (in-crate test seam): while non-empty,
     /// each `checkpoint` call pops and obeys the front entry instead of
     /// the counter-based injection (see
@@ -3665,6 +3708,8 @@ impl Backend {
             checkpoint_failures_retryable: std::sync::atomic::AtomicBool::new(false),
             checkpoint_latency: std::time::Duration::ZERO,
             registered_functions: BTreeSet::new(),
+            withdraw_at: None,
+            withdrew: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             checkpoint_plan: Mutex::new(std::collections::VecDeque::new()),
         }
@@ -4484,8 +4529,39 @@ impl Backend {
         updates: &[OperationUpdate],
     ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + 'a>>
     {
-        self.checkpoint_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let number = self
+            .checkpoint_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        let answer = self.checkpoint_counted(updates);
+        if self.withdraw_at != Some(number) {
+            return answer;
+        }
+        // `LocalRunner::withdraw_checkpoints_after`: the request is applied,
+        // and its answer carries no token.
+        Box::pin(async move {
+            let output = answer.await?;
+            self.withdrew
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(CheckpointOutput {
+                checkpoint_token: None,
+                ..output
+            })
+        })
+    }
+
+    /// Whether a request was answered without a token since the last call.
+    fn take_withdrawal(&self) -> bool {
+        self.withdrew
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// [`Self::checkpoint_now`] after the request was counted.
+    fn checkpoint_counted<'a>(
+        &'a self,
+        updates: &[OperationUpdate],
+    ) -> Pin<Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + 'a>>
+    {
         // In-crate test seam: a per-call plan (see
         // [`Backend::plan_checkpoint_calls`]) takes precedence over the
         // counter-based injection below while entries remain.

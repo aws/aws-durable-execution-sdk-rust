@@ -1559,16 +1559,13 @@ mod tests {
     const FIRST_ROOT_WIRE_ID: &str =
         "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b";
 
-    /// Drives `wrap` over `sdk_client` with a one-step handler whose step
-    /// the initial state already records as `STARTED`, so the step writes
-    /// no START and its first request is its SUCCEED. Returns the response.
+    /// Drives `wrap` over `sdk_client` with a one-step handler on a fresh
+    /// execution, so the step's first request is its START. Returns the
+    /// response.
     ///
     /// Checkpoint batching is off, so each checkpoint is its own request
-    /// and a test can count the requests. With batching on, the end of
-    /// the invocation sends one more terminal `FAIL` for the step whose
-    /// batched `SUCCEED` got no token, because the step's own `FAIL` also
-    /// got no token and so the log does not show the step terminal.
-    async fn invoke_started_step(sdk_client: aws_sdk_lambda::Client) -> serde_json::Value {
+    /// and a test can count the requests.
+    async fn invoke_one_step(sdk_client: aws_sdk_lambda::Client) -> serde_json::Value {
         let service = crate::wrap(
             |_event: serde_json::Value, ctx: crate::DurableContext| async move {
                 let value: u32 = ctx.step(|_| async { Ok(7_u32) }).name("one").await?;
@@ -1591,14 +1588,6 @@ mod tests {
                             "Type": "Execution",
                             "Status": "STARTED",
                             "ExecutionDetails": { "InputPayload": "{}" }
-                        },
-                        {
-                            "Id": FIRST_ROOT_WIRE_ID,
-                            "Type": "Step",
-                            "SubType": "Step",
-                            "Name": "one",
-                            "Status": "STARTED",
-                            "StepDetails": { "Attempt": 1 }
                         }
                     ]
                 }
@@ -1608,15 +1597,20 @@ mod tests {
         service(event)
             .await
             .map(|response| response.0)
-            .expect("a tokenless response fails the execution, not the invocation")
+            .expect("a tokenless response answers PENDING, not an invocation error")
     }
 
-    /// Every mocked checkpoint response has no `CheckpointToken`. The
-    /// transport reports `None`, and `DurableContext` maps it to the
-    /// non-retryable error the transport returned before, which fails the
-    /// execution after the step's terminal `FAIL`.
+    /// Every mocked checkpoint response has no `CheckpointToken`.
+    ///
+    /// (a) The transport reports the response as `Ok` with no token.
+    /// (b) A request without an `EXECUTION` update withdraws the token: the
+    /// handler answers exactly `{"Status":"PENDING"}` after one request,
+    /// the step's START, and sends no terminal `FAIL`.
+    /// (c) A request with an `EXECUTION` update is exempt: the call returns
+    /// `Ok`, no latch is set, the phase stays `Running`, and no WARN is
+    /// logged.
     #[tokio::test]
-    async fn checkpoint_output_without_token_is_non_retryable_until_withdrawal_lands() {
+    async fn checkpoint_output_without_token_answers_pending_unless_execution_update() {
         use std::sync::{Arc, Mutex as StdMutex};
 
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
@@ -1628,8 +1622,7 @@ mod tests {
             .expect("a tokenless response is Ok");
         assert_eq!(output.checkpoint_token(), None);
 
-        // Capture each request's updates, so the terminal FAIL can be read
-        // from the second request.
+        // Capture each request's updates.
         let requests: Arc<StdMutex<Vec<Vec<OperationUpdate>>>> = Arc::default();
         let seen = Arc::clone(&requests);
         let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
@@ -1641,43 +1634,58 @@ mod tests {
             })
             .then_output(|| CheckpointDurableExecutionOutput::builder().build());
         let response =
-            invoke_started_step(mock_client!(aws_sdk_lambda, RuleMode::MatchAny, [&rule])).await;
-
-        assert_eq!(
-            response.get("Status").and_then(serde_json::Value::as_str),
-            Some("FAILED"),
-            "unexpected response: {response}"
-        );
-        let error = response
-            .get("Error")
-            .expect("a FAILED envelope has an Error");
-        assert_eq!(
-            error.get("ErrorType").and_then(serde_json::Value::as_str),
-            Some("CheckpointUnrecoverableExecutionError")
-        );
-        assert_eq!(
-            error
-                .get("ErrorMessage")
-                .and_then(serde_json::Value::as_str),
-            Some(
-                "[Unrecoverable Execution] Checkpoint failed: backend returned no checkpoint token"
-            )
-        );
-
+            invoke_one_step(mock_client!(aws_sdk_lambda, RuleMode::MatchAny, [&rule])).await;
+        assert_eq!(response, serde_json::json!({ "Status": "PENDING" }));
         let requests = requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        assert_eq!(requests.len(), 2, "{requests:?}");
-        let fail = requests
-            .get(1)
-            .and_then(|second| second.iter().find(|u| u.action() == &OperationAction::Fail))
-            .expect("the second request carries the step's terminal FAIL");
-        assert_eq!(fail.id(), FIRST_ROOT_WIRE_ID);
-        assert_eq!(fail.r#type(), &OperationType::Step);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let first = requests.first().expect("one request");
+        assert_eq!(first.len(), 1, "{first:?}");
+        let start = first.first().expect("the step's START");
+        assert_eq!(start.id(), FIRST_ROOT_WIRE_ID);
+        assert_eq!(start.action(), &OperationAction::Start);
+        assert!(
+            requests
+                .iter()
+                .flatten()
+                .all(|u| u.action() != &OperationAction::Fail),
+            "no terminal FAIL is sent: {requests:?}"
+        );
+
+        let (messages, _guard) = crate::driver::test_support::EventMessages::install();
+        let rule = mock!(aws_sdk_lambda::Client::checkpoint_durable_execution)
+            .then_output(|| CheckpointDurableExecutionOutput::builder().build());
+        let ctx = crate::DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::new(LambdaExecutionClient::new(mock_client!(
+                aws_sdk_lambda,
+                [&rule]
+            ))),
+            "tok".to_owned(),
+        );
+        let succeed = OperationUpdate::builder()
+            .id("root")
+            .r#type(OperationType::Execution)
+            .action(OperationAction::Succeed)
+            .payload("1")
+            .build()
+            .expect("valid update");
+        ctx.checkpoint_updates_direct(vec![succeed])
+            .await
+            .expect("an EXECUTION update is exempt from withdrawal");
+        assert!(!ctx.coordinator().withdrawn());
         assert_eq!(
-            fail.error().and_then(|e| e.error_type()),
-            Some(crate::error::CHECKPOINT_FAILED_ERROR_TYPE)
+            ctx.coordinator().phase(),
+            crate::coordinator::Phase::Running
+        );
+        assert!(
+            messages.at(tracing::Level::WARN).is_empty(),
+            "{:?}",
+            messages.at(tracing::Level::WARN)
         );
     }
 

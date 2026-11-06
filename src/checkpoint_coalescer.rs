@@ -42,6 +42,12 @@
 //!   "retryable exhaustion fails the invocation with no further writes").
 //!   The terminal `FAIL` writes of the non-retryable classification are
 //!   unaffected: they go through the direct (uncoalesced) path.
+//! - When a checkpoint response has no token, the SDK sends nothing more
+//!   this invocation (see `InvocationCoordinator::withdraw`). The
+//!   withdrawal drops the open batch unpublished with its permits (see
+//!   [`CheckpointCoalescer::abandon_pending`]), so its
+//!   contributors never resolve. A flusher that already claimed a batch
+//!   drops it unpublished when it reaches the checkpoint-token lock.
 //! - The flush itself runs on a spawned task (see
 //!   `DurableContext::spawn_batch_flush`), so a contributor that is dropped
 //!   mid-await (a lost `race`, for example) cannot cancel an in-flight batch
@@ -668,6 +674,22 @@ impl CheckpointCoalescer {
     ) -> Option<(Arc<CheckpointBatch>, Vec<TrackedUpdate>, BatchPermits)> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         take_open(&mut state)
+    }
+
+    /// Drops the open batch without publishing it, with its updates and
+    /// its permits. The withdrawal of the checkpoint token calls it (see
+    /// `InvocationCoordinator::withdraw`), so the batch's contributors
+    /// never resolve. A hold on the batch stays counted until its
+    /// reservation is released, as every reservation is when it drops; a
+    /// flusher waiting for the holds then finds no batch. Returns the
+    /// permits, so the caller releases them outside the buffer lock.
+    pub(crate) fn abandon_pending(&self) -> BatchPermits {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.batch = None;
+        state.pending.clear();
+        BatchPermits {
+            held: std::mem::take(&mut state.permits),
+        }
     }
 
     /// Retains a checkpoint write failure for the end-of-invocation flush

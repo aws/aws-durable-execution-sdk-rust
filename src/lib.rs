@@ -1534,12 +1534,14 @@ where
             && retained.any_non_retryable()
         {
             let (response, end) = flush_failure_response(&retained, outcome, flush_ctx).await;
+            let (response, end) = driver::withdrawal_answer(flush_ctx, response, end);
             let late =
                 end_invocation(plugins, end_log, flush_ctx, end, Some(&response), fatal_won).await;
             return Finished::Respond(response, late);
         }
     } else if let Err(flush) = flush_ctx.flush_pending_checkpoints().await {
         let (response, end) = flush_failure_response(&flush, outcome, flush_ctx).await;
+        let (response, end) = driver::withdrawal_answer(flush_ctx, response, end);
         let late =
             end_invocation(plugins, end_log, flush_ctx, end, Some(&response), fatal_won).await;
         return Finished::Respond(response, late);
@@ -1569,6 +1571,7 @@ where
     // `ListDurableExecutionsByFunction`) instead. See the rustdoc on
     // [`run`] and [`wrap`].
     let (response, end) = outcome_envelope(outcome, flush_ctx);
+    let (response, end) = driver::withdrawal_answer(flush_ctx, response, end);
     let late = end_invocation(plugins, end_log, flush_ctx, end, Some(&response), fatal_won).await;
     Finished::Respond(response, late)
 }
@@ -1821,6 +1824,8 @@ async fn flush_failure_response(
         "non-retryable failure flushing coalesced checkpoints; recording terminal \
          FAILs for the affected operations and failing the execution"
     );
+    // After a withdrawn checkpoint token this sends nothing, and the
+    // invocation answers `PENDING` (see `driver::withdrawal_answer`).
     ctx.terminalize_unwritten_outcomes(flush).await;
 
     let failed = match outcome {
@@ -1843,7 +1848,7 @@ async fn flush_failure_response(
 /// durable service re-invokes (issue #43).
 ///
 /// It also returns how the invocation ended, for the plugins' end hooks.
-fn outcome_envelope(
+pub(crate) fn outcome_envelope(
     outcome: driver::InvocationOutcome,
     ctx: &DurableContext,
 ) -> (

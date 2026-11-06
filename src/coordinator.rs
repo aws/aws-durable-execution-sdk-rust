@@ -64,6 +64,19 @@
 //! `wait_for_condition` started on its own task is refreshed only once its
 //! handle is first polled. A step retry is refreshed whether or not it is
 //! awaited.
+//!
+//! # Checkpoint token withdrawal
+//!
+//! A checkpoint response without a `CheckpointToken`, to a request that
+//! holds no `EXECUTION` update, means the service accepts no further
+//! checkpoints from this invocation. [`InvocationCoordinator::withdraw`]
+//! sets the withdrawal latch, which closes admission at once, logs one
+//! WARN, drops every queued write without resolving its caller, and then
+//! moves the phase to [`Phase::Suspending`]. From then on no checkpoint
+//! request is sent: a request that already waited for the
+//! checkpoint-token lock sees the latch there and is dropped unresolved
+//! too. The invocation answers `PENDING` on every exit that returns a
+//! response or a Lambda error.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -121,6 +134,11 @@ fn refresh_delay(unchanged: u32) -> Duration {
         Duration::from_secs(u64::from(unchanged)).min(REFRESH_INTERVAL_CEILING)
     }
 }
+
+/// The message of the WARN that [`InvocationCoordinator::withdraw`] logs.
+pub(crate) const WITHDRAWAL_WARNING: &str = "Checkpoint response contained no CheckpointToken: \
+     the service will accept no further checkpoints from this invocation. Suspending; the \
+     execution continues on the next invocation.";
 
 /// The phase of one invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +242,14 @@ struct State {
     driver: Option<Waker>,
     /// The Lambda deadline in tokio time, set when the drive starts.
     deadline: Option<Instant>,
+    /// The withdrawal latch: set when a checkpoint response had no token
+    /// (see [`InvocationCoordinator::withdraw`]). It is never cleared.
+    withdrawn: bool,
+    /// The checkpoint failures that a live caller has yet to record, by
+    /// registration order (see [`InvocationCoordinator::displaced_candidate`]).
+    candidates: BTreeMap<u64, FatalError>,
+    /// The ID of the next entry of `candidates`.
+    next_candidate: u64,
     /// The wire ID of each registration [`InvocationCoordinator::wake_operations`]
     /// woke, in the order it woke them.
     #[cfg(test)]
@@ -235,7 +261,10 @@ impl State {
     /// waker to wake after the lock is released.
     fn check_suspension(&mut self) -> Option<Waker> {
         let quiescent = self.activity == 0 && self.checkpoint == 0 && self.scheduler == 0;
+        // After the withdrawal latch, `InvocationCoordinator::withdraw`
+        // moves the phase itself, once the queued writes are dropped.
         if self.phase == Phase::Running
+            && !self.withdrawn
             && quiescent
             && !self.waits.is_empty()
             && self.fatal.is_none()
@@ -245,6 +274,13 @@ impl State {
             return self.driver.clone();
         }
         None
+    }
+
+    /// Whether a permit or a wait registration can be taken: the phase is
+    /// `Running` and the withdrawal latch is not set. The latch closes
+    /// admission in the same lock that sets it, before the phase moves.
+    fn admits(&self) -> bool {
+        self.phase == Phase::Running && !self.withdrawn
     }
 
     /// Whether a buffered checkpoint write must stop waiting out its
@@ -288,6 +324,29 @@ pub(crate) struct InvocationCoordinator {
     clock: (Instant, SystemTime),
 }
 
+/// A checkpoint failure that a live caller has yet to record (see
+/// [`InvocationCoordinator::displaced_candidate`]). Dropping it before the
+/// withdrawal latch is set removes the failure.
+#[must_use = "dropping the candidate releases it"]
+pub(crate) struct DisplacedCandidate {
+    coordinator: Arc<InvocationCoordinator>,
+    id: u64,
+    consumed: bool,
+}
+
+impl DisplacedCandidate {
+    /// Removes the failure whatever the latch: the caller took it over.
+    pub(crate) fn consume(mut self) {
+        self.consumed = true;
+    }
+}
+
+impl Drop for DisplacedCandidate {
+    fn drop(&mut self) {
+        self.coordinator.release_candidate(self.id, self.consumed);
+    }
+}
+
 impl InvocationCoordinator {
     /// Creates a coordinator in the `Running` phase with no permit and no
     /// registration.
@@ -305,6 +364,9 @@ impl InvocationCoordinator {
                 panic_open: true,
                 driver: None,
                 deadline: None,
+                withdrawn: false,
+                candidates: BTreeMap::new(),
+                next_candidate: 0,
                 #[cfg(test)]
                 wake_log: Vec::new(),
             }),
@@ -335,10 +397,10 @@ impl InvocationCoordinator {
     }
 
     /// Takes a permit of `kind`. Returns `None` once the phase is not
-    /// `Running`.
+    /// `Running`, or once the withdrawal latch is set.
     pub(crate) fn acquire(self: &Arc<Self>, kind: PermitKind) -> Option<Permit> {
         let mut state = self.lock();
-        if state.phase != Phase::Running {
+        if !state.admits() {
             return None;
         }
         match kind {
@@ -362,7 +424,7 @@ impl InvocationCoordinator {
 
     /// Registers a wait on the record of `wire_id`, woken through `waker`
     /// when a merged response carries that operation. Returns `None` once
-    /// the phase is not `Running`.
+    /// the phase is not `Running`, or once the withdrawal latch is set.
     ///
     /// `due_at` and `status` are the record's end time and status when the
     /// wait starts. `awaited` is the first-poll flag of a handle started on
@@ -379,7 +441,7 @@ impl InvocationCoordinator {
     ) -> Option<WaitRegistration> {
         let now = Instant::now();
         let mut state = self.lock();
-        if state.phase != Phase::Running {
+        if !state.admits() {
             return None;
         }
         let mut registration = Registration {
@@ -630,6 +692,109 @@ impl InvocationCoordinator {
         }
     }
 
+    /// Handles a checkpoint response without a token: the service accepts
+    /// no further checkpoints from this invocation.
+    ///
+    /// The caller has emitted the lifecycle events of the accepted request,
+    /// discards the response's `NewExecutionState`, and leaves the
+    /// request's contributors unresolved. It calls this under the
+    /// checkpoint-token lock. This then does, in order:
+    ///
+    /// 1. It sets the withdrawal latch. The same lock closes admission: no
+    ///    permit or wait registration is taken after it (see
+    ///    [`State::admits`]).
+    /// 2. It logs the WARN with `execution_arn` and `request_id`.
+    /// 3. It calls `drop_queued`, which drops every queued write without
+    ///    resolving its caller.
+    /// 4. It moves the phase to [`Phase::Suspending`] when it is `Running`.
+    ///
+    /// A later call does nothing, and does not call `drop_queued`.
+    pub(crate) fn withdraw(
+        &self,
+        execution_arn: &str,
+        request_id: &str,
+        drop_queued: impl FnOnce(),
+    ) {
+        {
+            let mut state = self.lock();
+            if state.withdrawn {
+                return;
+            }
+            state.withdrawn = true;
+        }
+        tracing::warn!(
+            executionArn = %execution_arn,
+            requestId = %request_id,
+            "{WITHDRAWAL_WARNING}"
+        );
+        drop_queued();
+        let driver = {
+            let mut state = self.lock();
+            if state.phase == Phase::Running {
+                state.phase = Phase::Suspending;
+            }
+            state.driver.clone()
+        };
+        self.after_change((driver, true));
+    }
+
+    /// Registers `fatal`, the classification of a checkpoint failure that
+    /// a live caller has yet to record, and returns the candidate that
+    /// tracks it.
+    ///
+    /// The caller records the failure after a step that a withdrawn token
+    /// can keep from completing: the terminal `FAIL` write, or the task of
+    /// the operation that receives a direct write's result. The candidate
+    /// leaves the set in three ways:
+    ///
+    /// - [`DisplacedCandidate::consume`]: the caller took the failure over,
+    ///   and records it or writes its terminal `FAIL` under a new
+    ///   candidate.
+    /// - The candidate is dropped before the latch is set: the caller was
+    ///   stopped, by its scope or by the drive's cleanup, so the failure
+    ///   would not have been recorded without withdrawal either.
+    ///
+    /// A candidate dropped after the latch stays: the withdrawal ended the
+    /// invocation, or left the write unresolved, before the caller could
+    /// record the failure. The answer under withdrawal carries the first
+    /// such failure (see [`Self::displaced_fatal`]).
+    pub(crate) fn displaced_candidate(self: &Arc<Self>, fatal: FatalError) -> DisplacedCandidate {
+        let mut state = self.lock();
+        let id = state.next_candidate;
+        state.next_candidate = state.next_candidate.wrapping_add(1);
+        state.candidates.insert(id, fatal);
+        DisplacedCandidate {
+            coordinator: Arc::clone(self),
+            id,
+            consumed: false,
+        }
+    }
+
+    /// Removes candidate `id`: always when its caller consumed it, and
+    /// otherwise only before the latch is set.
+    fn release_candidate(&self, id: u64, consumed: bool) {
+        let mut state = self.lock();
+        if consumed || !state.withdrawn {
+            state.candidates.remove(&id);
+        }
+    }
+
+    /// The first candidate still registered (see
+    /// [`Self::displaced_candidate`]) when no fatal error is recorded. A
+    /// recorded fatal error already decides the end.
+    pub(crate) fn displaced_fatal(&self) -> Option<FatalError> {
+        let state = self.lock();
+        if state.fatal.is_some() {
+            return None;
+        }
+        state.candidates.values().next().cloned()
+    }
+
+    /// Whether the withdrawal latch is set (see [`Self::withdraw`]).
+    pub(crate) fn withdrawn(&self) -> bool {
+        self.lock().withdrawn
+    }
+
     /// Records an execution-fatal error (first record wins) and wakes the
     /// invocation driver.
     pub(crate) fn record_fatal(&self, error_type: String, error_message: String) {
@@ -653,7 +818,8 @@ impl InvocationCoordinator {
         });
     }
 
-    fn record(&self, fatal: FatalError) {
+    /// Records `fatal` (first record wins) and wakes the invocation driver.
+    pub(crate) fn record(&self, fatal: FatalError) {
         let driver = {
             let mut state = self.lock();
             if state.fatal.is_none() {
@@ -876,6 +1042,7 @@ mod tests {
     use super::{
         DueRefresh, InvocationCoordinator, PermitKind, Phase, first_refresh_delay, refresh_delay,
     };
+    use crate::driver::{FatalError, FatalSeverity};
     use crate::engine::CheckpointStatus;
     use crate::task::test_support::{Schedule, ScheduleState};
     use std::collections::BTreeMap;
@@ -1233,7 +1400,152 @@ mod tests {
         coordinator.record_fatal("Error".to_owned(), "second".to_owned());
         let fatal = coordinator.fatal_error().expect("recorded");
         assert_eq!(fatal.error_message, "first");
-        assert_eq!(fatal.severity, crate::driver::FatalSeverity::FailInvocation);
+        assert_eq!(fatal.severity, FatalSeverity::FailInvocation);
+    }
+
+    /// The first withdrawal sets the latch, moves `Running` to
+    /// `Suspending` with a permit still held, and wakes the driver. A
+    /// second one does nothing.
+    #[test]
+    fn withdraw_latches_once_and_suspends() {
+        let coordinator = InvocationCoordinator::new();
+        let (counter, waker) = counting_waker();
+        coordinator.register_driver_waker(&waker);
+        let _permit = coordinator.acquire(PermitKind::Activity).expect("running");
+        assert!(!coordinator.withdrawn());
+        coordinator.withdraw("arn", "req", || {});
+        assert!(coordinator.withdrawn());
+        assert_eq!(coordinator.phase(), Phase::Suspending);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        coordinator.withdraw("arn", "req", || {});
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "a second withdrawal does nothing"
+        );
+    }
+
+    /// The steps of a withdrawal run in order: when the queued writes are
+    /// dropped, the latch is set and admission is closed, but the phase is
+    /// still `Running`. No suspension happens before the drop, even when
+    /// the drop releases the last permit beside a live wait. A second
+    /// withdrawal does not drop again.
+    #[test]
+    fn withdraw_closes_admission_before_dropping_and_suspends_after() {
+        let coordinator = InvocationCoordinator::new();
+        let _wait = coordinator
+            .register_test_wait("op", Waker::noop())
+            .expect("running");
+        let permit = std::cell::RefCell::new(Some(
+            coordinator
+                .acquire(PermitKind::Checkpoint)
+                .expect("running"),
+        ));
+        let drops = std::cell::Cell::new(0);
+        coordinator.withdraw("arn", "req", || {
+            drops.set(drops.get() + 1);
+            assert!(coordinator.withdrawn(), "the latch is set first");
+            assert!(
+                coordinator.acquire(PermitKind::Activity).is_none(),
+                "no activity permit after the latch"
+            );
+            assert!(
+                coordinator.acquire(PermitKind::Checkpoint).is_none(),
+                "no checkpoint permit after the latch"
+            );
+            assert!(
+                coordinator.acquire(PermitKind::Scheduler).is_none(),
+                "no scheduler permit after the latch"
+            );
+            assert!(
+                coordinator
+                    .register_test_wait("other", Waker::noop())
+                    .is_none(),
+                "no wait registration after the latch"
+            );
+            // Dropping the last permit beside a live wait does not suspend
+            // here: the withdrawal moves the phase after the drop.
+            drop(permit.borrow_mut().take());
+            assert_eq!(coordinator.phase(), Phase::Running, "the phase moves last");
+        });
+        assert_eq!(drops.get(), 1);
+        assert_eq!(coordinator.phase(), Phase::Suspending);
+        coordinator.withdraw("arn", "req", || drops.set(drops.get() + 1));
+        assert_eq!(drops.get(), 1, "a second withdrawal drops nothing");
+    }
+
+    /// A withdrawal after the drive ended keeps the phase `Finished`.
+    #[test]
+    fn withdraw_after_finish_keeps_finished() {
+        let coordinator = InvocationCoordinator::new();
+        coordinator.finish();
+        coordinator.withdraw("arn", "req", || {});
+        assert!(coordinator.withdrawn());
+        assert_eq!(coordinator.phase(), Phase::Finished);
+    }
+
+    fn candidate_fatal(name: &str) -> FatalError {
+        FatalError {
+            error_type: name.to_owned(),
+            error_message: name.to_lowercase(),
+            severity: FatalSeverity::FailExecution,
+        }
+    }
+
+    fn displaced_type(coordinator: &InvocationCoordinator) -> Option<String> {
+        coordinator.displaced_fatal().map(|fatal| fatal.error_type)
+    }
+
+    /// The first live candidate is displaced while no fatal error is
+    /// recorded.
+    #[test]
+    fn first_candidate_is_displaced_until_a_fatal_is_recorded() {
+        let coordinator = InvocationCoordinator::new();
+        assert!(coordinator.displaced_fatal().is_none());
+        let _first = coordinator.displaced_candidate(candidate_fatal("First"));
+        let _second = coordinator.displaced_candidate(candidate_fatal("Second"));
+        assert_eq!(displaced_type(&coordinator).as_deref(), Some("First"));
+        coordinator.record_fatal("Error".to_owned(), "recorded".to_owned());
+        assert!(coordinator.displaced_fatal().is_none());
+    }
+
+    /// A candidate dropped before the latch is released: its caller was
+    /// stopped, and the failure is not displaced.
+    #[test]
+    fn candidate_dropped_before_the_latch_is_released() {
+        let coordinator = InvocationCoordinator::new();
+        let first = coordinator.displaced_candidate(candidate_fatal("First"));
+        let _second = coordinator.displaced_candidate(candidate_fatal("Second"));
+        drop(first);
+        coordinator.withdraw("arn", "req", || {});
+        assert_eq!(displaced_type(&coordinator).as_deref(), Some("Second"));
+    }
+
+    /// A candidate dropped after the latch stays: the withdrawal kept its
+    /// caller from recording it.
+    #[test]
+    fn candidate_dropped_after_the_latch_stays() {
+        let coordinator = InvocationCoordinator::new();
+        let first = coordinator.displaced_candidate(candidate_fatal("First"));
+        coordinator.withdraw("arn", "req", || {});
+        drop(first);
+        assert_eq!(displaced_type(&coordinator).as_deref(), Some("First"));
+    }
+
+    /// A consumed candidate is released before and after the latch: its
+    /// caller took the failure over.
+    #[test]
+    fn consumed_candidate_is_released_whatever_the_latch() {
+        let coordinator = InvocationCoordinator::new();
+        coordinator
+            .displaced_candidate(candidate_fatal("Before"))
+            .consume();
+        assert!(coordinator.displaced_fatal().is_none());
+        coordinator.withdraw("arn", "req", || {});
+        coordinator
+            .displaced_candidate(candidate_fatal("After"))
+            .consume();
+        assert!(coordinator.displaced_fatal().is_none());
     }
 
     #[test]

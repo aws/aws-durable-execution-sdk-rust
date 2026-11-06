@@ -535,6 +535,52 @@ where
     Ok((outcome, false))
 }
 
+/// The answer of an invocation whose checkpoint token was withdrawn.
+///
+/// The invocation wrapper calls it after the end-of-invocation flush, on
+/// every exit that returns a response or a Lambda error: handler `Ok` or
+/// `Err`, a transport error of either scope, a recorded fatal error and a
+/// serdes fault. A panic is not such an exit, and propagates.
+///
+/// Without the latch it returns `response` and `end` unchanged. With it the
+/// response is exactly `{"Status":"PENDING"}`, nothing is recorded as a
+/// fault or an execution failure, and the end hook receives `Pending` with
+/// the error `end` carried, or none.
+pub(crate) fn withdrawal_answer(
+    ctx: &crate::DurableContext,
+    response: Result<crate::InvocationResponse, lambda_runtime::Error>,
+    end: crate::InvocationEnd,
+) -> (
+    Result<crate::InvocationResponse, lambda_runtime::Error>,
+    crate::InvocationEnd,
+) {
+    if !ctx.coordinator().withdrawn() {
+        return (response, end);
+    }
+    // A checkpoint failure that the withdrawal kept from being recorded
+    // would have decided the outcome without withdrawal, so the end hook
+    // receives it. A failure whose caller was stopped or took it over
+    // before the latch is no longer a candidate (see
+    // `InvocationCoordinator::displaced_candidate`), so a completed
+    // handler's cleanup leaves the end with the handler's own error, or
+    // none.
+    let error = ctx
+        .coordinator()
+        .displaced_fatal()
+        .map(|fatal| {
+            crate::error::WireError::new(Some(fatal.error_type), Some(fatal.error_message))
+        })
+        .or(end.error);
+    // A suspension already answers `PENDING`, and emitted its event.
+    if end.status == crate::InvocationStatus::Pending {
+        return (response, crate::InvocationEnd { error, ..end });
+    }
+    drop(response);
+    let (pending, mut pending_end) = crate::outcome_envelope(InvocationOutcome::Pending, ctx);
+    pending_end.error = error;
+    (pending, pending_end)
+}
+
 /// [`drive_invocation`] without the fatal-arbitration flag, for callers
 /// that need only the outcome.
 #[cfg(test)]
@@ -6555,5 +6601,1159 @@ mod panic_owner {
             "the handler is never polled"
         );
         assert_eq!(returned_tag(&driven), Some(119));
+    }
+}
+
+/// Tests of the answer to a checkpoint response without a token.
+#[cfg(test)]
+mod withdrawal_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use aws_sdk_lambda::types::{
+        Operation, OperationAction, OperationStatus as WireStatus, OperationType, OperationUpdate,
+    };
+
+    use super::test_support::EventMessages;
+    use crate::client::{
+        CheckpointOutput, ExecutionClient, ExecutionClientError, ExecutionClientErrorScope,
+        GetStateOutput, InMemoryExecutionClient,
+    };
+    use crate::coordinator::{PermitKind, Phase, WITHDRAWAL_WARNING};
+    use crate::engine::CheckpointLog;
+    use crate::plugin::{
+        HookFuture, HookWork, InvocationEndInfo, InvocationInfo, OperationChangeInfo,
+        OperationInfo, Plugin, PluginFactory,
+    };
+    use crate::{BoxError, DurableContext, InvocationStatus, Options, WireError};
+
+    const ARN: &str = "arn:aws:lambda:us-east-1:1:function:test";
+    const REQUEST_ID: &str = "req-1";
+
+    /// How [`WithdrawingClient`] answers one checkpoint request.
+    #[derive(Clone)]
+    enum Answer {
+        /// As [`InMemoryExecutionClient`] answers it, with a token.
+        Pass,
+        /// `CheckpointOutput::new(None, vec![], None)`.
+        Tokenless,
+        /// No token, with these operations and this marker.
+        TokenlessWith(Vec<Operation>, String),
+        /// A transport error of this scope.
+        Fail(ExecutionClientErrorScope),
+    }
+
+    /// Decides the answer to request `n` (1-based) with `updates`, and the
+    /// tokio time to wait before it.
+    type Script = dyn Fn(usize, &[OperationUpdate]) -> (Answer, Duration) + Send + Sync;
+
+    /// A scripted `ExecutionClient` that records every call.
+    struct WithdrawingClient {
+        inner: InMemoryExecutionClient,
+        script: Box<Script>,
+        calls: Mutex<Vec<Vec<OperationUpdate>>>,
+        get_state_calls: AtomicUsize,
+        /// When set, every `get_state` call fails.
+        get_state_fails: std::sync::atomic::AtomicBool,
+    }
+
+    impl WithdrawingClient {
+        fn new(
+            script: impl Fn(usize, &[OperationUpdate]) -> (Answer, Duration) + Send + Sync + 'static,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner: InMemoryExecutionClient::new(Vec::new()),
+                script: Box::new(script),
+                calls: Mutex::new(Vec::new()),
+                get_state_calls: AtomicUsize::new(0),
+                get_state_fails: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        /// Answers request `n` without a token, and every other one as
+        /// [`Answer::Pass`].
+        fn tokenless_at(n: usize) -> Arc<Self> {
+            Self::new(move |call, _| {
+                if call == n {
+                    (Answer::Tokenless, Duration::ZERO)
+                } else {
+                    (Answer::Pass, Duration::ZERO)
+                }
+            })
+        }
+
+        fn calls(&self) -> Vec<Vec<OperationUpdate>> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn updates(&self) -> Vec<OperationUpdate> {
+            self.calls().into_iter().flatten().collect()
+        }
+    }
+
+    impl ExecutionClient for WithdrawingClient {
+        fn checkpoint(
+            &self,
+            execution_arn: &str,
+            checkpoint_token: &str,
+            updates: Vec<OperationUpdate>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<CheckpointOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            let number = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(updates.clone());
+                calls.len()
+            };
+            let (answer, delay) = (self.script)(number, &updates);
+            let pass = matches!(answer, Answer::Pass).then(|| {
+                self.inner
+                    .checkpoint(execution_arn, checkpoint_token, updates)
+            });
+            Box::pin(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                match answer {
+                    Answer::Pass => match pass {
+                        Some(pass) => pass.await,
+                        None => unreachable!("a pass answer has a future"),
+                    },
+                    Answer::Tokenless => Ok(CheckpointOutput::new(None, vec![], None)),
+                    Answer::TokenlessWith(operations, marker) => {
+                        Ok(CheckpointOutput::new(None, operations, Some(marker)))
+                    }
+                    Answer::Fail(scope) => Err(ExecutionClientError::new(
+                        scope,
+                        "scripted checkpoint failure",
+                    )),
+                }
+            })
+        }
+
+        fn get_state(
+            &self,
+            execution_arn: &str,
+            checkpoint_token: &str,
+            marker: Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<GetStateOutput, ExecutionClientError>> + Send + '_>,
+        > {
+            self.get_state_calls.fetch_add(1, Ordering::SeqCst);
+            if self.get_state_fails.load(Ordering::SeqCst) {
+                return Box::pin(async {
+                    Err(ExecutionClientError::new_non_retryable(
+                        "scripted get_state failure",
+                    ))
+                });
+            }
+            self.inner
+                .get_state(execution_arn, checkpoint_token, marker)
+        }
+    }
+
+    /// What a [`RecordingPlugin`] saw.
+    #[derive(Default)]
+    struct Seen {
+        ends: Vec<(InvocationStatus, Option<WireError>)>,
+        operation_starts: usize,
+        operation_ends: usize,
+        changes: usize,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingFactory(Arc<Mutex<Seen>>);
+
+    impl RecordingFactory {
+        /// The end hook's status and error. Exactly one end hook ran.
+        fn end(&self) -> (InvocationStatus, Option<WireError>) {
+            let seen = self.0.lock().unwrap();
+            assert_eq!(seen.ends.len(), 1, "one end hook");
+            seen.ends.first().cloned().unwrap()
+        }
+    }
+
+    impl PluginFactory for RecordingFactory {
+        fn create_plugin(
+            &self,
+            _info: &InvocationInfo,
+        ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+            Ok(Some(Box::new(RecordingPlugin(Arc::clone(&self.0)))))
+        }
+    }
+
+    struct RecordingPlugin(Arc<Mutex<Seen>>);
+
+    impl Plugin for RecordingPlugin {
+        fn on_operation_start(&self, _info: &OperationInfo) -> HookWork {
+            self.0.lock().unwrap().operation_starts += 1;
+            Ok(None)
+        }
+
+        fn on_operation_end(&self, _info: &OperationInfo) -> HookWork {
+            self.0.lock().unwrap().operation_ends += 1;
+            Ok(None)
+        }
+
+        fn on_operation_change(&self, _info: &OperationChangeInfo) -> HookWork {
+            self.0.lock().unwrap().changes += 1;
+            Ok(None)
+        }
+
+        fn on_invocation_end<'a>(&'a self, info: &'a InvocationEndInfo) -> HookFuture<'a> {
+            self.0
+                .lock()
+                .unwrap()
+                .ends
+                .push((info.status(), info.execution_error().cloned()));
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// Runs `handler` behind `wrap` over `client` on a new execution, with
+    /// checkpoint batching `batching` and `factory`, and returns the
+    /// response.
+    async fn run<F, Fut>(
+        client: &Arc<WithdrawingClient>,
+        batching: bool,
+        factory: &RecordingFactory,
+        handler: F,
+    ) -> serde_json::Value
+    where
+        F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<u32, BoxError>> + Send,
+    {
+        run_on(client, batching, factory, &[], handler).await
+    }
+
+    /// [`run`] on an execution whose state also holds `records`.
+    async fn run_on<F, Fut>(
+        client: &Arc<WithdrawingClient>,
+        batching: bool,
+        factory: &RecordingFactory,
+        records: &[serde_json::Value],
+        handler: F,
+    ) -> serde_json::Value
+    where
+        F: Fn(serde_json::Value, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<u32, BoxError>> + Send,
+    {
+        let mut operations = vec![serde_json::json!({
+            "Id": "root",
+            "Type": "EXECUTION",
+            "Status": "STARTED",
+            "ExecutionDetails": { "InputPayload": "{}" }
+        })];
+        operations.extend_from_slice(records);
+        let options = Options::builder()
+            .execution_client(Arc::clone(client) as Arc<dyn ExecutionClient>)
+            .checkpoint_batching(batching)
+            .plugin(factory.clone())
+            .build()
+            .unwrap();
+        let service = crate::wrap(handler, options);
+        let mut lambda_ctx = lambda_runtime::Context::default();
+        lambda_ctx.request_id = REQUEST_ID.to_owned();
+        let event = lambda_runtime::LambdaEvent::new(
+            crate::InvocationPayload(serde_json::json!({
+                "DurableExecutionArn": ARN,
+                "CheckpointToken": "t0",
+                "InitialExecutionState": { "Operations": operations }
+            })),
+            lambda_ctx,
+        );
+        tokio::time::timeout(Duration::from_secs(60), service(event))
+            .await
+            .expect("the invocation ends")
+            .expect("the invocation answers a response")
+            .0
+    }
+
+    fn pending() -> serde_json::Value {
+        serde_json::json!({ "Status": "PENDING" })
+    }
+
+    /// Whether `updates` hold an update of `name` with `action`.
+    fn has(updates: &[OperationUpdate], name: &str, action: &OperationAction) -> bool {
+        updates
+            .iter()
+            .any(|u| u.name() == Some(name) && u.action() == action)
+    }
+
+    fn no_fail(client: &WithdrawingClient) -> bool {
+        client
+            .updates()
+            .iter()
+            .all(|u| u.action() != &OperationAction::Fail)
+    }
+
+    /// A root context on `client`, without buffering.
+    fn direct_ctx(client: &Arc<WithdrawingClient>) -> DurableContext {
+        DurableContext::new_root_with_client(
+            ARN.to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(client) as Arc<dyn ExecutionClient>,
+            "t0".to_owned(),
+        )
+    }
+
+    fn step_start(id: &str) -> OperationUpdate {
+        OperationUpdate::builder()
+            .id(id)
+            .r#type(OperationType::Step)
+            .action(OperationAction::Start)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tokenless_direct_checkpoint_answers_pending() {
+        let client = WithdrawingClient::tokenless_at(1);
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            Ok(ctx.step(|_| async { Ok(1_u32) }).name("a").await?)
+        })
+        .await;
+        assert_eq!(response, pending());
+        assert_eq!(client.calls().len(), 1);
+        assert!(no_fail(&client));
+        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
+    }
+
+    #[tokio::test]
+    async fn tokenless_buffered_checkpoint_answers_pending() {
+        let client = WithdrawingClient::tokenless_at(1);
+        let factory = RecordingFactory::default();
+        let response = run(&client, true, &factory, |_event, ctx| async move {
+            let a = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
+            let b = ctx.step(|_| async { Ok(2_u32) }).name("b").spawn();
+            Ok(a.await? + b.await?)
+        })
+        .await;
+        assert_eq!(response, pending());
+        let calls = client.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let first = calls.first().unwrap();
+        assert!(has(first, "a", &OperationAction::Start), "{first:?}");
+        assert!(has(first, "b", &OperationAction::Start), "{first:?}");
+        assert!(no_fail(&client));
+        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
+    }
+
+    #[tokio::test]
+    async fn tokenless_latch_blocks_later_checkpoints() {
+        let client = WithdrawingClient::tokenless_at(1);
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            let a = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
+            let b = ctx.step(|_| async { Ok(2_u32) }).name("b").spawn();
+            Ok(a.await? + b.await?)
+        })
+        .await;
+        assert_eq!(response, pending());
+        let calls = client.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(has(calls.first().unwrap(), "a", &OperationAction::Start));
+        assert!(!has(&client.updates(), "b", &OperationAction::Start));
+    }
+
+    #[tokio::test]
+    async fn tokenless_emits_lifecycle_events_not_plugin_hooks() {
+        let (messages, _guard) = EventMessages::install();
+        let client = WithdrawingClient::tokenless_at(1);
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            Ok(ctx
+                .step(|_| async { Ok(1_u32) })
+                .name("a")
+                .semantics(crate::StepSemantics::AtMostOncePerRetry)
+                .await?)
+        })
+        .await;
+        assert_eq!(response, pending());
+        let started = messages
+            .at(tracing::Level::INFO)
+            .into_iter()
+            .chain(messages.at(tracing::Level::DEBUG))
+            .filter(|m| m == crate::observability::event_names::OPERATION_STARTED)
+            .count();
+        assert_eq!(started, 1, "the accepted START emits its event");
+        let seen = factory.0.lock().unwrap();
+        assert_eq!(seen.changes, 0, "no on_operation_change");
+        assert_eq!(seen.operation_starts, 0, "no operation start hook");
+        assert_eq!(seen.operation_ends, 0, "no operation end hook");
+    }
+
+    /// One recorded event: its level, target and fields.
+    type Recorded = (tracing::Level, String, Vec<(String, String)>);
+
+    /// Records every event's level, target and fields.
+    #[derive(Clone, Default)]
+    struct FieldsLayer(Arc<Mutex<Vec<Recorded>>>);
+
+    struct FieldsVisitor(Vec<(String, String)>);
+
+    impl tracing::field::Visit for FieldsVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push((field.name().to_owned(), format!("{value:?}")));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldsLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldsVisitor(Vec::new());
+            event.record(&mut visitor);
+            let meta = event.metadata();
+            self.0
+                .lock()
+                .unwrap()
+                .push((*meta.level(), meta.target().to_owned(), visitor.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn tokenless_warns_once_with_fields() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let layer = FieldsLayer::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(layer.clone()));
+        let client = WithdrawingClient::tokenless_at(1);
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
+            Ok(1)
+        })
+        .await;
+        assert_eq!(response, pending());
+        let warns: Vec<Recorded> = layer
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, _, _)| *level == tracing::Level::WARN)
+            .cloned()
+            .collect();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        let (_, target, fields) = warns.first().unwrap();
+        assert_eq!(target, "aws_durable_execution_sdk::coordinator");
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(field("executionArn").as_deref(), Some(ARN));
+        assert_eq!(field("requestId").as_deref(), Some(REQUEST_ID));
+        assert_eq!(field("message").as_deref(), Some(WITHDRAWAL_WARNING));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tokenless_discards_new_state() {
+        let state = Operation::builder()
+            .id("other")
+            .r#type(OperationType::Step)
+            .status(WireStatus::Succeeded)
+            .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+            .build()
+            .unwrap();
+        let client = WithdrawingClient::new(move |_, _| {
+            (
+                Answer::TokenlessWith(vec![state.clone()], "marker".to_owned()),
+                Duration::ZERO,
+            )
+        });
+        let ctx = direct_ctx(&client);
+        let write = ctx.submit_checkpoint_updates(vec![step_start("x")]);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), write)
+                .await
+                .is_err(),
+            "the caller never resolves"
+        );
+        assert!(ctx.coordinator().withdrawn());
+        assert!(
+            ctx.checkpoint_status_view("other").is_none()
+                && ctx.checkpoint_status_view("x").is_none(),
+            "the state is not merged"
+        );
+        assert_eq!(client.get_state_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tokenless_leaves_queued_contributors_unresolved() {
+        let client = WithdrawingClient::new(|n, _| {
+            if n == 1 {
+                (Answer::Tokenless, Duration::from_secs(1))
+            } else {
+                (Answer::Pass, Duration::ZERO)
+            }
+        });
+        let ctx = DurableContext::new_root_with_client_and_coalescer(
+            ARN.to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "t0".to_owned(),
+            crate::checkpoint_coalescer::CheckpointCoalescer::new(Duration::ZERO),
+        );
+        let first = ctx.submit_checkpoint_updates(vec![step_start("x")]);
+        while client.calls().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let second = ctx.submit_checkpoint_updates(vec![step_start("y")]);
+        let (first, second) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), first),
+            tokio::time::timeout(Duration::from_secs(5), second),
+        );
+        assert!(first.is_err(), "the in-flight caller never resolves");
+        assert!(second.is_err(), "the queued caller never resolves");
+        assert!(ctx.coordinator().withdrawn());
+        assert_eq!(client.calls().len(), 1, "the queued update is never sent");
+    }
+
+    /// The withdrawal drops the queued writes itself: a reserved write,
+    /// which no writer would ever take while it is held, is dropped with
+    /// its permit, unbuffered and buffered alike. It is never sent, even
+    /// after its reservation is released.
+    #[tokio::test(start_paused = true)]
+    async fn withdrawal_drops_queued_and_held_writes() {
+        for buffered in [false, true] {
+            let client = WithdrawingClient::new(|n, _| {
+                if n == 1 {
+                    (Answer::Tokenless, Duration::from_secs(1))
+                } else {
+                    (Answer::Pass, Duration::ZERO)
+                }
+            });
+            let ctx = if buffered {
+                DurableContext::new_root_with_client_and_coalescer(
+                    ARN.to_owned(),
+                    lambda_runtime::Context::default(),
+                    Arc::new(CheckpointLog::empty()),
+                    Arc::clone(&client) as Arc<dyn ExecutionClient>,
+                    "t0".to_owned(),
+                    crate::checkpoint_coalescer::CheckpointCoalescer::new(Duration::ZERO),
+                )
+            } else {
+                direct_ctx(&client)
+            };
+            let first = ctx.submit_checkpoint_updates(vec![step_start("x")]);
+            while client.calls().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            let held = ctx.reserve_checkpoint_updates(vec![step_start("y")]);
+            assert_eq!(ctx.coordinator().permits(PermitKind::Checkpoint), 2);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), first)
+                    .await
+                    .is_err(),
+                "the in-flight caller never resolves"
+            );
+            assert!(ctx.coordinator().withdrawn());
+            assert_eq!(ctx.coordinator().phase(), Phase::Suspending);
+            assert_eq!(
+                ctx.coordinator().permits(PermitKind::Checkpoint),
+                0,
+                "buffered={buffered}: the held write was dropped with its permit"
+            );
+            let held = held.release();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), held)
+                    .await
+                    .is_err(),
+                "the held caller never resolves"
+            );
+            assert_eq!(client.calls().len(), 1, "the held write is never sent");
+        }
+    }
+
+    /// Runs a handler that spawns steps `a` and `b` together, so both
+    /// STARTs are queued before either is written. `a`'s START fails at
+    /// once with a transport error of `scope`, and `b`'s START, written
+    /// right after it on the same writer poll, is answered without a token
+    /// at once. `a`'s task has not recorded the failure yet.
+    async fn queued_client_error(
+        scope: ExecutionClientErrorScope,
+    ) -> (Arc<WithdrawingClient>, serde_json::Value, RecordingFactory) {
+        let client = WithdrawingClient::new(move |_, updates| {
+            if has(updates, "a", &OperationAction::Start) {
+                (Answer::Fail(scope), Duration::ZERO)
+            } else if has(updates, "b", &OperationAction::Start) {
+                (Answer::Tokenless, Duration::ZERO)
+            } else {
+                (Answer::Pass, Duration::ZERO)
+            }
+        });
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            let a = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
+            let b = ctx.step(|_| async { Ok(2_u32) }).name("b").spawn();
+            Ok(a.await? + b.await?)
+        })
+        .await;
+        (client, response, factory)
+    }
+
+    #[tokio::test]
+    async fn pending_wins_over_queued_invocation_client_error() {
+        let (client, response, factory) =
+            queued_client_error(ExecutionClientErrorScope::Invocation).await;
+        assert_eq!(response, pending());
+        assert_eq!(client.calls().len(), 2, "a's START, then b's START");
+        let (status, error) = factory.end();
+        assert_eq!(status, InvocationStatus::Pending);
+        let error = error.expect("the displaced error");
+        assert_eq!(
+            error.error_type(),
+            Some(crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE)
+        );
+        assert!(
+            error
+                .error_message()
+                .is_some_and(|m| m.contains("scripted checkpoint failure")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_wins_over_queued_execution_client_error() {
+        let (client, response, factory) =
+            queued_client_error(ExecutionClientErrorScope::Execution).await;
+        assert_eq!(response, pending());
+        assert_eq!(client.calls().len(), 2, "a's START, then b's START");
+        assert!(no_fail(&client), "no terminal FAIL is sent");
+        let (status, error) = factory.end();
+        assert_eq!(status, InvocationStatus::Pending);
+        let error = error.expect("the displaced error");
+        assert_eq!(
+            error.error_type(),
+            Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+        assert!(
+            error
+                .error_message()
+                .is_some_and(|m| m.contains("scripted checkpoint failure")),
+            "{error:?}"
+        );
+    }
+
+    /// Answers the request that holds `a`'s START after a second, without
+    /// a token.
+    fn tokenless_start_of_a_after_a_second() -> Arc<WithdrawingClient> {
+        WithdrawingClient::new(|_, updates| {
+            if has(updates, "a", &OperationAction::Start) {
+                (Answer::Tokenless, Duration::from_secs(1))
+            } else {
+                (Answer::Pass, Duration::ZERO)
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn pending_wins_over_handler_ok() {
+        let client = WithdrawingClient::tokenless_at(1);
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
+            Ok(1)
+        })
+        .await;
+        assert_eq!(response, pending());
+        assert!(
+            client
+                .updates()
+                .iter()
+                .all(|u| u.r#type() != &OperationType::Execution),
+            "no EXECUTION update is sent"
+        );
+        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
+    }
+
+    #[tokio::test]
+    async fn pending_wins_over_handler_err() {
+        let client = WithdrawingClient::tokenless_at(1);
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
+            Err::<u32, BoxError>("boom".into())
+        })
+        .await;
+        assert_eq!(response, pending());
+        let (status, error) = factory.end();
+        assert_eq!(status, InvocationStatus::Pending);
+        assert_eq!(error.unwrap().error_message(), Some("boom"));
+    }
+
+    /// Runs `handler_err` (or a handler that returns `Ok(1)`) after it
+    /// spawns steps `a` and `b` and drops both handles, without buffering.
+    /// `a`'s START fails with a transport error after a second, after the
+    /// handler returned and the cleanup stopped `a`'s task, and `b`'s
+    /// START, queued behind it, is answered without a token.
+    async fn failed_then_tokenless_after_handler(
+        handler_err: bool,
+    ) -> (Arc<WithdrawingClient>, serde_json::Value, RecordingFactory) {
+        let client = WithdrawingClient::new(|_, updates| {
+            if has(updates, "a", &OperationAction::Start) {
+                (
+                    Answer::Fail(ExecutionClientErrorScope::Invocation),
+                    Duration::from_secs(1),
+                )
+            } else if has(updates, "b", &OperationAction::Start) {
+                (Answer::Tokenless, Duration::ZERO)
+            } else {
+                (Answer::Pass, Duration::ZERO)
+            }
+        });
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, move |_event, ctx| async move {
+            drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
+            drop(ctx.step(|_| async { Ok(2_u32) }).name("b").spawn());
+            if handler_err {
+                return Err::<u32, BoxError>("boom".into());
+            }
+            Ok(1)
+        })
+        .await;
+        (client, response, factory)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handler_ok_end_ignores_unread_queued_failure() {
+        let (client, response, factory) = failed_then_tokenless_after_handler(false).await;
+        assert_eq!(response, pending());
+        assert_eq!(client.calls().len(), 2, "a's START, then b's START");
+        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handler_err_end_ignores_unread_queued_failure() {
+        let (client, response, factory) = failed_then_tokenless_after_handler(true).await;
+        assert_eq!(response, pending());
+        assert_eq!(client.calls().len(), 2, "a's START, then b's START");
+        let (status, error) = factory.end();
+        assert_eq!(status, InvocationStatus::Pending);
+        let error = error.expect("the handler's error");
+        assert_eq!(error.error_message(), Some("boom"), "{error:?}");
+    }
+
+    /// A failure whose caller was stopped before the response came is not
+    /// the answer's error, also when the drive is interrupted: no task
+    /// would record it without withdrawal either.
+    #[tokio::test(start_paused = true)]
+    async fn pending_end_ignores_failure_of_stopped_caller() {
+        let client = WithdrawingClient::new(|_, updates| {
+            if has(updates, "a", &OperationAction::Start) {
+                (
+                    Answer::Fail(ExecutionClientErrorScope::Invocation),
+                    Duration::from_secs(1),
+                )
+            } else if has(updates, "w", &OperationAction::Start) {
+                (Answer::Tokenless, Duration::ZERO)
+            } else {
+                (Answer::Pass, Duration::ZERO)
+            }
+        });
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            // The child's body returns while `a`'s START is in flight, so
+            // its scope closes and stops `a` before the response.
+            ctx.run_in_child_context(|child| async move {
+                drop(child.step(|_| async { Ok(1_u32) }).name("a").spawn());
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok(0_u32)
+            })
+            .name("c")
+            .await?;
+            ctx.wait(Duration::from_secs(60)).name("w").await?;
+            Ok(1)
+        })
+        .await;
+        assert_eq!(response, pending());
+        assert!(has(&client.updates(), "w", &OperationAction::Start));
+        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
+    }
+
+    /// Runs a handler that spawns step `a`, drops its handle, waits 1.5 s
+    /// and returns `Err("boom")` when `handler_err`, else `Ok(1)`, without
+    /// buffering. `a`'s SUCCEED fails with an execution-scoped transport
+    /// error after a second, so `a`'s task registers the failure and writes
+    /// its terminal FAIL. The handler returns while that FAIL is in flight,
+    /// and the FAIL is answered without a token after the cleanup stopped
+    /// `a`'s task.
+    async fn fail_write_then_tokenless_after_handler(
+        handler_err: bool,
+    ) -> (Arc<WithdrawingClient>, serde_json::Value, RecordingFactory) {
+        let client = WithdrawingClient::new(|_, updates| {
+            if has(updates, "a", &OperationAction::Succeed) {
+                (
+                    Answer::Fail(ExecutionClientErrorScope::Execution),
+                    Duration::from_secs(1),
+                )
+            } else if has(updates, "a", &OperationAction::Fail) {
+                (Answer::Tokenless, Duration::from_secs(2))
+            } else {
+                (Answer::Pass, Duration::ZERO)
+            }
+        });
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, move |_event, ctx| async move {
+            drop(ctx.step(|_| async { Ok(1_u32) }).name("a").spawn());
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if handler_err {
+                return Err::<u32, BoxError>("boom".into());
+            }
+            Ok(1)
+        })
+        .await;
+        (client, response, factory)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handler_ok_end_ignores_failure_of_stopped_fail_write() {
+        let (client, response, factory) = fail_write_then_tokenless_after_handler(false).await;
+        assert_eq!(response, pending());
+        assert!(
+            has(&client.updates(), "a", &OperationAction::Fail),
+            "a's terminal FAIL was sent"
+        );
+        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handler_err_end_ignores_failure_of_stopped_fail_write() {
+        let (client, response, factory) = fail_write_then_tokenless_after_handler(true).await;
+        assert_eq!(response, pending());
+        assert!(
+            has(&client.updates(), "a", &OperationAction::Fail),
+            "a's terminal FAIL was sent"
+        );
+        let (status, error) = factory.end();
+        assert_eq!(status, InvocationStatus::Pending);
+        let error = error.expect("the handler's error");
+        assert_eq!(error.error_message(), Some("boom"), "{error:?}");
+    }
+
+    /// Runs a handler whose step `a` SUCCEED fails with a transport error
+    /// of `scope` after a second, while step `b`'s START waits behind it
+    /// and is answered without a token. Returns the client and the end.
+    async fn earlier_client_error(
+        scope: ExecutionClientErrorScope,
+    ) -> (Arc<WithdrawingClient>, serde_json::Value, RecordingFactory) {
+        let client = WithdrawingClient::new(move |_, updates| {
+            if has(updates, "a", &OperationAction::Succeed) {
+                (Answer::Fail(scope), Duration::from_secs(1))
+            } else if has(updates, "b", &OperationAction::Start) {
+                (Answer::Tokenless, Duration::from_secs(1))
+            } else {
+                (Answer::Pass, Duration::ZERO)
+            }
+        });
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            let a = ctx.step(|_| async { Ok(1_u32) }).name("a").spawn();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let b = ctx.step(|_| async { Ok(2_u32) }).name("b").spawn();
+            Ok(a.await? + b.await?)
+        })
+        .await;
+        (client, response, factory)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_wins_over_invocation_client_error() {
+        let (client, response, factory) =
+            earlier_client_error(ExecutionClientErrorScope::Invocation).await;
+        assert_eq!(response, pending());
+        assert!(has(&client.updates(), "b", &OperationAction::Start));
+        let (status, error) = factory.end();
+        assert_eq!(status, InvocationStatus::Pending);
+        let error = error.unwrap();
+        assert_eq!(
+            error.error_type(),
+            Some(crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE)
+        );
+        assert!(
+            error
+                .error_message()
+                .is_some_and(|m| m.contains("scripted checkpoint failure")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_wins_over_execution_client_error() {
+        let (client, response, factory) =
+            earlier_client_error(ExecutionClientErrorScope::Execution).await;
+        assert_eq!(response, pending());
+        assert!(has(&client.updates(), "b", &OperationAction::Start));
+        assert!(no_fail(&client), "no terminal FAIL is sent");
+        let (status, error) = factory.end();
+        assert_eq!(status, InvocationStatus::Pending);
+        let error = error.unwrap();
+        assert_eq!(
+            error.error_type(),
+            Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+        assert!(
+            error
+                .error_message()
+                .is_some_and(|m| m.contains("scripted checkpoint failure")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_wins_over_context_validation_fatal() {
+        let client = tokenless_start_of_a_after_a_second();
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            let cloned = ctx.clone();
+            Ok(ctx
+                .step(move |_| async move {
+                    let inner = cloned.step(|_| async { Ok(2_u32) }).name("inner").await?;
+                    Ok(inner)
+                })
+                .name("a")
+                .await?)
+        })
+        .await;
+        assert_eq!(response, pending());
+        let (status, error) = factory.end();
+        assert_eq!(status, InvocationStatus::Pending);
+        let error = error.unwrap();
+        assert_eq!(error.error_type(), Some("Error"));
+        assert!(
+            error
+                .error_message()
+                .is_some_and(|m| m.starts_with("context usage error")),
+            "{error:?}"
+        );
+    }
+
+    /// A serdes whose calls fail with a retryable error.
+    struct FailingSerdes;
+
+    impl crate::serdes::Serdes<u32> for FailingSerdes {
+        fn serialize(
+            &self,
+            _value: u32,
+            _context: crate::serdes::SerdesContext,
+        ) -> impl Future<Output = Result<String, BoxError>> + Send {
+            std::future::ready(Err(injected_serdes_failure()))
+        }
+
+        fn deserialize(
+            &self,
+            _wire: String,
+            _context: crate::serdes::SerdesContext,
+        ) -> impl Future<Output = Result<u32, BoxError>> + Send {
+            std::future::ready(Err(injected_serdes_failure()))
+        }
+    }
+
+    fn injected_serdes_failure() -> BoxError {
+        Box::new(crate::serdes::RetryableSerdesError::new(
+            "injected serdes failure",
+        ))
+    }
+
+    /// Step `r`'s replayed result fails to deserialize while step `a`'s
+    /// START is in flight. A step serializes its result only after its
+    /// START is answered, so the fault comes from the replay.
+    #[tokio::test(start_paused = true)]
+    async fn pending_wins_over_serdes_fault() {
+        let client = tokenless_start_of_a_after_a_second();
+        let factory = RecordingFactory::default();
+        let replayed = serde_json::json!({
+            "Id": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+            "Type": "STEP",
+            "SubType": "Step",
+            "Name": "r",
+            "Status": "SUCCEEDED",
+            "StepDetails": { "Attempt": 1, "Result": "1" }
+        });
+        let response = run_on(
+            &client,
+            false,
+            &factory,
+            &[replayed],
+            |_event, ctx| async move {
+                let replayed = ctx
+                    .step(|_| async { Ok(1_u32) })
+                    .name("r")
+                    .serdes(FailingSerdes)
+                    .future();
+                drop(ctx.step(|_| async { Ok(2_u32) }).name("a").spawn());
+                Ok(replayed.await?)
+            },
+        )
+        .await;
+        assert!(has(&client.updates(), "a", &OperationAction::Start));
+        assert_eq!(response, pending());
+        let (status, error) = factory.end();
+        assert_eq!(status, InvocationStatus::Pending);
+        let error = error.unwrap();
+        assert_eq!(
+            error.error_type(),
+            Some(crate::error::SERDES_FAILED_ERROR_TYPE)
+        );
+        assert!(
+            error
+                .error_message()
+                .is_some_and(|m| m.contains("injected serdes failure")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_withdrawal_end_hook_has_no_error() {
+        let client = WithdrawingClient::tokenless_at(1);
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            ctx.step(|_| async { Ok(1_u32) }).name("a").await?;
+            std::future::pending::<()>().await;
+            Ok(1)
+        })
+        .await;
+        assert_eq!(response, pending());
+        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
+    }
+
+    /// An `EXECUTION` update of the root execution with `action`.
+    fn execution_update(action: &OperationAction) -> OperationUpdate {
+        let builder = OperationUpdate::builder()
+            .id("root")
+            .r#type(OperationType::Execution)
+            .action(action.clone());
+        let builder = if *action == OperationAction::Fail {
+            builder.error(
+                aws_sdk_lambda::types::ErrorObject::builder()
+                    .error_type("Boom")
+                    .error_message("boom")
+                    .build(),
+            )
+        } else {
+            builder.payload("1")
+        };
+        builder.build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn execution_update_exempt_from_withdrawal() {
+        for (action, status) in [
+            (OperationAction::Succeed, WireStatus::Succeeded),
+            (OperationAction::Fail, WireStatus::Failed),
+        ] {
+            let (messages, _guard) = EventMessages::install();
+            let terminal = Operation::builder()
+                .id("root")
+                .r#type(OperationType::Execution)
+                .status(status.clone())
+                .start_timestamp(aws_smithy_types::DateTime::from_secs(0))
+                .build()
+                .unwrap();
+            let client = WithdrawingClient::new(move |_, _| {
+                (
+                    Answer::TokenlessWith(vec![terminal.clone()], String::new()),
+                    Duration::ZERO,
+                )
+            });
+            let ctx = direct_ctx(&client);
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                ctx.checkpoint_updates_direct(vec![execution_update(&action)]),
+            )
+            .await
+            .expect("the call resolves")
+            .expect("the call returns Ok");
+            assert_eq!(output.checkpoint_token(), None);
+            assert!(
+                output
+                    .updated_operations
+                    .iter()
+                    .any(|op| op.r#type() == &OperationType::Execution && op.status() == &status),
+                "the execution is terminal"
+            );
+            assert!(!ctx.coordinator().withdrawn(), "no latch is set");
+            assert_eq!(ctx.coordinator().phase(), Phase::Running);
+            assert_eq!(messages.at(tracing::Level::WARN), Vec::<String>::new());
+        }
+    }
+
+    /// A tokenless response to an `EXECUTION` update returns `Ok` without
+    /// fetching its pages, because the spent token is still in place: the
+    /// response carries a marker, and `get_state` would fail.
+    #[tokio::test]
+    async fn execution_update_exempt_skips_pagination() {
+        for action in [OperationAction::Succeed, OperationAction::Fail] {
+            let client = WithdrawingClient::new(move |_, _| {
+                (
+                    Answer::TokenlessWith(Vec::new(), "marker".to_owned()),
+                    Duration::ZERO,
+                )
+            });
+            client.get_state_fails.store(true, Ordering::SeqCst);
+            let ctx = direct_ctx(&client);
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                ctx.checkpoint_updates_direct(vec![execution_update(&action)]),
+            )
+            .await
+            .expect("the call resolves")
+            .expect("the call returns Ok");
+            assert_eq!(output.checkpoint_token(), None);
+            assert!(!ctx.coordinator().withdrawn(), "no latch is set");
+            assert_eq!(ctx.coordinator().phase(), Phase::Running);
+            assert_eq!(
+                client.get_state_calls.load(Ordering::SeqCst),
+                0,
+                "{action:?}: no get_state call"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_checkpoint_withdrawn() {
+        let client = WithdrawingClient::new(|_, updates| {
+            if updates.is_empty() {
+                (Answer::Tokenless, Duration::ZERO)
+            } else {
+                (Answer::Pass, Duration::ZERO)
+            }
+        });
+        let factory = RecordingFactory::default();
+        let response = run(&client, false, &factory, |_event, ctx| async move {
+            let wait = ctx.wait(Duration::from_secs(1)).name("w").spawn();
+            let step = ctx
+                .step(|_| async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok(1_u32)
+                })
+                .name("s")
+                .spawn();
+            let (waited, value) = tokio::join!(wait, step);
+            waited?;
+            Ok(value?)
+        })
+        .await;
+        assert_eq!(response, pending());
+        let calls = client.calls();
+        let refresh = calls
+            .iter()
+            .position(Vec::is_empty)
+            .expect("a refresh was sent");
+        assert_eq!(
+            refresh + 1,
+            calls.len(),
+            "no checkpoint after the refresh: {calls:?}"
+        );
+        assert!(!has(&client.updates(), "s", &OperationAction::Succeed));
+        assert_eq!(factory.end(), (InvocationStatus::Pending, None));
     }
 }
