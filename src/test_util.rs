@@ -2406,8 +2406,27 @@ impl LocalRunner {
     /// # Ok(())
     /// # }
     /// ```
-    #[expect(clippy::needless_pass_by_value)] // reason: the run takes the event, as the service delivers it
     pub fn run<E, O, F, Fut>(&self, handler: F, event: E) -> RunHandle<O>
+    where
+        E: Serialize + DeserializeOwned + Send + 'static,
+        O: Serialize + DeserializeOwned + Send + 'static,
+        F: Fn(E, DurableContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, BoxError>> + Send,
+    {
+        self.run_configured(handler, event, |_backend| {})
+    }
+
+    /// [`run`](Self::run), with `configure` applied to the run's backend
+    /// before the first invocation. Internal seam: a unit test plans the
+    /// backend's checkpoint answers for a run it controls through the
+    /// returned handle.
+    #[expect(clippy::needless_pass_by_value)] // reason: the run takes the event, as the service delivers it
+    fn run_configured<E, O, F, Fut>(
+        &self,
+        handler: F,
+        event: E,
+        configure: impl FnOnce(&Backend),
+    ) -> RunHandle<O>
     where
         E: Serialize + DeserializeOwned + Send + 'static,
         O: Serialize + DeserializeOwned + Send + 'static,
@@ -2418,6 +2437,7 @@ impl LocalRunner {
             self.callback_replies.clone(),
         )));
         let backend = Arc::new(self.backend_on(StateCell::Live(Arc::clone(&live))));
+        configure(&backend);
         let engine = Engine::Local;
         // Serialize the event once; the envelope re-delivers it per
         // invocation.
@@ -2627,11 +2647,19 @@ impl LocalRunner {
             // `tokio::task::try_id()` is `None` at context-creation time
             // and the task-ownership guard behaves as it does deployed.
             let response = service(lambda_event).await;
-            // A terminal envelope ends the run: a reply after this point is
-            // refused, in the same transition that ends the invocation.
-            let closing = response.as_ref().is_ok_and(|envelope| {
-                envelope.0.get("Status").and_then(serde_json::Value::as_str) != Some("PENDING")
-            });
+            // An accepted `EXECUTION` update ends the execution, as on the
+            // service, even when the invocation then failed.
+            let checkpointed = backend.execution_result();
+            // A terminal envelope ends the run, and so does an accepted
+            // `EXECUTION` update when the invocation then failed: a reply
+            // after this point is refused, in the same transition that ends
+            // the invocation.
+            let closing = match &response {
+                Ok(envelope) => {
+                    envelope.0.get("Status").and_then(serde_json::Value::as_str) != Some("PENDING")
+                }
+                Err(_) => checkpointed.is_some(),
+            };
             let response = match response {
                 Ok(envelope) => envelope.0,
                 Err(e) => {
@@ -2648,6 +2676,16 @@ impl LocalRunner {
                         &context.request_id,
                         Some(&crate::WireError::new(None::<String>, Some(fault.as_str()))),
                     );
+                    if checkpointed.is_some() {
+                        let end = RawEnd::Succeeded(checkpointed);
+                        backend.record_execution_end(&end);
+                        return Ok(RawRun {
+                            end,
+                            operations: backend.snapshot_operations(),
+                            invocations,
+                            events: backend.events(),
+                        });
+                    }
                     last_invocation_fault = Some(fault);
                     continue;
                 }
@@ -2664,10 +2702,12 @@ impl LocalRunner {
             );
             let end = match status {
                 Some("SUCCEEDED") => RawEnd::Succeeded(
-                    response
-                        .get("Result")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToOwned::to_owned),
+                    match response.get("Result").and_then(serde_json::Value::as_str) {
+                        // The result is too large for the envelope: the SDK
+                        // checkpointed it as the `EXECUTION` update.
+                        Some("") => Some(checkpointed.unwrap_or_default()),
+                        result => result.map(ToOwned::to_owned),
+                    },
                 ),
                 Some("FAILED") => RawEnd::Failed(envelope_wire_error(&response)),
                 Some("PENDING") => {
@@ -4055,6 +4095,10 @@ struct BackendState {
     events: Vec<Event>,
     /// The event ID of the last event in `events`, or 0 before the first.
     last_event_id: i32,
+    /// The payload of the accepted `EXECUTION` update: a result the SDK
+    /// checkpointed because it is over the response limit. No operation
+    /// stores it.
+    execution_result: Option<String>,
 }
 
 impl BackendState {
@@ -4071,6 +4115,7 @@ impl BackendState {
             updated_ids: Vec::new(),
             events: Vec::new(),
             last_event_id: 0,
+            execution_result: None,
         }
     }
 }
@@ -4200,6 +4245,10 @@ enum PlannedCheckpoint {
     /// answer until the test adds a permit to `gate`. So the SDK merges
     /// the response only after the release.
     PassGated { gate: Arc<tokio::sync::Semaphore> },
+    /// The call applies the updates as [`Self::Pass`] does, then answers
+    /// with a retryable error carrying the message, as when the service
+    /// recorded a write whose response was lost.
+    PassThenRetryableError(String),
 }
 
 impl Backend {
@@ -4242,6 +4291,24 @@ impl Backend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(plan);
+    }
+
+    /// Queues `response` as the answer to an upcoming checkpoint call, after
+    /// the calls queued before it. Only
+    /// [`TestResponse::AcceptThenRetryableError`] has a meaning for the
+    /// backend: it applies the call's updates, then answers with a
+    /// retryable error.
+    #[cfg(test)]
+    fn enqueue_response(&self, response: crate::client::TestResponse) {
+        let crate::client::TestResponse::AcceptThenRetryableError(message) = response else {
+            unreachable!("the LocalRunner backend answers only AcceptThenRetryableError");
+        };
+        self.plan_checkpoint_calls(vec![PlannedCheckpoint::PassThenRetryableError(message)]);
+    }
+
+    /// The payload of the `EXECUTION` update the backend accepted, if any.
+    fn execution_result(&self) -> Option<String> {
+        self.lock().execution_result.clone()
     }
 
     /// Pops the next planned checkpoint behavior, if a plan is queued.
@@ -5053,6 +5120,12 @@ impl BackendState {
     /// resulting stored op (cloned) for the checkpoint response.
     #[expect(clippy::too_many_lines)] // reason: one match over the update actions reads better as one flow
     fn apply_update(&mut self, kind: OperationKind, update: &OperationUpdate) -> Option<StoredOp> {
+        // An `EXECUTION` update carries the execution's result. It is kept
+        // apart, so it never appears as an operation.
+        if kind == OperationKind::Execution {
+            self.execution_result = update.payload().map(ToOwned::to_owned);
+            return None;
+        }
         let id = update.id().to_owned();
         let sub_type = update.sub_type().map(ToOwned::to_owned);
         let action = update.action().clone();
@@ -5363,6 +5436,18 @@ impl Backend {
                     return Box::pin(async move {
                         drop(gate.acquire().await);
                         answer.await
+                    });
+                }
+                PlannedCheckpoint::PassThenRetryableError(message) => {
+                    let answer = self.checkpoint_unplanned(updates, records);
+                    return Box::pin(async move {
+                        // The answer is replaced whatever it was: the test
+                        // sees only the lost response.
+                        drop(answer.await);
+                        Err(ExecutionClientError::new(
+                            crate::ExecutionClientErrorScope::Invocation,
+                            message,
+                        ))
                     });
                 }
                 PlannedCheckpoint::FailNonRetryable { gate } => {
@@ -12380,13 +12465,16 @@ mod tests {
             (T::Execution, A::Succeed, &statuses, None),
         ];
         for (op_type, action, allowed, message) in table {
+            // The backend stores no `EXECUTION` record (it keeps the
+            // payload apart), so an `EXECUTION` update never meets a
+            // stored status.
+            if op_type == T::Execution {
+                let update = built(rule_update("o", op_type.clone(), action.clone()));
+                check_rule_row("Execution Succeed", &[], &[], vec![update], message).await;
+                continue;
+            }
             // The seed creates the record. Its status is then set directly.
-            let seed_action = if op_type == T::Execution {
-                A::Succeed
-            } else {
-                A::Start
-            };
-            let seed = [built(rule_update("o", op_type.clone(), seed_action))];
+            let seed = [built(rule_update("o", op_type.clone(), A::Start))];
             for status in statuses {
                 let expected = (!allowed.contains(&status)).then_some(message).flatten();
                 let row = format!("{op_type:?} {action:?} at {status:?}");
@@ -12394,10 +12482,9 @@ mod tests {
                 check_rule_row(&row, &seed, &[("o", status)], vec![update], expected).await;
             }
         }
-        // EXECUTION FAIL is allowed at any status too.
-        let seed = [built(rule_update("o", T::Execution, A::Succeed))];
+        // EXECUTION FAIL is allowed too.
         let update = built(rule_update("o", T::Execution, A::Fail));
-        check_rule_row("Execution Fail", &seed, &[], vec![update], None).await;
+        check_rule_row("Execution Fail", &[], &[], vec![update], None).await;
     }
 
     /// Test 1.4: the parent rules.
@@ -20749,5 +20836,214 @@ mod tests {
             cloud.begin_history(false, true),
             Ok(HistoryStart::Read(_))
         ));
+    }
+
+    // ---- Oversized handler results ----
+
+    /// A handler whose serialized result is `n` bytes: `n - 2` letters and
+    /// two quotes. It builds the string when it runs, so a run of one
+    /// invocation builds it once.
+    fn sized_handler(
+        n: usize,
+    ) -> impl Fn((), DurableContext) -> std::future::Ready<Result<String, BoxError>>
+    + Send
+    + Sync
+    + 'static {
+        move |(), _ctx: DurableContext| std::future::ready(Ok("a".repeat(n - 2)))
+    }
+
+    /// Asserts that `result` succeeded with an output of `n - 2` letters,
+    /// comparing the lengths first so a failure does not print 6 MB.
+    fn assert_full_output(result: &TestResult<String>, n: usize) {
+        assert!(result.is_success(), "{:?}", result.error_message());
+        let output = result.output().expect("an output");
+        assert_eq!(output.len(), n - 2);
+        assert!(
+            output.bytes().all(|b| b == b'a'),
+            "the output is the result"
+        );
+    }
+
+    /// A result up to the limit is inline; above it, up to the backend's
+    /// maximum, it is checkpointed and read back; above the maximum the
+    /// service rejects it. No run lists an `EXECUTION` operation.
+    #[tokio::test]
+    async fn oversized_result_round_trips() {
+        for (n, checkpointed) in [(6_291_406, false), (6_291_407, true), (6_291_456, true)] {
+            let backend = Arc::new(Backend::new(QueuedReplies::default(), None));
+            let result: TestResult<String> = LocalRunner::new()
+                .run_on_backend(Arc::clone(&backend), sized_handler(n), "null".to_owned())
+                .await
+                .expect("runner");
+            assert_full_output(&result, n);
+            assert_eq!(
+                backend.execution_result().map(|stored| stored.len()),
+                checkpointed.then_some(n),
+                "n = {n}"
+            );
+            assert!(
+                result
+                    .operations()
+                    .iter()
+                    .all(|op| op.kind() != OperationKind::Execution),
+                "n = {n}"
+            );
+        }
+
+        let n = 6_291_457;
+        let backend = Arc::new(Backend::new(QueuedReplies::default(), None));
+        let result: TestResult<String> = LocalRunner::new()
+            .run_on_backend(Arc::clone(&backend), sized_handler(n), "null".to_owned())
+            .await
+            .expect("runner");
+        assert!(result.is_failure());
+        assert!(result.output().is_none());
+        assert_eq!(
+            result.error_type(),
+            Some(crate::error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+        let message = result.error_message().unwrap_or_default();
+        assert!(
+            message.starts_with("[Unrecoverable Execution] Checkpoint failed: "),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "Execution output payload size must be less than or equal to 6291456 bytes."
+            ),
+            "{message}"
+        );
+        assert_eq!(backend.execution_result(), None);
+        assert!(
+            result
+                .operations()
+                .iter()
+                .all(|op| op.kind() != OperationKind::Execution)
+        );
+    }
+
+    /// The backend accepts the `EXECUTION` update and the answer is lost:
+    /// the invocation fails, but the run ends `SUCCEEDED` with the full
+    /// output after one invocation. The end hook saw
+    /// `Retrying`.
+    #[tokio::test]
+    async fn oversized_result_accepted_then_error_ends_execution() {
+        let n = 6_291_407;
+        let plugin = crate::plugin::test_support::Hooks::default();
+        let runner = LocalRunner::new().options(
+            crate::Options::builder()
+                .plugin(plugin.clone())
+                .build()
+                .expect("valid options"),
+        );
+        let backend = Arc::new(Backend::new(QueuedReplies::default(), None));
+        backend.enqueue_response(crate::client::TestResponse::AcceptThenRetryableError(
+            "lost response".into(),
+        ));
+        let result: TestResult<String> = runner
+            .run_on_backend(Arc::clone(&backend), sized_handler(n), "null".to_owned())
+            .await
+            .expect("runner");
+        assert_full_output(&result, n);
+        assert_eq!(result.invocation_count(), 1);
+        let ends = plugin.ends();
+        let [end] = ends.as_slice() else {
+            unreachable!("one end info, got {}", ends.len());
+        };
+        assert_eq!(end.status(), crate::InvocationStatus::Retrying);
+        assert_eq!(
+            end.execution_error().and_then(crate::WireError::error_type),
+            Some(crate::error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE)
+        );
+    }
+
+    /// A handler that creates the callback `c`, with a heartbeat timeout,
+    /// and then returns a result one byte over the response limit, without
+    /// awaiting the callback.
+    async fn callback_then_oversized((): (), ctx: DurableContext) -> Result<String, BoxError> {
+        ctx.create_callback::<u32>()
+            .name("c")
+            .heartbeat(std::time::Duration::from_secs(60))
+            .await?;
+        Ok("a".repeat(crate::LAMBDA_RESPONSE_SIZE_LIMIT - 1))
+    }
+
+    /// The backend accepts the `EXECUTION` update of a live run and the
+    /// answer is lost: the run ends `SUCCEEDED` and is closed, so a reply
+    /// and a heartbeat to the callback still `Started` are refused.
+    #[tokio::test]
+    async fn oversized_result_accepted_then_error_closes_the_run() {
+        let n = crate::LAMBDA_RESPONSE_SIZE_LIMIT + 1;
+        let mut run = LocalRunner::new().run_configured(callback_then_oversized, (), |backend| {
+            // The callback's `START` passes; the `EXECUTION` write is
+            // accepted and its answer lost.
+            backend.plan_checkpoint_calls(vec![PlannedCheckpoint::Pass]);
+            backend.enqueue_response(crate::client::TestResponse::AcceptThenRetryableError(
+                "lost response".into(),
+            ));
+        });
+        let c = run.operation("c");
+        let result = (&mut run).await.expect("runner");
+        assert_full_output(&result, n);
+        assert_eq!(result.invocation_count(), 1);
+        assert_eq!(
+            c.snapshot().map(|op| op.status()),
+            Some(OperationStatus::Started)
+        );
+        let err = c
+            .send_callback(CallbackReply::success(&1_u32).expect("encodes"))
+            .await
+            .expect_err("the run ended");
+        assert!(
+            matches!(err, TestRunnerError::CallbackNotPending),
+            "{err:?}"
+        );
+        let err = c
+            .send_callback_heartbeat()
+            .await
+            .expect_err("the run ended");
+        assert!(
+            matches!(err, TestRunnerError::CallbackNotPending),
+            "{err:?}"
+        );
+        assert_eq!(
+            c.snapshot().map(|op| op.status()),
+            Some(OperationStatus::Started),
+            "the refused reply changed nothing"
+        );
+    }
+
+    /// An envelope with an empty `Result` and no checkpointed result reads
+    /// the empty string, which fails to decode as the output.
+    #[tokio::test]
+    async fn empty_result_without_checkpoint_fails_to_decode() {
+        let runner = LocalRunner::new();
+        let service = |_event: lambda_runtime::LambdaEvent<crate::InvocationPayload>| {
+            let response: crate::BoxedInvocationFuture = Box::pin(async {
+                Ok(crate::InvocationResponse(
+                    serde_json::json!({ "Status": "SUCCEEDED", "Result": "" }),
+                ))
+            });
+            response
+        };
+        let err = runner
+            .drive_service(Arc::new(runner.new_backend()), service, "null".to_owned())
+            .await
+            .expect("a run")
+            .into_test_result::<serde_json::Value>()
+            .expect_err("the empty string is not JSON");
+        assert!(
+            matches!(err, TestRunnerError::OutputDeserialization(_)),
+            "{err:?}"
+        );
+    }
+
+    /// The backend answers only `AcceptThenRetryableError` from a queued
+    /// `TestResponse`.
+    #[test]
+    #[should_panic(expected = "answers only AcceptThenRetryableError")]
+    fn backend_refuses_other_queued_responses() {
+        let backend = Backend::new(QueuedReplies::default(), None);
+        backend.enqueue_response(crate::client::TestResponse::RetryableError("x".into()));
     }
 }

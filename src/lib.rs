@@ -404,6 +404,12 @@ pub(crate) type RetryStrategy = Box<dyn Fn(&StepError, u32) -> RetryDecision + S
 /// durable-execution metrics (for example, executions that reach a failed
 /// terminal state) rather than on Lambda invocation errors.
 ///
+/// # Oversized results
+///
+/// A serialized result over 6 MB minus 50 bytes (6 291 406 bytes) does not
+/// fit the Lambda response. The SDK checkpoints it as the execution result,
+/// and the envelope carries an empty `Result`, as in JS.
+///
 /// # Errors
 ///
 /// Returns an error if the Lambda runtime fails to start or encounters an
@@ -1085,6 +1091,10 @@ pub(crate) type BoxedInvocationFuture = std::pin::Pin<
 /// execution status (`GetDurableExecution`) instead; see [`run`] for
 /// details.
 ///
+/// A serialized result over 6 MB minus 50 bytes (6 291 406 bytes) is
+/// checkpointed as the execution result, and the envelope carries an empty
+/// `Result`.
+///
 /// # Errors
 ///
 /// Returns an error if configuration is invalid.
@@ -1544,7 +1554,19 @@ where
     // execution status (`GetDurableExecution` /
     // `ListDurableExecutionsByFunction`) instead. See the rustdoc on
     // [`run`] and [`wrap`].
-    let (response, end) = outcome_envelope(outcome, flush_ctx);
+    //
+    // A result over the response limit is checkpointed as the execution's
+    // own `SUCCEED` update instead, after the flush, as in JS. This is a
+    // response site like the others: `end_invocation` below drains the
+    // change queue and runs the end hooks once with the end it returns.
+    let (response, end) = match outcome {
+        driver::InvocationOutcome::Complete(serialized)
+            if serialized.len() > LAMBDA_RESPONSE_SIZE_LIMIT =>
+        {
+            checkpoint_oversized_result(flush_ctx, serialized).await
+        }
+        outcome => outcome_envelope(outcome, flush_ctx),
+    };
     let (response, end) = driver::withdrawal_answer(flush_ctx, response, end);
     let late = end_invocation(plugins, end_log, flush_ctx, end, Some(&response), fatal_won).await;
     Finished::Respond(response, late)
@@ -1826,6 +1848,88 @@ pub(crate) fn outcome_envelope(
                 error: Some(error),
             },
         ),
+    }
+}
+
+/// Lambda's response limit minus 50 bytes for the envelope, as in JS.
+const LAMBDA_RESPONSE_SIZE_LIMIT: usize = 6 * 1024 * 1024 - 50;
+
+/// Checkpoints `serialized`, a handler result over
+/// [`LAMBDA_RESPONSE_SIZE_LIMIT`], as the execution's own `SUCCEED`
+/// update, and returns the response and the end for the plugins' end
+/// hooks.
+///
+/// The update's ID is the wire hash of `execution-result-<epoch ms>`, as
+/// in JS. It may read the clock, because a successful write ends the
+/// execution and no later invocation looks the ID up.
+///
+/// - Accepted: `{"Status":"SUCCEEDED","Result":""}`, and the end
+///   `Succeeded` with the full result.
+/// - A retryable failure fails the invocation with
+///   `failed to checkpoint the execution result: <error>`, and the end is
+///   `Retrying`.
+/// - A non-retryable failure answers `FAILED` with the record of
+///   [`checkpoint_execution_failure_wire`](error::checkpoint_execution_failure_wire),
+///   and the end is `Failed` with the same error.
+/// - A withdrawn checkpoint token answers `PENDING`.
+async fn checkpoint_oversized_result(
+    ctx: &DurableContext,
+    serialized: String,
+) -> (
+    Result<InvocationResponse, lambda_runtime::Error>,
+    InvocationEnd,
+) {
+    #[expect(clippy::expect_used)]
+    // reason: `duration_since` fails only for a clock set before 1970,
+    // which the Lambda runtime's clock never is.
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the Unix epoch")
+        .as_millis();
+    #[expect(clippy::expect_used)]
+    // reason: the ID, type and action, the builder's required fields, are set.
+    let update = aws_sdk_lambda::types::OperationUpdate::builder()
+        .id(engine::compute_wire_id_public(&format!(
+            "execution-result-{epoch_ms}"
+        )))
+        .r#type(aws_sdk_lambda::types::OperationType::Execution)
+        .action(aws_sdk_lambda::types::OperationAction::Succeed)
+        .payload(serialized.clone())
+        .build()
+        .expect("the update's required fields are set");
+    match ctx.checkpoint_updates_after_drive(vec![update]).await {
+        Ok(_) => (
+            Ok(InvocationResponse(serde_json::json!({
+                "Status": "SUCCEEDED",
+                "Result": ""
+            }))),
+            InvocationEnd {
+                status: InvocationStatus::Succeeded,
+                result: Some(serialized),
+                error: None,
+            },
+        ),
+        Err(context::WriteError::Failed(e)) if e.is_retryable() => {
+            let message = format!("failed to checkpoint the execution result: {e}");
+            (
+                Err(lambda_runtime::Error::from(message.clone())),
+                InvocationEnd::retrying(error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE, message),
+            )
+        }
+        Err(context::WriteError::Failed(e)) => {
+            let error = error::checkpoint_execution_failure_wire(&e);
+            (
+                Ok(failed_envelope(&error)),
+                InvocationEnd {
+                    status: InvocationStatus::Failed,
+                    result: None,
+                    error: Some(error),
+                },
+            )
+        }
+        Err(context::WriteError::Stopped) => {
+            outcome_envelope(driver::InvocationOutcome::Pending, ctx)
+        }
     }
 }
 
@@ -4744,5 +4848,253 @@ mod tests {
         assert_eq!(timeouts.read_timeout(), Some(Duration::from_secs(7)));
         assert_eq!(timeouts.connect_timeout(), None);
         assert_eq!(timeouts.operation_attempt_timeout(), None);
+    }
+
+    // ---- Oversized handler results ----
+
+    /// A durable invocation envelope with no recorded operation.
+    fn oversized_envelope() -> serde_json::Value {
+        serde_json::json!({
+            "DurableExecutionArn": "arn:aws:lambda:us-east-1:1:function:test",
+            "CheckpointToken": "token-abc",
+            "InitialExecutionState": { "Operations": [] }
+        })
+    }
+
+    /// Runs a `wrap` service whose handler returns `"a".repeat(n - 2)`, so
+    /// the serialized result is `n` bytes, over `client`, with `hooks`
+    /// registered. Returns the response and the end infos.
+    async fn run_sized_result(
+        n: usize,
+        client: std::sync::Arc<client::InMemoryExecutionClient>,
+    ) -> (
+        Result<serde_json::Value, lambda_runtime::Error>,
+        Vec<plugin::InvocationEndInfo>,
+    ) {
+        let hooks = Hooks::default();
+        let options = Options::builder()
+            .execution_client(client)
+            .plugin(hooks.clone())
+            .build()
+            .expect("valid options");
+        // The handler runs once, so the result string is built once.
+        let service = wrap(
+            move |_event: serde_json::Value, _ctx: DurableContext| async move {
+                Ok::<String, BoxError>("a".repeat(n - 2))
+            },
+            options,
+        );
+        let response = service(lambda_runtime::LambdaEvent::new(
+            InvocationPayload(oversized_envelope()),
+            lambda_runtime::Context::default(),
+        ))
+        .await
+        .map(|response| response.0);
+        (response, hooks.ends())
+    }
+
+    /// Whether `serialized` is the serialized result of
+    /// [`run_sized_result`]: `n` bytes, quotes around `n - 2` letters. It
+    /// checks the bytes in place, so no second 6 MB string is built.
+    fn is_sized_result(serialized: &str, n: usize) -> bool {
+        serialized.len() == n
+            && serialized
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+                .is_some_and(|inner| inner.bytes().all(|b| b == b'a'))
+    }
+
+    /// The `EXECUTION` updates `client` recorded.
+    fn execution_updates(
+        client: &client::InMemoryExecutionClient,
+    ) -> Vec<aws_sdk_lambda::types::OperationUpdate> {
+        client
+            .recorded_updates()
+            .into_iter()
+            .filter(|update| update.r#type() == &aws_sdk_lambda::types::OperationType::Execution)
+            .collect()
+    }
+
+    /// A result one byte over the limit is written as one `EXECUTION`
+    /// `SUCCEED` update with the result as payload and a hashed ID, and
+    /// the envelope carries an empty `Result`.
+    #[tokio::test]
+    async fn oversized_result_envelope_is_empty() {
+        let n = LAMBDA_RESPONSE_SIZE_LIMIT + 1;
+        assert_eq!(n, 6_291_407);
+        let client = std::sync::Arc::new(client::InMemoryExecutionClient::new(Vec::new()));
+        let (response, ends) = run_sized_result(n, std::sync::Arc::clone(&client)).await;
+        let response = response.expect("an envelope");
+        assert_eq!(
+            response,
+            serde_json::json!({ "Status": "SUCCEEDED", "Result": "" })
+        );
+        let updates = execution_updates(&client);
+        let [update] = updates.as_slice() else {
+            unreachable!("one EXECUTION update, got {}", updates.len());
+        };
+        assert_eq!(
+            update.action(),
+            &aws_sdk_lambda::types::OperationAction::Succeed
+        );
+        let payload = update.payload().unwrap_or_default();
+        assert_eq!(payload.len(), n);
+        assert!(
+            is_sized_result(payload, n),
+            "the payload is the serialized result"
+        );
+        let id = update.id();
+        assert_eq!(id.len(), 64, "{id}");
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "{id}"
+        );
+        let [end] = ends.as_slice() else {
+            unreachable!("one end, got {}", ends.len());
+        };
+        assert_eq!(end.status(), InvocationStatus::Succeeded);
+        let recorded = end.execution_result().unwrap_or_default();
+        assert_eq!(recorded.len(), n);
+        assert!(
+            is_sized_result(recorded, n),
+            "the end info holds the full result"
+        );
+    }
+
+    /// A failed write of the oversized result: a non-retryable failure
+    /// answers `FAILED` with `CheckpointUnrecoverableExecutionError`, and a
+    /// retryable one fails the invocation. The end hook runs once with the
+    /// matching status and error.
+    #[tokio::test]
+    async fn oversized_result_write_failures() {
+        let n = LAMBDA_RESPONSE_SIZE_LIMIT + 1;
+
+        let client = std::sync::Arc::new(client::InMemoryExecutionClient::new(Vec::new()));
+        client.enqueue_checkpoint_response(client::TestResponse::NonRetryableError(
+            "rejected".to_owned(),
+        ));
+        let (response, ends) = run_sized_result(n, std::sync::Arc::clone(&client)).await;
+        let response = response.expect("an envelope");
+        assert_eq!(json_str(&response, "/Status"), Some("FAILED"), "{response}");
+        assert_eq!(
+            json_str(&response, "/Error/ErrorType"),
+            Some(error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+        let message = json_str(&response, "/Error/ErrorMessage").unwrap_or_default();
+        assert!(
+            message.starts_with("[Unrecoverable Execution] Checkpoint failed: "),
+            "{message}"
+        );
+        let [end] = ends.as_slice() else {
+            unreachable!("one end, got {}", ends.len());
+        };
+        assert_eq!(end.status(), InvocationStatus::Failed);
+        assert_eq!(end.execution_result(), None);
+        assert_eq!(
+            end.execution_error().and_then(WireError::error_type),
+            Some(error::CHECKPOINT_EXECUTION_FAILED_ERROR_TYPE)
+        );
+        assert_eq!(
+            end.execution_error().and_then(WireError::error_message),
+            Some(message)
+        );
+
+        let client = std::sync::Arc::new(client::InMemoryExecutionClient::new(Vec::new()));
+        client.enqueue_checkpoint_response(client::TestResponse::RetryableError(
+            "throttled".to_owned(),
+        ));
+        let (response, ends) = run_sized_result(n, std::sync::Arc::clone(&client)).await;
+        let err = response.expect_err("the invocation fails");
+        assert!(
+            err.to_string()
+                .starts_with("failed to checkpoint the execution result: "),
+            "{err}"
+        );
+        assert!(err.to_string().contains("throttled"), "{err}");
+        let [end] = ends.as_slice() else {
+            unreachable!("one end, got {}", ends.len());
+        };
+        assert_eq!(end.status(), InvocationStatus::Retrying);
+        assert_eq!(end.execution_result(), None);
+        assert_eq!(
+            end.execution_error().and_then(WireError::error_type),
+            Some(error::CHECKPOINT_INVOCATION_FAILED_ERROR_TYPE)
+        );
+        assert!(
+            end.execution_error()
+                .and_then(WireError::error_message)
+                .is_some_and(|m| m.contains("failed to checkpoint the execution result")),
+            "{:?}",
+            end.execution_error()
+        );
+    }
+
+    /// The oversized write answers `PENDING` when the checkpoint token was
+    /// withdrawn before it, and sends nothing.
+    #[tokio::test]
+    async fn oversized_result_after_withdrawal_is_pending() {
+        let client = std::sync::Arc::new(client::InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client_and_defaults(
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
+            lambda_runtime::Context::default(),
+            std::sync::Arc::new(engine::CheckpointLog::empty()),
+            std::sync::Arc::clone(&client) as std::sync::Arc<dyn ExecutionClient>,
+            "t0".to_owned(),
+            None,
+            0,
+            None,
+        );
+        ctx.coordinator()
+            .withdraw(ctx.execution_arn(), "request", || {});
+        let (response, end) = checkpoint_oversized_result(&ctx, "\"a\"".to_owned()).await;
+        assert_eq!(
+            response.expect("an envelope").0,
+            serde_json::json!({ "Status": "PENDING" })
+        );
+        assert_eq!(end.status, InvocationStatus::Pending);
+        assert_eq!(client.recorded_updates().len(), 0);
+    }
+
+    /// A handler error with a 7 MB message answers `FAILED` and is never
+    /// checkpointed: only a result is size-checked.
+    #[tokio::test]
+    async fn oversized_error_is_not_checkpointed() {
+        let client = std::sync::Arc::new(client::InMemoryExecutionClient::new(Vec::new()));
+        let options = Options::builder()
+            .execution_client(std::sync::Arc::clone(&client) as std::sync::Arc<dyn ExecutionClient>)
+            .build()
+            .expect("valid options");
+        // The handler runs once, so the message is built once.
+        let service = wrap(
+            |_event: serde_json::Value, _ctx: DurableContext| async {
+                Err::<String, BoxError>("e".repeat(7 * 1024 * 1024).into())
+            },
+            options,
+        );
+        let response = service(lambda_runtime::LambdaEvent::new(
+            InvocationPayload(oversized_envelope()),
+            lambda_runtime::Context::default(),
+        ))
+        .await
+        .expect("an envelope")
+        .0;
+        assert_eq!(json_str(&response, "/Status"), Some("FAILED"));
+        assert_eq!(execution_updates(&client).len(), 0);
+    }
+
+    /// A result of exactly the limit stays inline, with no write.
+    #[tokio::test]
+    async fn result_at_limit_stays_inline() {
+        let n = LAMBDA_RESPONSE_SIZE_LIMIT;
+        assert_eq!(n, 6_291_406);
+        let client = std::sync::Arc::new(client::InMemoryExecutionClient::new(Vec::new()));
+        let (response, _ends) = run_sized_result(n, std::sync::Arc::clone(&client)).await;
+        let response = response.expect("an envelope");
+        assert_eq!(json_str(&response, "/Status"), Some("SUCCEEDED"));
+        let result = json_str(&response, "/Result").unwrap_or_default();
+        assert_eq!(result.len(), n);
+        assert!(is_sized_result(result, n), "the result is inline");
+        assert_eq!(client.recorded_updates().len(), 0);
     }
 }

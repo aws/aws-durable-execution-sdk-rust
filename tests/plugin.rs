@@ -363,6 +363,40 @@ async fn end_hook_succeeded() {
     );
 }
 
+/// A result over the response limit is checkpointed and read back, and
+/// the end hook runs once, with the full serialized result.
+#[tokio::test]
+async fn oversized_result_fires_invocation_end_once() {
+    let n = 6 * 1024 * 1024 - 50 + 1;
+    let plugin = Lifecycle::default();
+    // The handler runs once, so the result string is built once.
+    let result = lifecycle_runner(&plugin)
+        .run(
+            move |_e: (), _ctx: DurableContext| async move { Ok::<_, BoxError>("a".repeat(n - 2)) },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "{:?}", result.error_message());
+    let output: &String = result.output().expect("an output");
+    assert_eq!(output.len(), n - 2);
+    assert!(
+        output.bytes().all(|b| b == b'a'),
+        "the output is the result"
+    );
+    let ends = plugin.ends();
+    let [end] = ends.as_slice() else {
+        unreachable!("one end info, got {}", ends.len());
+    };
+    assert_eq!(end.status(), InvocationStatus::Succeeded);
+    let recorded = end.execution_result().unwrap_or_default();
+    assert_eq!(recorded.len(), n);
+    assert!(
+        recorded.strip_prefix('"').and_then(|r| r.strip_suffix('"')) == Some(output.as_str()),
+        "the end info holds the serialized result"
+    );
+}
+
 #[tokio::test]
 async fn end_hook_failed() {
     let plugin = Lifecycle::default();

@@ -172,6 +172,10 @@ destinations do not trigger, and X-Ray does not mark the trace as an error.
 Monitor and alarm on the durable execution status instead, via
 `get-durable-execution` or `list-durable-executions-by-function`.
 
+A serialized result over 6 MB minus 50 bytes (6 291 406 bytes) is
+checkpointed as the execution result, and the envelope carries an empty
+`Result`, as in JS.
+
 Durable operations are normal Rust futures. A waiting operation stays
 pending. While other SDK work runs, the SDK refreshes service state and may
 continue the operation in the same invocation. When no SDK work remains,

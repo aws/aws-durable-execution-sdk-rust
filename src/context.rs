@@ -492,9 +492,9 @@ fn checkpoint_failure_fatal(op_wire_id: &str, err: &ExecutionClientError) -> Fat
 /// Why a checkpoint write returned no output.
 #[derive(Debug)]
 pub(crate) enum WriteError {
-    /// The request failed, and the failure is recorded (see
-    /// [`InvocationCoordinator::fail_write`]).
-    Failed,
+    /// The request failed with this error, and the failure is recorded
+    /// (see [`InvocationCoordinator::fail_write`]).
+    Failed(ExecutionClientError),
     /// Nothing more is sent: the response had no token, the token was
     /// withdrawn before the request was sent (see
     /// [`InvocationCoordinator::withdraw`]), or an earlier write failed.
@@ -2750,8 +2750,7 @@ impl DurableContext {
     /// result to the caller at once: [`WriteError::Stopped`] when the token
     /// is or becomes withdrawn, or when a write failed before, and
     /// [`WriteError::Failed`] when it fails itself.
-    #[cfg(test)]
-    async fn checkpoint_updates_after_drive(
+    pub(crate) async fn checkpoint_updates_after_drive(
         &self,
         updates: Vec<OperationUpdate>,
     ) -> Result<CheckpointOutput, WriteError> {
@@ -2819,7 +2818,7 @@ impl DurableContext {
             let err = ExecutionClientError::new_non_retryable("no execution client configured");
             self.record_write_failure(&failure_id, &err);
             drop(token_guard);
-            return Some(Err(WriteError::Failed));
+            return Some(Err(WriteError::Failed(err)));
         };
         Some(
             self.write_locked(client, token_guard, updates, events, &failure_id)
@@ -2851,7 +2850,7 @@ impl DurableContext {
             Ok(output) => output,
             Err(err) => {
                 self.record_write_failure(failure_id, &err);
-                return Err(WriteError::Failed);
+                return Err(WriteError::Failed(err));
             }
         };
         let next_token = output.checkpoint_token().map(ToOwned::to_owned);
@@ -2928,7 +2927,7 @@ impl DurableContext {
                     // reported even though the pages failed.
                     self.queue_changes(change_set);
                     self.record_write_failure(failure_id, &err);
-                    return Err(WriteError::Failed);
+                    return Err(WriteError::Failed(err));
                 }
             };
             if !full_state.is_empty() {

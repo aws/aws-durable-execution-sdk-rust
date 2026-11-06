@@ -727,6 +727,9 @@ pub(crate) enum TestResponse {
     RetryableError(String),
     /// Return a non-retryable failure.
     NonRetryableError(String),
+    /// Accept the request's updates, then return a retryable failure, as
+    /// when the service recorded a write whose response was lost.
+    AcceptThenRetryableError(String),
 }
 
 /// In-memory test double for `ExecutionClient`.
@@ -872,9 +875,10 @@ impl ExecutionClient for InMemoryExecutionClient {
 
         Box::pin(async move {
             match response {
-                Some(TestResponse::RetryableError(msg)) => {
-                    Err(ExecutionClientError::from_retryable(msg))
-                }
+                // The updates are recorded above in both cases.
+                Some(
+                    TestResponse::RetryableError(msg) | TestResponse::AcceptThenRetryableError(msg),
+                ) => Err(ExecutionClientError::from_retryable(msg)),
                 Some(TestResponse::NonRetryableError(msg)) => {
                     Err(ExecutionClientError::non_retryable(msg))
                 }
@@ -2374,6 +2378,29 @@ mod tests {
     }
 
     // Test double behavior
+
+    /// A queued `AcceptThenRetryableError` records the request's updates,
+    /// then answers with a retryable error carrying its message.
+    #[tokio::test]
+    async fn accept_then_retryable_error_records_then_fails() {
+        let client = InMemoryExecutionClient::new(Vec::new());
+        client.enqueue_checkpoint_response(TestResponse::AcceptThenRetryableError(
+            "lost response".to_owned(),
+        ));
+        let update = OperationUpdate::builder()
+            .id("e")
+            .r#type(OperationType::Execution)
+            .action(OperationAction::Succeed)
+            .build()
+            .expect("valid update");
+        let err = client
+            .checkpoint("arn", "token", vec![update])
+            .await
+            .expect_err("a retryable error");
+        assert!(err.is_retryable());
+        assert_eq!(err.message(), "lost response");
+        assert_eq!(client.recorded_updates().len(), 1);
+    }
 
     #[tokio::test]
     async fn in_memory_client_returns_queued_responses_in_order() {
