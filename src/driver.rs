@@ -1861,7 +1861,7 @@ mod suspension_containment_and_task_ownership {
 
     fn live_ctx(client: Arc<InMemoryExecutionClient>) -> DurableContext {
         DurableContext::new_root_with_client(
-            "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
             lambda_runtime::Context::default(),
             Arc::new(CheckpointLog::empty()),
             client as Arc<dyn ExecutionClient>,
@@ -2503,7 +2503,7 @@ mod scoped_suspension {
 
     fn live_ctx(client: Arc<InMemoryExecutionClient>) -> DurableContext {
         DurableContext::new_root_with_client(
-            "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
             lambda_runtime::Context::default(),
             Arc::new(CheckpointLog::empty()),
             client as Arc<dyn ExecutionClient>,
@@ -2855,7 +2855,7 @@ mod spawn_scope_regressions {
 
     fn live_ctx(client: Arc<InMemoryExecutionClient>) -> DurableContext {
         DurableContext::new_root_with_client(
-            "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
             lambda_runtime::Context::default(),
             Arc::new(CheckpointLog::empty()),
             client as Arc<dyn ExecutionClient>,

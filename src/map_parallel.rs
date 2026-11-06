@@ -4636,7 +4636,7 @@ mod tests {
     /// Helper to create a test context with the given checkpoint log.
     fn test_ctx(log: CheckpointLog) -> DurableContext {
         DurableContext::new_root(
-            "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
             lambda_runtime::Context::default(),
             Arc::new(log),
         )
@@ -4701,7 +4701,7 @@ mod tests {
     ) -> (DurableContext, Arc<crate::client::InMemoryExecutionClient>) {
         let client = Arc::new(crate::client::InMemoryExecutionClient::new(Vec::new()));
         let ctx = DurableContext::new_root_with_client(
-            "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+            "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
             lambda_runtime::Context::default(),
             Arc::new(log),
             Arc::clone(&client) as Arc<dyn crate::client::ExecutionClient>,
@@ -8989,7 +8989,7 @@ mod tests {
         // it: the unwind of that task is the observable coordinator unwind.
         let handle = tokio::spawn(async move {
             let ctx = DurableContext::new_root_with_client(
-                "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+                "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
                 lambda_runtime::Context::default(),
                 Arc::new(log),
                 task_client as Arc<dyn crate::client::ExecutionClient>,
@@ -9052,7 +9052,7 @@ mod tests {
         // it: the unwind of that task is the observable coordinator unwind.
         let handle = tokio::spawn(async move {
             let ctx = DurableContext::new_root_with_client(
-                "arn:aws:lambda:us-east-1:123456789012:function:test".to_owned(),
+                "arn:aws:lambda:us-east-1:1:function:test".to_owned(),
                 lambda_runtime::Context::default(),
                 Arc::new(log),
                 task_client as Arc<dyn crate::client::ExecutionClient>,
