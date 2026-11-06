@@ -382,15 +382,34 @@ if [ -f "$WORK_DIR/pending" ]; then
     done < "$WORK_DIR/pending"
 fi
 
+# Phase 3: the SDK's CloudRunner tests against a deployed example
+#
+# tests/cloud_runner.rs drives the create_callback_simple function through
+# CloudRunner: it waits for the callback while the execution runs and
+# answers it. The test is ignored in a plain `cargo test`, so it runs here
+# with `--ignored`.
+
+callback_fn=$(function_name external create_callback_simple)
+if [ -z "$callback_fn" ]; then
+    echo "FAIL cloud_runner: create_callback_simple not found in stack $STACK_EXTERNAL" >> "$WORK_DIR/failures"
+elif CLOUD_CALLBACK_FUNCTION="$callback_fn" timeout 1800 \
+    cargo test --manifest-path ../Cargo.toml --features test-util \
+    --test cloud_runner -- --ignored; then
+    log "cloud_runner: pass"
+else
+    log "cloud_runner: FAIL"
+    echo "FAIL cloud_runner: cargo test --test cloud_runner failed" >> "$WORK_DIR/failures"
+fi
+
 # Report
 
-total=$(echo "$EXPECTATIONS" | grep -c '|' || true)
+total=$(( $(echo "$EXPECTATIONS" | grep -c '|' || true) + 1 ))
 if [ -f "$WORK_DIR/failures" ]; then
     failures=$(wc -l < "$WORK_DIR/failures")
     echo
-    echo "Cloud tests: $failures of $total example(s) FAILED:"
+    echo "Cloud tests: $failures of $total check(s) FAILED:"
     cat "$WORK_DIR/failures"
     exit 1
 fi
 echo
-echo "Cloud tests: all $total examples reached their expected terminal state."
+echo "Cloud tests: all $total checks passed (each example reached its expected terminal state, and the CloudRunner test passed)."

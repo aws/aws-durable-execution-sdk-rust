@@ -292,6 +292,9 @@ callback examples with `aws lambda send-durable-execution-callback-success`, and
 asserts that each execution reaches the terminal state its row in the script's
 expectations table names. Some examples pass by reaching `FAILED`, which is why
 the table is data rather than a blanket assertion.
+It then runs the ignored `CloudRunner` test in `tests/cloud_runner.rs` against
+the deployed `create_callback_simple` function, which answers a callback while
+the execution runs.
 
 The prerequisites match the conformance suite, plus `jq`. The whole run takes
 tens of minutes because several examples wait on real timers; the CI job caps it

@@ -303,3 +303,11 @@ required-features = ["test-util"]
 [[test]]
 name = "token_withdrawal"
 required-features = ["test-util"]
+
+[[test]]
+name = "live_control"
+required-features = ["test-util"]
+
+[[test]]
+name = "cloud_runner"
+required-features = ["test-util"]

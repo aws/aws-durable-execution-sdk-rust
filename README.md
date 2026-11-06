@@ -1745,6 +1745,7 @@ and `OperationStatus`, so a test checks
 `op.status() == OperationStatus::Succeeded`.
 `println!("{result}")` prints the operations as a table, and `result.display_with(columns)` selects the columns.
 `result.history_events()` returns the execution's history events, and `result.invocations()` lists each handler invocation with its request ID and error.
+Before it awaits the run, a test can wait for an operation with `run.operation(name).wait_for_data(..)` and answer its callback with `send_callback`, as the `test_util` docs show under "Reacting to a run in progress".
 
 `.register_function(name, f)` and `.register_durable_function(name, handler)`
 supply the target of `ctx.invoke`.
