@@ -171,6 +171,8 @@ status. Lambda-level error signals therefore stay quiet: the CloudWatch
 destinations do not trigger, and X-Ray does not mark the trace as an error.
 Monitor and alarm on the durable execution status instead, via
 `get-durable-execution` or `list-durable-executions-by-function`.
+[Differences from the JavaScript SDK](docs/differences-from-js.md#errors)
+lists where the recorded error types differ from the JavaScript SDK's.
 
 A serialized result over 6 MB minus 50 bytes (6 291 406 bytes) is
 checkpointed as the execution result, and the envelope carries an empty
@@ -277,6 +279,9 @@ time. Keep the control flow that decides which operations to create a pure
 function of the event and of results the SDK already recorded. Iterating a
 `HashMap` or `HashSet` to create operations breaks that, because the iteration
 order changes between runs; sort into a `Vec` first.
+[Differences from the JavaScript SDK](docs/differences-from-js.md#operations)
+lists where operation IDs, operation starts and suspension differ from the
+JavaScript SDK.
 
 Combinators and `with_retry` blocks are the exceptions to the call-site
 rule. A combinator (`try_join_all`, `join_all`, `select_ok` or `race`)
@@ -349,6 +354,8 @@ The helper has the settings of `lambda_runtime`'s default subscriber: it
 reads the level from `AWS_LAMBDA_LOG_LEVEL`, else `RUST_LOG`, else `INFO`,
 and writes JSON when `AWS_LAMBDA_LOG_FORMAT` is `json`. It returns an error
 when a global subscriber is already installed.
+[Differences from the JavaScript SDK](docs/differences-from-js.md#logging)
+compares this with the JavaScript SDK's replay-aware logger.
 `durable::init_default_subscriber_with_writer(writer)` does the same with
 another writer, such as a non-blocking one.
 
@@ -1151,6 +1158,8 @@ that wire string back to the typed value. There is no intermediate
 representation: a custom format sees struct field declaration order,
 `i128` values outside the `i64`/`u64` ranges, and everything else the real
 type carries.
+[Differences from the JavaScript SDK](docs/differences-from-js.md#serialization)
+lists where serdes behavior differs from the JavaScript SDK.
 
 The SDK awaits the future a serdes returns directly on the executor
 thread. Cheap in-memory transforms (like the default `JsonSerdes`) run
@@ -1367,7 +1376,8 @@ The SDK releases it when the invocation returns; a `DurableContext` clone
 that outlives the invocation keeps it alive until that clone drops. Every
 hook of the `Plugin` trait defaults to a no-op, so a plugin implements only
 the hooks it needs. The `plugin` module's rustdoc gives each hook's full
-contract.
+contract, and [Differences from the JavaScript SDK](docs/differences-from-js.md#plugins)
+lists where plugins behave differently from the JavaScript SDK.
 
 Example 1 counts the `on_operation_end` calls of each invocation and adds
 them to a total that the factory keeps across invocations.
@@ -1727,7 +1737,8 @@ plugin. A plugin that wants the SDK's log records installs its own
 
 Enable the `test-util` feature to get `LocalRunner`, which drives a handler
 through as many simulated invocations as the execution needs, in process and
-without AWS.
+without AWS. [Differences from the JavaScript SDK](docs/differences-from-js.md#testing)
+lists where `LocalRunner` differs from the JavaScript SDK's local runner.
 
 ```rust ignore
 let result = LocalRunner::new()
