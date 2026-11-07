@@ -158,7 +158,8 @@ where
     /// - explicit fail-fast:
     ///   [`CompletionConfig::with_tolerated_failure_count(0)`](CompletionConfig::with_tolerated_failure_count)
     /// - tolerate all failures:
-    ///   [`CompletionConfig::with_tolerated_failure_percentage(100.0)`](CompletionConfig::with_tolerated_failure_percentage)
+    ///   [`CompletionConfig::with_tolerated_failure_percentage(100.0)?`](CompletionConfig::with_tolerated_failure_percentage),
+    ///   which returns a `Result` because it checks the percentage
     pub fn completion(mut self, config: CompletionConfig) -> Self {
         self.completion = Some(config);
         self
@@ -320,9 +321,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the batch execution encounters an infrastructure
-    /// failure (a task-ownership violation) or an invalid completion
-    /// configuration, such as a failure percentage outside
-    /// `0.0..=100.0`. `max_concurrency(0)` returns no error: it fails the
+    /// failure (a task-ownership violation). `max_concurrency(0)` returns no error: it fails the
     /// execution, and the handler cannot catch it. A failed checkpoint
     /// write returns no error either: it ends the invocation, and the batch
     /// does not resolve. Item-level failures are
@@ -743,7 +742,8 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// - explicit fail-fast:
     ///   [`CompletionConfig::with_tolerated_failure_count(0)`](CompletionConfig::with_tolerated_failure_count)
     /// - tolerate all failures:
-    ///   [`CompletionConfig::with_tolerated_failure_percentage(100.0)`](CompletionConfig::with_tolerated_failure_percentage)
+    ///   [`CompletionConfig::with_tolerated_failure_percentage(100.0)?`](CompletionConfig::with_tolerated_failure_percentage),
+    ///   which returns a `Result` because it checks the percentage
     ///
     /// A failure percentage applies to `parallel` as it does to `map`, as
     /// in JS and Python `ParallelConfig`.
@@ -886,9 +886,7 @@ impl<O: Send + 'static, IS, RS> ParallelBuilder<O, IS, RS> {
     /// # Errors
     ///
     /// Returns an error if the batch execution encounters an infrastructure
-    /// failure (a task-ownership violation) or an invalid completion
-    /// configuration, such as a failure percentage outside
-    /// `0.0..=100.0`. `max_concurrency(0)` returns no error: it fails the
+    /// failure (a task-ownership violation). `max_concurrency(0)` returns no error: it fails the
     /// execution, and the handler cannot catch it. A failed checkpoint
     /// write returns no error either: it ends the invocation, and the batch
     /// does not resolve. Branch-level failures are
@@ -1303,7 +1301,8 @@ impl<RS> ParallelMixedBuilder<RS> {
     /// - explicit fail-fast:
     ///   [`CompletionConfig::with_tolerated_failure_count(0)`](CompletionConfig::with_tolerated_failure_count)
     /// - tolerate all failures:
-    ///   [`CompletionConfig::with_tolerated_failure_percentage(100.0)`](CompletionConfig::with_tolerated_failure_percentage)
+    ///   [`CompletionConfig::with_tolerated_failure_percentage(100.0)?`](CompletionConfig::with_tolerated_failure_percentage),
+    ///   which returns a `Result` because it checks the percentage
     ///
     /// A failure percentage applies to `parallel_mixed` as it does to
     /// `map`, as in JS and Python `ParallelConfig`.
@@ -1598,12 +1597,17 @@ pub(crate) type CompletionPredicate =
 /// hands the decision to the configured criteria:
 ///
 /// - explicit fail-fast: [`with_tolerated_failure_count(0)`](Self::with_tolerated_failure_count)
-/// - tolerate all failures: [`with_tolerated_failure_percentage(100.0)`](Self::with_tolerated_failure_percentage)
+/// - tolerate all failures: [`with_tolerated_failure_percentage(100.0)?`](Self::with_tolerated_failure_percentage),
+///   which returns a `Result` because it checks the percentage
 ///
 /// Construct with [`CompletionConfig::builder`] (which combines thresholds
 /// and validates them at [`build`](CompletionConfigBuilder::build) time) or
-/// with one of the single-threshold constructors. Read values back
-/// through the accessors.
+/// with one of the single-threshold constructors. Both
+/// [`build`](CompletionConfigBuilder::build) and
+/// [`with_tolerated_failure_percentage`](Self::with_tolerated_failure_percentage)
+/// return [`CompletionConfigValidationError`] for an invalid percentage, so
+/// an invalid config never reaches a batch; the other constructors cannot
+/// fail. Read values back through the accessors.
 ///
 /// # Examples
 ///
@@ -1751,8 +1755,7 @@ impl CompletionConfig {
     ///
     /// Use `0.0` for explicit fail-fast behavior (stop on first failure).
     /// Use `100.0` to tolerate all failures (the failure rate can never
-    /// strictly exceed 100%). A value that is not finite or lies outside
-    /// `0.0..=100.0` fails the batch at execute time.
+    /// strictly exceed 100%).
     ///
     /// The percentage applies to `parallel` as it does to `map`, as in JS
     /// and Python `ParallelConfig`.
@@ -1760,12 +1763,33 @@ impl CompletionConfig {
     /// **Default when unset:** an empty config fails fast on the first
     /// failure; a config with some other criterion set applies only that
     /// criterion.
-    #[must_use]
-    pub fn with_tolerated_failure_percentage(pct: f64) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompletionConfigValidationError`] when `pct` is not finite
+    /// or lies outside `0.0..=100.0`, with the message `invalid
+    /// CompletionConfig: tolerated_failure_percentage must be 0-100, got
+    /// {pct}`. [`CompletionConfigBuilder::build`] applies the same check.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aws_durable_execution_sdk::builders::map_parallel::CompletionConfig;
+    ///
+    /// let config = CompletionConfig::with_tolerated_failure_percentage(12.5)?;
+    /// assert_eq!(config.tolerated_failure_percentage(), Some(12.5));
+    ///
+    /// assert!(CompletionConfig::with_tolerated_failure_percentage(150.0).is_err());
+    /// # Ok::<(), aws_durable_execution_sdk::builders::map_parallel::CompletionConfigValidationError>(())
+    /// ```
+    pub fn with_tolerated_failure_percentage(
+        pct: f64,
+    ) -> Result<Self, CompletionConfigValidationError> {
+        check_percentage(Some(pct))?;
+        Ok(Self {
             tolerated_failure_percentage: Some(pct),
             ..Self::default()
-        }
+        })
     }
 
     /// Creates a config with just a custom completion predicate.
@@ -1884,37 +1908,31 @@ impl CompletionConfig {
             .as_ref()
             .map_or(CompletionDecision::Continue, |predicate| predicate(stats))
     }
-
-    /// Validates the completion config, returning an error message when the
-    /// config is invalid (crate-internal; callers convert the message into a
-    /// typed batch error).
-    ///
-    /// [`CompletionConfigBuilder::build`] performs the same range check at
-    /// construction time; this execute-time check remains as the guard for
-    /// configs made through the single-threshold constructors (for example
-    /// [`CompletionConfig::with_tolerated_failure_percentage`]), which do
-    /// not validate.
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        check_percentage(self.tolerated_failure_percentage)
-    }
 }
 
 /// Checks the failure percentage: it must be finite and lie in
-/// `0.0..=100.0`. Returns the message both validation paths report.
-fn check_percentage(pct: Option<f64>) -> Result<(), String> {
+/// `0.0..=100.0`. Both [`CompletionConfig::with_tolerated_failure_percentage`]
+/// and [`CompletionConfigBuilder::build`] call it, so they report the same
+/// error.
+fn check_percentage(pct: Option<f64>) -> Result<(), CompletionConfigValidationError> {
     match pct {
-        Some(pct) if !(pct.is_finite() && (0.0..=100.0).contains(&pct)) => Err(format!(
-            "tolerated_failure_percentage must be 0-100, got {pct}"
-        )),
+        Some(pct) if !(pct.is_finite() && (0.0..=100.0).contains(&pct)) => {
+            Err(CompletionConfigValidationError {
+                message: format!("tolerated_failure_percentage must be 0-100, got {pct}"),
+            })
+        }
         _ => Ok(()),
     }
 }
 
-/// Error returned by [`CompletionConfigBuilder::build`] when the configured
-/// thresholds are invalid.
+/// Error returned while constructing a [`CompletionConfig`]: by
+/// [`CompletionConfig::with_tolerated_failure_percentage`] and by
+/// [`CompletionConfigBuilder::build`].
 ///
 /// Mirrors [`OptionsValidationError`](crate::OptionsValidationError): misconfiguration fails at
-/// construction time rather than mid-execution.
+/// construction time rather than mid-execution. No map, parallel or
+/// `parallel_mixed` operation returns it, because an invalid config never
+/// reaches one.
 ///
 /// # Examples
 ///
@@ -2140,12 +2158,10 @@ impl CompletionConfigBuilder {
     ///    min_successful, tolerated_failure_count and
     ///    tolerated_failure_percentage`.
     ///
-    /// Item-count-dependent checks (for example `min_successful` against
-    /// the actual number of items) happen at execute time, where the item
-    /// count is first known.
+    /// A batch does not check its config again: an error here is the only
+    /// place an invalid config is reported.
     pub fn build(self) -> Result<CompletionConfig, CompletionConfigValidationError> {
-        check_percentage(self.tolerated_failure_percentage)
-            .map_err(|message| CompletionConfigValidationError { message })?;
+        check_percentage(self.tolerated_failure_percentage)?;
         if self.completion_predicate.is_some()
             && (self.min_successful.is_some()
                 || self.tolerated_failure_count.is_some()
@@ -2185,7 +2201,6 @@ mod tests {
         assert_eq!(combined.min_successful(), Some(2));
         assert_eq!(combined.tolerated_failure_count(), Some(1));
         assert_eq!(combined.tolerated_failure_percentage(), Some(25.0));
-        assert!(combined.validate().is_ok());
 
         // An unset threshold stays `None`.
         let only_min = CompletionConfig::builder()
@@ -2215,39 +2230,35 @@ mod tests {
         assert!(!default.has_completion_predicate());
     }
 
-    /// An out-of-range percentage is rejected at construction time by
-    /// `CompletionConfigBuilder::build`, and the error names the offending
-    /// field. The execute-time `validate()` applies the same check for
-    /// configs made through the single-threshold constructor, which does
-    /// not validate.
+    /// The direct constructor and the builder reject the same invalid
+    /// percentages with the same complete error, and accept every value in
+    /// `0.0..=100.0` unchanged.
     #[test]
-    fn completion_config_builder_percentage_is_validated() {
-        let err = CompletionConfig::builder()
-            .tolerated_failure_percentage(101.0)
-            .build()
-            .expect_err("a percentage above 100 must be rejected at build time");
-        assert!(
-            err.to_string().contains("tolerated_failure_percentage"),
-            "error should name the offending field, got: {err}"
-        );
-
-        // The boundary value 100 is accepted.
-        assert!(
-            CompletionConfig::builder()
-                .tolerated_failure_percentage(100.0)
+    fn percentage_is_checked_when_built() {
+        for pct in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 150.0] {
+            let expected = format!(
+                "invalid CompletionConfig: \
+                 tolerated_failure_percentage must be 0-100, got {pct}"
+            );
+            let direct = CompletionConfig::with_tolerated_failure_percentage(pct)
+                .expect_err("the constructor rejects an invalid percentage");
+            assert_eq!(direct.to_string(), expected);
+            let built = CompletionConfig::builder()
+                .tolerated_failure_percentage(pct)
                 .build()
-                .is_ok()
-        );
-
-        // The constructor path is still guarded by the execute-time check.
-        let constructed = CompletionConfig::with_tolerated_failure_percentage(101.0);
-        let msg = constructed
-            .validate()
-            .expect_err("execute-time validation must reject the constructor path");
-        assert!(
-            msg.contains("tolerated_failure_percentage"),
-            "error should name the offending field, got: {msg}"
-        );
+                .expect_err("the builder rejects an invalid percentage");
+            assert_eq!(built.to_string(), expected);
+        }
+        for pct in [0.0, 12.5, 100.0] {
+            let direct = CompletionConfig::with_tolerated_failure_percentage(pct)
+                .expect("the constructor accepts a valid percentage");
+            assert_eq!(direct.tolerated_failure_percentage(), Some(pct));
+            let built = CompletionConfig::builder()
+                .tolerated_failure_percentage(pct)
+                .build()
+                .expect("the builder accepts a valid percentage");
+            assert_eq!(built.tolerated_failure_percentage(), Some(pct));
+        }
     }
 
     /// A stored completion predicate keeps `CompletionConfig`'s `Clone` and
@@ -2384,10 +2395,9 @@ mod tests {
             .completion_predicate(complete_on_first_settle)
             .build()
             .expect_err("both rules are broken");
-        assert!(
-            err.to_string()
-                .contains("tolerated_failure_percentage must be 0-100"),
-            "unexpected message: {err}"
+        assert_eq!(
+            err.to_string(),
+            "invalid CompletionConfig: tolerated_failure_percentage must be 0-100, got 150"
         );
     }
 

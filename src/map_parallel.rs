@@ -2396,15 +2396,7 @@ where
 
     let completion_cfg = completion.unwrap_or_default();
 
-    // Validate completion config. A zero-item batch reads no threshold, so
-    // it succeeds whatever the config holds.
-    if total_items > 0
-        && let Err(msg) = completion_cfg.validate()
-    {
-        return Err(batch_error(&msg));
-    }
-
-    // 4 to 10: the batch-producing section, from the zero-item result or
+    // 3 to 8: the batch-producing section, from the zero-item result or
     // the first record read to the batch and its completion reason. On a
     // live or resumed batch it is the container's user function: its hooks
     // and wraps run through the runner, under the batch child context's
@@ -2470,7 +2462,7 @@ where
         return Ok(batch_result);
     }
 
-    // 11. Build the batch record text from the item wire strings (no
+    // 9. Build the batch record text from the item wire strings (no
     // serdes call), then pass it through the SAME `serialize_value` helper
     // as every other path. `result_serdes` receives the record's JSON text
     // and returns the payload to store.
@@ -2506,7 +2498,7 @@ where
     let summary_json =
         oversized_batch_summary(&batch_result, parent_sub_type, caller_summary.as_deref());
 
-    // 12. Checkpoint the parent SUCCEED.
+    // 10. Checkpoint the parent SUCCEED.
     checkpoint_batch_success_serialized(
         &ctx,
         &parent_wire,
@@ -2547,7 +2539,7 @@ struct BatchSection<'a, O, IS> {
     replay_plan: Option<ReplayPlan>,
 }
 
-/// The batch-producing section of [`execute_batch`], steps 4 to 10: the
+/// The batch-producing section of [`execute_batch`], steps 3 to 8: the
 /// zero-item result, or every item's record read, the items' dispatch and
 /// settlement, and the batch with its completion reason. It returns `Ok`
 /// with every item failure in the batch. The batch's scope closes inside
@@ -2578,7 +2570,7 @@ where
         replay_plan,
     } = section;
 
-    // 4. Empty collection: the batch succeeds at once. As in JS, a
+    // 3. Empty collection: the batch succeeds at once. As in JS, a
     // zero-item batch asks the predicate once, on an empty view; without a
     // predicate the decision is `Continue`, which records `AllCompleted`.
     if total_items == 0 {
@@ -2594,10 +2586,10 @@ where
         });
     }
 
-    // 5. Determine effective concurrency.
+    // 4. Determine effective concurrency.
     let concurrency = max_concurrency.unwrap_or(total_items).max(1);
 
-    // 6. Read every item's record up front (concurrent path). Each item's
+    // 5. Read every item's record up front (concurrent path). Each item's
     // ID comes from `item_ids`, so it depends on its index alone. Reading
     // is LOCAL, no `Start` is checkpointed here; the coordinator writes
     // each child's `Start` at dispatch, so a child is admitted (and
@@ -2642,7 +2634,7 @@ where
         }
     }
 
-    // 7. Execute items with bounded concurrency, branch-local suspension, and
+    // 6. Execute items with bounded concurrency, branch-local suspension, and
     // slot-holding accounting. Admission is ordered and LAZY: the
     // coordinator, the sole writer of child starts, checkpoints each
     // child's `Start` at the moment it dispatches that child, in index
@@ -2977,7 +2969,7 @@ where
         started,
     } = progress;
 
-    // 9. Assemble results in input order. On the live path, every
+    // 7. Assemble results in input order. On the live path, every
     // dispatched item that is not terminal (running when the trigger fired,
     // parked, or finished but not joined) is reported as STARTED, as in JS.
     // Never-started items are omitted. Under a replay plan the record's
@@ -3022,11 +3014,11 @@ where
         });
     }
 
-    // 10. Determine completion reason: the first trigger to fire during the
+    // 8. Determine completion reason: the first trigger to fire during the
     // run (recorded at the dispatch gate or the settle that fired it: first
     // trigger wins), or `AllCompleted` when no trigger fired. A non-empty
     // batch reaches this point only after a settle or after the dispatch
-    // gate set the reason, and the zero-item batch returned at step 4.
+    // gate set the reason, and the zero-item batch returned at step 3.
     let reason = tracker
         .stop_reason
         .unwrap_or(CompletionReason::AllCompleted);
@@ -6255,7 +6247,8 @@ mod tests {
         let tolerate_all =
             crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(
                 100.0,
-            );
+            )
+            .expect("a valid percentage");
         assert!(
             !should_stop_failure(&tolerate_all, 10, 10),
             "pct=100 must tolerate even a fully failed batch"
@@ -6333,18 +6326,6 @@ mod tests {
             .expect("valid completion config");
         // After 1 success, should stop.
         assert!(should_stop_min(&cfg, 1));
-    }
-
-    #[tokio::test]
-    async fn completion_config_validate_mutual_exclusivity() {
-        // Having both min_successful and tolerated_failure_count is valid
-        // (Go/JS allow it: first threshold fires). No error.
-        let cfg = crate::builders::map_parallel::CompletionConfig::builder()
-            .min_successful(2)
-            .tolerated_failure_count(1)
-            .build()
-            .expect("valid completion config");
-        assert!(cfg.validate().is_ok());
     }
 
     /// The completion types the tests below use. `CompletionConfig` gets the
@@ -6838,8 +6819,12 @@ mod tests {
         let items: Vec<Option<u32>> = (0..total)
             .map(|i| if i < failures { None } else { Some(1) })
             .collect();
-        let (batch, _payload, _awaited) =
-            run_map(items, Config::with_tolerated_failure_percentage(pct), 1).await;
+        let (batch, _payload, _awaited) = run_map(
+            items,
+            Config::with_tolerated_failure_percentage(pct).expect("a valid percentage"),
+            1,
+        )
+        .await;
         batch.reason
     }
 
@@ -6867,68 +6852,6 @@ mod tests {
             percentage_reason(8, 2, 12.5).await,
             CompletionReason::FailureToleranceExceeded
         );
-    }
-
-    #[test]
-    fn percentage_out_of_range_is_rejected() {
-        for pct in [100.5, -1.0, f64::NAN] {
-            let built = Config::builder()
-                .tolerated_failure_percentage(pct)
-                .build()
-                .expect_err("out of range");
-            assert!(
-                built
-                    .to_string()
-                    .contains("tolerated_failure_percentage must be 0-100"),
-                "{pct}: {built}"
-            );
-            let validated = Config::with_tolerated_failure_percentage(pct)
-                .validate()
-                .expect_err("out of range");
-            assert!(
-                validated.contains("tolerated_failure_percentage must be 0-100"),
-                "{pct}: {validated}"
-            );
-        }
-        // Infinity is not finite, and the bounds themselves are valid.
-        assert!(
-            Config::with_tolerated_failure_percentage(f64::INFINITY)
-                .validate()
-                .is_err()
-        );
-        for pct in [0.0, 100.0] {
-            assert!(
-                Config::with_tolerated_failure_percentage(pct)
-                    .validate()
-                    .is_ok()
-            );
-        }
-    }
-
-    /// An invalid percentage that skipped the builder's validation fails a
-    /// non-empty batch before any item runs, and a zero-item batch, which
-    /// reads no threshold, succeeds.
-    #[tokio::test]
-    async fn invalid_percentage_fails_only_a_non_empty_batch() {
-        let body = |_child: DurableContext, item: u32, _idx: usize| async move { Ok(item) };
-        let invalid = || Config::with_tolerated_failure_percentage(150.0);
-        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
-        let err = ctx
-            .map(vec![1_u32], body)
-            .completion(invalid())
-            .await
-            .expect_err("an invalid percentage fails the batch");
-        assert!(
-            crate::error::chain_string(&err).contains("tolerated_failure_percentage must be 0-100"),
-            "{err}"
-        );
-        let (ctx, _client) = test_ctx_with_client(CheckpointLog::empty());
-        let empty = ctx
-            .map(Vec::<u32>::new(), body)
-            .completion(invalid())
-            .await
-            .expect("a zero-item batch succeeds");
-        assert_eq!(empty, Vec::<u32>::new());
     }
 
     /// The statuses of a predicate's view, as `(name, status)` pairs.
@@ -12922,6 +12845,7 @@ mod tests {
             crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(
                 100.0,
             )
+            .expect("a valid percentage")
         };
         let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
         ctx.parallel(branches())
@@ -13382,7 +13306,10 @@ mod batch_terminal_tests {
                         let batch = ctx
                             .parallel(branches)
                             .max_concurrency(1)
-                            .completion(CompletionConfig::with_tolerated_failure_percentage(50.0))
+                            .completion(
+                                CompletionConfig::with_tolerated_failure_percentage(50.0)
+                                    .expect("a valid percentage"),
+                            )
                             .await_batch()
                             .await?;
                         *lock(&slot) = Some(record_of(&batch));

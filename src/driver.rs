@@ -2103,46 +2103,7 @@ mod suspension_containment_and_task_ownership {
         );
     }
 
-    // 3. Validation errors remain catchable; checkpoint failures do not
-
-    #[tokio::test]
-    async fn validation_error_is_catchable_err() {
-        let ctx = live_ctx(Arc::new(InMemoryExecutionClient::new(Vec::new())));
-        let signal = Arc::clone(ctx.coordinator());
-        let caught = Arc::new(AtomicBool::new(false));
-        let caught_c = Arc::clone(&caught);
-        let ctx_h = ctx.clone();
-        let outcome = drive_ok(
-            ctx.clone(),
-            async move {
-                // An out-of-range failure percentage is a validation
-                // error, returned as Err. (`max_concurrency(0)` fails the
-                // execution instead, as JS does.)
-                let r = ctx_h
-                    .parallel(vec![crate::Branch::new("b", |_| async {
-                        Ok("b".to_owned())
-                    })])
-                    .completion(
-                        crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(
-                            150.0,
-                        ),
-                    )
-                    .await;
-                if r.is_err() {
-                    caught_c.store(true, Ordering::SeqCst);
-                }
-                Ok::<_, crate::error::WireError>("handled".to_owned())
-            },
-            Arc::clone(ctx.task_ownership()),
-            signal,
-        )
-        .await;
-        assert_eq!(outcome, InvocationOutcome::Complete("handled".to_owned()));
-        assert!(
-            caught.load(Ordering::SeqCst),
-            "validation error must be catchable"
-        );
-    }
+    // 3. Checkpoint failures are not catchable
 
     /// A checkpoint API failure is never yielded to the handler as a
     /// catchable error (issue #43): the handler is dropped at its await

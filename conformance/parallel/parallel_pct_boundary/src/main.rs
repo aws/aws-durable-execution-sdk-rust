@@ -21,7 +21,7 @@ async fn handler(
         .parallel(branches)
         .name("pct-boundary")
         .max_concurrency(1)
-        .completion(CompletionConfig::with_tolerated_failure_percentage(25.0))
+        .completion(CompletionConfig::with_tolerated_failure_percentage(25.0)?)
         .await_batch()
         .await?;
 

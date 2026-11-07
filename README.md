@@ -923,7 +923,7 @@ Both accept `.max_concurrency(...)` and `.completion(...)`. By default
 first item failure fails the batch, matching the Python and JS SDKs.
 Configuring any criterion, including a predicate, replaces that implicit
 fail-fast: use `with_tolerated_failure_count(0)` for explicit fail-fast, or
-`with_tolerated_failure_percentage(100.0)` to tolerate all failures.
+`with_tolerated_failure_percentage(100.0)?` to tolerate all failures.
 
 When a batch result is over 256 KiB, the batch records a summary of its
 outcome instead, and `.summary(...)` adds the output of a function of the
@@ -932,7 +932,7 @@ reads.
 
 A `CompletionConfig` can end the batch early with fixed thresholds.
 `with_min_successful(n)` stops once `n` items succeed, and
-`with_tolerated_failure_count(n)` and `with_tolerated_failure_percentage(pct)`
+`with_tolerated_failure_count(n)` and `with_tolerated_failure_percentage(pct)?`
 fail the batch once the failures exceed the tolerance.
 `CompletionConfig::builder()` combines thresholds, and the first to fire
 wins. After each settle the SDK checks them in JS's order: the failure
@@ -942,8 +942,9 @@ minimum. So `min_successful(2)` over two items records `ALL_COMPLETED`.
 percentage is an `f64` and accepts a fraction such as `12.5`; the batch fails
 when the failure rate strictly exceeds it. The SDK compares
 `failures * 100 > pct * total` rather than dividing, so 7 failures of 50 do
-not exceed `14.0`. `build()` rejects a percentage that is not finite or lies
-outside `0.0..=100.0`.
+not exceed `14.0`. `with_tolerated_failure_percentage` and `build()` return
+a `CompletionConfigValidationError` for a percentage that is not finite or
+lies outside `0.0..=100.0`, so an invalid percentage never reaches a batch.
 
 The builder's `.completion_predicate(...)` sets a custom rule instead. The
 predicate receives a `BatchStats` snapshot and returns a `CompletionDecision`:

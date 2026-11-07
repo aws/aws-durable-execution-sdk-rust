@@ -279,3 +279,74 @@ async fn oversized_child_rebuild_does_not_call_predicate() {
     .await;
     assert_rebuild_skips_predicate(&seen);
 }
+
+/// An invalid percentage is rejected while the `CompletionConfig` is
+/// built, so no batch starts with it and no record stays `STARTED`. The
+/// handler runs a map only when construction succeeded, records each
+/// construction error, then runs a valid map.
+#[tokio::test]
+async fn invalid_percentage_starts_no_batch() {
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let handler_errors = Arc::clone(&errors);
+    let result = LocalRunner::new()
+        .run(
+            move |_event: serde_json::Value, ctx: durable::DurableContext| {
+                let errors = Arc::clone(&handler_errors);
+                async move {
+                    let attempts = [
+                        (
+                            "invalid-constructor",
+                            CompletionConfig::with_tolerated_failure_percentage(150.0),
+                        ),
+                        (
+                            "invalid-builder",
+                            CompletionConfig::builder()
+                                .tolerated_failure_percentage(150.0)
+                                .build(),
+                        ),
+                    ];
+                    for (name, built) in attempts {
+                        match built {
+                            Ok(config) => {
+                                ctx.map(vec![1_u32], |_child, item, _idx| async move { Ok(item) })
+                                    .name(name)
+                                    .completion(config)
+                                    .await?;
+                            }
+                            Err(err) => errors.lock().expect("lock").push(err.to_string()),
+                        }
+                    }
+                    ctx.map(vec![1_u32], |_child, item, _idx| async move { Ok(item) })
+                        .name("ok")
+                        .completion(CompletionConfig::with_tolerated_failure_percentage(100.0)?)
+                        .await?;
+                    Ok::<_, durable::BoxError>(())
+                }
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+    assert!(result.is_success(), "the execution succeeds: {result}");
+    assert_eq!(result.invocation_count(), 1);
+    let expected =
+        "invalid CompletionConfig: tolerated_failure_percentage must be 0-100, got 150".to_owned();
+    assert_eq!(
+        *errors.lock().expect("lock"),
+        [expected.clone(), expected],
+        "both construction paths return the same error"
+    );
+    assert!(result.operation("invalid-constructor").is_none());
+    assert!(result.operation("invalid-builder").is_none());
+    assert_eq!(
+        result.operation("ok").expect("the valid map ran").status(),
+        durable::OperationStatus::Succeeded
+    );
+    assert!(
+        result
+            .operations()
+            .iter()
+            .all(|op| op.status() != durable::OperationStatus::Started),
+        "no operation stays STARTED: {result}"
+    );
+}

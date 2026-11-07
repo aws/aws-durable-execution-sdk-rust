@@ -782,7 +782,8 @@ mod tests {
                         .name("m")
                         .serdes(FailSerialize)
                         .completion(
-                            crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(100.0),
+                            crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(100.0)
+                                .expect("a valid percentage"),
                         )
                         .into_future();
                     Box::pin(async move {
@@ -821,7 +822,8 @@ mod tests {
                         .name("m")
                         .nesting(nesting)
                         .completion(
-                            crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(100.0),
+                            crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_percentage(100.0)
+                                .expect("a valid percentage"),
                         )
                         .into_future();
                     Box::pin(async move {

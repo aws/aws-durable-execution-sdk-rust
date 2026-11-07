@@ -324,6 +324,14 @@ This page lists every place where the Rust SDK behaves differently from the Java
 - **Decision:** JavaScript defect and Decision (2026-08-06, [Rust SDK #19: tolerated_failure_percentage: integer-division boundary behavior and ParallelConfig percentage support need a spec decision](https://github.com/aws/aws-durable-execution-sdk-rust/issues/19)): compare by cross-multiplication.
 - **Where:** `src/map_parallel.rs`, `should_stop_failure`, which `CompletionTracker::settle` calls.
 
+### Failure percentage range
+
+- **JavaScript:** Documents `toleratedFailurePercentage` as 0 to 100, but its runtime validator checks only predicate/threshold mutual exclusivity, and its failure-percentage comparisons perform no finite or range check. With this field as the only criterion, `150` or `NaN` does not stop the batch for failure percentage; after all items settle, the completion reason is `ALL_COMPLETED`.
+- **Rust:** `CompletionConfig::with_tolerated_failure_percentage` and `CompletionConfigBuilder::build` return `CompletionConfigValidationError` for a non-finite value or one outside `0.0..=100.0`.
+- **Why:** An invalid threshold must not silently change when the batch stops.
+- **Decision:** JavaScript defect. Python also rejects `150`, `NaN` and either infinity when `CompletionConfig` is constructed.
+- **Where:** `src/builders/map_parallel.rs`, `check_percentage`.
+
 ### Items running at early completion
 
 - **JavaScript:** The items keep running after the batch completes. JavaScript drops their later checkpoints, and their callers never resume.
