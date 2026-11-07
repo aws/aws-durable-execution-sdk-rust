@@ -76,21 +76,24 @@ async fn no_retry_preset_fails_on_the_first_error() {
     assert_eq!(runs, 1);
 }
 
-/// A caller outside the crate builds a variant of the `#[non_exhaustive]`
-/// `Backoff` enum with struct syntax.
+/// A caller outside the crate builds each variant of the `#[non_exhaustive]`
+/// `Backoff` enum with its constructor, and matches it with `..`.
 #[test]
-fn backoff_built_outside_the_crate() {
+fn backoff_constructors_build_each_variant() {
     let config = builders::RetryStrategyConfig::builder()
-        .backoff(builders::Backoff::Linear {
-            increment: Duration::from_secs(2),
-        })
+        .backoff(builders::Backoff::linear(Duration::from_secs(2)))
         .build();
-    assert_eq!(
+    assert!(matches!(
         config.backoff(),
-        builders::Backoff::Linear {
-            increment: Duration::from_secs(2)
-        }
-    );
+        builders::Backoff::Linear { increment, .. } if increment == Duration::from_secs(2)
+    ));
+    let config = builders::RetryStrategyConfig::builder()
+        .backoff(builders::Backoff::exponential(3.0))
+        .build();
+    assert!(matches!(
+        config.backoff(),
+        builders::Backoff::Exponential { rate, .. } if (rate - 3.0).abs() < f64::EPSILON
+    ));
 }
 
 /// A partial exponential builder fills the JS `createRetryStrategy` values,
@@ -102,10 +105,7 @@ fn partial_builder_fills_js_values() {
         .build();
     assert_eq!(config.max_attempts(), 3);
     assert_eq!(config.max_delay(), Duration::from_secs(300));
-    assert_eq!(
-        config.backoff(),
-        builders::Backoff::Exponential { rate: 2.0 }
-    );
+    assert_eq!(config.backoff(), builders::Backoff::exponential(2.0));
     assert_eq!(config.jitter(), JitterStrategy::Full);
 
     let default = builders::RetryStrategyConfig::default_preset();
@@ -118,9 +118,7 @@ fn partial_builder_fills_js_values() {
 /// value.
 #[test]
 fn partial_linear_builder_fills_js_linear_values() {
-    let linear = builders::Backoff::Linear {
-        increment: Duration::from_secs(2),
-    };
+    let linear = builders::Backoff::linear(Duration::from_secs(2));
     let config = builders::RetryStrategyConfig::builder()
         .backoff(linear)
         .build();

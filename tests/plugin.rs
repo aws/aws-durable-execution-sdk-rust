@@ -147,9 +147,7 @@ async fn invocation_info_lists_recorded_operations() {
                             if attempt >= 2 {
                                 RetryDecision::Stop
                             } else {
-                                RetryDecision::Retry {
-                                    delay: Duration::from_secs(1),
-                                }
+                                RetryDecision::retry(Duration::from_secs(1))
                             }
                         })
                         .await?;
@@ -1087,9 +1085,7 @@ async fn custom_child_and_with_retry_subtypes_reach_plugin_operations() {
                             if attempt >= 2 {
                                 RetryDecision::Stop
                             } else {
-                                RetryDecision::Retry {
-                                    delay: Duration::from_secs(1),
-                                }
+                                RetryDecision::retry(Duration::from_secs(1))
                             }
                         })
                         .await?;
@@ -1292,9 +1288,7 @@ fn retry_below(
 ) -> impl Fn(&durable::StepError, u32) -> RetryDecision + Send + Sync + 'static {
     move |_err, attempt| {
         if attempt < stop_at {
-            RetryDecision::Retry {
-                delay: Duration::from_secs(1),
-            }
+            RetryDecision::retry(Duration::from_secs(1))
         } else {
             RetryDecision::Stop
         }
@@ -2853,9 +2847,7 @@ fn retry_once(_err: &durable::StepError, attempt: u32) -> RetryDecision {
     if attempt >= 2 {
         RetryDecision::Stop
     } else {
-        RetryDecision::Retry {
-            delay: Duration::from_secs(1),
-        }
+        RetryDecision::retry(Duration::from_secs(1))
     }
 }
 
@@ -5613,9 +5605,7 @@ async fn retry_reports_pending_change() {
                         if attempt >= 2 {
                             RetryDecision::Stop
                         } else {
-                            RetryDecision::Retry {
-                                delay: Duration::from_secs(1),
-                            }
+                            RetryDecision::retry(Duration::from_secs(1))
                         }
                     })
                     .await?)
@@ -6567,4 +6557,117 @@ async fn virtual_with_retry_hooks_are_virtual() {
     assert_eq!(end.info().sub_type(), Some("Charge"));
     assert_virtual_flags(&tree, &["b"]);
     assert!(!tree.of("b-attempt-1").is_empty());
+}
+
+/// One operation hook call: the hook, the operation name, `type_str()`,
+/// `status()` and `status_str()`.
+type TokenRow = (
+    &'static str,
+    Option<String>,
+    Option<String>,
+    Option<OperationStatus>,
+    Option<String>,
+);
+
+/// Records the identity tokens of every operation start and end info.
+#[derive(Clone, Default)]
+struct Tokens(Arc<Mutex<Vec<TokenRow>>>);
+
+impl Tokens {
+    fn push(&self, hook: &'static str, info: &OperationInfo) {
+        self.0.lock().unwrap().push((
+            hook,
+            info.name().map(str::to_owned),
+            info.type_str().map(str::to_owned),
+            info.status(),
+            info.status_str().map(str::to_owned),
+        ));
+    }
+
+    /// The row of `hook` for the operation `name`.
+    fn row(&self, hook: &str, name: &str) -> TokenRow {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.0 == hook && row.1.as_deref() == Some(name))
+            .cloned()
+            .expect("the operation has a hook row")
+    }
+}
+
+impl Plugin for Tokens {
+    fn on_operation_start(&self, info: &OperationInfo) -> HookWork {
+        self.push("start", info);
+        Ok(None)
+    }
+
+    fn on_operation_end(&self, info: &OperationInfo) -> HookWork {
+        self.push("end", info);
+        Ok(None)
+    }
+}
+
+impl PluginFactory for Tokens {
+    fn create_plugin(&self, _info: &InvocationInfo) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+        Ok(Some(Box::new(self.clone())))
+    }
+}
+
+/// On a first run, the start and end infos of a default step, a child
+/// context and a flat map item carry the type token of their kind and the
+/// status token of their status. A flat item writes no `START`, so its
+/// start info has no status and no status token.
+#[tokio::test]
+async fn live_operation_infos_have_type_and_status_tokens() {
+    use durable::builders::map_parallel::NestingMode;
+
+    let tokens = Tokens::default();
+    let result = LocalRunner::new()
+        .options(
+            Options::builder()
+                .plugin(tokens.clone())
+                .build()
+                .expect("valid options"),
+        )
+        .run(
+            |_e: (), ctx: DurableContext| async move {
+                ctx.step(|_| async { Ok(1_u32) }).name("s").await?;
+                ctx.run_in_child_context(|child| async move {
+                    Ok(child.step(|_| async { Ok(2_u32) }).name("inner").await?)
+                })
+                .name("c")
+                .await?;
+                ctx.map(vec![0_u32], |_child, item, _idx| async move { Ok(item) })
+                    .name("m")
+                    .item_namer(|_item, _idx| "flat".to_owned())
+                    .nesting(NestingMode::Flat)
+                    .await?;
+                Ok::<_, BoxError>(())
+            },
+            (),
+        )
+        .await
+        .expect("runner");
+    assert_eq!(result.invocation_count(), 1);
+
+    let started = |kind: &str| {
+        (
+            Some(kind.to_owned()),
+            Some(OperationStatus::Started),
+            Some("STARTED".to_owned()),
+        )
+    };
+    let tail = |row: TokenRow| (row.2, row.3, row.4);
+    assert_eq!(tail(tokens.row("start", "s")), started("STEP"));
+    assert_eq!(tail(tokens.row("start", "c")), started("CONTEXT"));
+    assert_eq!(
+        tail(tokens.row("start", "flat")),
+        (Some("CONTEXT".to_owned()), None, None)
+    );
+    for name in ["s", "c", "flat"] {
+        let row = tokens.row("end", name);
+        assert_eq!(row.3, Some(OperationStatus::Succeeded), "{name}");
+        assert_eq!(row.4.as_deref(), Some("SUCCEEDED"), "{name}");
+    }
 }

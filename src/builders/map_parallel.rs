@@ -437,7 +437,7 @@ where
     ///         .spawn_batch();
     ///     ctx.wait(Duration::from_secs(1)).name("meanwhile").await?;
     ///     let batch = batch.await?.into_result()?;
-    ///     Ok(batch.results().into_iter().copied().collect())
+    ///     Ok(batch.results().copied().collect())
     /// }
     /// ```
     pub fn spawn_batch(self) -> DurableFuture<BatchResult<O>>
@@ -1627,7 +1627,7 @@ pub(crate) type CompletionPredicate =
 /// // Custom predicate: complete as a success once two items have settled.
 /// let custom = CompletionConfig::with_completion_predicate(|stats| {
 ///     if stats.settled() >= 2 {
-///         CompletionDecision::Complete(CompletionOutcome::Succeeded)
+///         CompletionDecision::complete(CompletionOutcome::Succeeded)
 ///     } else {
 ///         CompletionDecision::Continue
 ///     }
@@ -1800,11 +1800,11 @@ impl CompletionConfig {
     /// - [`CompletionDecision::Continue`] keeps starting and awaiting items.
     ///   A batch whose predicate never completes it records
     ///   [`CompletionReason::AllCompleted`].
-    /// - `Complete(CompletionOutcome::Succeeded)` ends the batch now and
-    ///   records [`CompletionReason::CustomCompletionSucceeded`]. Item
+    /// - `CompletionDecision::complete(CompletionOutcome::Succeeded)` ends
+    ///   the batch now and records [`CompletionReason::CustomCompletionSucceeded`]. Item
     ///   failures inside it are tolerated rather than propagated as errors.
-    /// - `Complete(CompletionOutcome::Failed)` ends the batch now and records
-    ///   [`CompletionReason::CustomCompletionFailed`]. Awaiting the batch
+    /// - `CompletionDecision::complete(CompletionOutcome::Failed)` ends the
+    ///   batch now and records [`CompletionReason::CustomCompletionFailed`]. Awaiting the batch
     ///   returns the first failed item's error, or a
     ///   [`BatchCompletionFailed`](crate::ChildContextErrorKind::BatchCompletionFailed)
     ///   error when no item failed.
@@ -1827,8 +1827,9 @@ impl CompletionConfig {
     /// The live settle order is not recorded. On resume, the recorded items
     /// settle first, in index order. So the predicate MUST be a pure function
     /// of the [`BatchStats`] it receives, and it MUST be monotonic. A
-    /// predicate is monotonic when, after it returns `Complete(outcome)` for
-    /// a snapshot, it returns `Complete(outcome)` with the same outcome for
+    /// predicate is monotonic when, after it returns
+    /// `CompletionDecision::complete(outcome)` for a snapshot, it returns
+    /// `CompletionDecision::complete(outcome)` with the same outcome for
     /// every later snapshot of the same batch. A later snapshot is one where
     /// each item's status is the same or further along, in the order `None`,
     /// `Started`, then `Succeeded` or `Failed`. Under that rule the recorded
@@ -1846,7 +1847,7 @@ impl CompletionConfig {
     /// // Complete as a success once half the items have settled.
     /// let config = CompletionConfig::with_completion_predicate(|stats| {
     ///     if stats.settled() * 2 >= stats.total_items() {
-    ///         CompletionDecision::Complete(CompletionOutcome::Succeeded)
+    ///         CompletionDecision::complete(CompletionOutcome::Succeeded)
     ///     } else {
     ///         CompletionDecision::Continue
     ///     }
@@ -2064,9 +2065,10 @@ impl CompletionConfigBuilder {
     /// [`CompletionDecision`]. `Continue` keeps the batch running, and a
     /// batch whose predicate never completes it records
     /// [`CompletionReason::AllCompleted`].
-    /// `Complete(CompletionOutcome::Succeeded)` ends the batch and records
-    /// [`CompletionReason::CustomCompletionSucceeded`].
-    /// `Complete(CompletionOutcome::Failed)` ends the batch and records
+    /// `CompletionDecision::complete(CompletionOutcome::Succeeded)` ends the
+    /// batch and records [`CompletionReason::CustomCompletionSucceeded`].
+    /// `CompletionDecision::complete(CompletionOutcome::Failed)` ends the
+    /// batch and records
     /// [`CompletionReason::CustomCompletionFailed`]; awaiting the batch then
     /// returns an error. A predicate counts as a completion criterion, so
     /// the implicit fail-fast of an empty config does not apply. A
@@ -2093,12 +2095,13 @@ impl CompletionConfigBuilder {
     ///
     /// So the predicate MUST be a pure function of the [`BatchStats`] it
     /// receives, and it MUST be monotonic. A predicate is monotonic when,
-    /// after it returns `Complete(outcome)` for a snapshot, it returns
-    /// `Complete(outcome)` with the same outcome for every later snapshot of
-    /// the same batch. A later snapshot is one where each item's status is
-    /// the same or further along, in the order `None`, `Started`, then
-    /// `Succeeded` or `Failed`. Under that rule the recorded reason and
-    /// outcome do not depend on the settle order. Monotonicity is what keeps
+    /// after it returns `CompletionDecision::complete(outcome)` for a
+    /// snapshot, it returns `CompletionDecision::complete(outcome)` with the
+    /// same outcome for every later snapshot of the same batch. A later
+    /// snapshot is one where each item's status is the same or further
+    /// along, in the order `None`, `Started`, then `Succeeded` or `Failed`.
+    /// Under that rule the recorded reason and outcome do not depend on the
+    /// settle order. Monotonicity is what keeps
     /// two runs in agreement.
     ///
     /// A counterexample, as JS gives one: `succeeded() == 1 && failed() == 0`
@@ -2125,7 +2128,7 @@ impl CompletionConfigBuilder {
     ///                 .is_some_and(|item| item.status == Some(BatchItemStatus::Succeeded))
     ///         };
     ///         if ok(0) || (ok(1) && ok(2)) {
-    ///             CompletionDecision::Complete(CompletionOutcome::Succeeded)
+    ///             CompletionDecision::complete(CompletionOutcome::Succeeded)
     ///         } else {
     ///             CompletionDecision::Continue
     ///         }
@@ -2270,7 +2273,7 @@ mod tests {
         let config = CompletionConfig::builder()
             .completion_predicate(|stats| {
                 if stats.settled() >= 3 {
-                    CompletionDecision::Complete(CompletionOutcome::Succeeded)
+                    CompletionDecision::complete(CompletionOutcome::Succeeded)
                 } else {
                     CompletionDecision::Continue
                 }
@@ -2293,7 +2296,7 @@ mod tests {
         // predicate.
         let only_predicate = CompletionConfig::with_completion_predicate(|stats| {
             if stats.failed() > stats.succeeded() {
-                CompletionDecision::Complete(CompletionOutcome::Succeeded)
+                CompletionDecision::complete(CompletionOutcome::Succeeded)
             } else {
                 CompletionDecision::Continue
             }
@@ -2310,7 +2313,7 @@ mod tests {
         let stats = BatchStats::new(&more_failed);
         assert_eq!(
             only_predicate.predicate_decision(&stats),
-            CompletionDecision::Complete(CompletionOutcome::Succeeded)
+            CompletionDecision::complete(CompletionOutcome::Succeeded)
         );
         let even = [
             CompletionItem::new(0, None, Some(BatchItemStatus::Failed)),
@@ -2329,7 +2332,7 @@ mod tests {
 
     fn complete_on_first_settle(stats: &BatchStats<'_>) -> CompletionDecision {
         if stats.settled() >= 1 {
-            CompletionDecision::Complete(CompletionOutcome::Succeeded)
+            CompletionDecision::complete(CompletionOutcome::Succeeded)
         } else {
             CompletionDecision::Continue
         }

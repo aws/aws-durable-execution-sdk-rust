@@ -1681,10 +1681,13 @@ impl OperationInfo {
         self.kind
     }
 
-    /// The service's token, also when `kind()` or `status()` is `None`
-    /// because this SDK version does not know the value.
+    /// The token of [`kind`](Self::kind), such as `STEP`, when it is
+    /// `Some`. Otherwise the type token of the operation's record, which
+    /// this SDK version does not know, or `None` when the record has none.
     pub fn type_str(&self) -> Option<&str> {
-        self.type_str.as_deref()
+        self.kind
+            .map(OperationKind::wire_str)
+            .or(self.type_str.as_deref())
     }
 
     /// The operation's sub-type, such as `Step`, `Map` or `Parallel`.
@@ -1704,10 +1707,14 @@ impl OperationInfo {
         self.status
     }
 
-    /// The service's token, also when `kind()` or `status()` is `None`
-    /// because this SDK version does not know the value.
+    /// The token of [`status`](Self::status), such as `SUCCEEDED`, when it
+    /// is `Some`. Otherwise the status token of the operation's record,
+    /// which this SDK version does not know, or `None` when the operation
+    /// has no record.
     pub fn status_str(&self) -> Option<&str> {
-        self.status_str.as_deref()
+        self.status
+            .map(OperationStatus::wire_str)
+            .or(self.status_str.as_deref())
     }
 
     /// When the operation started.
@@ -1826,8 +1833,7 @@ impl OperationInfo {
     /// arguments: the kind, the sub-type, the name, and the parent, which
     /// is `ctx.parent_wire_id()`. A field the record populates keeps the
     /// record's value. Without a record the info holds only the ID and
-    /// those fields. The service's type and status tokens come only from a
-    /// record, so this sets neither.
+    /// those fields.
     pub(crate) fn for_operation(
         ctx: &crate::DurableContext,
         wire_id: &str,
@@ -1867,8 +1873,8 @@ impl OperationInfo {
         info
     }
 
-    /// Replaces the status. The service's status token is left as the
-    /// record set it.
+    /// Replaces the status, and so the token
+    /// [`status_str`](Self::status_str) returns.
     pub(crate) fn with_status(mut self, status: OperationStatus) -> Self {
         self.status = Some(status);
         self
@@ -4562,12 +4568,12 @@ mod tests {
             .with_status(OperationStatus::Started);
         assert_eq!(info.id(), "w");
         assert_eq!(info.kind(), Some(OperationKind::Step));
-        assert_eq!(info.type_str(), None);
+        assert_eq!(info.type_str(), Some("STEP"));
         assert_eq!(info.sub_type(), Some("Pay"));
         assert_eq!(info.name(), Some("a"));
         assert_eq!(info.parent_id(), None);
         assert_eq!(info.status(), Some(OperationStatus::Started));
-        assert_eq!(info.status_str(), None);
+        assert_eq!(info.status_str(), Some("STARTED"));
         assert_eq!(info.start_timestamp(), None);
         assert_eq!(info.attempt(), None);
     }
@@ -4623,7 +4629,7 @@ mod tests {
         assert_eq!(info.name(), Some("recorded"));
         assert_eq!(info.parent_id(), Some("p"));
         assert_eq!(info.status(), Some(OperationStatus::Succeeded));
-        assert_eq!(info.status_str(), Some("STARTED"));
+        assert_eq!(info.status_str(), Some("SUCCEEDED"));
     }
 
     /// A record without a type, sub-type or name gets them from the
@@ -4638,7 +4644,7 @@ mod tests {
         );
         let info = OperationInfo::for_operation(&ctx, "w", OperationKind::Step, "Pay", Some("a"));
         assert_eq!(info.kind(), Some(OperationKind::Step));
-        assert_eq!(info.type_str(), None);
+        assert_eq!(info.type_str(), Some("STEP"));
         assert_eq!(info.sub_type(), Some("Pay"));
         assert_eq!(info.name(), Some("a"));
         assert_eq!(info.parent_id(), None);
@@ -4707,6 +4713,7 @@ mod tests {
                 Some(OperationKind::ChainedInvoke),
                 "{spelling}"
             );
+            assert_eq!(info.type_str(), Some("CHAINED_INVOKE"), "{spelling}");
         }
     }
 

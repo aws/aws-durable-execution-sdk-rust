@@ -85,9 +85,7 @@ async fn failed_attempt_reruns_whole_block_with_fresh_namespace() {
                             if attempt >= 3 {
                                 RetryDecision::Stop
                             } else {
-                                RetryDecision::Retry {
-                                    delay: Duration::from_secs(1),
-                                }
+                                RetryDecision::retry(Duration::from_secs(1))
                             }
                         })
                         .await?;
@@ -309,9 +307,7 @@ fn retry_until(last: u32) -> impl Fn(&durable::StepError, u32) -> RetryDecision 
         if attempt >= last {
             RetryDecision::Stop
         } else {
-            RetryDecision::Retry {
-                delay: Duration::from_secs(1),
-            }
+            RetryDecision::retry(Duration::from_secs(1))
         }
     }
 }
@@ -428,9 +424,7 @@ async fn replay_handler_run(
                             if attempt >= 3 {
                                 RetryDecision::Stop
                             } else {
-                                RetryDecision::Retry {
-                                    delay: Duration::from_secs(1),
-                                }
+                                RetryDecision::retry(Duration::from_secs(1))
                             }
                         });
                     let block = if unwrapped {
@@ -502,9 +496,7 @@ async fn zero_delay_records_one_second_wait() {
                             }
                         })
                         .name("block")
-                        .retry_strategy(|_err, _attempt| RetryDecision::Retry {
-                            delay: Duration::ZERO,
-                        })
+                        .retry_strategy(|_err, _attempt| RetryDecision::retry(Duration::ZERO))
                         .await?;
                     Ok::<_, durable::BoxError>(out)
                 }
@@ -756,9 +748,7 @@ async fn unwrapped_failed_wait_returns_wait_error() {
                             if invocation == 1 {
                                 RetryDecision::Stop
                             } else {
-                                RetryDecision::Retry {
-                                    delay: Duration::from_secs(1),
-                                }
+                                RetryDecision::retry(Duration::from_secs(1))
                             }
                         })
                         .without_child_context()
@@ -873,9 +863,7 @@ async fn custom_sub_type_labels_only_the_block_in_history() {
                             if attempt >= 2 {
                                 RetryDecision::Stop
                             } else {
-                                RetryDecision::Retry {
-                                    delay: Duration::from_secs(1),
-                                }
+                                RetryDecision::retry(Duration::from_secs(1))
                             }
                         })
                         .await?;
@@ -940,9 +928,7 @@ async fn unnamed_block_waits_are_unnamed() {
                                 if attempt >= 2 {
                                     RetryDecision::Stop
                                 } else {
-                                    RetryDecision::Retry {
-                                        delay: Duration::from_secs(1),
-                                    }
+                                    RetryDecision::retry(Duration::from_secs(1))
                                 }
                             });
                         let block = match name {

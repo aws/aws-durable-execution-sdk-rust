@@ -467,7 +467,7 @@ async fn race_replay_children_does_not_stop_spawned_input() {
                     if attempt >= 2 {
                         RetryDecision::Stop
                     } else {
-                        RetryDecision::Retry { delay: secs(2) }
+                        RetryDecision::retry(secs(2))
                     }
                 })
                 .spawn();
@@ -618,7 +618,7 @@ async fn with_retry_attempt_end_stops_escaped_task() {
                 if attempt >= 2 {
                     RetryDecision::Stop
                 } else {
-                    RetryDecision::Retry { delay: secs(1) }
+                    RetryDecision::retry(secs(1))
                 }
             })
             .await?;

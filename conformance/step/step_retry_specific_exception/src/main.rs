@@ -43,9 +43,7 @@ async fn handler(
                     .is_some_and(|t| t.error_type() == "TransientError")
         });
         if is_transient {
-            durable::RetryDecision::Retry {
-                delay: Duration::from_secs(1),
-            }
+            durable::RetryDecision::retry(Duration::from_secs(1))
         } else {
             durable::RetryDecision::Stop
         }

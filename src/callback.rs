@@ -4785,9 +4785,7 @@ mod coordinator_tests {
                 .name("wfcb")
                 .submitter_retry(|_err, attempt| {
                     if attempt < 2 {
-                        crate::RetryDecision::Retry {
-                            delay: Duration::from_secs(1),
-                        }
+                        crate::RetryDecision::retry(Duration::from_secs(1))
                     } else {
                         crate::RetryDecision::Stop
                     }

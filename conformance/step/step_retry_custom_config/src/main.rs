@@ -22,9 +22,7 @@ async fn handler(
         // No jitter: deterministic delay = initial * backoff^(attempt-1).
         let delay_secs =
             INITIAL_DELAY_SECS * BACKOFF_RATE.saturating_pow(attempt.saturating_sub(1));
-        durable::RetryDecision::Retry {
-            delay: Duration::from_secs(delay_secs),
-        }
+        durable::RetryDecision::retry(Duration::from_secs(delay_secs))
     };
 
     let result: String = ctx

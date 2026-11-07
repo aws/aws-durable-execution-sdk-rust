@@ -60,17 +60,37 @@ pub(crate) const WFC_SUB_TYPE: &str = "WaitForCondition";
 /// let exhausted = WaitDecision::exhausted("max attempts exceeded");
 /// # drop(done); drop(cont); drop(exhausted);
 /// ```
+///
+/// The data-bearing variants are `#[non_exhaustive]`: build them with
+/// [`WaitDecision::continue_with`] and [`WaitDecision::exhausted`], and
+/// match them with `..`, as in `WaitDecision::Continue { delay, .. }`. A
+/// caller cannot build them with struct syntax:
+///
+/// ```rust,compile_fail
+/// use std::time::Duration;
+/// use aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision;
+///
+/// let _ = WaitDecision::Continue { delay: Duration::from_secs(1) };
+/// ```
+///
+/// ```rust,compile_fail
+/// use aws_durable_execution_sdk::builders::wait_for_condition::WaitDecision;
+///
+/// let _ = WaitDecision::Exhausted { reason: "done".to_owned() };
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum WaitDecision {
     /// Condition met: return the final state.
     Complete,
     /// Condition not met: wait for `delay`, then re-check.
+    #[non_exhaustive]
     Continue {
         /// Duration to wait before the next check attempt.
         delay: Duration,
     },
     /// Strategy exhaustion: fail the operation with an error.
+    #[non_exhaustive]
     Exhausted {
         /// Reason for exhaustion (e.g., "max attempts exceeded").
         reason: String,

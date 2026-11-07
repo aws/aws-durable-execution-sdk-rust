@@ -1563,7 +1563,7 @@ async fn custom_completion_failure_publishes_settled_handles() {
                 .max_concurrency(1)
                 .completion(CompletionConfig::with_completion_predicate(|stats| {
                     if stats.settled() >= 2 {
-                        CompletionDecision::Complete(CompletionOutcome::Failed)
+                        CompletionDecision::complete(CompletionOutcome::Failed)
                     } else {
                         CompletionDecision::Continue
                     }

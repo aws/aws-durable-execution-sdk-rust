@@ -676,12 +676,10 @@ impl<S> WaitStrategy<S> {
             return WaitDecision::Complete;
         }
         if attempt >= self.max_attempts {
-            return WaitDecision::Exhausted {
-                reason: format!(
-                    "max attempts exceeded: {attempt} checks completed (max_attempts = {})",
-                    self.max_attempts
-                ),
-            };
+            return WaitDecision::exhausted(format!(
+                "max attempts exceeded: {attempt} checks completed (max_attempts = {})",
+                self.max_attempts
+            ));
         }
 
         // Exponential backoff: initial * rate^(attempt-1), capped at max,
@@ -699,9 +697,7 @@ impl<S> WaitStrategy<S> {
             // Full jitter: random in [0, base].
             crate::builders::JitterStrategy::Full => crate::step::rand_full_jitter(base),
         };
-        WaitDecision::Continue {
-            delay: crate::step::quantize_delay(jittered),
-        }
+        WaitDecision::continue_with(crate::step::quantize_delay(jittered))
     }
 }
 

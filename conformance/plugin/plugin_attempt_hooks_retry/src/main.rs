@@ -74,9 +74,7 @@ impl PluginFactory for Factory {
 /// Retries an attempt below 3 after 1 s, and stops at attempt 3.
 fn retry_below_3(_err: &durable::StepError, attempt: u32) -> RetryDecision {
     if attempt < 3 {
-        RetryDecision::Retry {
-            delay: Duration::from_secs(1),
-        }
+        RetryDecision::retry(Duration::from_secs(1))
     } else {
         RetryDecision::Stop
     }

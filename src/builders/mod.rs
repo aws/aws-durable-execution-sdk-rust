@@ -225,8 +225,9 @@ pub enum JitterStrategy {
 /// How the retry delay grows from one attempt to the next, in a
 /// [`RetryStrategyConfig`].
 ///
-/// The enum is `#[non_exhaustive]`, but its variants are not, so a caller
-/// builds a variant with struct syntax.
+/// The enum and its variants are `#[non_exhaustive]`. Build a variant with
+/// [`Backoff::exponential`] or [`Backoff::linear`], and match it with `..`,
+/// as in `Backoff::Linear { increment, .. }`.
 ///
 /// # Examples
 ///
@@ -235,30 +236,58 @@ pub enum JitterStrategy {
 /// use std::time::Duration;
 ///
 /// let config = RetryStrategyConfig::builder()
-///     .backoff(Backoff::Linear { increment: Duration::from_secs(2) })
+///     .backoff(Backoff::linear(Duration::from_secs(2)))
 ///     .build();
-/// assert_eq!(
-///     config.backoff(),
-///     Backoff::Linear { increment: Duration::from_secs(2) }
-/// );
+/// assert_eq!(config.backoff(), Backoff::linear(Duration::from_secs(2)));
 /// assert_eq!(
 ///     RetryStrategyConfig::default_preset().backoff(),
-///     Backoff::Exponential { rate: 2.0 }
+///     Backoff::exponential(2.0)
 /// );
+/// ```
+///
+/// A caller cannot build a variant with struct syntax:
+///
+/// ```rust,compile_fail
+/// use aws_durable_execution_sdk::builders::Backoff;
+///
+/// let _ = Backoff::Exponential { rate: 2.0 };
+/// ```
+///
+/// ```rust,compile_fail
+/// use std::time::Duration;
+/// use aws_durable_execution_sdk::builders::Backoff;
+///
+/// let _ = Backoff::Linear { increment: Duration::from_secs(1) };
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum Backoff {
     /// The delay before attempt `n + 1` is `initial_delay * rate^(n - 1)`.
+    #[non_exhaustive]
     Exponential {
         /// Multiplier applied to the delay after each failed attempt.
         rate: f64,
     },
     /// The delay before attempt `n + 1` is `initial_delay + increment * (n - 1)`.
+    #[non_exhaustive]
     Linear {
         /// Amount added to the delay after each failed attempt.
         increment: Duration,
     },
+}
+
+impl Backoff {
+    /// An [`Exponential`](Self::Exponential) backoff with the given rate.
+    #[must_use]
+    pub fn exponential(rate: f64) -> Self {
+        Self::Exponential { rate }
+    }
+
+    /// A [`Linear`](Self::Linear) backoff with the given increment.
+    #[must_use]
+    pub fn linear(increment: Duration) -> Self {
+        Self::Linear { increment }
+    }
 }
 
 /// Builder-based configuration for retry delay shaping.
@@ -399,7 +428,7 @@ impl RetryStrategyConfig {
             max_attempts: 6,
             initial_delay: Duration::from_secs(5),
             max_delay: Duration::from_mins(1),
-            backoff: Backoff::Exponential { rate: 2.0 },
+            backoff: Backoff::exponential(2.0),
             jitter: JitterStrategy::Full,
             retry_if: None,
         }
@@ -466,7 +495,7 @@ impl RetryStrategyConfig {
     /// assert_eq!(config.initial_delay(), Duration::from_secs(1));
     /// assert_eq!(
     ///     config.backoff(),
-    ///     Backoff::Linear { increment: Duration::from_secs(1) }
+    ///     Backoff::linear(Duration::from_secs(1))
     /// );
     /// assert_eq!(config.jitter(), JitterStrategy::None);
     /// ```
@@ -476,9 +505,7 @@ impl RetryStrategyConfig {
             max_attempts: 6,
             initial_delay: Duration::from_secs(1),
             max_delay: Duration::from_mins(5),
-            backoff: Backoff::Linear {
-                increment: Duration::from_secs(1),
-            },
+            backoff: Backoff::linear(Duration::from_secs(1)),
             jitter: JitterStrategy::None,
             retry_if: None,
         }
@@ -504,7 +531,7 @@ impl RetryStrategyConfig {
             max_attempts: 1,
             initial_delay: Duration::from_secs(5),
             max_delay: Duration::from_mins(5),
-            backoff: Backoff::Exponential { rate: 2.0 },
+            backoff: Backoff::exponential(2.0),
             jitter: JitterStrategy::Full,
             retry_if: None,
         }
@@ -638,12 +665,12 @@ impl RetryStrategyConfigBuilder {
     }
 
     /// Sets an exponential backoff with `rate`: shorthand for
-    /// `backoff(Backoff::Exponential { rate })`.
+    /// `backoff(Backoff::exponential(rate))`.
     ///
     /// This setter and [`backoff`](Self::backoff) write the same field, so
     /// the last call wins.
     pub fn backoff_rate(self, rate: f64) -> Self {
-        self.backoff(Backoff::Exponential { rate })
+        self.backoff(Backoff::exponential(rate))
     }
 
     /// Sets how the delay grows after each failed attempt.
@@ -756,7 +783,7 @@ impl RetryStrategyConfigBuilder {
     /// documentation).
     #[must_use]
     pub fn build(self) -> RetryStrategyConfig {
-        let backoff = self.backoff.unwrap_or(Backoff::Exponential { rate: 2.0 });
+        let backoff = self.backoff.unwrap_or(Backoff::exponential(2.0));
         let (max_attempts, initial_delay) = match backoff {
             Backoff::Exponential { .. } => (3, Duration::from_secs(5)),
             Backoff::Linear { .. } => (6, Duration::from_secs(1)),
@@ -777,6 +804,19 @@ mod tests {
     use super::*;
     use crate::context::DurableContext;
     use crate::future::{Branch, DurableFuture};
+
+    /// `Backoff::exponential` and `Backoff::linear` build their variants.
+    #[test]
+    fn backoff_constructors_build_each_variant() {
+        assert!(matches!(
+            Backoff::exponential(2.5),
+            Backoff::Exponential { rate } if (rate - 2.5).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            Backoff::linear(Duration::from_secs(4)),
+            Backoff::Linear { increment } if increment == Duration::from_secs(4)
+        ));
+    }
 
     /// A root context over a recording in-memory client, with the
     /// coalescer `window` (`None`: direct writes).
@@ -1159,7 +1199,7 @@ mod tests {
         assert_eq!(config.max_attempts(), 4);
         assert_eq!(config.initial_delay(), Duration::from_millis(500));
         assert_eq!(config.max_delay(), Duration::from_secs(10));
-        assert_eq!(config.backoff(), Backoff::Exponential { rate: 3.0 });
+        assert_eq!(config.backoff(), Backoff::exponential(3.0));
         assert_eq!(config.jitter(), JitterStrategy::Half);
 
         // Unset values take the JS `createRetryStrategy` fill.
@@ -1167,16 +1207,14 @@ mod tests {
         assert_eq!(partial.max_attempts(), 2);
         assert_eq!(partial.initial_delay(), Duration::from_secs(5));
         assert_eq!(partial.max_delay(), Duration::from_mins(5));
-        assert_eq!(partial.backoff(), Backoff::Exponential { rate: 2.0 });
+        assert_eq!(partial.backoff(), Backoff::exponential(2.0));
         assert_eq!(partial.jitter(), JitterStrategy::Full);
         assert!(partial.retry_predicate().is_none());
 
         // A linear builder round-trips its backoff and keeps the set
         // fields.
         let linear = RetryStrategyConfig::builder()
-            .backoff(Backoff::Linear {
-                increment: Duration::from_secs(3),
-            })
+            .backoff(Backoff::linear(Duration::from_secs(3)))
             .max_attempts(4)
             .initial_delay(Duration::from_secs(2))
             .max_delay(Duration::from_secs(9))
@@ -1185,12 +1223,7 @@ mod tests {
         assert_eq!(linear.max_attempts(), 4);
         assert_eq!(linear.initial_delay(), Duration::from_secs(2));
         assert_eq!(linear.max_delay(), Duration::from_secs(9));
-        assert_eq!(
-            linear.backoff(),
-            Backoff::Linear {
-                increment: Duration::from_secs(3)
-            }
-        );
+        assert_eq!(linear.backoff(), Backoff::linear(Duration::from_secs(3)));
         assert_eq!(linear.jitter(), JitterStrategy::Half);
     }
 
@@ -1200,12 +1233,7 @@ mod tests {
         let linear = RetryStrategyConfig::linear();
         assert_eq!(linear.max_attempts(), 6);
         assert_eq!(linear.initial_delay(), Duration::from_secs(1));
-        assert_eq!(
-            linear.backoff(),
-            Backoff::Linear {
-                increment: Duration::from_secs(1)
-            }
-        );
+        assert_eq!(linear.backoff(), Backoff::linear(Duration::from_secs(1)));
         assert_eq!(linear.max_delay(), Duration::from_mins(5));
         assert_eq!(linear.jitter(), JitterStrategy::None);
         assert!(linear.retry_predicate().is_none());
@@ -1214,7 +1242,7 @@ mod tests {
         assert_eq!(no_retry.max_attempts(), 1);
         assert_eq!(no_retry.initial_delay(), Duration::from_secs(5));
         assert_eq!(no_retry.max_delay(), Duration::from_mins(5));
-        assert_eq!(no_retry.backoff(), Backoff::Exponential { rate: 2.0 });
+        assert_eq!(no_retry.backoff(), Backoff::exponential(2.0));
         assert_eq!(no_retry.jitter(), JitterStrategy::Full);
         assert!(no_retry.retry_predicate().is_none());
     }
@@ -1223,14 +1251,12 @@ mod tests {
     /// wins.
     #[test]
     fn backoff_setters_last_call_wins() {
-        let linear = Backoff::Linear {
-            increment: Duration::from_secs(1),
-        };
+        let linear = Backoff::linear(Duration::from_secs(1));
         let rate_last = RetryStrategyConfig::builder()
             .backoff(linear)
             .backoff_rate(3.0)
             .build();
-        assert_eq!(rate_last.backoff(), Backoff::Exponential { rate: 3.0 });
+        assert_eq!(rate_last.backoff(), Backoff::exponential(3.0));
 
         let linear_last = RetryStrategyConfig::builder()
             .backoff_rate(3.0)
@@ -1245,9 +1271,7 @@ mod tests {
     #[test]
     fn retry_strategy_config_builder_fill_follows_backoff() {
         let linear = RetryStrategyConfig::builder()
-            .backoff(Backoff::Linear {
-                increment: Duration::from_secs(2),
-            })
+            .backoff(Backoff::linear(Duration::from_secs(2)))
             .build();
         assert_eq!(linear.max_attempts(), 6);
         assert_eq!(linear.initial_delay(), Duration::from_secs(1));
@@ -1256,9 +1280,7 @@ mod tests {
         assert!(linear.retry_predicate().is_none());
 
         let replaced = RetryStrategyConfig::builder()
-            .backoff(Backoff::Linear {
-                increment: Duration::from_secs(2),
-            })
+            .backoff(Backoff::linear(Duration::from_secs(2)))
             .backoff_rate(3.0)
             .build();
         assert_eq!(replaced.max_attempts(), 3);
@@ -1297,9 +1319,9 @@ mod tests {
         assert!(set.contains("retry_if: true"), "{set}");
         let linear = format!(
             "{:?}",
-            builder.clone().backoff(Backoff::Linear {
-                increment: Duration::from_secs(1)
-            })
+            builder
+                .clone()
+                .backoff(Backoff::linear(Duration::from_secs(1)))
         );
         assert!(
             linear.contains("backoff: Some(Linear { increment: 1s })"),
@@ -1336,9 +1358,7 @@ mod tests {
         let err = StepError::new(StepErrorKind::ExecutionFailed, Some("boom".into()));
         assert_eq!(
             config.decide(&err, 1),
-            RetryDecision::Retry {
-                delay: Duration::from_secs(1)
-            }
+            RetryDecision::retry(Duration::from_secs(1))
         );
     }
 
@@ -1353,7 +1373,7 @@ mod tests {
         assert_eq!(config.max_attempts(), 6);
         assert_eq!(config.initial_delay(), Duration::from_secs(5));
         assert_eq!(config.max_delay(), Duration::from_secs(60));
-        assert_eq!(config.backoff(), Backoff::Exponential { rate: 2.0 });
+        assert_eq!(config.backoff(), Backoff::exponential(2.0));
         assert_eq!(config.jitter(), JitterStrategy::Full);
         assert!(config.retry_predicate().is_none());
 
@@ -1361,7 +1381,7 @@ mod tests {
         assert_eq!(built.max_attempts(), 3);
         assert_eq!(built.initial_delay(), Duration::from_secs(5));
         assert_eq!(built.max_delay(), Duration::from_secs(300));
-        assert_eq!(built.backoff(), Backoff::Exponential { rate: 2.0 });
+        assert_eq!(built.backoff(), Backoff::exponential(2.0));
         assert_eq!(built.jitter(), JitterStrategy::Full);
         assert!(built.retry_predicate().is_none());
     }

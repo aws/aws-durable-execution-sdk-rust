@@ -99,9 +99,7 @@ async fn retried_step_records_failure_events() {
                     Ok(1)
                 })
                 .name("flaky")
-                .retry_strategy(|_err, _attempt| RetryDecision::Retry {
-                    delay: Duration::from_secs(1),
-                })
+                .retry_strategy(|_err, _attempt| RetryDecision::retry(Duration::from_secs(1)))
                 .await?;
                 Ok::<_, BoxError>(())
             },

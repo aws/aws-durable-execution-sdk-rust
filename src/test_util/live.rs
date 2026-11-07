@@ -12,11 +12,11 @@ use serde::de::DeserializeOwned;
 
 use super::{
     BackendState, CallbackFailure, CallbackReply, CallbackReplyKind, CloudApi, CloudRunner,
-    InvocationType, TestOperation, TestResult, TestRunnerError, aws_error, check_heartbeat,
-    fetch_history, fold_history, is_terminal_status, reply_live, snapshot_of,
+    InvocationType, RunnerKind, TestOperation, TestResult, TestRunnerError, aws_error,
+    check_heartbeat, fetch_history, fold_history, is_terminal_status, reply_live, snapshot_of,
     terminal_execution_event,
 };
-use crate::{OperationKind, OperationStatus};
+use crate::OperationStatus;
 
 #[cfg(doc)]
 use super::LocalRunner;
@@ -98,8 +98,7 @@ impl Selector {
 
 /// Whether `op` is a `wait_for_callback` context.
 pub(super) fn is_wait_for_callback(op: &TestOperation) -> bool {
-    op.kind == OperationKind::Context
-        && op.sub_type.as_deref() == Some(crate::callback::WFCB_SUB_TYPE)
+    op.kind == RunnerKind::Context && op.sub_type.as_deref() == Some(crate::callback::WFCB_SUB_TYPE)
 }
 
 /// Whether `op` reached `status`, as the table of [`WaitingStatus`] states.
@@ -115,7 +114,7 @@ pub(super) fn status_reached(
     }
     let mut children = ops.iter().filter(|child| {
         child.parent_id.as_deref() == Some(op.id.as_str())
-            && matches!(child.kind, OperationKind::Step | OperationKind::Callback)
+            && matches!(child.kind, RunnerKind::Step | RunnerKind::Callback)
     });
     match status {
         WaitingStatus::Started => children.next().is_some(),
@@ -125,7 +124,7 @@ pub(super) fn status_reached(
         WaitingStatus::Completed => {
             is_terminal_status(op.status)
                 && children.any(|child| {
-                    child.kind == OperationKind::Callback && is_terminal_status(child.status)
+                    child.kind == RunnerKind::Callback && is_terminal_status(child.status)
                 })
         }
     }
@@ -161,11 +160,11 @@ pub(super) fn callback_target<'a>(
         .resolve(ops)
         .ok_or(TestRunnerError::OperationNotFound)?;
     match op.kind {
-        OperationKind::Callback => Ok(op),
+        RunnerKind::Callback => Ok(op),
         _ if is_wait_for_callback(op) => ops
             .iter()
             .find(|child| {
-                child.kind == OperationKind::Callback
+                child.kind == RunnerKind::Callback
                     && child.parent_id.as_deref() == Some(op.id.as_str())
             })
             .ok_or(TestRunnerError::CallbackNotPending),

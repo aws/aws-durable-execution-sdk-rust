@@ -83,8 +83,8 @@ async fn retry_delay_is_ordered_against_a_wait() {
                                 }
                                 Ok("retried".to_owned())
                             })
-                            .retry_strategy(|_err, _attempt| RetryDecision::Retry {
-                                delay: Duration::from_secs(300),
+                            .retry_strategy(|_err, _attempt| {
+                                RetryDecision::retry(Duration::from_secs(300))
                             })
                             .await
                             .map_err(BoxError::from)

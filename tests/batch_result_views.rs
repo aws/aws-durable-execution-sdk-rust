@@ -92,7 +92,7 @@ async fn spawn_batch_is_public() {
                     .spawn_batch();
                 ctx.wait(Duration::from_secs(1)).await?;
                 let batch = batch.await?.into_result()?;
-                Ok::<_, BoxError>(batch.results().into_iter().copied().collect::<Vec<i32>>())
+                Ok::<_, BoxError>(batch.results().copied().collect::<Vec<i32>>())
             },
             (),
         )

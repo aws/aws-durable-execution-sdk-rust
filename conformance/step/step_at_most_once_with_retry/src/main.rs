@@ -19,9 +19,7 @@ async fn handler(
         if attempt >= 3 {
             durable::RetryDecision::Stop
         } else {
-            durable::RetryDecision::Retry {
-                delay: Duration::from_secs(1),
-            }
+            durable::RetryDecision::retry(Duration::from_secs(1))
         }
     };
 

@@ -3410,7 +3410,7 @@ impl DurableContext {
     ///         if attempt >= 3 {
     ///             RetryDecision::Stop
     ///         } else {
-    ///             RetryDecision::Retry { delay: Duration::from_secs(5) }
+    ///             RetryDecision::retry(Duration::from_secs(5))
     ///         }
     ///     })
     ///     .await?;

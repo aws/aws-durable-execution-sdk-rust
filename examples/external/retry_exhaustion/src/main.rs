@@ -28,9 +28,7 @@ async fn handler(
             if attempt >= 3 {
                 RetryDecision::Stop
             } else {
-                RetryDecision::Retry {
-                    delay: Duration::from_secs(1),
-                }
+                RetryDecision::retry(Duration::from_secs(1))
             }
         })
         .await;

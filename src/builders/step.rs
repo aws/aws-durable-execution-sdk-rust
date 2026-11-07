@@ -47,7 +47,7 @@ use crate::{BoxError, context::StepContext};
 ///             if attempt >= 3 {
 ///                 RetryDecision::Stop
 ///             } else {
-///                 RetryDecision::Retry { delay: Duration::from_secs(1) }
+///                 RetryDecision::retry(Duration::from_secs(1))
 ///             }
 ///         })
 ///         .await?;
@@ -134,9 +134,9 @@ where
     ///             if attempt >= 3 {
     ///                 RetryDecision::Stop
     ///             } else {
-    ///                 RetryDecision::Retry {
-    ///                     delay: Duration::from_millis(100 * u64::from(2_u32.pow(attempt - 1))),
-    ///                 }
+    ///                 RetryDecision::retry(Duration::from_millis(
+    ///                     100 * u64::from(2_u32.pow(attempt - 1)),
+    ///                 ))
     ///             }
     ///         })
     ///         .await?;
@@ -471,9 +471,7 @@ mod tests {
                 if attempt >= 2 {
                     crate::RetryDecision::Stop
                 } else {
-                    crate::RetryDecision::Retry {
-                        delay: Duration::from_secs(7),
-                    }
+                    crate::RetryDecision::retry(Duration::from_secs(7))
                 }
             });
 
@@ -485,9 +483,7 @@ mod tests {
 
         assert_eq!(
             strategy(&err, 1),
-            crate::RetryDecision::Retry {
-                delay: Duration::from_secs(7)
-            }
+            crate::RetryDecision::retry(Duration::from_secs(7))
         );
         assert_eq!(strategy(&err, 2), crate::RetryDecision::Stop);
     }

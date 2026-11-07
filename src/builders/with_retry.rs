@@ -74,7 +74,7 @@ use crate::with_retry::{LoopFailure, RetryWrap};
 ///         if attempt >= 3 {
 ///             RetryDecision::Stop
 ///         } else {
-///             RetryDecision::Retry { delay: Duration::from_secs(2) }
+///             RetryDecision::retry(Duration::from_secs(2))
 ///         }
 ///     })
 ///     .await?;
@@ -345,7 +345,7 @@ where
     ///         if attempt >= 3 {
     ///             RetryDecision::Stop
     ///         } else {
-    ///             RetryDecision::Retry { delay: Duration::from_secs(1) }
+    ///             RetryDecision::retry(Duration::from_secs(1))
     ///         }
     ///     })
     ///     .await?;

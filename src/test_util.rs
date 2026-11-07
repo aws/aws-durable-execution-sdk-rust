@@ -388,7 +388,7 @@ const DEFAULT_STATE_PAGE_SIZE: usize = 1;
 #[non_exhaustive]
 pub struct TestOperation {
     id: String,
-    kind: OperationKind,
+    kind: RunnerKind,
     sub_type: Option<String>,
     status: OperationStatus,
     result: Option<String>,
@@ -412,7 +412,7 @@ pub struct TestOperation {
 impl TestOperation {
     /// A record of `kind` with no result, error or detail, in status
     /// `Started`.
-    fn started(id: String, kind: OperationKind) -> Self {
+    fn started(id: String, kind: RunnerKind) -> Self {
         Self {
             id,
             kind,
@@ -455,7 +455,7 @@ impl TestOperation {
     /// The operation kind, such as [`OperationKind::Step`] or
     /// [`OperationKind::Callback`].
     pub fn kind(&self) -> OperationKind {
-        self.kind
+        self.kind.operation_kind()
     }
 
     /// The operation sub-type, e.g. `"Step"`, `"Wait"`, `"Map"`,
@@ -546,12 +546,49 @@ impl TestOperation {
     /// [`TestOperationDetails::Step`], and so on.
     pub fn details(&self) -> TestOperationDetails<'_> {
         match self.kind {
-            OperationKind::Execution => TestOperationDetails::Execution,
-            OperationKind::Context => TestOperationDetails::Context(&self.context),
-            OperationKind::Step => TestOperationDetails::Step(&self.step),
-            OperationKind::Wait => TestOperationDetails::Wait(&self.wait),
-            OperationKind::Callback => TestOperationDetails::Callback(&self.callback),
-            OperationKind::ChainedInvoke => TestOperationDetails::ChainedInvoke,
+            RunnerKind::Context => TestOperationDetails::Context(&self.context),
+            RunnerKind::Step => TestOperationDetails::Step(&self.step),
+            RunnerKind::Wait => TestOperationDetails::Wait(&self.wait),
+            RunnerKind::Callback => TestOperationDetails::Callback(&self.callback),
+            RunnerKind::ChainedInvoke => TestOperationDetails::ChainedInvoke,
+        }
+    }
+}
+
+/// The kind of an operation that a runner records: every
+/// [`OperationKind`] except [`OperationKind::Execution`], which no runner
+/// stores as an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunnerKind {
+    Context,
+    Step,
+    Wait,
+    Callback,
+    ChainedInvoke,
+}
+
+impl RunnerKind {
+    /// The runner kind of `kind`, or `None` for
+    /// [`OperationKind::Execution`].
+    fn from_operation_kind(kind: OperationKind) -> Option<Self> {
+        match kind {
+            OperationKind::Execution => None,
+            OperationKind::Context => Some(Self::Context),
+            OperationKind::Step => Some(Self::Step),
+            OperationKind::Wait => Some(Self::Wait),
+            OperationKind::Callback => Some(Self::Callback),
+            OperationKind::ChainedInvoke => Some(Self::ChainedInvoke),
+        }
+    }
+
+    /// The public kind of this runner kind.
+    pub(crate) fn operation_kind(self) -> OperationKind {
+        match self {
+            Self::Context => OperationKind::Context,
+            Self::Step => OperationKind::Step,
+            Self::Wait => OperationKind::Wait,
+            Self::Callback => OperationKind::Callback,
+            Self::ChainedInvoke => OperationKind::ChainedInvoke,
         }
     }
 }
@@ -587,11 +624,20 @@ impl TestOperation {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// No runner returns the execution itself as a [`TestOperation`], so the
+/// enum has no variant for it:
+///
+/// ```rust,compile_fail
+/// use aws_durable_execution_sdk::test_util::TestOperationDetails;
+///
+/// fn is_execution(details: TestOperationDetails<'_>) -> bool {
+///     matches!(details, TestOperationDetails::Execution)
+/// }
+/// ```
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum TestOperationDetails<'a> {
-    /// The execution itself.
-    Execution,
     /// A child context.
     Context(&'a ContextDetails),
     /// A step.
@@ -3943,29 +3989,29 @@ fn set_attempt(op: &mut TestOperation, retry: Option<&RetryDetails>) {
     }
 }
 
-/// Maps an event type to the [`OperationKind`] of its operation, or
+/// Maps an event type to the [`RunnerKind`] of its operation, or
 /// `None` for execution-level / invocation-level events that are not folded
 /// into operations.
-fn event_family_op_type(event_type: Option<&EventType>) -> Option<OperationKind> {
+fn event_family_op_type(event_type: Option<&EventType>) -> Option<RunnerKind> {
     match event_type? {
         EventType::StepStarted | EventType::StepSucceeded | EventType::StepFailed => {
-            Some(OperationKind::Step)
+            Some(RunnerKind::Step)
         }
         EventType::WaitStarted | EventType::WaitSucceeded | EventType::WaitCancelled => {
-            Some(OperationKind::Wait)
+            Some(RunnerKind::Wait)
         }
         EventType::ContextStarted | EventType::ContextSucceeded | EventType::ContextFailed => {
-            Some(OperationKind::Context)
+            Some(RunnerKind::Context)
         }
         EventType::CallbackStarted
         | EventType::CallbackSucceeded
         | EventType::CallbackFailed
-        | EventType::CallbackTimedOut => Some(OperationKind::Callback),
+        | EventType::CallbackTimedOut => Some(RunnerKind::Callback),
         EventType::ChainedInvokeStarted
         | EventType::ChainedInvokeSucceeded
         | EventType::ChainedInvokeFailed
         | EventType::ChainedInvokeTimedOut
-        | EventType::ChainedInvokeStopped => Some(OperationKind::ChainedInvoke),
+        | EventType::ChainedInvokeStopped => Some(RunnerKind::ChainedInvoke),
         _ => None,
     }
 }
@@ -3983,7 +4029,7 @@ fn invocations_from_history(events: &[Event]) -> usize {
 #[derive(Debug, Clone)]
 struct StoredOp {
     id: String,
-    kind: OperationKind,
+    kind: RunnerKind,
     sub_type: Option<String>,
     status: OperationStatus,
     name: Option<String>,
@@ -4030,7 +4076,7 @@ struct StoredOp {
 /// caller merges name/sub-type metadata and the action's outcome fields.
 fn new_started_op(
     id: String,
-    kind: OperationKind,
+    kind: RunnerKind,
     sub_type: Option<String>,
     parent_id: Option<String>,
     now: u64,
@@ -4575,7 +4621,7 @@ impl Backend {
             .ops
             .iter_mut()
             .filter(|op| {
-                op.kind == OperationKind::ChainedInvoke
+                op.kind == RunnerKind::ChainedInvoke
                     && op.status == OperationStatus::Started
                     && !op.invoke_dispatched
             })
@@ -4645,7 +4691,7 @@ impl Backend {
         let state = self.lock();
         let mut names: Vec<String> = Vec::new();
         for op in &state.ops {
-            if op.kind == OperationKind::ChainedInvoke
+            if op.kind == RunnerKind::ChainedInvoke
                 && op.status == OperationStatus::Started
                 && let Some(name) = &op.invoke_function
                 && !names.contains(name)
@@ -4723,7 +4769,7 @@ fn advance_records(state: &mut BackendState) -> bool {
         *now = next;
         for op in ops.iter_mut() {
             if timed_due_at(op).is_some_and(|due| due <= next) {
-                let fired = if op.kind == OperationKind::Wait {
+                let fired = if op.kind == RunnerKind::Wait {
                     OperationStatus::Succeeded
                 } else {
                     OperationStatus::Ready
@@ -4908,7 +4954,7 @@ fn suspended_message(unmatched_names: &[String], pending_invokes: &[String]) -> 
 /// Whether `op` is a pending callback: a callback record in `Pending` or
 /// `Started` that has not received a reply.
 fn is_pending_callback(op: &StoredOp) -> bool {
-    op.kind == OperationKind::Callback
+    op.kind == RunnerKind::Callback
         && !op.callback_delivered
         && matches!(
             op.status,
@@ -4931,7 +4977,7 @@ fn reply_name_matches(ops: &[StoredOp], op: &StoredOp, name: &str) -> bool {
     };
     ops.iter().any(|parent| {
         parent.id == parent_id
-            && parent.kind == OperationKind::Context
+            && parent.kind == RunnerKind::Context
             && parent.sub_type.as_deref() == Some(crate::callback::WFCB_SUB_TYPE)
             && parent.name.as_deref() == Some(name)
     })
@@ -4971,8 +5017,8 @@ fn take_callback_deliveries(
 /// set.
 fn timed_due_at(op: &StoredOp) -> Option<u64> {
     match (op.kind, op.status) {
-        (OperationKind::Wait, OperationStatus::Started)
-        | (OperationKind::Step, OperationStatus::Pending) => op.due_at,
+        (RunnerKind::Wait, OperationStatus::Started)
+        | (RunnerKind::Step, OperationStatus::Pending) => op.due_at,
         _ => None,
     }
 }
@@ -5019,19 +5065,18 @@ impl BackendState {
         let error = || stored_wire_error(op).as_ref().map(event_error);
         let result = || event_result(op.result.as_deref());
         let event = match (op.kind, update.action()) {
-            (OperationKind::Step, OperationAction::Start) => op_event(op, EventType::StepStarted)
+            (RunnerKind::Step, OperationAction::Start) => op_event(op, EventType::StepStarted)
                 .step_started_details(aws_sdk_lambda::types::StepStartedDetails::builder().build()),
             // `attempt` counts completed retries, and `CurrentAttempt` is
             // 1-based.
-            (OperationKind::Step, OperationAction::Succeed) => {
-                op_event(op, EventType::StepSucceeded).step_succeeded_details(
+            (RunnerKind::Step, OperationAction::Succeed) => op_event(op, EventType::StepSucceeded)
+                .step_succeeded_details(
                     aws_sdk_lambda::types::StepSucceededDetails::builder()
                         .set_result(result())
                         .retry_details(retry_details(op.attempt.saturating_add(1), None))
                         .build(),
-                )
-            }
-            (OperationKind::Step, OperationAction::Fail) => op_event(op, EventType::StepFailed)
+                ),
+            (RunnerKind::Step, OperationAction::Fail) => op_event(op, EventType::StepFailed)
                 .step_failed_details(
                     aws_sdk_lambda::types::StepFailedDetails::builder()
                         .set_error(error())
@@ -5045,7 +5090,7 @@ impl BackendState {
             // `wait_for_condition` check that asked to continue, which the
             // service records as `StepSucceeded` with the update's payload,
             // the new state.
-            (OperationKind::Step, OperationAction::Retry) => {
+            (RunnerKind::Step, OperationAction::Retry) => {
                 let retry = retry_details(
                     op.attempt,
                     update
@@ -5067,26 +5112,25 @@ impl BackendState {
                     ),
                 }
             }
-            (OperationKind::Context, OperationAction::Start) => {
+            (RunnerKind::Context, OperationAction::Start) => {
                 op_event(op, EventType::ContextStarted).context_started_details(
                     aws_sdk_lambda::types::ContextStartedDetails::builder().build(),
                 )
             }
-            (OperationKind::Context, OperationAction::Succeed) => {
+            (RunnerKind::Context, OperationAction::Succeed) => {
                 op_event(op, EventType::ContextSucceeded).context_succeeded_details(
                     aws_sdk_lambda::types::ContextSucceededDetails::builder()
                         .set_result(result())
                         .build(),
                 )
             }
-            (OperationKind::Context, OperationAction::Fail) => {
-                op_event(op, EventType::ContextFailed).context_failed_details(
+            (RunnerKind::Context, OperationAction::Fail) => op_event(op, EventType::ContextFailed)
+                .context_failed_details(
                     aws_sdk_lambda::types::ContextFailedDetails::builder()
                         .set_error(error())
                         .build(),
-                )
-            }
-            (OperationKind::Wait, OperationAction::Start) => {
+                ),
+            (RunnerKind::Wait, OperationAction::Start) => {
                 // A missing duration counts as 0, as the stored due time
                 // does (see [`whole_seconds`]).
                 let duration = op.wait_seconds.unwrap_or(0);
@@ -5100,14 +5144,13 @@ impl BackendState {
                     .expect("the duration and the scheduled end are set");
                 op_event(op, EventType::WaitStarted).wait_started_details(details)
             }
-            (OperationKind::Wait, OperationAction::Cancel) => {
-                op_event(op, EventType::WaitCancelled).wait_cancelled_details(
+            (RunnerKind::Wait, OperationAction::Cancel) => op_event(op, EventType::WaitCancelled)
+                .wait_cancelled_details(
                     aws_sdk_lambda::types::WaitCancelledDetails::builder()
                         .set_error(error())
                         .build(),
-                )
-            }
-            (OperationKind::Callback, OperationAction::Start) => {
+                ),
+            (RunnerKind::Callback, OperationAction::Start) => {
                 let options = update.callback_options();
                 // A callback `START` assigns the callback ID when the
                 // record has none (see `apply_update`).
@@ -5125,7 +5168,7 @@ impl BackendState {
                     .expect("a callback START sets the callback ID");
                 op_event(op, EventType::CallbackStarted).callback_started_details(details)
             }
-            (OperationKind::ChainedInvoke, OperationAction::Start) => {
+            (RunnerKind::ChainedInvoke, OperationAction::Start) => {
                 // A `START` without `ChainedInvokeOptions` names no
                 // function, and records the empty name.
                 #[expect(clippy::expect_used)] // reason: the function name is set
@@ -5181,10 +5224,10 @@ impl BackendState {
     fn apply_update(&mut self, kind: OperationKind, update: &OperationUpdate) -> Option<StoredOp> {
         // An `EXECUTION` update carries the execution's result. It is kept
         // apart, so it never appears as an operation.
-        if kind == OperationKind::Execution {
+        let Some(kind) = RunnerKind::from_operation_kind(kind) else {
             self.execution_result = update.payload().map(ToOwned::to_owned);
             return None;
-        }
+        };
         let id = update.id().to_owned();
         let sub_type = update.sub_type().map(ToOwned::to_owned);
         let action = update.action().clone();
@@ -5234,7 +5277,7 @@ impl BackendState {
         // Decide callback-id assignment before taking the mutable op borrow
         // (assigning self.callback_counter later would conflict with it).
         let needs_callback_id = matches!(action, OperationAction::Start)
-            && kind == OperationKind::Callback
+            && kind == RunnerKind::Callback
             && self
                 .ops
                 .iter()
@@ -5267,11 +5310,11 @@ impl BackendState {
                 op.error_message = None;
                 op.error_data = None;
                 op.stack_trace = Vec::new();
-                if op.kind == OperationKind::Wait {
+                if op.kind == RunnerKind::Wait {
                     op.set_status(OperationStatus::Started, now);
                     op.wait_seconds = wait_seconds;
                     op.due_at = Some(now.saturating_add(whole_seconds(wait_seconds)));
-                } else if op.kind == OperationKind::Callback {
+                } else if op.kind == RunnerKind::Callback {
                     // The service creates a callback in `Started` and keeps
                     // it there until an external outcome. The backend
                     // assigns the callback id here.
@@ -5282,7 +5325,7 @@ impl BackendState {
                     op.heartbeat_seconds = heartbeat_seconds;
                 } else {
                     op.set_status(OperationStatus::Started, now);
-                    if op.kind == OperationKind::ChainedInvoke {
+                    if op.kind == RunnerKind::ChainedInvoke {
                         op.invoke_function = invoke_function;
                         op.invoke_input = payload;
                     }
@@ -5291,13 +5334,13 @@ impl BackendState {
             OperationAction::Succeed => {
                 op.set_status(OperationStatus::Succeeded, now);
                 op.result = payload;
-                if op.kind == OperationKind::Context {
+                if op.kind == RunnerKind::Context {
                     op.replay_children = replay_children;
                 }
             }
             OperationAction::Fail => {
                 op.set_status(OperationStatus::Failed, now);
-                if op.kind == OperationKind::Context {
+                if op.kind == RunnerKind::Context {
                     op.replay_children = replay_children;
                 }
                 op.error_type = err_type;
@@ -5760,10 +5803,11 @@ fn validate_parents_and_repeats(
             }
         }
         if let Some(parent_id) = update.parent_id() {
-            let parent_kind = started
-                .get(parent_id)
-                .copied()
-                .or_else(|| ops.iter().find(|op| op.id == parent_id).map(|op| op.kind));
+            let parent_kind = started.get(parent_id).copied().or_else(|| {
+                ops.iter()
+                    .find(|op| op.id == parent_id)
+                    .map(|op| op.kind.operation_kind())
+            });
             if parent_kind != Some(OperationKind::Context) {
                 return Err("Invalid parent operation id.".into());
             }
@@ -5792,7 +5836,7 @@ fn validate_identity(
     let differs = |supplied: Option<&str>, stored: Option<&String>| {
         supplied.is_some_and(|value| Some(value) != stored.map(String::as_str))
     };
-    if kind != stored.kind {
+    if kind != stored.kind.operation_kind() {
         return inconsistent("Type");
     }
     if differs(update.sub_type(), stored.sub_type.as_ref()) {
@@ -5952,41 +5996,40 @@ fn settled_event(op: &StoredOp) -> Option<EventBuilder> {
     let error = || stored_wire_error(op).as_ref().map(event_error);
     let result = || event_result(op.result.as_deref());
     let event = match (op.kind, op.status) {
-        (OperationKind::Wait, OperationStatus::Succeeded) => op_event(op, EventType::WaitSucceeded)
+        (RunnerKind::Wait, OperationStatus::Succeeded) => op_event(op, EventType::WaitSucceeded)
             .wait_succeeded_details(
                 aws_sdk_lambda::types::WaitSucceededDetails::builder()
                     .set_duration(op.wait_seconds)
                     .build(),
             ),
-        (OperationKind::Callback, OperationStatus::Succeeded) => {
+        (RunnerKind::Callback, OperationStatus::Succeeded) => {
             op_event(op, EventType::CallbackSucceeded).callback_succeeded_details(
                 aws_sdk_lambda::types::CallbackSucceededDetails::builder()
                     .set_result(result())
                     .build(),
             )
         }
-        (OperationKind::Callback, OperationStatus::Failed) => {
-            op_event(op, EventType::CallbackFailed).callback_failed_details(
+        (RunnerKind::Callback, OperationStatus::Failed) => op_event(op, EventType::CallbackFailed)
+            .callback_failed_details(
                 aws_sdk_lambda::types::CallbackFailedDetails::builder()
                     .set_error(error())
                     .build(),
-            )
-        }
-        (OperationKind::Callback, OperationStatus::TimedOut) => {
+            ),
+        (RunnerKind::Callback, OperationStatus::TimedOut) => {
             op_event(op, EventType::CallbackTimedOut).callback_timed_out_details(
                 aws_sdk_lambda::types::CallbackTimedOutDetails::builder()
                     .set_error(error())
                     .build(),
             )
         }
-        (OperationKind::ChainedInvoke, OperationStatus::Succeeded) => {
+        (RunnerKind::ChainedInvoke, OperationStatus::Succeeded) => {
             op_event(op, EventType::ChainedInvokeSucceeded).chained_invoke_succeeded_details(
                 aws_sdk_lambda::types::ChainedInvokeSucceededDetails::builder()
                     .set_result(result())
                     .build(),
             )
         }
-        (OperationKind::ChainedInvoke, OperationStatus::Failed) => {
+        (RunnerKind::ChainedInvoke, OperationStatus::Failed) => {
             op_event(op, EventType::ChainedInvokeFailed).chained_invoke_failed_details(
                 aws_sdk_lambda::types::ChainedInvokeFailedDetails::builder()
                     .set_error(error())
@@ -6032,7 +6075,7 @@ fn build_operation(stored: &StoredOp, base: std::time::SystemTime) -> Option<Ope
 
     let mut builder = Operation::builder()
         .id(&stored.id)
-        .r#type(OperationType::from(stored.kind.wire_str()))
+        .r#type(OperationType::from(stored.kind.operation_kind().wire_str()))
         .status(WireOperationStatus::from(stored.status.wire_str()))
         .start_timestamp(virtual_date_time(base, stored.start_at));
     if let Some(end_at) = stored.end_at {
@@ -6050,7 +6093,7 @@ fn build_operation(stored: &StoredOp, base: std::time::SystemTime) -> Option<Ope
     }
 
     match stored.kind {
-        OperationKind::Step => {
+        RunnerKind::Step => {
             let mut sd = WireStepDetails::builder().attempt(stored.attempt);
             if let Some(r) = &stored.result {
                 sd = sd.result(r);
@@ -6060,7 +6103,7 @@ fn build_operation(stored: &StoredOp, base: std::time::SystemTime) -> Option<Ope
             }
             builder = builder.step_details(sd.build());
         }
-        OperationKind::Context => {
+        RunnerKind::Context => {
             let mut cd = WireContextDetails::builder();
             if let Some(r) = &stored.result {
                 cd = cd.result(r);
@@ -6073,7 +6116,7 @@ fn build_operation(stored: &StoredOp, base: std::time::SystemTime) -> Option<Ope
             }
             builder = builder.context_details(cd.build());
         }
-        OperationKind::Callback => {
+        RunnerKind::Callback => {
             let mut cb = WireCallbackDetails::builder();
             if let Some(id) = &stored.callback_id {
                 cb = cb.callback_id(id);
@@ -6086,7 +6129,7 @@ fn build_operation(stored: &StoredOp, base: std::time::SystemTime) -> Option<Ope
             }
             builder = builder.callback_details(cb.build());
         }
-        OperationKind::ChainedInvoke => {
+        RunnerKind::ChainedInvoke => {
             let mut ci = ChainedInvokeDetails::builder();
             if let Some(r) = &stored.result {
                 ci = ci.result(r);
@@ -6096,7 +6139,7 @@ fn build_operation(stored: &StoredOp, base: std::time::SystemTime) -> Option<Ope
             }
             builder = builder.chained_invoke_details(ci.build());
         }
-        OperationKind::Wait | OperationKind::Execution => {}
+        RunnerKind::Wait => {}
     }
 
     builder.build().ok()
@@ -6111,7 +6154,10 @@ fn build_operation(stored: &StoredOp, base: std::time::SystemTime) -> Option<Ope
 fn stored_op_envelope_json(stored: &StoredOp, base: std::time::SystemTime) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("Id".to_owned(), serde_json::json!(stored.id));
-    obj.insert("Type".to_owned(), serde_json::json!(stored.kind.wire_str()));
+    obj.insert(
+        "Type".to_owned(),
+        serde_json::json!(stored.kind.operation_kind().wire_str()),
+    );
     obj.insert(
         "Status".to_owned(),
         serde_json::json!(stored.status.wire_str()),
@@ -6165,11 +6211,11 @@ fn stored_op_envelope_json(stored: &StoredOp, base: std::time::SystemTime) -> se
     }
 
     match stored.kind {
-        OperationKind::Step => {
+        RunnerKind::Step => {
             details.insert("Attempt".to_owned(), serde_json::json!(stored.attempt));
             obj.insert("StepDetails".to_owned(), serde_json::Value::Object(details));
         }
-        OperationKind::Context => {
+        RunnerKind::Context => {
             if stored.replay_children {
                 details.insert("ReplayChildren".to_owned(), serde_json::json!(true));
             }
@@ -6178,7 +6224,7 @@ fn stored_op_envelope_json(stored: &StoredOp, base: std::time::SystemTime) -> se
                 serde_json::Value::Object(details),
             );
         }
-        OperationKind::Callback => {
+        RunnerKind::Callback => {
             if let Some(id) = &stored.callback_id {
                 details.insert("CallbackId".to_owned(), serde_json::json!(id));
             }
@@ -6187,13 +6233,13 @@ fn stored_op_envelope_json(stored: &StoredOp, base: std::time::SystemTime) -> se
                 serde_json::Value::Object(details),
             );
         }
-        OperationKind::ChainedInvoke => {
+        RunnerKind::ChainedInvoke => {
             obj.insert(
                 "ChainedInvokeDetails".to_owned(),
                 serde_json::Value::Object(details),
             );
         }
-        OperationKind::Wait | OperationKind::Execution => {}
+        RunnerKind::Wait => {}
     }
 
     serde_json::Value::Object(obj)
@@ -6225,7 +6271,7 @@ fn prune_replay_children(ops: &[StoredOp]) -> Vec<&StoredOp> {
             let Some(parent) = parent_id.and_then(find) else {
                 return false;
             };
-            if parent.kind == OperationKind::Context
+            if parent.kind == RunnerKind::Context
                 && matches!(
                     parent.status,
                     OperationStatus::Succeeded | OperationStatus::Failed
@@ -6907,9 +6953,7 @@ mod tests {
                             if attempt >= 3 {
                                 RetryDecision::Stop
                             } else {
-                                RetryDecision::Retry {
-                                    delay: std::time::Duration::from_secs(1),
-                                }
+                                RetryDecision::retry(std::time::Duration::from_secs(1))
                             }
                         };
                         let v: i32 = ctx
@@ -7411,7 +7455,7 @@ mod tests {
                                 CompletionConfig::builder()
                                     .completion_predicate(|stats| {
                                         if stats.settled() >= 2 {
-                                            CompletionDecision::Complete(
+                                            CompletionDecision::complete(
                                                 CompletionOutcome::Succeeded,
                                             )
                                         } else {
@@ -7498,7 +7542,7 @@ mod tests {
                                 // predicate could stop early.
                                 .completion_predicate(|stats| {
                                     if stats.failed() > stats.succeeded() {
-                                        CompletionDecision::Complete(CompletionOutcome::Succeeded)
+                                        CompletionDecision::complete(CompletionOutcome::Succeeded)
                                     } else {
                                         CompletionDecision::Continue
                                     }
@@ -7598,7 +7642,7 @@ mod tests {
                                     // outnumber the successes by two.
                                     .completion_predicate(|stats| {
                                         if stats.failed() > stats.succeeded() + 1 {
-                                            CompletionDecision::Complete(
+                                            CompletionDecision::complete(
                                                 CompletionOutcome::Succeeded,
                                             )
                                         } else {
@@ -8174,9 +8218,7 @@ mod tests {
                             if attempt >= 2 {
                                 RetryDecision::Stop
                             } else {
-                                RetryDecision::Retry {
-                                    delay: std::time::Duration::from_secs(1),
-                                }
+                                RetryDecision::retry(std::time::Duration::from_secs(1))
                             }
                         })
                         .await?;
@@ -8296,9 +8338,7 @@ mod tests {
                                 if attempt >= 2 {
                                     RetryDecision::Stop
                                 } else {
-                                    RetryDecision::Retry {
-                                        delay: std::time::Duration::from_secs(1),
-                                    }
+                                    RetryDecision::retry(std::time::Duration::from_secs(1))
                                 }
                             })
                             .await?;
@@ -9099,7 +9139,7 @@ mod tests {
         }
         assert_eq!(
             event_family_op_type(Some(&EventType::ChainedInvokeSucceeded)),
-            Some(OperationKind::ChainedInvoke)
+            Some(RunnerKind::ChainedInvoke)
         );
         assert_eq!(
             event_family_op_type(Some(&EventType::ExecutionStarted)),
@@ -10436,8 +10476,8 @@ mod tests {
                                     }
                                     Ok("retried".to_owned())
                                 })
-                                .retry_strategy(|_err, _attempt| RetryDecision::Retry {
-                                    delay: std::time::Duration::from_secs(300),
+                                .retry_strategy(|_err, _attempt| {
+                                    RetryDecision::retry(std::time::Duration::from_secs(300))
                                 })
                                 .await
                                 .map_err(BoxError::from)
@@ -11311,13 +11351,7 @@ mod tests {
                             }
                         };
                         let items = batch.into_result()?;
-                        Ok::<_, BoxError>(
-                            items
-                                .results()
-                                .into_iter()
-                                .map(String::len)
-                                .collect::<Vec<_>>(),
-                        )
+                        Ok::<_, BoxError>(items.results().map(String::len).collect::<Vec<_>>())
                     },
                     (),
                 )
@@ -12790,7 +12824,7 @@ mod tests {
             .iter()
             .find(|op| op.id == step_id)
             .expect("the WAIT is stored");
-        assert_eq!(hidden.kind, OperationKind::Wait);
+        assert_eq!(hidden.kind, RunnerKind::Wait);
         assert_eq!(hidden.status, OperationStatus::Started);
     }
 
@@ -13738,7 +13772,6 @@ mod tests {
         assert_eq!(kinds.len(), 4, "{kinds:?}");
         for op in result.operations() {
             let matches = match op.details() {
-                TestOperationDetails::Execution => op.kind() == OperationKind::Execution,
                 TestOperationDetails::Context(_) => op.kind() == OperationKind::Context,
                 TestOperationDetails::Step(_) => op.kind() == OperationKind::Step,
                 TestOperationDetails::Wait(_) => op.kind() == OperationKind::Wait,
@@ -13757,7 +13790,6 @@ mod tests {
         // the one variant its kind must give.
         fn variant(details: TestOperationDetails<'_>) -> &'static str {
             match details {
-                TestOperationDetails::Execution => "Execution",
                 TestOperationDetails::Context(_) => "Context",
                 TestOperationDetails::Step(_) => "Step",
                 TestOperationDetails::Wait(_) => "Wait",
@@ -13766,17 +13798,26 @@ mod tests {
             }
         }
         let rows = [
-            (OperationKind::Execution, "Execution"),
-            (OperationKind::Context, "Context"),
-            (OperationKind::Step, "Step"),
-            (OperationKind::Wait, "Wait"),
-            (OperationKind::Callback, "Callback"),
-            (OperationKind::ChainedInvoke, "ChainedInvoke"),
+            (RunnerKind::Context, OperationKind::Context, "Context"),
+            (RunnerKind::Step, OperationKind::Step, "Step"),
+            (RunnerKind::Wait, OperationKind::Wait, "Wait"),
+            (RunnerKind::Callback, OperationKind::Callback, "Callback"),
+            (
+                RunnerKind::ChainedInvoke,
+                OperationKind::ChainedInvoke,
+                "ChainedInvoke",
+            ),
         ];
-        for (kind, expected) in rows {
+        for (kind, public, expected) in rows {
             let op = TestOperation::started("id".to_owned(), kind);
             assert_eq!(variant(op.details()), expected, "{kind:?}");
+            assert_eq!(op.kind(), public, "{kind:?}");
+            assert_eq!(RunnerKind::from_operation_kind(public), Some(kind));
         }
+        assert_eq!(
+            RunnerKind::from_operation_kind(OperationKind::Execution),
+            None
+        );
     }
 
     /// The error a step body or a handler returns in the error data tests.
@@ -15880,8 +15921,8 @@ mod tests {
                         Ok(7)
                     })
                     .name("flaky")
-                    .retry_strategy(|_err, _attempt| RetryDecision::Retry {
-                        delay: std::time::Duration::from_secs(30),
+                    .retry_strategy(|_err, _attempt| {
+                        RetryDecision::retry(std::time::Duration::from_secs(30))
                     })
                     .await?;
                     Ok::<_, BoxError>(())
@@ -15928,7 +15969,7 @@ mod tests {
     fn end_time_keeps_the_first_terminal_status() {
         // A record that ends at virtual time 5 keeps that end time when a
         // later write at time 9 sets another terminal status.
-        let mut op = new_started_op("x".to_owned(), OperationKind::Step, None, None, 1);
+        let mut op = new_started_op("x".to_owned(), RunnerKind::Step, None, None, 1);
         op.set_status(OperationStatus::Pending, 3);
         assert_eq!(op.end_at, None);
         op.set_status(OperationStatus::Succeeded, 5);
@@ -15948,7 +15989,7 @@ mod tests {
             (OperationStatus::Cancelled, true),
             (OperationStatus::Stopped, true),
         ] {
-            let mut op = new_started_op("x".to_owned(), OperationKind::Step, None, None, 0);
+            let mut op = new_started_op("x".to_owned(), RunnerKind::Step, None, None, 0);
             op.set_status(status, 4);
             assert_eq!(op.end_at, terminal.then_some(4), "{status:?}");
         }
@@ -16304,10 +16345,10 @@ mod tests {
     fn display_prints_dash_for_absent_times_and_sub_type() {
         // A record with no sub-type, no start and no end prints `-` in
         // those cells and in the duration.
-        let op = TestOperation::started("x".to_owned(), OperationKind::Step);
+        let op = TestOperation::started("x".to_owned(), RunnerKind::Step);
         let only_start = TestOperation {
             start_time: Some(std::time::UNIX_EPOCH),
-            ..TestOperation::started("y".to_owned(), OperationKind::Step)
+            ..TestOperation::started("y".to_owned(), RunnerKind::Step)
         };
         let result = result_with(vec![op, only_start]);
         assert_eq!(
@@ -16329,7 +16370,7 @@ mod tests {
     fn display_preserves_millisecond_fraction() {
         let op = TestOperation {
             start_time: Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(100_123)),
-            ..TestOperation::started("x".to_owned(), OperationKind::Step)
+            ..TestOperation::started("x".to_owned(), RunnerKind::Step)
         };
         let result = result_with(vec![op]);
         let table = result
@@ -16388,7 +16429,7 @@ mod tests {
         let op = TestOperation {
             start_time: std::time::UNIX_EPOCH.checked_sub(span),
             end_time: std::time::UNIX_EPOCH.checked_add(span),
-            ..TestOperation::started("x".to_owned(), OperationKind::Step)
+            ..TestOperation::started("x".to_owned(), RunnerKind::Step)
         };
         assert!(op.start_time.is_some() && op.end_time.is_some());
         let table = result_with(vec![op])
@@ -16408,7 +16449,7 @@ mod tests {
         let op = TestOperation {
             start_time: std::time::UNIX_EPOCH.checked_sub(span),
             end_time: std::time::UNIX_EPOCH.checked_add(span),
-            ..TestOperation::started("x".to_owned(), OperationKind::Step)
+            ..TestOperation::started("x".to_owned(), RunnerKind::Step)
         };
         assert!(op.start_time.is_some() && op.end_time.is_some());
         let table = result_with(vec![op])
@@ -17298,8 +17339,8 @@ mod tests {
                                 Ok(1)
                             })
                             .name("s")
-                            .retry_strategy(|_err, _attempt| RetryDecision::Retry {
-                                delay: std::time::Duration::from_secs(5),
+                            .retry_strategy(|_err, _attempt| {
+                                RetryDecision::retry(std::time::Duration::from_secs(5))
                             })
                             .await?)
                     })
@@ -17947,9 +17988,7 @@ mod tests {
                                         if attempt >= 2 {
                                             RetryDecision::Stop
                                         } else {
-                                            RetryDecision::Retry {
-                                                delay: std::time::Duration::from_secs(1),
-                                            }
+                                            RetryDecision::retry(std::time::Duration::from_secs(1))
                                         }
                                     });
                                 let block = match name {
@@ -18585,7 +18624,7 @@ mod tests {
     fn store_wait(backend: &Backend, id: &str, due: u64) {
         backend.lock().ops.push(StoredOp {
             due_at: Some(due),
-            ..new_started_op(id.to_owned(), OperationKind::Wait, None, None, 0)
+            ..new_started_op(id.to_owned(), RunnerKind::Wait, None, None, 0)
         });
     }
 
@@ -18594,7 +18633,7 @@ mod tests {
         backend.lock().ops.push(StoredOp {
             callback_id: Some(format!("cb-{id}")),
             heartbeat_seconds: Some(60),
-            ..new_started_op(id.to_owned(), OperationKind::Callback, None, None, 0)
+            ..new_started_op(id.to_owned(), RunnerKind::Callback, None, None, 0)
         });
     }
 
@@ -18698,7 +18737,7 @@ mod tests {
         let (shared, polls) = counting_run(&live);
         backend.lock().ops.push(new_started_op(
             "x".to_owned(),
-            OperationKind::Step,
+            RunnerKind::Step,
             None,
             None,
             0,
@@ -19172,11 +19211,11 @@ mod tests {
         let context = TestOperation {
             sub_type: Some(crate::callback::WFCB_SUB_TYPE.to_owned()),
             name: Some("approve".to_owned()),
-            ..TestOperation::started("ctx".to_owned(), OperationKind::Context)
+            ..TestOperation::started("ctx".to_owned(), RunnerKind::Context)
         };
         let plain = TestOperation {
             name: Some("plain".to_owned()),
-            ..TestOperation::started("p".to_owned(), OperationKind::Context)
+            ..TestOperation::started("p".to_owned(), RunnerKind::Context)
         };
         let ops = [context, plain];
         let err = callback_target(&Selector::Name("approve".to_owned(), 0), &ops)
@@ -19507,7 +19546,7 @@ mod tests {
             status,
             ..TestOperation::started(id.to_owned(), kind)
         };
-        let step = op("s", OperationKind::Step, OperationStatus::Pending);
+        let step = op("s", RunnerKind::Step, OperationStatus::Pending);
         assert!(status_reached(&step, WaitingStatus::Started, &[]));
         assert!(!status_reached(&step, WaitingStatus::Submitted, &[]));
         for status in [
@@ -19517,13 +19556,13 @@ mod tests {
             OperationStatus::TimedOut,
             OperationStatus::Stopped,
         ] {
-            let done = op("s", OperationKind::Step, status);
+            let done = op("s", RunnerKind::Step, status);
             assert!(status_reached(&done, WaitingStatus::Submitted, &[]));
             assert!(status_reached(&done, WaitingStatus::Completed, &[]));
         }
         let context = TestOperation {
             sub_type: Some(crate::callback::WFCB_SUB_TYPE.to_owned()),
-            ..op("ctx", OperationKind::Context, OperationStatus::Started)
+            ..op("ctx", RunnerKind::Context, OperationStatus::Started)
         };
         let child = |id: &str, kind, status| TestOperation {
             parent_id: Some("ctx".to_owned()),
@@ -19539,21 +19578,17 @@ mod tests {
         };
         // A wait child does not count.
         assert_eq!(
-            all(&[child("w", OperationKind::Wait, OperationStatus::Succeeded)]),
+            all(&[child("w", RunnerKind::Wait, OperationStatus::Succeeded)]),
             [false, false, false]
         );
         assert_eq!(
-            all(&[child(
-                "cb",
-                OperationKind::Callback,
-                OperationStatus::Started
-            )]),
+            all(&[child("cb", RunnerKind::Callback, OperationStatus::Started)]),
             [true, false, false]
         );
         assert_eq!(
             all(&[
-                child("cb", OperationKind::Callback, OperationStatus::Started),
-                child("sub", OperationKind::Step, OperationStatus::Succeeded),
+                child("cb", RunnerKind::Callback, OperationStatus::Started),
+                child("sub", RunnerKind::Step, OperationStatus::Succeeded),
             ]),
             [true, true, false]
         );
@@ -19562,7 +19597,7 @@ mod tests {
         assert_eq!(
             all(&[child(
                 "cb",
-                OperationKind::Callback,
+                RunnerKind::Callback,
                 OperationStatus::Succeeded
             )]),
             [true, true, false]
@@ -19575,7 +19610,7 @@ mod tests {
             let done = finished(status);
             let terminal_callback = [child(
                 "cb",
-                OperationKind::Callback,
+                RunnerKind::Callback,
                 OperationStatus::Succeeded,
             )];
             assert!(status_reached(
@@ -19586,8 +19621,8 @@ mod tests {
             // A finished context whose callback never ended, such as one
             // whose submitter failed, is not `Completed`, as in JS.
             let open_callback = [
-                child("cb", OperationKind::Callback, OperationStatus::Started),
-                child("sub", OperationKind::Step, OperationStatus::Failed),
+                child("cb", RunnerKind::Callback, OperationStatus::Started),
+                child("sub", RunnerKind::Step, OperationStatus::Failed),
             ];
             assert!(status_reached(
                 &done,
@@ -19601,7 +19636,7 @@ mod tests {
             ));
         }
         // A plain child context's status is its own.
-        let plain = op("p", OperationKind::Context, OperationStatus::Started);
+        let plain = op("p", RunnerKind::Context, OperationStatus::Started);
         assert!(status_reached(&plain, WaitingStatus::Started, &[]));
         assert!(!status_reached(&plain, WaitingStatus::Submitted, &[]));
     }

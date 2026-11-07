@@ -281,11 +281,11 @@ impl std::fmt::Display for BatchStatus {
 ///     )],
 ///     CompletionReason::AllCompleted,
 /// );
-/// let errors = result.errors();
-/// assert_eq!(errors[0].index, 2);
-/// assert_eq!(errors[0].name, "branch-c");
-/// assert_eq!(errors[0].message, "boom");
-/// assert_eq!(errors[0].error_type, Some("Error"));
+/// let error = result.errors().next().expect("one item failed");
+/// assert_eq!(error.index, 2);
+/// assert_eq!(error.name, "branch-c");
+/// assert_eq!(error.message, "boom");
+/// assert_eq!(error.error_type, Some("Error"));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -330,7 +330,7 @@ pub enum CompletionReason {
     /// The failure tolerance was exceeded.
     FailureToleranceExceeded,
     /// The custom completion predicate returned
-    /// `Complete(CompletionOutcome::Succeeded)`.
+    /// `CompletionDecision::complete(CompletionOutcome::Succeeded)`.
     ///
     /// The predicate is configured through
     /// [`crate::builders::map_parallel::CompletionConfig::with_completion_predicate`] or
@@ -340,7 +340,7 @@ pub enum CompletionReason {
     /// tolerated rather than propagated as errors.
     CustomCompletionSucceeded,
     /// The custom completion predicate returned
-    /// `Complete(CompletionOutcome::Failed)`.
+    /// `CompletionDecision::complete(CompletionOutcome::Failed)`.
     ///
     /// [`BatchResult::status`] is [`BatchStatus::Failed`] even when no item
     /// failed, and awaiting the batch returns an error.
@@ -406,8 +406,23 @@ impl CompletionReason {
 ///     CompletionDecision, CompletionOutcome,
 /// };
 ///
-/// let decision = CompletionDecision::Complete(CompletionOutcome::Failed);
+/// let decision = CompletionDecision::complete(CompletionOutcome::Failed);
 /// assert_ne!(decision, CompletionDecision::Continue);
+/// ```
+///
+/// The enum and its `Complete` variant are `#[non_exhaustive]`. Build a
+/// completion with [`CompletionDecision::complete`], and match it with
+/// `..`. Rust does not accept a tuple pattern for a `#[non_exhaustive]`
+/// tuple variant outside its crate, so use the field syntax, as in
+/// `CompletionDecision::Complete { 0: outcome, .. }`. A caller cannot build
+/// the variant directly:
+///
+/// ```rust,compile_fail
+/// use aws_durable_execution_sdk::builders::map_parallel::{
+///     CompletionDecision, CompletionOutcome,
+/// };
+///
+/// let _ = CompletionDecision::Complete(CompletionOutcome::Succeeded);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -415,7 +430,16 @@ pub enum CompletionDecision {
     /// Keep starting and awaiting items.
     Continue,
     /// Complete the batch now with this outcome.
+    #[non_exhaustive]
     Complete(CompletionOutcome),
+}
+
+impl CompletionDecision {
+    /// A [`Complete`](Self::Complete) decision with the given outcome.
+    #[must_use]
+    pub fn complete(outcome: CompletionOutcome) -> Self {
+        Self::Complete(outcome)
+    }
 }
 
 /// Whether a custom completion counts as a success or a failure of the batch.
@@ -617,8 +641,9 @@ impl<'a> BatchStats<'a> {
 /// assert_eq!(result.success_count(), 1);
 /// assert_eq!(result.failure_count(), 1);
 /// assert_eq!(result.status(), BatchStatus::Failed);
-/// assert_eq!(result.errors()[0].index, 1);
-/// assert_eq!(result.errors()[0].message, "oops");
+/// let error = result.errors().next().expect("one item failed");
+/// assert_eq!(error.index, 1);
+/// assert_eq!(error.message, "oops");
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]
@@ -637,21 +662,12 @@ impl<O> BatchResult<O> {
         Self { items, reason }
     }
 
-    /// Returns successful results in input order.
+    /// Iterates over the values of the succeeded items, in input order.
     ///
     /// Failed items, `Started` items, and items that never started are
     /// omitted.
-    pub fn results(&self) -> Vec<&O> {
-        self.items
-            .iter()
-            .filter_map(|item| {
-                if item.status == BatchItemStatus::Succeeded {
-                    item.result.as_ref()
-                } else {
-                    None
-                }
-            })
-            .collect()
+    pub fn results(&self) -> impl Iterator<Item = &O> + '_ {
+        self.succeeded().filter_map(|item| item.result.as_ref())
     }
 
     /// Returns the count of successes.
@@ -701,22 +717,18 @@ impl<O> BatchResult<O> {
         self.items.len()
     }
 
-    /// Returns the errors from failed items, in input order.
+    /// Iterates over the errors of the failed items, in input order.
     ///
     /// Each [`BatchError`] carries the failed item's index, display name,
     /// error type identifier, and error message, so a caller can tell
     /// which input produced which failure and what kind of error it was.
-    pub fn errors(&self) -> Vec<BatchError<'_>> {
-        self.items
-            .iter()
-            .filter(|item| item.status == BatchItemStatus::Failed)
-            .map(|item| BatchError {
-                index: item.index,
-                name: &item.name,
-                message: item.error_message.as_deref().unwrap_or_default(),
-                error_type: item.error_type.as_deref(),
-            })
-            .collect()
+    pub fn errors(&self) -> impl Iterator<Item = BatchError<'_>> + '_ {
+        self.failed().map(|item| BatchError {
+            index: item.index,
+            name: &item.name,
+            message: item.error_message.as_deref().unwrap_or_default(),
+            error_type: item.error_type.as_deref(),
+        })
     }
 
     /// Returns the items with status [`BatchItemStatus::Succeeded`], in
@@ -4688,6 +4700,83 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
 
+    /// `CompletionDecision::complete` builds the `Complete` variant with
+    /// the given outcome.
+    #[test]
+    fn completion_decision_constructor_builds_complete() {
+        for expected in [CompletionOutcome::Succeeded, CompletionOutcome::Failed] {
+            assert!(matches!(
+                CompletionDecision::complete(expected),
+                CompletionDecision::Complete(outcome) if outcome == expected
+            ));
+        }
+    }
+
+    /// `results()` and `errors()` are iterators over the succeeded values
+    /// and the failed items' errors, in input order.
+    #[test]
+    fn results_and_errors_are_iterators() {
+        let batch = BatchResult::new(
+            vec![
+                BatchItem::new(
+                    0,
+                    "a".to_owned(),
+                    BatchItemStatus::Succeeded,
+                    Some(1),
+                    None,
+                    None,
+                ),
+                BatchItem::new(
+                    1,
+                    "b".to_owned(),
+                    BatchItemStatus::Failed,
+                    None,
+                    Some("first".to_owned()),
+                    Some("Error".to_owned()),
+                ),
+                BatchItem::new(
+                    2,
+                    "c".to_owned(),
+                    BatchItemStatus::Started,
+                    None,
+                    None,
+                    None,
+                ),
+                BatchItem::new(
+                    3,
+                    "d".to_owned(),
+                    BatchItemStatus::Succeeded,
+                    Some(4),
+                    None,
+                    None,
+                ),
+                BatchItem::new(
+                    4,
+                    "e".to_owned(),
+                    BatchItemStatus::Failed,
+                    None,
+                    Some("second".to_owned()),
+                    Some("TimeoutError".to_owned()),
+                ),
+            ],
+            CompletionReason::AllCompleted,
+        );
+
+        assert_eq!(batch.results().next(), Some(&1));
+        assert_eq!(batch.results().copied().collect::<Vec<_>>(), [1, 4]);
+        let errors = batch
+            .errors()
+            .map(|e| (e.index, e.name, e.message, e.error_type))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors,
+            [
+                (1, "b", "first", Some("Error")),
+                (4, "e", "second", Some("TimeoutError")),
+            ]
+        );
+    }
+
     /// Helper to create a test context with the given checkpoint log.
     fn test_ctx(log: CheckpointLog) -> DurableContext {
         DurableContext::new_root(
@@ -4936,8 +5025,7 @@ mod tests {
                             .await_batch()
                             .await
                             .unwrap();
-                        let errors = batch.errors();
-                        let error = errors.first().expect("item 1 failed");
+                        let error = batch.errors().next().expect("item 1 failed");
                         (
                             "map-item-1",
                             (
@@ -4958,8 +5046,7 @@ mod tests {
                             .await_batch()
                             .await
                             .unwrap();
-                        let errors = batch.errors();
-                        let error = errors.first().expect("branch 1 failed");
+                        let error = batch.errors().next().expect("branch 1 failed");
                         (
                             "bad",
                             (
@@ -5611,7 +5698,7 @@ mod tests {
 
         // The structured error view must associate the failure with the
         // branch that produced it.
-        let errors = batch.errors();
+        let errors = batch.errors().collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].index, 1);
         assert_eq!(errors[0].name, "boom");
@@ -5696,7 +5783,7 @@ mod tests {
 
         // The structured error view must associate the replayed failure
         // with the branch that produced it.
-        let errors = batch.errors();
+        let errors = batch.errors().collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].index, 0);
         assert_eq!(
@@ -5765,7 +5852,10 @@ mod tests {
             .expect("the batch reports the failed item");
         assert_eq!(item.status, BatchItemStatus::Failed);
         assert_eq!(item.error_type.as_deref(), Some("Error"));
-        assert_eq!(batch.errors()[0].error_type, Some("Error"));
+        assert_eq!(
+            batch.errors().next().map(|e| e.error_type),
+            Some(Some("Error"))
+        );
 
         let record = recorded_batch_record(&client);
         assert_eq!(
@@ -6348,7 +6438,7 @@ mod tests {
     /// `Complete(Succeeded)` when `done`, else `Continue`.
     fn succeed_when(done: bool) -> CompletionDecision {
         if done {
-            CompletionDecision::Complete(CompletionOutcome::Succeeded)
+            CompletionDecision::complete(CompletionOutcome::Succeeded)
         } else {
             CompletionDecision::Continue
         }
@@ -6357,7 +6447,7 @@ mod tests {
     /// `Complete(Failed)` when `done`, else `Continue`.
     fn fail_when(done: bool) -> CompletionDecision {
         if done {
-            CompletionDecision::Complete(CompletionOutcome::Failed)
+            CompletionDecision::complete(CompletionOutcome::Failed)
         } else {
             CompletionDecision::Continue
         }
@@ -7070,7 +7160,7 @@ mod tests {
                 (2, BatchItemStatus::Failed)
             ]
         );
-        assert_eq!(batch.results(), [&1, &2]);
+        assert_eq!(batch.results().collect::<Vec<_>>(), [&1, &2]);
         assert_eq!(batch.reason, CompletionReason::CustomCompletionSucceeded);
         assert_eq!(ran.load(Ordering::SeqCst), 0, "no body ran");
     }
@@ -7119,7 +7209,7 @@ mod tests {
         let seen = Arc::clone(&calls);
         let predicate = Config::with_completion_predicate(move |_| {
             seen.fetch_add(1, Ordering::SeqCst);
-            CompletionDecision::Complete(CompletionOutcome::Failed)
+            CompletionDecision::complete(CompletionOutcome::Failed)
         });
         let threshold = Config::with_tolerated_failure_count(0);
 
@@ -7158,8 +7248,8 @@ mod tests {
         let cfg = Config::with_completion_predicate(move |s| {
             seen.fetch_add(1, Ordering::SeqCst);
             match s.settled() {
-                1 => CompletionDecision::Complete(CompletionOutcome::Succeeded),
-                2 => CompletionDecision::Complete(CompletionOutcome::Failed),
+                1 => CompletionDecision::complete(CompletionOutcome::Succeeded),
+                2 => CompletionDecision::complete(CompletionOutcome::Failed),
                 _ => CompletionDecision::Continue,
             }
         });
@@ -7606,7 +7696,7 @@ mod tests {
             vec![after_0.clone(), after_0, after_1.clone(), after_1, after_2],
             "settle of item 0, gate and settle of item 1, gate and settle of item 2"
         );
-        assert_eq!(batch.results(), [&1, &11, &12]);
+        assert_eq!(batch.results().collect::<Vec<_>>(), [&1, &11, &12]);
         assert_eq!(ran.load(Ordering::SeqCst), 2, "only the live items ran");
 
         let started: Vec<String> = client
@@ -7723,7 +7813,7 @@ mod tests {
             )
             .completion(
                 crate::builders::map_parallel::CompletionConfig::with_completion_predicate(|_| {
-                    CompletionDecision::Complete(CompletionOutcome::Succeeded)
+                    CompletionDecision::complete(CompletionOutcome::Succeeded)
                 }),
             )
             .await_batch()
@@ -7853,13 +7943,13 @@ mod tests {
         assert_eq!(result.total_count(), 3);
         assert!(result.has_failure());
         assert_eq!(result.status(), BatchStatus::Failed);
-        let errors = result.errors();
+        let errors = result.errors().collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].index, 1);
         assert_eq!(errors[0].name, "");
         assert_eq!(errors[0].message, "err");
         assert_eq!(errors[0].error_type, Some("Error"));
-        assert_eq!(result.results(), vec![&10, &30]);
+        assert_eq!(result.results().collect::<Vec<_>>(), vec![&10, &30]);
         assert_eq!(result.reason, CompletionReason::FailureToleranceExceeded);
     }
 
@@ -7890,7 +7980,7 @@ mod tests {
         assert_eq!(result.status(), BatchStatus::Succeeded);
         assert_eq!(result.success_count(), 2);
         assert_eq!(result.failure_count(), 0);
-        assert_eq!(result.errors(), []);
+        assert_eq!(result.errors().next(), None);
     }
 
     /// `BatchStatus` must render exactly the strings the old string-typed
@@ -7965,7 +8055,7 @@ mod tests {
             CompletionReason::AllCompleted,
         );
 
-        let errors = result.errors();
+        let errors = result.errors().collect::<Vec<_>>();
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].index, 1);
         assert_eq!(errors[0].name, "b");
@@ -7992,7 +8082,7 @@ mod tests {
             )],
             CompletionReason::AllCompleted,
         );
-        let errors = result.errors();
+        let errors = result.errors().collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].index, 0);
         assert_eq!(errors[0].name, "x");
@@ -8063,7 +8153,7 @@ mod tests {
             failed.stack_trace,
             ["frame-a".to_owned(), "frame-b".to_owned()]
         );
-        let errors = replayed.errors();
+        let errors = replayed.errors().collect::<Vec<_>>();
         assert_eq!(errors[0].error_type, Some("CustomFailure"));
         assert_eq!(errors[0].message, "it broke");
         let ok = &replayed.items[0];
@@ -8148,7 +8238,7 @@ mod tests {
         // empty failure payload rather than a fabricated one.
         assert_eq!(item.error_data, None);
         assert_eq!(item.stack_trace, Vec::<String>::new());
-        assert_eq!(replayed.errors()[0].error_type, None);
+        assert_eq!(replayed.errors().next().map(|e| e.error_type), Some(None));
     }
 
     /// Replaying a frozen terminal batch whose payload carries a per-item
@@ -8216,7 +8306,7 @@ mod tests {
 
         assert_eq!(batch.success_count(), 1);
         assert_eq!(batch.failure_count(), 1);
-        let errors = batch.errors();
+        let errors = batch.errors().collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].index, 1);
         assert_eq!(errors[0].message, "boom");
@@ -8458,7 +8548,7 @@ mod tests {
         );
         assert!(!first.contains("ready-value"), "{first}");
         assert_eq!(
-            format!("{:?}", batch.results()),
+            format!("{:?}", batch.results().collect::<Vec<_>>()),
             "[BranchValue { .. }, BranchValue { .. }]"
         );
         let text = format!("{batch:?}");
@@ -9931,7 +10021,7 @@ mod tests {
             "a STARTED item carries no result and no error"
         );
         // The Vec<O> success view skips the STARTED item.
-        assert_eq!(batch.results(), vec!["a", "c"]);
+        assert_eq!(batch.results().collect::<Vec<_>>(), vec!["a", "c"]);
     }
 
     /// The plan-constrained FALLBACK (fast replay hit a completed child
@@ -10014,7 +10104,7 @@ mod tests {
             ],
             "started-set item reported STARTED from the record; never-started omitted"
         );
-        assert_eq!(batch.results(), vec!["a", "c"]);
+        assert_eq!(batch.results().collect::<Vec<_>>(), vec!["a", "c"]);
     }
 
     /// A succeeded `replay_children` batch parent must carry its summary.
@@ -11035,7 +11125,7 @@ mod tests {
                 .expect("the recorded batch replays")
                 .expect("the replay succeeds");
             assert_eq!(
-                replayed.results(),
+                replayed.results().collect::<Vec<_>>(),
                 [&"hello".to_owned(), &"world".to_owned()]
             );
 
@@ -13088,7 +13178,7 @@ mod tests {
             .expect("replay succeeds");
         let names: Vec<&str> = replayed.items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["a", "parallel-branch-1"]);
-        let error_names: Vec<&str> = replayed.errors().iter().map(|e| e.name).collect();
+        let error_names: Vec<&str> = replayed.errors().map(|e| e.name).collect();
         assert_eq!(error_names, names);
     }
 
@@ -13444,7 +13534,7 @@ mod batch_terminal_tests {
                         let batch = logged_map(&ctx, invocation, &log).spawn_batch();
                         ctx.wait(Duration::from_secs(1)).await?;
                         let batch = batch.await?;
-                        Ok::<_, BoxError>(batch.results().into_iter().copied().collect::<Vec<_>>())
+                        Ok::<_, BoxError>(batch.results().copied().collect::<Vec<_>>())
                     }
                 },
                 (),

@@ -35,9 +35,7 @@ async fn handler(
                 .is_some_and(|t| t.error_type() == "ValidationError")
         });
         if retries {
-            durable::RetryDecision::Retry {
-                delay: std::time::Duration::from_secs(1),
-            }
+            durable::RetryDecision::retry(std::time::Duration::from_secs(1))
         } else {
             durable::RetryDecision::Stop
         }

@@ -1190,9 +1190,7 @@ async fn with_retry_attempts_are_not_user_functions() {
                     if attempt >= 2 {
                         durable::RetryDecision::Stop
                     } else {
-                        durable::RetryDecision::Retry {
-                            delay: std::time::Duration::from_secs(1),
-                        }
+                        durable::RetryDecision::retry(std::time::Duration::from_secs(1))
                     }
                 })
                 .await?)

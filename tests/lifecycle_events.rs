@@ -297,9 +297,7 @@ async fn retrying_step_emits_retry_scheduled_events() {
                         if attempt >= 3 {
                             durable::RetryDecision::Stop
                         } else {
-                            durable::RetryDecision::Retry {
-                                delay: Duration::from_secs(1),
-                            }
+                            durable::RetryDecision::retry(Duration::from_secs(1))
                         }
                     })
                     .await?;

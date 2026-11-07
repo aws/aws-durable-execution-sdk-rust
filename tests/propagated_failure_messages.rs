@@ -164,11 +164,7 @@ fn serialized_item_messages<O>(result: &TestResult<O>, batch: &str) -> (String, 
 /// `BatchItem::error_message` and `BatchError::message`.
 fn batch_views<O>(batch: &durable::builders::map_parallel::BatchResult<O>) -> Vec<String> {
     let item = batch.failed().next().expect("the item failed");
-    let error = batch
-        .errors()
-        .into_iter()
-        .next()
-        .expect("the batch has an error");
+    let error = batch.errors().next().expect("the batch has an error");
     vec![
         item.error_message
             .clone()

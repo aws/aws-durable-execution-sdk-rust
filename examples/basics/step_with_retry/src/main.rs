@@ -51,9 +51,7 @@ async fn handler(
                 RetryDecision::Stop
             } else {
                 // Linear backoff: 1s, 2s, ... before each retry.
-                RetryDecision::Retry {
-                    delay: Duration::from_secs(u64::from(attempt)),
-                }
+                RetryDecision::retry(Duration::from_secs(u64::from(attempt)))
             }
         })
         .semantics(StepSemantics::AtMostOncePerRetry)

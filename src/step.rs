@@ -85,9 +85,7 @@ impl RetryStrategyConfig {
             JitterStrategy::Full => rand_full_jitter(base),
         };
 
-        RetryDecision::Retry {
-            delay: quantize_delay(jittered),
-        }
+        RetryDecision::retry(quantize_delay(jittered))
     }
 
     /// Converts this configuration into the boxed retry-strategy closure
@@ -1916,9 +1914,7 @@ mod tests {
             })
             .name("s")
             .semantics(StepSemantics::AtMostOncePerRetry)
-            .retry_strategy(|_err, _attempt| RetryDecision::Retry {
-                delay: Duration::from_secs(1),
-            })
+            .retry_strategy(|_err, _attempt| RetryDecision::retry(Duration::from_secs(1)))
         };
 
         // Invocation 1: attempt 1 is STARTED.
@@ -1960,9 +1956,7 @@ mod tests {
                 Err::<u32, BoxError>("transient".into())
             })
             .name("s")
-            .retry_strategy(|_err, _attempt| RetryDecision::Retry {
-                delay: Duration::from_secs(10),
-            })
+            .retry_strategy(|_err, _attempt| RetryDecision::retry(Duration::from_secs(10)))
         };
 
         // Invocation 1: attempt 1 fails and schedules a 10 s retry.
@@ -2185,8 +2179,7 @@ mod tests {
                 .find("map-item-0", "uf_end")
                 .wire
                 .expect("an Err outcome");
-            let errors = batch.errors();
-            let item = errors.first().expect("the item failed");
+            let item = batch.errors().next().expect("the item failed");
             assert_eq!(
                 type_and_message(&end),
                 (
@@ -2370,9 +2363,7 @@ mod tests {
                 if attempt >= 2 {
                     RetryDecision::Stop
                 } else {
-                    RetryDecision::Retry {
-                        delay: Duration::from_secs(1),
-                    }
+                    RetryDecision::retry(Duration::from_secs(1))
                 }
             })),
             serdes: crate::serdes::JsonSerdes,
@@ -2564,9 +2555,7 @@ mod tests {
                 if attempt >= 2 {
                     RetryDecision::Stop
                 } else {
-                    RetryDecision::Retry {
-                        delay: Duration::from_secs(1),
-                    }
+                    RetryDecision::retry(Duration::from_secs(1))
                 }
             })
         }
@@ -2736,10 +2725,9 @@ mod tests {
         let op_id = ctx.mint_id();
 
         // Strategy that always retries with 1s delay.
-        let always_retry: RetryStrategy =
-            Box::new(|_err: &StepError, _attempt: u32| RetryDecision::Retry {
-                delay: Duration::from_secs(1),
-            });
+        let always_retry: RetryStrategy = Box::new(|_err: &StepError, _attempt: u32| {
+            RetryDecision::retry(Duration::from_secs(1))
+        });
 
         let closure = |_: StepContext| async { Err::<i32, BoxError>("transient".into()) };
 
@@ -2787,10 +2775,9 @@ mod tests {
         // Strategy that retries with a fractional 1.9s delay. Truncation
         // would checkpoint 1s and retry EARLIER than requested; ceiling
         // semantics must checkpoint 2s.
-        let fractional_retry: RetryStrategy =
-            Box::new(|_err: &StepError, _attempt: u32| RetryDecision::Retry {
-                delay: Duration::from_millis(1900),
-            });
+        let fractional_retry: RetryStrategy = Box::new(|_err: &StepError, _attempt: u32| {
+            RetryDecision::retry(Duration::from_millis(1900))
+        });
 
         let closure = |_: StepContext| async { Err::<i32, BoxError>("transient".into()) };
 
@@ -3005,9 +2992,8 @@ mod tests {
 
         let executed = Arc::new(AtomicBool::new(false));
         let (ctx, client) = context_over(vec![step_record(CheckpointStatus::Started, 0, None)]);
-        let (strategy, seen) = kind_recording_strategy(RetryDecision::Retry {
-            delay: Duration::from_secs(5),
-        });
+        let (strategy, seen) =
+            kind_recording_strategy(RetryDecision::retry(Duration::from_secs(5)));
         let signal = Arc::clone(ctx.coordinator());
         let ownership = Arc::clone(ctx.task_ownership());
         let root = ctx.clone();
@@ -3385,7 +3371,7 @@ mod tests {
         let linear = |initial: Duration, increment: Duration| {
             RetryStrategyConfig::builder()
                 .initial_delay(initial)
-                .backoff(Backoff::Linear { increment })
+                .backoff(Backoff::linear(increment))
                 .jitter(JitterStrategy::None)
         };
         let delays = |config: &RetryStrategyConfig, attempts: std::ops::RangeInclusive<u32>| {
@@ -3445,9 +3431,7 @@ mod tests {
     fn linear_half_jitter_stays_within_bounds() {
         let config = RetryStrategyConfig::builder()
             .initial_delay(Duration::from_secs(8))
-            .backoff(Backoff::Linear {
-                increment: Duration::from_secs(8),
-            })
+            .backoff(Backoff::linear(Duration::from_secs(8)))
             .jitter(JitterStrategy::Half)
             .build();
 
@@ -3545,8 +3529,8 @@ mod tests {
             let config = builder.build();
 
             let decision = config.decide(&err, attempt);
-            let expected = expected.map_or(RetryDecision::Stop, |secs| RetryDecision::Retry {
-                delay: Duration::from_secs(secs),
+            let expected = expected.map_or(RetryDecision::Stop, |secs| {
+                RetryDecision::retry(Duration::from_secs(secs))
             });
             assert_eq!(decision, expected, "case {case}");
             assert_eq!(
@@ -3571,9 +3555,7 @@ mod tests {
         assert_eq!(config.decide(&interrupted, 1), RetryDecision::Stop);
         assert_eq!(
             config.decide(&sample_error(), 1),
-            RetryDecision::Retry {
-                delay: Duration::from_secs(1)
-            }
+            RetryDecision::retry(Duration::from_secs(1))
         );
     }
 
@@ -3650,7 +3632,7 @@ mod coordinator_tests {
     /// Retries attempt 1 after 1 s and stops at attempt 2.
     fn retry_once(_err: &crate::StepError, attempt: u32) -> crate::RetryDecision {
         if attempt < 2 {
-            crate::RetryDecision::Retry { delay: secs(1) }
+            crate::RetryDecision::retry(secs(1))
         } else {
             crate::RetryDecision::Stop
         }

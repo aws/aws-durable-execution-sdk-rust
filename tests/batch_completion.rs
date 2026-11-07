@@ -113,7 +113,7 @@ async fn run_custom_completion(size: usize, outcome: CompletionOutcome) -> Vec<(
                         .max_concurrency(1)
                         .completion(CompletionConfig::with_completion_predicate(move |stats| {
                             if stats.settled() >= 2 {
-                                CompletionDecision::Complete(outcome)
+                                CompletionDecision::complete(outcome)
                             } else {
                                 CompletionDecision::Continue
                             }
@@ -213,7 +213,7 @@ async fn run_counted_predicate(
                         .completion(CompletionConfig::with_completion_predicate(move |stats| {
                             predicate_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             if stats.settled() >= 2 {
-                                CompletionDecision::Complete(CompletionOutcome::Failed)
+                                CompletionDecision::complete(CompletionOutcome::Failed)
                             } else {
                                 CompletionDecision::Continue
                             }

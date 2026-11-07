@@ -30,7 +30,7 @@ async fn handler(
         "hasFailure": batch.has_failure(),
         "successCount": batch.success_count(),
         "failureCount": batch.failure_count(),
-        "errorCount": batch.errors().len(),
+        "errorCount": batch.errors().count(),
     }))
 }
 

@@ -407,9 +407,7 @@ async fn join_all_mismatch_fails_execution() {
                             if attempt >= 2 {
                                 durable::RetryDecision::Stop
                             } else {
-                                durable::RetryDecision::Retry {
-                                    delay: Duration::from_secs(1),
-                                }
+                                durable::RetryDecision::retry(Duration::from_secs(1))
                             }
                         })
                         .future();
@@ -481,9 +479,7 @@ async fn select_ok_mismatch_fails_execution_despite_sibling_success() {
                             if attempt >= 2 {
                                 durable::RetryDecision::Stop
                             } else {
-                                durable::RetryDecision::Retry {
-                                    delay: Duration::from_secs(1),
-                                }
+                                durable::RetryDecision::retry(Duration::from_secs(1))
                             }
                         })
                         .future();
@@ -500,9 +496,7 @@ async fn select_ok_mismatch_fails_execution_despite_sibling_success() {
                             if attempt >= 2 {
                                 durable::RetryDecision::Stop
                             } else {
-                                durable::RetryDecision::Retry {
-                                    delay: Duration::from_secs(1),
-                                }
+                                durable::RetryDecision::retry(Duration::from_secs(1))
                             }
                         })
                         .future();
@@ -641,9 +635,7 @@ fn park_once_retry(_err: &durable::StepError, attempt: u32) -> durable::RetryDec
     if attempt >= 2 {
         durable::RetryDecision::Stop
     } else {
-        durable::RetryDecision::Retry {
-            delay: Duration::from_secs(1),
-        }
+        durable::RetryDecision::retry(Duration::from_secs(1))
     }
 }
 

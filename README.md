@@ -535,10 +535,19 @@ let value = ctx
 
 Add `.retry_strategy(...)` to turn transient failures into retries. The
 strategy takes the error and the 1-based attempt number and returns
-`RetryDecision::Retry { delay }` or `RetryDecision::Stop`. Between attempts
+`RetryDecision::retry(delay)` or `RetryDecision::Stop`. Between attempts
 the step waits for the delay. The invocation suspends during that wait only
 when no other SDK work can make progress, so a lone retrying step does not
 hold the invocation open.
+
+The variants of `RetryDecision`, `Backoff`, `WaitDecision` and
+`CompletionDecision` that carry data are `#[non_exhaustive]`, so code
+outside the SDK builds them with their constructors, such as
+`RetryDecision::retry(delay)` and `Backoff::linear(increment)`. Matching
+them with `..` remains supported, as in `RetryDecision::Retry { delay, .. }`.
+Rust does not accept a tuple pattern for a `#[non_exhaustive]` tuple variant
+outside its crate, so match `CompletionDecision::Complete` with the field
+syntax, as in `CompletionDecision::Complete { 0: outcome, .. }`.
 
 ```rust ignore
 let result = ctx
@@ -554,9 +563,7 @@ let result = ctx
         if attempt >= 3 {
             RetryDecision::Stop
         } else {
-            RetryDecision::Retry {
-                delay: Duration::from_secs(u64::from(attempt)),
-            }
+            RetryDecision::retry(Duration::from_secs(u64::from(attempt)))
         }
     })
     .semantics(StepSemantics::AtMostOncePerRetry)
@@ -878,7 +885,7 @@ let receipt = ctx
         if attempt >= 3 {
             RetryDecision::Stop
         } else {
-            RetryDecision::Retry { delay: Duration::from_secs(5) }
+            RetryDecision::retry(Duration::from_secs(5))
         }
     })
     .await?;
@@ -1000,9 +1007,10 @@ lies outside `0.0..=100.0`, so an invalid percentage never reaches a batch.
 
 The builder's `.completion_predicate(...)` sets a custom rule instead. The
 predicate receives a `BatchStats` snapshot and returns a `CompletionDecision`:
-`Continue`, `Complete(CompletionOutcome::Succeeded)`, which records
-`CUSTOM_COMPLETION_SUCCEEDED`, or `Complete(CompletionOutcome::Failed)`, which
-records `CUSTOM_COMPLETION_FAILED`. A batch the predicate completed as failed
+`Continue`, `CompletionDecision::complete(CompletionOutcome::Succeeded)`,
+which records `CUSTOM_COMPLETION_SUCCEEDED`, or
+`CompletionDecision::complete(CompletionOutcome::Failed)`, which records
+`CUSTOM_COMPLETION_FAILED`. A batch the predicate completed as failed
 has the status `Failed`, and awaiting it returns the first failed item's
 error, or a `BatchCompletionFailed` error when no item failed. A predicate
 that never completes the batch leaves the reason `ALL_COMPLETED`. As in JS, a
@@ -1019,8 +1027,9 @@ items, and it can complete the batch before the first item starts.
 The live settle order is not recorded, and on resume the recorded items
 settle first, in index order. So the sequence of snapshots can differ between
 runs, and the predicate must be a pure function of `BatchStats` and
-monotonic. A predicate is monotonic when, after it returns `Complete(outcome)`
-for a snapshot, it returns `Complete(outcome)` with the same outcome for every
+monotonic. A predicate is monotonic when, after it returns
+`CompletionDecision::complete(outcome)` for a snapshot, it returns
+`CompletionDecision::complete(outcome)` with the same outcome for every
 later snapshot of the same batch, where each item's status is the same or
 further along. The SDK stops asking once the first trigger fires, so within
 one run a predicate is never asked to reverse a decision; monotonicity is
@@ -1038,7 +1047,7 @@ let quorum = CompletionConfig::builder()
             stats.items()[i].status == Some(BatchItemStatus::Succeeded)
         };
         if ok(0) || (ok(1) && ok(2)) {
-            CompletionDecision::Complete(CompletionOutcome::Succeeded)
+            CompletionDecision::complete(CompletionOutcome::Succeeded)
         } else {
             CompletionDecision::Continue
         }
@@ -1049,9 +1058,10 @@ let quorum = CompletionConfig::builder()
 `MapBuilder` and `ParallelBuilder` also expose `.await_batch()`:
 await it instead of the builder to get a `BatchResult<O>` that reports each
 item's status and why the batch ended. `BatchResult::status()` returns a
-`BatchStatus` enum, and `BatchResult::errors()` returns `BatchError` entries
-that tie each failure to the index and name of the item that produced it,
-along with the error's type identifier and message.
+`BatchStatus` enum, and `BatchResult::errors()` iterates over `BatchError`
+entries that tie each failure to the index and name of the item that
+produced it, along with the error's type identifier and message.
+`BatchResult::results()` iterates over the succeeded values.
 `succeeded()`, `failed()` and `started()` iterate the items with that
 status in input order, and `started_count()` counts the `Started` ones.
 `into_result()` returns the first failed item's error, or the batch

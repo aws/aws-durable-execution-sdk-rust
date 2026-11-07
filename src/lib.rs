@@ -348,23 +348,43 @@ where
 /// use aws_durable_execution_sdk::RetryDecision;
 /// use std::time::Duration;
 ///
-/// let retry = RetryDecision::Retry {
-///     delay: Duration::from_secs(1),
-/// };
+/// let retry = RetryDecision::retry(Duration::from_secs(1));
 /// let stop = RetryDecision::Stop;
 /// # drop(retry);
 /// # drop(stop);
+/// ```
+///
+/// The enum and its `Retry` variant are `#[non_exhaustive]`. Build a retry
+/// with [`RetryDecision::retry`], and match it with `..`, as in
+/// `RetryDecision::Retry { delay, .. }`. A caller cannot build the variant
+/// with struct syntax:
+///
+/// ```rust,compile_fail
+/// use std::time::Duration;
+/// use aws_durable_execution_sdk::RetryDecision;
+///
+/// let _ = RetryDecision::Retry { delay: Duration::from_secs(1) };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RetryDecision {
     /// Retry after the specified delay.
+    #[non_exhaustive]
     Retry {
         /// Duration to wait before retrying.
         delay: Duration,
     },
     /// Do not retry; propagate the error.
     Stop,
+}
+
+impl RetryDecision {
+    /// A [`Retry`](Self::Retry) decision that waits `delay` before the next
+    /// attempt.
+    #[must_use]
+    pub fn retry(delay: Duration) -> Self {
+        Self::Retry { delay }
+    }
 }
 
 /// A boxed retry strategy that decides whether to retry a failed step.
@@ -2088,6 +2108,15 @@ mod tests {
     use std::future::IntoFuture;
 
     use super::*;
+
+    /// `RetryDecision::retry` builds the `Retry` variant with the delay.
+    #[test]
+    fn retry_decision_constructor_builds_retry() {
+        assert!(matches!(
+            RetryDecision::retry(Duration::from_secs(3)),
+            RetryDecision::Retry { delay } if delay == Duration::from_secs(3)
+        ));
+    }
 
     #[test]
     fn due_at_from_inline_timestamps() {

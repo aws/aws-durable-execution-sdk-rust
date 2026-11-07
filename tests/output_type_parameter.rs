@@ -102,9 +102,7 @@ async fn wait_for_callback_submitter_retries() {
                             if attempt >= 2 {
                                 RetryDecision::Stop
                             } else {
-                                RetryDecision::Retry {
-                                    delay: Duration::from_secs(1),
-                                }
+                                RetryDecision::retry(Duration::from_secs(1))
                             }
                         })
                         .await?;
