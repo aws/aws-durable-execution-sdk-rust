@@ -719,7 +719,7 @@ fn capture() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
         .json()
         .flatten_event(true)
         .with_writer(move || writer.clone());
-    let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+    let guard = test_tracing::install_test_subscriber(tracing_subscriber::registry().with(layer));
     (buffer, guard)
 }
 

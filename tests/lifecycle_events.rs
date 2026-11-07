@@ -51,7 +51,7 @@ fn capture_subscriber() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGua
         .with_current_span(true)
         .with_writer(CaptureWriter(Arc::clone(&buffer)));
     let subscriber = tracing_subscriber::registry().with(fmt_layer);
-    let guard = tracing::subscriber::set_default(subscriber);
+    let guard = test_tracing::install_test_subscriber(subscriber);
     (buffer, guard)
 }
 

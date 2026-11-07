@@ -4175,7 +4175,8 @@ pub(crate) mod test_support {
             .json()
             .flatten_event(true)
             .with_writer(move || writer.clone());
-        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        let guard =
+            test_tracing::install_test_subscriber(tracing_subscriber::registry().with(layer));
         (buffer, guard)
     }
 
@@ -4504,7 +4505,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt as _;
         for _attempt in 0..5 {
             let slot: Slot = Arc::default();
-            let _guard = tracing::subscriber::set_default(
+            let _guard = test_tracing::install_test_subscriber(
                 tracing_subscriber::registry().with(Calling(Arc::clone(&slot))),
             );
             let (service, event) = test_support::service_configured(
@@ -6728,7 +6729,10 @@ mod tests {
         let events = Arc::new(AtomicUsize::new(0));
         let plugins = test_support::plugins_of(UfPlugin::after_next(wrap_boom));
         let subscriber = tracing_subscriber::registry().with(Panicking(Arc::clone(&events)));
-        let result = tracing::subscriber::with_default(subscriber, || run_step_once(&plugins));
+        let result = {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
+            run_step_once(&plugins)
+        };
         assert_eq!(result, Some(7));
         assert!(
             events.load(Ordering::SeqCst) >= 1,

@@ -56,9 +56,10 @@ fn replay_filter_composes_with_the_runtime_reexport() {
             .with_filter(durable::ReplayFilterLayer::new()),
     );
 
-    tracing::subscriber::with_default(subscriber, || {
+    {
+        let _guard = test_tracing::install_test_subscriber(subscriber);
         tracing::info!("composed-record");
-    });
+    };
 
     let output = buffer.lock().map_or_else(
         |_| String::new(),

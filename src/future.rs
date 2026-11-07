@@ -1576,7 +1576,8 @@ mod tests {
     #[test]
     fn map_output_keeps_task_context_and_pending_claim() {
         let subscriber = lambda_runtime::tracing::subscriber::registry();
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime");
@@ -1673,7 +1674,7 @@ mod tests {
                     "{entered:?}; spawned: {spawned}"
                 );
             }
-        });
+        };
     }
 
     /// r7 item 5: a `parallel_mixed` future keeps the task context of its
@@ -1682,7 +1683,8 @@ mod tests {
     #[test]
     fn parallel_mixed_keeps_the_task_context_of_its_creation() {
         let subscriber = lambda_runtime::tracing::subscriber::registry();
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime");
@@ -1699,7 +1701,7 @@ mod tests {
             let plain = span.in_scope(|| ctx.step(|_| async { Ok(1_u32) }).future());
             let mapped = plain.map_output(|r| r.map(|v| v + 1));
             assert_eq!(mapped.task_context().span().id(), span.id());
-        });
+        };
     }
 
     /// Tokio may give a new task the ID of a task that exited, and the

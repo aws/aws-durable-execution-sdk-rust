@@ -6,8 +6,19 @@
 # decision: production code carries exactly one `#[expect]`, on the private
 # `raw` module in src/task.rs that the gateway functions call, and tests
 # that deliberately simulate foreign tasks carry their own with a reason.
+#
+# A thread-default tracing capture that a test installs directly can miss an
+# event: `tracing-core` caches one interest per callsite for the process, and
+# a callsite that a thread without a default reaches first can cache
+# `Interest::never()`. `test_tracing::install_test_subscriber`, which keeps
+# every cached interest undecided, is the one exception to the four tracing
+# entries below.
 disallowed-methods = [
     { path = "tokio::task::spawn", reason = "a raw tokio::spawn bypasses the task gateway; start the task through src/task.rs" },
     { path = "tokio::task::JoinSet::spawn", reason = "a raw JoinSet::spawn bypasses the task gateway; use TrackedJoinSet from src/task.rs" },
     { path = "tokio::task::spawn_blocking", reason = "a raw spawn_blocking bypasses the task gateway; use run_blocking from src/task.rs" },
+    { path = "tracing::subscriber::set_default", reason = "a test capture installed directly can miss events whose callsite another thread reached first; use test_tracing::install_test_subscriber" },
+    { path = "tracing::subscriber::with_default", reason = "a test capture installed directly can miss events whose callsite another thread reached first; hold the guard of test_tracing::install_test_subscriber in a scope" },
+    { path = "tracing::dispatcher::set_default", reason = "a test capture installed directly can miss events whose callsite another thread reached first; use test_tracing::install_test_subscriber" },
+    { path = "tracing::dispatcher::with_default", reason = "a test capture installed directly can miss events whose callsite another thread reached first; hold the guard of test_tracing::install_test_subscriber in a scope" },
 ]

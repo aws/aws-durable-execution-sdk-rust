@@ -1245,7 +1245,7 @@ pub(crate) mod test_support {
             use tracing_subscriber::layer::SubscriberExt as _;
             let capture = Self::default();
             let subscriber = tracing_subscriber::registry().with(capture.clone());
-            (capture, tracing::subscriber::set_default(subscriber))
+            (capture, test_tracing::install_test_subscriber(subscriber))
         }
 
         /// The messages of the events at `level`, in emission order.
@@ -1458,6 +1458,24 @@ mod tests {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// A capture receives an event whose callsite a thread without a default
+    /// subscriber reached first. Without the dispatchers that the
+    /// `test-tracing` initializer keeps, that first use caches
+    /// `Interest::never()`, and the capture misses the second event.
+    #[test]
+    fn capture_sees_callsite_first_reached_without_thread_default() {
+        fn probe() {
+            tracing::info!("capture-probe");
+        }
+        let (capture, _guard) = test_support::EventMessages::install();
+        std::thread::spawn(probe)
+            .join()
+            .expect("the probe thread does not panic");
+        assert_eq!(capture.at(tracing::Level::INFO), Vec::<String>::new());
+        probe();
+        assert_eq!(capture.at(tracing::Level::INFO), ["capture-probe"]);
     }
 
     /// A root context whose checkpoint calls carry nothing back, so a wait
@@ -7085,8 +7103,9 @@ mod withdrawal_tests {
     async fn tokenless_warns_once_with_fields() {
         use tracing_subscriber::layer::SubscriberExt as _;
         let layer = FieldsLayer::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(layer.clone()));
+        let _guard = test_tracing::install_test_subscriber(
+            tracing_subscriber::registry().with(layer.clone()),
+        );
         let client = WithdrawingClient::tokenless_at(1);
         let factory = RecordingFactory::default();
         let response = run(&client, false, &factory, |_event, ctx| async move {

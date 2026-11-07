@@ -285,11 +285,12 @@ async fn span_subscriber_panic_caught_by_gateway() {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     for at in [SpanCallback::Enter, SpanCallback::Exit] {
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(PanicsInSpan {
+        let _guard = test_tracing::install_test_subscriber(tracing_subscriber::registry().with(
+            PanicsInSpan {
                 at,
                 armed: std::sync::atomic::AtomicBool::new(true),
-            }));
+            },
+        ));
         #[expect(clippy::disallowed_methods)]
         // reason: the test observes the panic the run resumes, which only a
         // task's JoinHandle reports.
@@ -615,7 +616,7 @@ async fn span_entered_on_poll_and_on_drop() {
 
     let names = ScopeNames::default();
     let _guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(names.clone()));
+        test_tracing::install_test_subscriber(tracing_subscriber::registry().with(names.clone()));
     let runner = LocalRunner::new();
     let run = runner.run(
         |_event: (), ctx: DurableContext| async move {
@@ -827,7 +828,7 @@ async fn a_future_step_runs_inside_the_span_of_its_creation() {
 
     let names = ScopeNames::default();
     let _guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(names.clone()));
+        test_tracing::install_test_subscriber(tracing_subscriber::registry().with(names.clone()));
     let result = LocalRunner::new()
         .run(
             |_event: (), ctx: DurableContext| async move {
@@ -1141,7 +1142,7 @@ async fn a_start_hook_runs_outside_the_step_span_and_the_body_inside_it() {
 
     let names = ScopeNames::default();
     let _guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(names.clone()));
+        test_tracing::install_test_subscriber(tracing_subscriber::registry().with(names.clone()));
     let (result, _lines) = run_rec(|_event: (), ctx: DurableContext| async move {
         Ok(ctx
             .step(|_| async {
@@ -1621,7 +1622,7 @@ async fn run_spawned_step(
 
     let names = ScopeNames::default();
     let _guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(names.clone()));
+        test_tracing::install_test_subscriber(tracing_subscriber::registry().with(names.clone()));
     let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let body_log = std::sync::Arc::clone(&log);
     let result = LocalRunner::new()
@@ -1816,7 +1817,7 @@ async fn run_cross_child(
 
     let names = ScopeNames::default();
     let _guard =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(names.clone()));
+        test_tracing::install_test_subscriber(tracing_subscriber::registry().with(names.clone()));
     let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let body_log = std::sync::Arc::clone(&log);
     let result = LocalRunner::new()

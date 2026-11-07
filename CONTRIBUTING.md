@@ -87,9 +87,9 @@ targets after a failure:
 | Command | Rejects |
 | --- | --- |
 | `cargo fmt --check` | any file whose formatting differs from rustfmt's default output |
-| `cargo clippy --all-targets --all-features -- -D warnings` | every clippy warning, including the `pedantic` and `cargo` groups, across the library and its tests |
-| `cargo test` | a failing unit test or doctest in the default feature set |
-| `cargo test --all-features` | a failing test behind a feature gate (`test-util`), including the integration tests those features unlock |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | every clippy warning, including the `pedantic` and `cargo` groups, across the library, the `test-tracing` test-support crate and their tests |
+| `cargo test --workspace` | a failing unit test or doctest in the default feature set, in the library or the `test-tracing` crate |
+| `cargo test --workspace --all-features` | a failing test behind a feature gate (`test-util`), including the integration tests those features unlock |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` | a broken intra-doc link or malformed rustdoc markup anywhere in the documented surface, including feature-gated items |
 | `sh scripts/check-msrv-consistency.sh` | a `rust-version` declaration (in any manifest, the `msrv` CI job, or the README) that disagrees with the root `Cargo.toml`'s |
 | `cargo deny --all-features check` | a dependency license outside the allowlist, a crate carrying an unpatched RustSec advisory, or an unrecognized registry source, in the graph with every feature enabled |

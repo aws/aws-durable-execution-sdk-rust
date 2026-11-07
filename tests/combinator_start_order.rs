@@ -341,7 +341,7 @@ async fn final_record_replay_starts_no_input() {
                 .flatten_event(true)
                 .with_writer(CaptureWriter(Arc::clone(&buffer))),
         );
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = test_tracing::install_test_subscriber(subscriber);
         let runs = Runs::default();
         let hooks = StartHooks::default();
         let result = run_local(&hooks, steps_handler(combinator, &runs, fail_b)).await;

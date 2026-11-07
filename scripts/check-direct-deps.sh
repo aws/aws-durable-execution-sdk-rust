@@ -88,9 +88,10 @@ check_graph() {
                 *"(/"*")"*)
                     # This is a workspace member line: extract name (first field).
                     current_member=$(echo "$line" | awk '{print $1}')
-                    # Skip the conformance crate: it is test infrastructure, not production.
+                    # Skip the conformance and test-tracing crates: they are
+                    # test infrastructure, not production.
                     case "$current_member" in
-                        conformance) current_member=""; continue ;;
+                        conformance|test-tracing) current_member=""; continue ;;
                     esac
                     continue
                     ;;

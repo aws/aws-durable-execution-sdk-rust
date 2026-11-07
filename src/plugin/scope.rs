@@ -1228,7 +1228,8 @@ mod tests {
             calls: Arc::clone(&calls),
             seen: Arc::clone(&seen),
         };
-        let ran = tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+        let ran = {
+            let _guard = test_tracing::install_test_subscriber(tracing_subscriber::registry());
             let outer = tracing::info_span!("outer");
             let _entered = outer.enter();
             let mut run = std::pin::pin!(run_user_function(
@@ -1249,7 +1250,7 @@ mod tests {
                 unreachable!("the body fails in its first poll");
             };
             ran
-        });
+        };
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             take(&seen),
@@ -1405,7 +1406,8 @@ mod tests {
             ..Calls::default()
         });
         let body_seen = Arc::clone(&seen);
-        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+        {
+            let _guard = test_tracing::install_test_subscriber(tracing_subscriber::registry());
             let outer = tracing::info_span!("outer");
             let _entered = outer.enter();
             let mut run = std::pin::pin!(run_user_function(
@@ -1421,7 +1423,7 @@ mod tests {
                 |_: &BoxError| WireError::new(None::<String>, None::<String>),
             ));
             assert!(futures_poll_once(run.as_mut()).is_ready());
-        });
+        };
         assert_eq!(
             take(&seen),
             [
@@ -2095,9 +2097,10 @@ mod tests {
         let plugins = plugins(&[("p0", Mode::PanicAfter), ("p1", Mode::Normal)], &log);
         let mut run = std::pin::pin!(step_runner(&plugins, || PanicsWhenPolled("A")));
         let subscriber = lambda_runtime::tracing::subscriber::registry().with(PanickingLayer);
-        let caught = tracing::subscriber::with_default(subscriber, || {
+        let caught = {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             catch_unwind(AssertUnwindSafe(|| futures_poll_once(run.as_mut())))
-        });
+        };
         let payload = caught.expect_err("the body panicked");
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"A"));
         assert_eq!(
@@ -2270,7 +2273,7 @@ mod tests {
                 self.0.lock().unwrap().push(tracing::Span::current().id());
             }
         }
-        let _default = tracing::subscriber::set_default(registry());
+        let _default = test_tracing::install_test_subscriber(registry());
         let span = tracing::info_span!("creator");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let guard = OnDrop(Arc::clone(&seen));

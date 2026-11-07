@@ -48,7 +48,7 @@ async fn handler_level_log_emitted_exactly_once_across_invocations() {
         .with_writer(CaptureWriter(Arc::clone(&buffer)))
         .with_filter(ReplayFilterLayer::new());
     let subscriber = tracing_subscriber::registry().with(fmt_layer);
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let _guard = test_tracing::install_test_subscriber(subscriber);
 
     let result = LocalRunner::new()
         .run(
@@ -101,7 +101,7 @@ async fn child_context_pre_wait_logs_emitted_exactly_once() {
         .with_writer(CaptureWriter(Arc::clone(&buffer)))
         .with_filter(ReplayFilterLayer::new());
     let subscriber = tracing_subscriber::registry().with(fmt_layer);
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let _guard = test_tracing::install_test_subscriber(subscriber);
 
     let result = LocalRunner::new()
         .run(
@@ -166,7 +166,7 @@ async fn map_branch_pre_wait_logs_emitted_exactly_once() {
         .with_writer(CaptureWriter(Arc::clone(&buffer)))
         .with_filter(ReplayFilterLayer::new());
     let subscriber = tracing_subscriber::registry().with(fmt_layer);
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let _guard = test_tracing::install_test_subscriber(subscriber);
 
     let result = LocalRunner::new()
         .run(
@@ -235,7 +235,7 @@ async fn post_flat_batch_marker_emitted_exactly_once_on_terminal_replay() {
         .with_writer(CaptureWriter(Arc::clone(&buffer)))
         .with_filter(ReplayFilterLayer::new());
     let subscriber = tracing_subscriber::registry().with(fmt_layer);
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let _guard = test_tracing::install_test_subscriber(subscriber);
 
     let result = LocalRunner::new()
         .run(

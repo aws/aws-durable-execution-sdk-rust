@@ -5,7 +5,9 @@
 # SDK's release profile. They are deliberately NOT members of this workspace:
 # they pull a heavier dependency graph (aws-sdk-dynamodb) that has no business
 # in the SDK's `make check`, so they build as separate workspaces.
-members = ["."]
+# test-support/test-tracing is a private dev-only crate that installs the
+# SDK's test tracing captures.
+members = [".", "test-support/test-tracing"]
 
 [package]
 name = "aws-durable-execution-sdk"
@@ -207,6 +209,9 @@ tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
 # A CBOR result serdes in the batch record tests stores the record in a
 # binary format.
 ciborium = "0.2"
+# Installs every thread-default tracing capture in the tests, after
+# registering the dispatchers that keep callsite interest undecided.
+test-tracing = { path = "test-support/test-tracing" }
 
 [[test]]
 name = "nondeterminism"

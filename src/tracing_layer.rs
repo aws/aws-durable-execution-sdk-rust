@@ -945,8 +945,9 @@ pub(crate) mod tests {
     #[test]
     fn operation_span_has_correct_fields() {
         // Install a no-op subscriber so spans are not disabled.
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::fmt().with_test_writer().finish());
+        let _guard = test_tracing::install_test_subscriber(
+            tracing_subscriber::fmt().with_test_writer().finish(),
+        );
 
         let span = operation_span(
             "arn:aws:lambda:us-east-1:123:function:test:durable:abc",
@@ -1020,7 +1021,7 @@ pub(crate) mod tests {
             .with_span_list(false)
             .finish();
 
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = test_tracing::install_test_subscriber(subscriber);
 
         let test_arn = "arn:aws:lambda:us-east-1:123456789012:function:myFunc:durable:exec-123";
         let test_request_id = "req-abc-def-456";
@@ -1102,7 +1103,7 @@ pub(crate) mod tests {
             .with_span_list(false)
             .finish();
 
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = test_tracing::install_test_subscriber(subscriber);
 
         // Create a replay span (isReplay = true).
         let span = operation_span("arn:test", "req-1", None, "op-1", None, 1, true);
@@ -1164,7 +1165,7 @@ pub(crate) mod tests {
             .with_filter(ReplayFilterLayer::new());
 
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = test_tracing::install_test_subscriber(subscriber);
 
         // Event in a live span: should pass through.
         {
@@ -1244,7 +1245,7 @@ pub(crate) mod tests {
             .with_filter(ReplayFilterLayer::new());
 
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = test_tracing::install_test_subscriber(subscriber);
 
         // The boundary: the span starts replaying, then the next mint flips
         // it to live, and only afterwards does the final replay hit emit its
@@ -1323,7 +1324,7 @@ pub(crate) mod tests {
             .with_filter(ReplayFilterLayer::new());
 
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = test_tracing::install_test_subscriber(subscriber);
 
         // Event outside any operation span (SDK lifecycle).
         tracing::info!("sdk lifecycle event");
@@ -1384,7 +1385,7 @@ pub(crate) mod tests {
             .with_writer(writer)
             .with_filter(ReplayFilterLayer::new());
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = test_tracing::install_test_subscriber(subscriber);
 
         let span = execution_span("arn:test", "req-1", None, true);
         {
@@ -1439,7 +1440,7 @@ pub(crate) mod tests {
             .with_writer(writer)
             .with_filter(ReplayFilterLayer::new());
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = test_tracing::install_test_subscriber(subscriber);
 
         // Seed the checkpoint log with a completed wait at position "1":
         // this invocation is a resume that replays the wait.
@@ -1574,7 +1575,8 @@ pub(crate) mod tests {
     {
         use std::time::Duration;
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1597,7 +1599,7 @@ pub(crate) mod tests {
                     .expect("runner");
                 result.invocation_count()
             })
-        })
+        }
     }
 
     #[test]
@@ -1679,10 +1681,11 @@ pub(crate) mod tests {
             CaptureWriter(std::sync::Arc::clone(&buffer)),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             tracing::debug!(target: "app", "app-line");
             tracing::warn!("other-line");
-        });
+        };
 
         let output = captured(&buffer);
         assert_eq!(output.lines().count(), 1, "{output}");
@@ -1700,10 +1703,11 @@ pub(crate) mod tests {
             CaptureWriter(std::sync::Arc::clone(&buffer)),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             tracing::info!("info-line");
             tracing::warn!("warn-line");
-        });
+        };
 
         let output = captured(&buffer);
         assert_eq!(output.lines().count(), 1, "{output}");
@@ -1722,10 +1726,11 @@ pub(crate) mod tests {
             CaptureWriter(std::sync::Arc::clone(&buffer)),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             tracing::info_span!("outer").in_scope(|| tracing::debug!("inside-line"));
             tracing::debug!("outside-line");
-        });
+        };
 
         let output = captured(&buffer);
         assert_eq!(output.lines().count(), 1, "{output}");
@@ -1744,12 +1749,13 @@ pub(crate) mod tests {
             CaptureWriter(std::sync::Arc::clone(&buffer)),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             let span = tracing::info_span!("outer", flag = false);
             span.in_scope(|| tracing::debug!("before-record"));
             span.record("flag", true);
             span.in_scope(|| tracing::debug!("after-record"));
-        });
+        };
 
         let output = captured(&buffer);
         assert_eq!(output.lines().count(), 1, "{output}");
@@ -1773,7 +1779,8 @@ pub(crate) mod tests {
                 CaptureWriter(std::sync::Arc::clone(&buffer)),
             );
 
-            tracing::subscriber::with_default(subscriber, || {
+            {
+                let _guard = test_tracing::install_test_subscriber(subscriber);
                 let span = if which == "execution" {
                     execution_span("arn", "request", None, false)
                 } else {
@@ -1781,7 +1788,7 @@ pub(crate) mod tests {
                 };
                 span.in_scope(|| tracing::debug!("inside-line"));
                 tracing::debug!("outside-line");
-            });
+            };
 
             let output = captured(&buffer);
             assert_eq!(output.lines().count(), 1, "{directives}: {output}");
@@ -1828,9 +1835,10 @@ pub(crate) mod tests {
                 .with_filter(filter),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             drop(tracing::info_span!("closed"));
-        });
+        };
 
         assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -1932,10 +1940,11 @@ pub(crate) mod tests {
             CaptureWriter(std::sync::Arc::clone(&buffer)),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             tracing::info!("info-line");
             tracing::warn!("warn-line");
-        });
+        };
 
         let output = captured(&buffer);
         assert_eq!(output.lines().count(), 1, "{output}");
@@ -1952,10 +1961,11 @@ pub(crate) mod tests {
             CaptureWriter(std::sync::Arc::clone(&buffer)),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             tracing::debug!("debug-line");
             tracing::info!("info-line");
-        });
+        };
 
         let output = captured(&buffer);
         assert_eq!(output.lines().count(), 1, "{output}");
@@ -1973,9 +1983,10 @@ pub(crate) mod tests {
                 CaptureWriter(std::sync::Arc::clone(&buffer)),
             );
 
-            tracing::subscriber::with_default(subscriber, || {
+            {
+                let _guard = test_tracing::install_test_subscriber(subscriber);
                 tracing::info!("json-line");
-            });
+            };
 
             let output = captured(&buffer);
             assert_eq!(output.lines().count(), 1, "{format}: {output}");
@@ -1997,9 +2008,10 @@ pub(crate) mod tests {
             CaptureWriter(std::sync::Arc::clone(&buffer)),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             tracing::info!("text-line");
-        });
+        };
 
         let output = captured(&buffer);
         assert_eq!(output.lines().count(), 1, "{output}");
@@ -2110,7 +2122,8 @@ pub(crate) mod tests {
     {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = json_span_subscriber(&buffer);
-        let result = tracing::subscriber::with_default(subscriber, || {
+        let result = {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -2121,7 +2134,7 @@ pub(crate) mod tests {
                     .await
                     .expect("runner")
             })
-        });
+        };
         assert!(result.is_success(), "{:?}", result.error());
         (json_records(&buffer), result)
     }

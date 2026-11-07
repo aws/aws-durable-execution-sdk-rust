@@ -6597,7 +6597,7 @@ mod tests {
             .with_span_list(true)
             .with_writer(EventCaptureWriter(Arc::clone(&buffer)));
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = test_tracing::install_test_subscriber(subscriber);
         (buffer, guard)
     }
 
@@ -8071,7 +8071,8 @@ mod tests {
 
         let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = json_span_subscriber(&buffer);
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = test_tracing::install_test_subscriber(subscriber);
             let mut lambda_context = lambda_runtime::Context::default();
             lambda_context.tenant_id = tenant_id.map(str::to_owned);
             let root = DurableContext::new_root(
@@ -8082,7 +8083,7 @@ mod tests {
             root.replay_span().in_scope(|| tracing::info!("in-root"));
             let child = root.new_child("1", Some("child"));
             child.replay_span().in_scope(|| tracing::info!("in-child"));
-        });
+        };
         let records = json_records(&buffer);
         (
             spans_of(&records, "in-root"),

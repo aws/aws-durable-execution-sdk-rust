@@ -44,9 +44,9 @@ pins:
 check-sdk:
 	. scripts/tools.sh && require cargo rustfmt clippy
 	cargo fmt --check
-	cargo clippy --all-targets --all-features -- -D warnings
-	cargo test
-	cargo test --all-features
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo test --workspace
+	cargo test --workspace --all-features
 	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features
 	sh scripts/check-msrv-consistency.sh
 
