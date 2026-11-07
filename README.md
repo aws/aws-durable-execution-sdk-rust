@@ -14,7 +14,8 @@ without re-running the body.
 > may change without notice, and the final version may look different from
 > what you see today.
 
-The SDK requires Rust 1.94.1 or newer and edition 2024.
+The SDK requires Rust 1.94.1 or newer. The SDK crate uses edition 2024, but
+a crate that depends on it can use edition 2018 or later.
 
 ```toml
 [dependencies]
@@ -119,9 +120,10 @@ sam deploy --template-file template.yaml \
     --parameter-overrides ExecutionRoleArn=arn:aws:iam::111122223333:role/durable-lambda-role
 ```
 
-Invoking a durable function starts an execution and returns immediately with
-its ARN. The invocation response does not carry the handler's return value,
-because the execution outlives that first invocation.
+By default, `aws lambda invoke` invokes synchronously. Lambda keeps the
+invocation open until the durable execution completes, or until the shortest
+of the function timeout, execution timeout, and 15 minutes. A client can time
+out sooner.
 
 ```sh
 aws lambda invoke --function-name first-durable-function \
@@ -129,10 +131,25 @@ aws lambda invoke --function-name first-durable-function \
     --cli-binary-format raw-in-base64-out response.json
 ```
 
-The CLI writes the handler payload to `response.json` and prints the invoke
-metadata to stdout. Take `DurableExecutionArn` from that metadata and poll the
-execution until it leaves `RUNNING`. It reaches `SUCCEEDED` a couple of seconds
-after the timer fires, with `"hello, world"` as its result.
+For this execution, the CLI writes the execution result, `"hello, world"`, to
+`response.json` and prints invoke metadata that includes `StatusCode` 200 and
+`DurableExecutionArn`.
+
+Invoke asynchronously with `--invocation-type Event` when the client should
+return without waiting for the execution to finish:
+
+```sh
+aws lambda invoke --function-name first-durable-function \
+    --qualifier '$LATEST' --invocation-type Event \
+    --payload '{}' \
+    --cli-binary-format raw-in-base64-out response.json
+```
+
+The `Event` invocation leaves `response.json` empty and prints invoke metadata
+that includes `StatusCode` 202 and `DurableExecutionArn`. Take that ARN from
+the metadata and poll the execution until it leaves `RUNNING`. It reaches
+`SUCCEEDED` a couple of seconds after the timer fires, with `"hello, world"` as
+its result.
 
 ```sh
 aws lambda get-durable-execution \
@@ -156,8 +173,11 @@ async fn handler(
 per invocation. The event type needs `Deserialize` and the output type needs
 `Serialize`; both are yours to choose. `BoxError` is
 `Box<dyn Error + Send + Sync>`, so `?` accepts any error type without a
-conversion. Use `durable::wrap` instead of `durable::run` when you want to
-supply `Options` or add your own middleware around the service function.
+conversion.
+Use `durable::run_with_options(handler, options)` to start the Lambda runtime
+with the supplied `Options`. Use `durable::wrap(handler, options)` to obtain
+the service function without starting the runtime, for example when you need
+to register it with `lambda_runtime` behind middleware.
 
 Checkpoint writes from concurrent operations batch into fewer requests by
 default, and `Options::builder().checkpoint_batching(false)` sends each one
@@ -426,7 +446,7 @@ let transport = MeteredTransport::new(durable::LambdaExecutionClient::new(client
 let options = durable::Options::builder()
     .execution_client(std::sync::Arc::new(transport))
     .build()?;
-durable::wrap(handler, options);
+durable::run_with_options(handler, options).await
 ```
 
 ## Operations
