@@ -87,6 +87,8 @@ async fn plain_target_typed_error_reaches_caller() {
                 let wire = err.wire();
                 Ok::<_, BoxError>((
                     wire.and_then(WireError::error_type).map(ToOwned::to_owned),
+                    wire.and_then(WireError::error_message)
+                        .map(ToOwned::to_owned),
                     wire.and_then(WireError::error_data).map(ToOwned::to_owned),
                 ))
             },
@@ -99,6 +101,7 @@ async fn plain_target_typed_error_reaches_caller() {
         result.output(),
         Some(&(
             Some("PaymentError".to_owned()),
+            Some("declined".to_owned()),
             Some("{\"code\":7}".to_owned())
         )),
         "{:?}",
@@ -107,6 +110,7 @@ async fn plain_target_typed_error_reaches_caller() {
     let invoke = invoke_record(&result);
     assert_eq!(invoke.status(), durable::OperationStatus::Failed);
     assert_eq!(invoke.error_type(), Some("PaymentError"));
+    assert_eq!(invoke.error_message(), Some("declined"));
 }
 
 /// A durable target steps and waits as its own execution, and its result

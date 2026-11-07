@@ -13,7 +13,8 @@
 //! the alternate form `{:#}`, which walks the source chain from that layer
 //! down. The message recorded on the wire is the message of the operation
 //! failure that the error propagates, when it propagates one, and is
-//! otherwise built from that same single flattening site (see
+//! otherwise the chain's frames joined with `": "`, without the frame of a
+//! [`TypedError`], whose type name the record carries as its type (see
 //! [`wire_message`]).
 //!
 //! # Kinds classify, `source()` carries
@@ -47,11 +48,10 @@ const CHAIN_WALK_LIMIT: usize = 11;
 /// Writes `frame` followed by every frame of `source`'s chain, separated
 /// by `": "`.
 ///
-/// This is the **single flattening site**: every alternate (`{:#}`)
-/// `Display` implementation in this module and the wire-message builder
-/// ([`wire_message`], for an error that propagates no recorded message)
-/// funnel through it. No other code path joins an error's chain into one
-/// string.
+/// This is the full-chain renderer: every alternate (`{:#}`) `Display`
+/// implementation in this module funnels through it, and it writes every
+/// frame, a [`TypedError`]'s type name included. The recorded message
+/// uses [`chain_string`] instead, which omits the type names.
 pub(crate) fn write_chain(
     f: &mut fmt::Formatter<'_>,
     frame: &dyn fmt::Display,
@@ -65,23 +65,27 @@ pub(crate) fn write_chain(
     Ok(())
 }
 
-/// Flattens an error's chain into one string via [`write_chain`].
+/// Flattens an error's chain into one line for a recorded message: the
+/// `Display` frame of every error in the chain, in source order, joined
+/// with `": "`, except the frame of each [`TypedError`].
+///
+/// A `TypedError`'s frame is its type name, which the record carries as
+/// its `ErrorType`, so the message holds the wrapped error's text alone,
+/// as JS records an error's `name` and `message` in separate fields.
+/// `TypedError::with_type("PaymentError", "declined")` flattens to
+/// `declined`. A `TypedError` always has a source, so the last frame of
+/// a chain is never a `TypedError`'s and the result names every other
+/// error.
 pub(crate) fn chain_string(err: &(dyn Error + 'static)) -> String {
-    struct Chain<'a>(&'a (dyn Error + 'static));
-    impl fmt::Display for Chain<'_> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write_chain(f, &FrameOnly(self.0), self.0.source())
+    let mut frames = Vec::new();
+    let mut link = Some(err);
+    while let Some(e) = link {
+        if !e.is::<TypedError>() {
+            frames.push(e.to_string());
         }
+        link = e.source();
     }
-    /// Adapter printing only the error's own `Display` (non-alternate),
-    /// so foreign errors are not double-walked.
-    struct FrameOnly<'a>(&'a (dyn Error + 'static));
-    impl fmt::Display for FrameOnly<'_> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", self.0)
-        }
-    }
-    Chain(err).to_string()
+    frames.join(": ")
 }
 
 /// The failure fields of a wire `ErrorObject`, as a named record.
@@ -135,7 +139,10 @@ impl WireError {
     ///
     /// A failure that propagates another operation's failure records that
     /// operation's message. Any other failure records its error's chain,
-    /// flattened into one line.
+    /// flattened into one line. Neither includes the name of a
+    /// [`TypedError`], which the record carries as its type: a failure
+    /// with `TypedError::with_type("PaymentError", "declined")` records the
+    /// message `declined`.
     pub fn error_message(&self) -> Option<&str> {
         self.error_message.as_deref()
     }
@@ -333,8 +340,15 @@ impl Error for ContextualError {
 /// The wrapper is one chain layer: its `Display` frame is the recorded
 /// type name, and its [`source()`](std::error::Error::source) is the
 /// wrapped error itself, so the concrete error stays reachable through
-/// the ordinary `source()` downcast walk, and a flattened chain reads
-/// `"TransientError: temporary failure"`.
+/// the ordinary `source()` downcast walk, and the alternate form `{:#}`
+/// reads `"TransientError: temporary failure"`.
+///
+/// The recorded message never includes the type name, because the record
+/// carries it as its type, as JS records an error's `name` and `message`
+/// apart. A failure with `TypedError::with_type("PaymentError", "declined")`
+/// records the type `PaymentError` and the message `declined`. When the
+/// wrapped error propagates another operation's failure, the message is
+/// that failure's recorded message.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct TypedError {
@@ -436,7 +450,8 @@ fn short_type_name(full: &str) -> String {
 ///
 /// - `error_message` is the error's recorded message ([`wire_message`]):
 ///   the message of the first operation record its chain reaches through
-///   the SDK's propagation carriers, else its flattened source chain
+///   the SDK's propagation carriers and [`TypedError`]s, else its
+///   flattened source chain without the frames of [`TypedError`]s
 ///   ([`chain_string`]).
 /// - `error_type` is taken from structured identity when the error *is*
 ///   one: an [`OperationError`] re-records its attached wire record's
@@ -536,16 +551,18 @@ pub(crate) fn wire_error_with_type(err: &(dyn Error + 'static), error_type: &str
 /// An error that propagates another operation's failure records that
 /// failure's recorded message, as JS does: the walk follows `source()`
 /// through the SDK's propagation carriers ([`OperationError`] without a
-/// record, the per-operation error structs, [`ChildFnError`] and
-/// [`ContextualError`]) and returns the message of the first record it
-/// reaches, an [`OperationError`] with a record or a [`ReplayedFailure`].
-/// It examines at most [`CHAIN_WALK_LIMIT`] errors, counting `err`.
+/// record, the per-operation error structs, [`ChildFnError`],
+/// [`ContextualError`] and [`TypedError`]) and returns the message of the
+/// first record it reaches, an [`OperationError`] with a record or a
+/// [`ReplayedFailure`], verbatim. It examines at most
+/// [`CHAIN_WALK_LIMIT`] errors, counting `err`, and each [`TypedError`]
+/// is one of them.
 ///
-/// Every other case returns the flattened chain ([`chain_string`]): a
-/// record without a message, any other error on the way (a
-/// [`TypedError`], a serde error or a user wrapper, whose text the
-/// message keeps), a carrier without a source, and a record past the
-/// limit.
+/// Every other case returns the flattened chain of `err`
+/// ([`chain_string`]), which omits each [`TypedError`]'s type name: a
+/// record without a message, which ends the walk, any other error on the
+/// way (a serde error or a user wrapper, whose text the message keeps), a
+/// carrier without a source, and a record past the limit.
 pub(crate) fn wire_message(err: &(dyn Error + 'static)) -> String {
     let mut link = err;
     for _ in 0..CHAIN_WALK_LIMIT {
@@ -579,6 +596,7 @@ fn is_propagation_carrier(err: &(dyn Error + 'static)) -> bool {
         || err.is::<CombinatorError>()
         || err.is::<ChildFnError>()
         || err.is::<ContextualError>()
+        || err.is::<TypedError>()
 }
 
 /// The error type of the fault that a retryable checkpoint failure records.
@@ -2560,7 +2578,7 @@ mod tests {
         // The wire record derives the user's type from the wrapper...
         let wire = wire_error_for(&err, "Error");
         assert_eq!(wire.error_type(), Some("UserBoom"));
-        assert_eq!(wire.error_message(), Some("UserBoom: user boom: typed"));
+        assert_eq!(wire.error_message(), Some("user boom: typed"));
 
         // ...including through intermediate carriers (a child boundary).
         let child =
@@ -2575,7 +2593,9 @@ mod tests {
         // The wrapped error is the next chain link: downcast reaches it.
         let source = Error::source(&err).expect("wraps the error");
         assert!(source.downcast_ref::<UserBoom>().is_some());
-        // The chain names the type once, then the error's own frame.
+        // `Display` writes the type name alone, and the alternate form
+        // names the type once, then the error's own frame.
+        assert_eq!(err.to_string(), "TransientError");
         assert_eq!(format!("{err:#}"), "TransientError: user boom: x");
     }
 
@@ -2740,13 +2760,12 @@ mod tests {
         let sourceless = StepError::new(StepErrorKind::ExecutionFailed, None);
         assert_eq!(wire_message(&sourceless), "execution failed");
 
+        // A `TypedError` is a carrier too: the walk passes through it.
+        let typed = TypedError::with_type("OuterType", recorded_step());
+        assert_eq!(wire_message(&typed), "inner");
+
         // Any other error stops the walk, and the message is the
         // flattened chain.
-        let typed = TypedError::with_type("OuterType", recorded_step());
-        assert_eq!(
-            wire_message(&typed),
-            format!("OuterType: {RECORDED_STEP_CHAIN}")
-        );
         let wrapper = Wrapper(boxed());
         assert_eq!(
             wire_message(&wrapper),
@@ -2789,6 +2808,125 @@ mod tests {
         assert_ne!(wire_message(&*past_the_limit), "inner");
     }
 
+    /// A `TypedError` is one examined link of the recorded-message walk:
+    /// nine contextual layers and a `TypedError` reach the record at the
+    /// eleventh link, and ten layers and a `TypedError` do not.
+    #[test]
+    fn wire_message_counts_a_typed_error_as_one_link() {
+        let typed_over = |layers: usize| -> Source {
+            let typed: Source = Box::new(TypedError::with_type("T", recorded_step()));
+            (0..layers).fold(typed, |source, _| {
+                ContextualError::source_from("ctx", source)
+            })
+        };
+        assert_eq!(wire_message(&*typed_over(9)), "inner");
+        assert_eq!(
+            wire_message(&*typed_over(10)),
+            "ctx: ctx: ctx: ctx: ctx: ctx: ctx: ctx: ctx: ctx: \
+             operation error: step: execution failed: inner"
+        );
+    }
+
+    /// A `TypedError` around a record without a message: the walk stops
+    /// at that record and the message is the original error's flattened
+    /// chain, without the type name.
+    #[test]
+    fn wire_message_typed_record_without_message_flattens_the_chain() {
+        let typed = TypedError::with_type(
+            "Typed",
+            recorded_step_error(WireError::new(Some("RecordType"), None::<String>)),
+        );
+        assert_eq!(
+            wire_message(&typed),
+            "operation error: step: execution failed: RecordType"
+        );
+        let empty = TypedError::with_type(
+            "Typed",
+            recorded_step_error(WireError::new(Some("RecordType"), Some(""))),
+        );
+        assert_eq!(wire_message(&empty), "");
+    }
+
+    /// A test error with one frame and an optional source.
+    #[derive(Debug)]
+    struct Frame(&'static str, Option<Source>);
+    impl fmt::Display for Frame {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+    impl Error for Frame {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.1.as_deref().map(|s| s as &(dyn Error + 'static))
+        }
+    }
+
+    #[derive(Debug)]
+    struct PaymentDeclined;
+    impl fmt::Display for PaymentDeclined {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "payment declined")
+        }
+    }
+    impl Error for PaymentDeclined {}
+
+    /// Each row of the issue's table: the recorded type and message of a
+    /// `TypedError` chain, and its flattened chain without type names.
+    #[test]
+    fn chain_string_omits_typed_error_frames() {
+        let failed_step = || recorded_step_error(WireError::new(Some("StepType"), Some("boom")));
+        let rows: Vec<(Box<dyn Error + 'static>, &str, &str, &str)> = vec![
+            (
+                Box::new(TypedError::with_type("PaymentError", "declined")),
+                "PaymentError",
+                "declined",
+                "declined",
+            ),
+            (
+                Box::new(TypedError::new(PaymentDeclined)),
+                "PaymentDeclined",
+                "payment declined",
+                "payment declined",
+            ),
+            (
+                Box::new(TypedError::with_type("PaymentError", failed_step())),
+                "PaymentError",
+                "boom",
+                "operation error: step: execution failed: boom",
+            ),
+            (
+                Box::new(Frame(
+                    "charging",
+                    Some(Box::new(TypedError::with_type("PaymentError", "declined"))),
+                )),
+                "PaymentError",
+                "charging: declined",
+                "charging: declined",
+            ),
+            (
+                Box::new(TypedError::with_type("A", TypedError::with_type("B", "x"))),
+                "A",
+                "x",
+                "x",
+            ),
+            (
+                Box::new(TypedError::with_type(
+                    "Typed",
+                    Frame("a", Some(Box::new(Frame("b", None)))),
+                )),
+                "Typed",
+                "a: b",
+                "a: b",
+            ),
+        ];
+        for (err, error_type, message, chain) in &rows {
+            let wire = wire_error_for(&**err, "Error");
+            assert_eq!(wire.error_type(), Some(*error_type), "{err:#}");
+            assert_eq!(wire.error_message(), Some(*message), "{err:#}");
+            assert_eq!(chain_string(&**err), *chain, "{err:#}");
+        }
+    }
+
     #[test]
     fn wire_message_preserves_non_message_fields() {
         let inner_wire = || {
@@ -2813,6 +2951,24 @@ mod tests {
         assert_eq!(wire.error_type(), Some("SerializationError"));
         assert_eq!(wire.error_message(), Some("inner"));
         assert_eq!(wire.error_data(), Some("inner-data"));
+        assert_eq!(wire.stack_trace(), ["inner-frame"]);
+
+        // A `TypedError` names the type, and the record below it still
+        // supplies the message, data and stack.
+        let typed = TypedError::with_type("Typed", recorded_step_error(inner_wire()));
+        let wire = wire_error_for(&typed, "Error");
+        assert_eq!(wire.error_type(), Some("Typed"));
+        assert_eq!(wire.error_message(), Some("inner"));
+        assert_eq!(wire.error_data(), Some("inner-data"));
+        assert_eq!(wire.stack_trace(), ["inner-frame"]);
+
+        // Its own data wins over the record's.
+        let typed = TypedError::with_type("Typed", recorded_step_error(inner_wire()))
+            .with_error_data("typed-data");
+        let wire = wire_error_for(&typed, "Error");
+        assert_eq!(wire.error_type(), Some("Typed"));
+        assert_eq!(wire.error_message(), Some("inner"));
+        assert_eq!(wire.error_data(), Some("typed-data"));
         assert_eq!(wire.stack_trace(), ["inner-frame"]);
     }
 }

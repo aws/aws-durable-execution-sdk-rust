@@ -740,11 +740,12 @@ async fn step_failure_in_a_branch_records_the_step_type() {
     assert!(result.is_success(), "the execution succeeds: {result}");
     let fail = op(&result, "pay").error().expect("the branch records FAIL");
     assert_eq!(fail.error_type(), Some("PaymentError"));
+    assert_eq!(fail.error_message(), Some("declined"));
     let seen = entries(&seen);
     assert_eq!(seen.len(), 2, "two invocations ran");
     for wire in &seen {
         assert_eq!(wire.error_type(), Some("PaymentError"));
-        assert_eq!(wire.error_message(), fail.error_message());
+        assert_eq!(wire.error_message(), Some("declined"));
     }
 }
 
@@ -818,11 +819,12 @@ async fn failed_handle_carries_recorded_failure() {
     assert!(result.is_success(), "the execution succeeds: {result}");
     let fail = op(&result, "pay").error().expect("the branch records FAIL");
     assert_eq!(fail.error_type(), Some("PaymentError"));
+    assert_eq!(fail.error_message(), Some("declined"));
     let seen = entries(&seen);
     assert_eq!(seen.len(), 2, "two invocations ran");
     for wire in &seen {
         assert_eq!(wire.error_type(), Some("PaymentError"));
-        assert_eq!(wire.error_message(), fail.error_message());
+        assert_eq!(wire.error_message(), Some("declined"));
         assert_eq!(wire.error_data(), Some(r#"{"code":42}"#));
         assert_eq!(wire.error_data(), fail.error_data());
         assert_eq!(wire.stack_trace(), fail.stack_trace());

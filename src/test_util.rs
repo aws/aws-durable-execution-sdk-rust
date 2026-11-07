@@ -7980,9 +7980,19 @@ mod tests {
 
     #[tokio::test]
     async fn wfcb_submitter_failure_same_kind_live_and_replay() {
-        for (submitter, text) in [
-            (Submitter::FailsUntyped, "submission failed"),
-            (Submitter::FailsTyped, "declined"),
+        // The recorded message omits a `TypedError`'s name; the live
+        // source's alternate `Display` keeps it.
+        for (submitter, text, live_text) in [
+            (
+                Submitter::FailsUntyped,
+                "submission failed",
+                "operation error: step: execution failed: submission failed",
+            ),
+            (
+                Submitter::FailsTyped,
+                "declined",
+                "operation error: step: execution failed: PaymentError: declined",
+            ),
         ] {
             let run = run_wfcb_classification(
                 LocalRunner::new(),
@@ -8004,11 +8014,11 @@ mod tests {
                 .operation("approve")
                 .and_then(TestOperation::error_message)
                 .unwrap_or_default();
-            assert!(message.contains(text), "{message}");
+            assert_eq!(message, text);
             let live = run
                 .live_step_source
                 .expect("the live source is the step error");
-            assert!(live.contains(text), "{live}");
+            assert_eq!(live, live_text);
         }
     }
 
@@ -12969,7 +12979,7 @@ mod tests {
                         .invoke::<(), _>("pay", ())
                         .await
                         .expect_err("the invoke fails");
-                    Ok::<_, BoxError>(wire_type_and_message(&err).0)
+                    Ok::<_, BoxError>(wire_type_and_message(&err))
                 },
                 (),
             )
@@ -12977,13 +12987,14 @@ mod tests {
             .expect("runner");
         assert_eq!(
             result.output(),
-            Some(&Some("PaymentError".to_owned())),
+            Some(&(Some("PaymentError".to_owned()), Some("declined".to_owned()))),
             "{:?}",
             result.error_message()
         );
         let op = invoke_record(&result);
         assert_eq!(op.status(), OperationStatus::Failed);
         assert_eq!(op.error_type(), Some("PaymentError"));
+        assert_eq!(op.error_message(), Some("declined"));
     }
 
     #[tokio::test]
@@ -13222,8 +13233,7 @@ mod tests {
         );
         let op = invoke_record(&result);
         assert_eq!(op.status(), OperationStatus::Failed);
-        let message = op.error_message().unwrap_or_default();
-        assert!(message.contains("declined"), "{message}");
+        assert_eq!(op.error_message(), Some("declined"));
     }
 
     /// A durable target that waits twice, so its run needs three
@@ -13770,7 +13780,7 @@ mod tests {
             .and_then(TestOperation::error)
             .expect("the step error");
         assert_eq!(error.error_type(), Some("Bad"));
-        assert!(error.error_message().is_some_and(|m| m.contains("no")));
+        assert_eq!(error.error_message(), Some("no"));
         assert_eq!(error.error_data(), Some("{\"a\":1}"));
     }
 
@@ -13785,6 +13795,7 @@ mod tests {
             .expect("runner");
         let error = result.error().expect("the execution error");
         assert_eq!(error.error_type(), Some("Bad"));
+        assert_eq!(error.error_message(), Some("no"));
         assert_eq!(error.error_data(), Some("{\"a\":1}"));
     }
 
@@ -17126,9 +17137,10 @@ mod tests {
         serde_json::json!({ "current_attempt": current_attempt, "next_attempt_delay_seconds": delay })
     }
 
-    /// The message the SDK records for [`bad_no`]: the error chain, the
-    /// type name and then the message.
-    const BAD_NO_MESSAGE: &str = "Bad: no";
+    /// The message the SDK records for [`bad_no`]: the wrapped error's
+    /// message, without the type name, which the record carries as its
+    /// type.
+    const BAD_NO_MESSAGE: &str = "no";
 
     /// The error `Bad` / `no`.
     fn bad_no() -> BoxError {

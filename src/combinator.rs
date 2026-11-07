@@ -1255,7 +1255,8 @@ fn all_failed_wire(losers: &[crate::error::Source]) -> crate::error::WireError {
     // carries one (the normal case: a failed constituent operation
     // attaches its terminal wire record); derive one only for a wire-less
     // error (e.g. an internal join failure). A derived record keeps the
-    // loser's flattened chain as its message.
+    // loser's recorded message (see
+    // [`wire_message`](crate::error::wire_message)).
     let serialized_losers: Vec<SerializedLoser> = losers
         .iter()
         .map(|err| {
@@ -1264,13 +1265,10 @@ fn all_failed_wire(losers: &[crate::error::Source]) -> crate::error::WireError {
                 .and_then(|op| op.wire())
             {
                 Some(wire) => SerializedLoser::from_wire(wire),
-                None => SerializedLoser {
-                    message: Some(crate::error::chain_string(&**err)),
-                    ..SerializedLoser::from_wire(&crate::error::wire_error_for(
-                        &**err,
-                        COMBINATOR_ERROR_TYPE,
-                    ))
-                },
+                None => SerializedLoser::from_wire(&crate::error::wire_error_for(
+                    &**err,
+                    COMBINATOR_ERROR_TYPE,
+                )),
             }
         })
         .collect();
@@ -4847,8 +4845,41 @@ mod tests {
         );
     }
 
-    /// A wire-less loser: the outer summary takes its recorded message,
-    /// while its stored record keeps its flattened chain.
+    /// Wire-less `TypedError` losers of a `select_ok`: the summary and each
+    /// stored loser record the wrapped message without the type name, and
+    /// keep the type and data.
+    #[test]
+    fn all_failed_typed_losers_record_the_wrapped_message() {
+        let plain: crate::error::Source =
+            Box::new(crate::TypedError::with_type("PaymentError", "declined").with_error_data("d"));
+        let propagated: crate::error::Source = Box::new(crate::TypedError::with_type(
+            "PaymentError",
+            crate::error::recorded_step_error(crate::error::WireError::new(
+                Some("InnerType"),
+                Some("boom"),
+            )),
+        ));
+        let wire = all_failed_wire(&[plain, propagated]);
+        assert_eq!(
+            wire.error_message(),
+            Some("all 2 futures failed: [0] declined; [1] boom")
+        );
+        let losers: Vec<SerializedLoser> =
+            serde_json::from_str(wire.error_data().expect("the losers")).expect("loser JSON");
+        let losers: Vec<crate::error::WireError> =
+            losers.into_iter().map(SerializedLoser::into_wire).collect();
+        assert_eq!(
+            losers,
+            [
+                crate::error::WireError::new(Some("PaymentError"), Some("declined"))
+                    .with_error_data(Some("d")),
+                crate::error::WireError::new(Some("PaymentError"), Some("boom")),
+            ]
+        );
+    }
+
+    /// A wire-less loser: the outer summary and its stored record both take
+    /// its recorded message.
     #[test]
     fn all_failed_preserves_serialized_loser_message() {
         let inner = crate::error::WireError::new(Some("InnerType"), Some("a"))
@@ -4863,7 +4894,7 @@ mod tests {
         assert_eq!(
             wire.error_data(),
             Some(
-                r#"[{"error_type":"CombinatorError","message":"context: operation error: step: execution failed: a","error_data":"loser-data","stack_trace":["loser-frame"]}]"#
+                r#"[{"error_type":"CombinatorError","message":"a","error_data":"loser-data","stack_trace":["loser-frame"]}]"#
             )
         );
     }

@@ -2502,10 +2502,15 @@ mod tests {
         let live = exec.execute().await.expect_err("the step must fail");
         let recorded = recorded_fail(&client);
         assert_eq!(recorded.error_type(), Some("PaymentError"));
+        assert_eq!(recorded.error_message(), Some("declined"));
         assert_eq!(recorded.error_data(), Some(r#"{"code":42}"#));
         assert_eq!(
             live.wire().and_then(crate::error::WireError::error_data),
             Some(r#"{"code":42}"#)
+        );
+        assert_eq!(
+            live.wire().and_then(crate::error::WireError::error_message),
+            Some("declined")
         );
 
         // Replay: the recorded data is reachable through `wire()`.
@@ -2536,6 +2541,10 @@ mod tests {
         assert_eq!(
             err.wire().and_then(crate::error::WireError::error_data),
             Some(r#"{"code":42}"#)
+        );
+        assert_eq!(
+            err.wire().and_then(crate::error::WireError::error_message),
+            Some("declined")
         );
     }
 

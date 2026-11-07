@@ -581,10 +581,15 @@ failure carries the error type `StepInterruptedError`.
 A step records the error its body returns. An unwrapped error records the
 type `Error`, because Rust erases the concrete type when the error is
 boxed. Wrap the error in `TypedError` to record a type of your choice, and
-add `with_error_data` to record an opaque payload as the error data. When
+add `with_error_data` to record an opaque payload as the error data. The
+recorded message is the wrapped error's message without the type name, as
+JS records an error's `name` and `message` apart: when `charge_card`'s
+error displays `declined`, the step below records the type `PaymentError`
+and the message `declined`. When the wrapped error propagates another
+operation's failure, the message is that failure's recorded message. When
 the retry strategy stops, the step returns `StepErrorKind::ExecutionFailed`,
 and its `source()` is the body's error. After a replay,
-`OperationError::wire()` returns the recorded type and data.
+`OperationError::wire()` returns the recorded type, message and data.
 
 ```rust ignore
 let result = ctx
@@ -601,8 +606,10 @@ let result = ctx
 
 if let Err(err) = result {
     let wire = err.wire();
-    // Some("PaymentError") and Some(r#"{"code":42}"#), live and after a replay.
+    // Some("PaymentError"), Some("declined") and Some(r#"{"code":42}"#),
+    // live and after a replay.
     let error_type = wire.and_then(durable::WireError::error_type);
+    let error_message = wire.and_then(durable::WireError::error_message);
     let error_data = wire.and_then(durable::WireError::error_data);
 }
 ```

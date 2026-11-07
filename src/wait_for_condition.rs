@@ -1611,13 +1611,11 @@ mod tests {
             .unwrap_err();
         let wire = hooks.find("cond", "uf_end").wire.expect("an Err outcome");
         assert_eq!(wire.error_type(), Some("Throttled"));
+        assert_eq!(wire.error_message(), Some("slow down"));
         assert_eq!(err.wire(), Some(&wire));
         assert_eq!(
             recorded_fail(&client),
-            (
-                Some("Throttled".to_owned()),
-                wire.error_message().map(str::to_owned)
-            )
+            (Some("Throttled".to_owned()), Some("slow down".to_owned()))
         );
     }
 
@@ -2228,6 +2226,7 @@ mod tests {
     /// C5 to C8: a check failure records through `wire_error_for` with the
     /// fallback `Error`, and the live kind equals the replay kind.
     #[tokio::test]
+    #[expect(clippy::too_many_lines)] // reason: four cases, each checked live and on replay
     async fn check_failure_records_typed_error_type() {
         type MakeErr = fn() -> BoxError;
         let cases: [(MakeErr, &str, &str, &str); 4] = [
@@ -2296,12 +2295,17 @@ mod tests {
                 Some(recorded_type),
                 "the FAIL record's type"
             );
+            assert_eq!(
+                fail.error().and_then(|e| e.error_message()),
+                Some(message),
+                "the FAIL record's message"
+            );
             let live_source = wfc_source(&live);
             if kind == "MaxChecksExceeded" {
                 assert_eq!(live_source, None, "MaxChecksExceeded carries no source");
             } else {
                 let source = live_source.expect("the check error is the source");
-                assert!(source.contains(message), "source {source:?}");
+                assert_eq!(source, message, "the flattened source");
             }
 
             // Replay of the record the live check wrote: first check, so

@@ -679,8 +679,8 @@ where
 /// Any other error records the type `Error`, as the JS SDK records a
 /// plain `Error`, unless a `TypedError` in its chain names the type. The
 /// message is the error's recorded message: the message of the operation
-/// failure it propagates, else its flattened chain (see
-/// [`error::wire_message`]).
+/// failure it propagates, else its flattened chain, which never includes
+/// a `TypedError`'s type name (see [`error::wire_message`]).
 fn wire_error_from_box_error(err: BoxError) -> WireError {
     match err.downcast::<OperationError>() {
         Ok(op_err) => wire_error_from_operation_error(&op_err),

@@ -4020,7 +4020,10 @@ async fn serialize_value<T, S: Serdes<T>>(
             let e = ctx
                 .route_serdes_error("serialize", &operation_id, name, err)
                 .await;
-            Err(batch_error(&format!("serialize result: {e}")))
+            Err(batch_error(&format!(
+                "serialize result: {}",
+                crate::error::wire_message(&*e)
+            )))
         }
     }
 }
@@ -4051,7 +4054,10 @@ async fn deserialize_value<T, S: Serdes<T>>(
             let e = ctx
                 .route_serdes_error("deserialize", &operation_id, name, err)
                 .await;
-            Err(batch_error(&format!("deserialize result: {e}")))
+            Err(batch_error(&format!(
+                "deserialize result: {}",
+                crate::error::wire_message(&*e)
+            )))
         }
     }
 }
@@ -11451,6 +11457,225 @@ mod tests {
         );
     }
 
+    /// The error a typed serdes fails with: the type `PaymentError`, the
+    /// message `declined` and the data `d`.
+    fn typed_declined() -> BoxError {
+        Box::new(crate::TypedError::with_type("PaymentError", "declined").with_error_data("d"))
+    }
+
+    /// An item serdes whose `serialize` fails, unmarked, with
+    /// [`typed_declined`].
+    struct TypedItemSerializeFailure;
+
+    impl Serdes<u32> for TypedItemSerializeFailure {
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            _value: u32,
+            _context: SerdesContext,
+        ) -> Result<String, BoxError> {
+            Err(typed_declined())
+        }
+
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            wire: String,
+            _context: SerdesContext,
+        ) -> Result<u32, BoxError> {
+            Ok(wire.parse()?)
+        }
+    }
+
+    /// An item serdes that stores the value as its decimal text and whose
+    /// `deserialize` fails, unmarked, with [`typed_declined`].
+    struct TypedItemDeserializeFailure;
+
+    impl Serdes<u32> for TypedItemDeserializeFailure {
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(&self, value: u32, _context: SerdesContext) -> Result<String, BoxError> {
+            Ok(value.to_string())
+        }
+
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            _wire: String,
+            _context: SerdesContext,
+        ) -> Result<u32, BoxError> {
+            Err(typed_declined())
+        }
+    }
+
+    /// A batch result serdes that stores the record text and whose
+    /// `deserialize` fails, unmarked, with [`typed_declined`].
+    struct TypedResultDeserializeFailure;
+
+    impl Serdes<String> for TypedResultDeserializeFailure {
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            value: String,
+            _context: SerdesContext,
+        ) -> Result<String, BoxError> {
+            Ok(value)
+        }
+
+        // reason: a test serdes that completes at once, in the async-fn form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            _wire: String,
+            _context: SerdesContext,
+        ) -> Result<String, BoxError> {
+            Err(typed_declined())
+        }
+    }
+
+    /// A typed permanent serialize failure of an item result fails the
+    /// item with the serialization type and the wrapped message without
+    /// the type name, with no data and no stack, live and on replay.
+    #[tokio::test]
+    async fn typed_item_serialize_failure_records_the_wrapped_message() {
+        const MESSAGE: &str =
+            "operation error: child_context: internal error: serialize result: declined";
+        let assert_item = |batch: &BatchResult<u32>| {
+            let item = &batch.items[0];
+            assert_eq!(item.status, BatchItemStatus::Failed);
+            assert_eq!(
+                item.error_type.as_deref(),
+                Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE)
+            );
+            assert_eq!(item.error_message.as_deref(), Some(MESSAGE));
+            assert_eq!(item.error_data, None);
+            assert!(item.stack_trace.is_empty(), "{item:?}");
+        };
+        let tolerate_one =
+            || crate::builders::map_parallel::CompletionConfig::with_tolerated_failure_count(1);
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let live = ctx
+            .map(vec![1_u32], |_child, item, _idx| async move { Ok(item) })
+            .serdes(TypedItemSerializeFailure)
+            .completion(tolerate_one())
+            .await_batch()
+            .await
+            .expect("a tolerated failure is a batch result");
+        assert_item(&live);
+
+        let payload = parent_payload(&client);
+        let replayed = test_ctx(terminal_batch_log(&payload))
+            .map(vec![1_u32], |_child, _item, _idx| async move {
+                unreachable!("a terminal batch replays")
+            })
+            .serdes(TypedItemSerializeFailure)
+            .completion(tolerate_one())
+            .await_batch()
+            .await
+            .expect("replay succeeds");
+        assert_item(&replayed);
+    }
+
+    /// A typed permanent deserialize failure of a recorded batch result
+    /// gives an `Internal` error whose recorded message omits the type
+    /// name, with the child type and no data or stack. The live run does
+    /// not decode its own record, so only the replay reaches the decode.
+    #[tokio::test]
+    async fn typed_result_deserialize_failure_records_the_wrapped_message() {
+        let expected = crate::error::WireError::new(
+            Some("ChildContextError"),
+            Some("operation error: child_context: internal error: deserialize result: declined"),
+        );
+        let assert_error = |err: &OperationError| {
+            let OperationErrorKind::ChildContext(child) = err.kind() else {
+                unreachable!("expected a child context error, got {:?}", err.kind());
+            };
+            assert!(
+                matches!(child.kind(), ChildContextErrorKind::Internal),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::error::Error::source(child)
+                    .map(ToString::to_string)
+                    .as_deref(),
+                Some("deserialize result: declined")
+            );
+            assert_eq!(err.wire(), None);
+            assert_eq!(crate::error::wire_error_for(err, "Error"), expected);
+        };
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let live = ctx
+            .map(vec![1_u32], |_child, item, _idx| async move { Ok(item) })
+            .result_serdes(TypedResultDeserializeFailure)
+            .await
+            .expect("the live run returns its items");
+        assert_eq!(live, [1]);
+
+        let payload = parent_payload(&client);
+        let replayed: Result<Vec<u32>, OperationError> = test_ctx(terminal_batch_log(&payload))
+            .map(vec![1_u32], |_child, _item, _idx| async move {
+                unreachable!("a terminal batch replays")
+            })
+            .result_serdes(TypedResultDeserializeFailure)
+            .await;
+        let replayed = replayed.expect_err("the recorded batch cannot be decoded");
+        assert_error(&replayed);
+    }
+
+    /// A typed permanent deserialize failure of an item result: the live
+    /// round trip after the item's `SUCCEED` and the replay of the
+    /// succeeded item record both decode through the item serdes, and both
+    /// give the same error, whose recorded message omits the type name.
+    #[tokio::test]
+    async fn typed_item_deserialize_failure_records_the_wrapped_message() {
+        let expected = crate::error::WireError::new(
+            Some("ChildContextError"),
+            Some("operation error: child_context: internal error: deserialize result: declined"),
+        );
+        let assert_error = |err: &OperationError| {
+            let OperationErrorKind::ChildContext(child) = err.kind() else {
+                unreachable!("expected a child context error, got {:?}", err.kind());
+            };
+            assert!(
+                matches!(child.kind(), ChildContextErrorKind::Internal),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::error::Error::source(child)
+                    .map(ToString::to_string)
+                    .as_deref(),
+                Some("deserialize result: declined")
+            );
+            assert_eq!(err.wire(), None);
+            assert_eq!(crate::error::wire_error_for(err, "Error"), expected);
+        };
+        let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
+        let live: Result<Vec<u32>, OperationError> = ctx
+            .map(vec![1_u32], |_child, item, _idx| async move { Ok(item) })
+            .serdes(TypedItemDeserializeFailure)
+            .await;
+        let live = live.expect_err("the item value cannot be decoded");
+        assert_error(&live);
+        assert_eq!(child_success_payloads(&client), ["1"]);
+
+        // The record the live run's item `SUCCEED` wrote: the serialized
+        // value `1` under the item's ID.
+        let replayed: Result<Vec<u32>, OperationError> = test_ctx(CheckpointLog::from_records(
+            vec![succeeded_record("1-1", "1")],
+        ))
+        .map(vec![1_u32], |_child, _item, _idx| async move {
+            unreachable!("a recorded item replays")
+        })
+        .serdes(TypedItemDeserializeFailure)
+        .await;
+        let replayed = replayed.expect_err("the recorded item cannot be decoded");
+        assert_error(&replayed);
+    }
+
     #[tokio::test]
     async fn failed_item_error_has_js_shape() {
         let (ctx, client) = test_ctx_with_client(CheckpointLog::empty());
@@ -11466,19 +11691,16 @@ mod tests {
             .await_batch()
             .await
             .expect("a tolerated failure is a batch result");
-        let message = live.items[0]
-            .error_message
-            .clone()
-            .expect("the failed item has a message");
+        assert_eq!(live.items[0].error_message.as_deref(), Some("declined"));
         let payload = parent_payload(&client);
         let json: serde_json::Value = serde_json::from_str(&payload).expect("JSON");
         assert_eq!(
             json["all"][0]["error"],
             serde_json::json!({
                 "ErrorType": "ChildContextError",
-                "ErrorMessage": message,
+                "ErrorMessage": "declined",
                 "ErrorData": "d",
-                "Cause": {"ErrorType": "PaymentError", "ErrorMessage": message, "ErrorData": "d"},
+                "Cause": {"ErrorType": "PaymentError", "ErrorMessage": "declined", "ErrorData": "d"},
             })
         );
 
@@ -11497,10 +11719,7 @@ mod tests {
             Some("PaymentError")
         );
         assert_eq!(replayed.items[0].error_data.as_deref(), Some("d"));
-        assert_eq!(
-            replayed.items[0].error_message.as_deref(),
-            Some(message.as_str())
-        );
+        assert_eq!(replayed.items[0].error_message.as_deref(), Some("declined"));
     }
 
     #[tokio::test]

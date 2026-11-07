@@ -976,7 +976,10 @@ async fn serialize_value<O, S: Serdes<O>>(
             let e = ctx
                 .route_serdes_error("serialize", &operation_id, name, err)
                 .await;
-            Err(child_internal_error(&format!("serialize result: {e}")))
+            Err(child_internal_error(&format!(
+                "serialize result: {}",
+                crate::error::wire_message(&*e)
+            )))
         }
     }
 }
@@ -1015,7 +1018,10 @@ async fn deserialize_failure(
     let e = ctx
         .route_serdes_error("deserialize", operation_id, name, err)
         .await;
-    child_internal_error(&format!("deserialize result: {e}"))
+    child_internal_error(&format!(
+        "deserialize result: {}",
+        crate::error::wire_message(&*e)
+    ))
 }
 
 /// Constructs a `ChildContextError::Internal` wrapped as an
@@ -1117,8 +1123,8 @@ mod tests {
     /// returned, not of the SDK's internal carrier. A propagated
     /// operation failure records that operation's recorded message. One
     /// row per case: a plain error, a `TypedError`, a propagated step
-    /// failure (untyped and typed), and a propagated external callback
-    /// failure.
+    /// failure (untyped and typed), a propagated external callback
+    /// failure, and a `TypedError` around a propagated step failure.
     #[tokio::test]
     async fn child_failure_records_body_error_type() {
         // Row 1: a plain error records the fallback type "Error".
@@ -1132,7 +1138,7 @@ mod tests {
         })
         .await;
         assert_eq!(ty.as_deref(), Some("PaymentError"));
-        assert_eq!(msg.as_deref(), Some("PaymentError: declined"));
+        assert_eq!(msg.as_deref(), Some("declined"));
 
         // Row 3: a propagated untyped step failure records the step's
         // recorded type, "Error".
@@ -1162,7 +1168,7 @@ mod tests {
         })
         .await;
         assert_eq!(ty.as_deref(), Some("PaymentError"));
-        assert_eq!(msg.as_deref(), Some("PaymentError: declined"));
+        assert_eq!(msg.as_deref(), Some("declined"));
 
         // Row 5: a propagated external callback failure records the type
         // the callback failure carries.
@@ -1180,6 +1186,20 @@ mod tests {
         .await;
         assert_eq!(ty.as_deref(), Some("VendorError"));
         assert_eq!(msg.as_deref(), Some("denied"));
+
+        // Row 6: a TypedError around a propagated step failure records the
+        // user's type and the step's recorded message.
+        let (ty, msg) = child_fail_record(|child| async move {
+            let v = child
+                .step(|_| async { Err::<i32, crate::BoxError>("step boom".into()) })
+                .retry_strategy(|_err, _attempt| crate::RetryDecision::Stop)
+                .await
+                .map_err(|e| crate::TypedError::with_type("PaymentError", e))?;
+            Ok(v)
+        })
+        .await;
+        assert_eq!(ty.as_deref(), Some("PaymentError"));
+        assert_eq!(msg.as_deref(), Some("step boom"));
     }
 
     /// A root context over `records` whose transport is a fresh in-memory
@@ -2372,6 +2392,164 @@ mod tests {
                 Err("cannot decode".into())
             }
         }
+    }
+
+    /// The error a typed serdes fails with: the type `PaymentError`, the
+    /// message `declined` and the data `d`.
+    fn typed_declined() -> crate::BoxError {
+        Box::new(crate::TypedError::with_type("PaymentError", "declined").with_error_data("d"))
+    }
+
+    /// A JSON serdes whose `serialize` (when `on_serialize`) or
+    /// `deserialize` (otherwise) fails, unmarked, with [`typed_declined`].
+    struct TypedSerdesFailure {
+        on_serialize: bool,
+    }
+
+    impl<T> Serdes<T> for TypedSerdesFailure
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    {
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn serialize(
+            &self,
+            value: T,
+            _context: SerdesContext,
+        ) -> Result<String, crate::BoxError> {
+            if self.on_serialize {
+                Err(typed_declined())
+            } else {
+                Ok(serde_json::to_string(&value)?)
+            }
+        }
+        // reason: exercises the async-fn impl form user code writes
+        #[expect(clippy::unused_async_trait_impl)]
+        async fn deserialize(
+            &self,
+            wire: String,
+            _context: SerdesContext,
+        ) -> Result<T, crate::BoxError> {
+            if self.on_serialize {
+                Ok(serde_json::from_str(&wire)?)
+            } else {
+                Err(typed_declined())
+            }
+        }
+    }
+
+    /// The text of the source of a child context error.
+    fn child_source_text(err: &OperationError) -> Option<String> {
+        let OperationErrorKind::ChildContext(child) = err.kind() else {
+            unreachable!("expected a child context error, got {:?}", err.kind());
+        };
+        std::error::Error::source(child).map(ToString::to_string)
+    }
+
+    /// The recorded message of a typed serialize failure of a child result.
+    const TYPED_SERIALIZE_MESSAGE: &str =
+        "operation error: child_context: internal error: serialize result: declined";
+
+    /// A typed permanent serialize failure of a child result records the
+    /// wrapped message without the type name, under the serialization
+    /// type, with no data and no stack. Live and replay both give
+    /// `Internal` with that record.
+    #[tokio::test]
+    async fn typed_serialize_failure_records_the_wrapped_message() {
+        let expected = crate::error::WireError::new(
+            Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE),
+            Some(TYPED_SERIALIZE_MESSAGE),
+        );
+        let (ctx, client) = live_ctx();
+        let live = ctx
+            .run_in_child_context(|_child| async { Ok(3_u32) })
+            .serdes(TypedSerdesFailure { on_serialize: true })
+            .await
+            .expect_err("serialize fails");
+        assert!(is_child_internal(&live), "{live:?}");
+        assert_eq!(
+            child_source_text(&live).as_deref(),
+            Some("serialize result: declined")
+        );
+        assert_eq!(live.wire(), Some(&expected));
+        let updates = client.recorded_updates();
+        let error = updates
+            .iter()
+            .find(|u| u.action() == &OperationAction::Fail)
+            .and_then(OperationUpdate::error)
+            .expect("the child records a FAIL with an error");
+        assert_eq!(
+            error.error_type(),
+            Some(crate::error::SERIALIZATION_FAILED_ERROR_TYPE)
+        );
+        assert_eq!(error.error_message(), Some(TYPED_SERIALIZE_MESSAGE));
+        assert_eq!(error.error_data(), None);
+        assert!(error.stack_trace().is_empty(), "{error:?}");
+
+        let ctx = test_ctx(CheckpointLog::from_records(vec![failed_record(
+            "1",
+            crate::error::SERIALIZATION_FAILED_ERROR_TYPE,
+            TYPED_SERIALIZE_MESSAGE,
+        )]));
+        let replayed = ctx
+            .run_in_child_context(|_child| async { Ok(3_u32) })
+            .serdes(TypedSerdesFailure { on_serialize: true })
+            .await
+            .expect_err("the recorded failure replays");
+        assert!(is_child_internal(&replayed), "{replayed:?}");
+        assert_eq!(replayed.wire(), Some(&expected));
+    }
+
+    /// A typed permanent deserialize failure of a child result gives an
+    /// `Internal` error whose recorded message omits the type name, with
+    /// the child's type and no data or stack, live and on replay of the
+    /// recorded success.
+    #[tokio::test]
+    async fn typed_deserialize_failure_records_the_wrapped_message() {
+        let expected = crate::error::WireError::new(
+            Some("ChildContextError"),
+            Some("operation error: child_context: internal error: deserialize result: declined"),
+        );
+        let (ctx, client) = live_ctx();
+        let live = ctx
+            .run_in_child_context(|_child| async { Ok(3_u32) })
+            .serdes(TypedSerdesFailure {
+                on_serialize: false,
+            })
+            .await
+            .expect_err("deserialize fails");
+        assert!(is_child_internal(&live), "{live:?}");
+        assert_eq!(live.wire(), None);
+        assert_eq!(
+            child_source_text(&live).as_deref(),
+            Some("deserialize result: declined")
+        );
+        assert_eq!(crate::error::wire_error_for(&live, "Error"), expected);
+        assert!(
+            client
+                .recorded_updates()
+                .iter()
+                .any(|u| u.action() == &OperationAction::Succeed),
+            "the child records its success"
+        );
+
+        let ctx = test_ctx(CheckpointLog::from_records(vec![succeeded_record(
+            "1", "3",
+        )]));
+        let replayed = ctx
+            .run_in_child_context(|_child| async { Ok(3_u32) })
+            .serdes(TypedSerdesFailure {
+                on_serialize: false,
+            })
+            .await
+            .expect_err("the recorded success fails to decode");
+        assert!(is_child_internal(&replayed), "{replayed:?}");
+        assert_eq!(replayed.wire(), None);
+        assert_eq!(
+            child_source_text(&replayed).as_deref(),
+            Some("deserialize result: declined")
+        );
+        assert_eq!(crate::error::wire_error_for(&replayed, "Error"), expected);
     }
 
     /// Whether `err` is a child context error of kind `Internal`.

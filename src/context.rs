@@ -2036,16 +2036,16 @@ impl DurableContext {
         name: Option<&str>,
         err: BoxError,
     ) -> T {
-        let chain = crate::error::chain_string(&*err);
+        let detail = crate::error::wire_message(&*err);
         let message = match name {
             Some(name) => {
-                format!("serdes {call} failed for operation \"{name}\" ({operation_id}): {chain}")
+                format!("serdes {call} failed for operation \"{name}\" ({operation_id}): {detail}")
             }
-            None => format!("serdes {call} failed for operation {operation_id}: {chain}"),
+            None => format!("serdes {call} failed for operation {operation_id}: {detail}"),
         };
         tracing::error!(
             operation_id = %operation_id,
-            error = %chain,
+            error = %detail,
             "serdes {call} failed with a retryable error; failing the invocation so the \
              service re-invokes"
         );
@@ -4419,6 +4419,51 @@ mod tests {
     use crate::engine::{CheckpointLog, CheckpointStatus};
     use aws_sdk_lambda::types::Operation;
     use std::sync::Arc;
+
+    /// A `TypedError` around a `RetryableSerdesError` is still marked, so
+    /// it ends the invocation, and the fault message holds the wrapped
+    /// chain without the type name.
+    #[tokio::test]
+    async fn typed_retryable_serdes_error_fault_omits_the_type_name() {
+        let typed = crate::TypedError::with_type(
+            "Throttled",
+            crate::serdes::RetryableSerdesError::new("mount timed out"),
+        );
+        assert!(crate::serdes::is_retryable_serdes_error(&typed));
+        let client = Arc::new(InMemoryExecutionClient::new(Vec::new()));
+        let ctx = DurableContext::new_root_with_client(
+            "arn:test".to_owned(),
+            lambda_runtime::Context::default(),
+            Arc::new(CheckpointLog::empty()),
+            Arc::clone(&client) as Arc<dyn ExecutionClient>,
+            "token0".to_owned(),
+        );
+        let fault_ctx = ctx.clone();
+        let outcome = crate::driver::test_support::outcome_of(
+            ctx.clone(),
+            Arc::clone(ctx.task_ownership()),
+            Arc::clone(ctx.coordinator()),
+            async move {
+                let _ = fault_ctx
+                    .route_serdes_error("serialize", "op-1", Some("s"), Box::new(typed))
+                    .await;
+            },
+        )
+        .await;
+        let crate::driver::InvocationOutcome::Fault {
+            error_type,
+            message,
+        } = outcome
+        else {
+            unreachable!("expected an invocation fault, got {outcome:?}");
+        };
+        assert_eq!(error_type, crate::error::SERDES_FAILED_ERROR_TYPE);
+        assert_eq!(
+            message,
+            "serdes serialize failed for operation \"s\" (op-1): \
+             retryable serdes failure: mount timed out"
+        );
+    }
 
     /// The batch context, its Normal item context and its Flat item
     /// context take their levels from the constructors: `new_child` adds 1

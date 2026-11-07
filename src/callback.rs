@@ -3347,7 +3347,6 @@ mod tests {
     /// The outer record carries one fixed SDK type per kind; neither the
     /// external type nor a `TypedError` name sets it.
     #[test]
-    #[expect(clippy::too_many_lines)] // reason: one row per callback error kind
     fn extract_wire_error_records_fixed_sdk_types() {
         // C1: the external type is dropped; message and data are copied.
         let external = crate::error::WireError::new(Some("PaymentDeclined"), Some("card declined"))
@@ -3366,27 +3365,23 @@ mod tests {
         // C5.
         let wire = extract_wire_error(&submitter_failure("submission failed".into()));
         assert_eq!(wire.error_type(), Some("Callback.SubmitterFailed"));
-        assert!(
-            wire.error_message()
-                .is_some_and(|m| m.contains("submission failed")),
-            "{wire:?}"
+        assert_eq!(
+            wire.error_message(),
+            Some("submitter failed: operation error: step: execution failed: submission failed")
         );
         // C6: the user's type does not reach the outer record.
         let typed = crate::TypedError::with_type("PaymentError", "declined");
         let wire = extract_wire_error(&submitter_failure(Box::new(typed)));
         assert_eq!(wire.error_type(), Some("Callback.SubmitterFailed"));
-        assert!(
-            wire.error_message().is_some_and(|m| m.contains("declined")),
-            "{wire:?}"
+        assert_eq!(
+            wire.error_message(),
+            Some("submitter failed: operation error: step: execution failed: declined")
         );
 
         // C7.
         let wire = extract_wire_error(&callback_failure(CallbackErrorKind::Internal, "oops"));
         assert_eq!(wire.error_type(), Some("Callback.Internal"));
-        assert!(
-            wire.error_message().is_some_and(|m| m.contains("oops")),
-            "{wire:?}"
-        );
+        assert_eq!(wire.error_message(), Some("internal error: oops"));
 
         // C8: an error that is not a callback error, with a `TypedError` in
         // its chain.
@@ -3396,9 +3391,9 @@ mod tests {
         ));
         let wire = extract_wire_error(&other);
         assert_eq!(wire.error_type(), Some("Callback.Internal"));
-        assert!(
-            wire.error_message().is_some_and(|m| m.contains("declined")),
-            "{wire:?}"
+        assert_eq!(
+            wire.error_message(),
+            Some("operation error: child_context: child failed: declined")
         );
 
         // A propagated recorded failure records its recorded message, for
@@ -3449,10 +3444,9 @@ mod tests {
             "bad payload",
         ));
         assert_eq!(wire.error_type(), Some("Callback.DeserializationFailed"));
-        assert!(
-            wire.error_message()
-                .is_some_and(|m| m.contains("bad payload")),
-            "{wire:?}"
+        assert_eq!(
+            wire.error_message(),
+            Some("deserialization failed: bad payload")
         );
 
         // The timeouts.
