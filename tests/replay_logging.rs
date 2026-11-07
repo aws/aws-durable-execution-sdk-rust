@@ -284,3 +284,84 @@ async fn post_flat_batch_marker_emitted_exactly_once_on_terminal_replay() {
         );
     }
 }
+
+/// Example 2 of the README.
+struct TraceIdFactory;
+
+impl durable::plugin::PluginFactory for TraceIdFactory {
+    fn create_plugin(
+        &self,
+        info: &durable::plugin::InvocationInfo,
+    ) -> Result<Option<Box<dyn durable::plugin::Plugin>>, durable::BoxError> {
+        let root = info.x_ray_trace_id().unwrap_or("no-trace").to_owned();
+        Ok(Some(Box::new(TraceIdPlugin { root })))
+    }
+}
+
+/// Holds the invocation's X-Ray trace header.
+struct TraceIdPlugin {
+    root: String,
+}
+
+impl durable::plugin::Plugin for TraceIdPlugin {
+    fn wrap_user_function(&self, info: &durable::plugin::OperationInfo, next: &mut dyn FnMut()) {
+        let id = format!("{}/{}", self.root, info.id());
+        let span = tracing::info_span!("plugin_user_function", trace_id = %id);
+        span.in_scope(next);
+    }
+}
+
+/// With Example 2's plugin, whose span is now an ancestor of the child
+/// body's records, a child that logs before and after a wait still writes
+/// each marker once across both invocations, and each carries the plugin's
+/// trace ID.
+#[tokio::test]
+async fn plugin_span_keeps_replay_suppression() {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(CaptureWriter(Arc::clone(&buffer)))
+        .with_filter(ReplayFilterLayer::new());
+    let subscriber = tracing_subscriber::registry().with(fmt_layer);
+    let _guard = test_tracing::install_test_subscriber(subscriber);
+
+    let result = LocalRunner::new()
+        .options(
+            durable::Options::builder()
+                .plugin(TraceIdFactory)
+                .build()
+                .expect("valid options"),
+        )
+        .run(
+            |_event: serde_json::Value, ctx: durable::DurableContext| async move {
+                ctx.run_in_child_context(|child| async move {
+                    tracing::info!("plugin-child-before-wait");
+                    child.wait(Duration::from_secs(1)).name("pause").await?;
+                    tracing::info!("plugin-child-after-wait");
+                    Ok(())
+                })
+                .name("nested")
+                .await?;
+                Ok::<_, durable::BoxError>(())
+            },
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("runner");
+
+    assert_eq!(result.invocation_count(), 2, "the child suspends once");
+    let child = result.operation("nested").expect("the child record").id();
+    let trace_id = format!("no-trace/{child}");
+    let output = buffer.lock().map_or_else(
+        |_| String::new(),
+        |b| String::from_utf8_lossy(&b).to_string(),
+    );
+    for marker in ["plugin-child-before-wait", "plugin-child-after-wait"] {
+        let lines: Vec<&str> = output.lines().filter(|l| l.contains(marker)).collect();
+        assert_eq!(lines.len(), 1, "`{marker}` once. Got: {output}");
+        assert!(
+            lines.iter().all(|l| l.contains(&trace_id)),
+            "`{marker}` carries {trace_id}: {output}"
+        );
+    }
+}

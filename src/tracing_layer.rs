@@ -10,7 +10,8 @@
 //! - A `durable_execution` span per NAMESPACE. The handler-level span wraps
 //!   each invocation of the user's handler; each child namespace (a
 //!   `run_in_child_context` body, a map/parallel branch, a
-//!   `wait_for_callback` body) gets its own detached span wrapping its body.
+//!   `wait_for_callback` body) gets its own span wrapping its body, a child of
+//!   the span current when the child context is created.
 //!   Every one carries the execution ARN, the request ID, the tenant ID
 //!   when the invocation has one, and an `isReplay` flag that the SDK keeps current as that namespace crosses its own
 //!   replay high-water mark: the flag starts as the namespace's initial
@@ -159,9 +160,9 @@ pub(crate) fn execution_span(
     span
 }
 
-/// Creates a DETACHED `durable_execution` span for a child namespace: a
+/// Creates the `durable_execution` span of a child namespace: a
 /// `run_in_child_context` body, a map/parallel branch, or a
-/// `wait_for_callback` body.
+/// `wait_for_callback` body, recorded, virtual or flat.
 ///
 /// Each child context owns an [`crate::engine::EngineState`] with its own ID
 /// counter and therefore its own replay high-water mark: nested operations
@@ -171,16 +172,21 @@ pub(crate) fn execution_span(
 /// suppress a branch's pre-wait log lines on resume without consulting (or
 /// clobbering) the parent's state.
 ///
-/// The span is created with `parent: None` so an event inside the child
-/// scope resolves its replay status against the child namespace alone: a
-/// parent span that is still replaying must not suppress a branch that has
-/// gone live, and a live parent must not un-suppress a branch that is still
-/// replaying.
+/// The span is a child of the span current when the child context is
+/// created, so a record inside the child body also carries the spans
+/// around it, such as a plugin's span. [`ReplayFilterLayer`] resolves a
+/// record's replay status against its nearest execution namespace: it
+/// combines the `isReplay` flags of the SDK's `durable_execution` and
+/// `durable_operation` spans from the record up to and including the
+/// nearest `durable_execution` span, and suppresses the record when any of
+/// them replays. So a parent that is still replaying does not suppress a
+/// branch that has gone live, a live parent does not enable a branch that
+/// is still replaying, and a replaying operation inside a live branch
+/// still suppresses its records.
 ///
-/// The span is detached, so a record inside the child body does not see
-/// the root span's fields. So the span carries the root's fields itself
-/// (`executionArn`, `requestId`, `tenantId`, `isReplay`), and adds the
-/// child operation's `operationId` and, when it has one, `operationName`.
+/// The span carries the root's fields itself (`executionArn`, `requestId`,
+/// `tenantId`, `isReplay`), and adds the child operation's `operationId`
+/// and, when it has one, `operationName`.
 #[must_use]
 pub(crate) fn scoped_execution_span(
     execution_arn: &str,
@@ -191,7 +197,6 @@ pub(crate) fn scoped_execution_span(
     is_replay: bool,
 ) -> tracing::Span {
     let span = tracing::info_span!(
-        parent: None,
         "durable_execution",
         { fields::EXECUTION_ARN } = execution_arn,
         { fields::REQUEST_ID } = request_id,
@@ -508,8 +513,8 @@ impl tracing::field::Visit for ReplayVisitor {
 
 /// Returns `true` if the given span attributes include `isReplay = true`.
 ///
-/// Used by [`ReplayFilterLayer`] to detect replay spans at creation time and
-/// by the test-only [`ReplayTracker`] for verification.
+/// Used by [`ReplayFilterLayer`] to read an SDK span's initial replay flag
+/// at creation time.
 pub(crate) fn is_replay_event(attrs: &Attributes<'_>) -> bool {
     let mut visitor = ReplayVisitor { is_replay: None };
     attrs.record(&mut visitor);
@@ -518,8 +523,8 @@ pub(crate) fn is_replay_event(attrs: &Attributes<'_>) -> bool {
 
 /// Extracts the `isReplay` value from a `span.record()` update, if present.
 ///
-/// Used by [`ReplayFilterLayer`] to track the handler span's dynamic replay
-/// flag, which the SDK re-records after every operation claim.
+/// Used by [`ReplayFilterLayer`] to track the dynamic replay flag of an SDK
+/// namespace span, which the SDK re-records after every operation claim.
 fn replay_flag_in_record(values: &tracing::span::Record<'_>) -> Option<bool> {
     let mut visitor = ReplayVisitor { is_replay: None };
     values.record(&mut visitor);
@@ -547,10 +552,9 @@ impl ReplayTracker {
         }
     }
 
-    /// Returns whether the span (or any ancestor) is in replay mode.
-    ///
-    /// For a full implementation this would walk the span stack; for
-    /// unit tests we check if the given span ID is directly marked.
+    /// Returns whether the span with this ID is itself marked as replay.
+    /// It does not look at other spans; [`ReplayFilterLayer`] is what
+    /// resolves a record's nearest execution namespace.
     pub(crate) fn is_replay(&self, id: u64) -> bool {
         self.replay_spans.read().is_ok_and(|set| set.contains(&id))
     }
@@ -558,15 +562,26 @@ impl ReplayTracker {
 
 /// A per-layer filter that suppresses events describing replayed work:
 /// events carrying their own `isReplay = true` field (the SDK's lifecycle
-/// events: see [`crate::observability`]) and events emitted inside spans
-/// marked `isReplay = true` (application log lines during replay).
+/// events: see [`crate::observability`]) and application log lines emitted
+/// while their nearest execution namespace replays.
 ///
 /// When an execution resumes, the handler re-runs from the top and replays
 /// recorded results, so handler code between operations executes, and logs,
-/// again. The SDK wraps each invocation in a span whose `isReplay` flag
-/// tracks the live replay status; this filter drops events while that flag
-/// is `true`, so a log line is written once, on the invocation that first
-/// executed it, not again on every resume.
+/// again. The SDK wraps each invocation, and each child namespace, in a
+/// `durable_execution` span whose `isReplay` flag tracks that namespace's
+/// live replay status, and each step attempt and condition check in a
+/// `durable_operation` span. So a log line is written once, on the
+/// invocation that first executed it, not again on every resume.
+///
+/// For an event without its own `isReplay` field, the filter walks from the
+/// event towards the root through the SDK spans only, up to and including
+/// the first `durable_execution` span, and suppresses the event when any of
+/// those spans has `isReplay = true`. Spans outside that namespace decide
+/// nothing: a live child namespace is not suppressed by a replaying parent,
+/// and a replaying child is not enabled by a live parent. A span that the
+/// SDK did not create decides nothing either, even when it declares an
+/// `isReplay` field, so a plugin's span around `next()` keeps the
+/// suppression of the SDK span it is entered inside.
 ///
 /// For events that carry an explicit `isReplay` field, that field is
 /// authoritative and the span scope is not consulted: the execution span's
@@ -687,15 +702,22 @@ where
             return !is_replay;
         }
 
-        // Otherwise (application log lines carry no `isReplay` field), walk
-        // the span scope to check if any ancestor has isReplay=true.
+        // Otherwise (application log lines carry no `isReplay` field), the
+        // event's nearest execution namespace decides: walk from the event
+        // towards the root through the SDK spans, and stop at the first
+        // `durable_execution` span. Any replaying SDK span on the way
+        // suppresses the event; a span outside the namespace does not.
         if let Some(scope) = ctx.event_scope(event) {
             for span in scope {
                 let extensions = span.extensions();
-                if let Some(fields) = extensions.get::<ReplaySpanFields>()
-                    && fields.is_replay
-                {
-                    return false; // Suppress event.
+                let Some(fields) = extensions.get::<ReplaySpanFields>() else {
+                    continue;
+                };
+                if fields.is_replay {
+                    return false;
+                }
+                if fields.kind == SdkSpan::Execution {
+                    break;
                 }
             }
         }
@@ -703,12 +725,18 @@ where
     }
 
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: subscriber::layer::Context<'_, S>) {
-        // Record isReplay field when a new span is created.
-        if let Some(span) = ctx.span(id)
-            && is_replay_event(attrs)
+        // Keep the kind and the initial `isReplay` value of each SDK span.
+        // Span extensions are shared by every layer of the subscriber, so
+        // with this filter on two layers the second call finds the first
+        // one's value: `replace` stores the same value again where
+        // `insert` would panic.
+        if let Some(kind) = sdk_span(attrs.metadata())
+            && let Some(span) = ctx.span(id)
         {
-            span.extensions_mut()
-                .insert(ReplaySpanFields { is_replay: true });
+            span.extensions_mut().replace(ReplaySpanFields {
+                kind,
+                is_replay: is_replay_event(attrs),
+            });
         }
     }
 
@@ -718,26 +746,50 @@ where
         values: &tracing::span::Record<'_>,
         ctx: subscriber::layer::Context<'_, S>,
     ) {
-        // The SDK re-records the handler span's isReplay flag after every
+        // The SDK re-records a namespace span's isReplay flag after every
         // operation claim (see `execution_span`). Track those updates so
         // suppression follows the live replay status, not just the value
         // the span was created with.
         if let Some(is_replay) = replay_flag_in_record(values)
             && let Some(span) = ctx.span(id)
+            && let Some(fields) = span.extensions_mut().get_mut::<ReplaySpanFields>()
         {
-            let mut extensions = span.extensions_mut();
-            if let Some(fields) = extensions.get_mut::<ReplaySpanFields>() {
-                fields.is_replay = is_replay;
-            } else {
-                extensions.insert(ReplaySpanFields { is_replay });
-            }
+            fields.is_replay = is_replay;
         }
     }
 }
 
-/// Storage for the replay flag in span extensions.
+/// The kind of an SDK span that carries the replay state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SdkSpan {
+    /// A `durable_execution` span: one execution namespace.
+    Execution,
+    /// A `durable_operation` span: one step attempt or condition check.
+    Operation,
+}
+
+/// The target of the spans this module creates.
+const SPAN_TARGET: &str = module_path!();
+
+/// The kind of the SDK span `meta` describes, or `None` for any other span
+/// or for an event. Only the spans this module creates count, whatever
+/// fields another span declares.
+fn sdk_span(meta: &tracing::Metadata<'_>) -> Option<SdkSpan> {
+    if !meta.is_span() || meta.target() != SPAN_TARGET {
+        return None;
+    }
+    match meta.name() {
+        crate::observability::span_names::EXECUTION => Some(SdkSpan::Execution),
+        crate::observability::span_names::OPERATION => Some(SdkSpan::Operation),
+        _ => None,
+    }
+}
+
+/// Storage for an SDK span's kind and current replay flag in span
+/// extensions.
 #[derive(Debug)]
 struct ReplaySpanFields {
+    kind: SdkSpan,
     is_replay: bool,
 }
 
@@ -784,15 +836,6 @@ impl LogSettings {
     }
 }
 
-/// Whether `meta` describes an SDK span that carries the replay state.
-///
-/// [`ReplayFilterLayer`] reads the `isReplay` field of the SDK's
-/// `durable_execution` and `durable_operation` spans. Only these spans
-/// declare that field.
-fn is_replay_tracking_span(meta: &tracing::Metadata<'_>) -> bool {
-    meta.is_span() && meta.fields().field(fields::IS_REPLAY).is_some()
-}
-
 /// The filter of the default subscriber's `fmt` layer: the configured
 /// `EnvFilter`, then [`ReplayFilterLayer`].
 ///
@@ -823,7 +866,7 @@ where
         meta: &tracing::Metadata<'_>,
         cx: &subscriber::layer::Context<'_, S>,
     ) -> bool {
-        is_replay_tracking_span(meta) || self.env.enabled(meta, cx)
+        sdk_span(meta).is_some() || self.env.enabled(meta, cx)
     }
 
     fn callsite_enabled(
@@ -843,7 +886,7 @@ where
         // skipping the call for the SDK's spans would disable those
         // directives.
         let env = self.env.callsite_enabled(meta);
-        if !is_replay_tracking_span(meta) && env.is_never() {
+        if sdk_span(meta).is_none() && env.is_never() {
             tracing::subscriber::Interest::never()
         } else {
             tracing::subscriber::Interest::sometimes()
@@ -1476,8 +1519,10 @@ pub(crate) mod tests {
             log,
         );
 
-        // Mirror production (`run`/`wrap`): the handler future is
-        // instrumented with the handler-level span.
+        // Production (`run`/`wrap`) polls and drops the handler future
+        // inside the root task's `TaskContext`, which enters the
+        // handler-level span; instrumenting the future with that span
+        // enters it at the same points for this test.
         let replay_span = ctx.replay_span();
         async move {
             tracing::info!("handler line before the wait");
@@ -2379,5 +2424,280 @@ pub(crate) mod tests {
         let spans = spans_of(&records, "in-step");
         assert!(any_field(&spans, fields::OPERATION_ID), "{spans:?}");
         assert!(!any_field(&spans, fields::OPERATION_NAME), "{spans:?}");
+    }
+
+    /// The messages a capture filtered by [`ReplayFilterLayer`] wrote.
+    fn filtered_messages(run: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_writer(CaptureWriter(Arc::clone(&buffer)))
+            .with_filter(ReplayFilterLayer::new());
+        {
+            let _guard =
+                test_tracing::install_test_subscriber(tracing_subscriber::registry().with(layer));
+            run();
+        }
+        let output = String::from_utf8_lossy(&buffer.lock().expect("not poisoned")).to_string();
+        output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|v| v.get("message")?.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// A record without its own `isReplay` field follows its nearest
+    /// `durable_execution` span and the SDK spans inside it; a parent
+    /// namespace and a non-SDK span decide nothing.
+    #[test]
+    fn replay_filter_uses_the_nearest_execution_namespace() {
+        let emitted = filtered_messages(|| {
+            let child = |parent: &tracing::Span, replay: bool| {
+                let _entered = parent.enter();
+                scoped_execution_span("arn", "req", None, "child", None, replay)
+            };
+            let parent = execution_span("arn", "req", None, true);
+            let live_child = child(&parent, false);
+            live_child.in_scope(|| {
+                tracing::info!("parent replay, child live");
+                tracing::info!(
+                    { fields::IS_REPLAY } = true,
+                    "explicit replay in live child"
+                );
+                tracing::info_span!("not_sdk", isReplay = true)
+                    .in_scope(|| tracing::info!("non-SDK replay span in live child"));
+                operation_span("arn", "req", None, "op", None, 1, true)
+                    .in_scope(|| tracing::info!("replaying operation in live child"));
+            });
+            let parent = execution_span("arn", "req", None, false);
+            child(&parent, true).in_scope(|| {
+                tracing::info!("parent live, child replay");
+                tracing::info!(
+                    { fields::IS_REPLAY } = false,
+                    "explicit live in replaying child"
+                );
+                operation_span("arn", "req", None, "op", None, 1, false)
+                    .in_scope(|| tracing::info!("live operation in replaying child"));
+                // Another target's span of the same name is no namespace.
+                tracing::info_span!("durable_execution", isReplay = false)
+                    .in_scope(|| tracing::info!("foreign namespace in replaying child"));
+            });
+        });
+        assert_eq!(
+            emitted,
+            [
+                "parent replay, child live",
+                "non-SDK replay span in live child",
+                "explicit live in replaying child",
+            ]
+        );
+    }
+
+    /// The filter on two layers of one subscriber: both store the replay
+    /// state of an SDK span in the span's shared extensions, so the second
+    /// store must not panic, and both layers follow the span's later
+    /// `isReplay` updates.
+    #[test]
+    fn replay_filter_on_two_layers_shares_span_state() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let layer = |buffer: &Arc<Mutex<Vec<u8>>>| {
+            tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_writer(CaptureWriter(Arc::clone(buffer)))
+                .with_filter(ReplayFilterLayer::new())
+                .boxed()
+        };
+        let (first, second) = (Arc::default(), Arc::default());
+        {
+            let _guard = test_tracing::install_test_subscriber(
+                tracing_subscriber::registry().with(vec![layer(&first), layer(&second)]),
+            );
+            let span = execution_span("arn", "req", None, true);
+            span.in_scope(|| tracing::info!("while replaying"));
+            span.record(fields::IS_REPLAY, false);
+            span.in_scope(|| tracing::info!("after replay"));
+        }
+        for buffer in [first, second] {
+            let output = String::from_utf8_lossy(&buffer.lock().expect("not poisoned")).to_string();
+            let messages: Vec<String> = output
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter_map(|v| v.get("message")?.as_str().map(str::to_owned))
+                .collect();
+            assert_eq!(messages, ["after replay"], "{output}");
+        }
+    }
+
+    /// A child namespace's span is a child of the span current when it is
+    /// created, and keeps its fields.
+    #[test]
+    #[expect(clippy::indexing_slicing, reason = "test assertions on JSON records")]
+    fn child_execution_span_is_a_child_of_the_current_span() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_writer(CaptureWriter(Arc::clone(&buffer)));
+        {
+            let _guard =
+                test_tracing::install_test_subscriber(tracing_subscriber::registry().with(layer));
+            let current = tracing::info_span!("current");
+            let child = current.in_scope(|| {
+                scoped_execution_span("arn", "req", Some("tenant"), "op-1", Some("named"), true)
+            });
+            let unnamed =
+                current.in_scope(|| scoped_execution_span("arn", "req", None, "op-2", None, false));
+            // Entered outside `current`: only the stored parent links them.
+            child.in_scope(|| tracing::info!("in child"));
+            unnamed.in_scope(|| tracing::info!("in unnamed child"));
+        }
+        let output = String::from_utf8_lossy(&buffer.lock().expect("not poisoned")).to_string();
+        let records: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON"))
+            .collect();
+        let [named, unnamed] = records.as_slice() else {
+            unreachable!("two records: {output}");
+        };
+        let child_of = |record: &serde_json::Value| {
+            let spans = record["spans"].as_array().expect("a span list").clone();
+            let chain: Vec<&str> = spans.iter().filter_map(|s| s["name"].as_str()).collect();
+            assert_eq!(chain, ["current", "durable_execution"], "{record}");
+            spans[1].clone()
+        };
+        let child = child_of(named);
+        assert_eq!(child[fields::EXECUTION_ARN], "arn", "{child}");
+        assert_eq!(child[fields::REQUEST_ID], "req", "{child}");
+        assert_eq!(child[fields::TENANT_ID], "tenant", "{child}");
+        assert_eq!(child[fields::OPERATION_ID], "op-1", "{child}");
+        assert_eq!(child[fields::OPERATION_NAME], "named", "{child}");
+        assert_eq!(child[fields::IS_REPLAY], true, "{child}");
+        let child = child_of(unnamed);
+        assert_eq!(child[fields::OPERATION_ID], "op-2", "{child}");
+        assert_eq!(child[fields::IS_REPLAY], false, "{child}");
+        assert!(child.get(fields::TENANT_ID).is_none(), "{child}");
+        assert!(child.get(fields::OPERATION_NAME).is_none(), "{child}");
+    }
+
+    /// Only the SDK's `durable_execution` and `durable_operation` spans
+    /// carry the replay state. A span of the SDK's target with another name
+    /// neither suppresses a record nor bounds a namespace, and a non-SDK
+    /// span that records `isReplay = true` after its creation decides
+    /// nothing.
+    #[test]
+    fn replay_filter_ignores_other_spans_of_the_sdk_target() {
+        let emitted = filtered_messages(|| {
+            execution_span("arn", "req", None, false).in_scope(|| {
+                tracing::info_span!(target: SPAN_TARGET, "not_a_namespace", isReplay = true)
+                    .in_scope(|| tracing::info!("sdk-target replay span in live namespace"));
+                let late = tracing::info_span!("not_sdk", isReplay = tracing::field::Empty);
+                late.record(fields::IS_REPLAY, true);
+                late.in_scope(|| tracing::info!("non-SDK span recorded as replaying"));
+            });
+            execution_span("arn", "req", None, true).in_scope(|| {
+                tracing::info_span!(target: SPAN_TARGET, "not_an_operation", isReplay = false)
+                    .in_scope(|| tracing::info!("sdk-target live span in replaying namespace"));
+            });
+        });
+        assert_eq!(
+            emitted,
+            [
+                "sdk-target replay span in live namespace",
+                "non-SDK span recorded as replaying",
+            ]
+        );
+    }
+
+    /// An `EnvFilter` stand-in that enables only the `probe` target.
+    struct OnlyProbe;
+
+    impl<S> tracing_subscriber::layer::Filter<S> for OnlyProbe {
+        fn enabled(
+            &self,
+            meta: &tracing::Metadata<'_>,
+            _cx: &tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            meta.target() == "probe"
+        }
+
+        fn callsite_enabled(
+            &self,
+            meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            if meta.target() == "probe" {
+                tracing::subscriber::Interest::sometimes()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        }
+    }
+
+    /// `DefaultFilter` enables the SDK's replay-tracking spans that its
+    /// `EnvFilter` disables, and no other span of the SDK's target.
+    #[test]
+    fn default_filter_enables_only_the_replay_tracking_spans() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::{Filter, SubscriberExt as _};
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let filter = || DefaultFilter {
+            env: OnlyProbe,
+            replay: ReplayFilterLayer::new(),
+        };
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_writer(CaptureWriter(Arc::clone(&buffer)))
+            .with_filter(filter());
+        let (other, execution) = {
+            let _guard =
+                test_tracing::install_test_subscriber(tracing_subscriber::registry().with(layer));
+            let other = tracing::info_span!(target: SPAN_TARGET, "not_a_namespace");
+            other.in_scope(|| tracing::info!(target: "probe", "in other span"));
+            let execution = execution_span("arn", "req", None, false);
+            execution.in_scope(|| tracing::info!(target: "probe", "in execution span"));
+            (
+                other.metadata().expect("the registry enables every span"),
+                execution
+                    .metadata()
+                    .expect("the registry enables every span"),
+            )
+        };
+
+        let records = json_records(&buffer);
+        let names = |message: &str| -> Vec<String> {
+            spans_of(&records, message)
+                .iter()
+                .filter_map(|span| span.get("name")?.as_str().map(str::to_owned))
+                .collect()
+        };
+        assert!(names("in other span").is_empty(), "{records:?}");
+        assert_eq!(
+            names("in execution span"),
+            ["durable_execution"],
+            "{records:?}"
+        );
+
+        let interest = |meta| {
+            <DefaultFilter<OnlyProbe> as Filter<tracing_subscriber::Registry>>::callsite_enabled(
+                &filter(),
+                meta,
+            )
+        };
+        assert!(interest(other).is_never());
+        assert!(interest(execution).is_sometimes());
     }
 }

@@ -36,12 +36,18 @@
 //! | Span name | Wraps | Fields |
 //! |-----------|-------|--------|
 //! | [`span_names::EXECUTION`] (`durable_execution`), root | one invocation of the handler | `executionArn`, `requestId`, `isReplay`, `tenantId` |
-//! | [`span_names::EXECUTION`] (`durable_execution`), child | each child namespace (a `run_in_child_context` body, a map item, a parallel branch, a `wait_for_callback` body), in its own detached span | the root's fields, plus `operationId` and `operationName` of the child operation |
+//! | [`span_names::EXECUTION`] (`durable_execution`), child | each child namespace (a `run_in_child_context` body, a map item, a parallel branch, a `wait_for_callback` body, recorded, virtual or flat), in its own span, a child of the span current when the namespace is created | the root's fields, plus `operationId` and `operationName` of the child operation |
 //! | [`span_names::OPERATION`] (`durable_operation`) | each live step body and each `wait_for_condition` check | `executionArn`, `requestId`, `isReplay`, `tenantId`, `operationId`, `operationName`, `attempt` |
 //!
-//! A child span is detached from its parent, so a record inside a child
-//! body sees only the child span's fields. So the child span repeats the
-//! root's fields. `tenantId` is omitted when the invocation has no tenant
+//! A child span is a child of the span current when its namespace is
+//! created, so a record inside a child body also descends from the spans
+//! around it: the parent namespace's span, and a span a plugin entered
+//! around `next()` in `wrap_invocation` or `wrap_user_function`. The child
+//! span repeats the root's fields, so the innermost SDK span of a record
+//! holds the active namespace's or operation's values; where a formatter
+//! puts the fields of outer spans is the formatter's choice. A plugin's
+//! user-function span is a child of the SDK span of the user function it
+//! wraps. `tenantId` is omitted when the invocation has no tenant
 //! ID, and `operationName` is omitted when the operation has no recorded
 //! name. A map item or parallel branch always has one: the SDK records
 //! `map-item-{index}` or `parallel-branch-{index}` when the caller gave none.
@@ -50,8 +56,11 @@
 //! `durable_execution` span is dynamic: the SDK re-records it after every
 //! operation claim, so it flips to `false` the moment the invocation crosses
 //! the replay high-water mark. [`crate::ReplayFilterLayer`] is built on
-//! exactly this contract, and [`crate::init_default_subscriber`] installs
-//! a subscriber with it.
+//! exactly this contract: a record without its own `isReplay` field is
+//! suppressed when an SDK span between it and its nearest
+//! `durable_execution` span, that one included, is replaying. Spans outside
+//! that namespace, and spans the SDK did not create, decide nothing.
+//! [`crate::init_default_subscriber`] installs a subscriber with it.
 //!
 //! # Events
 //!
@@ -199,9 +208,10 @@
 //! Replay awareness carries over: an exporter that must not re-emit
 //! replayed work can drop events where `isReplay` is `true`.
 //! [`crate::ReplayFilterLayer`] implements exactly that
-//! rule for events that carry the field (and additionally suppresses
-//! application log lines emitted inside spans marked `isReplay = true`,
-//! which carry no field of their own).
+//! rule for events that carry the field. It additionally suppresses an
+//! application log line, which carries no field of its own, while an SDK
+//! span between the line and its nearest `durable_execution` span, that one
+//! included, has `isReplay = true`.
 
 /// The `tracing` target of every lifecycle event in this contract.
 ///
@@ -211,9 +221,11 @@ pub const TARGET: &str = "aws_durable_execution_sdk::lifecycle";
 
 /// Names of the spans the SDK creates.
 pub mod span_names {
-    /// Wraps one invocation of the handler, and, detached, each child
-    /// namespace's body: a `run_in_child_context` body, a map item, a
-    /// parallel branch and a `wait_for_callback` body.
+    /// Wraps one invocation of the handler, and each child namespace's
+    /// body: a `run_in_child_context` body, a map item, a parallel branch
+    /// and a `wait_for_callback` body, recorded, virtual or flat. A child
+    /// namespace's span is a child of the span current when the namespace
+    /// is created.
     ///
     /// The root span has `executionArn`, `requestId`, `isReplay` and
     /// `tenantId`. A child span adds the child operation's `operationId`

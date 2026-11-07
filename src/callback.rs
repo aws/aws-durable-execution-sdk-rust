@@ -602,10 +602,11 @@ where
             } => {
                 // Run inner body: create_callback + submitter step + await
                 // result. The body is a user function: its hooks and wraps
-                // run through the runner, and only the body carries the
-                // child namespace's replay-aware span, so a resumed body's
-                // log lines are suppressed while its nested operations
-                // replay. It runs as the child context's own body.
+                // run through the runner inside the child namespace's
+                // replay-aware span, so a resumed body's log lines, and its
+                // hooks' records, are suppressed while its nested
+                // operations replay. It runs as the child context's own
+                // body.
                 let child_span = child_ctx.replay_span();
                 let active = UserBody::Context(child_ctx.prefix().to_owned());
                 // The body's scope closes when the body returns, inside the

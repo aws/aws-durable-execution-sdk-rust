@@ -236,12 +236,16 @@ where
                 start,
                 after,
             } => {
-                // Run the child closure, instrumented with the child
-                // namespace's replay-aware span: on a resume, nested
-                // operations can still be replaying while the parent is
-                // live, and the child span's isReplay flag (kept current by
-                // the child's own mints) is what lets a filter suppress the
-                // body's pre-wait log lines exactly once.
+                // Run the child closure inside the child namespace's
+                // replay-aware span: on a resume, nested operations can
+                // still be replaying while the parent is live, and the child
+                // span's isReplay flag (kept current by the child's own
+                // mints) is what lets a filter suppress the body's pre-wait
+                // log lines exactly once. A live body's `Runner` owns the
+                // span and enters it outside its hooks and wraps on every
+                // poll and drop; a reconstruction or a `with_retry` attempt
+                // runs no user function, so its body is instrumented with
+                // the span instead.
                 //
                 // The scope encloses the closure call, so code the closure
                 // runs before it returns its future is checked too.
@@ -259,10 +263,11 @@ where
                 let result = if mode == ChildRunMode::Live
                     && user_function == UserFunctionPolicy::Hooks
                 {
-                    // A live body is a user function. Only the body
-                    // carries the span: the hooks and wraps run outside it.
-                    // The scope closes inside the body future, so it is
-                    // closed before the wire and the end hooks.
+                    // A live body is a user function. The runner enters the
+                    // span outside its hooks and wraps, so a span a wrap
+                    // enters is a child of it. The scope closes inside the
+                    // body future, so it is closed before the wire and the
+                    // end hooks.
                     crate::plugin::run_user_function(
                         after.ctx.shared_plugins(),
                         info,

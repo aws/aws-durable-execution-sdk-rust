@@ -1736,10 +1736,13 @@ where
     match item_before(&req).await? {
         ItemPrelude::Done(item) => Ok(item),
         ItemPrelude::Run { child_ctx } => {
-            // Instrument the branch body with the branch namespace's
-            // replay-aware span: a resumed branch's pre-wait log lines are
-            // suppressed while its own operations replay, independently of
-            // the root handler span and of sibling branches.
+            // Run the item body inside the item namespace's replay-aware
+            // span: a resumed item's pre-wait log lines are suppressed
+            // while its own operations replay, independently of the root
+            // handler span and of sibling items. A live body's `Runner`
+            // owns the span and enters it outside its hooks and wraps; a
+            // terminal item's rebuild runs no user function, so its body
+            // is instrumented with the span instead.
             let span = child_ctx.replay_span();
             let index = req.index;
             // The active-body scope encloses the closure call, so code the
@@ -1762,8 +1765,8 @@ where
             } else {
                 let info = user_function_info(&req, &item_ctx);
                 ItemBody::Ran(
-                    // Only the body carries the span: the hooks and wraps
-                    // run outside it, the body inside them. The scope
+                    // The runner enters the span outside the hooks and
+                    // wraps, and polls the body inside them. The scope
                     // closes inside the body future, so it is closed
                     // before the end hooks, as for a child context.
                     crate::plugin::run_user_function(
@@ -1839,10 +1842,11 @@ where
                     } else {
                         let info = user_function_info(&req, &item_ctx);
                         ItemBody::Ran(
-                            // Only the body carries the span, as for a
-                            // map item. The scope closes inside the body
-                            // future, so it is closed before the end
-                            // hooks, as for a map item.
+                            // The runner enters the span outside the hooks
+                            // and wraps, as for a map item. The scope
+                            // closes inside the body future, so it is
+                            // closed before the end hooks, as for a map
+                            // item.
                             crate::plugin::run_user_function(
                                 item_ctx.shared_plugins(),
                                 info,

@@ -378,6 +378,7 @@ impl Drop for TeardownGuard {
 /// code after the drive can still fill.
 pub(crate) async fn drive_invocation<F>(
     handler_future: F,
+    root_cx: crate::task::TaskContext,
     task_ownership: Arc<TaskOwnership>,
     coordinator: Arc<InvocationCoordinator>,
     root: crate::DurableContext,
@@ -386,9 +387,6 @@ pub(crate) async fn drive_invocation<F>(
 where
     F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
 {
-    // The handler runs inside the root context's frames (the invocation)
-    // and the span current when the invocation started.
-    let root_cx = crate::task::TaskContext::current();
     drive_with_scheduler(
         root_cx,
         handler_future,
@@ -585,9 +583,16 @@ pub(crate) async fn drive_outcome<F>(
 where
     F: Future<Output = Result<String, crate::error::WireError>> + Send + 'static,
 {
-    drive_invocation(handler_future, task_ownership, coordinator, root, remaining)
-        .await
-        .map(|(outcome, _)| outcome)
+    drive_invocation(
+        handler_future,
+        crate::task::TaskContext::current(),
+        task_ownership,
+        coordinator,
+        root,
+        remaining,
+    )
+    .await
+    .map(|(outcome, _)| outcome)
 }
 
 /// Test-only hooks of the driver.
@@ -2425,6 +2430,7 @@ mod suspension_containment_and_task_ownership {
 
         let mut drive = Box::pin(super::drive_invocation(
             handler,
+            crate::task::TaskContext::none(),
             Arc::clone(ctx.task_ownership()),
             Arc::clone(&coordinator),
             ctx.clone(),

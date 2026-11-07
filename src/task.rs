@@ -832,11 +832,11 @@ enum Gate {
 /// was created.
 ///
 /// A [`DurableFuture`](crate::DurableFuture) captures one when it is
-/// created. The gateway enters the frames around every poll and the drop
-/// of the task's future, and instruments the future with the span inside
-/// its own `catch_unwind`. So a task runs with the context of the code that
-/// created it, as JS's `AsyncLocalStorage` gives a promise the context it
-/// was created in.
+/// created. The gateway runs every poll and every drop of the task's
+/// future through [`TaskContext::catch`]: inside the span, then inside the
+/// frames. So a task runs with the context of the code that created it,
+/// as JS's `AsyncLocalStorage` gives a promise the context it was created
+/// in, and a span a plugin's wrap creates is a child of the captured span.
 #[derive(Debug, Clone)]
 pub(crate) struct TaskContext {
     frames: Frames,
@@ -866,6 +866,32 @@ impl TaskContext {
         self.frames.enter(f)
     }
 
+    /// Runs `action` inside the span, then inside the frames, and catches
+    /// every panic, for the task gateway:
+    ///
+    /// ```text
+    /// catch the span's enter and exit
+    ///   enter the span
+    ///     enter the frames
+    ///       catch the action
+    ///     leave the frames
+    ///   leave the span
+    /// ```
+    ///
+    /// No panic unwinds through a plugin frame. The action's result is kept
+    /// until the span has exited. The first panic wins: a panic entering
+    /// the span prevents the action, and a panic of the action wins over a
+    /// later panic exiting the span, which is discarded. A panic exiting
+    /// the span after the action returned wins over its value, which is
+    /// dropped with its own panic contained. An action that a panic
+    /// entering the span prevented is dropped the same way, after the
+    /// catch, so it never drops while that panic unwinds.
+    fn catch<R>(&self, action: impl FnOnce() -> R) -> std::thread::Result<R> {
+        catch_in_span(&self.span, || {
+            self.frames.enter(|| catch_unwind(AssertUnwindSafe(action)))
+        })
+    }
+
     /// The frames, for tests that check what a task runs inside.
     #[cfg(test)]
     pub(crate) fn frames(&self) -> &Frames {
@@ -879,6 +905,68 @@ impl TaskContext {
     }
 }
 
+/// Runs `action` inside `span` and catches every panic of the span's enter,
+/// the action and the span's exit:
+///
+/// ```text
+/// catch the span's enter and exit
+///   enter the span
+///     catch the action
+///   leave the span
+/// ```
+///
+/// The action's result is kept until the span has exited, so the span's
+/// exit never runs while a panic unwinds. The first panic wins: a panic
+/// entering the span prevents the action, and a panic of the action wins
+/// over a later panic exiting the span, which is discarded. A panic exiting
+/// the span after the action returned wins over its value, which is
+/// dropped with its own panic contained. An action that a panic entering
+/// the span prevented is dropped the same way, after the catch, so it
+/// never drops while that panic unwinds.
+pub(crate) fn catch_in_span<R>(
+    span: &tracing::Span,
+    action: impl FnOnce() -> std::thread::Result<R>,
+) -> std::thread::Result<R> {
+    let mut action = Some(action);
+    let mut inner = None;
+    let outer = catch_unwind(AssertUnwindSafe(|| {
+        let _entered = span.enter();
+        #[expect(clippy::expect_used)]
+        // reason: this closure runs once, and only the line below takes
+        // the action, so it is still present after the span's enter.
+        let action = action
+            .take()
+            .expect("the action is taken only once, after the span's enter");
+        inner = Some(catch_unwind(AssertUnwindSafe(action)).unwrap_or_else(Err));
+    }));
+    drop_after_first_panic(action);
+    match (inner, outer) {
+        (Some(result), Ok(())) => result,
+        (Some(Ok(value)), Err(exit)) => {
+            drop_after_first_panic(value);
+            Err(exit)
+        }
+        (Some(Err(first)), Err(exit)) => {
+            discard_panic(exit);
+            Err(first)
+        }
+        (None, outer) => {
+            #[expect(clippy::expect_used)]
+            // reason: the action's panic is caught inside the closure, so
+            // without a result the span's enter panicked.
+            Err(outer.expect_err("the action runs unless the span's enter panicked"))
+        }
+    }
+}
+
+/// Drops `task_cx` inside a catch. Its span's close and its frames'
+/// destruction run user code (a subscriber's `on_close`, a plugin's
+/// destructor), so a panic there is returned instead of unwinding through
+/// the gateway.
+fn dispose_task_cx(task_cx: TaskContext) -> std::thread::Result<()> {
+    catch_unwind(AssertUnwindSafe(move || drop(task_cx)))
+}
+
 /// The future of every gateway task: polls the inner future under
 /// `catch_unwind`, blesses the task before the first poll, and hands the
 /// outcome to the consumer before it releases its permits.
@@ -887,12 +975,13 @@ impl TaskContext {
 /// the inner future and closed the schedule, the bless guard drops before
 /// the task count.
 struct Wrapped<F: Future> {
-    /// The inner future, instrumented with its creator's span, so the span
-    /// is entered inside the catch around each poll and while it drops.
-    /// `None` once it finished or was dropped.
-    inner: Option<Pin<Box<tracing::instrument::Instrumented<F>>>>,
-    /// The frames every poll and the drop of `inner` run inside.
-    frames: Frames,
+    /// The inner future. `None` once it finished or was dropped.
+    inner: Option<Pin<Box<F>>>,
+    /// The span and the frames every poll and every drop of `inner` run
+    /// inside, through [`TaskContext::catch`]. Replaced with
+    /// [`TaskContext::none`] and dropped inside a catch once `inner` is
+    /// gone, because dropping the last clone of its span closes it.
+    task_cx: TaskContext,
     /// Present from the first poll of an operation task until it exits.
     bless: Option<BlessGuard>,
     /// The ownership handle to bless the task in, taken at the first poll.
@@ -917,11 +1006,8 @@ impl<F: Future> Wrapped<F> {
         permit: Option<TaskPermit>,
     ) -> Self {
         Self {
-            inner: Some(Box::pin(tracing::Instrument::instrument(
-                future,
-                task_cx.span,
-            ))),
-            frames: task_cx.frames,
+            inner: Some(Box::pin(future)),
+            task_cx,
             bless: None,
             ownership,
             coordinator,
@@ -971,25 +1057,22 @@ where
             .inner
             .as_mut()
             .expect("tokio does not poll a finished task");
-        // The frames' wraps are entered outside the catch, which stays
-        // innermost: a panic of the task's future, or of its span's enter
-        // and exit, is caught here and never unwinds through a plugin frame.
-        // `Frames::enter` lets nothing else unwind.
-        let frames = &this.frames;
+        // `TaskContext::catch` enters the span, then the frames, and
+        // catches innermost: a panic of the task's future, or of its span's
+        // enter and exit, never unwinds through a plugin frame.
+        let task_cx = &this.task_cx;
         let coordinator = &this.coordinator;
         let polled = match &this.gate {
             Gate::Scheduled { waker, .. } => {
                 let mut inner_cx = Context::from_waker(waker);
-                frames.enter(|| {
+                task_cx.catch(|| {
                     CURRENT_COORDINATOR.sync_scope(Arc::clone(coordinator), || {
-                        catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(&mut inner_cx)))
+                        inner.as_mut().poll(&mut inner_cx)
                     })
                 })
             }
-            Gate::Detached => frames.enter(|| {
-                CURRENT_COORDINATOR.sync_scope(Arc::clone(coordinator), || {
-                    catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx)))
-                })
+            Gate::Detached => task_cx.catch(|| {
+                CURRENT_COORDINATOR.sync_scope(Arc::clone(coordinator), || inner.as_mut().poll(cx))
             }),
         };
         let outcome = match polled {
@@ -1009,10 +1092,7 @@ where
             }
             Ok(Poll::Ready(value)) => {
                 let inner = this.inner.take();
-                let dropped = this
-                    .frames
-                    .enter(|| catch_unwind(AssertUnwindSafe(move || drop(inner))));
-                match dropped {
+                match this.task_cx.catch(move || drop(inner)) {
                     Ok(()) => TaskOutcome::Value(value),
                     Err(payload) => {
                         // The destructor's panic is the outcome. A panic
@@ -1027,8 +1107,26 @@ where
                 // The poll's panic is the outcome. A destructor panic after
                 // it is the task's second panic, so it is discarded.
                 let inner = this.inner.take();
-                this.frames.enter(move || drop_after_first_panic(inner));
+                if let Err(later) = this.task_cx.catch(move || drop(inner)) {
+                    discard_panic(later);
+                }
                 TaskOutcome::Panicked(payload)
+            }
+        };
+        // The task context is disposed of before the outcome is handed
+        // over: the last clone of its span closes here, and a subscriber's
+        // `on_close` is user code. Its panic is the task's panic only when
+        // the task had none.
+        let task_cx = std::mem::replace(&mut this.task_cx, TaskContext::none());
+        let outcome = match (dispose_task_cx(task_cx), outcome) {
+            (Ok(()), outcome) => outcome,
+            (Err(payload), TaskOutcome::Value(value)) => {
+                drop_after_first_panic(value);
+                TaskOutcome::Panicked(payload)
+            }
+            (Err(later), first @ TaskOutcome::Panicked(_)) => {
+                discard_panic(later);
+                first
             }
         };
         drop(this.bless.take());
@@ -1053,9 +1151,23 @@ impl<F: Future> Drop for Wrapped<F> {
         // An aborted task: its future is dropped before it finished, and
         // nobody reads an outcome. A panic from the future's destructor is
         // invocation-failing, so it is recorded.
-        if let Some(inner) = self.inner.take() {
-            let coordinator = &self.coordinator;
-            self.frames.enter(move || drop_recorded(coordinator, inner));
+        let dropped = match self.inner.take() {
+            Some(inner) => self.task_cx.catch(move || drop(inner)),
+            None => Ok(()),
+        };
+        // Then the task context, inside a catch: the last clone of its span
+        // closes here, and a subscriber's `on_close` is user code. A panic
+        // of the future's destructor came first, so it wins.
+        let task_cx = std::mem::replace(&mut self.task_cx, TaskContext::none());
+        match (dropped, dispose_task_cx(task_cx)) {
+            (Ok(()), Ok(())) => {}
+            (Err(payload), Ok(())) | (Ok(()), Err(payload)) => {
+                record_or_discard(&self.coordinator, payload);
+            }
+            (Err(first), Err(later)) => {
+                discard_panic(later);
+                record_or_discard(&self.coordinator, first);
+            }
         }
         // A waker that outlives the task takes no permit from now on.
         if let Gate::Scheduled { schedule, .. } = &self.gate {
@@ -3008,5 +3120,422 @@ mod tests {
         assert!(!ran.load(Ordering::SeqCst));
         join.abort();
         let _ = join.await;
+    }
+
+    thread_local! {
+        /// Set to make [`Scopes`] panic at the next exit of a `captured`
+        /// span on this thread.
+        static EXIT_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn arm_exit() {
+        EXIT_ARMED.with(|armed| armed.set(true));
+    }
+
+    thread_local! {
+        /// Set to make [`Scopes`] panic at the next enter of a `captured`
+        /// span on this thread.
+        static ENTER_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// Set to make [`Scopes`] panic `"close boom"` at the next close of
+        /// a `captured` span on this thread.
+        static CLOSE_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn arm_close() {
+        CLOSE_ARMED.with(|armed| armed.set(true));
+    }
+
+    /// A plugin whose invocation wrap enters a `frame` span around `next()`.
+    #[derive(Clone)]
+    struct FrameSpan;
+
+    impl crate::plugin::Plugin for FrameSpan {
+        fn wrap_invocation(&self, _info: &crate::plugin::InvocationInfo, next: &mut dyn FnMut()) {
+            tracing::info_span!("frame").in_scope(next);
+        }
+    }
+
+    impl crate::plugin::PluginFactory for FrameSpan {
+        fn create_plugin(
+            &self,
+            _info: &crate::plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn crate::plugin::Plugin>>, crate::BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// A task context with a `captured` span and an invocation frame whose
+    /// wrap enters a `frame` span.
+    fn captured_cx() -> super::TaskContext {
+        super::TaskContext::new(
+            crate::plugin::Frames::invocation(Some(crate::plugin::test_support::plugins_of(
+                FrameSpan,
+            ))),
+            tracing::info_span!("captured"),
+        )
+    }
+
+    /// One record a [`Scopes`] layer saw: its message and its stored span
+    /// chain, innermost first.
+    type Seen = Arc<Mutex<Vec<(String, Vec<&'static str>)>>>;
+
+    /// A layer that keeps every event's message and stored span chain, and
+    /// panics `"exit boom"` at an armed exit of a `captured` span.
+    struct Scopes(Seen);
+
+    impl<S> tracing_subscriber::Layer<S> for Scopes
+    where
+        S: tracing::Subscriber + for<'l> tracing_subscriber::registry::LookupSpan<'l>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            let chain = ctx
+                .event_scope(event)
+                .map(|scope| scope.map(|span| span.name()).collect())
+                .unwrap_or_default();
+            self.0.lock().unwrap().push((message.0, chain));
+        }
+
+        fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let captured = ctx.span(id).is_some_and(|span| span.name() == "captured");
+            let fire = captured && ENTER_ARMED.with(|armed| armed.replace(false));
+            assert!(!fire, "enter boom");
+        }
+
+        fn on_exit(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let captured = ctx.span(id).is_some_and(|span| span.name() == "captured");
+            let fire = captured && EXIT_ARMED.with(|armed| armed.replace(false));
+            assert!(!fire, "exit boom");
+        }
+
+        fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let captured = ctx.span(&id).is_some_and(|span| span.name() == "captured");
+            let fire = captured && CLOSE_ARMED.with(|armed| armed.replace(false));
+            assert!(!fire, "close boom");
+        }
+    }
+
+    /// Installs a [`Scopes`] layer on this thread.
+    fn scopes() -> (Seen, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let seen = Seen::default();
+        let guard = test_tracing::install_test_subscriber(
+            tracing_subscriber::registry().with(Scopes(Arc::clone(&seen))),
+        );
+        (seen, guard)
+    }
+
+    /// Asserts that `seen` holds exactly `messages`, each under the
+    /// `frame` span whose stored parent is the `captured` span.
+    fn assert_under_frame_in_captured(seen: &Seen, messages: &[&str]) {
+        let seen = seen.lock().unwrap().clone();
+        let got: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(got, messages, "{seen:?}");
+        for (message, chain) in &seen {
+            assert_eq!(chain, &["frame", "captured"], "{message}");
+        }
+    }
+
+    /// Logs `"<label> poll"` when polled and returns `Ready`, and logs
+    /// `"<label> drop"` when dropped.
+    struct Probe(&'static str);
+
+    impl Future for Probe {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            tracing::info!("{} poll", self.0);
+            Poll::Ready(())
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            tracing::info!("{} drop", self.0);
+        }
+    }
+
+    /// The gateway runs a poll and the destruction of a finished future
+    /// inside the captured frames, inside the captured span, for a
+    /// scheduled and a detached task.
+    #[tokio::test]
+    async fn gateway_scope_orders_captured_span_frames_and_action() {
+        let (seen, _guard) = scopes();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
+        let task = spawn_tracked(captured_cx(), &coord, &ownership(), Probe("scheduled"))
+            .expect("runtime");
+        assert!(matches!(task.await, TaskOutcome::Value(())));
+        drop(super::raw::spawn(super::Wrapped::new(
+            captured_cx(),
+            Probe("detached"),
+            None,
+            Arc::clone(&coord),
+            super::Gate::Detached,
+            super::Sink::Record,
+            Some(tasks.acquire()),
+        )));
+        tasks.wait_idle().await;
+        assert!(!coord.has_panic());
+        assert_under_frame_in_captured(
+            &seen,
+            &[
+                "scheduled poll",
+                "scheduled drop",
+                "detached poll",
+                "detached drop",
+            ],
+        );
+    }
+
+    /// Arms the exit panic, then panics `"poll boom"`, in its poll.
+    struct PollPanicsAfterArming;
+
+    impl Future for PollPanicsAfterArming {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            arm_exit();
+            panic!("poll boom");
+        }
+    }
+
+    /// Returns `Ready`; arms the exit panic, then panics `"drop boom"`, in
+    /// its destructor.
+    struct DropPanicsAfterArming;
+
+    impl Future for DropPanicsAfterArming {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Ready(())
+        }
+    }
+
+    impl Drop for DropPanicsAfterArming {
+        fn drop(&mut self) {
+            arm_exit();
+            panic!("drop boom");
+        }
+    }
+
+    /// The first panic of a gateway action wins over a later panic of the
+    /// captured span's exit; an exit panic after an action that returned
+    /// is the task's panic.
+    #[tokio::test]
+    async fn gateway_scope_keeps_the_first_panic() {
+        let (_seen, _guard) = scopes();
+        let coord = coordinator();
+        let own = ownership();
+        let poll =
+            spawn_tracked(captured_cx(), &coord, &own, PollPanicsAfterArming).expect("runtime");
+        assert_eq!(panicked_with(poll.await), Some("poll boom"));
+        let drop =
+            spawn_tracked(captured_cx(), &coord, &own, DropPanicsAfterArming).expect("runtime");
+        assert_eq!(panicked_with(drop.await), Some("drop boom"));
+        let exit = spawn_tracked(captured_cx(), &coord, &own, async {
+            arm_exit();
+            7
+        })
+        .expect("runtime");
+        assert_eq!(panicked_with(exit.await), Some("exit boom"));
+        assert!(
+            !EXIT_ARMED.with(std::cell::Cell::get),
+            "every armed exit fired"
+        );
+    }
+
+    /// Logs `"<label> drop"` when dropped, then panics `"drop boom"` when
+    /// `panics`.
+    struct LogsOnDrop {
+        label: &'static str,
+        panics: bool,
+    }
+
+    impl Drop for LogsOnDrop {
+        fn drop(&mut self) {
+            tracing::info!("{} drop", self.label);
+            assert!(!self.panics, "drop boom");
+        }
+    }
+
+    /// Panics `"poll boom"` when polled; holds a guard its own drop drops.
+    struct PollPanics {
+        _guard: LogsOnDrop,
+    }
+
+    impl Future for PollPanics {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            panic!("poll boom");
+        }
+    }
+
+    /// The drop of a finished future, the cleanup after a poll panic and
+    /// the drop of an aborted pending future run inside the captured span
+    /// and frames. A cleanup panic after a poll panic is discarded; a
+    /// destructor panic of an aborted future is recorded.
+    #[tokio::test]
+    async fn gateway_scope_covers_ready_failed_and_aborted_drops() {
+        let (seen, _guard) = scopes();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
+        let own = ownership();
+        let guard = |label, panics| LogsOnDrop { label, panics };
+        let ready = guard("ready", false);
+        let task = spawn_tracked(captured_cx(), &coord, &own, async move {
+            let _guard = ready;
+            std::future::ready(()).await;
+        })
+        .expect("runtime");
+        assert!(matches!(task.await, TaskOutcome::Value(())));
+        let task = spawn_tracked(
+            captured_cx(),
+            &coord,
+            &own,
+            PollPanics {
+                _guard: guard("failed", true),
+            },
+        )
+        .expect("runtime");
+        assert_eq!(panicked_with(task.await), Some("poll boom"));
+        assert!(!coord.has_panic(), "the cleanup panic was discarded");
+        let aborted = guard("aborted", true);
+        let task = spawn_tracked(captured_cx(), &coord, &own, async move {
+            let _guard = aborted;
+            std::future::pending::<()>().await;
+        })
+        .expect("runtime");
+        tokio::task::yield_now().await;
+        task.abort();
+        drop(task);
+        tasks.wait_idle().await;
+        let recorded = coord
+            .take_panic()
+            .expect("the aborted drop's panic is recorded");
+        assert_eq!(str_payload(recorded.as_ref()), Some("drop boom"));
+        assert_under_frame_in_captured(&seen, &["ready drop", "failed drop", "aborted drop"]);
+        // A panic entering the span prevents the drop inside it: the future
+        // is dropped after the catch, and its destructor's later panic is
+        // discarded. A fresh coordinator, because one keeps only its first
+        // panic.
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
+        let unentered = guard("unentered", true);
+        let task = spawn_tracked(captured_cx(), &coord, &own, async move {
+            let _guard = unentered;
+            std::future::pending::<()>().await;
+        })
+        .expect("runtime");
+        tokio::task::yield_now().await;
+        ENTER_ARMED.with(|armed| armed.set(true));
+        task.abort();
+        drop(task);
+        tasks.wait_idle().await;
+        let recorded = coord.take_panic().expect("the enter panic is recorded");
+        assert_eq!(str_payload(recorded.as_ref()), Some("enter boom"));
+        // The drop ran outside the frames. (The registry pushed the span
+        // before the layer panicked, so the span itself stays current.)
+        let seen = seen.lock().unwrap().clone();
+        let last = seen
+            .last()
+            .map(|(m, chain)| (m.as_str(), chain.contains(&"frame")));
+        assert_eq!(last, Some(("unentered drop", false)), "{seen:?}");
+    }
+
+    /// Returns `Pending` forever; arms the close panic, then panics
+    /// `"drop boom"`, in its destructor.
+    struct PendingDropPanicsAfterArmingClose;
+
+    impl Future for PendingDropPanicsAfterArmingClose {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDropPanicsAfterArmingClose {
+        fn drop(&mut self) {
+            arm_close();
+            panic!("drop boom");
+        }
+    }
+
+    /// The gateway disposes of a task's context, whose span closes with
+    /// it, inside a catch, after the future and before the outcome is
+    /// handed over. A close panic is the task's panic only when nothing
+    /// panicked first, on the completed and the aborted path.
+    #[tokio::test]
+    async fn gateway_disposes_task_context_with_the_first_panic() {
+        let (_seen, _guard) = scopes();
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
+        let own = ownership();
+        let completed = spawn_tracked(captured_cx(), &coord, &own, async {
+            arm_close();
+            7
+        })
+        .expect("runtime");
+        assert_eq!(panicked_with(completed.await), Some("close boom"));
+        let failed = spawn_tracked(captured_cx(), &coord, &own, async {
+            arm_close();
+            panic!("poll boom");
+        })
+        .expect("runtime");
+        assert_eq!(panicked_with(failed.await), Some("poll boom"));
+        assert!(!CLOSE_ARMED.with(std::cell::Cell::get), "the close fired");
+        assert!(!coord.has_panic(), "the later close panic was discarded");
+        // An aborted pending task: the close panic is recorded.
+        let aborted = spawn_tracked(captured_cx(), &coord, &own, std::future::pending::<()>())
+            .expect("runtime");
+        tokio::task::yield_now().await;
+        arm_close();
+        aborted.abort();
+        drop(aborted);
+        tasks.wait_idle().await;
+        let recorded = coord.take_panic().expect("the close panic is recorded");
+        assert_eq!(str_payload(recorded.as_ref()), Some("close boom"));
+        // An aborted task whose destructor panics first: that panic is
+        // recorded, and the close panic after it is discarded.
+        let coord = coordinator();
+        let tasks = Arc::clone(coord.tasks());
+        let aborted = spawn_tracked(
+            captured_cx(),
+            &coord,
+            &own,
+            PendingDropPanicsAfterArmingClose,
+        )
+        .expect("runtime");
+        tokio::task::yield_now().await;
+        aborted.abort();
+        drop(aborted);
+        tasks.wait_idle().await;
+        assert!(!CLOSE_ARMED.with(std::cell::Cell::get), "the close fired");
+        let recorded = coord
+            .take_panic()
+            .expect("the destructor panic is recorded");
+        assert_eq!(str_payload(recorded.as_ref()), Some("drop boom"));
     }
 }

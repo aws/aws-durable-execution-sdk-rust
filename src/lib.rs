@@ -220,7 +220,6 @@ pub mod lambda_types {
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::time::Duration;
-use tracing::Instrument as _;
 
 /// Boxed error type: `Box<dyn std::error::Error + Send + Sync>`.
 ///
@@ -1322,9 +1321,10 @@ where
             }
 
             // Run the handler through the driver which handles suspension.
-            // The handler future is instrumented with the handler-level span
-            // so user log events between operations carry the execution ARN
-            // and the live `isReplay` flag.
+            // The root task runs inside the handler-level span, then inside
+            // the invocation's frames, so user log events between operations
+            // carry the execution ARN and the live `isReplay` flag, and a
+            // span a `wrap_invocation` enters is a child of that span.
             //
             // The handler runs as the root context's body, so an operation
             // called on a child context that escaped its closure fails the
@@ -1340,8 +1340,7 @@ where
                     Ok(result) => serialize_handler_result(&result),
                     Err(e) => Err(wire_error_from_box_error(e)),
                 }
-            })
-            .instrument(replay_span);
+            });
             // An invocation-failing panic (of the handler, of the
             // checkpoint client, or of any task the SDK started) returns
             // here only after the driver cleaned up every task, and leaves
@@ -1357,11 +1356,17 @@ where
             // never resumes a panic itself. So it finishes, and is dropped
             // inside the wraps, before the contexts and plugins are dropped
             // and before any panic resumes.
+            //
+            // The root task's own context is built from the same frames and
+            // the handler-level span. That span covers the root task's polls
+            // and drop, not the processing after the drive.
             let frames = plugin::Frames::invocation(plugins.clone());
+            let root_cx = task::TaskContext::new(frames.clone(), replay_span);
             let finished = plugin::Frames::instrument(
                 &frames,
                 CatchFinished::new(finish_invocation(
                     root,
+                    root_cx,
                     task_ownership,
                     coordinator,
                     &flush_ctx,
@@ -1459,8 +1464,13 @@ enum Finished {
 /// Drives the handler, flushes, runs the end hooks and builds the
 /// response. It returns a panic as a value, so its caller resumes it only
 /// after this future was dropped inside the plugins' wraps.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the root task's future and its context are passed apart, as `spawn_root` takes them"
+)]
 async fn finish_invocation<R>(
     root: R,
+    root_cx: task::TaskContext,
     task_ownership: std::sync::Arc<driver::TaskOwnership>,
     coordinator: std::sync::Arc<coordinator::InvocationCoordinator>,
     flush_ctx: &DurableContext,
@@ -1473,6 +1483,7 @@ where
 {
     let (outcome, fatal_won) = match driver::drive_invocation(
         root,
+        root_cx,
         task_ownership,
         coordinator,
         flush_ctx.clone(),
@@ -1806,9 +1817,10 @@ pub(crate) fn outcome_envelope(
         ),
         driver::InvocationOutcome::Pending => {
             // Emitted while the handler's `durable_execution` span is
-            // entered, the instrumented handler future has already been
-            // dropped, but the context still holds the span handle, so
-            // the event is a span event of the execution span, matching
+            // entered. The root task, whose `TaskContext` entered that span
+            // around every poll and the drop of the handler future, has
+            // already ended, but the context still holds the span handle,
+            // so the event is a span event of the execution span, matching
             // the documented OpenTelemetry bridge (see
             // `crate::observability`).
             let execution_span = ctx.replay_span();
@@ -3714,6 +3726,7 @@ mod tests {
         let end_log = engine::CheckpointLog::empty();
         let finished = finish_invocation(
             root(ctx.clone()),
+            task::TaskContext::current(),
             std::sync::Arc::clone(ctx.task_ownership()),
             std::sync::Arc::clone(ctx.coordinator()),
             &ctx,

@@ -4462,6 +4462,104 @@ mod tests {
         (ctx, client)
     }
 
+    /// A plugin whose user-function wrap enters a `plugin_user_function`
+    /// span whose `trace_id` is the info's ID, as the README's Example 2
+    /// does.
+    #[derive(Clone)]
+    struct TraceSpan;
+
+    impl crate::plugin::Plugin for TraceSpan {
+        fn wrap_user_function(&self, info: &crate::plugin::OperationInfo, next: &mut dyn FnMut()) {
+            let span = tracing::info_span!("plugin_user_function", trace_id = %info.id());
+            span.in_scope(next);
+        }
+    }
+
+    impl crate::plugin::PluginFactory for TraceSpan {
+        fn create_plugin(
+            &self,
+            _info: &crate::plugin::InvocationInfo,
+        ) -> Result<Option<Box<dyn crate::plugin::Plugin>>, crate::BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// A record of the body `run_join` runs has the caller's span, then the
+    /// plugin's span, as its stored ancestry; the body runs under the
+    /// caller's active body; the plugin's trace ID is the join's
+    /// `OperationInfo::id()`, and the innermost SDK span is the caller's
+    /// namespace span with the caller's correlation operation ID.
+    #[tokio::test]
+    async fn run_join_body_record_is_under_the_plugin_span() {
+        use tracing::Instrument as _;
+        let (buffer, _guard) = crate::plugin::test_support::capture();
+        let (ctx, _client) = plugin_ctx(
+            CheckpointLog::empty(),
+            None,
+            crate::plugin::test_support::plugins_of(TraceSpan),
+        );
+        // A caller namespace with its own correlation operation ID, so a
+        // join that replaced the caller's span would change the record.
+        let caller = ctx.replay_span().in_scope(|| {
+            crate::tracing_layer::scoped_execution_span(
+                "arn:aws:lambda:us-east-1:1:function:test",
+                "req-caller",
+                None,
+                "caller-op",
+                Some("caller-name"),
+                false,
+            )
+        });
+        let joined = crate::context::run_body(
+            crate::context::ActiveBody::Context("caller".to_owned()),
+            run_join(
+                &ctx,
+                "7",
+                "join-wire",
+                Some("j"),
+                Run::Live,
+                async {
+                    tracing::info!("join body");
+                    Ok::<_, std::convert::Infallible>(crate::context::current_body())
+                },
+                crate::plugin::never_fails,
+            ),
+        )
+        .instrument(caller)
+        .await;
+        let Ok(active) = joined;
+        assert!(
+            matches!(&active, crate::context::ActiveBody::Context(id) if id == "caller"),
+            "{active:?}"
+        );
+        let output = String::from_utf8_lossy(&buffer.lock().unwrap()).to_string();
+        let record = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|v| v["message"] == "join body")
+            .unwrap_or_else(|| panic!("no join body record in {output}"));
+        let spans = record["spans"].as_array().expect("a span list");
+        let names: Vec<&str> = spans.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "durable_execution",
+                "durable_execution",
+                "plugin_user_function"
+            ],
+            "{record}"
+        );
+        assert_eq!(spans[2]["trace_id"], "join-wire", "{record}");
+        // The innermost SDK span is the caller's, with its exact operation
+        // ID, and no span carries the join's ID as a correlation field.
+        assert_eq!(spans[1]["operationId"], "caller-op", "{record}");
+        assert_eq!(spans[1]["operationName"], "caller-name", "{record}");
+        assert_eq!(spans[1]["requestId"], "req-caller", "{record}");
+        assert!(spans[0].get("operationId").is_none(), "{record}");
+        assert!(spans[2].get("operationId").is_none(), "{record}");
+        assert_eq!(record.get("operationId"), None, "{record}");
+    }
+
     /// Test 13: on a `PENDING` or `READY` combinator record, the replay
     /// start hooks of resuming waits fire before the combinator's.
     #[tokio::test]

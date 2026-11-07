@@ -659,12 +659,15 @@ struct Inner {
     owners: Arc<[String]>,
     /// This namespace's `durable_execution` span. For a root context it is
     /// the handler-level span wrapping the invocation; for a child context
-    /// (sequential child, map/parallel branch, callback body) it is a
-    /// detached span wrapping that child's body. [`DurableContext::mint_id`]
+    /// (sequential child, map/parallel branch, callback body), recorded,
+    /// virtual or flat, it is a child of the span current when the context
+    /// is created, wrapping that child's body. [`DurableContext::mint_id`]
     /// re-records its `isReplay` field after every operation claim minted
     /// through this context, so replay-aware filters (see
     /// `tracing_layer::ReplayFilterLayer`) can suppress log events emitted
-    /// while THIS namespace is replaying. Per-namespace spans are what keep
+    /// while THIS namespace is replaying: the filter reads the SDK spans
+    /// from an event up to and including its nearest namespace span, and
+    /// stops there. Per-namespace spans are what keep
     /// concurrent branches, each with its own replay high-water mark, from
     /// clobbering each other's flag.
     replay_span: tracing::Span,
@@ -1021,9 +1024,14 @@ impl DurableContext {
         ));
         // The child namespace has its own replay high-water mark: nested
         // operations can still be replaying while the parent is already
-        // live. Give it its own detached span, initialized from the CHILD
-        // engine's replay status; the child's mints keep it current, and the
-        // parent span keeps the value the parent's own mints gave it.
+        // live. Give it its own span, initialized from the CHILD engine's
+        // replay status; the child's mints keep it current, and the parent
+        // span keeps the value the parent's own mints gave it. The span is
+        // a child of the span current here, so a span a plugin entered
+        // around the code that creates this context is an ancestor of the
+        // child body's records. The replay filter decides by this span and
+        // the SDK operation spans inside this namespace, never by a parent
+        // namespace's span.
         let replay_span = crate::tracing_layer::scoped_execution_span(
             &self.inner.execution_arn,
             &self.inner.lambda_context.request_id,
@@ -1071,7 +1079,9 @@ impl DurableContext {
             Arc::clone(&self.inner.engine.checkpoint_log),
         ));
         // The virtual namespace has its own replay high-water mark, so it
-        // gets its own span, as a child from `new_child` does.
+        // gets its own span, a child of the current span, as a child from
+        // `new_child` does. It carries the virtual operation's stable ID,
+        // and no record is written for it.
         let replay_span = crate::tracing_layer::scoped_execution_span(
             &self.inner.execution_arn,
             &self.inner.lambda_context.request_id,
@@ -1253,10 +1263,11 @@ impl DurableContext {
         self.mint_id()
     }
 
-    /// Returns this namespace's `durable_execution` span. The handler future
-    /// (for a root context) or the child body future (for a child context)
-    /// is instrumented with it so log events inherit the execution ARN,
-    /// request ID, and the namespace's live `isReplay` flag.
+    /// Returns this namespace's `durable_execution` span. The root task (for
+    /// a root context) or the child body's runner (for a child context)
+    /// enters it outside the plugin frames and wraps, so log events inherit
+    /// the execution ARN, request ID, and the namespace's live `isReplay`
+    /// flag, and a span a plugin enters around `next()` is its child.
     pub(crate) fn replay_span(&self) -> tracing::Span {
         self.inner.replay_span.clone()
     }
@@ -1303,7 +1314,9 @@ impl DurableContext {
             Arc::clone(&self.inner.engine.checkpoint_log),
         ));
         // A flat branch has its own namespace and replay high-water mark,
-        // so it gets its own span, as a child from `new_child` does.
+        // so it gets its own span, a child of the current span, as a child
+        // from `new_child` does. It carries the virtual child's stable ID,
+        // and no record is written for it.
         let replay_span = crate::tracing_layer::scoped_execution_span(
             &self.inner.execution_arn,
             &self.inner.lambda_context.request_id,

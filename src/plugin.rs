@@ -712,7 +712,13 @@ pub trait Plugin: Send + Sync {
     /// end-of-invocation flush, the drain of the hook work and
     /// [`on_invocation_end`](Self::on_invocation_end). A wrap that calls
     /// `next()` inside its context, for example with a `tracing` span's
-    /// `in_scope`, makes the context current in all of that code. The
+    /// `in_scope`, makes the context current in all of that code. Each SDK
+    /// task enters its own `tracing` span outside these wraps: the root
+    /// task the invocation's `durable_execution` span, another task the
+    /// span current when its operation was created. So a span this wrap
+    /// creates is a child of that span, and the handler's records, the
+    /// records of every child namespace, recorded, virtual or flat, and the
+    /// records of the handler's destructors descend from it. The
     /// invocation is no user function, so no start or end hook fires for it;
     /// the wraps of each user function run inside these wraps, as
     /// [`wrap_user_function`](Self::wrap_user_function) describes.
@@ -768,7 +774,12 @@ pub trait Plugin: Send + Sync {
     /// 1. [`on_operation_start`](Self::on_operation_start) and, for a step
     ///    attempt or a check, [`on_attempt_start`](Self::on_attempt_start)
     ///    run first, as for any operation.
-    /// 2. At the first poll, `p0.on_user_function_start` runs. When it
+    /// 2. At every poll, the SDK first enters the user function's `tracing`
+    ///    span: the operation span of a step attempt or a check, the
+    ///    namespace span of a child, item, branch, container or
+    ///    `wait_for_callback` body, and the caller's current span for a
+    ///    combinator's join. Everything below runs inside it.
+    /// 3. At the first poll, `p0.on_user_function_start` runs. When it
     ///    started `p0`, `p0.wrap_user_function` runs, and inside its
     ///    `next()` the same happens for `p1`. Inside `p1`'s `next()` the SDK
     ///    polls the user function. A start hook whose synchronous call
@@ -776,17 +787,17 @@ pub trait Plugin: Send + Sync {
     ///    no wrap and no end hook for this user function, and the SDK logs a
     ///    warning. A start hook that returns `Ok(Some(future))` started its
     ///    plugin, and a later failure of that future is only logged.
-    /// 3. At every poll, the wraps of the started plugins run, then the SDK
-    ///    enters the operation's `tracing` span, then it polls the user
-    ///    function. The SDK calls the user's closure at the first poll,
-    ///    inside the wraps and the span. Later polls run no start hook.
-    /// 4. In the poll in which the user function returns, the SDK derives
+    /// 4. At every poll, the wraps of the started plugins run, then the SDK
+    ///    polls the user function inside them. The SDK calls the user's
+    ///    closure at the first poll, inside the span and the wraps. Later
+    ///    polls run no start hook.
+    /// 5. In the poll in which the user function returns, the SDK derives
     ///    the error it records, once, when the user function failed. The
     ///    wraps then unwind with no await between them: `p1`'s wrap returns,
     ///    `p1.on_user_function_end` runs inside `p0`'s wrap, `p0`'s wrap
     ///    returns, and `p0.on_user_function_end` runs. So the start hooks
     ///    run in registration order and the end hooks in reverse.
-    /// 5. Then the SDK serializes the value, writes the outcome checkpoint,
+    /// 6. Then the SDK serializes the value, writes the outcome checkpoint,
     ///    and fires [`on_attempt_end`](Self::on_attempt_end) for a step
     ///    attempt or a check, and
     ///    [`on_operation_end`](Self::on_operation_end). So an end hook runs
@@ -818,11 +829,24 @@ pub trait Plugin: Send + Sync {
     /// that made them. An operation awaited directly runs in the wraps and
     /// the span of the code that awaits it.
     ///
-    /// Inside a wrap, the current `tracing` span is the poller's. The SDK
-    /// enters the operation's span inside the innermost `next()`, so the
-    /// user function runs in it, and so does the synchronous code of a map
-    /// item's closure. The start hooks, and the formatting of the error
-    /// that the SDK records, run outside the operation's span.
+    /// Inside a wrap, the current `tracing` span is the user function's
+    /// span. So a span a wrap enters around `next()` is a child of it, and
+    /// every record of the user function, the synchronous code of a map
+    /// item's closure and the destructors of the user function's future
+    /// included, descends from both. The start and end hooks, and the
+    /// formatting of the error that the SDK records, run inside the user
+    /// function's span too. So their records follow that span's replay
+    /// state: [`ReplayFilterLayer`](crate::ReplayFilterLayer) suppresses an
+    /// unmarked record while the user function's span, or an SDK span
+    /// between it and its nearest `durable_execution` span, replays. It
+    /// keeps such a record while the parent namespace alone replays, and
+    /// keeps a record that carries its own `isReplay = false`. The SDK does
+    /// not enter an operation's own span around that operation's start,
+    /// end, attempt or change hooks, nor around the invocation hooks. An
+    /// operation that a user function runs calls its hooks on that user
+    /// function's poll, so those hooks run inside the enclosing user
+    /// function's span and wraps. A future that a hook returns runs on its
+    /// own task, outside every user function's span and wrap.
     ///
     /// A wrap runs on whichever thread polls, as often as the SDK polls, and
     /// the synchronous part of each start and end hook runs on the
@@ -1232,7 +1256,7 @@ pub trait Plugin: Send + Sync {
     /// check, `on_attempt_start`. It runs inside the wraps of the enclosing
     /// user functions and of the plugins registered before this one, and
     /// before this plugin's [`wrap_user_function`](Self::wrap_user_function).
-    /// It runs outside the operation's `tracing` span. `info` is described
+    /// It runs inside the user function's `tracing` span. `info` is described
     /// in the section on operation metadata of `wrap_user_function`, which
     /// also gives the order of every hook and wrap and the cases that fire
     /// no hook.

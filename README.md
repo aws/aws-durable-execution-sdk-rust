@@ -1662,8 +1662,13 @@ can inspect the serialized checkpoint payload through
 expose a method generic over each operation's `O`.
 
 Example 2 puts a trace ID on every log event of a user function:
-`wrap_user_function` calls `span.in_scope(next)`, so the events the user
-function emits are parented to the span and carry its `trace_id` field.
+`wrap_user_function` calls `span.in_scope(next)`. The SDK enters the user
+function's own span (the step's `durable_operation` span, or the child's
+`durable_execution` span) before it calls the wrap, so the plugin's span is
+a child of the SDK's span, and the events the user function emits descend
+from both: they carry the plugin's `trace_id` and the SDK's correlation
+fields, and the replay filter still suppresses them while their namespace
+replays.
 
 ```rust no_run
 use aws_durable_execution_sdk as durable;
@@ -1702,9 +1707,13 @@ parallel and `parallel_mixed` branches, combinator inputs) inside the wraps
 and the `tracing` span that were current when that operation's builder
 became its future (`.await`, `.spawn()` or `.future()`), or, for a map item
 or branch, when the container dispatched it, around every poll and every
-drop. The handler's root task runs inside the invocation's wraps, captured
-when it is dispatched. An operation awaited directly runs inside the wraps
-of the code that awaits it, plus its own.
+drop. The SDK enters the captured span first and the wraps inside it, so a
+span a wrap enters is a child of the captured span. The handler's root task
+runs inside the invocation's `durable_execution` span and, inside it, the
+invocation's wraps, around every poll and its drop. A child namespace's
+`durable_execution` span is a child of the span current when the child
+context is created. An operation awaited directly runs inside the wraps of
+the code that awaits it, plus its own.
 
 A user-started task is outside SDK propagation and must use the relevant
 explicit carrier: tracing instrumentation, capture `Context::current()` and
@@ -1741,9 +1750,29 @@ tokio::spawn(async move { my_plugin::in_context(context, work).await });
 
 To add fields such as a trace ID to log events, enter a span that carries
 the fields around `next()` in `wrap_invocation` or `wrap_user_function`.
-Events emitted inside are parented to that span, and the application's
+Events emitted inside descend from that span, and the application's
 `tracing` subscriber or layer can render the span's fields. The SDK enters
 the wraps on every task it starts for an operation.
+
+A span entered in `wrap_invocation` is an ancestor of the handler's
+records, the records of the handler's destructors, and the records of every
+child namespace, recorded, virtual or flat. A span entered in
+`wrap_user_function` is a child of the user function's SDK span: the
+operation span of a step attempt or a `wait_for_condition` check, the
+namespace span of a child context, a map item, a parallel or
+`parallel_mixed` branch, a container or a `wait_for_callback` body, and the
+caller's span for a combinator's join. The start and end hooks of a user
+function run inside that SDK span too, so `ReplayFilterLayer` suppresses an
+unmarked record they emit while the user function's namespace replays, and
+keeps a record that carries its own `isReplay = false`.
+
+`ReplayFilterLayer` decides a record without its own `isReplay` field by the
+SDK spans between the record and its nearest `durable_execution` span, that
+one included: a live child is not suppressed by a replaying parent, and a
+replaying child is not enabled by a live parent. A span the SDK did not
+create decides nothing, even when it declares an `isReplay` field. Where a
+formatter puts the fields of the outer spans in its output is the
+formatter's choice.
 
 ### When each operation hook fires
 

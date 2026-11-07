@@ -605,9 +605,9 @@ impl Drop for EmitsOnDrop {
 /// stays pending; the enclosing scope closes, which aborts the task. Both
 /// events are inside `outer`.
 ///
-/// A child body's scope closing is what aborts the task, and a child body
-/// runs in its own detached span, so `outer` is entered inside the child
-/// body rather than around the handler.
+/// A child body's scope closing is what aborts the task, so `outer`
+/// instruments the child body, where the step is spawned, rather than the
+/// handler.
 /// Current-thread, so the thread-local subscriber sees every event.
 #[tokio::test]
 async fn span_entered_on_poll_and_on_drop() {
@@ -1134,10 +1134,10 @@ async fn a_step_attempts_user_function_hooks_see_the_started_attempt() {
     }
 }
 
-/// A plugin's start hook runs outside the SDK's step span; the
-/// body's event runs inside it.
+/// A plugin's start hook and the body's event both run inside the SDK's
+/// step span.
 #[tokio::test]
-async fn a_start_hook_runs_outside_the_step_span_and_the_body_inside_it() {
+async fn a_start_hook_and_the_body_run_inside_the_step_span() {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     let names = ScopeNames::default();
@@ -1159,7 +1159,7 @@ async fn a_start_hook_runs_outside_the_step_span_and_the_body_inside_it() {
     assert_eq!(seen.len(), 2, "one start and one body event: {seen:?}");
     let start = seen.first().expect("a start event");
     let body = seen.get(1).expect("a body event");
-    assert!(!start.contains(&"durable_operation"), "{start:?}");
+    assert!(start.contains(&"durable_operation"), "{start:?}");
     assert!(body.contains(&"durable_operation"), "{body:?}");
 }
 
@@ -1986,5 +1986,282 @@ fn assert_frames(
     for ((what, _), scope) in seen.iter().zip(scopes) {
         assert!(scope.contains(&span), "{kind:?} {what} span: {scope:?}");
         assert!(!scope.contains(&other), "{kind:?} {what} span: {scope:?}");
+    }
+}
+
+/// The log [`PanicsAtCaptured`] and [`CapturedFrames`] share.
+type Log = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+fn log(log: &Log, line: &str) {
+    log.lock().expect("not poisoned").push(line.to_owned());
+}
+
+type Flag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+thread_local! {
+    /// The spans entered on this thread.
+    static DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A layer that, once `armed` is set, panics `"span subscriber panics"`
+/// at the next outermost enter or exit of a `captured` span, once, and
+/// logs `panic` first. It sets `started` at the step's `START` lifecycle
+/// event, which the checkpoint path emits inside `captured` too.
+struct PanicsAtCaptured {
+    at: SpanCallback,
+    armed: Flag,
+    started: Flag,
+    log: Log,
+}
+
+impl PanicsAtCaptured {
+    fn hit<S>(&self, id: &tracing::span::Id, ctx: &tracing_subscriber::layer::Context<'_, S>)
+    where
+        S: tracing::Subscriber + for<'l> tracing_subscriber::registry::LookupSpan<'l>,
+    {
+        let captured = ctx.span(id).is_some_and(|span| span.name() == "captured");
+        // Outermost: the gateway's own enter or exit, not one nested in a
+        // poll.
+        let outermost = DEPTH.with(Cell::get) == 0;
+        if !captured || !outermost || !self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        log(&self.log, "panic");
+        #[expect(clippy::panic, reason = "the subscriber panic under test")]
+        {
+            panic!("span subscriber panics");
+        }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for PanicsAtCaptured
+where
+    S: tracing::Subscriber + for<'l> tracing_subscriber::registry::LookupSpan<'l>,
+{
+    fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if self.at == SpanCallback::Enter {
+            self.hit(id, &ctx);
+        }
+        DEPTH.with(|depth| depth.set(depth.get() + 1));
+    }
+
+    fn on_exit(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        if self.at == SpanCallback::Exit {
+            self.hit(id, &ctx);
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let in_captured = ctx
+            .event_span(event)
+            .is_some_and(|span| span.name() == "captured");
+        if in_captured && event.metadata().target() == durable::observability::TARGET {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// A plugin whose invocation wrap logs, for a frame entered inside a
+/// `captured` span, `enter` before `next()`, and after it whether the
+/// thread panics.
+#[derive(Clone)]
+struct CapturedFrames(Log);
+
+impl Plugin for CapturedFrames {
+    fn wrap_invocation(&self, _info: &InvocationInfo, next: &mut dyn FnMut()) {
+        let captured = tracing::Span::current()
+            .metadata()
+            .is_some_and(|meta| meta.name() == "captured");
+        if captured {
+            log(&self.0, "enter");
+        }
+        next();
+        if captured {
+            log(
+                &self.0,
+                &format!("after panicking={}", std::thread::panicking()),
+            );
+        }
+    }
+}
+
+/// The message of a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
+}
+
+/// Runs a handler that `.spawn()`s, inside a `captured` span, the step `s`
+/// running `body`, with a [`PanicsAtCaptured`] at `at` installed and
+/// [`CapturedFrames`] registered. `body` gets the layer's `armed` and
+/// `started` flags and a `ready` flag. The handler awaits the step when
+/// `await_step`; otherwise, once the body set `ready`, it arms the layer
+/// and returns, which stops the step. Returns the message of the panic the invocation fails with, and
+/// the log.
+async fn failing_run<B, Fut>(at: SpanCallback, await_step: bool, body: B) -> (String, Vec<String>)
+where
+    B: Fn(Flag, Flag, Flag) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<u32, BoxError>> + Send + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = Log::default();
+    let layer = PanicsAtCaptured {
+        at,
+        armed: Flag::default(),
+        started: Flag::default(),
+        log: std::sync::Arc::clone(&log),
+    };
+    let flags = (
+        std::sync::Arc::clone(&layer.armed),
+        std::sync::Arc::clone(&layer.started),
+        Flag::default(),
+    );
+    let plugin = CapturedFrames(std::sync::Arc::clone(&log));
+    let _guard = test_tracing::install_test_subscriber(tracing_subscriber::registry().with(layer));
+    #[expect(clippy::disallowed_methods)]
+    // reason: the test observes the panic the run resumes, which only a
+    // task's JoinHandle reports.
+    let joined = tokio::spawn(async move {
+        LocalRunner::new()
+            .options(
+                Options::builder()
+                    .plugin(Each(plugin))
+                    .build()
+                    .expect("valid options"),
+            )
+            .run(
+                move |_event: (), ctx: DurableContext| {
+                    let (body, flags) = (body.clone(), flags.clone());
+                    async move {
+                        let (armed, ready) = (
+                            std::sync::Arc::clone(&flags.0),
+                            std::sync::Arc::clone(&flags.2),
+                        );
+                        let handle = tracing::info_span!("captured").in_scope(|| {
+                            ctx.step(move |_| {
+                                body(flags.0.clone(), flags.1.clone(), flags.2.clone())
+                            })
+                            .name("s")
+                            .spawn()
+                        });
+                        if await_step {
+                            handle.await?;
+                        } else {
+                            while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+                                tokio::task::yield_now().await;
+                            }
+                            // The step's poll that set `ready` has ended:
+                            // its drop is the next enter and exit.
+                            armed.store(true, std::sync::atomic::Ordering::SeqCst);
+                            drop(handle);
+                        }
+                        Ok::<_, BoxError>(())
+                    }
+                },
+                (),
+            )
+            .await
+    })
+    .await;
+    let message = panic_message(&*joined.expect_err("the invocation fails").into_panic());
+    let seen = log.lock().expect("not poisoned").clone();
+    (message, seen)
+}
+
+/// Yields until the step's `START` event was emitted inside `captured`,
+/// so the next outermost enter or exit of `captured` is the gateway's.
+async fn after_start(started: &Flag) {
+    while !started.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The gateway catches a subscriber panic at its captured span's enter
+/// before it enters any captured frame, and one at its exit after every
+/// frame returned normally. A step body's panic is caught inside the
+/// frames, whose wraps then run with no panic in flight, and it wins over
+/// the later exit panic.
+#[tokio::test]
+async fn captured_span_panic_is_caught_outside_plugin_frames() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let after_frame = ["enter", "after panicking=false", "panic"];
+    for (at, body_panics, expected, message) in [
+        (
+            SpanCallback::Enter,
+            false,
+            &["panic"][..],
+            "span subscriber panics",
+        ),
+        (
+            SpanCallback::Exit,
+            false,
+            &after_frame[..],
+            "span subscriber panics",
+        ),
+        (SpanCallback::Exit, true, &after_frame[..], "body panics"),
+    ] {
+        let (reported, seen) = failing_run(at, true, move |armed, started, _ready| async move {
+            after_start(&started).await;
+            armed.store(true, SeqCst);
+            if at == SpanCallback::Enter {
+                // The gateway's next poll enters `captured` and panics.
+                tokio::task::yield_now().await;
+            }
+            assert!(!body_panics, "body panics");
+            Ok(1_u32)
+        })
+        .await;
+        let case = format!("{at:?} body_panics={body_panics}");
+        assert_eq!(reported, message, "{case}");
+        let seen: Vec<&str> = seen.iter().map(String::as_str).collect();
+        let panic = seen.iter().position(|l| *l == "panic").expect("the panic");
+        // The last frame before the panic, and its end.
+        let start = (panic + 1).saturating_sub(expected.len());
+        let before = seen.get(start..=panic);
+        assert_eq!(before, Some(expected), "{case}: {seen:?}");
+        if at == SpanCallback::Enter {
+            // The panicking poll entered no frame: the frame before the
+            // panic is the previous poll's, which ended.
+            assert_eq!(
+                seen.get(panic.saturating_sub(1)),
+                Some(&"after panicking=false"),
+                "{case}: {seen:?}"
+            );
+        }
+        assert!(!seen.contains(&"after panicking=true"), "{case}: {seen:?}");
+    }
+}
+
+/// A subscriber panic entering or exiting the captured span while the
+/// gateway drops an aborted pending task fails the invocation, and no
+/// panic unwinds through the task's captured frames.
+#[tokio::test]
+async fn captured_span_panic_during_aborted_task_drop_is_recorded() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for at in [SpanCallback::Enter, SpanCallback::Exit] {
+        let (reported, seen) = failing_run(at, false, |_armed, started, ready| async move {
+            after_start(&started).await;
+            ready.store(true, SeqCst);
+            std::future::pending::<Result<u32, BoxError>>().await
+        })
+        .await;
+        assert_eq!(reported, "span subscriber panics", "{at:?}");
+        let seen: Vec<&str> = seen.iter().map(String::as_str).collect();
+        let panic = seen.iter().position(|l| *l == "panic").expect("the panic");
+        let expected: &[&str] = match at {
+            // The drop never enters the frames: the frame before the panic
+            // is the last poll's, which ended.
+            SpanCallback::Enter => &["after panicking=false", "panic"],
+            // The drop ran inside the frames, which returned normally.
+            SpanCallback::Exit => &["enter", "after panicking=false", "panic"],
+        };
+        let start = (panic + 1).saturating_sub(expected.len());
+        assert_eq!(seen.get(start..=panic), Some(expected), "{at:?}: {seen:?}");
+        assert!(!seen.contains(&"after panicking=true"), "{at:?}: {seen:?}");
     }
 }

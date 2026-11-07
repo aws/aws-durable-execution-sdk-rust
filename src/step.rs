@@ -386,7 +386,7 @@ enum StepPrelude<O> {
     /// The record is `PENDING`, or a `RETRY` was just recorded for an
     /// interrupted `AtMostOncePerRetry` attempt: wait for the retry timer.
     Wait,
-    /// The body must run at `attempt`, instrumented with `span`.
+    /// The body must run at `attempt`, inside `span`.
     Run {
         /// 1-based attempt number for this live execution.
         attempt: u32,

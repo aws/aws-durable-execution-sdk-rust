@@ -441,13 +441,20 @@ pub(crate) fn never_fails(never: &std::convert::Infallible) -> WireError {
 /// 4. The innermost level builds the own node above the frames current at
 ///    this poll, also when none are, and polls `body` inside it, with
 ///    `active` as the active body. `body` is called in the first poll.
-///    `span` covers only the body: its call and its polls. The `WireError`
-///    is derived once, inside the own node and `active`, outside `span`,
-///    right after the body returned.
-/// 5. In the poll in which the body returned, level `i` calls plugin `i`'s
+///    The `WireError` is derived once, inside the own node, right after
+///    the body returned.
+/// 5. `span` is entered around every poll and the drop, outside the own
+///    hooks and wraps: the start hooks, the wraps, the body, the wire
+///    derivation and the end hooks run inside it, and so does the drop of
+///    a body, finished or pending. A span a wrap creates around `next()`
+///    is a child of `span`, so a record of the body carries both. `span`
+///    is the operation span of a step attempt or a condition check, the
+///    namespace span of a child or batch body, and the caller's current
+///    span for a combinator's join.
+/// 6. In the poll in which the body returned, level `i` calls plugin `i`'s
 ///    `on_user_function_end` after plugin `i`'s wrap returned, inside the
 ///    wraps of the plugins before it: ends run in reverse order.
-/// 6. Each returned hook future runs on its own task; the runner awaits
+/// 7. Each returned hook future runs on its own task; the runner awaits
 ///    nothing but the body and holds no permit.
 pub(crate) fn run_user_function<T, E, B>(
     plugins: Option<Arc<InvocationPlugins>>,
@@ -515,8 +522,7 @@ where
     let inner = run_body(active, async move {
         // Polled through `poll_slot`, not awaited, so a finished body
         // whose destructor panics cannot abort while its output is held.
-        let body = tracing::Instrument::instrument(span.in_scope(body), span);
-        let mut body = Some(Box::pin(body));
+        let mut body = Some(Box::pin(body()));
         match std::future::poll_fn(|cx| poll_slot(&mut body, cx)).await {
             Ok(value) => Ran(Outcome::Ok(value)),
             Err(error) => {
@@ -528,6 +534,7 @@ where
     Runner {
         info,
         plugins,
+        span,
         started: None,
         own: None,
         inner: Some(Box::pin(inner)),
@@ -539,6 +546,10 @@ struct Runner<F> {
     info: Arc<OperationInfo>,
     /// The plugins of the operation's own context.
     plugins: Option<Arc<InvocationPlugins>>,
+    /// The span entered around every poll and the drop, outside the own
+    /// hooks and wraps: a span a wrap creates is its child, so the body's
+    /// records carry both.
+    span: tracing::Span,
     /// `None` before the first poll; then the started plugins.
     started: Option<Arc<[usize]>>,
     /// The own node of the last poll, reused while its parent is the same.
@@ -589,10 +600,26 @@ impl<T, E, F: Future<Output = Ran<T, E>>> Future for Runner<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Ran<T, E>> {
         let this = self.get_mut();
+        let span = this.span.clone();
+        // The body's panic is caught inside the chain and resumed after the
+        // span exited, so the span's exit never runs while it unwinds. The
+        // first panic wins: a body panic over a later panic exiting the
+        // span, and a panic entering the span prevents the poll.
+        match crate::task::catch_in_span(&span, || this.poll_in_span(cx)) {
+            Ok(polled) => polled,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+}
+
+impl<T, E, F: Future<Output = Ran<T, E>>> Runner<F> {
+    /// One poll, inside the span: the own chain around the body.
+    fn poll_in_span(&mut self, cx: &mut Context<'_>) -> Polled<Ran<T, E>> {
+        let this = self;
         let first = this.started.is_none();
         let Some(plugins) = this.plugins.clone() else {
             this.started = Some(Arc::from([]));
-            return poll_slot(&mut this.inner, cx);
+            return catch_unwind(AssertUnwindSafe(|| poll_slot(&mut this.inner, cx)));
         };
         let candidates: Arc<[usize]> = match &this.started {
             Some(started) => Arc::clone(started),
@@ -633,25 +660,58 @@ impl<T, E, F: Future<Output = Ran<T, E>>> Future for Runner<F> {
         #[expect(clippy::expect_used)]
         // reason: every level calls `next` itself when its wrap did not,
         // so the innermost closure ran exactly once.
-        match out.into_inner().expect("the innermost call always runs") {
-            Ok(polled) => polled,
-            Err(payload) => resume_unwind(payload),
-        }
+        out.into_inner().expect("the innermost call always runs")
     }
 }
 
 impl<F> Drop for Runner<F> {
-    /// Drops a pending body inside its own frame's wraps, above the frames
-    /// current at the drop.
+    /// Drops a pending body inside the span and its own frame's wraps,
+    /// above the frames current at the drop, as a poll does, then drops
+    /// the span.
+    ///
+    /// The destructor's panic is caught inside the span and resumed after
+    /// the span exited, so the span's exit never runs while it unwinds.
+    /// The span is dropped inside a catch before any panic is resumed,
+    /// because dropping its last handle closes it, which runs a
+    /// subscriber's `on_close`. The first panic wins, as in a poll: a
+    /// destructor panic over a later panic closing the span, which is
+    /// discarded.
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            match (self.started.clone(), self.plugins.as_ref()) {
-                (Some(started), Some(plugins)) => {
-                    own_node(&mut self.own, plugins, &self.info, started)
-                        .enter_from(true, move || drop(inner));
-                }
-                _ => drop(inner),
+        let dropped = match self.inner.take() {
+            Some(inner) => {
+                let Self {
+                    span,
+                    started,
+                    plugins,
+                    own,
+                    info,
+                    ..
+                } = self;
+                crate::task::catch_in_span(span, || {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        match (started.clone(), plugins.as_ref()) {
+                            (Some(started), Some(plugins)) => {
+                                own_node(own, plugins, info, started)
+                                    .enter_from(true, move || drop(inner));
+                            }
+                            _ => drop(inner),
+                        }
+                    }))
+                })
             }
+            None => Ok(()),
+        };
+        let span = std::mem::replace(&mut self.span, tracing::Span::none());
+        let closed = catch_unwind(AssertUnwindSafe(move || drop(span)));
+        match (dropped, closed) {
+            (Err(first), closed) => {
+                if let Err(later) = closed {
+                    crate::task::discard_panic(later);
+                }
+                resume_unwind(first);
+            }
+            (Ok(()), Err(close)) => resume_unwind(close),
+            (Ok(()), Ok(())) => {}
         }
     }
 }
@@ -1215,10 +1275,10 @@ mod tests {
     }
 
     /// The body's factory and polls run inside the SDK span; the wire is
-    /// derived once, outside it, under `ActiveBody::Outcome` with the
+    /// derived once, inside it too, under `ActiveBody::Outcome` with the
     /// body's ID, and the end hooks receive it.
     #[test]
-    fn wire_derived_outside_span() {
+    fn wire_derived_inside_span() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let plugins = plugins(&[("p0", Mode::Normal)], &log);
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1257,7 +1317,7 @@ mod tests {
             [
                 "factory in Some(\"body_span\")",
                 "poll in Some(\"body_span\")",
-                "display in Some(\"outer\") under Outcome(\"m\")",
+                "display in Some(\"body_span\") under Outcome(\"m\")",
             ]
         );
         let (_, wire) = ran.into_parts().expect_err("the body failed");
@@ -1392,10 +1452,10 @@ mod tests {
         .expect("a factory was given")
     }
 
-    /// A start hook runs outside the SDK span, in the poller's span; the
-    /// step body runs inside the SDK span.
+    /// A start hook and the step body both run inside the SDK span, not in
+    /// the poller's span.
     #[test]
-    fn start_hook_outside_sdk_span() {
+    fn start_hook_inside_sdk_span() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let start_seen = Arc::clone(&seen);
         let plugins = calls_plugins(Calls {
@@ -1427,7 +1487,7 @@ mod tests {
         assert_eq!(
             take(&seen),
             [
-                "start in Some(\"outer\")",
+                "start in Some(\"durable_operation\")",
                 "body in Some(\"durable_operation\")",
             ]
         );
@@ -2337,5 +2397,410 @@ mod tests {
         ) {
             panic!("subscriber panicked");
         }
+    }
+
+    /// A plugin whose user-function wrap enters a `plugin_span` around
+    /// `next()`, and which logs, for its start and end hooks and its wrap,
+    /// the current span and the thread.
+    #[derive(Clone, Default)]
+    struct SpanWrap(Arc<Mutex<Vec<String>>>);
+
+    impl SpanWrap {
+        fn seen(&self, site: &str) {
+            let thread = std::thread::current().id();
+            push(
+                &self.0,
+                format!("{site} in {:?} on {thread:?}", span_name()),
+            );
+        }
+    }
+
+    impl Plugin for SpanWrap {
+        fn wrap_user_function(&self, _info: &OperationInfo, next: &mut dyn FnMut()) {
+            self.seen("wrap");
+            tracing::info_span!("plugin_span").in_scope(next);
+        }
+
+        fn on_user_function_start(&self, _info: &OperationInfo) -> HookWork {
+            self.seen("start");
+            Ok(None)
+        }
+
+        fn on_user_function_end(
+            &self,
+            _info: &OperationInfo,
+            _outcome: Result<(), &WireError>,
+        ) -> HookWork {
+            self.seen("end");
+            Ok(None)
+        }
+    }
+
+    impl PluginFactory for SpanWrap {
+        fn create_plugin(
+            &self,
+            _info: &InvocationInfo,
+        ) -> Result<Option<Box<dyn Plugin>>, BoxError> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// A supplied SDK span: the operation span of the step `s`.
+    fn supplied_span() -> tracing::Span {
+        crate::tracing_layer::operation_span("arn", "req", None, "s", None, 1, false)
+    }
+
+    /// A runner of the step `s` under [`SpanWrap`], inside [`supplied_span`].
+    fn span_runner<B, M>(plugin: &SpanWrap, body: M) -> impl Future<Output = Ran<()>> + use<B, M>
+    where
+        M: FnOnce() -> B,
+        B: Future<Output = Result<(), BoxError>>,
+    {
+        run_user_function(
+            Some(crate::plugin::test_support::plugins_of(plugin.clone())),
+            info("s"),
+            UserBody::Step("s".to_owned()),
+            supplied_span(),
+            body,
+            |_: &BoxError| WireError::new(None::<String>, None::<String>),
+        )
+    }
+
+    /// The span names of the captured record whose message is `message`,
+    /// outermost first, as its stored parent chain gives them.
+    #[expect(
+        clippy::indexing_slicing,
+        clippy::panic,
+        reason = "test assertions on JSON records"
+    )]
+    fn ancestry(buffer: &Arc<Mutex<Vec<u8>>>, message: &str) -> Vec<String> {
+        let output = String::from_utf8_lossy(&buffer.lock().unwrap()).to_string();
+        let record = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|v| field(v, "message") == message)
+            .unwrap_or_else(|| panic!("no record {message:?} in {output}"));
+        record["spans"]
+            .as_array()
+            .map(|spans| spans.iter().map(|s| field(s, "name").to_owned()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The runner enters its supplied span outside its own chain: a body
+    /// record's stored ancestry is the supplied span, then the plugin's
+    /// span; the start and end hooks run inside the supplied span; and
+    /// every hook and wrap runs on the thread that polls.
+    #[test]
+    fn runner_enters_supplied_span_outside_own_chain() {
+        let plugin = SpanWrap::default();
+        let polled = plugin.clone();
+        let (buffer, thread) = std::thread::spawn(move || {
+            let (buffer, _guard) = capture();
+            let mut run = std::pin::pin!(span_runner(&polled, || async {
+                polls(1, || tracing::info!("body record")).await;
+                Ok(())
+            }));
+            assert!(futures_poll_once(run.as_mut()).is_pending());
+            assert!(futures_poll_once(run.as_mut()).is_ready());
+            (buffer, std::thread::current().id())
+        })
+        .join()
+        .expect("the poller returns");
+        assert_eq!(
+            ancestry(&buffer, "body record"),
+            ["durable_operation", "plugin_span"]
+        );
+        let on = format!("on {thread:?}");
+        assert_eq!(
+            take(&plugin.0),
+            [
+                format!("start in Some(\"durable_operation\") {on}"),
+                format!("wrap in Some(\"durable_operation\") {on}"),
+                format!("wrap in Some(\"durable_operation\") {on}"),
+                format!("end in Some(\"durable_operation\") {on}"),
+            ]
+        );
+    }
+
+    /// The destructor of a body that returned `Ready`, and of a pending
+    /// body dropped with its runner, runs inside the supplied span and the
+    /// plugin's span.
+    #[test]
+    fn runner_drops_completed_and_pending_bodies_inside_own_chain() {
+        struct LogsOnDrop(&'static str);
+        impl Drop for LogsOnDrop {
+            fn drop(&mut self) {
+                tracing::info!("{}", self.0);
+            }
+        }
+        let plugin = SpanWrap::default();
+        let (buffer, _guard) = capture();
+        let mut completed = std::pin::pin!(span_runner(&plugin, || {
+            let guard = LogsOnDrop("completed body dropped");
+            async move {
+                let _guard = guard;
+                Ok(())
+            }
+        }));
+        assert!(futures_poll_once(completed.as_mut()).is_ready());
+        let mut pending = Box::pin(span_runner(&plugin, || {
+            let guard = LogsOnDrop("pending body dropped");
+            async move {
+                let _guard = guard;
+                std::future::pending::<Result<(), BoxError>>().await
+            }
+        }));
+        assert!(futures_poll_once(pending.as_mut()).is_pending());
+        drop(pending);
+        for message in ["completed body dropped", "pending body dropped"] {
+            assert_eq!(
+                ancestry(&buffer, message),
+                ["durable_operation", "plugin_span"],
+                "{message}"
+            );
+        }
+    }
+
+    thread_local! {
+        /// Set to make [`ExitPanics`] panic `"exit boom"` at the next exit
+        /// of a `durable_operation` span on this thread.
+        static OPERATION_EXIT_ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn arm_operation_exit() {
+        OPERATION_EXIT_ARMED.with(|armed| armed.set(true));
+    }
+
+    /// A layer that panics `"exit boom"` at an armed exit of a
+    /// `durable_operation` span.
+    struct ExitPanics;
+
+    impl<S> lambda_runtime::tracing::subscriber::Layer<S> for ExitPanics
+    where
+        S: tracing::Subscriber
+            + for<'l> lambda_runtime::tracing::subscriber::registry::LookupSpan<'l>,
+    {
+        fn on_exit(
+            &self,
+            id: &tracing::span::Id,
+            ctx: lambda_runtime::tracing::subscriber::layer::Context<'_, S>,
+        ) {
+            let operation = ctx
+                .span(id)
+                .is_some_and(|span| span.name() == "durable_operation");
+            let fire = operation && OPERATION_EXIT_ARMED.with(|armed| armed.replace(false));
+            assert!(!fire, "exit boom");
+        }
+    }
+
+    /// The payload of `result`'s panic, as a `&'static str`.
+    fn panic_message<T>(result: std::thread::Result<T>) -> Option<&'static str> {
+        let payload = result.err()?;
+        payload.downcast_ref::<&'static str>().copied()
+    }
+
+    /// The first panic wins when the supplied span's exit panics after the
+    /// body: a body poll panic and a pending body's destructor panic win
+    /// over the exit panic, which is discarded instead of unwinding while
+    /// they unwind, and an exit panic after a `Ready` poll is the runner's
+    /// panic.
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "the test needs a body and a destructor that panic"
+    )]
+    fn runner_keeps_the_first_panic_over_a_supplied_span_exit_panic() {
+        use lambda_runtime::tracing::subscriber::layer::SubscriberExt as _;
+
+        struct ArmsThenPanicsOnDrop;
+        impl Drop for ArmsThenPanicsOnDrop {
+            fn drop(&mut self) {
+                arm_operation_exit();
+                panic!("drop boom");
+            }
+        }
+        let _guard = test_tracing::install_test_subscriber(
+            lambda_runtime::tracing::subscriber::registry().with(ExitPanics),
+        );
+        let plugin = SpanWrap::default();
+        let mut polled = Box::pin(span_runner(&plugin, || async {
+            arm_operation_exit();
+            panic!("body boom");
+        }));
+        let poll = catch_unwind(AssertUnwindSafe(|| futures_poll_once(polled.as_mut())));
+        assert_eq!(panic_message(poll), Some("body boom"));
+        assert!(!OPERATION_EXIT_ARMED.with(Cell::get), "the exit fired");
+        let mut pending = Box::pin(span_runner(&plugin, || {
+            let guard = ArmsThenPanicsOnDrop;
+            async move {
+                let _guard = guard;
+                std::future::pending::<Result<(), BoxError>>().await
+            }
+        }));
+        assert!(futures_poll_once(pending.as_mut()).is_pending());
+        let dropped = catch_unwind(AssertUnwindSafe(move || drop(pending)));
+        assert_eq!(panic_message(dropped), Some("drop boom"));
+        assert!(!OPERATION_EXIT_ARMED.with(Cell::get), "the exit fired");
+        let mut ready = Box::pin(span_runner(&plugin, || async {
+            arm_operation_exit();
+            Ok(())
+        }));
+        let poll = catch_unwind(AssertUnwindSafe(|| futures_poll_once(ready.as_mut())));
+        assert_eq!(panic_message(poll), Some("exit boom"));
+    }
+
+    thread_local! {
+        /// Set to make [`ClosePanics`] panic `"close boom"` at the next
+        /// close of a `durable_operation` span on this thread.
+        static OPERATION_CLOSE_ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    thread_local! {
+        /// Set to make the next armed close panic with a
+        /// [`ClosePayloadDropPanics`] payload instead of `"close boom"`.
+        static CLOSE_PAYLOAD_DROP_PANICS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn arm_operation_close() {
+        OPERATION_CLOSE_ARMED.with(|armed| armed.set(true));
+    }
+
+    /// A close panic payload whose destructor panics `"payload drop boom"`.
+    struct ClosePayloadDropPanics;
+
+    impl Drop for ClosePayloadDropPanics {
+        #[expect(
+            clippy::panic,
+            reason = "the test needs a payload whose destructor panics"
+        )]
+        fn drop(&mut self) {
+            panic!("payload drop boom");
+        }
+    }
+
+    /// A layer that panics `"close boom"` at an armed close of a
+    /// `durable_operation` span.
+    struct ClosePanics;
+
+    impl<S> lambda_runtime::tracing::subscriber::Layer<S> for ClosePanics
+    where
+        S: tracing::Subscriber
+            + for<'l> lambda_runtime::tracing::subscriber::registry::LookupSpan<'l>,
+    {
+        fn on_close(
+            &self,
+            id: tracing::span::Id,
+            ctx: lambda_runtime::tracing::subscriber::layer::Context<'_, S>,
+        ) {
+            let operation = ctx
+                .span(&id)
+                .is_some_and(|span| span.name() == "durable_operation");
+            let fire = operation && OPERATION_CLOSE_ARMED.with(|armed| armed.replace(false));
+            if fire && CLOSE_PAYLOAD_DROP_PANICS.with(|set| set.replace(false)) {
+                #[expect(
+                    clippy::panic,
+                    reason = "the test needs a close panic whose payload's destructor panics"
+                )]
+                std::panic::panic_any(ClosePayloadDropPanics);
+            }
+            assert!(!fire, "close boom");
+        }
+    }
+
+    /// A runner's drop closes its span inside a catch before it resumes a
+    /// panic. A pending body's destructor panic wins over a panic closing
+    /// the span, which is discarded instead of unwinding while the
+    /// destructor's panic unwinds, which would abort the process. A close
+    /// panic alone, after a pending or a finished body, is the drop's
+    /// panic.
+    #[test]
+    #[expect(clippy::panic, reason = "the test needs a destructor that panics")]
+    fn runner_drop_keeps_the_first_panic_over_a_span_close_panic() {
+        use lambda_runtime::tracing::subscriber::layer::SubscriberExt as _;
+
+        struct ArmsCloseThenPanicsOnDrop;
+        impl Drop for ArmsCloseThenPanicsOnDrop {
+            fn drop(&mut self) {
+                arm_operation_close();
+                panic!("drop boom");
+            }
+        }
+        let _guard = test_tracing::install_test_subscriber(
+            lambda_runtime::tracing::subscriber::registry().with(ClosePanics),
+        );
+        let plugin = SpanWrap::default();
+
+        let mut both = Box::pin(span_runner(&plugin, || {
+            let guard = ArmsCloseThenPanicsOnDrop;
+            async move {
+                let _guard = guard;
+                std::future::pending::<Result<(), BoxError>>().await
+            }
+        }));
+        assert!(futures_poll_once(both.as_mut()).is_pending());
+        let dropped = catch_unwind(AssertUnwindSafe(move || drop(both)));
+        assert_eq!(panic_message(dropped), Some("drop boom"));
+        assert!(
+            !OPERATION_CLOSE_ARMED.with(Cell::get),
+            "the close did not run"
+        );
+
+        let mut pending = Box::pin(span_runner(&plugin, || async {
+            std::future::pending::<Result<(), BoxError>>().await
+        }));
+        assert!(futures_poll_once(pending.as_mut()).is_pending());
+        arm_operation_close();
+        let dropped = catch_unwind(AssertUnwindSafe(move || drop(pending)));
+        assert_eq!(panic_message(dropped), Some("close boom"));
+
+        let mut ready = Box::pin(span_runner(&plugin, || async { Ok(()) }));
+        assert!(futures_poll_once(ready.as_mut()).is_ready());
+        arm_operation_close();
+        let dropped = catch_unwind(AssertUnwindSafe(move || drop(ready)));
+        assert_eq!(panic_message(dropped), Some("close boom"));
+        assert!(
+            !OPERATION_CLOSE_ARMED.with(Cell::get),
+            "the close did not run"
+        );
+    }
+    /// A runner's drop discards a later span-close panic through the
+    /// contained-drop policy: the close panic's payload has a destructor
+    /// that panics, and the body destructor's panic still wins as the
+    /// drop's panic, with the payload's own panic contained.
+    #[test]
+    #[expect(clippy::panic, reason = "the test needs a destructor that panics")]
+    fn runner_drop_contains_a_close_panic_payload_whose_drop_panics() {
+        use lambda_runtime::tracing::subscriber::layer::SubscriberExt as _;
+
+        struct ArmsPanickingCloseThenPanicsOnDrop;
+        impl Drop for ArmsPanickingCloseThenPanicsOnDrop {
+            fn drop(&mut self) {
+                CLOSE_PAYLOAD_DROP_PANICS.with(|set| set.set(true));
+                arm_operation_close();
+                panic!("drop boom");
+            }
+        }
+        let _guard = test_tracing::install_test_subscriber(
+            lambda_runtime::tracing::subscriber::registry().with(ClosePanics),
+        );
+        let plugin = SpanWrap::default();
+        let mut pending = Box::pin(span_runner(&plugin, || {
+            let guard = ArmsPanickingCloseThenPanicsOnDrop;
+            async move {
+                let _guard = guard;
+                std::future::pending::<Result<(), BoxError>>().await
+            }
+        }));
+        assert!(futures_poll_once(pending.as_mut()).is_pending());
+        let dropped = catch_unwind(AssertUnwindSafe(move || drop(pending)));
+        assert_eq!(panic_message(dropped), Some("drop boom"));
+        assert!(
+            !OPERATION_CLOSE_ARMED.with(Cell::get),
+            "the close did not run"
+        );
+        assert!(
+            !CLOSE_PAYLOAD_DROP_PANICS.with(Cell::get),
+            "the close did not panic with the payload"
+        );
     }
 }
